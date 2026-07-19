@@ -6,7 +6,7 @@ from typing import Any
 
 from orbitserve.runtime import RuntimeStrategySpec
 from orbitserve.runtime import build_runtime_performance_result
-from orbitserve.orbit import RuntimeTraceManifest
+from orbitserve.orbit import OrbitTraceManifest
 from .costing import estimate_terrestrial_ground_cost
 from .global_runtime import is_centralized_ground_policy, run_centralized_ground_runtime
 from .runtime import (
@@ -35,7 +35,7 @@ def evaluate_ground_runtime_performance(scenario: Any, strategy: Any) -> Any:
         records=engine_result.records,
         ground_config=runtime_strategy.ground_config,
     )
-    trace_manifest = RuntimeTraceManifest.from_value(
+    trace_manifest = OrbitTraceManifest.from_value(
         getattr(scenario, "simulation_trace_ref", None)
     )
     return build_runtime_performance_result(

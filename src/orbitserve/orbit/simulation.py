@@ -13,7 +13,7 @@ from typing import Any
 
 from ..common import to_jsonable
 from ..common import PerformanceMetrics, SLOMetrics
-from .simulation_traces import CIRCULAR_GEOMETRY_TRACE, RuntimeTraceManifest, SURROGATE_ORBIT_TRACE
+from .simulation_traces import CIRCULAR_GEOMETRY_TRACE, OrbitTraceManifest, SURROGATE_ORBIT_TRACE
 
 
 _REMOVED_TRACE_PHYSICAL_INPUTS = (
@@ -109,7 +109,7 @@ def run_simulation(
     """Return placeholder metrics plus any requested runtime trace manifest."""
 
     if config.trace_model == "ideal_full_visibility":
-        manifest = RuntimeTraceManifest.ideal_full_visibility(
+        manifest = OrbitTraceManifest.ideal_full_visibility(
             trace_id=f"ideal_full_visibility:{config.epoch}:{config.duration_s:g}s"
         )
         return SimulationResult(
@@ -135,7 +135,7 @@ def run_simulation(
                 slo=SLOMetrics(),
                 trace_model=SURROGATE_ORBIT_TRACE,
                 trace_evaluated=False,
-                trace_manifest=RuntimeTraceManifest(
+                trace_manifest=OrbitTraceManifest(
                     trace_model=SURROGATE_ORBIT_TRACE,
                     warnings=(
                         "surrogate_orbit_trace requires constellation and materialized workload_generation",
@@ -165,7 +165,7 @@ def run_simulation(
                 slo=SLOMetrics(),
                 trace_model=SURROGATE_ORBIT_TRACE,
                 trace_evaluated=False,
-                trace_manifest=RuntimeTraceManifest(
+                trace_manifest=OrbitTraceManifest(
                     trace_model=SURROGATE_ORBIT_TRACE,
                     warnings=(warning, "valid_for_paper_main_results=false"),
                 ).to_dict(),
@@ -194,7 +194,7 @@ def run_simulation(
                 slo=SLOMetrics(),
                 trace_model=CIRCULAR_GEOMETRY_TRACE,
                 trace_evaluated=False,
-                trace_manifest=RuntimeTraceManifest(
+                trace_manifest=OrbitTraceManifest(
                     trace_model=CIRCULAR_GEOMETRY_TRACE,
                     warnings=(
                         "circular_geometry_trace requires constellation and materialized workload_generation",
@@ -224,7 +224,7 @@ def run_simulation(
                 slo=SLOMetrics(),
                 trace_model=CIRCULAR_GEOMETRY_TRACE,
                 trace_evaluated=False,
-                trace_manifest=RuntimeTraceManifest(
+                trace_manifest=OrbitTraceManifest(
                     trace_model=CIRCULAR_GEOMETRY_TRACE,
                     warnings=(warning, "valid_for_paper_main_results=false"),
                 ).to_dict(),
@@ -252,7 +252,7 @@ def run_simulation(
         slo=SLOMetrics(),
         trace_model=config.trace_model,
         trace_evaluated=False,
-        trace_manifest=RuntimeTraceManifest(warnings=("simulation trace is not implemented",)).to_dict(),
+        trace_manifest=OrbitTraceManifest(warnings=("simulation trace is not implemented",)).to_dict(),
         warnings=(
             "orbit/visibility simulation is not implemented",
             f"received simulation window duration_s={config.duration_s} step_s={config.step_s}",

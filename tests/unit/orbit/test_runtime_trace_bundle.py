@@ -15,8 +15,8 @@ from orbitserve.runtime.routing import (
 from orbitserve.runtime.scenario import build_runtime_scenario
 from orbitserve.orbit.simulation_traces import (
     CIRCULAR_GEOMETRY_TRACE,
-    RuntimeTraceBundle,
-    RuntimeTraceManifest,
+    OrbitTraceBundle,
+    OrbitTraceManifest,
     SATELLITE_MOTION_TRACE_SCHEMA,
     SURROGATE_ORBIT_TRACE,
     load_surrogate_trace_bundle,
@@ -28,7 +28,7 @@ def _write_json(path, payload):
     path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
 
 
-class RuntimeTraceManifestAndBundleTests(unittest.TestCase):
+class OrbitTraceManifestAndBundleTests(unittest.TestCase):
     def test_nested_manifest_roundtrip_preserves_current_surface(self):
         nested = {
             "schema_version": "orbitserve.satellite_motion_trace.v1",
@@ -56,7 +56,7 @@ class RuntimeTraceManifestAndBundleTests(unittest.TestCase):
             "scope": "geometry_trace_surrogate",
             "valid_for_paper_main_results": False,
         }
-        nested_manifest = RuntimeTraceManifest.from_value(nested)
+        nested_manifest = OrbitTraceManifest.from_value(nested)
         nested_payload = nested_manifest.to_dict()
 
         self.assertEqual(nested_manifest.satellite_catalog_path, "satellite_catalog.json")
@@ -123,10 +123,10 @@ class RuntimeTraceManifestAndBundleTests(unittest.TestCase):
             "propagation_delay_s": 0.01,
             "edge_available_external": True,
         }
-        motion_bundle = RuntimeTraceBundle(
+        motion_bundle = OrbitTraceBundle(
             trace_id="malformed-motion",
             trace_model=CIRCULAR_GEOMETRY_TRACE,
-            trace_manifest=RuntimeTraceManifest(
+            trace_manifest=OrbitTraceManifest(
                 schema_version=SATELLITE_MOTION_TRACE_SCHEMA,
                 trace_model=CIRCULAR_GEOMETRY_TRACE,
                 evaluated=True,
@@ -167,10 +167,10 @@ class RuntimeTraceManifestAndBundleTests(unittest.TestCase):
             "propagation_delay_s": 0.012,
             "tau_setup_s": 0.003,
         }
-        bundle = RuntimeTraceBundle(
+        bundle = OrbitTraceBundle(
             trace_id="sgl-window-query",
             trace_model=CIRCULAR_GEOMETRY_TRACE,
-            trace_manifest=RuntimeTraceManifest(
+            trace_manifest=OrbitTraceManifest(
                 schema_version=SATELLITE_MOTION_TRACE_SCHEMA,
                 trace_model=CIRCULAR_GEOMETRY_TRACE,
                 evaluated=True,
@@ -335,7 +335,7 @@ class RuntimeTraceManifestAndBundleTests(unittest.TestCase):
                     ],
                 },
             )
-            manifest = RuntimeTraceManifest.from_value(
+            manifest = OrbitTraceManifest.from_value(
                 {
                     "trace_model": CIRCULAR_GEOMETRY_TRACE,
                     "evaluated": True,
@@ -363,7 +363,7 @@ class RuntimeTraceManifestAndBundleTests(unittest.TestCase):
 
             bundle = load_surrogate_trace_bundle(manifest)
 
-        self.assertIsInstance(bundle, RuntimeTraceBundle)
+        self.assertIsInstance(bundle, OrbitTraceBundle)
         self.assertEqual(len(bundle.satellite_catalog), 1)
         self.assertEqual(len(bundle.ephemeris_samples), 1)
         self.assertTrue(bundle.access_at("gw-0", 5.0).available)

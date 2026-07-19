@@ -9,7 +9,7 @@ from orbitserve.orbit.simulation_traces import (
     CIRCULAR_GEOMETRY_TRACE,
     IDEAL_FULL_VISIBILITY,
     SURROGATE_ORBIT_TRACE,
-    RuntimeTraceManifest,
+    OrbitTraceManifest,
 )
 from orbitserve.dse.static_slo import evaluate_static_slo_proxy
 
@@ -173,7 +173,7 @@ class StaticSLOProxyCornerCaseTests(unittest.TestCase):
                     simulation_result={
                         "trace_model": trace_model,
                         "trace_evaluated": False,
-                        "trace_manifest": RuntimeTraceManifest(
+                        "trace_manifest": OrbitTraceManifest(
                             trace_model=trace_model,
                             warnings=(build_warning,),
                         ).to_dict(),
@@ -220,7 +220,7 @@ class StaticSLOProxyCornerCaseTests(unittest.TestCase):
         result = evaluate_static_slo_proxy(
             workload_generation=_workload((request,)),
             serving_throughput=_serving(),
-            simulation_result={"trace_manifest": RuntimeTraceManifest.ideal_full_visibility().to_dict()},
+            simulation_result={"trace_manifest": OrbitTraceManifest.ideal_full_visibility().to_dict()},
         ).to_dict()
 
         self.assertTrue(result["evaluated"])

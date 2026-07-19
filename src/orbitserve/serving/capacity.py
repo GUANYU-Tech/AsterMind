@@ -516,7 +516,7 @@ class ServingSpec:
 
 
 @dataclass(frozen=True)
-class ServingThroughputEstimate:
+class ServingCapacityProfile:
     evaluated: bool
     feasible: bool
     deployment_mode: str
@@ -602,7 +602,7 @@ def estimate_serving_throughput(
     hardware: SatelliteHardwareProfile | None = None,
     token_distribution: TokenDistribution | None = None,
     constellation_satellite_count: int | None = None,
-) -> ServingThroughputEstimate:
+) -> ServingCapacityProfile:
     """Estimate LLM prefill/decode throughput for a hardware profile."""
 
     resolved_hardware = hardware or serving.hardware
@@ -767,7 +767,7 @@ def estimate_serving_throughput(
     )
     deployment_mode = _deployment_mode(parallelism)
     communication_summary = _merge_communication_summaries(prefill, decode, kv_handoff)
-    return ServingThroughputEstimate(
+    return ServingCapacityProfile(
         evaluated=True,
         feasible=feasible,
         deployment_mode=deployment_mode,
@@ -2247,8 +2247,8 @@ def _safe_ratio(numerator: float, denominator: float) -> float:
     return numerator / denominator
 
 
-def _unevaluated_throughput(message: str) -> ServingThroughputEstimate:
-    return ServingThroughputEstimate(
+def _unevaluated_throughput(message: str) -> ServingCapacityProfile:
+    return ServingCapacityProfile(
         evaluated=False,
         feasible=False,
         deployment_mode="not_evaluated",

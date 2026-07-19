@@ -1,4 +1,4 @@
-"""Deterministic surrogate trace builder for preliminary runtime experiments."""
+"""Deterministic surrogate orbit-trace builder."""
 
 from __future__ import annotations
 
@@ -14,15 +14,15 @@ from .simulation_traces import (
     SURROGATE_ORBIT_TRACE,
     SURROGATE_TRACE_SCHEMA,
     TRACE_BACKED_RUNTIME_SURROGATE_SCOPE,
-    RuntimeTraceManifest,
+    OrbitTraceManifest,
     trace_file_sha256,
 )
 
 
 @dataclass(frozen=True)
-class RuntimeTraceBuildResult:
+class OrbitTraceBuildResult:
     trace_dir: str
-    trace_manifest: RuntimeTraceManifest
+    trace_manifest: OrbitTraceManifest
     access_trace: dict[str, Any]
     link_trace: dict[str, Any]
     energy_trace: dict[str, Any]
@@ -51,7 +51,7 @@ def build_surrogate_orbit_trace(
     workload_generation: Any,
     base_dir: str | Path | None = None,
     experiment_id: str | None = None,
-) -> RuntimeTraceBuildResult:
+) -> OrbitTraceBuildResult:
     workload = _mapping(workload_generation)
     requests = tuple(_dict(item) for item in workload.get("requests", ()) if isinstance(item, dict))
     gateways = tuple(_dict(item) for item in workload.get("gateways", ()) if isinstance(item, dict))
@@ -144,7 +144,7 @@ def build_surrogate_orbit_trace(
     _write_json_deterministic(access_path, access_trace)
     _write_json_deterministic(link_path, link_trace)
     _write_json_deterministic(energy_path, energy_trace)
-    manifest = RuntimeTraceManifest(
+    manifest = OrbitTraceManifest(
         trace_model=SURROGATE_ORBIT_TRACE,
         evaluated=True,
         trace_id=trace_id,
@@ -159,7 +159,7 @@ def build_surrogate_orbit_trace(
         warnings=tuple(dict.fromkeys(warnings)),
         provenance=provenance,
     )
-    return RuntimeTraceBuildResult(
+    return OrbitTraceBuildResult(
         trace_dir=str(trace_dir),
         trace_manifest=manifest,
         access_trace=access_trace,
@@ -757,7 +757,7 @@ def _nonnegative_int(value: Any) -> int:
 
 
 __all__ = [
-    "RuntimeTraceBuildResult",
+    "OrbitTraceBuildResult",
     "build_surrogate_orbit_trace",
     "stable_int_hash",
 ]

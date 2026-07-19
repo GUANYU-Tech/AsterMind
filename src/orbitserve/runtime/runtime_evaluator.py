@@ -13,7 +13,7 @@ from ..orbit import (
     CIRCULAR_GEOMETRY_TRACE,
     IDEAL_FULL_VISIBILITY,
     SURROGATE_ORBIT_TRACE,
-    RuntimeTraceManifest,
+    OrbitTraceManifest,
     load_surrogate_trace_bundle,
 )
 
@@ -30,7 +30,7 @@ def try_evaluate_runtime_performance(
     requests = tuple(getattr(scenario, "requests", ()) or ())
     if not requests:
         return None
-    trace_manifest = RuntimeTraceManifest.from_value(
+    trace_manifest = OrbitTraceManifest.from_value(
         getattr(scenario, "simulation_trace_ref", None)
     )
     if not trace_manifest.evaluated:

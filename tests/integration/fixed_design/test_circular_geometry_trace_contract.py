@@ -10,8 +10,8 @@ from pathlib import Path
 
 from orbitserve.experiments import load_experiment_spec
 from orbitserve.runtime.routing import find_access_candidates
-from orbitserve.orbit.simulation_traces import RuntimeTraceBundle, RuntimeTraceManifest, load_surrogate_trace_bundle
-from orbitserve.workload import GatewaySpec, RegionSpec, WorkloadGenerationResult, materialize_workload_bundle
+from orbitserve.orbit.simulation_traces import OrbitTraceBundle, OrbitTraceManifest, load_surrogate_trace_bundle
+from orbitserve.workload import GatewaySpec, RegionSpec, MaterializedWorkload, materialize_workload_bundle
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -38,7 +38,7 @@ def _as_dict(value):
 def _trace_manifest(value):
     payload = _as_dict(value)
     manifest_payload = payload.get("trace_manifest") or payload
-    return RuntimeTraceManifest.from_value(manifest_payload), manifest_payload, payload
+    return OrbitTraceManifest.from_value(manifest_payload), manifest_payload, payload
 
 
 def _trace_dir(manifest_payload, result_payload, tmpdir):
@@ -68,7 +68,7 @@ def _base_workload():
 
 
 def _gateway_and_direct_workload():
-    return WorkloadGenerationResult(
+    return MaterializedWorkload(
         bundle_dir=None,
         manifest={
             "schema_version": "orbitserve.workload",
@@ -198,7 +198,7 @@ class CircularGeometryTraceContractTests(unittest.TestCase):
         }
 
         membership = _access_membership(access_trace)
-        bundle = RuntimeTraceBundle(
+        bundle = OrbitTraceBundle(
             trace_id="access-membership-half-open",
             trace_model=CIRCULAR_TRACE_MODEL,
             horizon_s=40.0,

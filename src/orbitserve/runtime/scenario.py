@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from ..orbit import RuntimeTraceManifest, resolve_trace_path
+from ..orbit import OrbitTraceManifest, resolve_trace_path
 from ..common import to_jsonable
 from .contracts import (
     RUNTIME_INTERFACE_DOC,
@@ -95,7 +95,7 @@ def build_runtime_scenario(
         "workload_spec": workload_spec_payload,
         "warnings": _warnings_from_payload(workload_payload),
     }
-    trace_manifest_obj = RuntimeTraceManifest.from_value(simulation_payload)
+    trace_manifest_obj = OrbitTraceManifest.from_value(simulation_payload)
     trace_manifest = trace_manifest_obj.to_dict()
     satellite_catalog = _satellite_catalog_from_trace_manifest(trace_manifest_obj)
     trace_model = _first_present(
@@ -182,9 +182,9 @@ def build_runtime_scenario(
             },
             "serving_model": {
                 "modeling_doc": "docs/research/parameters/llm_serving_capacity_model.md",
-                "estimate_schema": "ServingThroughputEstimate",
+                "estimate_schema": "ServingCapacityProfile",
             },
-            "satellite_architecture": satellite_architecture_payload or hardware_payload,
+            "hardware_config": satellite_architecture_payload or hardware_payload,
             "cost_model": cost_power["provenance"],
             "runtime_interface_doc": RUNTIME_INTERFACE_DOC,
             "runtime_performance_model_doc": RUNTIME_PERFORMANCE_DOC,
@@ -224,7 +224,7 @@ def _warnings_from_payload(payload: dict[str, Any]) -> tuple[str, ...]:
         return (raw,)
     return tuple(str(item) for item in raw)
 
-def _satellite_catalog_from_trace_manifest(trace_manifest: RuntimeTraceManifest) -> tuple[dict[str, Any], ...]:
+def _satellite_catalog_from_trace_manifest(trace_manifest: OrbitTraceManifest) -> tuple[dict[str, Any], ...]:
     trace_dir = _optional_str(trace_manifest.provenance.get("trace_dir"))
     satellite_catalog = _read_satellite_catalog_json(
         resolve_trace_path(

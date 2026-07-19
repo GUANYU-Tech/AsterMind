@@ -522,7 +522,7 @@ class EnergyAccountingAlignmentTests(unittest.TestCase):
             },
             {
                 "evaluated": True,
-                "scope": "trace_backed_runtime_sanity",
+                "scope": "trace_backed_runtime_surrogate",
                 "trace_model": "surrogate_orbit_trace",
                 "runtime_metrics": {"served_ratio": 1.0},
             },
@@ -551,7 +551,7 @@ class EnergyAccountingAlignmentTests(unittest.TestCase):
             },
             {
                 "evaluated": True,
-                "scope": "trace_backed_runtime_sanity",
+                "scope": "trace_backed_runtime_surrogate",
                 "trace_model": "surrogate_orbit_trace",
                 "runtime_metrics": {"served_ratio": 1.0},
                 "request_records": (
@@ -583,7 +583,7 @@ class EnergyAccountingAlignmentTests(unittest.TestCase):
         }
         runtime = {
             "evaluated": True,
-            "scope": "trace_backed_runtime_sanity",
+            "scope": "trace_backed_runtime_surrogate",
             "trace_model": "surrogate_orbit_trace",
             "runtime_metrics": {"served_ratio": None},
             "request_records": (),
@@ -707,7 +707,7 @@ class EnergyAccountingAlignmentTests(unittest.TestCase):
             },
             {
                 "evaluated": True,
-                "scope": "trace_backed_runtime_sanity",
+                "scope": "trace_backed_runtime_surrogate",
                 "trace_model": "surrogate_orbit_trace",
                 "runtime_metrics": {"served_ratio": 0.0},
                 "request_records": (
@@ -797,7 +797,7 @@ class EnergyAccountingAlignmentTests(unittest.TestCase):
             },
             {
                 "evaluated": True,
-                "scope": "trace_backed_runtime_sanity",
+                "scope": "trace_backed_runtime_surrogate",
                 "trace_model": "surrogate_orbit_trace",
                 "runtime_metrics": {"served_ratio": 1.0},
                 "request_records": (

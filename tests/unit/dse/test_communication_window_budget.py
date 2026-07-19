@@ -5,11 +5,11 @@ from pathlib import Path
 
 from orbitserve.dse.search import DSESpec
 from orbitserve.dse.satellite_budget import analyze_communication_window_satellite_budget_from_bundle
-from orbitserve.orbit.simulation_traces import CIRCULAR_GEOMETRY_TRACE, RuntimeTraceBundle
+from orbitserve.orbit.simulation_traces import CIRCULAR_GEOMETRY_TRACE, OrbitTraceBundle
 
 
 def _bundle():
-    return RuntimeTraceBundle(
+    return OrbitTraceBundle(
         trace_id="unit-budget",
         trace_model=CIRCULAR_GEOMETRY_TRACE,
         satellite_catalog=tuple({"satellite_id": f"sat-{index}"} for index in range(4)),

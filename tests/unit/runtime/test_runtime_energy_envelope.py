@@ -19,7 +19,7 @@ from orbitserve.runtime.runtime_energy_envelope import derive_runtime_energy_env
 from orbitserve.runtime.engines.trace_backed import run_trace_backed_runtime
 from orbitserve.runtime.contracts import RuntimeStrategySpec
 from orbitserve.orbit.simulation_trace_builder import build_surrogate_orbit_trace
-from orbitserve.orbit.simulation_traces import RuntimeTraceManifest, load_surrogate_trace_bundle
+from orbitserve.orbit.simulation_traces import OrbitTraceManifest, load_surrogate_trace_bundle
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -350,7 +350,7 @@ class RuntimeEnergyEnvelopeTests(unittest.TestCase):
                 base_dir=ROOT,
                 experiment_id="missing_energy_field",
             )
-            bundle = load_surrogate_trace_bundle(RuntimeTraceManifest.from_value(result.to_trace_manifest()))
+            bundle = load_surrogate_trace_bundle(OrbitTraceManifest.from_value(result.to_trace_manifest()))
         object.__setattr__(
             bundle,
             "energy_windows",

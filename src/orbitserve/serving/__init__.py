@@ -6,7 +6,7 @@ from .capacity import (
     PrecisionSpec,
     ServingParallelism,
     ServingSpec,
-    ServingThroughputEstimate,
+    ServingCapacityProfile,
     StageServingProfile,
     estimate_serving_throughput,
 )
@@ -17,7 +17,7 @@ __all__ = [
     "PrecisionSpec",
     "ServingParallelism",
     "ServingSpec",
-    "ServingThroughputEstimate",
+    "ServingCapacityProfile",
     "StageServingProfile",
     "estimate_serving_throughput",
 ]

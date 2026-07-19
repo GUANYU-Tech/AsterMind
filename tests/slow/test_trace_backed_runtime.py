@@ -12,7 +12,7 @@ from orbitserve.runtime.deployment_contracts import RuntimeDeployment, RuntimeDe
 from orbitserve.runtime.engines.trace_backed import run_trace_backed_runtime
 from orbitserve.orbit.simulation_trace_builder import build_surrogate_orbit_trace
 from orbitserve.orbit.simulation_traces import (
-    RuntimeTraceManifest,
+    OrbitTraceManifest,
     TRACE_BACKED_RUNTIME_SURROGATE_SCOPE,
     load_surrogate_trace_bundle,
 )
@@ -70,7 +70,7 @@ class TraceBackedRuntimeTests(unittest.TestCase):
                 base_dir=ROOT,
                 experiment_id="unit_runtime",
             )
-            return load_surrogate_trace_bundle(RuntimeTraceManifest.from_value(result.to_trace_manifest()))
+            return load_surrogate_trace_bundle(OrbitTraceManifest.from_value(result.to_trace_manifest()))
 
     def test_engine_records_link_queue_and_energy_violation(self):
         requests = (
@@ -105,7 +105,7 @@ class TraceBackedRuntimeTests(unittest.TestCase):
                 {"policy": "nearest_visible", "hard_gate_mode": "audit_only"}
             ),
             trace_bundle=bundle,
-            scope="trace_backed_runtime_sanity",
+            scope="trace_backed_runtime_surrogate",
         )
 
         self.assertTrue(result.evaluated)

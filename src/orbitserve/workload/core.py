@@ -176,7 +176,7 @@ class GatewaySpec:
 
 
 @dataclass(frozen=True)
-class WorkloadGenerationResult:
+class MaterializedWorkload:
     bundle_dir: str | None
     manifest: dict[str, Any]
     regions: tuple[RegionSpec, ...]
@@ -208,9 +208,9 @@ class WorkloadGenerationResult:
 
 
 def generate_workload_bundle(
-    description: dict[str, Any] | str | Path | WorkloadGenerationResult,
+    description: dict[str, Any] | str | Path | MaterializedWorkload,
     base_dir: str | Path | None = None,
-) -> WorkloadGenerationResult:
+) -> MaterializedWorkload:
     """Generate or normalize a canonical workload bundle from a description.
 
     The function returns the in-memory canonical bundle and writes it when the
@@ -219,7 +219,7 @@ def generate_workload_bundle(
     Markdown require optional PyYAML for YAML parsing.
     """
 
-    if isinstance(description, WorkloadGenerationResult):
+    if isinstance(description, MaterializedWorkload):
         return description
     if isinstance(description, (str, Path)):
         return compile_workload_description(description, base_dir=base_dir)
@@ -253,7 +253,7 @@ def generate_workload_bundle(
 def compile_workload_description(
     path: str | Path,
     base_dir: str | Path | None = None,
-) -> WorkloadGenerationResult:
+) -> MaterializedWorkload:
     """Compile a JSON/YAML/Markdown workload description into a bundle."""
 
     description_path = Path(path).expanduser()
@@ -268,7 +268,7 @@ def compile_workload_description(
     return generate_workload_bundle(desc, base_dir=description_base_dir)
 
 
-def load_workload_bundle(bundle_dir: str | Path) -> WorkloadGenerationResult:
+def load_workload_bundle(bundle_dir: str | Path) -> MaterializedWorkload:
     """Load and fully validate one canonical workload seven-file bundle."""
 
     root = Path(bundle_dir).expanduser().resolve()
@@ -298,7 +298,7 @@ def load_workload_bundle(bundle_dir: str | Path) -> WorkloadGenerationResult:
         _reject_runtime_fields(row, context=f"request row {index}")
     for index, row in enumerate(sessions):
         _reject_runtime_fields(row, context=f"session row {index}")
-    return WorkloadGenerationResult(
+    return MaterializedWorkload(
         bundle_dir=str(root), manifest=manifest,
         regions=tuple(RegionSpec.from_dict(item) for item in region_rows),
         gateways=tuple(GatewaySpec.from_dict(item) for item in gateway_rows),
@@ -309,21 +309,21 @@ def load_workload_bundle(bundle_dir: str | Path) -> WorkloadGenerationResult:
 
 
 def materialize_workload_bundle(
-    workload_ref: WorkloadBundleRef | WorkloadGenerationResult,
+    workload_ref: WorkloadBundleRef | MaterializedWorkload,
     base_dir: str | Path | None = None,
-) -> WorkloadGenerationResult:
+) -> MaterializedWorkload:
     """Load a canonical bundle referenced by an experiment.
 
     Workload construction is intentionally separate from experiment execution;
     callers must compile or adapt external datasets into the canonical workload format before simulation.
     """
 
-    if isinstance(workload_ref, WorkloadGenerationResult):
+    if isinstance(workload_ref, MaterializedWorkload):
         if workload_ref.bundle_dir is None:
             raise ValueError("bundle_dir is required for an in-memory workload result")
         return load_workload_bundle(workload_ref.bundle_dir)
     if not isinstance(workload_ref, WorkloadBundleRef):
-        raise TypeError("workload_ref must be WorkloadBundleRef or WorkloadGenerationResult")
+        raise TypeError("workload_ref must be WorkloadBundleRef or MaterializedWorkload")
     if not workload_ref.bundle_dir:
         raise ValueError("workload.bundle_dir is required and must reference a workload bundle")
     root = _base_dir(base_dir)
@@ -333,7 +333,7 @@ def materialize_workload_bundle(
 def _generate_synthetic_workload(
     desc: dict[str, Any],
     base_dir: Path,
-) -> WorkloadGenerationResult:
+) -> MaterializedWorkload:
     time_cfg = _dict(desc.get("time"))
     arrival_cfg = _dict(desc.get("arrival"))
     token_cfg = _dict(desc.get("tokens"))
@@ -484,7 +484,7 @@ def _generate_synthetic_workload(
         input_trace_files=(),
         base_dir=base_dir,
     )
-    return WorkloadGenerationResult(
+    return MaterializedWorkload(
         bundle_dir=None,
         manifest=manifest,
         regions=regions,
@@ -499,7 +499,7 @@ def _generate_synthetic_workload(
 def _load_explicit_requests_workload(
     desc: dict[str, Any],
     base_dir: Path,
-) -> WorkloadGenerationResult:
+) -> MaterializedWorkload:
     explicit_cfg = _dict(desc.get("explicit_requests"))
     if not explicit_cfg:
         raise ValueError("source_mode='explicit_requests' requires explicit_requests section")
@@ -560,7 +560,7 @@ def _load_explicit_requests_workload(
         input_trace_files=tuple(_source_file_record(path, base_dir) for path in input_files),
         base_dir=base_dir,
     )
-    return WorkloadGenerationResult(
+    return MaterializedWorkload(
         bundle_dir=None,
         manifest=manifest,
         regions=regions,
@@ -577,7 +577,7 @@ def _load_replayed_trace_workload(
     base_dir: Path,
     *,
     source_mode: str,
-) -> WorkloadGenerationResult:
+) -> MaterializedWorkload:
     trace_cfg = _dict(desc.get("trace_replay"))
     if not trace_cfg:
         raise ValueError(f"source_mode={source_mode!r} requires trace_replay section")
@@ -694,7 +694,7 @@ def _load_replayed_trace_workload(
         input_trace_files=(_source_file_record(trace_path, base_dir),),
         base_dir=base_dir,
     )
-    return WorkloadGenerationResult(
+    return MaterializedWorkload(
         bundle_dir=None,
         manifest=manifest,
         regions=regions,
@@ -812,7 +812,7 @@ def _build_synthetic_event_rows(
     return rows, session_row
 
 
-def _with_manifest(result: WorkloadGenerationResult) -> WorkloadGenerationResult:
+def _with_manifest(result: MaterializedWorkload) -> MaterializedWorkload:
     region_rows = [item.to_dict() for item in result.regions]
     gateway_rows = [item.to_dict() for item in result.gateways]
     request_rows = [dict(item) for item in result.requests]
@@ -969,7 +969,7 @@ def _build_manifest(
 
 
 def _write_workload_bundle(
-    result: WorkloadGenerationResult,
+    result: MaterializedWorkload,
     bundle_dir: Path,
     *,
     overwrite: bool,

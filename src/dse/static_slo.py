@@ -18,7 +18,7 @@ from ..orbit import (
     CIRCULAR_GEOMETRY_TRACE,
     IDEAL_FULL_VISIBILITY,
     SURROGATE_ORBIT_TRACE,
-    RuntimeTraceManifest,
+    OrbitTraceManifest,
     load_surrogate_trace_bundle,
 )
 
@@ -323,7 +323,7 @@ def _load_trace_bundle(
             None,
         )
     manifest_payload = payload.get("trace_manifest") or payload
-    manifest = RuntimeTraceManifest.from_value(manifest_payload)
+    manifest = OrbitTraceManifest.from_value(manifest_payload)
     payload_warning_value = payload.get("warnings", ())
     payload_warnings = (
         (payload_warning_value,)

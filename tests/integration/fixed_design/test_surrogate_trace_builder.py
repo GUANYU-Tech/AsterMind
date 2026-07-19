@@ -9,7 +9,7 @@ from orbitserve.experiments import load_experiment_spec
 from orbitserve.orbit.simulation_trace_builder import build_surrogate_orbit_trace
 from orbitserve.orbit.simulation_traces import (
     SURROGATE_ORBIT_TRACE,
-    RuntimeTraceManifest,
+    OrbitTraceManifest,
     load_surrogate_trace_bundle,
 )
 from orbitserve.workload import materialize_workload_bundle
@@ -37,7 +37,7 @@ class SurrogateTraceBuilderTests(unittest.TestCase):
                 base_dir=ROOT,
                 experiment_id="unit_trace",
             )
-            manifest = RuntimeTraceManifest.from_value(result.to_trace_manifest())
+            manifest = OrbitTraceManifest.from_value(result.to_trace_manifest())
             bundle = load_surrogate_trace_bundle(manifest)
 
             self.assertEqual(manifest.trace_model, SURROGATE_ORBIT_TRACE)
@@ -73,7 +73,7 @@ class SurrogateTraceBuilderTests(unittest.TestCase):
                 base_dir=ROOT,
                 experiment_id="unit_gap",
             )
-            bundle = load_surrogate_trace_bundle(RuntimeTraceManifest.from_value(result.to_trace_manifest()))
+            bundle = load_surrogate_trace_bundle(OrbitTraceManifest.from_value(result.to_trace_manifest()))
 
             self.assertEqual(find_access_candidates(bundle, ingress_id, arrival_s), ())
             next_access = find_next_access_candidate(bundle, ingress_id, arrival_s)

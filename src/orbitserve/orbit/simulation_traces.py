@@ -1,4 +1,4 @@
-"""Runtime trace contracts for OrbitServe simulation outputs.
+"""Orbit trace contracts for geometry, visibility, and illumination outputs.
 
 The trace layer intentionally separates trace metadata from the runtime event
 engine.  It supports the original idealized full-visibility trace for compute
@@ -25,11 +25,6 @@ CIRCULAR_GEOMETRY_TRACE = "circular_geometry_trace"
 TRACE_BACKED_RUNTIME_SURROGATE_SCOPE = "trace_backed_runtime_surrogate"
 SURROGATE_TRACE_SCHEMA = "orbitserve.surrogate_orbit_trace.v1"
 SATELLITE_MOTION_TRACE_SCHEMA = "orbitserve.satellite_motion_trace.v1"
-
-_LEGACY_TRACE_SCOPE_ALIASES = {
-    "trace_backed_runtime_sanity": TRACE_BACKED_RUNTIME_SURROGATE_SCOPE,
-}
-
 
 _TRACE_PATH_KEYS = (
     "satellite_catalog_path",
@@ -68,7 +63,7 @@ _MANIFEST_KNOWN_KEYS = {
 
 
 @dataclass(frozen=True)
-class RuntimeTraceManifest:
+class OrbitTraceManifest:
     schema_version: str | None = None
     trace_model: str = SKELETON_TRACE
     evaluated: bool = False
@@ -97,7 +92,7 @@ class RuntimeTraceManifest:
     extra: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def from_value(cls, value: Any = None) -> "RuntimeTraceManifest":
+    def from_value(cls, value: Any = None) -> "OrbitTraceManifest":
         payload = _mapping(value)
         if not payload:
             return cls(warnings=("simulation trace manifest is not configured",))
@@ -153,7 +148,7 @@ class RuntimeTraceManifest:
         )
 
     @classmethod
-    def ideal_full_visibility(cls, *, trace_id: str | None = None) -> "RuntimeTraceManifest":
+    def ideal_full_visibility(cls, *, trace_id: str | None = None) -> "OrbitTraceManifest":
         return cls(
             trace_model=IDEAL_FULL_VISIBILITY,
             evaluated=True,
@@ -164,7 +159,7 @@ class RuntimeTraceManifest:
                 "ideal_full_visibility is a compute-queue-only trace, not an orbit-aware trace",
                 "valid_for_paper_main_results=false",
             ),
-            provenance={"source": "orbitserve.simulation_traces.RuntimeTraceManifest.ideal_full_visibility"},
+            provenance={"source": "orbitserve.simulation_traces.OrbitTraceManifest.ideal_full_visibility"},
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -225,7 +220,7 @@ class TraceQueryResult:
 
 
 @dataclass(frozen=True)
-class RuntimeTraceBundle:
+class OrbitTraceBundle:
     trace_id: str
     access_trace: dict[str, Any] = field(default_factory=dict)
     link_trace: dict[str, Any] = field(default_factory=dict)
@@ -243,7 +238,7 @@ class RuntimeTraceBundle:
     solar_samples: tuple[dict[str, Any], ...] = ()
     ephemeris_samples: tuple[dict[str, Any], ...] = ()
     satellite_initial_soc: dict[str, float] = field(default_factory=dict)
-    trace_manifest: RuntimeTraceManifest | dict[str, Any] | None = None
+    trace_manifest: OrbitTraceManifest | dict[str, Any] | None = None
     horizon_s: float | None = None
     step_s: float | None = None
     boundary_tolerance_s: float = 1e-9
@@ -758,9 +753,6 @@ class RuntimeTraceBundle:
         )
 
 
-SurrogateTraceBundle = RuntimeTraceBundle
-
-
 def trace_file_sha256(path: str | Path | None) -> str | None:
     if path is None:
         return None
@@ -796,18 +788,18 @@ def normalize_trace_scope(scope: str | None) -> str:
     if scope is None:
         return "not_evaluated"
     scope_text = str(scope)
-    return _LEGACY_TRACE_SCOPE_ALIASES.get(scope_text, scope_text)
+    return scope_text
 
 
 def load_surrogate_trace_bundle(
-    trace_manifest: RuntimeTraceManifest | dict[str, Any],
+    trace_manifest: OrbitTraceManifest | dict[str, Any],
     *,
     base_dir: str | Path | None = None,
-) -> RuntimeTraceBundle:
+) -> OrbitTraceBundle:
     manifest = (
         trace_manifest
-        if isinstance(trace_manifest, RuntimeTraceManifest)
-        else RuntimeTraceManifest.from_value(trace_manifest)
+        if isinstance(trace_manifest, OrbitTraceManifest)
+        else OrbitTraceManifest.from_value(trace_manifest)
     )
     if manifest.trace_model not in {SURROGATE_ORBIT_TRACE, CIRCULAR_GEOMETRY_TRACE}:
         raise ValueError(f"unsupported runtime trace_model: {manifest.trace_model!r}")
@@ -898,7 +890,7 @@ def load_surrogate_trace_bundle(
         "energy_trace_path": str(energy_path),
         **({"calibration_report_path": str(calibration_path)} if calibration_path is not None else {}),
     }
-    return RuntimeTraceBundle(
+    return OrbitTraceBundle(
         trace_id=manifest.trace_id or str(access_trace.get("trace_id") or SURROGATE_ORBIT_TRACE),
         access_trace=access_trace,
         link_trace=link_trace,
@@ -1039,7 +1031,7 @@ def _active_link_id_set(value: Any) -> frozenset[str]:
 
 def _infer_time_authority(
     *,
-    trace_manifest: RuntimeTraceManifest | dict[str, Any] | None,
+    trace_manifest: OrbitTraceManifest | dict[str, Any] | None,
     access_windows: tuple[dict[str, Any], ...],
     visible_count_samples: tuple[dict[str, Any], ...],
     link_samples: tuple[dict[str, Any], ...],
@@ -1077,8 +1069,8 @@ def _infer_time_authority(
     return horizon_s, step_s, boundary_tolerance_s, warnings
 
 
-def _manifest_mapping(value: RuntimeTraceManifest | dict[str, Any] | None) -> dict[str, Any]:
-    if isinstance(value, RuntimeTraceManifest):
+def _manifest_mapping(value: OrbitTraceManifest | dict[str, Any] | None) -> dict[str, Any]:
+    if isinstance(value, OrbitTraceManifest):
         return value.to_dict()
     return _mapping(value)
 
@@ -1127,13 +1119,12 @@ def _string_tuple(value: Any) -> tuple[str, ...]:
 __all__ = [
     "CIRCULAR_GEOMETRY_TRACE",
     "IDEAL_FULL_VISIBILITY",
-    "RuntimeTraceManifest",
-    "RuntimeTraceBundle",
+    "OrbitTraceManifest",
+    "OrbitTraceBundle",
     "SATELLITE_MOTION_TRACE_SCHEMA",
     "SKELETON_TRACE",
     "SURROGATE_ORBIT_TRACE",
     "SURROGATE_TRACE_SCHEMA",
-    "SurrogateTraceBundle",
     "TraceQueryResult",
     "TRACE_BACKED_RUNTIME_SURROGATE_SCOPE",
     "load_surrogate_trace_bundle",

@@ -26,7 +26,7 @@ from .constellation import (
 from .simulation_traces import (
     CIRCULAR_GEOMETRY_TRACE,
     SATELLITE_MOTION_TRACE_SCHEMA,
-    RuntimeTraceManifest,
+    OrbitTraceManifest,
     trace_file_sha256,
 )
 
@@ -37,7 +37,7 @@ MOTION_TRACE_DOC = "docs/research/parameters/satellite_motion_trace_model.md"
 @dataclass(frozen=True)
 class MotionTraceBuildResult:
     trace_dir: str
-    trace_manifest: RuntimeTraceManifest
+    trace_manifest: OrbitTraceManifest
     manifest: dict[str, Any]
     satellite_catalog: tuple[dict[str, Any], ...]
     access_trace: dict[str, Any]
@@ -271,7 +271,7 @@ def build_satellite_motion_trace(
     manifest = {**manifest, "sha256": {**sha256, "trace_manifest_sha256": trace_file_sha256(manifest_path)}}
     _write_json(manifest_path, manifest)
 
-    trace_manifest = RuntimeTraceManifest.from_value(manifest)
+    trace_manifest = OrbitTraceManifest.from_value(manifest)
     return MotionTraceBuildResult(
         trace_dir=str(trace_dir),
         trace_manifest=trace_manifest,

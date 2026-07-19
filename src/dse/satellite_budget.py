@@ -6,13 +6,13 @@ import math
 from pathlib import Path
 from typing import Any
 
-from ..orbit import RuntimeTraceBundle, RuntimeTraceManifest, load_surrogate_trace_bundle
+from ..orbit import OrbitTraceBundle, OrbitTraceManifest, load_surrogate_trace_bundle
 
 
 def analyze_communication_window_satellite_budget(
     *,
     simulation_result: Any | None = None,
-    trace_bundle: RuntimeTraceBundle | None = None,
+    trace_bundle: OrbitTraceBundle | None = None,
     workload_generation: Any | None = None,
     serving_throughput: Any | None = None,
     config: dict[str, Any] | None = None,
@@ -30,7 +30,7 @@ def analyze_communication_window_satellite_budget(
     warnings_out: list[str] = []
     bundle = trace_bundle
     if bundle is None:
-        manifest = RuntimeTraceManifest.from_value(getattr(simulation_result, "trace_manifest", None))
+        manifest = OrbitTraceManifest.from_value(getattr(simulation_result, "trace_manifest", None))
         if not manifest.evaluated:
             return {
                 "evaluated": False,
@@ -56,7 +56,7 @@ def analyze_communication_window_satellite_budget(
 
 
 def analyze_communication_window_satellite_budget_from_bundle(
-    trace_bundle: RuntimeTraceBundle,
+    trace_bundle: OrbitTraceBundle,
     *,
     workload_generation: Any | None = None,
     serving_throughput: Any | None = None,
@@ -259,7 +259,7 @@ def _visible_counts(samples: tuple[dict[str, Any], ...]) -> list[int]:
     return counts
 
 
-def _visible_satellite_ids(trace_bundle: RuntimeTraceBundle) -> tuple[str, ...]:
+def _visible_satellite_ids(trace_bundle: OrbitTraceBundle) -> tuple[str, ...]:
     ids: set[str] = set()
     for window in trace_bundle.access_windows:
         satellite_id = window.get("satellite_id")
@@ -272,7 +272,7 @@ def _visible_satellite_ids(trace_bundle: RuntimeTraceBundle) -> tuple[str, ...]:
     return tuple(sorted(ids))
 
 
-def _request_visible_counts(trace_bundle: RuntimeTraceBundle, workload_generation: Any | None) -> list[int]:
+def _request_visible_counts(trace_bundle: OrbitTraceBundle, workload_generation: Any | None) -> list[int]:
     requests = _workload_requests(workload_generation)
     observations: list[int] = []
     for row in requests:
@@ -336,7 +336,7 @@ def _access_delay_summary(access_windows: tuple[dict[str, Any], ...]) -> dict[st
     }
 
 
-def _constellation_count(trace_bundle: RuntimeTraceBundle, visible_satellite_ids: tuple[str, ...]) -> int:
+def _constellation_count(trace_bundle: OrbitTraceBundle, visible_satellite_ids: tuple[str, ...]) -> int:
     return max(len(trace_bundle.satellite_catalog), len(visible_satellite_ids), 1)
 
 

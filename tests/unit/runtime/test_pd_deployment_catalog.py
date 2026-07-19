@@ -8,7 +8,7 @@ from pathlib import Path
 
 from orbitserve.runtime.scenario import build_runtime_scenario
 from orbitserve.runtime.runtime_deployments import build_runtime_deployment_catalog
-from orbitserve.orbit.simulation_traces import RuntimeTraceManifest, SURROGATE_ORBIT_TRACE
+from orbitserve.orbit.simulation_traces import OrbitTraceManifest, SURROGATE_ORBIT_TRACE
 
 
 def _scenario(
@@ -202,7 +202,7 @@ class PDDeploymentCatalogTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            trace_manifest = RuntimeTraceManifest(
+            trace_manifest = OrbitTraceManifest(
                 trace_model=SURROGATE_ORBIT_TRACE,
                 evaluated=True,
                 satellite_catalog_path=catalog_path.name,
@@ -252,7 +252,7 @@ class PDDeploymentCatalogTests(unittest.TestCase):
                 json.dumps({"satellite_catalog": satellite_catalog, "access_windows": []}),
                 encoding="utf-8",
             )
-            trace_manifest = RuntimeTraceManifest(
+            trace_manifest = OrbitTraceManifest(
                 trace_model=SURROGATE_ORBIT_TRACE,
                 evaluated=True,
                 access_trace_path=access_path.name,
