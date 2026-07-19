@@ -29,6 +29,7 @@ from ..runtime_eligibility import ComputeEligibilitySet, build_compute_eligibili
 from ..runtime_records import RuntimeRequestRecord
 from ..runtime_state import RuntimeState
 from ..runtime_timing import TTFT_DEFINITION, ttft_breakdown
+from ..request_contract import normalize_runtime_request
 from ..kv_runtime import (
     _pd_prefill_context,
     _pd_prefill_context_for_action,
@@ -294,53 +295,6 @@ def run_trace_backed_runtime(
     )
 
 
-
-
-def normalize_runtime_request(raw_request: dict[str, Any], index: int = 0) -> dict[str, Any]:
-    declared_prompt_tokens = _first_present(
-        raw_request.get("prompt_tokens"),
-        raw_request.get("input_tokens"),
-    )
-    declared_new_user_tokens = raw_request.get("new_user_tokens")
-    prompt_tokens = max(
-        0,
-        _int(
-            _first_present(
-                declared_prompt_tokens,
-                raw_request.get("new_user_tokens"),
-            ),
-            0,
-        ),
-    )
-    output_tokens = max(
-        0,
-        _int(
-            _first_present(
-                raw_request.get("output_tokens"),
-                raw_request.get("max_output_tokens"),
-                raw_request.get("decode_tokens"),
-            ),
-            0,
-        ),
-    )
-    return {
-        "request_id": str(raw_request.get("request_id") or f"req-{index:06d}"),
-        "arrival_time_s": _float(_first_present(raw_request.get("arrival_time_s"), raw_request.get("time_s")), 0.0),
-        "prompt_tokens": prompt_tokens,
-        "output_tokens": output_tokens,
-        "input_bytes": _float(raw_request.get("input_bytes"), prompt_tokens * 4.0),
-        "output_bytes": _float(raw_request.get("output_bytes"), output_tokens * 4.0),
-        "ttft_deadline_s": _optional_float(_first_present(raw_request.get("ttft_deadline_s"), raw_request.get("deadline_ttft_s"))),
-        "e2e_deadline_s": _optional_float(
-            _first_present(raw_request.get("e2e_deadline_s"), raw_request.get("deadline_s"), raw_request.get("deadline_e2e_s"))
-        ),
-        "session_id": _optional_str(raw_request.get("session_id")),
-        "ingress_id": _optional_str(_first_present(raw_request.get("ingress_id"), raw_request.get("gateway_id"))),
-        "prompt_tokens_declared": declared_prompt_tokens is not None,
-        "new_user_tokens": _optional_int(declared_new_user_tokens),
-        "context_tokens_before_turn": _optional_int(raw_request.get("context_tokens_before_turn")),
-        "context_window_tokens": _optional_int(raw_request.get("context_window_tokens")),
-    }
 
 
 def _evaluate_trace_request(

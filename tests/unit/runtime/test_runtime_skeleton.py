@@ -593,10 +593,7 @@ class RuntimeSkeletonTests(unittest.TestCase):
         self.assertIsNone(result["runtime_metrics"]["served_ratio"])
         self.assertIsNone(result["runtime_metrics"]["ttft_p95_s"])
         self.assertIsNone(result["runtime_metrics"]["e2e_p95_s"])
-        self.assertNotEqual(
-            result["runtime_metrics"]["served_ratio"],
-            serving_performance["request_throughput_per_s"],
-        )
+        self.assertIsNone(serving_performance["request_throughput_per_s"])
         self.assertTrue(result["warnings"])
         for group_name in (
             "session_metrics",

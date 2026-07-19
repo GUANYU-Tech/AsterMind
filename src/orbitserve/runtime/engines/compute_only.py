@@ -10,6 +10,7 @@ from ..deployment_contracts import RuntimeDeploymentCatalog
 from ..runtime_records import RuntimeRequestRecord
 from ..runtime_state import RuntimeState
 from ..runtime_timing import TTFT_DEFINITION, ttft_breakdown
+from ..request_contract import normalize_runtime_request
 
 def run_compute_only_fifo(
     *,
@@ -25,8 +26,9 @@ def run_compute_only_fifo(
     records: list[RuntimeRequestRecord] = []
     warnings = list(deployment_catalog.warnings)
     deployments = deployment_catalog.deployments
+    normalized_requests = tuple(normalize_runtime_request(item, index) for index, item in enumerate(requests))
     ordered_requests = sorted(
-        requests,
+        normalized_requests,
         key=lambda item: (float(item.get("arrival_time_s", 0.0)), str(item.get("request_id", ""))),
     )
 
@@ -76,10 +78,10 @@ def _evaluate_request(
     trace_model: str,
     scope: str,
 ) -> RuntimeRequestRecord:
-    request_id = str(request.get("request_id") or f"request-{len(state.request_records):06d}")
-    arrival_s = _float(request.get("arrival_time_s"), 0.0)
-    prompt_tokens = max(0, _int(_first_present(request.get("prompt_tokens"), request.get("new_user_tokens")), 0))
-    output_tokens = max(0, _int(request.get("output_tokens"), 0))
+    request_id = str(request["request_id"])
+    arrival_s = float(request["arrival_time_s"])
+    prompt_tokens = int(request["prompt_tokens"])
+    output_tokens = int(request["output_tokens"])
     ttft_deadline_s = _optional_float(request.get("ttft_deadline_s"))
     e2e_deadline_s = _optional_float(request.get("e2e_deadline_s"))
 
