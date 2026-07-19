@@ -9,7 +9,7 @@ src/orbitserve/              Core simulation engine
   architecture/              Identical per-satellite hardware, static energy sizing, and cost parameters
   orbit/                     Constellation geometry, orbital motion, visibility, sunlight, and traces
   workload/                  Canonical workload contracts, validation, loading, and materialization
-  serving/                   Model deployment, prefill/decode, KV capacity, and throughput estimation
+  serving/                   Workload-independent model deployment and per-group capacity
   runtime/                   Routing, queues, scheduling, KV state, SOC, and request-level execution
   common/                    Policy-free metric DTOs and serialization
 src/experiments/             Manifests, cross-module orchestration, fixed-design evaluation, and output
@@ -39,6 +39,16 @@ orbitserve.experiments.cli
 
 Fixed-design evaluation and DSE candidates share `evaluate_materialized_design()`. Architecture does not infer hardware from workload demand. Orbit produces geometrically visible candidates. Runtime selects the active graph under Architecture terminal limits.
 
+## Stable Module Contracts
+
+- Architecture exports `SatelliteArchitectureProfile`, `SatelliteHardwareProfile`, and `SatelliteEnergyProfile`. These contain static, identical per-satellite hardware and energy configuration; cost-only inputs remain private to Architecture.
+- Orbit exports `OrbitTraceManifest` and `OrbitTraceBundle`. Their public representation contains geometry, visibility, propagation, and illumination data, but no link capacity, DVFS decision, or SOC state.
+- Workload exports `MaterializedWorkload` and the canonical seven-file bundle. Runtime accepts canonical request fields only and does not translate legacy aliases.
+- Serving exports `ServingCapacityProfile`. It describes one colocated deployment or one prefill/decode group from model, deployment, and per-satellite hardware configuration. It does not read Workload or choose constellation-wide group counts.
+- Runtime combines the four contracts, instantiates serving groups from the available constellation, and owns routing, queueing, request latency, DVFS, SOC, and request-level metrics.
+
+Core modules import only through public package interfaces. The boundary regression test is `tests/unit/test_module_boundaries.py`.
+
 ## Installation
 
 ```bash
@@ -61,7 +71,7 @@ timebin_demand.csv
 workload_summary.json
 ```
 
-Dataset-specific inputs must first be converted under `src/workloads/<dataset>/`. Experiment manifests then reference the generated bundle through `workload.bundle_dir`. The core package does not retain legacy workload readers.
+Dataset-specific inputs must first be converted under `src/workloads/<dataset>/`. Experiment manifests then reference the generated bundle through `workload.bundle_dir`. The core package does not retain legacy workload readers or Runtime request-field aliases.
 
 ## Running Examples
 
