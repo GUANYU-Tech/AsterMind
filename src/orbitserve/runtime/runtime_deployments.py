@@ -101,14 +101,25 @@ def _build_aggregate_catalog(
     decode_tokens_per_s = _optional_float(
         _first_present(payload.get("decode_tokens_per_s"), throughput_payload.get("decode_tokens_per_s"))
     )
+    deployment_group_count = max(
+        1,
+        (total_satellites or satellites_per_deployment or 1)
+        // max(1, satellites_per_deployment or 1),
+    )
+    aggregate_prefill_tokens_per_s = (
+        prefill_tokens_per_s * deployment_group_count if prefill_tokens_per_s is not None else None
+    )
+    aggregate_decode_tokens_per_s = (
+        decode_tokens_per_s * deployment_group_count if decode_tokens_per_s is not None else None
+    )
     deployment = RuntimeDeployment(
         deployment_id=deployment_id,
         role=str(payload.get("role") or "colocated"),
         member_satellites=member_satellites,
         entry_satellite_ids=_entry_satellites_for(member_satellites),
         placement_scope="aggregate_logical_pool",
-        prefill_tokens_per_s=prefill_tokens_per_s,
-        decode_tokens_per_s=decode_tokens_per_s,
+        prefill_tokens_per_s=aggregate_prefill_tokens_per_s,
+        decode_tokens_per_s=aggregate_decode_tokens_per_s,
         request_throughput_per_s=_optional_float(
             _first_present(payload.get("request_throughput_per_s"), throughput_payload.get("request_throughput_per_s"))
         ),
@@ -135,6 +146,8 @@ def _build_aggregate_catalog(
             "source": "ServingDeploymentView",
             "input_deployment_id": deployment_id,
             "member_satellite_assignment": _member_assignment_source(payload, constellation),
+            "deployment_group_count": deployment_group_count,
+            "throughput_source": "serving_per_group_capacity_scaled_by_runtime",
             **budget_payload,
             "physical_nearest_semantics": "not_available_without_access_trace",
         },
@@ -204,32 +217,22 @@ def _build_disaggregated_catalog(
             deployment_id=deployment_id,
         )
 
-    prefill_group_count = _optional_int(
-        _first_present(
-            payload.get("prefill_deployment_group_count"),
-            throughput_payload.get("prefill_deployment_group_count"),
-        )
-    )
-    decode_group_count = _optional_int(
-        _first_present(
-            payload.get("decode_deployment_group_count"),
-            throughput_payload.get("decode_deployment_group_count"),
-        )
-    )
-    if prefill_group_count is None or decode_group_count is None:
+    available_group_count = (total_satellites or 0) // satellites_per_deployment
+    if available_group_count < 2:
         return _fail_closed_catalog(
-            "serving_not_feasible:missing_pd_deployment_group_count",
+            "serving_not_feasible:insufficient_satellites_for_pd_deployment",
             base_warnings,
             total_satellites=total_satellites,
             deployment_id=deployment_id,
         )
-    if prefill_group_count <= 0 or decode_group_count <= 0:
-        return _fail_closed_catalog(
-            "serving_not_feasible:invalid_pd_deployment_group_count",
-            base_warnings,
-            total_satellites=total_satellites,
-            deployment_id=deployment_id,
-        )
+    prefill_fraction = _optional_float(serving_payload.get("prefill_satellite_fraction"))
+    decode_fraction = _optional_float(serving_payload.get("decode_satellite_fraction"))
+    if prefill_fraction is None and decode_fraction is None:
+        prefill_fraction = 0.5
+    elif prefill_fraction is None:
+        prefill_fraction = 1.0 - float(decode_fraction)
+    prefill_group_count = max(1, min(available_group_count - 1, int(round(available_group_count * float(prefill_fraction)))))
+    decode_group_count = available_group_count - prefill_group_count
 
     weight_memory_per_satellite_gb = _optional_float(
         _first_present(
@@ -255,20 +258,20 @@ def _build_disaggregated_catalog(
             deployment_id=deployment_id,
         )
 
-    aggregate_prefill_tokens_per_s = _optional_float(
+    per_group_prefill = _optional_float(
         _first_present(payload.get("prefill_tokens_per_s"), throughput_payload.get("prefill_tokens_per_s"))
     )
-    aggregate_decode_tokens_per_s = _optional_float(
+    per_group_decode = _optional_float(
         _first_present(payload.get("decode_tokens_per_s"), throughput_payload.get("decode_tokens_per_s"))
     )
-    if aggregate_prefill_tokens_per_s is None or aggregate_prefill_tokens_per_s <= 0:
+    if per_group_prefill is None or per_group_prefill <= 0:
         return _fail_closed_catalog(
             "serving_not_feasible:missing_prefill_throughput",
             base_warnings,
             total_satellites=total_satellites,
             deployment_id=deployment_id,
         )
-    if aggregate_decode_tokens_per_s is None or aggregate_decode_tokens_per_s <= 0:
+    if per_group_decode is None or per_group_decode <= 0:
         return _fail_closed_catalog(
             "serving_not_feasible:missing_decode_throughput",
             base_warnings,
@@ -277,6 +280,8 @@ def _build_disaggregated_catalog(
         )
 
     required_satellites = (prefill_group_count + decode_group_count) * satellites_per_deployment
+    aggregate_prefill_tokens_per_s = per_group_prefill * prefill_group_count
+    aggregate_decode_tokens_per_s = per_group_decode * decode_group_count
     budget_payload = _serving_satellite_budget_payload(payload, throughput_payload)
     satellite_catalog = _satellite_catalog_from_constellation(constellation)
     member_satellites = _resolve_member_satellites(
@@ -351,12 +356,10 @@ def _build_disaggregated_catalog(
     aggregate_request_throughput = _optional_float(
         _first_present(payload.get("request_throughput_per_s"), throughput_payload.get("request_throughput_per_s"))
     )
-    per_group_prefill = aggregate_prefill_tokens_per_s / prefill_group_count
-    per_group_decode = aggregate_decode_tokens_per_s / decode_group_count
     common_provenance = {
         "source": "ServingDeploymentView",
         "input_deployment_id": deployment_id,
-        "throughput_source": "aggregate_role_throughput_split_by_pd_group_count",
+        "throughput_source": "serving_per_group_capacity_scaled_by_runtime",
         "aggregate_prefill_tokens_per_s": aggregate_prefill_tokens_per_s,
         "aggregate_decode_tokens_per_s": aggregate_decode_tokens_per_s,
         "prefill_deployment_group_count": prefill_group_count,

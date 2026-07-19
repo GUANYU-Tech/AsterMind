@@ -19,9 +19,16 @@ def _scenario(
     deployment_id="deployment_0",
     **deployment_overrides,
 ):
+    throughput = dict(throughput)
+    prefill_fraction = float(throughput.pop("_test_prefill_fraction", 0.6))
+    serving_spec = {
+        "prefill_satellite_fraction": prefill_fraction,
+        "decode_satellite_fraction": 1.0 - prefill_fraction,
+    }
     deployment = {
         "deployment_id": deployment_id,
         "throughput_estimate": throughput,
+        "serving_spec": serving_spec,
         **deployment_overrides,
     }
     constellation = {"satellite_count": satellite_count}
@@ -33,7 +40,7 @@ def _scenario(
     )
 
 
-def _pd_throughput(**overrides):
+def _pd_throughput(*, prefill_fraction=0.6, **overrides):
     payload = {
         "evaluated": True,
         "feasible": True,
@@ -41,8 +48,7 @@ def _pd_throughput(**overrides):
         "prefill_tokens_per_s": 1200.0,
         "decode_tokens_per_s": 600.0,
         "request_throughput_per_s": 8.0,
-        "prefill_deployment_group_count": 3,
-        "decode_deployment_group_count": 2,
+        "_test_prefill_fraction": prefill_fraction,
         "satellites_per_deployment": 2,
         "stage_satellite_count": 1,
         "kv_cache_capacity_tokens": 1_000_000,
@@ -111,8 +117,8 @@ class PDDeploymentCatalogTests(unittest.TestCase):
 
         self.assertEqual(catalog.placement_model, "explicit_pd_deployment_groups")
         self.assertEqual(catalog.default_deployment.deployment_id, "deployment_0")
-        self.assertEqual(catalog.default_deployment.prefill_tokens_per_s, 1200.0)
-        self.assertEqual(catalog.default_deployment.decode_tokens_per_s, 600.0)
+        self.assertEqual(catalog.default_deployment.prefill_tokens_per_s, 3600.0)
+        self.assertEqual(catalog.default_deployment.decode_tokens_per_s, 1200.0)
         self.assertEqual(catalog.default_deployment.internal_comm_accounting, "externalized_pd_kv")
         self.assertEqual(len(catalog.prefill_deployments), 3)
         self.assertEqual(len(catalog.decode_deployments), 2)
@@ -126,9 +132,9 @@ class PDDeploymentCatalogTests(unittest.TestCase):
         self.assertEqual(first_decode.member_satellites, ("sat-00006", "sat-00007"))
         self.assertEqual(first_prefill.entry_satellite_ids, ("sat-00000",))
         self.assertEqual(first_decode.entry_satellite_ids, ("sat-00006",))
-        self.assertEqual(first_prefill.per_group_prefill_tokens_per_s, 400.0)
+        self.assertEqual(first_prefill.per_group_prefill_tokens_per_s, 1200.0)
         self.assertIsNone(first_prefill.per_group_decode_tokens_per_s)
-        self.assertEqual(first_decode.per_group_decode_tokens_per_s, 300.0)
+        self.assertEqual(first_decode.per_group_decode_tokens_per_s, 600.0)
         self.assertIsNone(first_decode.per_group_prefill_tokens_per_s)
         self.assertEqual(first_prefill.kv_cache_capacity_tokens, 1_000_000)
         self.assertEqual(first_prefill.kv_cache_bytes_per_token, 16.0)
@@ -149,7 +155,7 @@ class PDDeploymentCatalogTests(unittest.TestCase):
         ]
         catalog = build_runtime_deployment_catalog(
             _scenario(
-                _pd_throughput(prefill_deployment_group_count=1, decode_deployment_group_count=1),
+                _pd_throughput(prefill_fraction=0.5),
                 satellite_count=8,
                 satellite_catalog=satellite_catalog,
                 serving_spec={
@@ -216,8 +222,7 @@ class PDDeploymentCatalogTests(unittest.TestCase):
                     "pd_placement": {"placement_scope": "cross_plane"},
                 },
                 serving_throughput=_pd_throughput(
-                    prefill_deployment_group_count=1,
-                    decode_deployment_group_count=1,
+                    prefill_fraction=0.5,
                     satellites_per_deployment=2,
                 ),
                 simulation_result={
@@ -270,25 +275,28 @@ class PDDeploymentCatalogTests(unittest.TestCase):
 
         self.assertEqual(scenario.constellation["satellite_catalog"], satellite_catalog)
 
-    def test_disaggregated_catalog_fail_closed_when_group_counts_missing_or_zero(self):
+    def test_runtime_derives_pd_group_counts_without_serving_group_counts(self):
         missing_count = build_runtime_deployment_catalog(
-            _scenario(_pd_throughput(prefill_deployment_group_count=None), satellite_count=10)
+            _scenario(_pd_throughput(prefill_fraction=0.5), satellite_count=10)
         )
         zero_count = build_runtime_deployment_catalog(
-            _scenario(_pd_throughput(decode_deployment_group_count=0), satellite_count=10)
+            _scenario(_pd_throughput(prefill_fraction=0.8), satellite_count=10)
         )
 
-        self.assertEqual(missing_count.deployments, ())
-        self.assertIn("serving_not_feasible:missing_pd_deployment_group_count", missing_count.warnings)
-        self.assertEqual(zero_count.deployments, ())
-        self.assertIn("serving_not_feasible:invalid_pd_deployment_group_count", zero_count.warnings)
+        self.assertEqual(len(missing_count.prefill_deployments) + len(missing_count.decode_deployments), 5)
+        self.assertEqual(len(zero_count.prefill_deployments) + len(zero_count.decode_deployments), 5)
 
-    def test_disaggregated_catalog_fail_closed_when_satellites_insufficient(self):
+    def test_runtime_leaves_incomplete_pd_group_unassigned(self):
         catalog = build_runtime_deployment_catalog(_scenario(_pd_throughput(), satellite_count=9))
 
-        self.assertEqual(catalog.deployments, ())
-        self.assertIn("serving_not_feasible:insufficient_satellites_for_pd_deployment", catalog.warnings)
-        self.assertTrue(catalog.provenance["fail_closed"])
+        self.assertTrue(catalog.deployments)
+        self.assertEqual(catalog.provenance["unused_satellite_count"], 1)
+        assigned = {
+            satellite
+            for deployment in (*catalog.prefill_deployments, *catalog.decode_deployments)
+            for satellite in deployment.member_satellites
+        }
+        self.assertEqual(len(assigned), 8)
 
     def test_missing_topology_fails_closed_by_default_for_scoped_candidate(self):
         catalog = build_runtime_deployment_catalog(
@@ -341,8 +349,7 @@ class PDDeploymentCatalogTests(unittest.TestCase):
         catalog = build_runtime_deployment_catalog(
             _scenario(
                 _pd_throughput(
-                    prefill_deployment_group_count=2,
-                    decode_deployment_group_count=2,
+                    prefill_fraction=0.5,
                     satellites_per_deployment=1,
                     pd_placement={"placement_scope": "same_plane_cross_cluster"},
                 ),
@@ -367,8 +374,7 @@ class PDDeploymentCatalogTests(unittest.TestCase):
         catalog = build_runtime_deployment_catalog(
             _scenario(
                 _pd_throughput(
-                    prefill_deployment_group_count=2,
-                    decode_deployment_group_count=2,
+                    prefill_fraction=0.5,
                     satellites_per_deployment=1,
                     pd_placement={
                         "placement_scope": "hybrid_explicit_pairs",
@@ -403,8 +409,7 @@ class PDDeploymentCatalogTests(unittest.TestCase):
         catalog = build_runtime_deployment_catalog(
             _scenario(
                 _pd_throughput(
-                    prefill_deployment_group_count=1,
-                    decode_deployment_group_count=1,
+                    prefill_fraction=0.5,
                     satellites_per_deployment=1,
                     pd_placement={
                         "placement_scope": "hybrid_explicit_pairs",
@@ -436,8 +441,7 @@ class PDDeploymentCatalogTests(unittest.TestCase):
         catalog = build_runtime_deployment_catalog(
             _scenario(
                 _pd_throughput(
-                    prefill_deployment_group_count=1,
-                    decode_deployment_group_count=3,
+                    prefill_fraction=0.25,
                     satellites_per_deployment=1,
                     pd_placement={
                         "placement_scope": "hybrid_template_mix",
@@ -480,8 +484,7 @@ class PDDeploymentCatalogTests(unittest.TestCase):
         catalog = build_runtime_deployment_catalog(
             _scenario(
                 _pd_throughput(
-                    prefill_deployment_group_count=1,
-                    decode_deployment_group_count=1,
+                    prefill_fraction=0.5,
                     satellites_per_deployment=1,
                     pd_placement={
                         "placement_scope": "hybrid_template_mix",
@@ -508,8 +511,7 @@ class PDDeploymentCatalogTests(unittest.TestCase):
         catalog = build_runtime_deployment_catalog(
             _scenario(
                 _pd_throughput(
-                    prefill_deployment_group_count=1,
-                    decode_deployment_group_count=5,
+                    prefill_fraction=0.16666666666666666,
                     satellites_per_deployment=1,
                     pd_placement={
                         "placement_scope": "hybrid_template_mix",

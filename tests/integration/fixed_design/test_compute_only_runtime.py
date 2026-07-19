@@ -20,6 +20,7 @@ def _request(request_id, arrival_time_s, prompt_tokens=128, output_tokens=32, e2
         "arrival_time_s": arrival_time_s,
         "prompt_tokens": prompt_tokens,
         "output_tokens": output_tokens,
+        "ingress_id": "gw-test",
         "ttft_deadline_s": 5.0,
         "e2e_deadline_s": e2e_deadline_s,
         "slo_class": "interactive_5s",
