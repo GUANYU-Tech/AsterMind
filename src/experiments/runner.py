@@ -45,7 +45,7 @@ def run_experiment(spec: ExperimentSpec) -> ExperimentResult:
     constellation_architecture = evaluation.constellation_architecture
     scheduler = evaluation.scheduler
     scheduler_decision = evaluation.scheduler_decision
-    resolved_hardware = evaluation.resolved_hardware
+    satellite_architecture = evaluation.satellite_architecture
     cost = evaluation.cost
     simulation = evaluation.simulation
     serving_throughput = evaluation.serving_throughput
@@ -129,7 +129,7 @@ def run_experiment(spec: ExperimentSpec) -> ExperimentResult:
         "hardware": "ground_service_model_configured"
         if terrestrial_runtime
         else "resolved"
-        if resolved_hardware.configured
+        if satellite_architecture is not None
         else "not_configured",
         "workload_generation": str(workload_generation.get("status", "unknown")),
         "simulation": "not_required_terrestrial_baseline"

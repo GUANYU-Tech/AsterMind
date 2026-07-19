@@ -5,7 +5,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
-from orbitserve.architecture.hardware import resolve_experiment_hardware
+from orbitserve.architecture.hardware import resolve_satellite_architecture
 from orbitserve.experiments import load_experiment_spec
 from orbitserve.experiments.constellation_cost import estimate_constellation_cost
 
@@ -16,13 +16,14 @@ MANIFEST = ROOT / "tests/fixtures/manifests/smoke_clustered_constellation.json"
 
 class ConstellationCostTests(unittest.TestCase):
     def _estimate(self, spec):
-        hardware = resolve_experiment_hardware(spec.hardware, base_dir=ROOT)
+        architecture = resolve_satellite_architecture(spec.hardware, base_dir=ROOT)
+        cost_limits, cost_config, case_path = architecture.cost_inputs()
         return estimate_constellation_cost(
             spec.constellation,
             spec.costing,
-            cost_limits=hardware.cost_limits,
-            cost_config=hardware.cost_config,
-            single_satellite_case_path=hardware.single_satellite_case_path,
+            cost_limits=cost_limits,
+            cost_config=cost_config,
+            single_satellite_case_path=case_path,
         )
 
     def test_constellation_cost_scales_immutable_single_satellite_cost(self) -> None:
@@ -46,12 +47,13 @@ class ConstellationCostTests(unittest.TestCase):
             spec.constellation,
             name="same_count_different_orbit",
         )
-        hardware = resolve_experiment_hardware(spec.hardware, base_dir=ROOT)
+        architecture = resolve_satellite_architecture(spec.hardware, base_dir=ROOT)
+        cost_limits, cost_config, _case_path = architecture.cost_inputs()
         second = estimate_constellation_cost(
             changed_design,
             spec.costing,
-            cost_limits=hardware.cost_limits,
-            cost_config=hardware.cost_config,
+            cost_limits=cost_limits,
+            cost_config=cost_config,
         )
         self.assertEqual(first.single_satellite, second.single_satellite)
 

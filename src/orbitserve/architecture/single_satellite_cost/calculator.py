@@ -226,18 +226,37 @@ def estimate_single_satellite_cost(
             / solar_denominator
         )
 
-    M_solar_kg = _safe_ratio(P_solar_req_w, config.power.solar_specific_power_w_per_kg, "solar_specific_power_w_per_kg", violations)
-    M_battery_kg = _safe_ratio(E_battery_req_wh, config.power.battery_specific_energy_wh_per_kg, "battery_specific_energy_wh_per_kg", violations)
+    installed_battery_wh = (
+        E_battery_req_wh
+        if config.power.battery_capacity_wh is None
+        else config.power.battery_capacity_wh
+    )
+    installed_solar_w = (
+        P_solar_req_w
+        if config.power.solar_array_power_w is None
+        else config.power.solar_array_power_w
+    )
+    if installed_battery_wh < E_battery_req_wh:
+        violations.append(
+            "power.battery_capacity_wh is smaller than the required eclipse capacity"
+        )
+    if installed_solar_w < P_solar_req_w:
+        violations.append(
+            "power.solar_array_power_w is smaller than the required solar capacity"
+        )
+
+    M_solar_kg = _safe_ratio(installed_solar_w, config.power.solar_specific_power_w_per_kg, "solar_specific_power_w_per_kg", violations)
+    M_battery_kg = _safe_ratio(installed_battery_wh, config.power.battery_specific_energy_wh_per_kg, "battery_specific_energy_wh_per_kg", violations)
     M_power_kg = M_solar_kg + M_battery_kg
 
     if config.power.solar_cost_per_w_usd is None:
         C_solar_usd = M_solar_kg * config.cost.build_cost_per_kg_usd
     else:
-        C_solar_usd = config.power.solar_cost_per_w_usd * P_solar_req_w
+        C_solar_usd = config.power.solar_cost_per_w_usd * installed_solar_w
     if config.power.battery_cost_per_wh_usd is None:
         C_battery_usd = M_battery_kg * config.cost.build_cost_per_kg_usd
     else:
-        C_battery_usd = config.power.battery_cost_per_wh_usd * E_battery_req_wh
+        C_battery_usd = config.power.battery_cost_per_wh_usd * installed_battery_wh
     C_power_usd = C_solar_usd + C_battery_usd
 
     radiator_denominator = (
@@ -332,6 +351,8 @@ def estimate_single_satellite_cost(
         "P_sunlit_avg_w": P_sunlit_avg_w if solar_denominator > 0 and storage_denominator > 0 else None,
         "power_sizing_mode": power_sizing_mode,
         "energy_parameters": {
+            "installed_battery_capacity_wh": installed_battery_wh,
+            "installed_solar_array_power_w": installed_solar_w,
             "compute_standby_power_w": config.power.compute_standby_power_w,
             "communication_standby_power_w": config.power.communication_standby_power_w,
             "compute_energy_j_per_token": config.power.compute_energy_j_per_token,
@@ -343,6 +364,7 @@ def estimate_single_satellite_cost(
             "eclipse_requirement_wh": eclipse_battery_req_wh,
             "minimum_battery_wh": config.power.minimum_battery_capacity_wh,
             "selected_battery_wh": E_battery_req_wh,
+            "installed_battery_wh": installed_battery_wh,
             "soc_min": soc_min,
             "usable_initial_soc_fraction": usable_initial_soc_fraction,
         },

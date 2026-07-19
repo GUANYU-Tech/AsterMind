@@ -1,6 +1,12 @@
 """Static, identical per-satellite hardware, energy-sizing, and cost models."""
 
-from .hardware import HardwareSpec, ResolvedHardware, SatelliteHardwareProfile, resolve_experiment_hardware
+from .hardware import (
+    HardwareSpec,
+    SatelliteArchitectureProfile,
+    SatelliteEnergyProfile,
+    SatelliteHardwareProfile,
+    resolve_satellite_architecture,
+)
 from .single_satellite_cost import (
     CostResult,
     SatelliteDesignLimits,
@@ -11,10 +17,11 @@ from .single_satellite_cost import (
 __all__ = [
     "HardwareSpec",
     "CostResult",
-    "ResolvedHardware",
+    "SatelliteArchitectureProfile",
+    "SatelliteEnergyProfile",
     "SatelliteDesignLimits",
     "SatelliteHardwareProfile",
     "SingleSatelliteConfig",
     "estimate_single_satellite_cost",
-    "resolve_experiment_hardware",
+    "resolve_satellite_architecture",
 ]

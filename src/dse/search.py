@@ -548,8 +548,7 @@ def _evaluate_design_row(
         input_warnings=input_warnings,
     )
     architecture_analysis = evaluation.constellation_architecture
-    resolved_hardware = evaluation.resolved_hardware
-    resolver_warnings.extend(resolved_hardware.warnings)
+    satellite_architecture = evaluation.satellite_architecture
     cost = evaluation.cost
     serving_throughput = evaluation.serving_throughput
     simulation_result = evaluation.simulation

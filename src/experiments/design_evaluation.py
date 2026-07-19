@@ -17,7 +17,7 @@ from typing import Any
 from .constellation_cost import estimate_constellation_cost
 from ..runtime import EnergyIntensity, build_planned_energy_demand
 from ..runtime import attach_energy_alignment, summarize_runtime_sunlight
-from ..architecture import resolve_experiment_hardware
+from ..architecture import resolve_satellite_architecture
 from ..runtime import build_runtime_scenario
 from .runtime_dispatch import evaluate_runtime_performance
 from ..runtime import apply_runtime_energy_envelope
@@ -43,7 +43,7 @@ class MaterializedDesignEvaluation:
     constellation_architecture: dict[str, Any]
     scheduler: Any
     scheduler_decision: Any
-    resolved_hardware: Any
+    satellite_architecture: Any
     planned_energy_demand: Any
     cost: Any
     simulation_config: Any
@@ -87,7 +87,7 @@ def evaluate_materialized_design(
     constellation_architecture = design.architecture_analysis()
     scheduler = get_scheduler(experiment_spec.scheduler)
     scheduler_decision = scheduler.select_action(state=None, request=None)
-    resolved_hardware = resolve_experiment_hardware(
+    satellite_architecture = resolve_satellite_architecture(
         getattr(experiment_spec, "hardware", None),
         base_dir=base_dir,
     )
@@ -95,25 +95,30 @@ def evaluate_materialized_design(
         experiment_spec,
         workload_generation=workload_generation,
         satellite_count=design.satellite_count,
-        resolved_hardware=resolved_hardware,
+        satellite_architecture=satellite_architecture,
         simulation_duration_s=getattr(input_simulation_config, "duration_s", None),
     )
+    cost_limits = None
+    cost_config = None
+    single_satellite_case_path = None
+    if satellite_architecture is not None:
+        cost_limits, cost_config, single_satellite_case_path = satellite_architecture.cost_inputs()
     cost = estimate_constellation_cost(
         design,
         experiment_spec.costing,
         base_dir=base_dir,
-        cost_limits=resolved_hardware.cost_limits,
-        cost_config=resolved_hardware.cost_config,
-        single_satellite_case_path=resolved_hardware.single_satellite_case_path,
+        cost_limits=cost_limits,
+        cost_config=cost_config,
+        single_satellite_case_path=single_satellite_case_path,
     )
     resolved_simulation_config, runtime_energy_envelope = apply_runtime_energy_envelope(
         input_simulation_config,
         cost_result=cost,
-        resolved_hardware=resolved_hardware,
+        satellite_architecture=satellite_architecture,
     )
     resolved_simulation_config = _simulation_config_with_link_hardware(
         resolved_simulation_config,
-        resolved_hardware=resolved_hardware,
+        satellite_architecture=satellite_architecture,
     )
     simulation = run_simulation(
         resolved_simulation_config,
@@ -127,13 +132,13 @@ def evaluate_materialized_design(
         runtime_energy_envelope=runtime_energy_envelope,
         base_dir=base_dir,
     )
-    serving_spec, serving_warnings = _serving_spec_for_resolved_hardware(
+    serving_spec, serving_warnings = _serving_spec_for_satellite_architecture(
         experiment_spec,
-        resolved_hardware=resolved_hardware,
+        satellite_architecture=satellite_architecture,
     )
     serving_throughput = estimate_serving_throughput(
         serving_spec,
-        hardware=resolved_hardware.satellite_profile,
+        hardware=satellite_architecture.hardware if satellite_architecture is not None else None,
         token_distribution=serving_workload,
         constellation_satellite_count=design.satellite_count,
     )
@@ -141,7 +146,6 @@ def evaluate_materialized_design(
     pre_runtime_warnings = _dedupe(
         (
             *input_warnings,
-            *resolved_hardware.warnings,
             *energy_planning_warnings,
             *serving_warnings,
             *runtime_energy_envelope.warnings,
@@ -167,7 +171,7 @@ def evaluate_materialized_design(
         cost_result=cost,
         scheduler_spec=scheduler.to_runtime_strategy(),
         hardware=getattr(experiment_spec, "hardware", None),
-        resolved_hardware=resolved_hardware,
+        satellite_architecture=satellite_architecture,
         warnings=pre_runtime_warnings,
     )
     runtime_performance = evaluate_runtime_performance(
@@ -191,7 +195,7 @@ def evaluate_materialized_design(
         constellation_architecture=constellation_architecture,
         scheduler=scheduler,
         scheduler_decision=scheduler_decision,
-        resolved_hardware=resolved_hardware,
+        satellite_architecture=satellite_architecture,
         planned_energy_demand=planned_energy_demand,
         cost=cost,
         simulation_config=resolved_simulation_config,
@@ -298,7 +302,7 @@ def _planned_energy_demand_for_design(
     *,
     workload_generation: Any,
     satellite_count: int,
-    resolved_hardware: Any,
+    satellite_architecture: Any,
     simulation_duration_s: float | None,
 ) -> tuple[Any | None, tuple[str, ...]]:
     """Build an offered-workload energy audit without sizing static hardware."""
@@ -312,22 +316,19 @@ def _planned_energy_demand_for_design(
             "offered-workload energy accounting is unavailable because canonical offered requests are not configured; "
             "the energy audit is unavailable",
         )
-    cost_config = getattr(resolved_hardware, "cost_config", None)
-    power = getattr(cost_config, "power", None)
-    if power is None:
+    energy = getattr(satellite_architecture, "energy", None)
+    if energy is None:
         return None, (
             "offered-workload energy accounting is unavailable because resolved cost power configuration is missing; "
             "the energy audit is unavailable",
         )
     intensity = EnergyIntensity(
-        compute_standby_power_w=float(getattr(power, "compute_standby_power_w", 0.0)),
+        compute_standby_power_w=float(energy.compute_standby_power_w),
         communication_standby_power_w=float(
-            getattr(power, "communication_standby_power_w", 0.0)
+            energy.communication_standby_power_w
         ),
-        compute_energy_j_per_token=float(
-            getattr(power, "compute_energy_j_per_token", 0.5)
-        ),
-        link_energy_j_per_byte=float(getattr(power, "link_energy_j_per_byte", 1e-6)),
+        compute_energy_j_per_token=float(energy.compute_energy_j_per_token),
+        link_energy_j_per_byte=float(energy.link_energy_j_per_byte),
     )
     planned = build_planned_energy_demand(
         workload_generation,
@@ -344,24 +345,16 @@ def _planned_energy_demand_for_design(
     )
 
 
-def _serving_spec_for_resolved_hardware(
+def _serving_spec_for_satellite_architecture(
     experiment_spec: Any,
     *,
-    resolved_hardware: Any,
+    satellite_architecture: Any,
 ) -> tuple[Any, tuple[str, ...]]:
     """Use resolver output as the single-design hardware authority."""
 
     serving = experiment_spec.serving
-    if resolved_hardware.satellite_profile is None:
+    if satellite_architecture is None:
         return serving, ()
-
-    cost_or_top_level_hardware = (
-        getattr(experiment_spec, "hardware", None) is not None
-        or resolved_hardware.single_satellite_case_path is not None
-    )
-    if not cost_or_top_level_hardware:
-        return replace(serving, hardware=None), ()
-
     return replace(serving, hardware=None), ()
 
 
@@ -446,10 +439,10 @@ def _simulation_config_with_default_trace_dir(
         return simulation_config
 
 
-def _simulation_config_with_link_hardware(simulation_config: Any, *, resolved_hardware: Any) -> Any:
+def _simulation_config_with_link_hardware(simulation_config: Any, *, satellite_architecture: Any) -> Any:
     """Inject the immutable single-satellite terminal capability into trace inputs."""
 
-    profile = getattr(resolved_hardware, "satellite_profile", None)
+    profile = getattr(satellite_architecture, "hardware", None)
     if profile is None:
         return simulation_config
     options = dict(getattr(simulation_config, "trace_options", {}) or {})

@@ -217,6 +217,8 @@ class CommunicationConfig:
 
 @dataclass(frozen=True)
 class PowerConfig:
+    battery_capacity_wh: float | None = None
+    solar_array_power_w: float | None = None
     compute_standby_power_w: float = 0.0
     communication_standby_power_w: float = 0.0
     compute_energy_j_per_token: float = 0.5
@@ -238,6 +240,8 @@ class PowerConfig:
     def from_dict(cls, data: dict[str, Any] | None) -> "PowerConfig":
         data = data or {}
         return cls(
+            battery_capacity_wh=_optional_float(data.get("battery_capacity_wh")),
+            solar_array_power_w=_optional_float(data.get("solar_array_power_w")),
             compute_standby_power_w=float(_pick(data, "compute_standby_power_w", 0.0)),
             communication_standby_power_w=float(
                 _pick(data, "communication_standby_power_w", 0.0)

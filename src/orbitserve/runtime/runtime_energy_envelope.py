@@ -41,13 +41,13 @@ def apply_runtime_energy_envelope(
     simulation_config: Any,
     *,
     cost_result: Any,
-    resolved_hardware: Any = None,
+    satellite_architecture: Any = None,
 ) -> tuple[Any, RuntimeEnergyEnvelope]:
     """Return a simulation config whose runtime energy options come from cost/hardware."""
 
     envelope = derive_runtime_energy_envelope(
         cost_result,
-        resolved_hardware=resolved_hardware,
+        satellite_architecture=satellite_architecture,
         base_trace_options=getattr(simulation_config, "trace_options", {}) or {},
     )
     current_options = dict(getattr(simulation_config, "trace_options", {}) or {})
@@ -68,41 +68,34 @@ def apply_runtime_energy_envelope(
 def derive_runtime_energy_envelope(
     cost_result: Any,
     *,
-    resolved_hardware: Any = None,
+    satellite_architecture: Any = None,
     base_trace_options: dict[str, Any] | None = None,
 ) -> RuntimeEnergyEnvelope:
     """Project cost-model battery/solar/power closure into runtime trace options."""
 
+    energy = getattr(satellite_architecture, "energy", None)
+    if energy is None:
+        return RuntimeEnergyEnvelope(
+            evaluated=False,
+            warnings=("runtime energy envelope was not derived because SatelliteEnergyProfile is missing",),
+            provenance={"source": "satellite_architecture", "energy_profile_available": False},
+        )
     cost_payload = _mapping(cost_result)
-    if not bool(cost_payload.get("evaluated", False)):
-        return RuntimeEnergyEnvelope(
-            evaluated=False,
-            warnings=("runtime energy envelope was not derived because cost.evaluated=false",),
-            provenance={"source": "cost_hardware_orbit_runtime", "cost_evaluated": False},
-        )
     single = _dict(cost_payload.get("single_satellite"))
-    if not single:
-        return RuntimeEnergyEnvelope(
-            evaluated=False,
-            warnings=("runtime energy envelope was not derived because cost.single_satellite is missing",),
-            provenance={"source": "cost_hardware_orbit_runtime", "cost_evaluated": True},
-        )
     single_provenance = _dict(single.get("provenance"))
     power_sizing_mode = str(
         single_provenance.get("power_sizing_mode") or "conservative_peak_load"
     )
 
-    battery_wh = _first_float(single.get("E_battery_req_wh"), single.get("E_battery_req"))
-    solar_w = _first_float(single.get("P_solar_req_w"), single.get("P_solar_req"))
+    battery_wh = _optional_float(energy.battery_capacity_wh)
+    solar_w = _optional_float(energy.solar_array_power_w)
     p_avg_w = _first_float(single.get("P_avg_w"), single.get("P_avg"))
     p_shadow_w = _first_float(single.get("P_shadow_avg_w"), single.get("P_shadow_avg"))
     missing = [
         name
         for name, value in (
-            ("E_battery_req_wh", battery_wh),
-            ("P_solar_req_w", solar_w),
-            ("P_avg_w", p_avg_w),
-            ("P_shadow_avg_w", p_shadow_w),
+            ("battery_capacity_wh", battery_wh),
+            ("solar_array_power_w", solar_w),
         )
         if value is None or not math.isfinite(value) or value <= 0
     ]
@@ -113,36 +106,23 @@ def derive_runtime_energy_envelope(
             provenance={"source": "cost_hardware_orbit_runtime", "missing_fields": missing},
         )
 
-    cost_config = getattr(resolved_hardware, "cost_config", None)
-    power_config = getattr(cost_config, "power", None)
-    platform_config = getattr(cost_config, "platform", None)
-    dod_max = _optional_float(getattr(power_config, "dod_max", None))
+    dod_max = _optional_float(energy.dod_max)
     base_options = dict(base_trace_options or {})
     initial_soc = _optional_float(base_options.get("initial_soc", 0.8))
-    battery_eol_fraction = _optional_float(getattr(power_config, "battery_eol_fraction", None))
-    eta_pmad = _optional_float(getattr(power_config, "eta_pmad", None))
-    pv_eol_fraction = _optional_float(getattr(power_config, "pv_eol_fraction", None))
-    battery_charge_efficiency = _optional_float(
-        getattr(power_config, "battery_charge_efficiency", 1.0)
-    )
-    battery_discharge_efficiency = _optional_float(
-        getattr(power_config, "battery_discharge_efficiency", 1.0)
-    )
-    platform_power_w = _optional_float(getattr(platform_config, "power_w", None))
-    compute_standby_power_w = _optional_float(
-        getattr(power_config, "compute_standby_power_w", None)
-    )
-    communication_standby_power_w = _optional_float(
-        getattr(power_config, "communication_standby_power_w", None)
-    )
-    compute_energy_j_per_token = _optional_float(
-        getattr(power_config, "compute_energy_j_per_token", None)
-    )
-    link_energy_j_per_byte = _optional_float(
-        getattr(power_config, "link_energy_j_per_byte", None)
-    )
+    battery_eol_fraction = _optional_float(energy.battery_eol_fraction)
+    eta_pmad = _optional_float(energy.eta_pmad)
+    pv_eol_fraction = _optional_float(energy.pv_eol_fraction)
+    battery_charge_efficiency = _optional_float(energy.battery_charge_efficiency)
+    battery_discharge_efficiency = _optional_float(energy.battery_discharge_efficiency)
+    platform_power_w = _optional_float(energy.platform_power_w)
+    compute_standby_power_w = _optional_float(energy.compute_standby_power_w)
+    communication_standby_power_w = _optional_float(energy.communication_standby_power_w)
+    compute_energy_j_per_token = _optional_float(energy.compute_energy_j_per_token)
+    link_energy_j_per_byte = _optional_float(energy.link_energy_j_per_byte)
     orbit_condition = _dict(single_provenance.get("orbit_energy_condition"))
-    sunlit_fraction = _optional_float(orbit_condition.get("sunlit_fraction"))
+    sunlit_fraction = _optional_float(
+        orbit_condition.get("sunlit_fraction", 1.0 - float(base_options.get("shadow_fraction", 0.36)))
+    )
     eclipse_duration_min = _optional_float(orbit_condition.get("eclipse_duration_min"))
     contract_values = {
         "battery_eol_fraction": battery_eol_fraction,

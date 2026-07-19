@@ -7,9 +7,11 @@ from pathlib import Path
 
 from orbitserve.architecture.hardware import (
     HardwareSpec,
+    SatelliteArchitectureProfile,
+    SatelliteEnergyProfile,
     SatelliteHardwareProfile,
     hardware_from_single_satellite_case,
-    resolve_experiment_hardware,
+    resolve_satellite_architecture,
 )
 
 
@@ -41,16 +43,25 @@ class HardwareProfileTests(unittest.TestCase):
                     "isl_terminal_count": 4,
                     "isl_terminal_bandwidth_gbps": 20,
                 },
+                "power": {
+                    "battery_capacity_wh": 5000,
+                    "solar_array_power_w": 6000,
+                },
             }
         )
-        resolved = resolve_experiment_hardware(spec)
-        self.assertTrue(resolved.configured)
-        self.assertEqual(resolved.mode, "fixed")
-        self.assertEqual(resolved.satellite_profile.accelerator_count, 2)
-        self.assertEqual(resolved.satellite_profile.storage_capacity_tb, 16)
-        self.assertEqual(resolved.satellite_profile.inter_satellite_bandwidth_gbps, 80)
-        self.assertEqual(resolved.cost_config.compute.accelerator_count, 2)
-        self.assertEqual(resolved.cost_config.storage.device_count, 2)
+        resolved = resolve_satellite_architecture(spec)
+        self.assertIsInstance(resolved, SatelliteArchitectureProfile)
+        self.assertEqual(resolved.architecture_id, "fixed_satellite")
+        self.assertEqual(resolved.hardware.accelerator_count, 2)
+        self.assertEqual(resolved.hardware.storage_capacity_tb, 16)
+        self.assertEqual(resolved.hardware.inter_satellite_bandwidth_gbps, 80)
+        self.assertIsInstance(resolved.energy, SatelliteEnergyProfile)
+        self.assertEqual(resolved.energy.battery_capacity_wh, 5000)
+        self.assertNotIn("provenance", resolved.to_dict())
+        self.assertNotIn("warnings", resolved.to_dict())
+        _limits, cost_config, _path = resolved.cost_inputs()
+        self.assertEqual(cost_config.compute.accelerator_count, 2)
+        self.assertEqual(cost_config.storage.device_count, 2)
 
     def test_hardware_resolution_does_not_accept_constellation_inputs(self) -> None:
         spec = HardwareSpec.from_dict(
@@ -63,7 +74,7 @@ class HardwareProfileTests(unittest.TestCase):
             }
         )
         with self.assertRaises(TypeError):
-            resolve_experiment_hardware(spec, constellation=object())
+            resolve_satellite_architecture(spec, constellation=object())
 
     def test_source_case_is_an_explicit_top_level_hardware_source(self) -> None:
         spec = HardwareSpec.from_dict(
@@ -72,14 +83,11 @@ class HardwareProfileTests(unittest.TestCase):
                 "source_case_path": "examples/single_satellite/edge_orin_small_sat.json",
             }
         )
-        resolved = resolve_experiment_hardware(spec, base_dir=ROOT)
-        self.assertTrue(resolved.configured)
-        self.assertEqual(resolved.satellite_profile.accelerator_count, 2)
+        resolved = resolve_satellite_architecture(spec, base_dir=ROOT)
+        self.assertEqual(resolved.hardware.accelerator_count, 2)
 
     def test_missing_hardware_is_explicitly_unevaluated(self) -> None:
-        resolved = resolve_experiment_hardware(None)
-        self.assertFalse(resolved.configured)
-        self.assertEqual(resolved.mode, "not_configured")
+        self.assertIsNone(resolve_satellite_architecture(None))
 
     def test_only_fixed_and_from_cost_case_modes_are_supported(self) -> None:
         spec = HardwareSpec.from_dict(
@@ -89,7 +97,7 @@ class HardwareProfileTests(unittest.TestCase):
             }
         )
         with self.assertRaises(ValueError):
-            resolve_experiment_hardware(spec)
+            resolve_satellite_architecture(spec)
 
     def test_canonical_communication_names_are_serialized(self) -> None:
         spec = HardwareSpec.from_dict(

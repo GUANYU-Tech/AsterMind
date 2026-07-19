@@ -41,7 +41,7 @@ class ExperimentManifestAndCliTests(unittest.TestCase):
         self.assertEqual(payload["module_status"]["simulation"], "stub")
         self.assertEqual(payload["module_status"]["serving_throughput"], "evaluated")
         self.assertEqual(payload["module_status"]["dse"], "disabled")
-        self.assertEqual(payload["cost"]["provenance"]["single_satellite_input"], "resolved_hardware")
+        self.assertEqual(payload["cost"]["provenance"]["single_satellite_input"], "satellite_architecture")
 
     def test_runner_uses_top_level_hardware_interface_for_cost_and_performance(self):
         spec = load_experiment_spec(ROOT / "tests/fixtures/manifests/smoke_hardware_interface.json")
@@ -52,7 +52,7 @@ class ExperimentManifestAndCliTests(unittest.TestCase):
         self.assertTrue(payload["cost"]["evaluated"])
         self.assertTrue(payload["performance"]["evaluated"])
         self.assertEqual(payload["module_status"]["hardware"], "resolved")
-        self.assertEqual(payload["cost"]["provenance"]["single_satellite_input"], "resolved_hardware")
+        self.assertEqual(payload["cost"]["provenance"]["single_satellite_input"], "satellite_architecture")
         self.assertEqual(payload["cost"]["single_satellite"]["provenance"]["N_acc"], 3)
         self.assertEqual(payload["performance"]["details"]["hardware"]["accelerator_count"], 3)
         self.assertGreater(payload["performance"]["request_throughput_per_s"], 0)

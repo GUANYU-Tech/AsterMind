@@ -34,6 +34,8 @@
     "clink_allocated_usd": 1000
   },
   "power": {
+    "battery_capacity_wh": 530,
+    "solar_array_power_w": 520,
     "dod_max": 0.3,
     "battery_eol_fraction": 0.8,
     "solar_specific_power_w_per_kg": 100,

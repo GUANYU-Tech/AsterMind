@@ -147,6 +147,104 @@ class SatelliteHardwareProfile:
         )
         return payload
 
+
+@dataclass(frozen=True)
+class SatelliteEnergyProfile:
+    """Static, pre-launch energy configuration for one satellite."""
+
+    battery_capacity_wh: float
+    solar_array_power_w: float
+    dod_max: float
+    battery_eol_fraction: float
+    battery_charge_efficiency: float
+    battery_discharge_efficiency: float
+    pv_eol_fraction: float
+    eta_pmad: float
+    platform_power_w: float
+    compute_standby_power_w: float
+    communication_standby_power_w: float
+    compute_energy_j_per_token: float
+    link_energy_j_per_byte: float
+
+    def __post_init__(self) -> None:
+        positive = {
+            "battery_capacity_wh": self.battery_capacity_wh,
+            "solar_array_power_w": self.solar_array_power_w,
+            "battery_eol_fraction": self.battery_eol_fraction,
+            "pv_eol_fraction": self.pv_eol_fraction,
+            "eta_pmad": self.eta_pmad,
+        }
+        for name, value in positive.items():
+            if value <= 0:
+                raise ValueError(f"energy.{name} must be positive")
+        for name, value in {
+            "dod_max": self.dod_max,
+            "battery_eol_fraction": self.battery_eol_fraction,
+            "battery_charge_efficiency": self.battery_charge_efficiency,
+            "battery_discharge_efficiency": self.battery_discharge_efficiency,
+            "pv_eol_fraction": self.pv_eol_fraction,
+            "eta_pmad": self.eta_pmad,
+        }.items():
+            if not 0 < value <= 1:
+                raise ValueError(f"energy.{name} must be in (0, 1]")
+        for name, value in {
+            "platform_power_w": self.platform_power_w,
+            "compute_standby_power_w": self.compute_standby_power_w,
+            "communication_standby_power_w": self.communication_standby_power_w,
+            "compute_energy_j_per_token": self.compute_energy_j_per_token,
+            "link_energy_j_per_byte": self.link_energy_j_per_byte,
+        }.items():
+            if value < 0:
+                raise ValueError(f"energy.{name} must be non-negative")
+
+    @classmethod
+    def from_cost_config(cls, config: SingleSatelliteConfig) -> "SatelliteEnergyProfile":
+        power = config.power
+        if power.battery_capacity_wh is None:
+            raise ValueError("power.battery_capacity_wh is required by the static architecture contract")
+        if power.solar_array_power_w is None:
+            raise ValueError("power.solar_array_power_w is required by the static architecture contract")
+        return cls(
+            battery_capacity_wh=float(power.battery_capacity_wh),
+            solar_array_power_w=float(power.solar_array_power_w),
+            dod_max=float(power.dod_max),
+            battery_eol_fraction=float(power.battery_eol_fraction),
+            battery_charge_efficiency=float(power.battery_charge_efficiency),
+            battery_discharge_efficiency=float(power.battery_discharge_efficiency),
+            pv_eol_fraction=float(power.pv_eol_fraction),
+            eta_pmad=float(power.eta_pmad),
+            platform_power_w=float(config.platform.power_w),
+            compute_standby_power_w=float(power.compute_standby_power_w),
+            communication_standby_power_w=float(power.communication_standby_power_w),
+            compute_energy_j_per_token=float(power.compute_energy_j_per_token),
+            link_energy_j_per_byte=float(power.link_energy_j_per_byte),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return to_jsonable(self)
+
+
+@dataclass(frozen=True)
+class SatelliteArchitectureProfile:
+    """Frozen static architecture exported to Serving and Runtime."""
+
+    architecture_id: str
+    hardware: SatelliteHardwareProfile
+    energy: SatelliteEnergyProfile
+    _cost_limits: SatelliteDesignLimits = field(repr=False, compare=False)
+    _cost_config: SingleSatelliteConfig = field(repr=False, compare=False)
+    _source_case_path: str | None = field(default=None, repr=False, compare=False)
+
+    def cost_inputs(self) -> tuple[SatelliteDesignLimits, SingleSatelliteConfig, str | None]:
+        return self._cost_limits, self._cost_config, self._source_case_path
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "architecture_id": self.architecture_id,
+            "hardware": self.hardware.to_dict(),
+            "energy": self.energy.to_dict(),
+        }
+
 def hardware_from_single_satellite_case(
     case_path: str | Path,
     *,
@@ -384,6 +482,8 @@ class PlatformSpec:
 
 @dataclass(frozen=True)
 class PowerSpec:
+    battery_capacity_wh: float | None = None
+    solar_array_power_w: float | None = None
     compute_standby_power_w: float = 0.0
     communication_standby_power_w: float = 0.0
     compute_energy_j_per_token: float = 0.5
@@ -405,6 +505,8 @@ class PowerSpec:
     def from_dict(cls, data: dict[str, Any] | None) -> "PowerSpec":
         data = data or {}
         return cls(
+            battery_capacity_wh=_optional_float(data.get("battery_capacity_wh")),
+            solar_array_power_w=_optional_float(data.get("solar_array_power_w")),
             compute_standby_power_w=float(_pick(data, "compute_standby_power_w", 0.0)),
             communication_standby_power_w=float(
                 _pick(data, "communication_standby_power_w", 0.0)
@@ -592,75 +694,50 @@ class HardwareSpec:
             "cost": self.cost.to_dict(),
         }
 
-@dataclass(frozen=True)
-class ResolvedHardware:
-    """Resolved downstream views for OrbitServe hardware-dependent modules."""
-
-    configured: bool
-    mode: str
-    satellite_profile: SatelliteHardwareProfile | None = None
-    cost_limits: SatelliteDesignLimits | None = None
-    cost_config: SingleSatelliteConfig | None = None
-    single_satellite_case_path: str | None = None
-    warnings: tuple[str, ...] = ()
-    provenance: dict[str, Any] = field(default_factory=dict)
-
-    def to_dict(self) -> dict[str, Any]:
-        return to_jsonable(self)
-
-
-
-def resolve_experiment_hardware(
+def resolve_satellite_architecture(
     hardware: HardwareSpec | None,
     *,
     base_dir: str | Path | None = None,
-) -> ResolvedHardware:
-    """Resolve one immutable single-satellite hardware configuration."""
+) -> SatelliteArchitectureProfile | None:
+    """Resolve one immutable pre-launch satellite architecture."""
 
     if hardware is None:
-        return ResolvedHardware(
-            configured=False,
-            mode="not_configured",
-            warnings=("hardware is not configured",),
-            provenance={"source": "none"},
-        )
+        return None
     if hardware.mode == "from_cost_case":
         if hardware.source_case_path is None:
-            return ResolvedHardware(
-                configured=False,
-                mode=hardware.mode,
-                warnings=("hardware.source_case_path is required in from_cost_case mode",),
-                provenance={"source": "top_level_hardware"},
-            )
+            raise ValueError("hardware.source_case_path is required in from_cost_case mode")
         path, design_limits, config = _load_single_satellite_case(
             hardware.source_case_path,
             base_dir,
         )
-        profile = hardware_from_single_satellite_case(path)
-        return ResolvedHardware(
-            configured=True,
-            mode=hardware.mode,
-            satellite_profile=profile,
-            cost_limits=design_limits,
-            cost_config=config,
-            single_satellite_case_path=str(path),
-            provenance={"source": "top_level_hardware", "case_path": str(path)},
+        profile = hardware_from_cost_inputs(
+            design_limits,
+            config,
+            name=f"{path.stem}_hardware",
+            source="single_satellite_cost_case",
+            case_path=str(path),
+        )
+        return SatelliteArchitectureProfile(
+            architecture_id=hardware.name,
+            hardware=profile,
+            energy=SatelliteEnergyProfile.from_cost_config(config),
+            _cost_limits=design_limits,
+            _cost_config=config,
+            _source_case_path=str(path),
         )
     if hardware.mode != "fixed":
         raise ValueError("hardware.mode must be 'fixed' or 'from_cost_case'")
-    design_limits, config, warnings = hardware.to_cost_inputs()
+    design_limits, config, _warnings = hardware.to_cost_inputs()
     profile = hardware.to_performance_profile(
         design_limits=design_limits,
         config=config,
     )
-    return ResolvedHardware(
-        configured=True,
-        mode=hardware.mode,
-        satellite_profile=profile,
-        cost_limits=design_limits,
-        cost_config=config,
-        warnings=warnings,
-        provenance={"source": "top_level_hardware", "hardware": hardware.to_dict()},
+    return SatelliteArchitectureProfile(
+        architecture_id=hardware.name,
+        hardware=profile,
+        energy=SatelliteEnergyProfile.from_cost_config(config),
+        _cost_limits=design_limits,
+        _cost_config=config,
     )
 
 def _resolve_cost_accelerator(config: SingleSatelliteConfig) -> CostAcceleratorProfile:
@@ -703,4 +780,3 @@ def _optional_int(value: Any) -> int | None:
     if value is None:
         return None
     return int(value)
-

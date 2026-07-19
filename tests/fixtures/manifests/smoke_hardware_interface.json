@@ -63,6 +63,8 @@
       "power_w": 100
     },
     "power": {
+      "battery_capacity_wh": 7300,
+      "solar_array_power_w": 7200,
       "battery_eol_fraction": 0.8,
       "battery_specific_energy_wh_per_kg": 200,
       "dod_max": 0.3,

@@ -31,7 +31,7 @@ def build_runtime_scenario(
     cost_result: Any = None,
     scheduler_spec: Any = None,
     hardware: Any = None,
-    resolved_hardware: Any = None,
+    satellite_architecture: Any = None,
     time_horizon_s: float | None = None,
     warnings: tuple[str, ...] = (),
 ) -> RuntimeScenario:
@@ -43,7 +43,7 @@ def build_runtime_scenario(
     constellation_payload = _mapping_from_result(constellation)
     architecture_payload = _mapping_from_result(constellation_architecture)
     runtime_strategy = RuntimeStrategySpec.from_value(scheduler_spec)
-    resolved_hardware_payload = _mapping_from_result(resolved_hardware)
+    satellite_architecture_payload = _mapping_from_result(satellite_architecture)
     hardware_payload = _mapping_from_result(hardware)
     scenario_name = scenario_id or str(_first_present(workload_spec_payload.get("name"), "runtime_scenario"))
     design_name = design_id or str(
@@ -184,7 +184,7 @@ def build_runtime_scenario(
                 "modeling_doc": "docs/research/parameters/llm_serving_capacity_model.md",
                 "estimate_schema": "ServingThroughputEstimate",
             },
-            "hardware_config": resolved_hardware_payload or hardware_payload,
+            "satellite_architecture": satellite_architecture_payload or hardware_payload,
             "cost_model": cost_power["provenance"],
             "runtime_interface_doc": RUNTIME_INTERFACE_DOC,
             "runtime_performance_model_doc": RUNTIME_PERFORMANCE_DOC,

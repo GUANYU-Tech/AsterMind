@@ -118,7 +118,7 @@ def estimate_constellation_cost(
         warnings=warnings,
         provenance={
             "scale_by": costing.scale_by,
-            "single_satellite_input": "resolved_hardware" if cost_limits is not None else "case_path",
+            "single_satellite_input": "satellite_architecture" if cost_limits is not None else "case_path",
             "single_satellite_provenance": single_result.provenance,
         },
     )
