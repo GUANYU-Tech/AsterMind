@@ -29,7 +29,9 @@ class DSESkeletonTests(unittest.TestCase):
         for row in payload["rows"]:
             self.assertTrue(row["cost"]["evaluated"])
             self.assertTrue(row["performance"]["evaluated"])
-            self.assertGreater(row["performance"]["request_throughput_per_s"], 0)
+            self.assertIsNone(row["performance"]["request_throughput_per_s"])
+            self.assertGreater(row["performance"]["prefill_tokens_per_s"], 0)
+            self.assertGreater(row["performance"]["decode_tokens_per_s"], 0)
             self.assertFalse(row["slo"]["evaluated"])
             self.assertIsNone(row["slo"]["served_ratio"])
 
@@ -156,9 +158,11 @@ class DSESkeletonTests(unittest.TestCase):
 
             result = run_dse(load_experiment_spec(manifest_path))
             payload = result.to_dict()
-            token_distribution = payload["rows"][0]["performance"]["details"]["provenance"]["token_distribution"]
             runtime = payload["rows"][0]["performance"]["details"]["runtime"]
-            self.assertNotEqual(token_distribution["prompt_tokens_p50"], 9999)
+            self.assertNotIn(
+                "token_distribution",
+                payload["rows"][0]["performance"]["details"]["provenance"],
+            )
             self.assertEqual(runtime["workload"]["source_mode"], "synthetic_generation")
             self.assertGreater(runtime["workload"]["request_count"], 0)
             self.assertGreater(runtime["provenance"]["workload_bundle"]["request_count"], 0)
