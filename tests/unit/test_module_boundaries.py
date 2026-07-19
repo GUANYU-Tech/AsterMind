@@ -17,10 +17,16 @@ CORE = ROOT / "src" / "orbitserve"
 class CoreModuleBoundaryTests(unittest.TestCase):
     def test_public_contracts_are_exported(self):
         for module, names in {
-            architecture: ("HardwareSpec", "ResolvedHardware", "SatelliteHardwareProfile", "resolve_experiment_hardware"),
-            orbit: ("ConstellationDesign", "RuntimeTraceBundle", "SimulationConfig", "run_simulation"),
-            workload: ("WorkloadBundleRef", "WorkloadGenerationResult", "materialize_workload_bundle"),
-            serving: ("ServingSpec", "ServingThroughputEstimate", "estimate_serving_throughput"),
+            architecture: (
+                "HardwareSpec",
+                "SatelliteArchitectureProfile",
+                "SatelliteEnergyProfile",
+                "SatelliteHardwareProfile",
+                "resolve_satellite_architecture",
+            ),
+            orbit: ("ConstellationDesign", "OrbitTraceBundle", "SimulationConfig", "run_simulation"),
+            workload: ("WorkloadBundleRef", "MaterializedWorkload", "materialize_workload_bundle"),
+            serving: ("ServingSpec", "ServingCapacityProfile", "estimate_serving_capacity"),
             runtime: ("RuntimeScenario", "RuntimeStrategySpec", "RuntimePerformanceResult", "evaluate_runtime_performance"),
         }.items():
             with self.subTest(module=module.__name__):
@@ -32,7 +38,7 @@ class CoreModuleBoundaryTests(unittest.TestCase):
             "architecture": {"common"},
             "orbit": {"common"},
             "workload": {"common"},
-            "serving": {"architecture", "common", "workload"},
+            "serving": {"architecture", "common"},
             "runtime": {"common", "orbit"},
             "common": set(),
         }
@@ -85,6 +91,18 @@ class CoreModuleBoundaryTests(unittest.TestCase):
                 elif node.level >= 2 and len(parts) >= 2 and parts[0] in domains:
                     violations.append(f"{path.relative_to(ROOT)}:{node.lineno} imports {node.module}")
         self.assertEqual(violations, [], "\n".join(violations))
+
+    def test_removed_contract_names_are_not_exported(self):
+        removed = {
+            architecture: ("ResolvedHardware", "resolve_experiment_hardware"),
+            orbit: ("RuntimeTraceManifest", "RuntimeTraceBundle", "SurrogateTraceBundle"),
+            workload: ("WorkloadGenerationResult",),
+            serving: ("ServingThroughputEstimate", "estimate_serving_throughput"),
+        }
+        for module, names in removed.items():
+            for name in names:
+                with self.subTest(module=module.__name__, name=name):
+                    self.assertFalse(hasattr(module, name))
 
     @staticmethod
     def _target_domain(path, node):
