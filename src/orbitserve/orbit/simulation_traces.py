@@ -249,7 +249,40 @@ class OrbitTraceBundle:
     provenance: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return to_jsonable(self)
+        # The in-memory loader may carry Runtime-enriched values while an
+        # evaluation is running.  The public Orbit contract exports only
+        # geometry, visibility, propagation, and illumination information.
+        payload = {
+            "trace_id": self.trace_id,
+            "access_trace": self.access_trace,
+            "link_trace": self.link_trace,
+            "energy_trace": self.energy_trace,
+            "satellite_catalog": self.satellite_catalog,
+            "access_windows": self.access_windows,
+            "visible_count_samples": self.visible_count_samples,
+            "physical_links": self.physical_links,
+            "links": self.links,
+            "link_samples": self.link_samples,
+            "active_graph_snapshots": self.active_graph_snapshots,
+            "energy_windows": self.energy_windows,
+            "shadow_windows": self.shadow_windows,
+            "solar_samples": self.solar_samples,
+            "ephemeris_samples": self.ephemeris_samples,
+            "trace_manifest": (
+                self.trace_manifest.to_dict()
+                if isinstance(self.trace_manifest, OrbitTraceManifest)
+                else self.trace_manifest
+            ),
+            "horizon_s": self.horizon_s,
+            "step_s": self.step_s,
+            "boundary_tolerance_s": self.boundary_tolerance_s,
+            "trace_model": self.trace_model,
+            "scope": self.scope,
+            "warnings": self.warnings,
+            "time_warnings": self.time_warnings,
+            "provenance": self.provenance,
+        }
+        return to_jsonable(_orbit_public_value(payload))
 
     def _allow_static_link_compat(self) -> bool:
         cached = self.__dict__.get("_allow_static_link_compat_cache")
@@ -1114,6 +1147,41 @@ def _string_tuple(value: Any) -> tuple[str, ...]:
     if isinstance(value, str):
         return (value,)
     return tuple(str(item) for item in value)
+
+
+_RUNTIME_OWNED_ORBIT_KEYS = frozenset(
+    {
+        "bandwidth_bps",
+        "bandwidth_bps_nominal",
+        "B_raw_bps",
+        "dvfs_multiplier",
+        "satellite_initial_soc",
+        "initial_soc",
+        "battery_capacity_j",
+        "battery_charge_efficiency",
+        "battery_discharge_efficiency",
+        "charge_rate_w",
+        "idle_power_w",
+        "idle_power_w_sunlit",
+        "idle_power_w_shadow",
+        "compute_energy_j_per_token",
+        "link_energy_j_per_byte",
+        "soc_min",
+        "energy_accounting_mode",
+    }
+)
+
+
+def _orbit_public_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key): _orbit_public_value(item)
+            for key, item in value.items()
+            if key not in _RUNTIME_OWNED_ORBIT_KEYS
+        }
+    if isinstance(value, (list, tuple)):
+        return [_orbit_public_value(item) for item in value]
+    return value
 
 
 __all__ = [

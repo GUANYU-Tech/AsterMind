@@ -29,6 +29,38 @@ def _write_json(path, payload):
 
 
 class OrbitTraceManifestAndBundleTests(unittest.TestCase):
+    def test_public_bundle_excludes_runtime_owned_state_and_capacity(self):
+        bundle = OrbitTraceBundle(
+            trace_id="orbit-contract",
+            links=({"link_id": "isl-0", "bandwidth_bps": 1_000.0, "propagation_delay_s": 0.01},),
+            link_samples=({"link_id": "isl-0", "time_s": 0.0, "B_raw_bps": 1_000.0, "tau_prop_s": 0.01},),
+            energy_windows=(
+                {
+                    "satellite_id": "sat-0",
+                    "start_s": 0.0,
+                    "end_s": 10.0,
+                    "sunlit": False,
+                    "dvfs_multiplier": 2.0,
+                    "battery_capacity_j": 10_000.0,
+                    "soc_min": 0.2,
+                },
+            ),
+            satellite_initial_soc={"sat-0": 0.8},
+        )
+        payload = bundle.to_dict()
+        encoded = json.dumps(payload, sort_keys=True)
+        self.assertIn("propagation_delay_s", encoded)
+        self.assertIn("sunlit", encoded)
+        for forbidden in (
+            "bandwidth_bps",
+            "B_raw_bps",
+            "dvfs_multiplier",
+            "battery_capacity_j",
+            "soc_min",
+            "satellite_initial_soc",
+        ):
+            self.assertNotIn(forbidden, encoded)
+
     def test_nested_manifest_roundtrip_preserves_current_surface(self):
         nested = {
             "schema_version": "orbitserve.satellite_motion_trace.v1",
