@@ -1,0 +1,19 @@
+{
+  "base_case": "examples/single_satellite/h200_gpu_derived.json",
+  "launch_costs_per_kg_usd": [
+    250,
+    500,
+    1000,
+    3360,
+    5000
+  ],
+  "compute": {
+    "accelerator_count": 1
+  },
+  "storage": {
+    "device_count": 1
+  },
+  "interconnect": {
+    "switch_count": 1
+  }
+}

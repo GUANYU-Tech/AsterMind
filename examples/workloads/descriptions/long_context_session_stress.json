@@ -1,0 +1,237 @@
+{
+  "arrival": {
+    "day_profile": "weekday",
+    "diurnal_profile": "enterprise_workday",
+    "lambda_global": 0.035,
+    "load_scale": 1.0,
+    "process": "nhpp_synthetic"
+  },
+  "bursts": [],
+  "gateways": {
+    "access_mode": "gateway_sgl",
+    "mapping_policy": "served_region_ids",
+    "sites": [
+      {
+        "availability_profile_id": "clear_sky_reference",
+        "gateway_bandwidth_bps": 100000000000,
+        "gateway_id": "gw_us_ashburn",
+        "lat_deg": 39.03,
+        "lon_deg": -77.47,
+        "served_region_ids": [
+          "us_east"
+        ]
+      },
+      {
+        "availability_profile_id": "clear_sky_reference",
+        "gateway_bandwidth_bps": 100000000000,
+        "gateway_id": "gw_eu_frankfurt",
+        "lat_deg": 50.11,
+        "lon_deg": 8.68,
+        "served_region_ids": [
+          "europe_west"
+        ]
+      },
+      {
+        "availability_profile_id": "clear_sky_reference",
+        "gateway_bandwidth_bps": 100000000000,
+        "gateway_id": "gw_asia_tokyo",
+        "lat_deg": 35.68,
+        "lon_deg": 139.76,
+        "served_region_ids": [
+          "asia_east"
+        ]
+      }
+    ]
+  },
+  "geography": {
+    "demand_weight_normalization": "require_sum_one",
+    "mode": "named_gateway_service_regions",
+    "regions": [
+      {
+        "demand_weight": 0.4,
+        "lat_deg": 39.0,
+        "lon_deg": -77.0,
+        "market_class": "core_cloud",
+        "region_id": "us_east",
+        "region_name": "US East",
+        "timezone_utc_offset_h": -5,
+        "weight_source": "example_region_mix"
+      },
+      {
+        "demand_weight": 0.3,
+        "lat_deg": 50.1,
+        "lon_deg": 8.7,
+        "market_class": "core_cloud",
+        "region_id": "europe_west",
+        "region_name": "Europe West",
+        "timezone_utc_offset_h": 1,
+        "weight_source": "example_region_mix"
+      },
+      {
+        "demand_weight": 0.3,
+        "lat_deg": 35.7,
+        "lon_deg": 139.7,
+        "market_class": "core_cloud",
+        "region_id": "asia_east",
+        "region_name": "Asia East",
+        "timezone_utc_offset_h": 9,
+        "weight_source": "example_region_mix"
+      }
+    ]
+  },
+  "output": {
+    "bundle_dir": "examples/workloads/trace_examples/long_context_session_stress",
+    "emit_timebin_demand": true,
+    "overwrite": true
+  },
+  "output_bundle_schema": "orbitserve.workload",
+  "provenance": {
+    "notes": [
+      "Long-context multi-turn trace for KV cache, context growth, and recompute/sticky-routing sensitivity."
+    ],
+    "sources": [
+      "OrbitServe synthetic workload trace example"
+    ]
+  },
+  "schema_version": "orbitserve.workload_description",
+  "seed": 404,
+  "sessions": {
+    "context_window_tokens": 32768,
+    "gap_distribution": {
+      "buckets": [
+        {
+          "max_s": 30,
+          "min_s": 5,
+          "name": "short_gap",
+          "weight": 0.45
+        },
+        {
+          "max_s": 300,
+          "min_s": 60,
+          "name": "medium_gap",
+          "weight": 0.4
+        },
+        {
+          "max_s": 1200,
+          "min_s": 600,
+          "name": "long_gap",
+          "weight": 0.15
+        }
+      ],
+      "type": "bucketed_uniform"
+    },
+    "session_mode": "open_loop_turn_arrivals",
+    "session_ratio": 0.7,
+    "session_ttl_s": 1200,
+    "turn_count_distribution": "session_stress"
+  },
+  "slo": {
+    "classes": [
+      {
+        "e2e_deadline_s": 60,
+        "priority": "interactive",
+        "slo_class": "interactive_10s",
+        "ttft_deadline_s": 10,
+        "weight": 0.25
+      },
+      {
+        "e2e_deadline_s": 60,
+        "priority": "relaxed",
+        "slo_class": "relaxed_60s",
+        "ttft_deadline_s": 10,
+        "weight": 0.65
+      },
+      {
+        "e2e_deadline_s": 300,
+        "priority": "batch",
+        "slo_class": "batch_300s",
+        "ttft_deadline_s": null,
+        "weight": 0.1
+      }
+    ],
+    "mix": "relaxed_heavy"
+  },
+  "source_mode": "synthetic_generation",
+  "time": {
+    "epoch": "synthetic_day_0",
+    "time_bin_s": 300,
+    "time_horizon_s": 5400
+  },
+  "tokens": {
+    "bytes_per_input_token": 4,
+    "bytes_per_output_token": 4,
+    "model_family": "llama_70b_like",
+    "request_metadata_bytes": 512,
+    "response_metadata_bytes": 256,
+    "task_mix": [
+      {
+        "output_distribution": {
+          "max": 3072,
+          "min": 128,
+          "p50": 512,
+          "p95": 1536,
+          "p99": 2048,
+          "type": "quantile_buckets"
+        },
+        "prompt_distribution": {
+          "max": 32768,
+          "min": 2048,
+          "p50": 8192,
+          "p95": 24576,
+          "p99": 32768,
+          "type": "quantile_buckets"
+        },
+        "task_type": "long_context_qa",
+        "weight": 0.45
+      },
+      {
+        "output_distribution": {
+          "max": 4096,
+          "min": 128,
+          "p50": 512,
+          "p95": 1536,
+          "p99": 2048,
+          "type": "quantile_buckets"
+        },
+        "prompt_distribution": {
+          "max": 32768,
+          "min": 2048,
+          "p50": 6144,
+          "p95": 16384,
+          "p99": 24576,
+          "type": "quantile_buckets"
+        },
+        "task_type": "summarization",
+        "weight": 0.35
+      },
+      {
+        "output_distribution": {
+          "max": 8192,
+          "min": 256,
+          "p50": 1024,
+          "p95": 4096,
+          "p99": 6144,
+          "type": "quantile_buckets"
+        },
+        "prompt_distribution": {
+          "max": 32768,
+          "min": 1024,
+          "p50": 4096,
+          "p95": 12288,
+          "p99": 20000,
+          "type": "quantile_buckets"
+        },
+        "task_type": "code",
+        "weight": 0.2
+      }
+    ]
+  },
+  "validation": {
+    "max_generated_requests": 2000,
+    "normalize_region_weights": false,
+    "reject_runtime_fields": true,
+    "require_unique_request_id": true,
+    "sort_requests": true
+  },
+  "workload_id": "long_context_session_stress"
+}

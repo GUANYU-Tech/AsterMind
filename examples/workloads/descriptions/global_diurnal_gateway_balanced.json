@@ -1,0 +1,235 @@
+{
+  "arrival": {
+    "day_profile": "weekday",
+    "diurnal_profile": "mixed_chatllm",
+    "lambda_global": 0.07,
+    "load_scale": 1.0,
+    "process": "nhpp_synthetic"
+  },
+  "bursts": [],
+  "gateways": {
+    "access_mode": "gateway_sgl",
+    "mapping_policy": "served_region_ids",
+    "sites": [
+      {
+        "availability_profile_id": "clear_sky_reference",
+        "gateway_bandwidth_bps": 100000000000,
+        "gateway_id": "gw_us_ashburn",
+        "lat_deg": 39.03,
+        "lon_deg": -77.47,
+        "served_region_ids": [
+          "us_east"
+        ]
+      },
+      {
+        "availability_profile_id": "clear_sky_reference",
+        "gateway_bandwidth_bps": 100000000000,
+        "gateway_id": "gw_eu_frankfurt",
+        "lat_deg": 50.11,
+        "lon_deg": 8.68,
+        "served_region_ids": [
+          "europe_west"
+        ]
+      },
+      {
+        "availability_profile_id": "clear_sky_reference",
+        "gateway_bandwidth_bps": 100000000000,
+        "gateway_id": "gw_asia_tokyo",
+        "lat_deg": 35.68,
+        "lon_deg": 139.76,
+        "served_region_ids": [
+          "asia_east"
+        ]
+      }
+    ]
+  },
+  "geography": {
+    "demand_weight_normalization": "require_sum_one",
+    "mode": "named_gateway_service_regions",
+    "regions": [
+      {
+        "demand_weight": 0.4,
+        "lat_deg": 39.0,
+        "lon_deg": -77.0,
+        "market_class": "core_cloud",
+        "region_id": "us_east",
+        "region_name": "US East",
+        "timezone_utc_offset_h": -5,
+        "weight_source": "example_region_mix"
+      },
+      {
+        "demand_weight": 0.3,
+        "lat_deg": 50.1,
+        "lon_deg": 8.7,
+        "market_class": "core_cloud",
+        "region_id": "europe_west",
+        "region_name": "Europe West",
+        "timezone_utc_offset_h": 1,
+        "weight_source": "example_region_mix"
+      },
+      {
+        "demand_weight": 0.3,
+        "lat_deg": 35.7,
+        "lon_deg": 139.7,
+        "market_class": "core_cloud",
+        "region_id": "asia_east",
+        "region_name": "Asia East",
+        "timezone_utc_offset_h": 9,
+        "weight_source": "example_region_mix"
+      }
+    ]
+  },
+  "output": {
+    "bundle_dir": "examples/workloads/trace_examples/global_diurnal_gateway_balanced",
+    "emit_timebin_demand": true,
+    "overwrite": true
+  },
+  "output_bundle_schema": "orbitserve.workload",
+  "provenance": {
+    "notes": [
+      "Three-region gateway trace with mixed ChatLLM diurnal skew and balanced task/SLO mix."
+    ],
+    "sources": [
+      "OrbitServe synthetic workload trace example"
+    ]
+  },
+  "schema_version": "orbitserve.workload_description",
+  "seed": 202,
+  "sessions": {
+    "context_window_tokens": 32768,
+    "gap_distribution": "mixed_gap",
+    "session_mode": "open_loop_turn_arrivals",
+    "session_ratio": 0.35,
+    "session_ttl_s": 600,
+    "turn_count_distribution": "light_session"
+  },
+  "slo": {
+    "classes": [
+      {
+        "e2e_deadline_s": 30,
+        "priority": "interactive",
+        "slo_class": "interactive_5s",
+        "ttft_deadline_s": 5,
+        "weight": 0.6
+      },
+      {
+        "e2e_deadline_s": 60,
+        "priority": "interactive",
+        "slo_class": "interactive_10s",
+        "ttft_deadline_s": 10,
+        "weight": 0.2
+      },
+      {
+        "e2e_deadline_s": 60,
+        "priority": "relaxed",
+        "slo_class": "relaxed_60s",
+        "ttft_deadline_s": 10,
+        "weight": 0.2
+      }
+    ],
+    "mix": "balanced"
+  },
+  "source_mode": "synthetic_generation",
+  "time": {
+    "epoch": "synthetic_day_0",
+    "time_bin_s": 300,
+    "time_horizon_s": 3600
+  },
+  "tokens": {
+    "bytes_per_input_token": 4,
+    "bytes_per_output_token": 4,
+    "model_family": "llama_70b_like",
+    "request_metadata_bytes": 512,
+    "response_metadata_bytes": 256,
+    "task_mix": [
+      {
+        "output_distribution": {
+          "max": 4096,
+          "min": 32,
+          "p50": 256,
+          "p95": 1024,
+          "p99": 2048,
+          "type": "quantile_buckets"
+        },
+        "prompt_distribution": {
+          "max": 8192,
+          "min": 128,
+          "p50": 768,
+          "p95": 2048,
+          "p99": 4096,
+          "type": "quantile_buckets"
+        },
+        "task_type": "conversation",
+        "weight": 0.55
+      },
+      {
+        "output_distribution": {
+          "max": 8192,
+          "min": 128,
+          "p50": 512,
+          "p95": 2048,
+          "p99": 4096,
+          "type": "quantile_buckets"
+        },
+        "prompt_distribution": {
+          "max": 12000,
+          "min": 256,
+          "p50": 1024,
+          "p95": 4096,
+          "p99": 8192,
+          "type": "quantile_buckets"
+        },
+        "task_type": "code",
+        "weight": 0.15
+      },
+      {
+        "output_distribution": {
+          "max": 6144,
+          "min": 128,
+          "p50": 512,
+          "p95": 2048,
+          "p99": 4096,
+          "type": "quantile_buckets"
+        },
+        "prompt_distribution": {
+          "max": 8192,
+          "min": 128,
+          "p50": 768,
+          "p95": 2048,
+          "p99": 4096,
+          "type": "quantile_buckets"
+        },
+        "task_type": "math_reasoning",
+        "weight": 0.1
+      },
+      {
+        "output_distribution": {
+          "max": 2048,
+          "min": 128,
+          "p50": 384,
+          "p95": 1024,
+          "p99": 1536,
+          "type": "quantile_buckets"
+        },
+        "prompt_distribution": {
+          "max": 16384,
+          "min": 1024,
+          "p50": 3072,
+          "p95": 8192,
+          "p99": 12288,
+          "type": "quantile_buckets"
+        },
+        "task_type": "summarization",
+        "weight": 0.2
+      }
+    ]
+  },
+  "validation": {
+    "max_generated_requests": 2000,
+    "normalize_region_weights": false,
+    "reject_runtime_fields": true,
+    "require_unique_request_id": true,
+    "sort_requests": true
+  },
+  "workload_id": "global_diurnal_gateway_balanced"
+}

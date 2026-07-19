@@ -1,0 +1,58 @@
+{
+  "design_limits": {
+    "payload_power_limit_w": 500,
+    "satellite_mass_limit_kg": 120
+  },
+  "platform": {
+    "mass_kg": 30,
+    "power_w": 35
+  },
+  "compute": {
+    "mode": "cots",
+    "profile": "jetson_agx_orin_64gb",
+    "purchase_cost_per_unit_usd": 2000,
+    "alpha_pkg": 0.1,
+    "alpha_power_overhead": 0.1,
+    "alpha_mass_overhead": 0.2,
+    "accelerator_count": 2
+  },
+  "storage": {
+    "profile": "nvme_4tb",
+    "device_count": 1
+  },
+  "interconnect": {
+    "alpha_intra": 0.05,
+    "switch_bw_gbs": 64,
+    "switch_count": 1
+  },
+  "communication": {
+    "ground_link_bandwidth_gbps": 1,
+    "ground_link_mass_kg": 2,
+    "ground_link_power_w": 20,
+    "isl_terminal_count": 0,
+    "isl_terminal_bandwidth_gbps": 0,
+    "clink_allocated_usd": 1000
+  },
+  "power": {
+    "dod_max": 0.3,
+    "battery_eol_fraction": 0.8,
+    "solar_specific_power_w_per_kg": 100,
+    "battery_specific_energy_wh_per_kg": 200,
+    "eta_pmad": 0.92,
+    "pv_eol_fraction": 0.85,
+    "power_margin_fraction": 0.2
+  },
+  "thermal": {
+    "radiator_areal_density_kg_m2": 2.8,
+    "radiator_temperature_k": 350,
+    "emissivity": 0.95,
+    "view_factor": 0.85,
+    "environment_heat_flux_w_m2": 150
+  },
+  "cost": {
+    "build_cost_per_kg_usd": 500,
+    "launch_cost_per_kg_usd": 3360,
+    "mass_margin_fraction": 0.2,
+    "capital_recovery_factor": 0.1
+  }
+}

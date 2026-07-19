@@ -1,0 +1,138 @@
+{
+  "experiment_id": "smoke_circular_geometry_runtime_matrix",
+  "description": "Smoke experiment for circular geometry runtime simulation plus the audit-only DSE runtime strategy matrix. Write CLI output to results/experiments/smoke_circular_geometry_runtime_matrix.json.",
+  "constellation": {
+    "name": "smoke_circular_geometry_walker_550km",
+    "application_profile": "ChatLLM inference",
+    "orbital_sets": [
+      {
+        "name": "walker_550_53_motion_smoke",
+        "altitude_km": 550,
+        "inclination_deg": 53,
+        "orbit_type": "circular",
+        "orbital_set_type": "walker_delta",
+        "walker_type": "delta",
+        "raan0_deg": -115,
+        "u0_deg": 52,
+        "planes": 2,
+        "clusters_per_plane": 2,
+        "walker_phase": 1,
+        "epoch": "2026-06-16T00:00:00Z",
+        "min_elevation_deg": 25,
+        "cluster": {
+          "grid_shape": "2x1",
+          "satellites_per_cluster": 2,
+          "formation_frame": "lvlh",
+          "formation_pitch_m": 500,
+          "d_keepout_m": 50,
+          "sigma_navigation_m": 2,
+          "sigma_control_m": 2
+        },
+        "provenance": {
+          "source": "docs/research/parameters/satellite_motion_trace_model.md",
+          "role": "geometry_trace_runtime_matrix_smoke"
+        }
+      }
+    ],
+    "gateway_profile": {
+      "mode": "ground_gateway_smoke",
+      "bandwidth_bps": 1000000000,
+      "setup_delay_s": 0.2,
+      "max_range_km": null,
+      "terminal_count_per_gateway": 1,
+      "terminal_count_per_satellite": 1
+    }
+  },
+  "costing": {
+    "scale_by": "satellite_count"
+  },
+  "workload": {
+    "bundle_dir": "tests/fixtures/workloads/smoke_flat_single_turn_direct"
+  },
+  "serving": {
+    "model": {
+      "name": "llama-like-34b",
+      "parameter_count_b": 34,
+      "precision": "bf16",
+      "max_context_tokens": 8192
+    },
+    "effective_utilization": 0.5
+  },
+  "simulation": {
+    "duration_s": 600,
+    "step_s": 60,
+    "epoch": "2026-06-16T00:00:00Z",
+    "trace_model": "circular_geometry_trace",
+    "trace_output_dir": "/tmp/orbitserve_test_traces/smoke_circular_geometry_runtime_matrix",
+    "trace_options": {
+      "propagation_model": "circular_two_body",
+      "eci_ecef_model": "simplified_gmst",
+      "ground_ingress_source": "workload_bundle_gateways_and_direct_requests",
+      "time_grid": {
+        "boundary_tolerance_s": 1,
+        "min_window_duration_s": 5,
+        "merge_gap_s": 2
+      },
+      "optical_constraint_profiles": {
+        "default": {
+          "field_of_regard_deg": null,
+          "pointing_model": "placeholder_pass",
+          "acquisition_model": "setup_delay_only",
+          "sun_exclusion_angle_deg": null
+        }
+      },
+      "shadow_model": {
+        "model": "cylindrical_eclipse",
+        "sun_vector_model": "simple_epoch_fixed",
+        "atmosphere_margin_km": 0
+      },
+      "stk_calibration": {
+        "enabled": false,
+        "import_dir": null
+      }
+    }
+  },
+  "scheduler": {
+    "policy": "shortest_path",
+    "lookahead_orbits": 1,
+    "max_hop_count": 2
+  },
+  "dse": {
+    "enabled": true,
+    "sweep": {
+      "altitude_km": [
+        550,
+        650
+      ],
+      "plane_count": [
+        2
+      ]
+    },
+    "runtime_matrix": {
+      "enabled": true,
+      "include_current_policy": true,
+      "policies": [
+        "local_only",
+        "shortest_path",
+        "load_aware",
+        "energy_aware",
+        "orbitserve"
+      ],
+      "allow_preliminary_runtime_metrics": true,
+      "ignore_optional_cost": true,
+      "objective": {
+        "name": "preliminary_cost_slo_weighted",
+        "missing_metric_policy": "keep_with_warning",
+        "weights": {
+          "served": 1.0,
+          "tail": 1.0,
+          "cost": 0.0
+        }
+      }
+    }
+  },
+  "hardware": {
+    "mode": "from_cost_case",
+    "source_case_path": "examples/single_satellite/h200_gpu_derived.json"
+  }
+}

@@ -1,0 +1,147 @@
+{
+  "arrival": {
+    "day_profile": "weekday",
+    "diurnal_profile": "flat",
+    "lambda_global": 0.08,
+    "load_scale": 1.0,
+    "process": "nhpp_synthetic"
+  },
+  "bursts": [],
+  "gateways": {
+    "access_mode": "direct_user_sgl",
+    "mapping_policy": "region_center",
+    "sites": []
+  },
+  "geography": {
+    "demand_weight_normalization": "require_sum_one",
+    "mode": "named_gateway_service_regions",
+    "regions": [
+      {
+        "demand_weight": 1.0,
+        "lat_deg": 39.0,
+        "lon_deg": -77.0,
+        "market_class": "core_cloud",
+        "region_id": "us_east",
+        "region_name": "US East",
+        "timezone_utc_offset_h": -5,
+        "weight_source": "single_region_smoke"
+      }
+    ]
+  },
+  "output": {
+    "bundle_dir": "tests/fixtures/workloads/smoke_flat_single_turn_direct",
+    "emit_timebin_demand": true,
+    "overwrite": true
+  },
+  "output_bundle_schema": "orbitserve.workload",
+  "provenance": {
+    "notes": [
+      "Flat single-region direct-user smoke trace for parser and schema compatibility checks."
+    ],
+    "sources": [
+      "OrbitServe synthetic workload trace example"
+    ]
+  },
+  "schema_version": "orbitserve.workload_description",
+  "seed": 101,
+  "sessions": {
+    "context_window_tokens": 8192,
+    "gap_distribution": {
+      "type": "constant",
+      "value_s": 0
+    },
+    "session_mode": "open_loop_turn_arrivals",
+    "session_ratio": 0.0,
+    "session_ttl_s": 0,
+    "turn_count_distribution": "single_turn_only"
+  },
+  "slo": {
+    "classes": [
+      {
+        "e2e_deadline_s": 30,
+        "priority": "interactive",
+        "slo_class": "interactive_5s",
+        "ttft_deadline_s": 5,
+        "weight": 0.6
+      },
+      {
+        "e2e_deadline_s": 60,
+        "priority": "interactive",
+        "slo_class": "interactive_10s",
+        "ttft_deadline_s": 10,
+        "weight": 0.2
+      },
+      {
+        "e2e_deadline_s": 60,
+        "priority": "relaxed",
+        "slo_class": "relaxed_60s",
+        "ttft_deadline_s": 10,
+        "weight": 0.2
+      }
+    ],
+    "mix": "balanced"
+  },
+  "source_mode": "synthetic_generation",
+  "time": {
+    "epoch": "synthetic_day_0",
+    "time_bin_s": 60,
+    "time_horizon_s": 900
+  },
+  "tokens": {
+    "bytes_per_input_token": 4,
+    "bytes_per_output_token": 4,
+    "model_family": "llama_70b_like",
+    "request_metadata_bytes": 512,
+    "response_metadata_bytes": 256,
+    "task_mix": [
+      {
+        "output_distribution": {
+          "max": 768,
+          "min": 32,
+          "p50": 96,
+          "p95": 256,
+          "p99": 512,
+          "type": "quantile_buckets"
+        },
+        "prompt_distribution": {
+          "max": 1536,
+          "min": 64,
+          "p50": 256,
+          "p95": 768,
+          "p99": 1024,
+          "type": "quantile_buckets"
+        },
+        "task_type": "conversation",
+        "weight": 0.8
+      },
+      {
+        "output_distribution": {
+          "max": 1024,
+          "min": 64,
+          "p50": 160,
+          "p95": 384,
+          "p99": 768,
+          "type": "quantile_buckets"
+        },
+        "prompt_distribution": {
+          "max": 4096,
+          "min": 512,
+          "p50": 1024,
+          "p95": 2048,
+          "p99": 3072,
+          "type": "quantile_buckets"
+        },
+        "task_type": "summarization",
+        "weight": 0.2
+      }
+    ]
+  },
+  "validation": {
+    "max_generated_requests": 2000,
+    "normalize_region_weights": false,
+    "reject_runtime_fields": true,
+    "require_unique_request_id": true,
+    "sort_requests": true
+  },
+  "workload_id": "smoke_flat_single_turn_direct"
+}

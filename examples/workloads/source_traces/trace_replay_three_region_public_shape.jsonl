@@ -1,0 +1,12 @@
+{"output_tokens": 128, "prompt_tokens": 420, "region_id": "us_east", "task_type": "conversation", "timestamp_s": 20, "trace_id": "trace_us_0001"}
+{"output_tokens": 256, "prompt_tokens": 780, "region_id": "us_east", "task_type": "conversation", "timestamp_s": 65, "trace_id": "trace_us_0002"}
+{"output_tokens": 360, "prompt_tokens": 1800, "region_id": "europe_west", "task_type": "summarization", "timestamp_s": 130, "trace_id": "trace_eu_0001"}
+{"output_tokens": 640, "prompt_tokens": 640, "region_id": "asia_east", "task_type": "math_reasoning", "timestamp_s": 260, "trace_id": "trace_as_0001"}
+{"output_tokens": 512, "prompt_tokens": 4096, "region_id": "europe_west", "task_type": "long_context_qa", "timestamp_s": 340, "trace_id": "trace_eu_0002"}
+{"output_tokens": 1536, "prompt_tokens": 1200, "region_id": "us_east", "task_type": "code", "timestamp_s": 500, "trace_id": "trace_us_0003"}
+{"output_tokens": 256, "prompt_tokens": 2200, "region_id": "asia_east", "task_type": "summarization", "timestamp_s": 760, "trace_id": "trace_as_0002"}
+{"output_tokens": 960, "prompt_tokens": 1600, "region_id": "asia_east", "task_type": "conversation", "timestamp_s": 900, "trace_id": "trace_as_0003"}
+{"output_tokens": 768, "prompt_tokens": 3200, "region_id": "europe_west", "task_type": "code", "timestamp_s": 1120, "trace_id": "trace_eu_0003"}
+{"output_tokens": 160, "prompt_tokens": 900, "region_id": "us_east", "task_type": "conversation", "timestamp_s": 1400, "trace_id": "trace_us_0004"}
+{"output_tokens": 512, "prompt_tokens": 5000, "region_id": "europe_west", "task_type": "long_context_qa", "timestamp_s": 1700, "trace_id": "trace_eu_0004"}
+{"output_tokens": 2048, "prompt_tokens": 700, "region_id": "asia_east", "task_type": "math_reasoning", "timestamp_s": 2000, "trace_id": "trace_as_0004"}

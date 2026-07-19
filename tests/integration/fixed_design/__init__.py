@@ -1,0 +1,1 @@
+"""Fixed-design integration tests."""

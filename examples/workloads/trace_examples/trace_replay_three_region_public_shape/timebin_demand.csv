@@ -1,0 +1,12 @@
+time_bin_start_s,time_bin_end_s,region_id,request_count,prompt_tokens_total,new_user_tokens_total,output_tokens_total,interactive_request_count,burst_request_count
+0,300.0,asia_east,1,640,640,640,1,0
+0,300.0,europe_west,1,1800,1800,360,1,0
+0,300.0,us_east,2,1200,1200,384,1,0
+300.0,600.0,europe_west,1,4096,4096,512,0,0
+300.0,600.0,us_east,1,1200,1200,1536,1,0
+600.0,900.0,asia_east,1,2200,2200,256,1,0
+900.0,1200.0,asia_east,1,1600,1600,960,0,0
+900.0,1200.0,europe_west,1,3200,3200,768,1,0
+1200.0,1500.0,us_east,1,900,900,160,1,0
+1500.0,1800.0,europe_west,1,5000,5000,512,1,0
+1800.0,2100.0,asia_east,1,700,700,2048,0,0

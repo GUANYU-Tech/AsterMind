@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "OrbitServe"
+version = "0.0.1"
+description = "Private research artifact for OrbitServe LEO AI serving cost-SLO co-design."
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.setuptools]
+packages = [
+  "orbitserve",
+  "orbitserve.architecture",
+  "orbitserve.architecture.single_satellite_cost",
+  "orbitserve.baselines",
+  "orbitserve.baselines.ground",
+  "orbitserve.common",
+  "orbitserve.dse",
+  "orbitserve.experiments",
+  "orbitserve.runtime",
+  "orbitserve.runtime.engines",
+  "orbitserve.serving",
+  "orbitserve.orbit",
+  "orbitserve.workload",
+]
+
+[tool.setuptools.package-dir]
+orbitserve = "src/orbitserve"
+"orbitserve.experiments" = "src/experiments"
+"orbitserve.dse" = "src/dse"
+"orbitserve.baselines" = "src/baselines"
+"orbitserve.baselines.ground" = "src/baselines/ground"

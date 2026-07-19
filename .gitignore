@@ -1,0 +1,5 @@
+# Research documents are maintained locally and are not uploaded.
+/docs/
+
+# Generated experiment output.
+/results/

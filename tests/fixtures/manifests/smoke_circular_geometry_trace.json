@@ -1,0 +1,108 @@
+{
+  "constellation": {
+    "application_profile": "ChatLLM inference",
+    "gateway_profile": {
+      "bandwidth_bps": 1000000000,
+      "max_range_km": null,
+      "mode": "ground_gateway_smoke",
+      "setup_delay_s": 0.2,
+      "terminal_count_per_gateway": 1,
+      "terminal_count_per_satellite": 1
+    },
+    "name": "smoke_circular_geometry_walker_550km",
+    "orbital_sets": [
+      {
+        "altitude_km": 550,
+        "cluster": {
+          "d_keepout_m": 50,
+          "formation_frame": "lvlh",
+          "formation_pitch_m": 500,
+          "grid_shape": "2x1",
+          "satellites_per_cluster": 2,
+          "sigma_control_m": 2,
+          "sigma_navigation_m": 2
+        },
+        "clusters_per_plane": 2,
+        "epoch": "2026-06-16T00:00:00Z",
+        "inclination_deg": 53,
+        "min_elevation_deg": 25,
+        "name": "walker_550_53_motion_smoke",
+        "orbit_type": "circular",
+        "orbital_set_type": "walker_delta",
+        "planes": 2,
+        "provenance": {
+          "role": "geometry_trace_smoke",
+          "source": "docs/research/parameters/satellite_motion_trace_model.md"
+        },
+        "raan0_deg": -115,
+        "u0_deg": 52,
+        "walker_phase": 1,
+        "walker_type": "delta"
+      }
+    ]
+  },
+  "costing": {
+    "scale_by": "satellite_count"
+  },
+  "description": "Smoke experiment for the circular geometry satellite motion/access/link/shadow trace path. CLI output is isolated at /tmp/orbitserve-refactor-baseline/canonical/smoke_circular_geometry_trace.json.",
+  "dse": {
+    "enabled": false,
+    "sweep": {}
+  },
+  "experiment_id": "smoke_circular_geometry_trace",
+  "scheduler": {
+    "lookahead_orbits": 1,
+    "max_hop_count": 2,
+    "policy": "shortest_path"
+  },
+  "serving": {
+    "effective_utilization": 0.5,
+    "model": {
+      "max_context_tokens": 8192,
+      "name": "llama-like-34b",
+      "parameter_count_b": 34,
+      "precision": "bf16"
+    }
+  },
+  "simulation": {
+    "duration_s": 600,
+    "epoch": "2026-06-16T00:00:00Z",
+    "step_s": 60,
+    "trace_model": "circular_geometry_trace",
+    "trace_options": {
+      "eci_ecef_model": "simplified_gmst",
+      "ground_ingress_source": "workload_bundle_gateways_and_direct_requests",
+      "optical_constraint_profiles": {
+        "default": {
+          "acquisition_model": "setup_delay_only",
+          "field_of_regard_deg": null,
+          "pointing_model": "placeholder_pass",
+          "sun_exclusion_angle_deg": null
+        }
+      },
+      "propagation_model": "circular_two_body",
+      "shadow_model": {
+        "atmosphere_margin_km": 0,
+        "model": "cylindrical_eclipse",
+        "sun_vector_model": "simple_epoch_fixed"
+      },
+      "stk_calibration": {
+        "enabled": false,
+        "import_dir": null
+      },
+      "time_grid": {
+        "boundary_tolerance_s": 1,
+        "merge_gap_s": 2,
+        "min_window_duration_s": 5
+      }
+    },
+    "trace_output_dir": "/tmp/orbitserve_test_traces/smoke_circular_geometry_trace"
+  },
+  "workload": {
+    "bundle_dir": "tests/fixtures/workloads/smoke_flat_single_turn_direct"
+  },
+  "hardware": {
+    "mode": "from_cost_case",
+    "source_case_path": "examples/single_satellite/h200_gpu_derived.json"
+  }
+}

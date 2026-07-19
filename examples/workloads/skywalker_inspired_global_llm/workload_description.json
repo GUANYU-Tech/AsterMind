@@ -1,0 +1,283 @@
+{
+  "schema_version": "orbitserve.workload_description",
+  "workload_id": "skywalker_inspired_global_llm_explicit_small",
+  "source_mode": "explicit_requests",
+  "output_bundle_schema": "orbitserve.workload",
+  "explicit_requests": {
+    "requests_path": "examples/workloads/skywalker_inspired_global_llm/requests.jsonl",
+    "sessions_path": "examples/workloads/skywalker_inspired_global_llm/sessions.jsonl",
+    "format": "jsonl",
+    "request_schema": "orbitserve.workload.request"
+  },
+  "time": {
+    "epoch": "synthetic_day_0_utc",
+    "time_horizon_s": 86400,
+    "time_bin_s": 3600,
+    "arrival_time_unit": "seconds_since_epoch"
+  },
+  "geography": {
+    "mode": "named_gateway_service_regions",
+    "demand_weight_normalization": "require_sum_one",
+    "regions": [
+      {
+        "region_id": "us_east",
+        "region_name": "US East",
+        "lat_deg": 39.0,
+        "lon_deg": -77.0,
+        "timezone_utc_offset_h": -5,
+        "demand_weight": 0.4,
+        "weight_source": "synthetic_skywalker_inspired_target_mix",
+        "market_class": "core_cloud"
+      },
+      {
+        "region_id": "europe_west",
+        "region_name": "Europe West",
+        "lat_deg": 50.1,
+        "lon_deg": 8.7,
+        "timezone_utc_offset_h": 1,
+        "demand_weight": 0.3,
+        "weight_source": "synthetic_skywalker_inspired_target_mix",
+        "market_class": "core_cloud"
+      },
+      {
+        "region_id": "asia_east",
+        "region_name": "Asia East",
+        "lat_deg": 35.7,
+        "lon_deg": 139.7,
+        "timezone_utc_offset_h": 9,
+        "demand_weight": 0.3,
+        "weight_source": "synthetic_skywalker_inspired_target_mix",
+        "market_class": "core_cloud"
+      }
+    ]
+  },
+  "gateways": {
+    "access_mode": "gateway_sgl",
+    "mapping_policy": "one_gateway_per_service_region",
+    "sites": [
+      {
+        "gateway_id": "gw_us_ashburn",
+        "lat_deg": 39.03,
+        "lon_deg": -77.47,
+        "served_region_ids": [
+          "us_east"
+        ],
+        "gateway_bandwidth_bps": 100000000000,
+        "availability_profile_id": "clear_sky_reference"
+      },
+      {
+        "gateway_id": "gw_eu_frankfurt",
+        "lat_deg": 50.11,
+        "lon_deg": 8.68,
+        "served_region_ids": [
+          "europe_west"
+        ],
+        "gateway_bandwidth_bps": 100000000000,
+        "availability_profile_id": "clear_sky_reference"
+      },
+      {
+        "gateway_id": "gw_asia_tokyo",
+        "lat_deg": 35.68,
+        "lon_deg": 139.76,
+        "served_region_ids": [
+          "asia_east"
+        ],
+        "gateway_bandwidth_bps": 100000000000,
+        "availability_profile_id": "clear_sky_reference"
+      }
+    ]
+  },
+  "arrival": {
+    "process": "explicit_requests",
+    "diurnal_profile": "manual_mixed_chatllm_shifted_by_local_time",
+    "load_shape_notes": [
+      "Asia requests concentrate around UTC 01:00 and 11:00-13:50, matching local workday/evening windows.",
+      "Europe requests concentrate around UTC 08:10-09:04 and 16:30-20:20.",
+      "US requests appear near UTC 00:10-02:10 and 14:30-23:05, matching US local evening/workday periods."
+    ],
+    "request_count": 60,
+    "region_request_counts": {
+      "us_east": 24,
+      "asia_east": 18,
+      "europe_west": 18
+    }
+  },
+  "tokens": {
+    "validate_only": true,
+    "model_family": "llama_70b_like",
+    "bytes_per_input_token": 4,
+    "bytes_per_output_token": 4,
+    "request_metadata_bytes": 512,
+    "response_metadata_bytes": 256,
+    "task_counts": {
+      "conversation": 30,
+      "code": 9,
+      "math_reasoning": 8,
+      "summarization": 8,
+      "long_context_qa": 5
+    },
+    "prompt_token_stats": {
+      "p50": 3236,
+      "p95": 16612,
+      "p99": 22720,
+      "max": 22720
+    },
+    "output_token_stats": {
+      "p50": 256,
+      "p95": 2048,
+      "p99": 3072,
+      "max": 3072
+    }
+  },
+  "slo": {
+    "validate_only": true,
+    "class_counts": {
+      "interactive_5s": 29,
+      "interactive_10s": 15,
+      "relaxed_60s": 16
+    },
+    "classes": [
+      {
+        "slo_class": "interactive_5s",
+        "ttft_deadline_s": 5,
+        "e2e_deadline_s": 30
+      },
+      {
+        "slo_class": "interactive_10s",
+        "ttft_deadline_s": 10,
+        "e2e_deadline_s": 60
+      },
+      {
+        "slo_class": "relaxed_60s",
+        "ttft_deadline_s": 10,
+        "e2e_deadline_s": 60
+      }
+    ]
+  },
+  "sessions": {
+    "validate_only": true,
+    "session_mode": "open_loop_turn_arrivals",
+    "session_count": 20,
+    "turn_count_distribution": {
+      "1": 2,
+      "2": 5,
+      "3": 5,
+      "4": 7,
+      "5": 1
+    },
+    "session_ttl_s": 900,
+    "context_window_tokens": 32768,
+    "kv_locality_fields": [
+      "session_id",
+      "turn_index",
+      "context_tokens_before_turn"
+    ]
+  },
+  "bursts": [
+    {
+      "burst_id": "asia_tot_fanout_burst",
+      "region_ids": [
+        "asia_east"
+      ],
+      "start_time_s": 39600,
+      "duration_s": 1920,
+      "multiplier": 3.0,
+      "shape": "clustered_explicit",
+      "task_mix_override": [
+        "math_reasoning",
+        "code",
+        "summarization",
+        "long_context_qa"
+      ],
+      "request_count": 7
+    },
+    {
+      "burst_id": "us_early_evening_reasoning_burst",
+      "region_ids": [
+        "us_east"
+      ],
+      "start_time_s": 7800,
+      "duration_s": 60,
+      "multiplier": 2.0,
+      "shape": "tight_cluster_explicit",
+      "task_mix_override": [
+        "math_reasoning"
+      ],
+      "request_count": 2
+    },
+    {
+      "burst_id": "us_workday_code_burst",
+      "region_ids": [
+        "us_east"
+      ],
+      "start_time_s": 55200,
+      "duration_s": 80,
+      "multiplier": 2.5,
+      "shape": "tight_cluster_explicit",
+      "task_mix_override": [
+        "code",
+        "math_reasoning"
+      ],
+      "request_count": 3
+    },
+    {
+      "burst_id": "eu_evening_launch_burst",
+      "region_ids": [
+        "europe_west"
+      ],
+      "start_time_s": 59400,
+      "duration_s": 4320,
+      "multiplier": 2.0,
+      "shape": "clustered_explicit",
+      "task_mix_override": [
+        "summarization",
+        "conversation",
+        "code",
+        "math_reasoning"
+      ],
+      "request_count": 6
+    },
+    {
+      "burst_id": "us_late_workday_reasoning_burst",
+      "region_ids": [
+        "us_east"
+      ],
+      "start_time_s": 75600,
+      "duration_s": 110,
+      "multiplier": 2.0,
+      "shape": "tight_cluster_explicit",
+      "task_mix_override": [
+        "math_reasoning",
+        "conversation",
+        "summarization"
+      ],
+      "request_count": 4
+    }
+  ],
+  "validation": {
+    "reject_runtime_fields": true,
+    "require_sorted_requests": true,
+    "sort_requests": false,
+    "require_unique_request_id": true,
+    "require_session_turn_continuity": true,
+    "require_prompt_equals_context_plus_new_user_tokens": true
+  },
+  "output": {
+    "bundle_dir": "results/workloads/skywalker_inspired_global_llm",
+    "overwrite": true
+  },
+  "provenance": {
+    "sources": [
+      "Synthetic workload constructed for OrbitServe examples; no original SkyWalker, WildChat, or ChatBot Arena trace rows are included.",
+      "Inspired by the workload structure discussed in SkyWalker/SkyLB: A Locality-Aware Cross-Region Load Balancer for LLM Inference, arXiv:2505.24095.",
+      "Inspired by public chatbot workload characteristics from WildChat and LMSYS/Chatbot Arena style multi-turn conversations."
+    ],
+    "notes": [
+      "This is a small human-reviewable explicit_requests bundle, not a statistically faithful reproduction of any production trace.",
+      "Region counts are fixed to 24/18/18 requests for US/EU/Asia, matching a 40/30/30 target mix.",
+      "Prompt/output tails and burst labels are hand-authored to stress prefill, decode, session KV locality, and regional diurnal skew."
+    ],
+    "seed": 20260624,
+    "authoring_method": "hand-authored deterministic sample, emitted as static UTF-8 JSON/JSONL/Markdown files"
+  }
+}
