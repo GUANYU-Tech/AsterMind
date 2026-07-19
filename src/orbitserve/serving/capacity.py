@@ -9,7 +9,6 @@ from typing import Any
 from ..common import to_jsonable
 from ..architecture import SatelliteHardwareProfile
 from ..common import PerformanceMetrics
-from ..workload import TokenDistribution
 
 
 BYTES_PER_GB = 1e9
@@ -318,6 +317,35 @@ class StageServingProfile:
     def to_dict(self) -> dict[str, Any]:
         return to_jsonable(self)
 
+
+@dataclass(frozen=True)
+class ServingReferenceShape:
+    """Configured model-shape points used to report static serving capacity.
+
+    These values describe the capacity table being evaluated.  They are not
+    derived from, and do not summarize, a workload.
+    """
+
+    prompt_tokens: int = 2048
+    decode_context_tokens: int = 2304
+    kv_context_tokens: int = 2560
+    throughput_prompt_tokens: int = 512
+    throughput_output_tokens: int = 128
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "ServingReferenceShape":
+        data = data or {}
+        return cls(
+            prompt_tokens=max(1, int(_pick(data, "prompt_tokens", 2048))),
+            decode_context_tokens=max(1, int(_pick(data, "decode_context_tokens", 2304))),
+            kv_context_tokens=max(1, int(_pick(data, "kv_context_tokens", 2560))),
+            throughput_prompt_tokens=max(1, int(_pick(data, "throughput_prompt_tokens", 512))),
+            throughput_output_tokens=max(1, int(_pick(data, "throughput_output_tokens", 128))),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return to_jsonable(self)
+
 @dataclass(frozen=True)
 class ServingParallelism:
     strategy: str = "single_satellite"
@@ -461,7 +489,7 @@ class ServingSpec:
     interconnect_utilization: float = 0.7
     memory_reserve_fraction: float = 0.1
     pd_placement: dict[str, Any] = field(default_factory=dict)
-    satellite_budget: dict[str, Any] = field(default_factory=dict)
+    reference_shape: ServingReferenceShape = field(default_factory=ServingReferenceShape)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "ServingSpec":
@@ -492,7 +520,7 @@ class ServingSpec:
             interconnect_utilization=float(_pick(data, "interconnect_utilization", 0.7)),
             memory_reserve_fraction=float(_pick(data, "memory_reserve_fraction", 0.1)),
             pd_placement=dict(data.get("pd_placement") or {}),
-            satellite_budget=dict(data.get("satellite_budget") or {}),
+            reference_shape=ServingReferenceShape.from_dict(data.get("reference_shape")),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -511,7 +539,7 @@ class ServingSpec:
             "interconnect_utilization": self.interconnect_utilization,
             "memory_reserve_fraction": self.memory_reserve_fraction,
             "pd_placement": to_jsonable(self.pd_placement),
-            "satellite_budget": to_jsonable(self.satellite_budget),
+            "reference_shape": self.reference_shape.to_dict(),
         }
 
 
@@ -534,17 +562,10 @@ class ServingCapacityProfile:
     latency_parallelism_routed_path: int
     throughput_parallelism_always_path: int
     throughput_parallelism_routed_path: int
-    satellite_count_used: int
-    serving_satellite_budget_count: int | None
-    constellation_satellite_count: int | None
-    satellite_budget_mode: str | None
-    comparison_group_id: str | None
-    deployment_group_count: int
-    prefill_deployment_group_count: int
-    decode_deployment_group_count: int
+    prefill_satellites_per_group: int
+    decode_satellites_per_group: int
     local_tensor_parallel_degree: int
     data_parallel_replicas_per_group: int
-    total_data_parallel_replicas: int
     min_satellites_for_weights: int
     weight_memory_gb: float
     weight_memory_per_satellite_gb: float
@@ -553,9 +574,6 @@ class ServingCapacityProfile:
     kv_cache_capacity_tokens: int | None
     prefill_tokens_per_s: float | None
     decode_tokens_per_s: float | None
-    request_throughput_per_s: float | None
-    ttft_s: float | None
-    e2e_s: float | None
     prefill_interconnect_time_s: float | None
     decode_interconnect_time_s: float | None
     effective_isl_bandwidth_gbps: float | None
@@ -580,7 +598,7 @@ class ServingCapacityProfile:
             return PerformanceMetrics()
         return PerformanceMetrics(
             evaluated=True,
-            request_throughput_per_s=self.request_throughput_per_s,
+            request_throughput_per_s=None,
             token_throughput_per_s=self.decode_tokens_per_s,
             ttft_p95_s=None,
             e2e_p95_s=None,
@@ -588,7 +606,7 @@ class ServingCapacityProfile:
             decode_tokens_per_s=self.decode_tokens_per_s,
             model_weight_memory_gb=self.weight_memory_gb,
             kv_cache_capacity_tokens=self.kv_cache_capacity_tokens,
-            satellite_count_used=self.satellite_count_used,
+            satellite_count_used=self.satellites_per_deployment,
             feasible=self.feasible,
             bottleneck=", ".join(f"{key}:{value}" for key, value in sorted(self.bottlenecks.items())),
             details=self.to_dict(),
@@ -596,12 +614,10 @@ class ServingCapacityProfile:
         )
 
 
-def estimate_serving_throughput(
+def estimate_serving_capacity(
     serving: ServingSpec,
     *,
     hardware: SatelliteHardwareProfile | None = None,
-    token_distribution: TokenDistribution | None = None,
-    constellation_satellite_count: int | None = None,
 ) -> ServingCapacityProfile:
     """Estimate LLM prefill/decode throughput for a hardware profile."""
 
@@ -609,12 +625,12 @@ def estimate_serving_throughput(
     if resolved_hardware is None:
         return _unevaluated_throughput("serving.hardware is not configured")
     model = serving.model.resolved()
-    token_distribution = token_distribution or TokenDistribution()
+    reference_shape = serving.reference_shape
     parallelism, parallelism_warnings = _resolve_parallelism(
         serving.parallelism,
         model,
         resolved_hardware,
-        constellation_satellite_count=constellation_satellite_count,
+        constellation_satellite_count=None,
         memory_reserve_fraction=serving.memory_reserve_fraction,
     )
 
@@ -627,8 +643,8 @@ def estimate_serving_throughput(
         warnings.append("active_parameter_count_b exceeds parameter_count_b")
     if model.is_moe and model.active_parameter_count_b is None:
         warnings.append("MoE model is missing active_parameter_count_b; active FLOPs fall back to total parameters")
-    if token_distribution.prompt_tokens_p95 > model.max_context_tokens:
-        warnings.append("workload prompt_tokens_p95 exceeds model max_context_tokens")
+    if reference_shape.prompt_tokens > model.max_context_tokens:
+        warnings.append("serving reference prompt length exceeds model max_context_tokens")
 
     layout = _parallel_layout(model, parallelism)
     warnings.extend(layout.placement_warnings)
@@ -636,20 +652,18 @@ def estimate_serving_throughput(
     pool_plan = _pd_pool_plan(
         serving,
         satellites_per_deployment=layout.satellites_per_deployment,
-        constellation_satellite_count=constellation_satellite_count,
+        constellation_satellite_count=None,
     )
     warnings.extend(pool_plan["warnings"])
-    satellite_count_used = pool_plan["satellite_count_used"]
     usable_memory_per_sat = resolved_hardware.total_fast_mem_gb * (1.0 - serving.memory_reserve_fraction)
     weight_memory_gb = model.weight_memory_gb
     weight_breakdown = _weight_memory_breakdown_gb(model, parallelism)
     weight_memory_per_sat = weight_breakdown["total"]
     local_tensor_degree = 1
     replicas_per_group = 1
-    deployment_group_count = pool_plan["deployment_group_count"]
-    prefill_deployment_group_count = pool_plan["prefill_deployment_group_count"]
-    decode_deployment_group_count = pool_plan["decode_deployment_group_count"]
-    total_data_parallel_replicas = layout.dp_replica_factor * deployment_group_count
+    deployment_group_count = 1
+    prefill_deployment_group_count = 1
+    decode_deployment_group_count = 1
     kv_cache_bytes_per_token = model.kv_cache_bytes_per_token
     kv_capacity_tokens = _kv_cache_capacity_tokens(
         serving,
@@ -660,11 +674,6 @@ def estimate_serving_throughput(
     )
     min_sats_for_weights = _min_satellites_for_weights(model, usable_memory_per_sat)
     feasible = True
-    if constellation_satellite_count is not None and satellite_count_used > constellation_satellite_count:
-        feasible = False
-        warnings.append(
-            f"parallelism uses {satellite_count_used} satellites but constellation has {constellation_satellite_count}"
-        )
     if serving.pd_mode == "disaggregated" and (
         prefill_deployment_group_count <= 0 or decode_deployment_group_count <= 0
     ):
@@ -695,12 +704,12 @@ def estimate_serving_throughput(
         )
     decode_context_tokens = min(
         model.max_context_tokens,
-        token_distribution.prompt_tokens_p95 + max(1, token_distribution.output_tokens_p95 // 2),
+        reference_shape.decode_context_tokens,
     )
-    representative_context = token_distribution.prompt_tokens_p95 + token_distribution.output_tokens_p95
+    representative_context = reference_shape.kv_context_tokens
     if kv_capacity_tokens is not None and kv_capacity_tokens < representative_context:
         warnings.append(
-            f"KV cache capacity {kv_capacity_tokens} tokens is below p95 context+output {representative_context}"
+            f"KV cache capacity {kv_capacity_tokens} tokens is below configured reference context {representative_context}"
         )
 
     prefill = _estimate_prefill(
@@ -709,7 +718,7 @@ def estimate_serving_throughput(
         resolved_hardware,
         parallelism,
         layout,
-        prompt_tokens=token_distribution.prompt_tokens_p95,
+        prompt_tokens=reference_shape.prompt_tokens,
         replicas_per_group=replicas_per_group,
         deployment_group_count=prefill_deployment_group_count,
         pd_handoff_active=False,
@@ -730,8 +739,8 @@ def estimate_serving_throughput(
         model,
         resolved_hardware,
         parallelism,
-        prompt_tokens_latency=token_distribution.prompt_tokens_p95,
-        prompt_token_count_for_throughput=token_distribution.prompt_tokens_p50,
+        prompt_tokens_latency=reference_shape.prompt_tokens,
+        prompt_token_count_for_throughput=reference_shape.throughput_prompt_tokens,
         base_required_flows=max(prefill["isl_required_flows"], decode["isl_required_flows"]),
     )
     feasible = feasible and math.isfinite(prefill["latency_s"]) and math.isfinite(decode["latency_s"])
@@ -745,8 +754,8 @@ def estimate_serving_throughput(
     decode_tokens_per_s = decode["token_throughput_per_s"]
     request_throughput = None
     if prefill_tokens_per_s and decode_tokens_per_s:
-        prefill_request_throughput_per_s = prefill_tokens_per_s / max(1, token_distribution.prompt_tokens_p50)
-        decode_request_throughput_per_s = decode_tokens_per_s / max(1, token_distribution.output_tokens_p50)
+        prefill_request_throughput_per_s = prefill_tokens_per_s / reference_shape.throughput_prompt_tokens
+        decode_request_throughput_per_s = decode_tokens_per_s / reference_shape.throughput_output_tokens
         if serving.pd_mode == "disaggregated":
             candidates = [prefill_request_throughput_per_s, decode_request_throughput_per_s]
             if kv_handoff["kv_handoff_request_limit_per_s"] is not None:
@@ -754,8 +763,8 @@ def estimate_serving_throughput(
             request_throughput = min(candidates)
         else:
             request_throughput = 1.0 / (
-                max(1, token_distribution.prompt_tokens_p50) / prefill_tokens_per_s
-                + max(1, token_distribution.output_tokens_p50) / decode_tokens_per_s
+                reference_shape.throughput_prompt_tokens / prefill_tokens_per_s
+                + reference_shape.throughput_output_tokens / decode_tokens_per_s
             )
     ttft_s = (
         None
@@ -763,7 +772,7 @@ def estimate_serving_throughput(
         else serving.prefill.batching_window_ms / 1000.0 + prefill["latency_s"] + kv_handoff["latency_s"]
     )
     e2e_s = None if ttft_s is None or not math.isfinite(decode["latency_s"]) else (
-        ttft_s + token_distribution.output_tokens_p95 * decode["latency_s"]
+        ttft_s + reference_shape.throughput_output_tokens * decode["latency_s"]
     )
     deployment_mode = _deployment_mode(parallelism)
     communication_summary = _merge_communication_summaries(prefill, decode, kv_handoff)
@@ -785,17 +794,10 @@ def estimate_serving_throughput(
         latency_parallelism_routed_path=layout.latency_parallelism_routed_path,
         throughput_parallelism_always_path=layout.throughput_parallelism_always_path,
         throughput_parallelism_routed_path=layout.throughput_parallelism_routed_path,
-        satellite_count_used=satellite_count_used,
-        serving_satellite_budget_count=pool_plan.get("serving_satellite_budget_count"),
-        constellation_satellite_count=constellation_satellite_count,
-        satellite_budget_mode=pool_plan.get("satellite_budget_mode"),
-        comparison_group_id=pool_plan.get("comparison_group_id"),
-        deployment_group_count=deployment_group_count,
-        prefill_deployment_group_count=prefill_deployment_group_count,
-        decode_deployment_group_count=decode_deployment_group_count,
+        prefill_satellites_per_group=layout.satellites_per_deployment,
+        decode_satellites_per_group=layout.satellites_per_deployment,
         local_tensor_parallel_degree=local_tensor_degree,
         data_parallel_replicas_per_group=layout.dp_replica_factor,
-        total_data_parallel_replicas=total_data_parallel_replicas,
         min_satellites_for_weights=min_sats_for_weights,
         weight_memory_gb=weight_memory_gb,
         weight_memory_per_satellite_gb=weight_memory_per_sat,
@@ -804,9 +806,6 @@ def estimate_serving_throughput(
         kv_cache_capacity_tokens=kv_capacity_tokens,
         prefill_tokens_per_s=prefill_tokens_per_s,
         decode_tokens_per_s=decode_tokens_per_s,
-        request_throughput_per_s=request_throughput,
-        ttft_s=ttft_s,
-        e2e_s=e2e_s,
         prefill_interconnect_time_s=prefill["interconnect_time_s"],
         decode_interconnect_time_s=decode["interconnect_time_s"],
         effective_isl_bandwidth_gbps=communication_summary["effective_isl_bandwidth_gbps"],
@@ -832,7 +831,7 @@ def estimate_serving_throughput(
                 "effective_memory_utilization": serving.effective_memory_utilization,
                 "interconnect_utilization": serving.interconnect_utilization,
             },
-            "token_distribution": token_distribution.to_dict(),
+            "reference_shape": reference_shape.to_dict(),
             "parallel_layout": layout.to_dict(),
             "data_parallel_replica_semantics": {
                 "dp_replica_model": layout.dp_replica_model,
@@ -1608,347 +1607,24 @@ def _pd_pool_plan(
     serving: ServingSpec,
     *,
     satellites_per_deployment: int,
-    constellation_satellite_count: int | None,
+    constellation_satellite_count: int | None = None,
 ) -> dict[str, Any]:
-    warnings: list[str] = []
-    satellite_budget = _normalised_satellite_budget(serving.satellite_budget)
-    satellite_budget_mode = _satellite_budget_mode(satellite_budget)
-    comparison_group_id = _optional_str(satellite_budget.get("comparison_group_id")) if satellite_budget else None
-    serving_budget_count, satellite_budget_source, budget_warnings = _resolve_serving_satellite_budget_count(
-        satellite_budget,
-        constellation_satellite_count=constellation_satellite_count,
-    )
-    warnings.extend(budget_warnings)
-
-    if serving.pd_mode == "colocated":
-        pool_satellites = serving_budget_count if serving_budget_count is not None else constellation_satellite_count
-        groups = _deployment_group_count(satellites_per_deployment, pool_satellites)
+    """Describe one static serving deployment; Runtime chooses group counts."""
+    if serving.pd_mode == "disaggregated":
         return {
-            "deployment_group_count": groups,
-            "prefill_deployment_group_count": groups,
-            "decode_deployment_group_count": groups,
-            "satellite_count_used": satellites_per_deployment,
-            "serving_satellite_budget_count": pool_satellites,
-            "constellation_satellite_count": constellation_satellite_count,
-            "satellite_budget_mode": satellite_budget_mode,
-            "satellite_budget_source": satellite_budget_source,
-            "comparison_group_id": comparison_group_id,
-            "satellite_budget_unused_count": _satellite_budget_unused_count(
-                constellation_satellite_count,
-                pool_satellites,
-            ),
-            "prefill_pool_satellites": pool_satellites,
-            "decode_pool_satellites": pool_satellites,
-            "warnings": tuple(dict.fromkeys(warnings)),
-        }
-
-    prefill_fraction, decode_fraction, fraction_warnings, fractions_valid = _resolved_pd_satellite_fractions(
-        pd_mode=serving.pd_mode,
-        prefill_fraction=serving.prefill_satellite_fraction,
-        decode_fraction=serving.decode_satellite_fraction,
-    )
-    warnings.extend(fraction_warnings)
-    if not fractions_valid:
-        return {
-            "deployment_group_count": 0,
-            "prefill_deployment_group_count": 0,
-            "decode_deployment_group_count": 0,
-            "satellite_count_used": 0,
-            "serving_satellite_budget_count": serving_budget_count,
-            "constellation_satellite_count": constellation_satellite_count,
-            "satellite_budget_mode": satellite_budget_mode,
-            "satellite_budget_source": satellite_budget_source,
-            "comparison_group_id": comparison_group_id,
-            "satellite_budget_unused_count": _satellite_budget_unused_count(
-                constellation_satellite_count,
-                serving_budget_count,
-            ),
-            "prefill_pool_satellites": 0,
-            "decode_pool_satellites": 0,
-            "prefill_satellite_fraction": prefill_fraction,
-            "decode_satellite_fraction": decode_fraction,
-            "warnings": tuple(dict.fromkeys(warnings)),
-        }
-
-    if serving_budget_count is None:
-        if serving.prefill_satellite_fraction is not None or serving.decode_satellite_fraction is not None:
-            warnings.append("PD satellite fractions are ignored when constellation_satellite_count is not configured")
-        if satellite_budget:
-            warnings.append("satellite_budget is ignored when no active or constellation satellite count is configured")
-        return {
+            "satellite_count_used": 2 * satellites_per_deployment,
             "deployment_group_count": 1,
             "prefill_deployment_group_count": 1,
             "decode_deployment_group_count": 1,
-            "satellite_count_used": 2 * satellites_per_deployment,
-            "serving_satellite_budget_count": None,
-            "constellation_satellite_count": constellation_satellite_count,
-            "satellite_budget_mode": satellite_budget_mode,
-            "satellite_budget_source": satellite_budget_source,
-            "comparison_group_id": comparison_group_id,
-            "satellite_budget_unused_count": None,
-            "prefill_pool_satellites": satellites_per_deployment,
-            "decode_pool_satellites": satellites_per_deployment,
-            "prefill_satellite_fraction": prefill_fraction,
-            "decode_satellite_fraction": decode_fraction,
-            "warnings": tuple(dict.fromkeys(warnings)),
+            "warnings": (),
         }
-
-    role_plan = _pd_role_pool_plan(
-        satellite_budget,
-        serving_budget_count=serving_budget_count,
-        prefill_fraction=prefill_fraction,
-        decode_fraction=decode_fraction,
-    )
-    warnings.extend(role_plan["warnings"])
-    if not role_plan["valid"]:
-        return {
-            "deployment_group_count": 0,
-            "prefill_deployment_group_count": 0,
-            "decode_deployment_group_count": 0,
-            "satellite_count_used": 0,
-            "serving_satellite_budget_count": serving_budget_count,
-            "constellation_satellite_count": constellation_satellite_count,
-            "satellite_budget_mode": satellite_budget_mode,
-            "satellite_budget_source": satellite_budget_source,
-            "comparison_group_id": comparison_group_id,
-            "satellite_budget_unused_count": _satellite_budget_unused_count(
-                constellation_satellite_count,
-                serving_budget_count,
-            ),
-            "prefill_pool_satellites": 0,
-            "decode_pool_satellites": 0,
-            "prefill_satellite_fraction": prefill_fraction,
-            "decode_satellite_fraction": decode_fraction,
-            "warnings": tuple(dict.fromkeys(warnings)),
-        }
-
-    prefill_pool_satellites = role_plan["prefill_pool_satellites"]
-    decode_pool_satellites = role_plan["decode_pool_satellites"]
-    if serving_budget_count > 0 and "fraction" not in str(role_plan["source"]):
-        prefill_fraction = prefill_pool_satellites / serving_budget_count
-        decode_fraction = decode_pool_satellites / serving_budget_count
-    prefill_groups = prefill_pool_satellites // max(1, satellites_per_deployment)
-    decode_groups = decode_pool_satellites // max(1, satellites_per_deployment)
-    paired_groups = min(prefill_groups, decode_groups)
     return {
-        "deployment_group_count": paired_groups,
-        "prefill_deployment_group_count": prefill_groups,
-        "decode_deployment_group_count": decode_groups,
-        "satellite_count_used": min(serving_budget_count, prefill_pool_satellites + decode_pool_satellites),
-        "serving_satellite_budget_count": serving_budget_count,
-        "constellation_satellite_count": constellation_satellite_count,
-        "satellite_budget_mode": satellite_budget_mode,
-        "satellite_budget_source": satellite_budget_source,
-        "pd_role_budget_source": role_plan["source"],
-        "comparison_group_id": comparison_group_id,
-        "satellite_budget_unused_count": _satellite_budget_unused_count(
-            constellation_satellite_count,
-            serving_budget_count,
-        ),
-        "role_budget_unused_count": max(0, serving_budget_count - prefill_pool_satellites - decode_pool_satellites),
-        "prefill_pool_satellites": prefill_pool_satellites,
-        "decode_pool_satellites": decode_pool_satellites,
-        "prefill_satellite_fraction": prefill_fraction,
-        "decode_satellite_fraction": decode_fraction,
-        "warnings": tuple(dict.fromkeys(warnings)),
+        "satellite_count_used": satellites_per_deployment,
+        "deployment_group_count": 1,
+        "prefill_deployment_group_count": 1,
+        "decode_deployment_group_count": 1,
+        "warnings": (),
     }
-
-
-def _normalised_satellite_budget(value: Any) -> dict[str, Any]:
-    return dict(value) if isinstance(value, dict) else {}
-
-
-def _satellite_budget_mode(satellite_budget: dict[str, Any]) -> str:
-    if not satellite_budget:
-        return "full_constellation_default"
-    return str(satellite_budget.get("mode") or "fixed_total").lower()
-
-
-def _resolve_serving_satellite_budget_count(
-    satellite_budget: dict[str, Any],
-    *,
-    constellation_satellite_count: int | None,
-) -> tuple[int | None, str, tuple[str, ...]]:
-    warnings_out: list[str] = []
-    if not satellite_budget:
-        return constellation_satellite_count, "full_constellation_default", ()
-
-    count, count_key = _budget_int_from_keys(
-        satellite_budget,
-        (
-            "active_satellite_count",
-            "active_satellites",
-            "serving_satellite_budget_count",
-            "serving_satellites",
-            "satellite_count",
-            "total_satellites",
-        ),
-    )
-    if count is not None:
-        resolved = max(0, count)
-        source = count_key or "active_satellite_count"
-    else:
-        fraction, fraction_key = _budget_float_from_keys(
-            satellite_budget,
-            (
-                "active_satellite_fraction",
-                "serving_satellite_fraction",
-                "satellite_fraction",
-                "total_fraction",
-            ),
-        )
-        if fraction is not None:
-            source = fraction_key or "active_satellite_fraction"
-            if constellation_satellite_count is None:
-                warnings_out.append("satellite_budget fraction requires constellation_satellite_count")
-                return None, source, tuple(warnings_out)
-            if not math.isfinite(fraction) or fraction < 0:
-                warnings_out.append("satellite_budget fraction must be finite and non-negative")
-                return 0, source, tuple(warnings_out)
-            resolved = math.floor(constellation_satellite_count * fraction)
-        else:
-            resolved = constellation_satellite_count if constellation_satellite_count is not None else None
-            source = "satellite_budget_default_full_constellation"
-
-    if resolved is not None and constellation_satellite_count is not None and resolved > constellation_satellite_count:
-        warnings_out.append(
-            f"satellite_budget requested {resolved} satellites but constellation has {constellation_satellite_count}; clipping"
-        )
-        resolved = constellation_satellite_count
-    return resolved, source, tuple(warnings_out)
-
-
-def _pd_role_pool_plan(
-    satellite_budget: dict[str, Any],
-    *,
-    serving_budget_count: int,
-    prefill_fraction: float,
-    decode_fraction: float,
-) -> dict[str, Any]:
-    warnings_out: list[str] = []
-    prefill_count, prefill_count_key = _budget_int_from_keys(
-        satellite_budget,
-        (
-            "prefill_satellites",
-            "prefill_satellite_count",
-            "prefill_active_satellite_count",
-            "prefill_pool_satellites",
-        ),
-    )
-    decode_count, decode_count_key = _budget_int_from_keys(
-        satellite_budget,
-        (
-            "decode_satellites",
-            "decode_satellite_count",
-            "decode_active_satellite_count",
-            "decode_pool_satellites",
-        ),
-    )
-    if prefill_count is not None or decode_count is not None:
-        if prefill_count is None:
-            prefill_count = max(0, serving_budget_count - max(0, decode_count or 0))
-            prefill_count_key = "complement_of_decode_satellites"
-        if decode_count is None:
-            decode_count = max(0, serving_budget_count - max(0, prefill_count or 0))
-            decode_count_key = "complement_of_prefill_satellites"
-        prefill_pool = max(0, int(prefill_count))
-        decode_pool = max(0, int(decode_count))
-        source = f"{prefill_count_key}+{decode_count_key}"
-        return _validate_pd_role_pools(
-            prefill_pool,
-            decode_pool,
-            serving_budget_count=serving_budget_count,
-            source=source,
-            warnings_out=warnings_out,
-        )
-
-    budget_prefill_fraction, budget_prefill_key = _budget_float_from_keys(
-        satellite_budget,
-        ("prefill_fraction", "prefill_satellite_fraction"),
-    )
-    budget_decode_fraction, budget_decode_key = _budget_float_from_keys(
-        satellite_budget,
-        ("decode_fraction", "decode_satellite_fraction"),
-    )
-    if budget_prefill_fraction is not None or budget_decode_fraction is not None:
-        resolved_prefill, resolved_decode, fraction_warnings, fractions_valid = _resolved_pd_satellite_fractions(
-            pd_mode="disaggregated",
-            prefill_fraction=budget_prefill_fraction,
-            decode_fraction=budget_decode_fraction,
-        )
-        warnings_out.extend(fraction_warnings)
-        if not fractions_valid:
-            return {
-                "valid": False,
-                "prefill_pool_satellites": 0,
-                "decode_pool_satellites": 0,
-                "source": "satellite_budget_role_fraction",
-                "warnings": tuple(dict.fromkeys(warnings_out)),
-            }
-        prefill_fraction = resolved_prefill
-        decode_fraction = resolved_decode
-        source = f"{budget_prefill_key or 'complement_prefill_fraction'}+{budget_decode_key or 'complement_decode_fraction'}"
-    else:
-        source = "serving_pd_satellite_fraction"
-
-    prefill_pool = math.floor(serving_budget_count * max(0.0, prefill_fraction))
-    decode_pool = math.floor(serving_budget_count * max(0.0, decode_fraction))
-    return _validate_pd_role_pools(
-        prefill_pool,
-        decode_pool,
-        serving_budget_count=serving_budget_count,
-        source=source,
-        warnings_out=warnings_out,
-    )
-
-
-def _validate_pd_role_pools(
-    prefill_pool: int,
-    decode_pool: int,
-    *,
-    serving_budget_count: int,
-    source: str,
-    warnings_out: list[str],
-) -> dict[str, Any]:
-    valid = True
-    if prefill_pool + decode_pool > serving_budget_count:
-        warnings_out.append(
-            "prefill/decode satellite counts exceed serving satellite budget"
-        )
-        valid = False
-    return {
-        "valid": valid,
-        "prefill_pool_satellites": prefill_pool if valid else 0,
-        "decode_pool_satellites": decode_pool if valid else 0,
-        "source": source,
-        "warnings": tuple(dict.fromkeys(warnings_out)),
-    }
-
-
-def _budget_int_from_keys(payload: dict[str, Any], keys: tuple[str, ...]) -> tuple[int | None, str | None]:
-    for key in keys:
-        value = payload.get(key)
-        if value is not None:
-            return int(value), key
-    return None, None
-
-
-def _budget_float_from_keys(payload: dict[str, Any], keys: tuple[str, ...]) -> tuple[float | None, str | None]:
-    for key in keys:
-        value = payload.get(key)
-        if value is not None:
-            return float(value), key
-    return None, None
-
-
-def _satellite_budget_unused_count(
-    constellation_satellite_count: int | None,
-    serving_budget_count: int | None,
-) -> int | None:
-    if constellation_satellite_count is None or serving_budget_count is None:
-        return None
-    return max(0, constellation_satellite_count - serving_budget_count)
-
 
 def _resolved_pd_satellite_fractions(
     *,
@@ -2266,17 +1942,10 @@ def _unevaluated_throughput(message: str) -> ServingCapacityProfile:
         latency_parallelism_routed_path=0,
         throughput_parallelism_always_path=0,
         throughput_parallelism_routed_path=0,
-        satellite_count_used=0,
-        serving_satellite_budget_count=None,
-        constellation_satellite_count=None,
-        satellite_budget_mode=None,
-        comparison_group_id=None,
-        deployment_group_count=0,
-        prefill_deployment_group_count=0,
-        decode_deployment_group_count=0,
+        prefill_satellites_per_group=0,
+        decode_satellites_per_group=0,
         local_tensor_parallel_degree=0,
         data_parallel_replicas_per_group=0,
-        total_data_parallel_replicas=0,
         min_satellites_for_weights=0,
         weight_memory_gb=0.0,
         weight_memory_per_satellite_gb=0.0,
@@ -2285,9 +1954,6 @@ def _unevaluated_throughput(message: str) -> ServingCapacityProfile:
         kv_cache_capacity_tokens=None,
         prefill_tokens_per_s=None,
         decode_tokens_per_s=None,
-        request_throughput_per_s=None,
-        ttft_s=None,
-        e2e_s=None,
         prefill_interconnect_time_s=None,
         decode_interconnect_time_s=None,
         effective_isl_bandwidth_gbps=None,

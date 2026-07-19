@@ -22,7 +22,7 @@ from ..runtime import build_runtime_scenario
 from .runtime_dispatch import evaluate_runtime_performance
 from ..runtime import apply_runtime_energy_envelope
 from ..runtime import get_scheduler
-from ..serving import estimate_serving_throughput
+from ..serving import estimate_serving_capacity
 from ..orbit import run_simulation
 from ..orbit import load_surrogate_trace_bundle
 
@@ -136,11 +136,9 @@ def evaluate_materialized_design(
         experiment_spec,
         satellite_architecture=satellite_architecture,
     )
-    serving_throughput = estimate_serving_throughput(
+    serving_throughput = estimate_serving_capacity(
         serving_spec,
         hardware=satellite_architecture.hardware if satellite_architecture is not None else None,
-        token_distribution=serving_workload,
-        constellation_satellite_count=design.satellite_count,
     )
 
     pre_runtime_warnings = _dedupe(

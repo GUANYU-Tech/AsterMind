@@ -618,14 +618,14 @@ def _materialize_workload_for_runner(
     if token_values is not None:
         from orbitserve.workload import TokenDistribution
         token_distribution = TokenDistribution.from_dict(token_values)
-        token_warning = "workload representative token distribution applied to serving throughput"
+        token_warning = "workload representative token distribution retained for Runtime and DSE"
     else:
-        token_warning = "workload summary lacks complete prompt/output p50/p95; serving uses defaults"
+        token_warning = "workload summary lacks complete prompt/output p50/p95"
     warnings = [f"workload_generation status: {status}", *result_warnings, token_warning]
     payload = dict(payload)
     payload.setdefault("status", status)
     payload["configured"] = True
-    payload["applied_to_serving"] = token_distribution is not None
+    payload["applied_to_serving"] = False
     payload["representative_token_distribution"] = token_values
     payload["warnings"] = tuple(dict.fromkeys(warnings[1:]))
     return to_jsonable(payload), token_distribution, tuple(dict.fromkeys(warnings))

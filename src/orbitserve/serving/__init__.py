@@ -5,10 +5,11 @@ from .capacity import (
     ParallelLayout,
     PrecisionSpec,
     ServingParallelism,
+    ServingReferenceShape,
     ServingSpec,
     ServingCapacityProfile,
     StageServingProfile,
-    estimate_serving_throughput,
+    estimate_serving_capacity,
 )
 
 __all__ = [
@@ -16,8 +17,9 @@ __all__ = [
     "ParallelLayout",
     "PrecisionSpec",
     "ServingParallelism",
+    "ServingReferenceShape",
     "ServingSpec",
     "ServingCapacityProfile",
     "StageServingProfile",
-    "estimate_serving_throughput",
+    "estimate_serving_capacity",
 ]

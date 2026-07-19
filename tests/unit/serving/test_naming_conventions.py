@@ -10,10 +10,9 @@ from orbitserve.architecture.hardware import CommunicationSpec
 from orbitserve.serving.capacity import (
     StageServingProfile,
     ServingSpec,
-    estimate_serving_throughput,
+    estimate_serving_capacity,
 )
 from orbitserve.architecture.single_satellite_cost.models import CommunicationConfig
-from orbitserve.workload import TokenDistribution
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -22,14 +21,6 @@ ROOT = Path(__file__).resolve().parents[3]
 def h200_hardware():
     return hardware_from_single_satellite_case(ROOT / "examples/single_satellite/h200_gpu_derived.json")
 
-
-def chat_workload():
-    return TokenDistribution(
-            prompt_tokens_p50=512,
-            prompt_tokens_p95=2048,
-            output_tokens_p50=128,
-            output_tokens_p95=512,
-    )
 
 
 class ServingNamingConventionTests(unittest.TestCase):
@@ -52,11 +43,9 @@ class ServingNamingConventionTests(unittest.TestCase):
         json.dumps(payload, ensure_ascii=False, allow_nan=False)
 
     def test_serving_outputs_use_capacity_only_for_storage_like_fields(self):
-        result = estimate_serving_throughput(
+        result = estimate_serving_capacity(
             ServingSpec.from_dict({"model": {"preset": "llama3-8b"}}),
             hardware=h200_hardware(),
-            token_distribution=chat_workload(),
-            constellation_satellite_count=6,
         )
         payload = result.to_dict()
         capacity_keys = sorted(key for key in _walk_keys(payload) if "capacity" in key)
@@ -72,7 +61,7 @@ class ServingNamingConventionTests(unittest.TestCase):
 
     def test_bit_byte_units_are_explicit_and_consistent(self):
         hardware = h200_hardware()
-        result = estimate_serving_throughput(
+        result = estimate_serving_capacity(
             ServingSpec.from_dict(
                 {
                     "model": {"preset": "deepseek-moe-671b"},
@@ -80,8 +69,6 @@ class ServingNamingConventionTests(unittest.TestCase):
                 }
             ),
             hardware=hardware,
-            token_distribution=chat_workload(),
-            constellation_satellite_count=4,
         )
         stage = result.provenance["prefill_stage"]
         self.assertIn("ep_communication_bytes", stage)

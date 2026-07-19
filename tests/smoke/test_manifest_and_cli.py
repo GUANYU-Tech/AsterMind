@@ -33,7 +33,7 @@ class ExperimentManifestAndCliTests(unittest.TestCase):
         payload = result.to_dict()
         self.assertTrue(payload["cost"]["evaluated"])
         self.assertTrue(payload["performance"]["evaluated"])
-        self.assertGreater(payload["performance"]["request_throughput_per_s"], 0)
+        self.assertIsNone(payload["performance"]["request_throughput_per_s"])
         self.assertGreater(payload["performance"]["prefill_tokens_per_s"], 0)
         self.assertGreater(payload["performance"]["decode_tokens_per_s"], 0)
         self.assertFalse(payload["slo"]["evaluated"])
@@ -55,7 +55,7 @@ class ExperimentManifestAndCliTests(unittest.TestCase):
         self.assertEqual(payload["cost"]["provenance"]["single_satellite_input"], "satellite_architecture")
         self.assertEqual(payload["cost"]["single_satellite"]["provenance"]["N_acc"], 3)
         self.assertEqual(payload["performance"]["details"]["hardware"]["accelerator_count"], 3)
-        self.assertGreater(payload["performance"]["request_throughput_per_s"], 0)
+        self.assertIsNone(payload["performance"]["request_throughput_per_s"])
 
 
 
@@ -84,7 +84,7 @@ class ExperimentManifestAndCliTests(unittest.TestCase):
         self.assertTrue(payload["performance"]["feasible"])
         self.assertEqual(details["deployment_mode"], "tensor_pipeline_expert_parallel")
         self.assertEqual(details["parallelism"]["stage_parallel_degree"], 4)
-        self.assertEqual(details["satellite_count_used"], 8)
+        self.assertEqual(details["satellites_per_deployment"], 8)
         self.assertGreater(details["parallelism"]["bubble_multiplier"], 1.0)
 
     def test_serving_owns_runtime_utilization_calibration(self):
@@ -186,17 +186,11 @@ class ExperimentManifestAndCliTests(unittest.TestCase):
             representative = workload_generation["representative_token_distribution"]
 
             self.assertEqual(payload["module_status"]["workload_generation"], "loaded")
-            self.assertTrue(workload_generation["applied_to_serving"])
+            self.assertFalse(workload_generation["applied_to_serving"])
             self.assertGreater(workload_generation["request_count"], 0)
             self.assertTrue((tmp / "bundle" / "requests.jsonl").exists())
-            self.assertEqual(
-                payload["performance"]["details"]["provenance"]["token_distribution"]["prompt_tokens_p50"],
-                representative["prompt_tokens_p50"],
-            )
-            self.assertEqual(
-                payload["performance"]["details"]["provenance"]["token_distribution"]["output_tokens_p95"],
-                representative["output_tokens_p95"],
-            )
+            self.assertNotIn("token_distribution", payload["performance"]["details"]["provenance"])
+            self.assertGreater(representative["prompt_tokens_p50"], 0)
             self.assertFalse(payload["slo"]["evaluated"])
             self.assertIsNone(payload["slo"]["served_ratio"])
 
@@ -298,11 +292,9 @@ class ExperimentManifestAndCliTests(unittest.TestCase):
 
             payload = result.to_dict()
             row = payload["dse"]["rows"][0]
-            token_distribution = row["performance"]["details"]["provenance"]["token_distribution"]
             runtime = row["performance"]["details"]["runtime"]
 
             self.assertEqual(payload["dse"]["design_count"], 1)
-            self.assertNotEqual(token_distribution["prompt_tokens_p50"], 9999)
             self.assertEqual(runtime["workload"]["source_mode"], "synthetic_generation")
             self.assertGreater(runtime["workload"]["request_count"], 0)
             self.assertTrue((tmp / "bundle" / "requests.jsonl").exists())
@@ -338,7 +330,7 @@ class ExperimentManifestAndCliTests(unittest.TestCase):
                 self.assertIn(key, data)
             self.assertTrue(data["cost"]["evaluated"])
             self.assertTrue(data["performance"]["evaluated"])
-            self.assertGreater(data["performance"]["request_throughput_per_s"], 0)
+            self.assertIsNone(data["performance"]["request_throughput_per_s"])
 
     def test_experiment_cli_full_mode_preserves_monolithic_json_contract(self):
         with tempfile.TemporaryDirectory() as tmpdir:
