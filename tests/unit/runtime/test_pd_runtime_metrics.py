@@ -29,12 +29,23 @@ class SingleSatelliteRuntimeMetricsTests(unittest.TestCase):
     def test_record_identifies_one_full_serving_satellite(self):
         payload = records_to_jsonable((_record("req-0"),))[0]
 
-        self.assertEqual(payload["assigned_satellite_id"], "sat-01")
-        self.assertEqual(payload["compute_owner_satellite_id"], "sat-01")
-        self.assertNotIn("prefill_deployment_id", payload)
-        self.assertNotIn("decode_deployment_id", payload)
-        self.assertFalse(any(key.startswith("pd_") for key in payload))
-        self.assertFalse(any(key.startswith("kv_handoff") for key in payload))
+        self.assertEqual(payload["decision"]["serving_satellite_id"], "sat-01")
+        self.assertEqual(payload["placement"]["compute_owner_satellite_id"], "sat-01")
+        serialized_keys = {key for section in payload.values() for key in section}
+        self.assertNotIn("prefill_deployment_id", serialized_keys)
+        self.assertNotIn("decode_deployment_id", serialized_keys)
+        self.assertFalse(any(key.startswith("pd_") for key in serialized_keys))
+        self.assertFalse(any(key.startswith("kv_handoff") for key in serialized_keys))
+
+    def test_record_has_all_responsibility_sections(self):
+        payload = records_to_jsonable((_record("req-sections"),))[0]
+
+        self.assertEqual(
+            tuple(payload),
+            ("request", "decision", "placement", "timing", "routing", "energy", "kv", "outcome", "provenance"),
+        )
+        self.assertEqual(payload["request"]["request_id"], "req-sections")
+        self.assertTrue(payload["outcome"]["completed"])
 
     def test_metrics_have_no_phase_separation_fields(self):
         metrics = aggregate_runtime_records(
@@ -53,8 +64,29 @@ class SingleSatelliteRuntimeMetricsTests(unittest.TestCase):
             (_record("req-1", prefill_service_s=0.5, decode_service_s=2.0),)
         )[0]
 
-        self.assertEqual(payload["prefill_service_s"], 0.5)
-        self.assertEqual(payload["decode_service_s"], 2.0)
+        self.assertEqual(payload["timing"]["prefill_service_s"], 0.5)
+        self.assertEqual(payload["timing"]["decode_service_s"], 2.0)
+
+    def test_routing_and_energy_facts_are_derived_from_recorded_events(self):
+        payload = records_to_jsonable((
+            _record(
+                "req-facts",
+                selected_path=(
+                    {"link_id": "sgl-1", "kind": "sgl", "propagation_delay_s": 0.1},
+                    {"link_id": "isl-1", "kind": "isl", "propagation_delay_s": 0.2},
+                ),
+                energy_ledger=(
+                    {"compute_bus_j": 4.0, "link_bus_j": 1.5},
+                    {"compute_bus_j": 0.0, "link_bus_j": 0.5},
+                ),
+            ),
+        ))[0]
+
+        self.assertEqual(payload["routing"]["route_links"], ["sgl-1", "isl-1"])
+        self.assertEqual(payload["routing"]["hop_count"], 1)
+        self.assertAlmostEqual(payload["timing"]["propagation_s"], 0.3)
+        self.assertEqual(payload["energy"]["compute_energy_j"], 4.0)
+        self.assertEqual(payload["energy"]["communication_energy_j"], 2.0)
 
 
 if __name__ == "__main__":

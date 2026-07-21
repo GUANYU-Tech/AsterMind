@@ -736,8 +736,7 @@ def _evaluate_trace_request(
                 first_token_decode_s=first_token_service_s,
                 return_path_s=max(0.0, first_done_s - first_token_ready_s),
             )
-            record = replace(
-                record,
+            record = record.with_updates(
                 ttft_s=float(partial_timing["ttft_s"]),
                 uplink_s=float(partial_timing["uplink_s"]),
                 kv_transfer_s=0.0,
@@ -785,12 +784,15 @@ def _evaluate_trace_request(
             state, request.get("session_id"), route_plan.compute_satellite_id, arrival_s,
             deployment=deployment, runtime_strategy=runtime_strategy, request=request,
         )
+    session = state.sessions.get(str(request.get("session_id"))) if request.get("session_id") else None
+    kv_event = dict(getattr(session, "last_kv_event", {}) or {})
     total_sgl_wait = sgl_wait_in + sgl_wait_first + sgl_wait_remaining
     total_isl_wait = isl_wait_in + isl_wait_first + isl_wait_remaining
     bottleneck = _bottleneck(energy_update["energy_violation"], prefill_wait_s, decode_wait_s, total_sgl_wait + total_isl_wait)
     selected_path = tuple((*inbound_path, *first_path, *remaining_path))
     record = RuntimeRequestRecord(
         request_id=request["request_id"],
+        session_id=request.get("session_id"),
         arrival_time_s=arrival_s,
         deployment_id=deployment.deployment_id,
         action_type=action_type,
@@ -833,6 +835,15 @@ def _evaluate_trace_request(
         deferred=deferred,
         defer_until_s=defer_until_s,
         session_action=session_action,
+        kv_capacity_admission=kv_event.get("admission"),
+        kv_serve_action=session_action,
+        kv_hit_tokens=kv_event.get("hit_tokens"),
+        kv_miss_tokens=kv_event.get("miss_tokens"),
+        context_recompute_tokens=kv_event.get("recompute_tokens"),
+        kv_evicted_bytes=kv_event.get("evicted_bytes"),
+        kv_evicted_entry_count=len(tuple(kv_event.get("evicted_session_ids", ()) or ())),
+        hbm_occupancy_before=kv_event.get("occupancy_bytes_before"),
+        hbm_occupancy_after=kv_event.get("occupancy_bytes_after"),
         bottleneck_reason=bottleneck,
         scope=scope,
         trace_model=trace_model,
@@ -1614,6 +1625,7 @@ def _reserve_route(
         sampled_legs,
         start_s,
         request_id=request_id,
+            session_id=request.get("session_id"),
         energy_stage=energy_stage,
     )
 
@@ -1636,6 +1648,7 @@ def _reserve_sampled_route(
             sampled_legs,
             start_s,
             request_id=request_id,
+            session_id=request.get("session_id"),
             energy_stage=energy_stage,
         )
     except EnergyWindowError as exc:
@@ -1987,6 +2000,7 @@ def _post_compute_route_failure_record(
     del prefill_done_s
     return RuntimeRequestRecord(
         request_id=request["request_id"],
+        session_id=request.get("session_id"),
         arrival_time_s=arrival_s,
         deployment_id=deployment_id,
         action_type=action_type,
@@ -2122,6 +2136,7 @@ def _fallback_record(
         e2e_s = latency_s
     return RuntimeRequestRecord(
         request_id=request["request_id"],
+        session_id=request.get("session_id"),
         arrival_time_s=request["arrival_time_s"],
         deployment_id=None,
         action_type="ground_fallback",
@@ -2157,6 +2172,7 @@ def _reject_record(
 ) -> RuntimeRequestRecord:
     return RuntimeRequestRecord(
         request_id=request["request_id"],
+        session_id=request.get("session_id"),
         arrival_time_s=request["arrival_time_s"],
         deployment_id=None,
         action_type="reject_drop",
@@ -2247,6 +2263,7 @@ def _session_action(
         session.owner_deployment_id = None
         session.owner_satellite_ids = ()
         session.last_session_action = "recompute_context"
+        session.last_kv_event = dict(admission)
         session.last_seen_s = now_s
         return "recompute_context"
     entry = admission["entry"]
@@ -2258,6 +2275,12 @@ def _session_action(
     session.context_tokens = tokens
     session.last_seen_s = now_s
     session.last_session_action = action
+    session.last_kv_event = {
+        **dict(admission),
+        "hit_tokens": tokens if action == "sticky_kv_owner" else 0,
+        "miss_tokens": tokens if action == "recompute_context" else 0,
+        "recompute_tokens": tokens if action == "recompute_context" else 0,
+    }
     return action
 
 

@@ -133,6 +133,7 @@ class SessionState:
     last_seen_s: float = 0.0
     replica_deployment_ids: tuple[str, ...] = ()
     last_session_action: str = "none"
+    last_kv_event: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return to_jsonable(self)

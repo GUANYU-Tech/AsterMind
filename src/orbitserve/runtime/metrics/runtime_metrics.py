@@ -198,6 +198,7 @@ def aggregate_runtime_records(
         "kv_generated_bytes_total": _sum_numeric(getattr(record, "kv_generated_bytes", None) for record in records),
         "kv_migration_bytes_total": _sum_numeric(getattr(record, "kv_migration_bytes", None) for record in records),
         "kv_replication_bytes_total": _sum_numeric(getattr(record, "kv_replication_bytes", None) for record in records),
+        "kv_evicted_bytes_total": _sum_numeric(getattr(record, "kv_evicted_bytes", None) for record in records),
         "kv_transfer_attempted_bytes_total": kv_transfer_attempted_total,
         "kv_transfer_useful_bytes_total": kv_transfer_useful_total,
         "kv_transfer_waste_ratio": (
@@ -206,7 +207,12 @@ def aggregate_runtime_records(
             else None
         ),
         "kv_transfer_interruption_count": len([record for record in records if getattr(record, "kv_transfer_interrupted", False)]),
-        "kv_eviction_count": int(_sum_numeric(getattr(record, "kv_pages_evicted", None) for record in records)),
+        "kv_eviction_count": int(_sum_numeric(
+            getattr(record, "kv_evicted_entry_count", None)
+            if getattr(record, "kv_evicted_entry_count", None) is not None
+            else getattr(record, "kv_pages_evicted", None)
+            for record in records
+        )),
         "post_turn_replication_request_fraction": (
             kv_post_turn_action_counts.get("replicate_kv", 0) / total
             if total > 0
@@ -348,6 +354,7 @@ def _empty_runtime_metrics(*, trace_model: str, scope: str) -> dict[str, Any]:
         "kv_generated_bytes_total": 0.0,
         "kv_migration_bytes_total": 0.0,
         "kv_replication_bytes_total": 0.0,
+        "kv_evicted_bytes_total": 0.0,
         "kv_transfer_attempted_bytes_total": 0.0,
         "kv_transfer_useful_bytes_total": 0.0,
         "kv_transfer_waste_ratio": None,

@@ -135,6 +135,8 @@ def _admit_session_kv(
         kv_policy=kv_policy,
     )
     current = cache.entries.get(session_id)
+    occupancy_tokens_before = sum(entry.tokens for entry in cache.entries.values())
+    occupancy_bytes_before = sum(entry.bytes for entry in cache.entries.values())
     other_entries = [entry for key, entry in cache.entries.items() if key != session_id]
     used_tokens = sum(entry.tokens for entry in other_entries)
     used_bytes = sum(entry.bytes for entry in other_entries)
@@ -162,6 +164,11 @@ def _admit_session_kv(
             "admission": "capacity_unavailable",
             "evicted_session_ids": (),
             "entry": current.to_dict() if current is not None else None,
+            "evicted_bytes": 0.0,
+            "occupancy_tokens_before": occupancy_tokens_before,
+            "occupancy_tokens_after": occupancy_tokens_before,
+            "occupancy_bytes_before": occupancy_bytes_before,
+            "occupancy_bytes_after": occupancy_bytes_before,
         }
 
     for victim in evicted:
@@ -192,6 +199,11 @@ def _admit_session_kv(
         "admission": "hit" if current is not None else "admitted",
         "evicted_session_ids": tuple(victim.session_id for victim in evicted),
         "entry": entry.to_dict(),
+        "evicted_bytes": sum(victim.bytes for victim in evicted),
+        "occupancy_tokens_before": occupancy_tokens_before,
+        "occupancy_tokens_after": sum(item.tokens for item in cache.entries.values()),
+        "occupancy_bytes_before": occupancy_bytes_before,
+        "occupancy_bytes_after": sum(item.bytes for item in cache.entries.values()),
     }
 
 def _token_context_contract_error(request: dict[str, Any]) -> str | None:

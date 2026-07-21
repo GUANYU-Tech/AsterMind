@@ -604,7 +604,7 @@ def _aggregate_request_event_energy(
             ):
                 request_energy_violation_event_count += 1
             event_count += 1
-    completed_count = sum(1 for record in records if bool(record.get("completed", False)))
+    completed_count = sum(1 for record in records if bool(_record_value(record, "outcome", "completed", False)))
     return {
         "attempted_request_count": len(records),
         "completed_request_count": completed_count,
@@ -649,10 +649,10 @@ def _runtime_energy_ledger_expected(runtime: dict[str, Any]) -> bool:
 def _record_requires_request_energy_ledger(record: dict[str, Any]) -> bool:
     """Only satellite-completed work must carry a satellite energy ledger."""
 
-    if not bool(record.get("completed", False)):
+    if not bool(_record_value(record, "outcome", "completed", False)):
         return False
-    action_type = str(record.get("action_type") or "")
-    if bool(record.get("fallback_used", False)) or action_type.startswith("ground_"):
+    action_type = str(_record_value(record, "decision", "action", "") or "")
+    if bool(_record_value(record, "decision", "fallback_used", False)) or action_type.startswith("ground_"):
         return False
     return True
 
@@ -774,10 +774,23 @@ def _audit_runtime_ledger_coefficients(
 def _request_energy_ledger(record: dict[str, Any]) -> tuple[Any, ...]:
     """Read the one supported ledger from either serialized record shape."""
 
-    ledger = record.get("energy_ledger")
+    ledger = _record_value(record, "energy", "energy_ledger")
     if not isinstance(ledger, (list, tuple)):
         ledger = _nested(record, "provenance", "energy_ledger")
     return tuple(ledger) if isinstance(ledger, (list, tuple)) else ()
+
+
+def _record_value(
+    record: dict[str, Any],
+    section: str,
+    key: str,
+    default: Any = None,
+) -> Any:
+    nested = record.get(section)
+    if isinstance(nested, dict) and key in nested:
+        return nested[key]
+    legacy_key = "action_type" if key == "action" else key
+    return record.get(legacy_key, default)
 
 
 def _runtime_request_records(runtime_performance: Any, runtime: dict[str, Any]) -> tuple[dict[str, Any], ...]:

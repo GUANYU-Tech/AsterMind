@@ -1,4 +1,4 @@
-"""Request-level runtime records for OrbitServe event simulation."""
+"""Structured request-level facts emitted by Runtime engines."""
 
 from __future__ import annotations
 
@@ -8,103 +8,191 @@ from typing import Any
 from ...common import to_jsonable
 
 
-@dataclass(frozen=True)
+_SECTION_DEFAULTS: dict[str, dict[str, Any]] = {
+    "request": {
+        "request_id": None, "arrival_time_s": 0.0, "prompt_tokens": 0,
+        "output_tokens": 0, "session_id": None,
+    },
+    "decision": {
+        "strategy": None, "action": "reject_drop", "action_components": (),
+        "deployment_id": None, "access_satellite_id": None,
+        "serving_satellite_id": None, "dvfs_scale": None,
+        "fallback_used": False, "deferred": False, "defer_until_s": None,
+        "session_action": None, "shadow_strategy": None, "shadow_strategies": (),
+        "access_action_type": None, "prefill_action_type": None,
+        "decode_action_type": None,
+    },
+    "placement": {
+        "compute_owner_satellite_id": None, "compute_owner_satellite_ids": (),
+    },
+    "timing": {
+        "access_wait_s": None, "link_queue_wait_s": None,
+        "sgl_queue_wait_s": None, "isl_queue_wait_s": None,
+        "link_transmission_s": None, "propagation_s": None,
+        "prefill_queue_wait_s": None, "prefill_service_s": None,
+        "decode_queue_wait_s": None, "decode_service_s": None,
+        "uplink_s": None, "kv_transfer_s": None, "first_token_decode_s": None,
+        "return_path_s": None, "first_token_return_s": None,
+        "ttft_breakdown_s": {}, "ttft_s": None, "e2e_s": None,
+        "response_streaming_model": None,
+        "ground_network_delay_s": None,
+        "ground_load_balancer_queue_wait_s": None,
+        "ground_replica_pending_wait_s": None,
+    },
+    "routing": {
+        "ingress": None, "input_route_nodes": (), "output_route_nodes": (),
+        "route_node_ids": (), "route_links": (), "hop_count": 0,
+        "selected_path": (), "ground_origin_region_id": None,
+        "ground_serving_region_id": None, "ground_replica_id": None,
+        "ground_cross_region": None,
+    },
+    "energy": {
+        "soc_before": None, "soc_after": None, "compute_energy_j": None,
+        "communication_energy_j": None, "energy_violation": None,
+        "compute_sunlit": None, "access_sunlit": None, "energy_ledger": (),
+    },
+    "kv": {
+        "kv_capacity_admission": None, "kv_serve_action": None,
+        "kv_post_turn_action": None, "kv_background_event_count": None,
+        "kv_hit_tokens": None, "kv_miss_tokens": None,
+        "context_recompute_tokens": None, "kv_reused_bytes": None,
+        "kv_generated_bytes": None, "kv_migration_bytes": None,
+        "kv_replication_bytes": None, "kv_evicted_bytes": None,
+        "kv_evicted_entry_count": None,
+        "session_kv_migration_bytes": None, "session_kv_visible_s": None,
+        "kv_transfer_attempted_bytes": None, "kv_transfer_delivered_bytes": None,
+        "kv_transfer_committed_page_bytes": None, "kv_transfer_useful_bytes": None,
+        "kv_transfer_interrupted": None, "kv_transfer_interruption_reason": None,
+        "kv_pages_required": None, "kv_pages_hit": None,
+        "kv_pages_migrated": None, "kv_pages_replicated": None,
+        "kv_pages_evicted": None, "hbm_admission_result": None,
+        "hbm_occupancy_before": None, "hbm_occupancy_after": None,
+        "visible_kv_delay_s": None, "hidden_kv_delay_s": None,
+        "ground_prefix_cache_hit_ratio": None,
+    },
+    "outcome": {
+        "completed": False, "uncompleted_stage": None,
+        "uncompleted_reason": None, "bottleneck_reason": None,
+    },
+    "provenance": {
+        "scope": "idealized_compute_only", "trace_model": "ideal_full_visibility",
+        "valid_for_paper_main_results": False,
+    },
+}
+
+_ALIASES = {
+    "action_type": ("decision", "action"),
+    "assigned_satellite_id": ("decision", "serving_satellite_id"),
+}
+_FIELD_SECTION = {
+    key: section
+    for section, defaults in _SECTION_DEFAULTS.items()
+    for key in defaults
+}
+
+
+@dataclass(frozen=True, init=False)
 class RuntimeRequestRecord:
-    request_id: str
-    arrival_time_s: float
-    deployment_id: str | None
-    action_type: str
-    completed: bool
-    uncompleted_stage: str | None = None
-    uncompleted_reason: str | None = None
-    action_components: tuple[str, ...] = ()
-    prompt_tokens: int = 0
-    output_tokens: int = 0
-    prefill_queue_wait_s: float | None = None
-    decode_queue_wait_s: float | None = None
-    link_queue_wait_s: float | None = None
-    access_wait_s: float | None = None
-    sgl_queue_wait_s: float | None = None
-    isl_queue_wait_s: float | None = None
-    link_transmission_s: float | None = None
-    ground_origin_region_id: str | None = None
-    ground_serving_region_id: str | None = None
-    ground_replica_id: str | None = None
-    ground_cross_region: bool | None = None
-    ground_network_delay_s: float | None = None
-    ground_load_balancer_queue_wait_s: float | None = None
-    ground_replica_pending_wait_s: float | None = None
-    ground_prefix_cache_hit_ratio: float | None = None
-    prefill_service_s: float | None = None
-    decode_service_s: float | None = None
-    uplink_s: float | None = None
-    kv_transfer_s: float | None = None
-    first_token_decode_s: float | None = None
-    return_path_s: float | None = None
-    ttft_breakdown_s: dict[str, Any] = field(default_factory=dict)
-    ttft_s: float | None = None
-    e2e_s: float | None = None
-    assigned_satellite_id: str | None = None
-    compute_owner_satellite_id: str | None = None
-    compute_owner_satellite_ids: tuple[str, ...] = ()
-    access_satellite_id: str | None = None
-    first_token_return_s: float | None = None
-    session_kv_migration_bytes: float | None = None
-    session_kv_visible_s: float | None = None
-    kv_capacity_admission: str | None = None
-    kv_serve_action: str | None = None
-    kv_post_turn_action: str | None = None
-    kv_background_event_count: int | None = None
-    kv_hit_tokens: int | None = None
-    kv_miss_tokens: int | None = None
-    context_recompute_tokens: int | None = None
-    kv_reused_bytes: float | None = None
-    kv_generated_bytes: float | None = None
-    kv_migration_bytes: float | None = None
-    kv_replication_bytes: float | None = None
-    kv_transfer_attempted_bytes: float | None = None
-    kv_transfer_delivered_bytes: float | None = None
-    kv_transfer_committed_page_bytes: float | None = None
-    kv_transfer_useful_bytes: float | None = None
-    kv_transfer_interrupted: bool | None = None
-    kv_transfer_interruption_reason: str | None = None
-    kv_pages_required: int | None = None
-    kv_pages_hit: int | None = None
-    kv_pages_migrated: int | None = None
-    kv_pages_replicated: int | None = None
-    kv_pages_evicted: int | None = None
-    hbm_admission_result: str | None = None
-    hbm_occupancy_before: float | None = None
-    hbm_occupancy_after: float | None = None
-    visible_kv_delay_s: float | None = None
-    hidden_kv_delay_s: float | None = None
-    response_streaming_model: str | None = None
-    route_node_ids: tuple[str, ...] = ()
-    selected_path: tuple[dict[str, Any], ...] = ()
-    soc_before: float | None = None
-    soc_after: float | None = None
-    energy_violation: bool | None = None
-    compute_sunlit: bool | None = None
-    access_sunlit: bool | None = None
-    dvfs_scale: float | None = None
-    shadow_strategy: str | None = None
-    shadow_strategies: tuple[str, ...] = ()
-    access_action_type: str | None = None
-    prefill_action_type: str | None = None
-    decode_action_type: str | None = None
-    energy_ledger: tuple[dict[str, Any], ...] = ()
-    fallback_used: bool = False
-    deferred: bool = False
-    defer_until_s: float | None = None
-    session_action: str | None = None
-    bottleneck_reason: str | None = None
-    scope: str = "idealized_compute_only"
-    trace_model: str = "ideal_full_visibility"
-    valid_for_paper_main_results: bool = False
+    request: dict[str, Any] = field(default_factory=dict)
+    decision: dict[str, Any] = field(default_factory=dict)
+    placement: dict[str, Any] = field(default_factory=dict)
+    timing: dict[str, Any] = field(default_factory=dict)
+    routing: dict[str, Any] = field(default_factory=dict)
+    energy: dict[str, Any] = field(default_factory=dict)
+    kv: dict[str, Any] = field(default_factory=dict)
+    outcome: dict[str, Any] = field(default_factory=dict)
     provenance: dict[str, Any] = field(default_factory=dict)
 
+    def __init__(self, **values: Any) -> None:
+        sections = {
+            name: _copy_defaults(defaults)
+            for name, defaults in _SECTION_DEFAULTS.items()
+        }
+        for section_name in _SECTION_DEFAULTS:
+            supplied = values.pop(section_name, None)
+            if supplied is not None:
+                if not isinstance(supplied, dict):
+                    raise TypeError(f"{section_name} must be a mapping")
+                sections[section_name].update(supplied)
+        detail_provenance = values.pop("provenance", None)
+        if detail_provenance is not None:
+            if not isinstance(detail_provenance, dict):
+                raise TypeError("provenance must be a mapping")
+            sections["provenance"].update(detail_provenance)
+        for key, value in values.items():
+            target = _ALIASES.get(key)
+            if target is None:
+                section_name = _FIELD_SECTION.get(key)
+                if section_name is None:
+                    raise TypeError(f"unexpected RuntimeRequestRecord field: {key}")
+                target = (section_name, key)
+            sections[target[0]][target[1]] = value
+
+        path = tuple(sections["routing"].get("selected_path") or ())
+        if path:
+            sections["routing"]["route_links"] = tuple(
+                str(leg["link_id"]) for leg in path
+                if isinstance(leg, dict) and leg.get("link_id") is not None
+            )
+            sections["routing"]["hop_count"] = sum(
+                1 for leg in path
+                if isinstance(leg, dict) and str(leg.get("kind", "")).lower() == "isl"
+            )
+            sections["timing"]["propagation_s"] = _sum_path_value(path, "propagation_delay_s")
+        ledger = tuple(sections["energy"].get("energy_ledger") or ())
+        if ledger:
+            sections["energy"]["compute_energy_j"] = _sum_ledger_value(ledger, "compute_bus_j")
+            sections["energy"]["communication_energy_j"] = _sum_ledger_value(ledger, "link_bus_j")
+        if sections["decision"].get("strategy") is None:
+            sections["decision"]["strategy"] = sections["provenance"].get("policy")
+        if sections["request"].get("request_id") is None:
+            raise TypeError("request_id is required")
+        for name, payload in sections.items():
+            object.__setattr__(self, name, payload)
+
+    def __getattr__(self, name: str) -> Any:
+        target = _ALIASES.get(name)
+        if target is not None:
+            return object.__getattribute__(self, target[0]).get(target[1])
+        section_name = _FIELD_SECTION.get(name)
+        if section_name is not None:
+            return object.__getattribute__(self, section_name).get(name)
+        raise AttributeError(name)
+
+    def with_updates(self, **values: Any) -> "RuntimeRequestRecord":
+        payload = self.to_dict()
+        for key, value in values.items():
+            target = _ALIASES.get(key)
+            if target is None:
+                section_name = _FIELD_SECTION.get(key)
+                if section_name is None:
+                    raise TypeError(f"unexpected RuntimeRequestRecord field: {key}")
+                target = (section_name, key)
+            payload[target[0]][target[1]] = value
+        return RuntimeRequestRecord(**payload)
+
     def to_dict(self) -> dict[str, Any]:
-        return to_jsonable(self)
+        return to_jsonable({
+            "request": self.request, "decision": self.decision,
+            "placement": self.placement, "timing": self.timing,
+            "routing": self.routing, "energy": self.energy, "kv": self.kv,
+            "outcome": self.outcome, "provenance": self.provenance,
+        })
+
+
+def _copy_defaults(defaults: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: dict(value) if isinstance(value, dict) else value
+        for key, value in defaults.items()
+    }
+
+
+def _sum_path_value(path: tuple[Any, ...], key: str) -> float:
+    return sum(float(leg.get(key, 0.0) or 0.0) for leg in path if isinstance(leg, dict))
+
+
+def _sum_ledger_value(ledger: tuple[Any, ...], key: str) -> float:
+    return sum(float(row.get(key, 0.0) or 0.0) for row in ledger if isinstance(row, dict))
 
 
 def records_to_jsonable(records: tuple[RuntimeRequestRecord, ...]) -> tuple[dict[str, Any], ...]:

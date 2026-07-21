@@ -83,6 +83,7 @@ def _evaluate_request(
     if output_tokens <= 0:
         return RuntimeRequestRecord(
             request_id=request_id,
+            session_id=request.get("session_id"),
             arrival_time_s=arrival_s,
             deployment_id=getattr(deployment, "deployment_id", None),
             action_type="reject_drop",
@@ -100,6 +101,7 @@ def _evaluate_request(
     if action.action_type != "local_compute":
         return RuntimeRequestRecord(
             request_id=request_id,
+            session_id=request.get("session_id"),
             arrival_time_s=arrival_s,
             deployment_id=None,
             action_type=action.action_type,
@@ -117,6 +119,7 @@ def _evaluate_request(
     if deployment is None or not deployment.has_compute_capacity:
         return RuntimeRequestRecord(
             request_id=request_id,
+            session_id=request.get("session_id"),
             arrival_time_s=arrival_s,
             deployment_id=getattr(deployment, "deployment_id", None),
             action_type=action.action_type,
@@ -136,6 +139,7 @@ def _evaluate_request(
     if not math.isfinite(prefill_service_s) or not math.isfinite(decode_service_s):
         return RuntimeRequestRecord(
             request_id=request_id,
+            session_id=request.get("session_id"),
             arrival_time_s=arrival_s,
             deployment_id=deployment.deployment_id,
             action_type=action.action_type,
@@ -171,6 +175,7 @@ def _evaluate_request(
 
     return RuntimeRequestRecord(
         request_id=request_id,
+            session_id=request.get("session_id"),
         arrival_time_s=arrival_s,
         deployment_id=deployment.deployment_id,
         action_type=action.action_type,
