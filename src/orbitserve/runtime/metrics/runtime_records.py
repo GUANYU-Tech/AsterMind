@@ -67,9 +67,7 @@ class RuntimeRequestRecord:
     kv_transfer_committed_page_bytes: float | None = None
     kv_transfer_useful_bytes: float | None = None
     kv_transfer_interrupted: bool | None = None
-    kv_transfer_expired: bool | None = None
     kv_transfer_interruption_reason: str | None = None
-    kv_transfer_expiry_reason: str | None = None
     kv_pages_required: int | None = None
     kv_pages_hit: int | None = None
     kv_pages_migrated: int | None = None

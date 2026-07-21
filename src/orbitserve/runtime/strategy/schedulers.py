@@ -494,7 +494,6 @@ class RuntimeScheduler:
         kv_migration_visible_s = _finite_or(provenance.get("kv_migration_visible_s"), 0.0)
         kv_recompute_tokens = _finite_or(provenance.get("context_recompute_tokens"), 0.0)
         kv_hbm_occupancy = _finite_or(provenance.get("hbm_occupancy_after"), 0.0)
-        kv_expiry_risk = _finite_or(provenance.get("kv_transfer_expiry_risk"), 0.0)
         compute_sunlit = provenance.get("compute_sunlit")
         access_sunlit = provenance.get("access_sunlit")
         shadow_triggered = bool(provenance.get("shadow_triggered", False))
@@ -519,7 +518,6 @@ class RuntimeScheduler:
         normalized_kv_migration = kv_migration_visible_s / refs["link_s"]
         normalized_kv_recompute = kv_recompute_tokens / refs["tokens"]
         normalized_kv_hbm = kv_hbm_occupancy / refs["hbm_occupancy"]
-        normalized_kv_expiry = kv_expiry_risk / refs["expiry_risk"]
         normalized_kv_hit_credit = kv_hit_tokens / refs["tokens"]
         weighted_components = {
             "latency": _weight(weights, "latency", 1.0) * normalized_e2e,
@@ -534,7 +532,6 @@ class RuntimeScheduler:
             )
             * normalized_kv_recompute,
             "kv_hbm": _weight(weights, "kv_hbm", 0.0) * normalized_kv_hbm,
-            "kv_staleness": _weight(weights, "kv_staleness", 0.0) * normalized_kv_expiry,
             "kv_hit": -_weight(weights, "kv_hit", 0.0) * normalized_kv_hit_credit,
             "shadow_local": _weight(weights, "shadow_local", 0.0) * shadow_local_penalty,
             "shadow_dvfs_credit": -_weight(weights, "shadow_dvfs_credit", 0.0) * shadow_dvfs_indicator,
@@ -597,15 +594,6 @@ class RuntimeScheduler:
                 0.0,
                 weighted_components,
             ),
-            "kv_staleness": _score_component(
-                kv_expiry_risk,
-                refs["expiry_risk"],
-                normalized_kv_expiry,
-                weights,
-                "kv_staleness",
-                0.0,
-                weighted_components,
-            ),
             "kv_hit": _score_component(
                 kv_hit_tokens,
                 refs["tokens"],
@@ -664,7 +652,6 @@ class RuntimeScheduler:
             "kv_migration_visible_s": kv_migration_visible_s,
             "context_recompute_tokens": kv_recompute_tokens,
             "hbm_occupancy_after": kv_hbm_occupancy,
-            "kv_transfer_expiry_risk": kv_expiry_risk,
             "compute_sunlit": compute_sunlit,
             "access_sunlit": access_sunlit,
             "shadow_triggered": shadow_triggered,
@@ -675,7 +662,6 @@ class RuntimeScheduler:
             "normalized_kv_migration": normalized_kv_migration,
             "normalized_kv_recompute": normalized_kv_recompute,
             "normalized_kv_hbm": normalized_kv_hbm,
-            "normalized_kv_expiry": normalized_kv_expiry,
             "normalized_kv_hit_credit": normalized_kv_hit_credit,
             "weights": weights,
             "normalization_refs": refs,
@@ -866,7 +852,6 @@ def _normalization_refs(
         ),
         "tokens": _positive_float(configured.get("tokens"), state_refs.get("tokens"), request.get("prompt_tokens"), 1.0),
         "hbm_occupancy": _positive_float(configured.get("hbm_occupancy"), state_refs.get("hbm_occupancy"), 1.0),
-        "expiry_risk": _positive_float(configured.get("expiry_risk"), state_refs.get("expiry_risk"), 1.0),
     }
 
 

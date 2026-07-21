@@ -131,7 +131,6 @@ class SessionState:
     kv_pages: int = 0
     context_version: int = 0
     last_seen_s: float = 0.0
-    expires_at_s: float | None = None
     replica_deployment_ids: tuple[str, ...] = ()
     last_session_action: str = "none"
 
@@ -165,6 +164,7 @@ class KVCacheDeploymentState:
     metadata_bytes_per_page: float = 0.0
     fragmentation_reserve_fraction: float = 0.0
     card_level_hbm_admission: bool = False
+    entries: dict[str, "KVCacheEntryState"] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -180,7 +180,27 @@ class KVCacheDeploymentState:
             "metadata_bytes_per_page": self.metadata_bytes_per_page,
             "fragmentation_reserve_fraction": self.fragmentation_reserve_fraction,
             "card_level_hbm_admission": self.card_level_hbm_admission,
+            "entries": {key: entry.to_dict() for key, entry in self.entries.items()},
         }
+
+
+@dataclass
+class KVCacheEntryState:
+    session_id: str
+    satellite_id: str
+    deployment_id: str
+    tokens: int
+    bytes: float
+    last_access_s: float
+    reference_count: int = 0
+    evictable: bool = True
+
+    @property
+    def in_use(self) -> bool:
+        return self.reference_count > 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return to_jsonable(self)
 
 
 @dataclass
@@ -262,6 +282,7 @@ __all__ = [
     "ComputeQueueState",
     "KVCacheCardState",
     "KVCacheDeploymentState",
+    "KVCacheEntryState",
     "LinkState",
     "SatelliteState",
     "SessionState",

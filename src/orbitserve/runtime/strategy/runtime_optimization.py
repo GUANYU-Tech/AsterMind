@@ -449,7 +449,6 @@ def _kv_policy_candidates(search_space: RuntimeStrategySearchSpace) -> tuple[dic
                 "kv_post_turn_actions_enabled",
                 "replica_count_limit",
                 "replica_target_deployment_id",
-                "session_ttl_s",
                 "kv_page_size_tokens",
                 "kv_page_metadata_bytes",
                 "kv_fragmentation_reserve_fraction",

@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from .runtime_state import RuntimeState
+from .runtime_state import KVCacheEntryState, RuntimeState
 
 
 def _kv_policy(runtime_strategy: Any) -> dict[str, Any]:
@@ -20,7 +20,6 @@ def _kv_policy(runtime_strategy: Any) -> dict[str, Any]:
         "kv_post_turn_actions_enabled",
         "replica_count_limit",
         "replica_target_deployment_id",
-        "session_ttl_s",
         "kv_page_size_tokens",
         "kv_page_metadata_bytes",
         "kv_fragmentation_reserve_fraction",
@@ -40,10 +39,6 @@ def _kv_policy(runtime_strategy: Any) -> dict[str, Any]:
     return merged
 
 
-def _kv_transfer_chunk_bytes(kv_policy: dict[str, Any]) -> float | None:
-    value = _optional_float(kv_policy.get("kv_transfer_chunk_bytes"))
-    return value if value is not None and value > 0 else None
-
 def _kv_page_size_tokens(kv_policy: dict[str, Any]) -> int | None:
     value = _optional_int(kv_policy.get("kv_page_size_tokens"))
     return value if value is not None and value > 0 else None
@@ -53,15 +48,6 @@ def _kv_required_pages(tokens: int | float, page_size_tokens: int | None) -> int
     if page_size_tokens is None or page_size_tokens <= 0:
         return 1 if token_count > 0 else 0
     return int(math.ceil(token_count / page_size_tokens))
-
-
-def _session_expires_at(state: RuntimeState, session_id: str | None) -> float | None:
-    session = state.sessions.get(str(session_id)) if session_id else None
-    return _optional_float(getattr(session, "expires_at_s", None)) if session is not None else None
-
-def _session_ttl_deadline(runtime_strategy: Any, now_s: float) -> float | None:
-    ttl_s = _session_ttl_s(runtime_strategy)
-    return now_s + ttl_s if ttl_s is not None else None
 
 
 def _deployment_hbm_capacity_bytes(deployment: Any, kv_policy: dict[str, Any]) -> float | None:
@@ -120,42 +106,93 @@ def _sync_kv_cache_state_for_deployment(state: RuntimeState, deployment: Any, ru
     replica_tokens = 0
     primary_bytes = 0.0
     replica_bytes = 0.0
-    for session in state.sessions.values():
-        if getattr(session, "owner_deployment_id", None) == deployment_id:
-            primary_tokens += max(0, int(getattr(session, "kv_cache_tokens", 0) or 0))
-            primary_bytes += max(0.0, float(getattr(session, "kv_cache_bytes", 0.0) or 0.0))
-        if deployment_id in tuple(str(item) for item in getattr(session, "replica_deployment_ids", ()) or ()):
-            replica_tokens += max(0, int(getattr(session, "kv_cache_tokens", 0) or 0))
-            replica_bytes += max(0.0, float(getattr(session, "kv_cache_bytes", 0.0) or 0.0))
+    for entry in cache.entries.values():
+        primary_tokens += max(0, int(entry.tokens))
+        primary_bytes += max(0.0, float(entry.bytes))
     cache.aggregate_used_tokens_by_kind = {"primary": primary_tokens, "replica": replica_tokens}
     cache.aggregate_used_bytes_by_kind = {"primary": primary_bytes, "replica": replica_bytes}
 
+def _admit_session_kv(
+    state: RuntimeState,
+    deployment: Any,
+    runtime_strategy: Any,
+    *,
+    session_id: str,
+    satellite_id: str,
+    tokens: int,
+    kv_bytes_per_token: float,
+    now_s: float,
+) -> dict[str, Any]:
+    """Admit or refresh one session entry, evicting by capacity-pressure LRU."""
 
-def _expire_session_kv(state: RuntimeState, now_s: float) -> None:
-    for session in state.sessions.values():
-        expires_at_s = getattr(session, "expires_at_s", None)
-        if expires_at_s is None or now_s < expires_at_s:
-            continue
-        session.owner_satellite_id = None
-        session.owner_deployment_id = None
-        session.owner_satellite_ids = ()
-        session.kv_cache_tokens = 0
-        session.kv_cache_bytes = 0.0
-        session.expires_at_s = None
-        session.replica_deployment_ids = ()
-        session.last_session_action = "expired"
-
-def _session_ttl_s(runtime_strategy: Any) -> float | None:
-    overrides = _dict(getattr(runtime_strategy, "hard_gate_overrides", {}))
+    deployment_id = str(getattr(deployment, "deployment_id", ""))
     kv_policy = _kv_policy(runtime_strategy)
-    value = _first_present(
-        kv_policy.get("session_ttl_s"),
-        overrides.get("session_ttl_s"),
-        overrides.get("kv_session_ttl_s"),
-        getattr(runtime_strategy, "session_ttl_s", None),
+    _sync_kv_cache_state_for_deployment(state, deployment, runtime_strategy)
+    cache = state.kv_cache_for(deployment_id)
+    accounted_bytes = _kv_accounted_bytes(
+        tokens,
+        kv_bytes_per_token=kv_bytes_per_token,
+        kv_policy=kv_policy,
     )
-    ttl_s = _optional_float(value)
-    return ttl_s if ttl_s is not None and ttl_s >= 0 else None
+    current = cache.entries.get(session_id)
+    other_entries = [entry for key, entry in cache.entries.items() if key != session_id]
+    used_tokens = sum(entry.tokens for entry in other_entries)
+    used_bytes = sum(entry.bytes for entry in other_entries)
+    required_tokens = max(0, int(tokens))
+
+    def fits(extra_tokens: int, extra_bytes: float) -> bool:
+        tokens_ok = cache.aggregate_capacity_tokens is None or extra_tokens <= cache.aggregate_capacity_tokens
+        bytes_ok = cache.aggregate_capacity_bytes is None or extra_bytes <= cache.aggregate_capacity_bytes
+        return tokens_ok and bytes_ok
+
+    eviction_candidates = sorted(
+        (entry for entry in other_entries if entry.evictable and not entry.in_use),
+        key=lambda entry: (entry.last_access_s, entry.session_id),
+    )
+    evicted: list[KVCacheEntryState] = []
+    while not fits(used_tokens + required_tokens, used_bytes + accounted_bytes) and eviction_candidates:
+        victim = eviction_candidates.pop(0)
+        evicted.append(victim)
+        used_tokens -= victim.tokens
+        used_bytes -= victim.bytes
+
+    if not fits(used_tokens + required_tokens, used_bytes + accounted_bytes):
+        return {
+            "admitted": False,
+            "admission": "capacity_unavailable",
+            "evicted_session_ids": (),
+            "entry": current.to_dict() if current is not None else None,
+        }
+
+    for victim in evicted:
+        cache.entries.pop(victim.session_id, None)
+        victim_session = state.sessions.get(victim.session_id)
+        if victim_session is not None and victim_session.owner_deployment_id == deployment_id:
+            victim_session.owner_satellite_id = None
+            victim_session.owner_deployment_id = None
+            victim_session.owner_satellite_ids = ()
+            victim_session.kv_cache_tokens = 0
+            victim_session.kv_cache_bytes = 0.0
+            victim_session.last_session_action = "evicted"
+
+    entry = KVCacheEntryState(
+        session_id=session_id,
+        satellite_id=str(satellite_id),
+        deployment_id=deployment_id,
+        tokens=required_tokens,
+        bytes=accounted_bytes,
+        last_access_s=float(now_s),
+        reference_count=current.reference_count if current is not None else 0,
+        evictable=current.evictable if current is not None else True,
+    )
+    cache.entries[session_id] = entry
+    _sync_kv_cache_state_for_deployment(state, deployment, runtime_strategy)
+    return {
+        "admitted": True,
+        "admission": "hit" if current is not None else "admitted",
+        "evicted_session_ids": tuple(victim.session_id for victim in evicted),
+        "entry": entry.to_dict(),
+    }
 
 def _token_context_contract_error(request: dict[str, Any]) -> str | None:
     new_user_tokens = request.get("new_user_tokens")

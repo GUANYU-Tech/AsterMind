@@ -30,49 +30,11 @@ from ..metrics.runtime_records import RuntimeRequestRecord
 from ..state.runtime_state import RuntimeState
 from .runtime_timing import TTFT_DEFINITION, ttft_breakdown
 from ..state.kv_runtime import (
-    _expire_session_kv,
+    _admit_session_kv,
     _kv_policy,
-    _kv_transfer_chunk_bytes,
-    _session_expires_at,
 )
 from ..strategy.schedulers import SchedulerCandidate, get_scheduler
 from ...orbit import TRACE_BACKED_RUNTIME_SURROGATE_SCOPE, normalize_trace_scope
-
-
-
-
-@dataclass(frozen=True)
-class KVTransferResult:
-    done_s: float
-    path: tuple[dict[str, Any], ...] = ()
-    sgl_wait_s: float = 0.0
-    isl_wait_s: float = 0.0
-    transmission_s: float = 0.0
-    attempted_bytes: float = 0.0
-    delivered_bytes: float = 0.0
-    committed_page_bytes: float = 0.0
-    useful_bytes: float = 0.0
-    interrupted: bool = False
-    expired: bool = False
-    interruption_reason: str | None = None
-    expiry_reason: str | None = None
-    sampled_legs: tuple[Any, ...] = ()
-
-
-class KVTransferRuntimeError(RuntimeError):
-    def __init__(
-        self,
-        reason: str,
-        *,
-        transfer: KVTransferResult,
-        kv_serve_action: str | None,
-        kv_post_turn_action: str | None,
-    ) -> None:
-        super().__init__(reason)
-        self.reason = reason
-        self.transfer = transfer
-        self.kv_serve_action = kv_serve_action
-        self.kv_post_turn_action = kv_post_turn_action
 
 
 
@@ -175,7 +137,6 @@ def run_trace_backed_runtime(
     warnings.extend(horizon_warnings)
 
     for normalized, raw_request in ordered_requests:
-        _expire_session_kv(state, normalized["arrival_time_s"])
         if normalized["output_tokens"] <= 0:
             record = _reject_record(
                 normalized,
@@ -576,7 +537,10 @@ def _evaluate_trace_request(
             trace_bundle,
             [energy_update["ledger_entry"], *_path_energy_entries(inbound_path)],
         )
-        session_action = _session_action(state, request.get("session_id"), route_plan.compute_satellite_id, arrival_s)
+        session_action = _session_action(
+            state, request.get("session_id"), route_plan.compute_satellite_id, arrival_s,
+            deployment=deployment, runtime_strategy=runtime_strategy, request=request,
+        )
         record = _post_compute_route_failure_record(
             request=request,
             deployment_id=deployment.deployment_id,
@@ -639,7 +603,10 @@ def _evaluate_trace_request(
             trace_bundle,
             [energy_update["ledger_entry"], *_path_energy_entries(inbound_path)],
         )
-        session_action = _session_action(state, request.get("session_id"), route_plan.compute_satellite_id, arrival_s)
+        session_action = _session_action(
+            state, request.get("session_id"), route_plan.compute_satellite_id, arrival_s,
+            deployment=deployment, runtime_strategy=runtime_strategy, request=request,
+        )
         record = _post_compute_route_failure_record(
             request=request,
             deployment_id=deployment.deployment_id,
@@ -723,7 +690,10 @@ def _evaluate_trace_request(
                     *_path_energy_entries(inbound_path, first_path),
                 ],
             )
-            session_action = _session_action(state, request.get("session_id"), route_plan.compute_satellite_id, arrival_s)
+            session_action = _session_action(
+            state, request.get("session_id"), route_plan.compute_satellite_id, arrival_s,
+            deployment=deployment, runtime_strategy=runtime_strategy, request=request,
+        )
             record = _post_compute_route_failure_record(
                 request=request,
                 deployment_id=deployment.deployment_id,
@@ -811,7 +781,10 @@ def _evaluate_trace_request(
     )
     ttft_s = float(timing["ttft_s"])
     e2e_s = remaining_done_s - arrival_s
-    session_action = _session_action(state, request.get("session_id"), route_plan.compute_satellite_id, arrival_s)
+    session_action = _session_action(
+            state, request.get("session_id"), route_plan.compute_satellite_id, arrival_s,
+            deployment=deployment, runtime_strategy=runtime_strategy, request=request,
+        )
     total_sgl_wait = sgl_wait_in + sgl_wait_first + sgl_wait_remaining
     total_isl_wait = isl_wait_in + isl_wait_first + isl_wait_remaining
     bottleneck = _bottleneck(energy_update["energy_violation"], prefill_wait_s, decode_wait_s, total_sgl_wait + total_isl_wait)
@@ -1883,131 +1856,6 @@ def _energy_summary_for_request(
     return _energy_summary_for_events(state, trace_bundle, identities)
 
 
-def _reserve_kv_transfer(
-    *,
-    state: RuntimeState,
-    trace_bundle: Any,
-    source_satellite_id: str,
-    target_satellite_id: str,
-    payload_bytes: float,
-    start_s: float,
-    max_hop_count: int | None,
-    chunk_bytes: float | None,
-    flow_kind: str,
-    deadline_s: float | None,
-    expires_at_s: float | None,
-    request_id: str | None = None,
-) -> KVTransferResult:
-    payload_bytes = max(0.0, float(payload_bytes or 0.0))
-    if payload_bytes <= 0:
-        return KVTransferResult(done_s=start_s)
-    if source_satellite_id == target_satellite_id:
-        return KVTransferResult(
-            done_s=start_s,
-            committed_page_bytes=0.0,
-            useful_bytes=0.0,
-        )
-    chunk_size = payload_bytes if chunk_bytes is None else max(1.0, min(payload_bytes, float(chunk_bytes)))
-    remaining = payload_bytes
-    current_s = start_s
-    path: list[dict[str, Any]] = []
-    sampled: list[Any] = []
-    sgl_wait = 0.0
-    isl_wait = 0.0
-    tx = 0.0
-    attempted = 0.0
-    delivered = 0.0
-    committed = 0.0
-    useful = 0.0
-    while remaining > 1e-9:
-        chunk = min(chunk_size, remaining)
-        try:
-            legs = _satellite_route_legs(
-                trace_bundle,
-                source_satellite_id,
-                target_satellite_id,
-                chunk,
-                time_s=current_s,
-                max_hop_count=max_hop_count,
-            )
-            attempted += chunk
-            done_s, chunk_path, chunk_sgl_wait, chunk_isl_wait, chunk_tx, chunk_sampled = _reserve_route(
-                state,
-                trace_bundle,
-                legs,
-                current_s,
-                request_id=request_id,
-                energy_stage=flow_kind,
-            )
-        except RouteSamplingError as exc:
-            return KVTransferResult(
-                done_s=current_s,
-                path=tuple(path),
-                sgl_wait_s=sgl_wait,
-                isl_wait_s=isl_wait,
-                transmission_s=tx,
-                attempted_bytes=attempted,
-                delivered_bytes=delivered,
-                committed_page_bytes=committed,
-                useful_bytes=useful,
-                interrupted=True,
-                interruption_reason=f"{flow_kind}:{exc.reason}",
-                sampled_legs=tuple(sampled),
-            )
-        path.extend(chunk_path)
-        sampled.extend(chunk_sampled)
-        sgl_wait += chunk_sgl_wait
-        isl_wait += chunk_isl_wait
-        tx += chunk_tx
-        delivered += chunk
-        current_s = done_s
-        if deadline_s is not None and current_s > deadline_s:
-            return KVTransferResult(
-                done_s=current_s,
-                path=tuple(path),
-                sgl_wait_s=sgl_wait,
-                isl_wait_s=isl_wait,
-                transmission_s=tx,
-                attempted_bytes=attempted,
-                delivered_bytes=delivered,
-                committed_page_bytes=committed,
-                useful_bytes=useful,
-                expired=True,
-                expiry_reason=f"{flow_kind}:deadline_expired",
-                sampled_legs=tuple(sampled),
-            )
-        if expires_at_s is not None and current_s > expires_at_s:
-            return KVTransferResult(
-                done_s=current_s,
-                path=tuple(path),
-                sgl_wait_s=sgl_wait,
-                isl_wait_s=isl_wait,
-                transmission_s=tx,
-                attempted_bytes=attempted,
-                delivered_bytes=delivered,
-                committed_page_bytes=committed,
-                useful_bytes=useful,
-                expired=True,
-                expiry_reason=f"{flow_kind}:ttl_expired",
-                sampled_legs=tuple(sampled),
-            )
-        remaining -= chunk
-    committed = payload_bytes
-    useful = payload_bytes
-    return KVTransferResult(
-        done_s=current_s,
-        path=tuple(path),
-        sgl_wait_s=sgl_wait,
-        isl_wait_s=isl_wait,
-        transmission_s=tx,
-        attempted_bytes=attempted,
-        delivered_bytes=delivered,
-        committed_page_bytes=committed,
-        useful_bytes=useful,
-        sampled_legs=tuple(sampled),
-    )
-
-
 def _build_post_compute_outbound_plan(
     *,
     trace_bundle: Any,
@@ -2363,17 +2211,54 @@ def _failure_reason(reason: str) -> str:
     return "no_compute_capacity"
 
 
-def _session_action(state: RuntimeState, session_id: str | None, satellite_id: str, now_s: float) -> str:
+def _session_action(
+    state: RuntimeState,
+    session_id: str | None,
+    satellite_id: str,
+    now_s: float,
+    *,
+    deployment: Any,
+    runtime_strategy: Any,
+    request: dict[str, Any],
+) -> str:
     if not session_id:
         return "none"
+    existed = session_id in state.sessions
     session = state.session_for(session_id)
-    if session.owner_satellite_id is None or session.owner_satellite_id == satellite_id:
-        session.owner_satellite_id = satellite_id
+    deployment_id = str(getattr(deployment, "deployment_id", ""))
+    cache = state.kv_cache_for(deployment_id)
+    cache_hit = session_id in cache.entries and cache.entries[session_id].satellite_id == satellite_id
+    action = "sticky_kv_owner" if cache_hit or not existed else "recompute_context"
+    tokens = max(0, int(request.get("prompt_tokens", 0))) + max(
+        0, int(request.get("output_tokens", 0))
+    )
+    admission = _admit_session_kv(
+        state,
+        deployment,
+        runtime_strategy,
+        session_id=str(session_id),
+        satellite_id=str(satellite_id),
+        tokens=tokens,
+        kv_bytes_per_token=float(getattr(deployment, "kv_cache_bytes_per_token", 0.0) or 0.0),
+        now_s=float(now_s),
+    )
+    if not admission["admitted"]:
+        session.owner_satellite_id = None
+        session.owner_deployment_id = None
+        session.owner_satellite_ids = ()
+        session.last_session_action = "recompute_context"
         session.last_seen_s = now_s
-        return "sticky_kv_owner"
+        return "recompute_context"
+    entry = admission["entry"]
     session.owner_satellite_id = satellite_id
+    session.owner_deployment_id = deployment_id
+    session.owner_satellite_ids = (satellite_id,)
+    session.kv_cache_tokens = int(entry["tokens"])
+    session.kv_cache_bytes = float(entry["bytes"])
+    session.context_tokens = tokens
     session.last_seen_s = now_s
-    return "recompute_context"
+    session.last_session_action = action
+    return action
 
 
 def _bottleneck(
