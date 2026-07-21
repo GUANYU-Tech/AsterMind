@@ -11,6 +11,7 @@ from orbitserve.runtime.metrics.energy_alignment import (
     summarize_runtime_sunlight,
 )
 from orbitserve.runtime.state.runtime_state import SatelliteState
+from orbitserve.runtime.engine.trace_backed import _energy_window_for_runtime_action
 
 
 def _window(**overrides):
@@ -19,7 +20,7 @@ def _window(**overrides):
         "start_s": 0.0,
         "end_s": 10.0,
         "sunlit": False,
-        "dvfs_multiplier": 1.0,
+        "dvfs_scale": 1.0,
         "charge_rate_w": 0.0,
         "idle_power_w": 0.0,
         "compute_energy_j_per_token": 2.0,
@@ -35,6 +36,19 @@ def _window(**overrides):
 
 
 class EnergyAccountingAlignmentTests(unittest.TestCase):
+    def test_shadow_dvfs_scales_capacity_without_double_scaling_token_energy(self):
+        strategy = type("Strategy", (), {"hard_gate_overrides": {}, "dvfs_modes_enabled": ("shadow_dvfs",)})()
+
+        adjusted = _energy_window_for_runtime_action(
+            _window(),
+            runtime_strategy=strategy,
+            action_type="shadow_dvfs",
+        )
+
+        self.assertEqual(adjusted["dvfs_scale"], 0.5)
+        self.assertEqual(adjusted["compute_energy_j_per_token"], 2.0)
+        self.assertEqual(adjusted["runtime_compute_energy_scale"], 1.0)
+
     def test_zero_request_has_zero_dynamic_energy(self):
         intensity = EnergyIntensity(
             compute_energy_j_per_token=2.0,

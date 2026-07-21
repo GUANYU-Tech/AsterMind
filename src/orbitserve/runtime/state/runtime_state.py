@@ -99,7 +99,7 @@ class SatelliteState:
     initial_soc: float = 0.8
     last_energy_update_s: float = 0.0
     sunlit: bool = True
-    dvfs_multiplier: float = 1.0
+    dvfs_scale: float = 1.0
     energy_events: tuple[dict[str, Any], ...] = ()
     energy_ledger: tuple[dict[str, Any], ...] = ()
     materialized_energy_event_ids: tuple[str, ...] = ()
@@ -112,7 +112,7 @@ class SatelliteState:
             "initial_soc": self.initial_soc,
             "last_energy_update_s": self.last_energy_update_s,
             "sunlit": self.sunlit,
-            "dvfs_multiplier": self.dvfs_multiplier,
+            "dvfs_scale": self.dvfs_scale,
             "energy_events": to_jsonable(self.energy_events),
             "energy_ledger": to_jsonable(self.energy_ledger),
             "materialized_energy_event_ids": self.materialized_energy_event_ids,

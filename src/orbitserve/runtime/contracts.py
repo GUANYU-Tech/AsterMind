@@ -39,7 +39,7 @@ RUNTIME_RESULT_FIELDS = frozenset(
         "soc_after",
         "compute_sunlit",
         "access_sunlit",
-        "dvfs_multiplier",
+        "dvfs_scale",
         "shadow_strategy",
         "sgl_queue_wait_s",
         "isl_queue_wait_s",

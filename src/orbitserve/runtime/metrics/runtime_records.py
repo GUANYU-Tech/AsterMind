@@ -88,7 +88,7 @@ class RuntimeRequestRecord:
     energy_violation: bool | None = None
     compute_sunlit: bool | None = None
     access_sunlit: bool | None = None
-    dvfs_multiplier: float | None = None
+    dvfs_scale: float | None = None
     shadow_strategy: str | None = None
     shadow_strategies: tuple[str, ...] = ()
     access_action_type: str | None = None

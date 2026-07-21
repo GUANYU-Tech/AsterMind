@@ -535,15 +535,18 @@ def _evaluate_trace_request(
         runtime_strategy=runtime_strategy,
         action_type=action_type,
     )
-    dvfs = float(request_energy_window.get("dvfs_multiplier", 1.0))
-    prefill_service_s = _safe_service_time(request["prompt_tokens"], prefill_rate_per_sat) * dvfs
-    decode_service_s = _safe_service_time(request["output_tokens"], decode_rate_per_sat) * dvfs
+    dvfs_scale = float(request_energy_window.get("dvfs_scale", 1.0))
+    prefill_service_s = _safe_service_time(request["prompt_tokens"], prefill_rate_per_sat) / dvfs_scale
+    decode_service_s = _safe_service_time(request["output_tokens"], decode_rate_per_sat) / dvfs_scale
     if not math.isfinite(prefill_service_s) or not math.isfinite(decode_service_s):
         record = _reject_record(request, "non_finite_service_time", scope=scope, trace_model=trace_model)
         return record, _decision_trace(request, policy, access_candidates, route_plan, "non_finite_service_time")
     prefill_start_s, prefill_done_s, prefill_wait_s = satellite.compute_queue.reserve_prefill(inbound_done_s, prefill_service_s)
     decode_start_s, decode_done_s, decode_wait_s = satellite.compute_queue.reserve_decode(prefill_done_s, decode_service_s)
-    first_token_service_s = min(decode_service_s, _safe_service_time(1, decode_rate_per_sat) * dvfs)
+    first_token_service_s = min(
+        decode_service_s,
+        _safe_service_time(1, decode_rate_per_sat) / dvfs_scale,
+    )
     first_token_ready_s = decode_start_s + first_token_service_s
     first_token_bytes = _first_token_bytes(request)
     remaining_output_bytes = max(0.0, request["output_bytes"] - first_token_bytes)
@@ -851,7 +854,7 @@ def _evaluate_trace_request(
         energy_ledger=tuple(energy_update.get("energy_ledger", ())),
         compute_sunlit=_energy_window_sunlit(raw_request_energy_window),
         access_sunlit=selected.get("access_sunlit"),
-        dvfs_multiplier=float(request_energy_window.get("dvfs_multiplier", 1.0)),
+        dvfs_scale=float(request_energy_window.get("dvfs_scale", 1.0)),
         shadow_strategy=selected.get("shadow_strategy"),
         fallback_used=False,
         deferred=deferred,
@@ -889,8 +892,8 @@ def _evaluate_trace_request(
             "predicted_energy_risk": selected.get("predicted_energy_risk"),
             "access_sunlit": selected.get("access_sunlit"),
             "compute_sunlit": _energy_window_sunlit(raw_request_energy_window),
-            "raw_dvfs_multiplier": raw_request_energy_window.get("dvfs_multiplier"),
-            "effective_dvfs_multiplier": request_energy_window.get("dvfs_multiplier"),
+            "raw_dvfs_scale": raw_request_energy_window.get("dvfs_scale"),
+            "effective_dvfs_scale": request_energy_window.get("dvfs_scale"),
             "shadow_strategy": selected.get("shadow_strategy"),
             "shadow_triggered": _shadow_triggered(action_type, selected.get("access_energy_window"), raw_request_energy_window),
             "shadow_runtime_action": action_type,
@@ -1250,14 +1253,17 @@ def _build_scheduler_candidates(
             runtime_strategy=runtime_strategy,
             action_type=action_type,
         )
-        dvfs = float(request_energy_window.get("dvfs_multiplier", 1.0))
-        prefill_service_s = _safe_service_time(request["prompt_tokens"], prefill_rate_per_sat) * dvfs
-        decode_service_s = _safe_service_time(request["output_tokens"], decode_rate_per_sat) * dvfs
+        dvfs_scale = float(request_energy_window.get("dvfs_scale", 1.0))
+        prefill_service_s = _safe_service_time(request["prompt_tokens"], prefill_rate_per_sat) / dvfs_scale
+        decode_service_s = _safe_service_time(request["output_tokens"], decode_rate_per_sat) / dvfs_scale
         if not math.isfinite(prefill_service_s) or not math.isfinite(decode_service_s):
             continue
         prefill_start, prefill_done, prefill_wait = satellite.compute_queue.preview_prefill(inbound_done, prefill_service_s)
         decode_start, decode_done, decode_wait = satellite.compute_queue.preview_decode(prefill_done, decode_service_s)
-        first_token_service_s = min(decode_service_s, _safe_service_time(1, decode_rate_per_sat) * dvfs)
+        first_token_service_s = min(
+            decode_service_s,
+            _safe_service_time(1, decode_rate_per_sat) / dvfs_scale,
+        )
         first_token_route_plan = replace(
             route_plan,
             inbound_legs=(),
@@ -1386,8 +1392,8 @@ def _build_scheduler_candidates(
                 "path_id": route_plan.path_id,
                 "access_sunlit": _energy_window_sunlit(access_energy_window),
                 "compute_sunlit": _energy_window_sunlit(raw_request_energy_window),
-                "raw_dvfs_multiplier": raw_request_energy_window.get("dvfs_multiplier"),
-                "effective_dvfs_multiplier": request_energy_window.get("dvfs_multiplier"),
+                "raw_dvfs_scale": raw_request_energy_window.get("dvfs_scale"),
+                "effective_dvfs_scale": request_energy_window.get("dvfs_scale"),
                 "shadow_strategy": _shadow_strategy_label(action_type, raw_request_energy_window),
                 "shadow_triggered": _shadow_triggered(action_type, access_energy_window, raw_request_energy_window),
             },
@@ -1411,7 +1417,7 @@ def _build_scheduler_candidates(
             "access_energy_window": access_energy_window,
             "access_sunlit": _energy_window_sunlit(access_energy_window),
             "compute_sunlit": _energy_window_sunlit(raw_request_energy_window),
-            "dvfs_multiplier": request_energy_window.get("dvfs_multiplier"),
+            "dvfs_scale": request_energy_window.get("dvfs_scale"),
             "shadow_strategy": _shadow_strategy_label(action_type, raw_request_energy_window),
             "scheduler_candidate": candidate.to_dict(),
         }
@@ -1480,22 +1486,18 @@ def _energy_window_for_runtime_action(
         return adjusted
     overrides = _dict(getattr(runtime_strategy, "hard_gate_overrides", {}))
     if action_type == "shadow_dvfs":
-        compute_scale = _optional_float(overrides.get("shadow_dvfs_compute_energy_scale"))
-        link_scale = _optional_float(overrides.get("shadow_dvfs_link_energy_scale"))
-        adjusted["compute_energy_j_per_token"] = float(adjusted["compute_energy_j_per_token"]) * (
-            compute_scale if compute_scale is not None else 0.72
-        )
-        adjusted["link_energy_j_per_byte"] = float(adjusted["link_energy_j_per_byte"]) * (
-            link_scale if link_scale is not None else 1.0
-        )
+        dvfs_scale = _optional_float(overrides.get("shadow_dvfs_scale"))
+        effective_scale = dvfs_scale if dvfs_scale is not None else 0.5
+        if not 0.0 < effective_scale <= 1.0:
+            raise ValueError("shadow_dvfs_scale must be in (0, 1]")
+        adjusted["dvfs_scale"] = effective_scale
         adjusted["shadow_strategy"] = "shadow_dvfs"
-        adjusted["shadow_dvfs_compute_energy_scale"] = compute_scale if compute_scale is not None else 0.72
-        adjusted["shadow_dvfs_link_energy_scale"] = link_scale if link_scale is not None else 1.0
-        adjusted["runtime_compute_energy_scale"] = adjusted["shadow_dvfs_compute_energy_scale"]
-        adjusted["runtime_link_energy_scale"] = adjusted["shadow_dvfs_link_energy_scale"]
+        # Compute power and capacity scale together.  Their effects cancel in
+        # the per-token dynamic-energy coefficient, so that coefficient must
+        # not be scaled a second time here.
         return adjusted
     if not _runtime_dvfs_enabled(runtime_strategy, "shadow_dvfs"):
-        adjusted["dvfs_multiplier"] = 1.0
+        adjusted["dvfs_scale"] = 1.0
     adjusted["shadow_strategy"] = "shadow_local_compute" if action_type == "shadow_local_compute" else action_type
     return adjusted
 
@@ -1794,7 +1796,7 @@ def _commit_energy_preview_states(state: RuntimeState, previews: dict[str, Any])
         target.initial_soc = preview.initial_soc
         target.last_energy_update_s = preview.last_energy_update_s
         target.sunlit = preview.sunlit
-        target.dvfs_multiplier = preview.dvfs_multiplier
+        target.dvfs_scale = preview.dvfs_scale
         target.energy_events = preview.energy_events
         target.energy_ledger = preview.energy_ledger
         target.materialized_energy_event_ids = preview.materialized_energy_event_ids
