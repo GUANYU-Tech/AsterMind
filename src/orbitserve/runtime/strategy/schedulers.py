@@ -316,8 +316,8 @@ class RuntimeScheduler:
             "candidate_search_space_available": True,
             "candidate_strategy_count": len(candidate_strategies),
             "candidate_policies": tuple(candidate["policy"] for candidate in candidate_strategies),
-            "request_level_execution": "request_level_slo_aware_surrogate_not_full_shadow_kv_marginal_rule",
-            "paper_rule_status": "request_level_slo_aware_surrogate_not_full_shadow_kv_marginal_rule",
+            "request_level_execution": "request_level_resource_aware_surrogate",
+            "paper_rule_status": "request_level_resource_aware_surrogate",
         }
         if not candidates:
             return SchedulerDecision(
@@ -452,14 +452,14 @@ class RuntimeScheduler:
             optimization_support=support,
             candidate_strategies=candidate_strategies,
             module_status={
-                "scheduling": "request_level_slo_aware_surrogate_not_full_shadow_kv_marginal_rule",
+                "scheduling": "request_level_resource_aware_surrogate",
                 "runtime_strategy": "provided",
                 "runtime_optimization": "candidate_strategy_payloads_available",
             },
             provenance={
                 "scheduler_interface": "request_level_candidate_selector",
                 "state_request_available": True,
-                "score_model": "request_level_slo_aware_surrogate_not_full_shadow_kv_marginal_rule",
+                "score_model": "request_level_resource_aware_surrogate",
                 "hard_gate_mode": hard_gate_mode,
             },
         )
@@ -480,21 +480,11 @@ class RuntimeScheduler:
         link = _finite_or(candidate.predicted_link_wait_s, 0.0)
         energy_risk = _finite_or(candidate.predicted_energy_risk, 0.0)
         latency_for_score = _finite_or(candidate.predicted_nominal_latency_s, e2e)
-        ttft_deadline = _optional_float(request.get("ttft_deadline_s"))
-        e2e_deadline = _optional_float(request.get("e2e_deadline_s"))
-        ttft_miss = ttft_deadline is not None and ttft > ttft_deadline
-        e2e_miss = e2e_deadline is not None and e2e > e2e_deadline
-        negative_ttft_slack = max(0.0, ttft - ttft_deadline) if ttft_deadline is not None else 0.0
-        negative_e2e_slack = max(0.0, e2e - e2e_deadline) if e2e_deadline is not None else 0.0
         # Hard gates are enforced before ranking in select_action().  Keep this
         # compatibility field at zero so a penalty can never substitute for
         # admission filtering.
         hard_gate_penalty = 0.0
-        slo_miss_penalty = 1_000_000.0 if ttft_miss or e2e_miss else 0.0
         normalized_e2e = latency_for_score / refs["latency_s"]
-        normalized_negative_slack = (
-            negative_ttft_slack / refs["ttft_s"] + negative_e2e_slack / refs["e2e_s"]
-        )
         normalized_queue = queue / refs["queue_s"]
         normalized_link = link / refs["link_s"]
         normalized_energy_risk = energy_risk / refs["energy_risk"]
@@ -533,7 +523,6 @@ class RuntimeScheduler:
         normalized_kv_hit_credit = kv_hit_tokens / refs["tokens"]
         weighted_components = {
             "latency": _weight(weights, "latency", 1.0) * normalized_e2e,
-            "slack": _weight(weights, "slack", 10.0) * normalized_negative_slack,
             "queue": _weight(weights, "queue", 1.0) * normalized_queue,
             "link": _weight(weights, "link", 1.0) * normalized_link,
             "energy": _weight(weights, "energy", 10.0) * normalized_energy_risk,
@@ -552,11 +541,7 @@ class RuntimeScheduler:
             "shadow_offload_credit": -_weight(weights, "shadow_offload_credit", 0.0)
             * shadow_offload_indicator,
         }
-        score = (
-            hard_gate_penalty
-            + slo_miss_penalty
-            + sum(weighted_components.values())
-        )
+        score = hard_gate_penalty + sum(weighted_components.values())
         score_components = {
             "latency": _score_component(
                 latency_for_score,
@@ -565,15 +550,6 @@ class RuntimeScheduler:
                 weights,
                 "latency",
                 1.0,
-                weighted_components,
-            ),
-            "slack": _score_component(
-                {"negative_ttft_slack_s": negative_ttft_slack, "negative_e2e_slack_s": negative_e2e_slack},
-                {"ttft_s": refs["ttft_s"], "e2e_s": refs["e2e_s"]},
-                normalized_negative_slack,
-                weights,
-                "slack",
-                10.0,
                 weighted_components,
             ),
             "queue": _score_component(
@@ -678,14 +654,8 @@ class RuntimeScheduler:
             "hard_gate_blocking": hard_gate_blocking,
             "hard_gate_violations": candidate.hard_gate_violations,
             "hard_gate_results": candidate.hard_gate_results,
-            "ttft_deadline_s": ttft_deadline,
-            "e2e_deadline_s": e2e_deadline,
-            "negative_ttft_slack_s": negative_ttft_slack,
-            "negative_e2e_slack_s": negative_e2e_slack,
             "hard_gate_penalty": hard_gate_penalty,
-            "slo_miss_penalty": slo_miss_penalty,
             "normalized_e2e": normalized_e2e,
-            "normalized_negative_slack": normalized_negative_slack,
             "normalized_queue": normalized_queue,
             "normalized_link": normalized_link,
             "normalized_energy_risk": normalized_energy_risk,
@@ -711,22 +681,22 @@ class RuntimeScheduler:
             "normalization_refs": refs,
             "normalization_scope": "request_candidate_set",
             "score_components": score_components,
-            "score_model": "request_level_slo_aware_surrogate_not_full_shadow_kv_marginal_rule",
+            "score_model": "request_level_resource_aware_surrogate",
         }
         return score, candidate, to_jsonable(score_terms)
 
     def _effective_policy_weights(self, runtime_strategy: dict[str, Any]) -> dict[str, float]:
         policy = str(runtime_strategy.get("policy") or self.spec.policy)
         if policy in {"local_only", "nearest_visible"}:
-            defaults = {"latency": 1.0, "slack": 10.0, "queue": 1.0, "link": 1.0, "energy": 10.0, "hop": 0.0}
+            defaults = {"latency": 1.0, "queue": 1.0, "link": 1.0, "energy": 10.0, "hop": 0.0}
         elif policy == "shortest_path":
-            defaults = {"latency": 1.0, "slack": 0.0, "queue": 0.0, "link": 0.0, "energy": 0.0, "hop": 0.2}
+            defaults = {"latency": 1.0, "queue": 0.0, "link": 0.0, "energy": 0.0, "hop": 0.2}
         elif policy == "load_aware":
-            defaults = {"latency": 0.25, "slack": 5.0, "queue": 5.0, "link": 0.5, "energy": 0.0, "hop": 0.05}
+            defaults = {"latency": 0.25, "queue": 5.0, "link": 0.5, "energy": 0.0, "hop": 0.05}
         elif policy == "energy_aware":
-            defaults = {"latency": 0.25, "slack": 5.0, "queue": 0.5, "link": 0.5, "energy": 50.0, "hop": 0.05}
+            defaults = {"latency": 0.25, "queue": 0.5, "link": 0.5, "energy": 50.0, "hop": 0.05}
         else:
-            defaults = {"latency": 1.0, "slack": 10.0, "queue": 2.0, "link": 1.0, "energy": 10.0, "hop": 0.1}
+            defaults = {"latency": 1.0, "queue": 2.0, "link": 1.0, "energy": 10.0, "hop": 0.1}
         overrides = _mapping_from_value(runtime_strategy.get("weights"))
         for key, value in overrides.items():
             if value is not None:
@@ -829,8 +799,6 @@ def _normalization_refs(
 ) -> dict[str, float]:
     configured = _mapping_from_value(runtime_strategy.get("normalization_refs"))
     state_refs = _mapping_from_value(state.get("normalization_refs"))
-    e2e_deadline = _optional_float(request.get("e2e_deadline_s"))
-    ttft_deadline = _optional_float(request.get("ttft_deadline_s"))
     candidate_max = {
         "latency_s": max(
             1.0,
@@ -845,19 +813,14 @@ def _normalization_refs(
     }
     latency_default = max(
         1.0,
-        _finite_or(e2e_deadline, 0.0),
         *(_finite_or(candidate.predicted_e2e_s, 0.0) for candidate in candidates),
         *(_finite_or(candidate.predicted_nominal_latency_s, 0.0) for candidate in candidates),
     )
     ttft_default = max(
         1.0,
-        _finite_or(ttft_deadline, 0.0),
         *(_finite_or(candidate.predicted_ttft_s, 0.0) for candidate in candidates),
     )
-    symbolic_values = {
-        "e2e_deadline_s": e2e_deadline,
-        "ttft_deadline_s": ttft_deadline,
-    }
+    symbolic_values: dict[str, float | None] = {}
     return {
         "latency_s": _normalization_ref(
             configured.get("latency_s"),
@@ -916,12 +879,6 @@ def _with_scheduler_gate_results(
     """Make scheduler admission self-contained for direct and runtime callers."""
 
     results = _mapping_from_value(candidate.hard_gate_results)
-    ttft_deadline = _optional_float(request.get("ttft_deadline_s"))
-    e2e_deadline = _optional_float(request.get("e2e_deadline_s"))
-    ttft = _finite_optional(candidate.predicted_ttft_s)
-    e2e = _finite_optional(candidate.predicted_e2e_s)
-    results["slo_ttft"] = _deadline_gate_result("ttft", ttft, ttft_deadline)
-    results["slo_e2e"] = _deadline_gate_result("e2e", e2e, e2e_deadline)
     results["physical_eligibility"] = {
         "passed": candidate.feasible,
         "reason": None if candidate.feasible else "candidate_marked_infeasible",
@@ -947,10 +904,6 @@ def _with_scheduler_gate_results(
             "soc_slack": None if predicted_soc_after is None else predicted_soc_after - soc_min,
         }
     scheduler_owned_reasons = {
-        "predicted_ttft_deadline_miss",
-        "predicted_e2e_deadline_miss",
-        "predicted_ttft_unavailable",
-        "predicted_e2e_unavailable",
         "candidate_marked_infeasible",
     }
     if soc_min is not None:
@@ -970,29 +923,6 @@ def _with_scheduler_gate_results(
         hard_gate_violations=tuple(violations),
         hard_gate_results=to_jsonable(results),
     )
-
-
-def _deadline_gate_result(
-    metric_name: str,
-    predicted_s: float | None,
-    deadline_s: float | None,
-) -> dict[str, Any]:
-    if deadline_s is None:
-        return {"passed": None, "reason": None, "predicted_s": predicted_s, "deadline_s": None}
-    if predicted_s is None:
-        return {
-            "passed": False,
-            "reason": f"predicted_{metric_name}_unavailable",
-            "predicted_s": None,
-            "deadline_s": deadline_s,
-        }
-    passed = predicted_s <= deadline_s
-    return {
-        "passed": passed,
-        "reason": None if passed else f"predicted_{metric_name}_deadline_miss",
-        "predicted_s": predicted_s,
-        "deadline_s": deadline_s,
-    }
 
 
 def _finite_optional(value: Any) -> float | None:

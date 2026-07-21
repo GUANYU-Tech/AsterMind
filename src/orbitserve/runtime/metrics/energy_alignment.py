@@ -27,7 +27,7 @@ class EnergyAlignmentResult:
     difference_fraction: float | None = None
     tolerance_fraction: float = DEFAULT_ALIGNMENT_TOLERANCE_FRACTION
     target_served_ratio: float | None = None
-    runtime_served_ratio: float | None = None
+    runtime_completion_ratio: float | None = None
     target_served_ratio_met: bool | None = None
     coefficients_match: bool | None = None
     sunlight_fraction_match: bool | None = None
@@ -123,21 +123,20 @@ def evaluate_energy_alignment(
         warnings.append("runtime energy ledger contains invalid request-event energy values")
     if actual["missing_required_ledger_record_count"]:
         warnings.append(
-            "one or more satellite-served requests have no request-event energy ledger"
+            "one or more satellite-completed requests have no request-event energy ledger"
         )
     if not ledger_available:
         warnings.append("runtime request-event energy ledger is unavailable")
 
     runtime_evaluated = bool(runtime.get("evaluated", getattr(runtime_performance, "evaluated", False)))
-    runtime_served_ratio = _first_finite(
-        _nested(runtime, "runtime_metrics", "served_ratio"),
-        _nested(runtime, "slo", "served_ratio"),
+    runtime_completion_ratio = _first_finite(
+        _nested(runtime, "runtime_metrics", "completion_ratio"),
     )
     missing_runtime_request_record_count = 0
     if (
         runtime_energy_ledger_expected
-        and runtime_served_ratio is not None
-        and runtime_served_ratio > 0.0
+        and runtime_completion_ratio is not None
+        and runtime_completion_ratio > 0.0
     ):
         if offered_request_count is not None:
             missing_runtime_request_record_count = max(
@@ -151,44 +150,44 @@ def evaluate_energy_alignment(
     )
     if missing_runtime_request_record_count:
         warnings.append(
-            "runtime reports served satellite work but its request-record collection is incomplete"
+            "runtime reports completed satellite work but its request-record collection is incomplete"
         )
-    request_record_served_ratio = None
+    request_record_completion_ratio = None
     if offered_request_count is not None and offered_request_count > 0:
-        request_record_served_ratio = (
-            actual["served_request_count"] / offered_request_count
+        request_record_completion_ratio = (
+            actual["completed_request_count"] / offered_request_count
         )
     runtime_request_record_mismatch = False
     if (
         runtime_energy_ledger_expected
-        and runtime_served_ratio is not None
+        and runtime_completion_ratio is not None
         and not zero_workload
     ):
-        if request_record_served_ratio is not None:
+        if request_record_completion_ratio is not None:
             runtime_request_record_mismatch = not math.isclose(
-                runtime_served_ratio,
-                request_record_served_ratio,
+                runtime_completion_ratio,
+                request_record_completion_ratio,
                 rel_tol=1e-12,
                 abs_tol=1e-12,
             )
-        elif runtime_served_ratio > 0.0 and actual["served_request_count"] == 0:
+        elif runtime_completion_ratio > 0.0 and actual["completed_request_count"] == 0:
             runtime_request_record_mismatch = True
-    actual["request_record_served_ratio"] = request_record_served_ratio
+    actual["request_record_completion_ratio"] = request_record_completion_ratio
     actual["runtime_request_record_mismatch"] = runtime_request_record_mismatch
     if runtime_request_record_mismatch:
         warnings.append(
-            "runtime served-ratio metrics disagree with the request-record collection"
+            "runtime completed-ratio metrics disagree with the request-record collection"
         )
     target_served_ratio = _target_served_ratio(planned)
     target_met = None
     if target_served_ratio is not None:
         target_met = True if zero_workload else (
-            runtime_served_ratio is not None
-            and runtime_served_ratio + 1e-12 >= target_served_ratio
+            runtime_completion_ratio is not None
+            and runtime_completion_ratio + 1e-12 >= target_served_ratio
         )
         if not target_met:
             warnings.append(
-                "runtime served ratio did not meet the sizing target; planned energy remains unchanged"
+                "runtime completed ratio did not meet the sizing target; planned energy remains unchanged"
             )
 
     runtime_coefficients = _runtime_coefficients(runtime_energy_envelope)
@@ -425,7 +424,7 @@ def evaluate_energy_alignment(
         difference_fraction=difference_fraction,
         tolerance_fraction=tolerance,
         target_served_ratio=target_served_ratio,
-        runtime_served_ratio=runtime_served_ratio,
+        runtime_completion_ratio=runtime_completion_ratio,
         target_served_ratio_met=target_met,
         coefficients_match=coefficients_match,
         sunlight_fraction_match=sunlight_fraction_match,
@@ -605,12 +604,10 @@ def _aggregate_request_event_energy(
             ):
                 request_energy_violation_event_count += 1
             event_count += 1
-    served_count = sum(1 for record in records if bool(record.get("served", False)))
-    accepted_count = sum(1 for record in records if bool(record.get("accepted", False)))
+    completed_count = sum(1 for record in records if bool(record.get("completed", False)))
     return {
         "attempted_request_count": len(records),
-        "accepted_request_count": accepted_count,
-        "served_request_count": served_count,
+        "completed_request_count": completed_count,
         "request_event_count": event_count,
         "deduplicated_request_event_count": len(seen),
         "invalid_ledger_entry_count": invalid,
@@ -650,9 +647,9 @@ def _runtime_energy_ledger_expected(runtime: dict[str, Any]) -> bool:
 
 
 def _record_requires_request_energy_ledger(record: dict[str, Any]) -> bool:
-    """Only satellite-served work must carry a satellite energy ledger."""
+    """Only satellite-completed work must carry a satellite energy ledger."""
 
-    if not bool(record.get("served", False)):
+    if not bool(record.get("completed", False)):
         return False
     action_type = str(record.get("action_type") or "")
     if bool(record.get("fallback_used", False)) or action_type.startswith("ground_"):

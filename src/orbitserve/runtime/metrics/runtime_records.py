@@ -14,18 +14,12 @@ class RuntimeRequestRecord:
     arrival_time_s: float
     deployment_id: str | None
     action_type: str
-    accepted: bool
     completed: bool
-    served: bool
-    rejected: bool
-    timeout: bool
+    uncompleted_stage: str | None = None
+    uncompleted_reason: str | None = None
     action_components: tuple[str, ...] = ()
-    reject_reason: str | None = None
-    timeout_reason: str | None = None
     prompt_tokens: int = 0
     output_tokens: int = 0
-    ttft_deadline_s: float | None = None
-    e2e_deadline_s: float | None = None
     prefill_queue_wait_s: float | None = None
     decode_queue_wait_s: float | None = None
     link_queue_wait_s: float | None = None

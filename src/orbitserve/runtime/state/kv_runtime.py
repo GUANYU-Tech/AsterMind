@@ -54,13 +54,6 @@ def _kv_required_pages(tokens: int | float, page_size_tokens: int | None) -> int
         return 1 if token_count > 0 else 0
     return int(math.ceil(token_count / page_size_tokens))
 
-def _request_kv_deadline_s(request: dict[str, Any], arrival_s: float) -> float | None:
-    deadlines = []
-    for key in ("ttft_deadline_s", "e2e_deadline_s"):
-        value = _optional_float(request.get(key))
-        if value is not None:
-            deadlines.append(arrival_s + value)
-    return min(deadlines) if deadlines else None
 
 def _session_expires_at(state: RuntimeState, session_id: str | None) -> float | None:
     session = state.sessions.get(str(session_id)) if session_id else None

@@ -38,9 +38,9 @@ PERFORMANCE_FIELDS = (
 )
 
 SLO_FIELDS = (
-    "served_ratio",
-    "rejected_ratio",
-    "timeout_ratio",
+    "completion_ratio",
+    "uncompleted_ratio",
+
     "energy_violation_count",
     "isl_congestion_p95",
     "sgl_congestion_p95",
@@ -71,7 +71,7 @@ class RuntimeOptimizationObjective:
     allow_idealized_runtime_metrics: bool = False
     ignore_optional_cost: bool = False
     weights: dict[str, float] = field(
-        default_factory=lambda: {"served": 1.0, "tail": 1.0, "cost": 1.0}
+        default_factory=lambda: {"completion": 1.0, "tail": 1.0, "cost": 1.0}
     )
 
     @classmethod
@@ -277,7 +277,7 @@ def optimize_runtime_strategy(
     if selected is None:
         result_warnings.append(
             "runtime evaluator did not provide complete evaluated metrics; optimizer cannot claim "
-            "served_ratio, TTFT, E2E, or cost-SLO improvements"
+            "completion_ratio, TTFT, E2E, or cost-SLO improvements"
         )
     if any(row.objective_score is None for row in rows):
         result_warnings.append(
@@ -595,12 +595,11 @@ def _summarize_evaluator_result(result: Any) -> dict[str, Any]:
         }
     if not slo and runtime_metrics:
         slo = {
-            "served_ratio": runtime_metrics.get("served_ratio"),
-            "rejected_ratio": _first_present(
-                runtime_metrics.get("rejected_ratio"),
+            "completion_ratio": runtime_metrics.get("completion_ratio"),
+            "uncompleted_ratio": _first_present(
+                runtime_metrics.get("uncompleted_ratio"),
                 runtime_metrics.get("reject_ratio"),
             ),
-            "timeout_ratio": runtime_metrics.get("timeout_ratio"),
             "energy_violation_count": runtime_metrics.get("energy_violation_count"),
             "isl_congestion_p95": runtime_metrics.get("isl_congestion_p95"),
             "sgl_congestion_p95": runtime_metrics.get("sgl_congestion_p95"),
@@ -732,18 +731,18 @@ def _objective_score(
         )
     performance = _mapping_from_value(evaluator_result.get("performance"))
     slo = _mapping_from_value(evaluator_result.get("slo"))
-    served_ratio = slo.get("served_ratio")
+    completion_ratio = slo.get("completion_ratio")
     e2e_p95_s = performance.get("e2e_p95_s")
-    if served_ratio is None or e2e_p95_s is None:
+    if completion_ratio is None or e2e_p95_s is None:
         return (
             None,
             None,
             valid_for_paper,
-            ("objective_score is null because served_ratio or e2e_p95_s is missing",),
+            ("objective_score is null because completion_ratio or e2e_p95_s is missing",),
             _score_provenance(objective, None, valid_for_paper),
         )
     score = (
-        -objective.weights.get("served", 1.0) * float(served_ratio)
+        -objective.weights.get("completion", 1.0) * float(completion_ratio)
         + objective.weights.get("tail", 1.0) * float(e2e_p95_s)
     )
     cost_weight = objective.weights.get("cost", 0.0)

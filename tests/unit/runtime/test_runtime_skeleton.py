@@ -70,9 +70,6 @@ def _request(**overrides):
         "output_tokens": 128,
         "input_bytes": 1024,
         "output_bytes": 256,
-        "slo_class": "interactive_5s",
-        "ttft_deadline_s": 5.0,
-        "e2e_deadline_s": 30.0,
         "session_id": "session-0",
         "turn_index": 0,
         "session_turn_count": 1,
@@ -161,7 +158,7 @@ class RuntimeSkeletonTests(unittest.TestCase):
         )
         decision = scheduler.select_action(
             state={"candidates": (local_candidate.to_dict(), offload_candidate.to_dict())},
-            request={"request_id": "req-0", "ttft_deadline_s": 60.0, "e2e_deadline_s": 300.0},
+            request={"request_id": "req-0"},
         ).to_dict()
 
         self.assertTrue(decision["evaluated"])
@@ -171,11 +168,11 @@ class RuntimeSkeletonTests(unittest.TestCase):
         self.assertEqual(decision["feasible_candidate_count"], 2)
         self.assertEqual(
             decision["score_terms"]["score_model"],
-            "request_level_slo_aware_surrogate_not_full_shadow_kv_marginal_rule",
+            "request_level_resource_aware_surrogate",
         )
         self.assertEqual(
             decision["optimization_support"]["paper_rule_status"],
-            "request_level_slo_aware_surrogate_not_full_shadow_kv_marginal_rule",
+            "request_level_resource_aware_surrogate",
         )
 
     def test_hard_gate_mode_controls_candidate_admission(self):
@@ -225,13 +222,13 @@ class RuntimeSkeletonTests(unittest.TestCase):
             {"policy": "orbitserve", "hard_gate_mode": "strict", "weights": gate_mode_test_weights}
         ).select_action(
             state={"candidates": (violating_fast.to_dict(), safe_slow.to_dict())},
-            request={"request_id": "req-0", "ttft_deadline_s": 60.0, "e2e_deadline_s": 300.0},
+            request={"request_id": "req-0"},
         ).to_dict()
         audit = get_scheduler(
             {"policy": "orbitserve", "hard_gate_mode": "audit_only", "weights": gate_mode_test_weights}
         ).select_action(
             state={"candidates": (violating_fast.to_dict(), safe_slow.to_dict())},
-            request={"request_id": "req-0", "ttft_deadline_s": 60.0, "e2e_deadline_s": 300.0},
+            request={"request_id": "req-0"},
         ).to_dict()
 
         self.assertEqual(strict["selected_candidate_id"], "safe-slow")
@@ -290,52 +287,6 @@ class RuntimeSkeletonTests(unittest.TestCase):
         self.assertEqual(rejected_slow["score_terms"]["normalization_refs"]["latency_s"], 20.0)
         self.assertEqual(rejected_slow["score_terms"]["normalized_e2e"], 1.0)
 
-    def test_scheduler_hard_rejects_all_candidates_that_miss_deadline(self):
-        def candidate(candidate_id, satellite_id, predicted_e2e_s):
-            return SchedulerCandidate(
-                candidate_id=candidate_id,
-                action_type="cross_satellite_forward",
-                feasible=True,
-                route_plan={"compute_satellite_id": satellite_id},
-                predicted_ttft_s=1.0,
-                predicted_e2e_s=predicted_e2e_s,
-                predicted_queue_wait_s=0.0,
-                predicted_link_wait_s=0.0,
-                predicted_energy_risk=0.0,
-                predicted_soc_after=0.8,
-                hop_count=1,
-                predicted_nominal_latency_s=predicted_e2e_s,
-                provenance={
-                    "compute_satellite_id": satellite_id,
-                    "access_satellite_id": "access",
-                    "path_id": candidate_id,
-                },
-            )
-
-        decision = get_scheduler(
-            {"policy": "shortest_path", "weights": {"hop": 0.0}}
-        ).select_action(
-            state={
-                "candidates": (
-                    candidate("slow", "sat-a", 20.0).to_dict(),
-                    candidate("fast", "sat-b", 10.0).to_dict(),
-                )
-            },
-            request={"request_id": "req-deadline-gate", "e2e_deadline_s": 5.0},
-        ).to_dict()
-
-        self.assertEqual(decision["action"], "reject_drop")
-        self.assertEqual(decision["feasible_candidate_count"], 0)
-        self.assertEqual(
-            decision["gate_results"]["violations_by_gate"]["predicted_e2e_deadline_miss"],
-            2,
-        )
-        self.assertTrue(
-            all(item["rejection_reason"] == "hard_gate_violation" for item in decision["rejected_candidates"])
-        )
-        self.assertTrue(
-            all(item["score_terms"]["hard_gate_penalty"] == 0.0 for item in decision["rejected_candidates"])
-        )
 
     def test_scheduler_hard_rejects_physical_ineligibility(self):
         ineligible = SchedulerCandidate(
@@ -379,116 +330,6 @@ class RuntimeSkeletonTests(unittest.TestCase):
         self.assertEqual(rejected["rejection_reason"], "candidate_marked_infeasible")
         self.assertFalse(rejected["hard_gate_results"]["physical_eligibility"]["passed"])
 
-    def test_scheduler_recomputes_stale_deadline_gate_results(self):
-        stale = SchedulerCandidate(
-            candidate_id="stale-pass",
-            action_type="local_compute",
-            feasible=True,
-            route_plan={"compute_satellite_id": "sat-a"},
-            predicted_ttft_s=1.0,
-            predicted_e2e_s=20.0,
-            predicted_queue_wait_s=0.0,
-            predicted_link_wait_s=0.0,
-            predicted_energy_risk=0.0,
-            predicted_soc_after=0.8,
-            hop_count=0,
-            hard_gate_results={"slo_e2e": {"passed": True, "reason": None}},
-            predicted_nominal_latency_s=20.0,
-        )
-        valid = SchedulerCandidate(
-            candidate_id="valid",
-            action_type="local_compute",
-            feasible=True,
-            route_plan={"compute_satellite_id": "sat-b"},
-            predicted_ttft_s=1.0,
-            predicted_e2e_s=4.0,
-            predicted_queue_wait_s=2_000_000.0,
-            predicted_link_wait_s=0.0,
-            predicted_energy_risk=0.0,
-            predicted_soc_after=0.8,
-            hop_count=0,
-            predicted_nominal_latency_s=4.0,
-        )
-        decision = get_scheduler(
-            {
-                "policy": "load_aware",
-                "weights": {"latency": 0.0, "slack": 0.0, "queue": 1.0, "link": 0.0, "energy": 0.0, "hop": 0.0},
-                "normalization_refs": {"queue_s": 1.0},
-            }
-        ).select_action(
-            state={"candidates": (stale.to_dict(), valid.to_dict())},
-            request={"e2e_deadline_s": 5.0},
-        ).to_dict()
-
-        self.assertEqual(decision["selected_candidate_id"], "valid")
-        self.assertEqual(decision["feasible_candidate_count"], 1)
-        rejected = decision["rejected_candidates"][0]
-        self.assertIn("predicted_e2e_deadline_miss", rejected["hard_gate_violations"])
-        self.assertFalse(rejected["hard_gate_results"]["slo_e2e"]["passed"])
-
-    def test_scheduler_fail_closes_missing_and_nonfinite_deadline_metrics(self):
-        candidates = tuple(
-            SchedulerCandidate(
-                candidate_id=candidate_id,
-                action_type="local_compute",
-                feasible=True,
-                route_plan={"compute_satellite_id": candidate_id},
-                predicted_ttft_s=1.0,
-                predicted_e2e_s=predicted_e2e_s,
-                predicted_queue_wait_s=0.0,
-                predicted_link_wait_s=0.0,
-                predicted_energy_risk=0.0,
-                predicted_soc_after=0.8,
-                hop_count=0,
-                predicted_nominal_latency_s=predicted_e2e_s,
-            ).to_dict()
-            for candidate_id, predicted_e2e_s in (("missing", None), ("nan", float("nan")))
-        )
-        decision = get_scheduler("shortest_path").select_action(
-            state={"candidates": candidates},
-            request={"e2e_deadline_s": 5.0},
-        ).to_dict()
-
-        self.assertEqual(decision["action"], "reject_drop")
-        self.assertEqual(decision["feasible_candidate_count"], 0)
-        self.assertEqual(
-            decision["gate_results"]["violations_by_gate"]["predicted_e2e_unavailable"],
-            2,
-        )
-
-    def test_scheduler_resolves_symbolic_shared_normalization_refs(self):
-        candidates = tuple(
-            SchedulerCandidate(
-                candidate_id=candidate_id,
-                action_type="local_compute",
-                feasible=True,
-                route_plan={"compute_satellite_id": candidate_id},
-                predicted_ttft_s=1.0,
-                predicted_e2e_s=e2e,
-                predicted_queue_wait_s=queue,
-                predicted_link_wait_s=0.0,
-                predicted_energy_risk=0.0,
-                predicted_soc_after=0.8,
-                hop_count=0,
-                predicted_nominal_latency_s=e2e,
-            ).to_dict()
-            for candidate_id, e2e, queue in (("slow", 20.0, 2.0), ("fast", 10.0, 1.0))
-        )
-        decision = get_scheduler(
-            {
-                "policy": "shortest_path",
-                "hard_gate_mode": "audit_only",
-                "normalization_refs": {"latency_s": "e2e_deadline_s", "queue_s": "candidate_max"},
-            }
-        ).select_action(
-            state={"candidates": candidates},
-            request={"e2e_deadline_s": 5.0},
-        ).to_dict()
-
-        self.assertEqual(decision["selected_candidate_id"], "fast")
-        self.assertEqual(decision["score_terms"]["normalization_refs"]["latency_s"], 5.0)
-        self.assertEqual(decision["score_terms"]["normalization_refs"]["queue_s"], 2.0)
-        self.assertEqual(decision["score_terms"]["normalized_e2e"], 2.0)
 
     def test_scheduler_recomputes_soc_gate_when_threshold_is_available(self):
         candidate = SchedulerCandidate(
@@ -590,11 +431,11 @@ class RuntimeSkeletonTests(unittest.TestCase):
 
         self.assertFalse(result["evaluated"])
         self.assertEqual(result["module_status"]["simulation"], "skeleton")
-        self.assertIsNone(result["runtime_metrics"]["served_ratio"])
+        self.assertIsNone(result["runtime_metrics"]["completion_ratio"])
         self.assertIsNone(result["runtime_metrics"]["ttft_p95_s"])
         self.assertIsNone(result["runtime_metrics"]["e2e_p95_s"])
         self.assertNotEqual(
-            result["runtime_metrics"]["served_ratio"],
+            result["runtime_metrics"]["completion_ratio"],
             serving_performance["request_throughput_per_s"],
         )
         self.assertTrue(result["warnings"])
@@ -615,15 +456,15 @@ class RuntimeSkeletonTests(unittest.TestCase):
             requests=[
                 _request(
                     assigned_satellite="sat-0",
-                    served=True,
-                    served_ratio=1.0,
+                    completed=True,
+                    completion_ratio=1.0,
                     observed_e2e_s=3.0,
                     cost_per_served_mtoken_usd=1.2,
                 )
             ],
         )
 
-        with self.assertRaisesRegex(ValueError, "assigned_satellite|served_ratio|observed_e2e_s|runtime leakage"):
+        with self.assertRaisesRegex(ValueError, "assigned_satellite|completion_ratio|observed_e2e_s|runtime leakage"):
             self.runtime.evaluate_runtime_performance(scenario, strategy)
 
     def test_session_runtime_leakage_is_rejected(self):
@@ -675,7 +516,7 @@ class RuntimeSkeletonTests(unittest.TestCase):
                 fallback_enabled=True,
                 defer_enabled=True,
                 weights={"latency": 1.0, "energy": 0.25, "queue": 1.0, "fallback": 10.0},
-                normalization_refs={"latency_s": "e2e_deadline_s"},
+                normalization_refs={"latency_s": "candidate_max"},
             ),
         )
         payload = run_experiment(spec).to_dict()
@@ -688,7 +529,7 @@ class RuntimeSkeletonTests(unittest.TestCase):
         self.assertTrue(strategy["fallback_enabled"])
         self.assertTrue(strategy["defer_enabled"])
         self.assertEqual(strategy["weights"]["fallback"], 10.0)
-        self.assertEqual(strategy["normalization_refs"]["latency_s"], "e2e_deadline_s")
+        self.assertEqual(strategy["normalization_refs"]["latency_s"], "candidate_max")
         self.assertEqual(payload["module_status"]["scheduling"], "runtime_bridge")
 
     def test_plain_runner_scheduler_uses_runtime_policy_defaults(self):
@@ -736,7 +577,7 @@ class RuntimeOptimizationSkeletonTests(unittest.TestCase):
             def evaluate(self, scenario, strategy):
                 return {
                     "evaluated": False,
-                    "runtime_metrics": {"served_ratio": None, "ttft_p95_s": None, "e2e_p95_s": None},
+                    "runtime_metrics": {"completion_ratio": None, "ttft_p95_s": None, "e2e_p95_s": None},
                     "warnings": ["simulation trace is not implemented"],
                 }
 
@@ -756,7 +597,7 @@ class RuntimeOptimizationSkeletonTests(unittest.TestCase):
         for row in payload["score_table"]:
             self.assertIsNone(row["objective_score"])
             self.assertFalse(row["evaluator_result"]["evaluated"])
-            self.assertIsNone(row["evaluator_result"]["slo"]["served_ratio"])
+            self.assertIsNone(row["evaluator_result"]["slo"]["completion_ratio"])
             self.assertIsNone(row["evaluator_result"]["performance"]["ttft_p95_s"])
             self.assertIsNone(row["evaluator_result"]["performance"]["e2e_p95_s"])
         self.assertIn(payload.get("selected_strategy"), (None, {}))

@@ -19,8 +19,9 @@ RUNTIME_RESULT_FIELDS = frozenset(
         "access_satellite_id",
         "selected_path",
         "session_action",
-        "served",
-        "served_ratio",
+        "completed",
+        "completion_ratio",
+        "uncompleted_reason",
         "TTFT",
         "E2E",
         "ttft_s",
@@ -63,7 +64,6 @@ RUNTIME_RESULT_FIELDS = frozenset(
 def _default_weights() -> dict[str, Any]:
     return {
         "latency": None,
-        "slack": None,
         "energy": None,
         "link": None,
         "queue": None,
@@ -401,8 +401,6 @@ class RuntimePredictionEnvelope:
     delta_energy_j: float | None = None
     soc_min_predicted: float | None = None
     energy_feasible: bool | None = None
-    deadline_slack_s: float | None = None
-    ttft_slack_s: float | None = None
     bottleneck_reason: str | None = None
     warnings: tuple[str, ...] = ("runtime prediction is not implemented",)
 

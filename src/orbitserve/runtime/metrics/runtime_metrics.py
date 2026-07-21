@@ -51,11 +51,8 @@ def aggregate_runtime_records(
             warnings=warnings,
         )
 
-    accepted = [record for record in records if record.accepted]
     completed = [record for record in records if record.completed]
-    served = [record for record in records if record.served]
-    rejected = [record for record in records if record.rejected]
-    timeout = [record for record in records if record.timeout]
+    uncompleted = [record for record in records if not record.completed]
     fallback = [record for record in records if getattr(record, "fallback_used", False)]
     terrestrial = [record for record in records if _is_ground_record(record)]
     cross_region_ground = [
@@ -73,7 +70,6 @@ def aggregate_runtime_records(
     kv_transfer_attempted_total = _sum_numeric(getattr(record, "kv_transfer_attempted_bytes", None) for record in records)
     kv_transfer_useful_total = _sum_numeric(getattr(record, "kv_transfer_useful_bytes", None) for record in records)
     horizon = _effective_horizon(records, time_horizon_s)
-    served_tokens = sum(record.prompt_tokens + record.output_tokens for record in served)
     completed_tokens = sum(
         record.prompt_tokens + record.output_tokens for record in completed
     )
@@ -106,29 +102,29 @@ def aggregate_runtime_records(
         or getattr(record, "compute_sunlit", None) is False
         or getattr(record, "access_sunlit", None) is False
     ]
-    shadow_served = [record for record in shadow_records if record.served]
+    shadow_completed = [record for record in shadow_records if record.completed]
+    uncompleted_stage_breakdown = _value_counts(uncompleted, "uncompleted_stage")
+    uncompleted_reason_breakdown = _value_counts(uncompleted, "uncompleted_reason")
 
     runtime_metrics = {
         "total_request_count": total,
-        "accepted_request_count": len(accepted),
-        "served_request_count": len(served),
-        "timeout_request_count": len(timeout),
-        "rejected_request_count": len(rejected),
-        "served_ratio": len(served) / total,
-        "accepted_ratio": len(accepted) / total,
-        "timeout_ratio": len(timeout) / total,
-        "rejected_ratio": len(rejected) / total,
+        "completed_request_count": len(completed),
+        "uncompleted_request_count": len(uncompleted),
+        "completion_ratio": len(completed) / total,
+        "uncompleted_ratio": len(uncompleted) / total,
+        "uncompleted_stage_breakdown": uncompleted_stage_breakdown,
+        "uncompleted_reason_breakdown": uncompleted_reason_breakdown,
         "fallback_request_fraction": len(fallback) / total,
         "deferred_request_fraction": len(deferred) / total,
-        "leo_served_ratio": len(
+        "leo_completion_ratio": len(
             [
                 record
-                for record in served
+                for record in completed
                 if not getattr(record, "fallback_used", False) and not _is_ground_record(record)
             ]
         )
         / total,
-        "terrestrial_served_ratio": len([record for record in served if _is_ground_record(record)]) / total,
+        "terrestrial_completion_ratio": len([record for record in completed if _is_ground_record(record)]) / total,
         "ground_cross_region_request_count": len(cross_region_ground),
         "ground_cross_region_request_fraction": (
             len(cross_region_ground) / len(terrestrial) if terrestrial else None
@@ -151,7 +147,7 @@ def aggregate_runtime_records(
         "action_type_counts": action_type_counts,
         "shadow_affected_request_count": len(shadow_records),
         "shadow_affected_request_fraction": len(shadow_records) / total,
-        "shadow_served_ratio": len(shadow_served) / len(shadow_records) if shadow_records else None,
+        "shadow_completion_ratio": len(shadow_completed) / len(shadow_records) if shadow_records else None,
         "shadow_dvfs_request_count": shadow_dvfs_count,
         "shadow_dvfs_request_fraction": shadow_dvfs_count / total,
         "shadow_offload_request_count": shadow_offload_count,
@@ -168,8 +164,8 @@ def aggregate_runtime_records(
         "e2e_p50_s": _percentile([record.e2e_s for record in completed], 0.50),
         "e2e_p95_s": _percentile([record.e2e_s for record in completed], 0.95),
         "e2e_p99_s": _percentile([record.e2e_s for record in completed], 0.99),
-        "useful_request_throughput_per_s": len(served) / horizon if horizon > 0 else None,
-        "useful_token_throughput_per_s": served_tokens / horizon if horizon > 0 else None,
+        "useful_request_throughput_per_s": len(completed) / horizon if horizon > 0 else None,
+        "useful_token_throughput_per_s": completed_tokens / horizon if horizon > 0 else None,
         "completed_request_throughput_per_s": len(completed) / horizon if horizon > 0 else None,
         "completed_token_throughput_per_s": completed_tokens / horizon if horizon > 0 else None,
         "completed_output_token_throughput_per_s": (
@@ -287,18 +283,8 @@ def aggregate_runtime_records(
         warnings=warnings,
     )
     slo = SLOMetrics(
-        evaluated=True,
-        served_ratio=runtime_metrics["served_ratio"],
-        rejected_ratio=runtime_metrics["rejected_ratio"],
-        timeout_ratio=runtime_metrics["timeout_ratio"],
-        energy_violation_count=(
-            len(energy_violations)
-            if _uses_trace_backed_surrogate_model(trace_model, scope)
-            else None
-        ),
-        isl_congestion_p95=runtime_metrics["isl_congestion_p95"],
-        sgl_congestion_p95=runtime_metrics["sgl_congestion_p95"],
-        warnings=warnings,
+        evaluated=False,
+        warnings=(*warnings, "SLO evaluation is intentionally outside Runtime"),
     )
     return RuntimeAggregateMetrics(
         runtime_metrics=runtime_metrics,
@@ -314,11 +300,13 @@ def aggregate_runtime_records(
 def _empty_runtime_metrics(*, trace_model: str, scope: str) -> dict[str, Any]:
     return {
         "total_request_count": 0,
-        "served_ratio": None,
-        "accepted_ratio": None,
-        "timeout_ratio": None,
-        "rejected_ratio": None,
-        "terrestrial_served_ratio": None,
+        "completed_request_count": 0,
+        "uncompleted_request_count": 0,
+        "completion_ratio": None,
+        "uncompleted_ratio": None,
+        "uncompleted_stage_breakdown": {},
+        "uncompleted_reason_breakdown": {},
+        "terrestrial_completion_ratio": None,
         "ground_cross_region_request_count": 0,
         "ground_cross_region_request_fraction": None,
         "ground_network_delay_p50_s": None,
@@ -329,7 +317,7 @@ def _empty_runtime_metrics(*, trace_model: str, scope: str) -> dict[str, Any]:
         "action_type_counts": {},
         "shadow_affected_request_count": 0,
         "shadow_affected_request_fraction": None,
-        "shadow_served_ratio": None,
+        "shadow_completion_ratio": None,
         "shadow_dvfs_request_count": 0,
         "shadow_dvfs_request_fraction": None,
         "shadow_offload_request_count": 0,
@@ -576,6 +564,15 @@ def _session_action_counts(records: tuple[RuntimeRequestRecord, ...]) -> dict[st
     return counts
 
 
+def _value_counts(records: list[RuntimeRequestRecord], field_name: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for record in records:
+        value = getattr(record, field_name, None)
+        key = str(value or "unknown")
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
 def _kv_serve_action_counts(records: tuple[RuntimeRequestRecord, ...]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for record in records:
@@ -647,10 +644,7 @@ def _kv_capacity_reject_count(records: tuple[RuntimeRequestRecord, ...]) -> int:
         if admission is not None and str(admission).lower() in rejected_values:
             count += 1
             continue
-        if getattr(record, "rejected", False) and (
-            getattr(record, "reject_reason", None) == "kv_capacity"
-            or getattr(record, "bottleneck_reason", None) == "kv_capacity"
-        ):
+        if not record.completed and getattr(record, "uncompleted_reason", None) == "kv_capacity_unavailable":
             count += 1
     return count
 

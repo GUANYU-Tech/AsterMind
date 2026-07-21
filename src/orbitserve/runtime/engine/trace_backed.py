@@ -33,7 +33,6 @@ from ..state.kv_runtime import (
     _expire_session_kv,
     _kv_policy,
     _kv_transfer_chunk_bytes,
-    _request_kv_deadline_s,
     _session_expires_at,
 )
 from ..strategy.schedulers import SchedulerCandidate, get_scheduler
@@ -273,10 +272,6 @@ def normalize_runtime_request(raw_request: dict[str, Any], index: int = 0) -> di
         "output_tokens": output_tokens,
         "input_bytes": _float(raw_request.get("input_bytes"), prompt_tokens * 4.0),
         "output_bytes": _float(raw_request.get("output_bytes"), output_tokens * 4.0),
-        "ttft_deadline_s": _optional_float(_first_present(raw_request.get("ttft_deadline_s"), raw_request.get("deadline_ttft_s"))),
-        "e2e_deadline_s": _optional_float(
-            _first_present(raw_request.get("e2e_deadline_s"), raw_request.get("deadline_s"), raw_request.get("deadline_e2e_s"))
-        ),
         "session_id": _optional_str(raw_request.get("session_id")),
         "ingress_id": _optional_str(_first_present(raw_request.get("ingress_id"), raw_request.get("gateway_id"))),
         "prompt_tokens_declared": declared_prompt_tokens is not None,
@@ -359,16 +354,15 @@ def _evaluate_trace_request(
             max_defer_s = _optional_float(_dict(getattr(runtime_strategy, "hard_gate_overrides", {})).get("max_defer_s"))
             if next_access is not None:
                 wait_s = max(0.0, next_access.start_s - arrival_s)
-                deadline_ok = request["e2e_deadline_s"] is None or wait_s < request["e2e_deadline_s"]
                 max_defer_ok = max_defer_s is None or wait_s <= max_defer_s
-                if deadline_ok and max_defer_ok:
+                if max_defer_ok:
                     access_candidates = (next_access,)
                     access_wait_s = wait_s
                     deferred = True
                     defer_until_s = next_access.start_s
         if not access_candidates:
             record = _fallback_or_reject(request, runtime_strategy, "no_access_window", scope, trace_model)
-            return record, _decision_trace(request, policy, (), None, record.reject_reason or "fallback")
+            return record, _decision_trace(request, policy, (), None, record.uncompleted_reason or "fallback")
 
     routing_time_s = arrival_s + access_wait_s
     eligibility = _compute_eligibility_at(
@@ -398,7 +392,7 @@ def _evaluate_trace_request(
             policy,
             access_candidates,
             None,
-            record.reject_reason or failure_reason,
+            record.uncompleted_reason or failure_reason,
             warnings=(failure_reason,),
         )
     prefill_rate_per_sat = float(deployment.prefill_tokens_per_s or 0.0) / eligibility.capacity_member_count
@@ -432,7 +426,7 @@ def _evaluate_trace_request(
             policy,
             access_candidates,
             None,
-            record.reject_reason or "fallback",
+            record.uncompleted_reason or "fallback",
             warnings=warnings,
         )
 
@@ -467,7 +461,7 @@ def _evaluate_trace_request(
             policy,
             access_candidates,
             None,
-            record.reject_reason or reason or "fallback",
+            record.uncompleted_reason or reason or "fallback",
             warnings=tuple(dict.fromkeys(candidate_warnings or candidate_failures)),
         )
 
@@ -497,7 +491,7 @@ def _evaluate_trace_request(
             policy,
             access_candidates,
             None,
-            record.reject_reason or "fallback",
+            record.uncompleted_reason or "fallback",
             scheduler_decision=scheduler_decision,
         )
 
@@ -814,28 +808,19 @@ def _evaluate_trace_request(
     )
     ttft_s = float(timing["ttft_s"])
     e2e_s = remaining_done_s - arrival_s
-    timeout, timeout_reason = _timeout_status(ttft_s, e2e_s, request["ttft_deadline_s"], request["e2e_deadline_s"])
     session_action = _session_action(state, request.get("session_id"), route_plan.compute_satellite_id, arrival_s)
-    served = not timeout and not energy_update["energy_violation"]
     total_sgl_wait = sgl_wait_in + sgl_wait_first + sgl_wait_remaining
     total_isl_wait = isl_wait_in + isl_wait_first + isl_wait_remaining
-    bottleneck = _bottleneck(timeout_reason, energy_update["energy_violation"], prefill_wait_s, decode_wait_s, total_sgl_wait + total_isl_wait)
+    bottleneck = _bottleneck(energy_update["energy_violation"], prefill_wait_s, decode_wait_s, total_sgl_wait + total_isl_wait)
     selected_path = tuple((*inbound_path, *first_path, *remaining_path))
     record = RuntimeRequestRecord(
         request_id=request["request_id"],
         arrival_time_s=arrival_s,
         deployment_id=deployment.deployment_id,
         action_type=action_type,
-        accepted=True,
         completed=True,
-        served=served,
-        rejected=False,
-        timeout=timeout,
-        timeout_reason=timeout_reason,
         prompt_tokens=request["prompt_tokens"],
         output_tokens=request["output_tokens"],
-        ttft_deadline_s=request["ttft_deadline_s"],
-        e2e_deadline_s=request["e2e_deadline_s"],
         prefill_queue_wait_s=prefill_wait_s,
         decode_queue_wait_s=decode_wait_s,
         sgl_queue_wait_s=total_sgl_wait,
@@ -1551,36 +1536,13 @@ def _candidate_hard_gate_results(
     predicted_soc_after: float,
     soc_min: float,
 ) -> dict[str, Any]:
-    ttft_deadline_s = _optional_float(request.get("ttft_deadline_s"))
-    e2e_deadline_s = _optional_float(request.get("e2e_deadline_s"))
-    ttft_miss = (
-        ttft_deadline_s is not None
-        and math.isfinite(predicted_ttft_s)
-        and predicted_ttft_s > ttft_deadline_s
-    )
-    e2e_miss = (
-        e2e_deadline_s is not None
-        and math.isfinite(predicted_e2e_s)
-        and predicted_e2e_s > e2e_deadline_s
-    )
+    del request, predicted_ttft_s, predicted_e2e_s
     energy_miss = (
         math.isfinite(predicted_soc_after)
         and math.isfinite(soc_min)
         and predicted_soc_after < soc_min
     )
     return {
-        "slo_ttft": {
-            "passed": None if ttft_deadline_s is None else not ttft_miss,
-            "reason": "predicted_ttft_deadline_miss" if ttft_miss else None,
-            "predicted_s": predicted_ttft_s,
-            "deadline_s": ttft_deadline_s,
-        },
-        "slo_e2e": {
-            "passed": None if e2e_deadline_s is None else not e2e_miss,
-            "reason": "predicted_e2e_deadline_miss" if e2e_miss else None,
-            "predicted_s": predicted_e2e_s,
-            "deadline_s": e2e_deadline_s,
-        },
         "energy_soc": {
             "passed": not energy_miss,
             "reason": "energy_soc" if energy_miss else None,
@@ -2178,16 +2140,11 @@ def _post_compute_route_failure_record(
         arrival_time_s=arrival_s,
         deployment_id=deployment_id,
         action_type=action_type,
-        accepted=True,
         completed=False,
-        served=False,
-        rejected=False,
-        timeout=True,
-        timeout_reason="route_became_unavailable_after_compute",
+        uncompleted_stage="delivery",
+        uncompleted_reason="link_interrupted",
         prompt_tokens=request["prompt_tokens"],
         output_tokens=request["output_tokens"],
-        ttft_deadline_s=request["ttft_deadline_s"],
-        e2e_deadline_s=request["e2e_deadline_s"],
         prefill_queue_wait_s=prefill_wait_s,
         decode_queue_wait_s=decode_wait_s,
         sgl_queue_wait_s=sgl_wait_in,
@@ -2310,30 +2267,19 @@ def _fallback_record(
     completed = latency_s is not None
     ttft_s = None
     e2e_s = None
-    timeout = False
-    timeout_reason = None
-    served = False
     if latency_s is not None:
         ttft_s = latency_s
         e2e_s = latency_s
-        timeout, timeout_reason = _timeout_status(ttft_s, e2e_s, request["ttft_deadline_s"], request["e2e_deadline_s"])
-        served = not timeout
     return RuntimeRequestRecord(
         request_id=request["request_id"],
         arrival_time_s=request["arrival_time_s"],
         deployment_id=None,
         action_type="ground_fallback",
-        accepted=True,
         completed=completed,
-        served=served,
-        rejected=False,
-        timeout=timeout,
-        reject_reason=None if completed else reason,
-        timeout_reason=timeout_reason,
+        uncompleted_stage=None if completed else _failure_stage(reason),
+        uncompleted_reason=None if completed else _failure_reason(reason),
         prompt_tokens=request["prompt_tokens"],
         output_tokens=request["output_tokens"],
-        ttft_deadline_s=request["ttft_deadline_s"],
-        e2e_deadline_s=request["e2e_deadline_s"],
         ttft_s=ttft_s,
         e2e_s=e2e_s,
         bottleneck_reason="ground_fallback" if completed else "fallback_latency_missing",
@@ -2364,39 +2310,55 @@ def _reject_record(
         arrival_time_s=request["arrival_time_s"],
         deployment_id=None,
         action_type="reject_drop",
-        accepted=False,
         completed=False,
-        served=False,
-        rejected=True,
-        timeout=False,
-        reject_reason=reason,
+        uncompleted_stage=_failure_stage(reason),
+        uncompleted_reason=_failure_reason(reason),
         prompt_tokens=request["prompt_tokens"],
         output_tokens=request["output_tokens"],
-        ttft_deadline_s=request.get("ttft_deadline_s"),
-        e2e_deadline_s=request.get("e2e_deadline_s"),
         bottleneck_reason=reason,
         scope=scope,
         trace_model=trace_model,
         valid_for_paper_main_results=False,
-        provenance={"reject_reason": reason, "warnings": warnings, **(provenance or {})},
+        provenance={"failure_reason": reason, "warnings": warnings, **(provenance or {})},
     )
 
 
-def _timeout_status(
-    ttft_s: float | None,
-    e2e_s: float | None,
-    ttft_deadline_s: float | None,
-    e2e_deadline_s: float | None,
-) -> tuple[bool, str | None]:
-    ttft_miss = ttft_s is not None and ttft_deadline_s is not None and ttft_s > ttft_deadline_s
-    e2e_miss = e2e_s is not None and e2e_deadline_s is not None and e2e_s > e2e_deadline_s
-    if ttft_miss and e2e_miss:
-        return True, "ttft_and_e2e_deadline_miss"
-    if ttft_miss:
-        return True, "ttft_deadline_miss"
-    if e2e_miss:
-        return True, "e2e_deadline_miss"
-    return False, None
+def _failure_stage(reason: str) -> str:
+    text = str(reason)
+    if "invalid" in text or "must_be_positive" in text:
+        return "validation"
+    if "trace_horizon" in text or "outside_trace" in text:
+        return "validation"
+    if "access" in text or "ingress" in text or "sgl" in text:
+        return "access"
+    if "outbound" in text or "after_compute" in text:
+        return "delivery"
+    if "route" in text or "link" in text or "graph" in text:
+        return "routing"
+    if "energy" in text:
+        return "compute"
+    if "kv" in text or "hbm" in text:
+        return "compute"
+    return "compute"
+
+
+def _failure_reason(reason: str) -> str:
+    text = str(reason)
+    if "invalid" in text or "must_be_positive" in text:
+        return "invalid_request"
+    if "trace_horizon" in text or "outside_trace" in text:
+        return "trace_ended"
+    if "access" in text or "ingress" in text or "sgl" in text:
+        return "no_access"
+    if "energy" in text:
+        return "energy_unavailable"
+    if "kv" in text or "hbm" in text:
+        return "kv_capacity_unavailable"
+    if "interrupted" in text or "after_compute" in text:
+        return "link_interrupted"
+    if "route" in text or "link" in text or "graph" in text:
+        return "no_route"
+    return "no_compute_capacity"
 
 
 def _session_action(state: RuntimeState, session_id: str | None, satellite_id: str, now_s: float) -> str:
@@ -2413,14 +2375,11 @@ def _session_action(state: RuntimeState, session_id: str | None, satellite_id: s
 
 
 def _bottleneck(
-    timeout_reason: str | None,
     energy_violation: bool,
     prefill_wait_s: float,
     decode_wait_s: float,
     link_wait_s: float,
 ) -> str:
-    if timeout_reason:
-        return timeout_reason
     if energy_violation:
         return "energy_violation"
     if link_wait_s > 0:

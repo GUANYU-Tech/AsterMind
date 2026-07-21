@@ -376,7 +376,7 @@ class RuntimeEnergyEnvelopeTests(unittest.TestCase):
         )
 
         self.assertTrue(runtime.evaluated)
-        self.assertEqual(runtime.records[0].reject_reason, "energy_window_missing_field")
+        self.assertEqual(runtime.records[0].uncompleted_reason, "energy_unavailable")
         self.assertIn("missing:battery_capacity_j", runtime.records[0].provenance["warnings"])
         self.assertIn("battery_capacity_j", REQUIRED_RUNTIME_ENERGY_WINDOW_FIELDS)
 

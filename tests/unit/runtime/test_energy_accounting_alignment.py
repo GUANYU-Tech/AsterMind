@@ -63,7 +63,7 @@ class EnergyAccountingAlignmentTests(unittest.TestCase):
         }
         runtime = {
             "evaluated": True,
-            "runtime_metrics": {"served_ratio": None},
+            "runtime_metrics": {"completion_ratio": None},
             "request_records": (),
         }
         envelope = {
@@ -97,10 +97,10 @@ class EnergyAccountingAlignmentTests(unittest.TestCase):
         }
         runtime = {
             "evaluated": True,
-            "runtime_metrics": {"served_ratio": 0.0},
+            "runtime_metrics": {"completion_ratio": 0.0},
             "request_records": (
-                {"accepted": False, "served": False, "energy_ledger": ()},
-                {"accepted": False, "served": False, "energy_ledger": ()},
+                { "completed": False, "energy_ledger": ()},
+                { "completed": False, "energy_ledger": ()},
             ),
         }
         envelope = {
@@ -221,9 +221,9 @@ class EnergyAccountingAlignmentTests(unittest.TestCase):
         }
         runtime = {
             "evaluated": True,
-            "runtime_metrics": {"served_ratio": 1.0},
+            "runtime_metrics": {"completion_ratio": 1.0},
             "request_records": (
-                {"accepted": True, "served": True, "energy_ledger": (ledger,)},
+                { "completed": True, "energy_ledger": (ledger,)},
             ),
         }
         envelope = {
@@ -249,8 +249,8 @@ class EnergyAccountingAlignmentTests(unittest.TestCase):
             **runtime,
             "request_records": (
                 {
-                    "accepted": True,
-                    "served": True,
+
+                    "completed": True,
                     "energy_ledger": ({**ledger, "runtime_compute_energy_scale": 1.0},),
                 },
             ),
@@ -295,11 +295,11 @@ class EnergyAccountingAlignmentTests(unittest.TestCase):
             },
             {
                 "evaluated": True,
-                "runtime_metrics": {"served_ratio": 1.0},
+                "runtime_metrics": {"completion_ratio": 1.0},
                 "request_records": (
                     {
-                        "accepted": True,
-                        "served": True,
+
+                        "completed": True,
                         "provenance": {"energy_ledger": (ledger,)},
                     },
                 ),
@@ -349,9 +349,9 @@ class EnergyAccountingAlignmentTests(unittest.TestCase):
             },
             {
                 "evaluated": True,
-                "runtime_metrics": {"served_ratio": 1.0},
+                "runtime_metrics": {"completion_ratio": 1.0},
                 "request_records": (
-                    {"accepted": True, "served": True, "energy_ledger": (ledger,)},
+                    { "completed": True, "energy_ledger": (ledger,)},
                 ),
             },
             runtime_energy_envelope={
@@ -388,7 +388,7 @@ class EnergyAccountingAlignmentTests(unittest.TestCase):
             },
             {
                 "evaluated": True,
-                "runtime_metrics": {"served_ratio": None},
+                "runtime_metrics": {"completion_ratio": None},
                 "request_records": (),
             },
             runtime_energy_envelope={
@@ -429,11 +429,11 @@ class EnergyAccountingAlignmentTests(unittest.TestCase):
             },
             {
                 "evaluated": True,
-                "runtime_metrics": {"served_ratio": 1.0},
+                "runtime_metrics": {"completion_ratio": 1.0},
                 "request_records": (
                     {
-                        "accepted": True,
-                        "served": True,
+
+                        "completed": True,
                         "energy_ledger": (
                             {
                                 "energy_kind": "request_event",
@@ -491,9 +491,9 @@ class EnergyAccountingAlignmentTests(unittest.TestCase):
             },
             {
                 "evaluated": True,
-                "runtime_metrics": {"served_ratio": 1.0},
+                "runtime_metrics": {"completion_ratio": 1.0},
                 "request_records": (
-                    {"accepted": True, "served": True, "energy_ledger": (ledger,)},
+                    { "completed": True, "energy_ledger": (ledger,)},
                 ),
             },
             runtime_energy_envelope={
@@ -509,7 +509,7 @@ class EnergyAccountingAlignmentTests(unittest.TestCase):
         self.assertEqual(result.runtime_energy["invalid_ledger_entry_count"], 1)
         self.assertEqual(result.runtime_energy["per_satellite_dynamic_energy_j"], {})
 
-    def test_positive_served_ratio_without_request_records_requires_resizing(self):
+    def test_positive_completion_ratio_without_request_records_requires_resizing(self):
         result = evaluate_energy_alignment(
             {
                 "offered_request_count": 1,
@@ -524,7 +524,7 @@ class EnergyAccountingAlignmentTests(unittest.TestCase):
                 "evaluated": True,
                 "scope": "trace_backed_runtime_sanity",
                 "trace_model": "surrogate_orbit_trace",
-                "runtime_metrics": {"served_ratio": 1.0},
+                "runtime_metrics": {"completion_ratio": 1.0},
             },
             runtime_energy_envelope={
                 "trace_options": {
@@ -538,7 +538,7 @@ class EnergyAccountingAlignmentTests(unittest.TestCase):
         self.assertTrue(result.requires_resizing)
         self.assertEqual(result.runtime_energy["missing_runtime_request_record_count"], 1)
 
-    def test_served_ratio_must_match_request_records(self):
+    def test_completion_ratio_must_match_request_records(self):
         result = evaluate_energy_alignment(
             {
                 "offered_request_count": 1,
@@ -553,9 +553,9 @@ class EnergyAccountingAlignmentTests(unittest.TestCase):
                 "evaluated": True,
                 "scope": "trace_backed_runtime_sanity",
                 "trace_model": "surrogate_orbit_trace",
-                "runtime_metrics": {"served_ratio": 1.0},
+                "runtime_metrics": {"completion_ratio": 1.0},
                 "request_records": (
-                    {"accepted": False, "served": False, "energy_ledger": ()},
+                    { "completed": False, "energy_ledger": ()},
                 ),
             },
             runtime_energy_envelope={
@@ -585,7 +585,7 @@ class EnergyAccountingAlignmentTests(unittest.TestCase):
             "evaluated": True,
             "scope": "trace_backed_runtime_sanity",
             "trace_model": "surrogate_orbit_trace",
-            "runtime_metrics": {"served_ratio": None},
+            "runtime_metrics": {"completion_ratio": None},
             "request_records": (),
         }
         envelope = {
@@ -642,9 +642,9 @@ class EnergyAccountingAlignmentTests(unittest.TestCase):
             },
             {
                 "evaluated": True,
-                "runtime_metrics": {"served_ratio": 1.0},
+                "runtime_metrics": {"completion_ratio": 1.0},
                 "request_records": (
-                    {"accepted": True, "served": True, "energy_ledger": ()},
+                    { "completed": True, "energy_ledger": ()},
                 ),
             },
             runtime_energy_envelope={
@@ -674,9 +674,9 @@ class EnergyAccountingAlignmentTests(unittest.TestCase):
             },
             {
                 "evaluated": True,
-                "runtime_metrics": {"served_ratio": 0.0},
+                "runtime_metrics": {"completion_ratio": 0.0},
                 "request_records": (
-                    {"accepted": False, "served": False, "energy_ledger": ()},
+                    { "completed": False, "energy_ledger": ()},
                 ),
             },
             runtime_energy_envelope={
@@ -709,11 +709,11 @@ class EnergyAccountingAlignmentTests(unittest.TestCase):
                 "evaluated": True,
                 "scope": "trace_backed_runtime_sanity",
                 "trace_model": "surrogate_orbit_trace",
-                "runtime_metrics": {"served_ratio": 0.0},
+                "runtime_metrics": {"completion_ratio": 0.0},
                 "request_records": (
                     {
-                        "accepted": True,
-                        "served": False,
+
+                        "completed": False,
                         "timeout": True,
                         "energy_violation": False,
                         "energy_ledger": (),
@@ -751,12 +751,12 @@ class EnergyAccountingAlignmentTests(unittest.TestCase):
                 "scope": "idealized_compute_only",
                 "trace_model": "ideal_full_visibility",
                 "runtime_metrics": {
-                    "served_ratio": 1.0,
+                    "completion_ratio": 1.0,
                     "scope": "idealized_compute_only",
                     "trace_model": "ideal_full_visibility",
                 },
                 "request_records": (
-                    {"accepted": True, "served": True, "energy_ledger": ()},
+                    { "completed": True, "energy_ledger": ()},
                 ),
             },
             runtime_energy_envelope={
@@ -799,11 +799,11 @@ class EnergyAccountingAlignmentTests(unittest.TestCase):
                 "evaluated": True,
                 "scope": "trace_backed_runtime_sanity",
                 "trace_model": "surrogate_orbit_trace",
-                "runtime_metrics": {"served_ratio": 1.0},
+                "runtime_metrics": {"completion_ratio": 1.0},
                 "request_records": (
                     {
-                        "accepted": True,
-                        "served": True,
+
+                        "completed": True,
                         "fallback_used": True,
                         "action_type": "ground_fallback",
                         "energy_ledger": (),
@@ -859,14 +859,14 @@ class EnergyAccountingAlignmentTests(unittest.TestCase):
             {
                 "evaluated": True,
                 "runtime_metrics": {
-                    "served_ratio": 0.5,
+                    "completion_ratio": 0.5,
                     "energy_violation_count": 1,
                 },
                 "request_records": (
-                    {"accepted": True, "served": True, "energy_ledger": (ledger("e0"),)},
+                    { "completed": True, "energy_ledger": (ledger("e0"),)},
                     {
-                        "accepted": True,
-                        "served": False,
+
+                        "completed": False,
                         "energy_ledger": (
                             ledger("e1", unserved_energy_j=10_000.0),
                         ),
@@ -919,7 +919,7 @@ class EnergyAccountingAlignmentTests(unittest.TestCase):
     def test_attaching_alignment_to_dict_preserves_existing_runtime_details(self):
         runtime = {
             "evaluated": True,
-            "runtime_metrics": {"served_ratio": 1.0},
+            "runtime_metrics": {"completion_ratio": 1.0},
             "request_records": (),
             "details": {"existing_contract": "keep-me"},
         }

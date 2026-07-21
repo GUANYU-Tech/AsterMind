@@ -125,9 +125,9 @@ def build_runtime_performance_result(
         "deployment_catalog": deployment_payload,
         "engine_provenance": engine_result.provenance or {},
         "metrics_contract": {
-            "served_ratio": "completed and TTFT/E2E deadlines both satisfied",
-            "rejected_ratio": "arrival-time admission rejection",
-            "timeout_ratio": "accepted request completed after TTFT or E2E deadline",
+            "completion_ratio": "complete output delivered within the Runtime trace horizon",
+            "uncompleted_ratio": "request output was not completely delivered",
+            "uncompleted_reason_breakdown": "physical reason for incomplete delivery",
             "cost_per_served": (
                 "explicit terrestrial cloud instance/optional-egress contract"
                 if terrestrial_costing is not None and terrestrial_costing.evaluated

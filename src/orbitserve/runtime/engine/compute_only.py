@@ -80,25 +80,17 @@ def _evaluate_request(
     arrival_s = _float(request.get("arrival_time_s"), 0.0)
     prompt_tokens = max(0, _int(_first_present(request.get("prompt_tokens"), request.get("new_user_tokens")), 0))
     output_tokens = max(0, _int(request.get("output_tokens"), 0))
-    ttft_deadline_s = _optional_float(request.get("ttft_deadline_s"))
-    e2e_deadline_s = _optional_float(request.get("e2e_deadline_s"))
-
     if output_tokens <= 0:
         return RuntimeRequestRecord(
             request_id=request_id,
             arrival_time_s=arrival_s,
             deployment_id=getattr(deployment, "deployment_id", None),
             action_type="reject_drop",
-            accepted=False,
             completed=False,
-            served=False,
-            rejected=True,
-            timeout=False,
-            reject_reason="output_tokens_must_be_positive_for_ttft",
+            uncompleted_stage="validation",
+            uncompleted_reason="invalid_request",
             prompt_tokens=prompt_tokens,
             output_tokens=output_tokens,
-            ttft_deadline_s=ttft_deadline_s,
-            e2e_deadline_s=e2e_deadline_s,
             bottleneck_reason="invalid_request",
             scope=scope,
             trace_model=trace_model,
@@ -111,16 +103,11 @@ def _evaluate_request(
             arrival_time_s=arrival_s,
             deployment_id=None,
             action_type=action.action_type,
-            accepted=False,
             completed=False,
-            served=False,
-            rejected=True,
-            timeout=False,
-            reject_reason=action.action_type,
+            uncompleted_stage="scheduling",
+            uncompleted_reason="no_compute_capacity",
             prompt_tokens=prompt_tokens,
             output_tokens=output_tokens,
-            ttft_deadline_s=ttft_deadline_s,
-            e2e_deadline_s=e2e_deadline_s,
             bottleneck_reason="reject",
             scope=scope,
             trace_model=trace_model,
@@ -133,16 +120,11 @@ def _evaluate_request(
             arrival_time_s=arrival_s,
             deployment_id=getattr(deployment, "deployment_id", None),
             action_type=action.action_type,
-            accepted=False,
             completed=False,
-            served=False,
-            rejected=True,
-            timeout=False,
-            reject_reason="compute_capacity_unavailable",
+            uncompleted_stage="compute",
+            uncompleted_reason="no_compute_capacity",
             prompt_tokens=prompt_tokens,
             output_tokens=output_tokens,
-            ttft_deadline_s=ttft_deadline_s,
-            e2e_deadline_s=e2e_deadline_s,
             bottleneck_reason="compute_capacity",
             scope=scope,
             trace_model=trace_model,
@@ -157,16 +139,11 @@ def _evaluate_request(
             arrival_time_s=arrival_s,
             deployment_id=deployment.deployment_id,
             action_type=action.action_type,
-            accepted=False,
             completed=False,
-            served=False,
-            rejected=True,
-            timeout=False,
-            reject_reason="non_finite_service_time",
+            uncompleted_stage="compute",
+            uncompleted_reason="no_compute_capacity",
             prompt_tokens=prompt_tokens,
             output_tokens=output_tokens,
-            ttft_deadline_s=ttft_deadline_s,
-            e2e_deadline_s=e2e_deadline_s,
             bottleneck_reason="service_time",
             scope=scope,
             trace_model=trace_model,
@@ -190,36 +167,16 @@ def _evaluate_request(
     )
     ttft_s = float(timing["ttft_s"]) if output_tokens > 0 else None
     e2e_s = decode_done_s - arrival_s
-    ttft_miss = ttft_deadline_s is not None and ttft_s > ttft_deadline_s
-    e2e_miss = e2e_deadline_s is not None and e2e_s > e2e_deadline_s
-    timeout = ttft_miss or e2e_miss
-    timeout_reason = None
-    if ttft_miss and e2e_miss:
-        timeout_reason = "ttft_and_e2e_deadline_miss"
-    elif ttft_miss:
-        timeout_reason = "ttft_deadline_miss"
-    elif e2e_miss:
-        timeout_reason = "e2e_deadline_miss"
-
     bottleneck = "compute_queue" if prefill_wait_s > 0 or decode_wait_s > 0 else "compute_service"
-    if timeout:
-        bottleneck = timeout_reason or bottleneck
 
     return RuntimeRequestRecord(
         request_id=request_id,
         arrival_time_s=arrival_s,
         deployment_id=deployment.deployment_id,
         action_type=action.action_type,
-        accepted=True,
         completed=True,
-        served=not timeout,
-        rejected=False,
-        timeout=timeout,
-        timeout_reason=timeout_reason,
         prompt_tokens=prompt_tokens,
         output_tokens=output_tokens,
-        ttft_deadline_s=ttft_deadline_s,
-        e2e_deadline_s=e2e_deadline_s,
         prefill_queue_wait_s=prefill_wait_s,
         decode_queue_wait_s=decode_wait_s,
         link_queue_wait_s=None,

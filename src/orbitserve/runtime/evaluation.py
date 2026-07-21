@@ -54,7 +54,7 @@ def evaluate_runtime_performance(
         warnings.append("serving_throughput.feasible=false; runtime cannot admit LEO actions")
     if not simulation_evaluated:
         warnings.append("simulation trace is not implemented; runtime observed metrics are null")
-    warnings.append("runtime event simulator is not implemented; served_ratio and observed latency metrics are null")
+    warnings.append("runtime event simulator is not implemented; completion_ratio and observed latency metrics are null")
     total_request_count = len(scenario.requests) or scenario.workload_bundle.get("request_count")
     bottleneck_breakdown: dict[str, Any] = {}
     bottleneck_breakdown["not_implemented"] = total_request_count
@@ -89,10 +89,10 @@ def evaluate_runtime_performance(
     }
     runtime_metrics = {
         "total_request_count": total_request_count,
-        "served_ratio": None,
-        "accepted_ratio": None,
-        "timeout_ratio": None,
-        "rejected_ratio": None,
+        "completion_ratio": None,
+        "uncompleted_ratio": None,
+        "uncompleted_stage_breakdown": {},
+        "uncompleted_reason_breakdown": {},
         "fallback_request_fraction": None,
         "ttft_p50_s": None,
         "ttft_p95_s": None,
