@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from .contracts import RuntimePerformanceResult, RuntimeStrategySpec
-from .engines import run_compute_only_fifo, run_trace_backed_runtime
-from .result_builder import build_runtime_performance_result
-from .runtime_deployments import build_runtime_deployment_catalog
-from .runtime_policies import get_runtime_policy
-from ..orbit import (
+from ..contracts import RuntimePerformanceResult, RuntimeStrategySpec
+from .compute_only import run_compute_only_fifo
+from .trace_backed import run_trace_backed_runtime
+from ..metrics.result_builder import build_runtime_performance_result
+from ..scenario.runtime_deployments import build_runtime_deployment_catalog
+from ..strategy.runtime_policies import get_runtime_policy
+from ...orbit import (
     CIRCULAR_GEOMETRY_TRACE,
     IDEAL_FULL_VISIBILITY,
     SURROGATE_ORBIT_TRACE,

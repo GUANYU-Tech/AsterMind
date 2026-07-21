@@ -3,14 +3,14 @@ import unittest
 from pathlib import Path
 
 
-from orbitserve.runtime.energy_state import apply_request_energy
-from orbitserve.runtime.energy_accounting import EnergyIntensity, compute_dynamic_energy_j
-from orbitserve.runtime.energy_alignment import (
+from orbitserve.runtime.state.energy_state import apply_request_energy
+from orbitserve.runtime.state.energy_accounting import EnergyIntensity, compute_dynamic_energy_j
+from orbitserve.runtime.metrics.energy_alignment import (
     attach_energy_alignment,
     evaluate_energy_alignment,
     summarize_runtime_sunlight,
 )
-from orbitserve.runtime.runtime_state import SatelliteState
+from orbitserve.runtime.state.runtime_state import SatelliteState
 
 
 def _window(**overrides):

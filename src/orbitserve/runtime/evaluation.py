@@ -26,7 +26,7 @@ def evaluate_runtime_performance(
             "workload runtime leakage detected in canonical bundle: "
             + ", ".join(leaked_fields)
         )
-    from .runtime_evaluator import try_evaluate_runtime_performance
+    from .engine.runtime_evaluator import try_evaluate_runtime_performance
 
     evaluated_result = try_evaluate_runtime_performance(scenario, runtime_strategy)
     if evaluated_result is not None:

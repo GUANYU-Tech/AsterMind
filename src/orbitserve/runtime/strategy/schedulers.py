@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
-from ..common import to_jsonable
+from ...common import to_jsonable
 
 
 @dataclass(frozen=True)
@@ -218,7 +218,7 @@ class RuntimeScheduler:
         return self.spec.policy
 
     def to_runtime_strategy(self) -> Any:
-        from .contracts import RuntimeStrategySpec
+        from ..contracts import RuntimeStrategySpec
 
         strategy = RuntimeStrategySpec.from_value(self.spec)
         return RuntimeStrategySpec.from_dict(
@@ -236,7 +236,7 @@ class RuntimeScheduler:
         return self.to_runtime_strategy().to_dict()
 
     def candidate_strategy_payloads(self, policies: tuple[str, ...] | None = None) -> tuple[dict[str, Any], ...]:
-        from .contracts import RuntimeStrategySpec
+        from ..contracts import RuntimeStrategySpec
 
         ordered_policies = _unique_policies(
             (

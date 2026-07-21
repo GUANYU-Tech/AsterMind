@@ -10,13 +10,13 @@ from unittest.mock import patch
 
 from orbitserve.experiments.constellation_cost import estimate_constellation_cost
 from orbitserve.experiments.design_evaluation import _runtime_sunlight_summary
-from orbitserve.runtime.energy_state import REQUIRED_RUNTIME_ENERGY_WINDOW_FIELDS
+from orbitserve.runtime.state.energy_state import REQUIRED_RUNTIME_ENERGY_WINDOW_FIELDS
 from orbitserve.experiments import load_experiment_spec, run_experiment
 from orbitserve.architecture.hardware import SatelliteHardwareProfile
 from orbitserve.architecture.hardware import resolve_experiment_hardware
-from orbitserve.runtime.deployment_contracts import RuntimeDeployment, RuntimeDeploymentCatalog
-from orbitserve.runtime.runtime_energy_envelope import derive_runtime_energy_envelope
-from orbitserve.runtime.engines.trace_backed import run_trace_backed_runtime
+from orbitserve.runtime.scenario.deployment_contracts import RuntimeDeployment, RuntimeDeploymentCatalog
+from orbitserve.runtime.scenario.runtime_energy_envelope import derive_runtime_energy_envelope
+from orbitserve.runtime.engine.trace_backed import run_trace_backed_runtime
 from orbitserve.runtime.contracts import RuntimeStrategySpec
 from orbitserve.orbit.simulation_trace_builder import build_surrogate_orbit_trace
 from orbitserve.orbit.simulation_traces import RuntimeTraceManifest, load_surrogate_trace_bundle

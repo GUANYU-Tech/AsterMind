@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..common import to_jsonable
+from ...common import to_jsonable
 
 
 _NON_COMPUTE_ROLES = frozenset({"relay", "communication", "communications", "gateway", "non_compute", "none"})

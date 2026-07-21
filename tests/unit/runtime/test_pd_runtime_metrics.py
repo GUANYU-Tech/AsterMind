@@ -3,8 +3,8 @@ import unittest
 from pathlib import Path
 
 
-from orbitserve.runtime.runtime_metrics import aggregate_runtime_records
-from orbitserve.runtime.runtime_records import RuntimeRequestRecord, records_to_jsonable
+from orbitserve.runtime.metrics.runtime_metrics import aggregate_runtime_records
+from orbitserve.runtime.metrics.runtime_records import RuntimeRequestRecord, records_to_jsonable
 
 
 def _record(request_id: str, **overrides):

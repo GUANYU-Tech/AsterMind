@@ -6,7 +6,7 @@ import math
 from dataclasses import dataclass, field, replace
 from typing import Any
 
-from ..common import to_jsonable
+from ...common import to_jsonable
 
 
 COST_ENERGY_TRACE_OPTION_KEYS = (

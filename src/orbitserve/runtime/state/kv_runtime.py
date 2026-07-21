@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from .deployment_contracts import RuntimeDeploymentCatalog
+from ..scenario.deployment_contracts import RuntimeDeploymentCatalog
 from .runtime_state import RuntimeState
 
 def _pd_prefill_context(state: RuntimeState, request: dict[str, Any]) -> dict[str, Any]:

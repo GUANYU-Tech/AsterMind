@@ -6,10 +6,10 @@ import math
 from typing import Any
 
 from .contracts import RuntimeEngineResult
-from ..deployment_contracts import RuntimeDeploymentCatalog
-from ..runtime_records import RuntimeRequestRecord
-from ..runtime_state import RuntimeState
-from ..runtime_timing import TTFT_DEFINITION, ttft_breakdown
+from ..scenario.deployment_contracts import RuntimeDeploymentCatalog
+from ..metrics.runtime_records import RuntimeRequestRecord
+from ..state.runtime_state import RuntimeState
+from .runtime_timing import TTFT_DEFINITION, ttft_breakdown
 
 def run_compute_only_fifo(
     *,

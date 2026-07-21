@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from .contracts import RuntimeAction, RuntimePredictionEnvelope, RuntimeStrategySpec
+from ..contracts import RuntimeAction, RuntimePredictionEnvelope, RuntimeStrategySpec
 
 
 class RuntimePolicy(Protocol):

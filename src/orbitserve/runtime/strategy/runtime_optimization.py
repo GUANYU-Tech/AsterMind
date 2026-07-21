@@ -6,7 +6,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
-from ..common import to_jsonable
+from ...common import to_jsonable
 
 
 EvaluatorLike = Callable[[Any, Any], Any]
@@ -487,7 +487,7 @@ def _scheduler_for_policy(
 
 def _default_scheduler_for_policy(policy: str) -> dict[str, Any]:
     try:
-        from .contracts import RuntimeStrategySpec
+        from ..contracts import RuntimeStrategySpec
 
         return RuntimeStrategySpec.from_dict({"policy": policy}).to_dict()
     except Exception:
@@ -523,7 +523,7 @@ def _default_scheduler_for_policy(policy: str) -> dict[str, Any]:
 def _strategy_object(scheduler: Mapping[str, Any]) -> Any:
     payload = {k: v for k, v in scheduler.items() if k != "strategy_id"}
     try:
-        from .contracts import RuntimeStrategySpec
+        from ..contracts import RuntimeStrategySpec
 
         if hasattr(RuntimeStrategySpec, "from_dict"):
             return RuntimeStrategySpec.from_dict(dict(payload))
@@ -540,7 +540,7 @@ def _strategy_object(scheduler: Mapping[str, Any]) -> Any:
 
 def _default_evaluator(scenario: Any, strategy: Any) -> Any:
     try:
-        from .evaluation import evaluate_runtime_performance
+        from ..evaluation import evaluate_runtime_performance
     except Exception as exc:
         return _unevaluated_result(f"default runtime evaluator is unavailable: {exc}")
     try:

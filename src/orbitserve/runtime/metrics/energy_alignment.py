@@ -13,7 +13,7 @@ import math
 from dataclasses import dataclass, field, is_dataclass, replace
 from typing import Any, Mapping
 
-from ..common import to_jsonable
+from ...common import to_jsonable
 
 
 DEFAULT_ALIGNMENT_TOLERANCE_FRACTION = 0.05

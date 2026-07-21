@@ -6,8 +6,8 @@ from pathlib import Path
 
 
 from orbitserve.experiments import load_experiment_spec, run_experiment
-from orbitserve.runtime.runtime_optimization import optimize_runtime_strategy
-from orbitserve.runtime.schedulers import RuntimeScheduler, SchedulerCandidate, get_scheduler
+from orbitserve.runtime.strategy.runtime_optimization import optimize_runtime_strategy
+from orbitserve.runtime.strategy.schedulers import RuntimeScheduler, SchedulerCandidate, get_scheduler
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -722,7 +722,7 @@ class RuntimeSkeletonTests(unittest.TestCase):
 class RuntimeOptimizationSkeletonTests(unittest.TestCase):
     def test_optimizer_keeps_scores_null_for_unevaluated_evaluator_results(self):
         runtime = _optional_import("orbitserve.runtime")
-        optimization = _optional_import("orbitserve.runtime.runtime_optimization")
+        optimization = _optional_import("orbitserve.runtime.strategy.runtime_optimization")
         if runtime is None or optimization is None:
             self.skipTest("runtime optimization modules are not available yet")
 

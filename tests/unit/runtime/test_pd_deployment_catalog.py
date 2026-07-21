@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 from orbitserve.runtime.scenario import build_runtime_scenario
-from orbitserve.runtime.runtime_deployments import build_runtime_deployment_catalog
+from orbitserve.runtime.scenario.runtime_deployments import build_runtime_deployment_catalog
 from orbitserve.orbit.simulation_traces import RuntimeTraceManifest, SURROGATE_ORBIT_TRACE
 
 
