@@ -94,7 +94,7 @@ def build_compute_eligibility_set(
     relay_ids = tuple(satellite_id for satellite_id in catalog_by_id if satellite_id not in capacity_set)
     return ComputeEligibilitySet(
         deployment_id=str(getattr(deployment, "deployment_id", "")),
-        deployment_role=str(getattr(deployment, "role", "colocated")),
+        deployment_role="serving",
         capacity_member_ids=tuple(capacity_members),
         eligible_compute_satellite_ids=tuple(eligible),
         relay_satellite_ids=relay_ids,

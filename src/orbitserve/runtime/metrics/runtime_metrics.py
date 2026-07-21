@@ -63,8 +63,6 @@ def aggregate_runtime_records(
     ]
     deferred = [record for record in records if getattr(record, "deferred", False)]
     energy_violations = [record for record in records if getattr(record, "energy_violation", False)]
-    pd_scope_counts = _pd_scope_counts(records)
-    pd_pairing_rule_counts = _pd_pairing_rule_counts(records)
     session_action_counts = _session_action_counts(records)
     kv_serve_action_counts = _kv_serve_action_counts(records)
     kv_post_turn_action_counts = _kv_post_turn_action_counts(records)
@@ -180,15 +178,6 @@ def aggregate_runtime_records(
         "completed_throughput_token_accounting": "prompt_plus_output_and_output_only_both_reported",
         "prefill_queue_wait_p95_s": _percentile([record.prefill_queue_wait_s for record in completed], 0.95),
         "decode_queue_wait_p95_s": _percentile([record.decode_queue_wait_s for record in completed], 0.95),
-        "pd_kv_handoff_bytes_total": _sum_numeric(getattr(record, "kv_handoff_bytes", None) for record in records),
-        "pd_kv_handoff_p95_s": _percentile(_pd_kv_handoff_visible_times(records), 0.95),
-        "pd_intra_cluster_request_fraction": pd_scope_counts["intra_cluster"] / total,
-        "pd_same_plane_request_fraction": pd_scope_counts["same_plane_cross_cluster"] / total,
-        "pd_cross_plane_request_fraction": pd_scope_counts["cross_plane"] / total,
-        "pd_pairing_rule_counts": pd_pairing_rule_counts,
-        "pd_pairing_rule_fractions": {
-            key: value / total for key, value in pd_pairing_rule_counts.items()
-        },
         "sticky_kv_owner_requests": kv_serve_action_counts.get("sticky_kv_owner", session_action_counts.get("sticky_kv_owner", 0)),
         "recompute_context_requests": kv_serve_action_counts.get("recompute_context", session_action_counts.get("recompute_context", 0)),
         "migrate_kv_requests": kv_serve_action_counts.get("migrate_kv", session_action_counts.get("migrate_kv", 0)),
@@ -211,7 +200,6 @@ def aggregate_runtime_records(
         ),
         "kv_reuse_bytes_total": _sum_numeric(getattr(record, "kv_reused_bytes", None) for record in records),
         "kv_generated_bytes_total": _sum_numeric(getattr(record, "kv_generated_bytes", None) for record in records),
-        "kv_handoff_bytes_total": _sum_numeric(getattr(record, "kv_handoff_bytes", None) for record in records),
         "kv_migration_bytes_total": _sum_numeric(getattr(record, "kv_migration_bytes", None) for record in records),
         "kv_replication_bytes_total": _sum_numeric(getattr(record, "kv_replication_bytes", None) for record in records),
         "kv_transfer_attempted_bytes_total": kv_transfer_attempted_total,
@@ -357,13 +345,6 @@ def _empty_runtime_metrics(*, trace_model: str, scope: str) -> dict[str, Any]:
         "completed_token_throughput_per_s": None,
         "completed_output_token_throughput_per_s": None,
         "completed_throughput_token_accounting": "prompt_plus_output_and_output_only_both_reported",
-        "pd_kv_handoff_bytes_total": 0.0,
-        "pd_kv_handoff_p95_s": None,
-        "pd_intra_cluster_request_fraction": 0.0,
-        "pd_same_plane_request_fraction": 0.0,
-        "pd_cross_plane_request_fraction": 0.0,
-        "pd_pairing_rule_counts": {},
-        "pd_pairing_rule_fractions": {},
         "sticky_kv_owner_requests": 0,
         "recompute_context_requests": 0,
         "migrate_kv_requests": 0,
@@ -378,7 +359,6 @@ def _empty_runtime_metrics(*, trace_model: str, scope: str) -> dict[str, Any]:
         "kv_hit_rate_pages": None,
         "kv_reuse_bytes_total": 0.0,
         "kv_generated_bytes_total": 0.0,
-        "kv_handoff_bytes_total": 0.0,
         "kv_migration_bytes_total": 0.0,
         "kv_replication_bytes_total": 0.0,
         "kv_transfer_attempted_bytes_total": 0.0,
@@ -584,44 +564,6 @@ def _link_queue_waits(records: list[RuntimeRequestRecord]) -> list[float | None]
     return values
 
 
-def _pd_kv_handoff_visible_times(records: tuple[RuntimeRequestRecord, ...]) -> list[float | None]:
-    return [_pd_kv_handoff_visible_time(record) for record in records]
-
-
-def _pd_kv_handoff_visible_time(record: RuntimeRequestRecord) -> float | None:
-    visible = _optional_number(getattr(record, "kv_handoff_visible_s", None))
-    if visible is not None:
-        return visible
-    components = (
-        _optional_number(getattr(record, "kv_handoff_queue_wait_s", None)),
-        _optional_number(getattr(record, "kv_handoff_setup_s", None)),
-        _optional_number(getattr(record, "kv_handoff_transmission_s", None)),
-        _optional_number(getattr(record, "kv_handoff_propagation_s", None)),
-    )
-    if all(component is None for component in components):
-        return None
-    return sum(component or 0.0 for component in components)
-
-
-def _pd_scope_counts(records: tuple[RuntimeRequestRecord, ...]) -> dict[str, int]:
-    counts = {
-        "intra_cluster": 0,
-        "same_plane_cross_cluster": 0,
-        "cross_plane": 0,
-    }
-    aliases = {
-        "same_plane": "same_plane_cross_cluster",
-        "same_plane_cross_cluster": "same_plane_cross_cluster",
-    }
-    for record in records:
-        scope = getattr(record, "resolved_pd_pair_scope", None) or getattr(record, "pd_placement_scope", None)
-        if scope is None:
-            continue
-        normalized = aliases.get(str(scope), str(scope))
-        if normalized in counts:
-            counts[normalized] += 1
-    return counts
-
 
 def _session_action_counts(records: tuple[RuntimeRequestRecord, ...]) -> dict[str, int]:
     counts: dict[str, int] = {}
@@ -666,16 +608,6 @@ def _action_type_counts(records: tuple[RuntimeRequestRecord, ...]) -> dict[str, 
         counts[key] = counts.get(key, 0) + 1
     return counts
 
-
-def _pd_pairing_rule_counts(records: tuple[RuntimeRequestRecord, ...]) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for record in records:
-        rule = getattr(record, "pd_pairing_rule", None) or getattr(record, "pd_placement_scope", None)
-        if rule is None:
-            continue
-        key = str(rule)
-        counts[key] = counts.get(key, 0) + 1
-    return counts
 
 
 def _context_recompute_tokens_total(records: tuple[RuntimeRequestRecord, ...]) -> float:

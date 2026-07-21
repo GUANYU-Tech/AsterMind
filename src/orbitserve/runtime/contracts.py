@@ -294,7 +294,6 @@ class RuntimeStrategySpec:
 @dataclass(frozen=True)
 class ServingDeploymentView:
     deployment_id: str
-    role: str
     member_satellites: tuple[str, ...] = ()
     serving_spec: dict[str, Any] = field(default_factory=dict)
     throughput_estimate: dict[str, Any] = field(default_factory=dict)
@@ -307,7 +306,6 @@ class ServingDeploymentView:
     kv_cache_bytes_per_token: float | None = None
     satellites_per_deployment: int | None = None
     stage_satellite_count: int | None = None
-    pd_mode: str | None = None
     internal_comm_summary: dict[str, Any] = field(default_factory=dict)
     internal_comm_accounting: str = "embedded"
     warnings: tuple[str, ...] = ()
@@ -333,8 +331,6 @@ class ServingDeploymentView:
     ) -> "ServingDeploymentView":
         serving_payload = _mapping_from_result(serving_spec)
         throughput_payload = _mapping_from_result(throughput_estimate)
-        pd_mode = _optional_str(throughput_payload.get("pd_mode")) or _optional_str(serving_payload.get("pd_mode"))
-        role = "colocated" if pd_mode in (None, "colocated") else "prefill_decode_pools"
         internal_comm_summary = {
             key: throughput_payload.get(key)
             for key in (
@@ -347,7 +343,6 @@ class ServingDeploymentView:
                 "tp_communication_time_s",
                 "ep_communication_time_s",
                 "pp_communication_time_s",
-                "kv_handoff_time_s",
                 "communication_bottleneck",
                 "bottlenecks",
                 "warnings",
@@ -357,7 +352,6 @@ class ServingDeploymentView:
         }
         return cls(
             deployment_id=deployment_id,
-            role=role,
             member_satellites=tuple(
                 str(item)
                 for item in _first_present(
@@ -378,7 +372,6 @@ class ServingDeploymentView:
             kv_cache_bytes_per_token=_optional_float(throughput_payload.get("kv_cache_bytes_per_token")),
             satellites_per_deployment=_optional_int(throughput_payload.get("satellites_per_deployment")),
             stage_satellite_count=_optional_int(throughput_payload.get("stage_satellite_count")),
-            pd_mode=pd_mode,
             internal_comm_summary=internal_comm_summary,
             internal_comm_accounting=internal_comm_accounting,
             warnings=_warnings_from_payload(throughput_payload),
@@ -423,8 +416,6 @@ class RuntimeAction:
     action_type: str = "reject_drop"
     access_node: str | None = None
     serving_deployment: str | None = None
-    prefill_deployment: str | None = None
-    decode_deployment: str | None = None
     route_in: Any | None = None
     route_out: Any | None = None
     kv_route: Any | None = None

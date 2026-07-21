@@ -39,8 +39,6 @@ class LocalOnlyRuntimePolicy:
             request_id=request_id,
             action_type="local_compute",
             serving_deployment=deployment.deployment_id,
-            prefill_deployment=deployment.deployment_id,
-            decode_deployment=deployment.deployment_id,
             prediction=RuntimePredictionEnvelope(evaluated=False, warnings=()),
             provenance={
                 "policy": self.name,

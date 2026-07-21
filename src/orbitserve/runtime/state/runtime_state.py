@@ -124,9 +124,7 @@ class SessionState:
     session_id: str
     owner_satellite_id: str | None = None
     owner_deployment_id: str | None = None
-    owner_role: str | None = None
     owner_satellite_ids: tuple[str, ...] = ()
-    paired_prefill_deployment_id: str | None = None
     context_tokens: int = 0
     kv_cache_tokens: int = 0
     kv_cache_bytes: float = 0.0
