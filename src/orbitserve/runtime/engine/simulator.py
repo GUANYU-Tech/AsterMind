@@ -2580,13 +2580,10 @@ from ...orbit import (
 )
 
 
-def try_evaluate_runtime_performance(
+def try_run_runtime_simulation(
     scenario: Any,
-    strategy: RuntimeStrategySpec | dict[str, Any] | Any | None = None,
 ) -> RuntimePerformanceResult | None:
-    runtime_strategy = RuntimeStrategySpec.from_value(
-        strategy
-    )
+    runtime_strategy = RuntimeStrategySpec.from_value(scenario.strategy)
     if runtime_strategy.policy.startswith("ground_") or runtime_strategy.policy == "skywalker_like_ground":
         return None
     requests = tuple(getattr(scenario, "requests", ()) or ())
@@ -2698,5 +2695,5 @@ __all__ = [
     "RuntimeEngineResult",
     "normalize_runtime_request",
     "run_trace_backed_runtime",
-    "try_evaluate_runtime_performance",
+    "try_run_runtime_simulation",
 ]

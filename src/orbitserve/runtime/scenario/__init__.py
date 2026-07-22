@@ -1,9 +1,9 @@
 """Static Runtime scenario and deployment preparation."""
 
-from .model import RuntimeScenario
-from .builder import build_runtime_scenario
+from .model import RuntimeSimulationSpec
+from .builder import build_runtime_simulation_spec
 
 __all__ = [
-    "RuntimeScenario",
-    "build_runtime_scenario",
+    "RuntimeSimulationSpec",
+    "build_runtime_simulation_spec",
 ]

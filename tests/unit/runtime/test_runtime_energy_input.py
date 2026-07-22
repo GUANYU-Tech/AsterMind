@@ -1,6 +1,6 @@
 import unittest
 
-from orbitserve.runtime.scenario.builder import build_runtime_scenario
+from orbitserve.runtime.scenario.builder import build_runtime_simulation_spec
 
 
 class RuntimeEnergyInputTests(unittest.TestCase):
@@ -19,7 +19,7 @@ class RuntimeEnergyInputTests(unittest.TestCase):
             "warnings": [],
         }
 
-        scenario = build_runtime_scenario(energy_profile=energy_profile)
+        scenario = build_runtime_simulation_spec(energy_profile=energy_profile)
 
         self.assertEqual(scenario.energy_profile, energy_profile)
         self.assertEqual(
@@ -28,7 +28,7 @@ class RuntimeEnergyInputTests(unittest.TestCase):
         )
 
     def test_builder_does_not_derive_energy_from_cost(self):
-        scenario = build_runtime_scenario()
+        scenario = build_runtime_simulation_spec()
 
         self.assertEqual(scenario.energy_profile, {})
 

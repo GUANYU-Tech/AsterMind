@@ -9,16 +9,15 @@ from .contracts import (
     RUNTIME_PERFORMANCE_DOC,
     RUNTIME_RESULT_FIELDS,
     RuntimePerformanceResult,
-    RuntimeStrategySpec,
 )
-from .scenario.model import RuntimeScenario
+from .scenario.model import RuntimeSimulationSpec
 
 
 def run_runtime_simulation(
-    scenario: RuntimeScenario,
-    strategy: RuntimeStrategySpec | dict[str, Any] | Any | None = None,
+    simulation_spec: RuntimeSimulationSpec,
 ) -> RuntimePerformanceResult:
-    runtime_strategy = RuntimeStrategySpec.from_value(strategy)
+    scenario = simulation_spec
+    runtime_strategy = simulation_spec.strategy
     leakage = _runtime_leakage_records(scenario.requests, scenario.sessions)
     if leakage:
         leaked_fields = sorted({field for record in leakage for field in record["fields"]})
@@ -28,7 +27,7 @@ def run_runtime_simulation(
         )
     from .engine.simulator import try_run_runtime_simulation
 
-    evaluated_result = try_run_runtime_simulation(scenario, runtime_strategy)
+    evaluated_result = try_run_runtime_simulation(scenario)
     if evaluated_result is not None:
         return evaluated_result
     serving_profile = scenario.serving_profile
@@ -65,7 +64,7 @@ def run_runtime_simulation(
         "queue_model": "not_implemented",
         "link_model": "not_implemented",
         "energy_model": "not_implemented",
-        "cost_model": cost_status,
+        "cost_model": "not_configured",
     }
     config = {
         "time_mode": scenario.time_mode,
@@ -182,7 +181,7 @@ def _runtime_leakage_records(
                 )
     return tuple(leaks)
 
-def _workload_status(scenario: RuntimeScenario, leakage: tuple[dict[str, Any], ...]) -> str:
+def _workload_status(scenario: RuntimeSimulationSpec, leakage: tuple[dict[str, Any], ...]) -> str:
     if leakage:
         return "invalid"
     status = str(scenario.workload_bundle.get("status") or "")

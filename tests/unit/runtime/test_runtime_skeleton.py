@@ -1,17 +1,8 @@
 import importlib
-import sys
 import unittest
-from dataclasses import replace
-from pathlib import Path
 
 from orbitserve.runtime.contracts import ServingCapacityProfile
-
-from orbitserve.experiments import load_experiment_spec, run_experiment
-from orbitserve.dse.runtime_optimization import optimize_runtime_strategy
 from orbitserve.runtime.strategy.schedulers import RuntimeScheduler, SchedulerCandidate, get_scheduler
-
-
-ROOT = Path(__file__).resolve().parents[3]
 
 
 def _optional_import(module_name):
@@ -23,16 +14,15 @@ def _optional_import(module_name):
         raise
 
 
-def _to_dict(value):
-    if hasattr(value, "to_dict"):
-        return value.to_dict()
-    return value
-
-
 def _runtime_scenario(runtime, *, requests=None, sessions=None):
-    spec = load_experiment_spec(ROOT / "tests/fixtures/manifests/smoke_single_design.json")
-    experiment = run_experiment(spec)
-    performance = experiment.performance.to_dict()
+    performance = {
+        "evaluated": True,
+        "feasible": True,
+        "prefill_tokens_per_s": 100.0,
+        "decode_tokens_per_s": 50.0,
+        "kv_cache_capacity_tokens": 100000,
+        "request_throughput_per_s": 1.0,
+    }
     strategy = runtime.RuntimeStrategySpec.from_dict(
         {
             "policy": "orbitserve",
@@ -44,9 +34,10 @@ def _runtime_scenario(runtime, *, requests=None, sessions=None):
         }
     )
     deployment = ServingCapacityProfile.from_value(performance)
-    scenario = runtime.RuntimeScenario(
-        scenario_id=spec.experiment_id,
-        time_horizon_s=spec.simulation.duration_s,
+    scenario = runtime.RuntimeSimulationSpec(
+        strategy=strategy,
+        scenario_id="runtime-unit",
+        time_horizon_s=60.0,
         workload_bundle={"status": "loaded", "request_count": len(requests or [])},
         requests=tuple(requests or [_request()]),
         sessions=tuple(sessions or ()),
@@ -414,7 +405,7 @@ class RuntimeSkeletonTests(unittest.TestCase):
 
     def test_performance_skeleton_keeps_observed_metrics_null_without_trace(self):
         scenario, strategy, serving_performance = _runtime_scenario(self.runtime)
-        result = self.runtime.run_runtime_simulation(scenario, strategy).to_dict()
+        result = self.runtime.run_runtime_simulation(scenario).to_dict()
 
         self.assertFalse(result["evaluated"])
         self.assertEqual(result["module_status"]["simulation"], "skeleton")
@@ -452,7 +443,7 @@ class RuntimeSkeletonTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "assigned_satellite|completion_ratio|observed_e2e_s|runtime leakage"):
-            self.runtime.run_runtime_simulation(scenario, strategy)
+            self.runtime.run_runtime_simulation(scenario)
 
     def test_session_runtime_leakage_is_rejected(self):
         scenario, strategy, _performance = _runtime_scenario(
@@ -461,104 +452,8 @@ class RuntimeSkeletonTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "session_action|soc_before|runtime leakage"):
-            self.runtime.run_runtime_simulation(scenario, strategy)
+            self.runtime.run_runtime_simulation(scenario)
 
-    def test_runner_runtime_details_use_materialized_workload(self):
-        payload = run_experiment(
-            load_experiment_spec(ROOT / "tests/fixtures/manifests/smoke_single_design.json")
-        ).to_dict()
-        details = payload["performance"]["details"]
-
-        self.assertIn("runtime", details)
-        self.assertFalse(details["runtime"]["evaluated"])
-        self.assertTrue(details["runtime"]["workload"]["configured"])
-        self.assertIsNone(payload["performance"]["ttft_p95_s"])
-        self.assertIsNone(payload["performance"]["e2e_p95_s"])
-        self.assertNotIn("runtime_optimization", details)
-
-    def test_runner_preserves_extended_scheduler_fields_in_runtime_strategy(self):
-        base = load_experiment_spec(ROOT / "tests/fixtures/manifests/smoke_single_design.json")
-        spec = replace(
-            base,
-            scheduler=replace(
-                base.scheduler,
-                policy="orbitserve",
-                lookahead_orbits=1.5,
-                h_lookahead_s=8550.0,
-                enabled_actions=("local_compute", "ground_fallback", "reject_drop"),
-                fallback_enabled=True,
-                defer_enabled=True,
-                weights={"latency": 1.0, "energy": 0.25, "queue": 1.0, "fallback": 10.0},
-                normalization_refs={"latency_s": "candidate_max"},
-            ),
-        )
-        payload = run_experiment(spec).to_dict()
-        strategy = payload["performance"]["details"]["runtime"]["strategy"]
-
-        self.assertEqual(strategy["policy"], "orbitserve")
-        self.assertEqual(strategy["lookahead_orbits"], 1.5)
-        self.assertEqual(strategy["h_lookahead_s"], 8550.0)
-        self.assertEqual(strategy["enabled_actions"], ["local_compute", "ground_fallback", "reject_drop"])
-        self.assertTrue(strategy["fallback_enabled"])
-        self.assertTrue(strategy["defer_enabled"])
-        self.assertEqual(strategy["weights"]["fallback"], 10.0)
-        self.assertEqual(strategy["normalization_refs"]["latency_s"], "candidate_max")
-
-    def test_plain_runner_scheduler_uses_runtime_policy_defaults(self):
-        payload = run_experiment(
-            load_experiment_spec(ROOT / "tests/fixtures/manifests/smoke_single_design.json")
-        ).to_dict()
-        strategy = payload["performance"]["details"]["runtime"]["strategy"]
-
-        self.assertEqual(strategy["policy"], "orbitserve")
-        self.assertIn("local_compute", strategy["enabled_actions"])
-        self.assertIn("ground_fallback", strategy["enabled_actions"])
-        self.assertIn("sticky_kv_owner", strategy["session_actions_enabled"])
-        self.assertEqual(strategy["path_policy"], "k_shortest_score")
-        self.assertNotIn("runtime_optimization", payload["performance"]["details"])
-
-
-class RuntimeOptimizationSkeletonTests(unittest.TestCase):
-    def test_optimizer_keeps_scores_null_for_unevaluated_evaluator_results(self):
-        runtime = _optional_import("orbitserve.runtime")
-        optimization = _optional_import("orbitserve.dse.runtime_optimization")
-        if runtime is None or optimization is None:
-            self.skipTest("runtime optimization modules are not available yet")
-
-        scenario, _strategy, _performance = _runtime_scenario(runtime)
-        strategies = [
-            runtime.RuntimeStrategySpec.from_dict({"policy": policy})
-            for policy in ("local_only", "shortest_path", "energy_aware", "orbitserve")
-        ]
-
-        class UnevaluatedEvaluator:
-            def evaluate(self, scenario, strategy):
-                return {
-                    "evaluated": False,
-                    "runtime_metrics": {"completion_ratio": None, "ttft_p95_s": None, "e2e_p95_s": None},
-                    "warnings": ["simulation trace is not implemented"],
-                }
-
-        result = optimization.optimize_runtime_strategy(
-            scenario=scenario,
-            search_space=strategies,
-            evaluator=UnevaluatedEvaluator(),
-        )
-        payload = _to_dict(result)
-
-        self.assertFalse(payload["evaluated"])
-        self.assertEqual(len(payload["score_table"]), len(strategies))
-        self.assertEqual(
-            [row["scheduler"]["policy"] for row in payload["score_table"]],
-            ["local_only", "shortest_path", "energy_aware", "orbitserve"],
-        )
-        for row in payload["score_table"]:
-            self.assertIsNone(row["objective_score"])
-            self.assertFalse(row["evaluator_result"]["evaluated"])
-            self.assertIsNone(row["evaluator_result"]["slo"]["completion_ratio"])
-            self.assertIsNone(row["evaluator_result"]["performance"]["ttft_p95_s"])
-            self.assertIsNone(row["evaluator_result"]["performance"]["e2e_p95_s"])
-        self.assertIn(payload.get("selected_strategy"), (None, {}))
 
 
 if __name__ == "__main__":

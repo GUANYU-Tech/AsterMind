@@ -10,12 +10,13 @@ from ...common import to_jsonable
 from ..contracts import (
     RUNTIME_INTERFACE_DOC,
     RUNTIME_PERFORMANCE_DOC,
+    RuntimeStrategySpec,
     ServingCapacityProfile,
 )
-from .model import RuntimeScenario
+from .model import RuntimeSimulationSpec
 
 
-def build_runtime_scenario(
+def build_runtime_simulation_spec(
     *,
     scenario_id: str | None = None,
     design_id: str | None = None,
@@ -27,9 +28,10 @@ def build_runtime_scenario(
     simulation_result: Any = None,
     simulation_config: Any = None,
     energy_profile: Any = None,
+    strategy: Any = None,
     time_horizon_s: float | None = None,
     warnings: tuple[str, ...] = (),
-) -> RuntimeScenario:
+) -> RuntimeSimulationSpec:
     workload_payload = _mapping_from_result(workload_generation)
     workload_spec_payload = _mapping_from_result(workload_spec)
     simulation_payload = _mapping_from_result(simulation_result)
@@ -126,7 +128,8 @@ def build_runtime_scenario(
             )
         )
     )
-    return RuntimeScenario(
+    return RuntimeSimulationSpec(
+        strategy=RuntimeStrategySpec.from_value(strategy),
         scenario_id=scenario_name,
         design_id=design_name,
         time_horizon_s=time_horizon_s,

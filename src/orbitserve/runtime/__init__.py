@@ -2,13 +2,13 @@
 
 from .api import run_runtime_simulation
 from .contracts import RuntimePerformanceResult, RuntimeStrategySpec
-from .scenario.builder import build_runtime_scenario
-from .scenario.model import RuntimeScenario
+from .scenario.builder import build_runtime_simulation_spec
+from .scenario.model import RuntimeSimulationSpec
 
 __all__ = [
     "RuntimePerformanceResult",
-    "RuntimeScenario",
+    "RuntimeSimulationSpec",
     "RuntimeStrategySpec",
-    "build_runtime_scenario",
+    "build_runtime_simulation_spec",
     "run_runtime_simulation",
 ]

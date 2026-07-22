@@ -1,7 +1,7 @@
 import unittest
 
 from orbitserve.runtime import RuntimePerformanceResult
-from orbitserve.runtime.engine.simulator import try_evaluate_runtime_performance
+from orbitserve.runtime.engine.simulator import try_run_runtime_simulation
 from orbitserve.runtime.engine.simulator import normalize_runtime_request
 from orbitserve.runtime.metrics.aggregation import aggregate_runtime_records
 from orbitserve.runtime.metrics.records import RuntimeRequestRecord
@@ -9,7 +9,7 @@ from orbitserve.runtime.metrics.records import RuntimeRequestRecord
 
 class RuntimeResultContractTests(unittest.TestCase):
     def test_runtime_evaluator_entrypoint_is_importable(self):
-        self.assertTrue(callable(try_evaluate_runtime_performance))
+        self.assertTrue(callable(try_run_runtime_simulation))
 
     def test_runtime_result_does_not_export_slo_group(self):
         result = RuntimePerformanceResult(

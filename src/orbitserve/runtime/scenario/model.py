@@ -6,14 +6,15 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ...common import to_jsonable
-from ..contracts import ServingCapacityProfile
+from ..contracts import RuntimeStrategySpec, ServingCapacityProfile
 
 
 @dataclass(frozen=True)
-class RuntimeScenario:
+class RuntimeSimulationSpec:
     """Fully assembled, immutable input boundary for one Runtime evaluation."""
 
-    scenario_id: str = "runtime_scenario"
+    strategy: RuntimeStrategySpec
+    scenario_id: str = "runtime_simulation"
     design_id: str = "runtime_design"
     time_horizon_s: float | None = None
     workload_bundle: dict[str, Any] = field(default_factory=dict)
@@ -27,7 +28,7 @@ class RuntimeScenario:
     energy_profile: dict[str, Any] = field(default_factory=dict)
     provenance: dict[str, Any] = field(default_factory=dict)
     warnings: tuple[str, ...] = ()
-    schema_version: str = "orbitserve.runtime_scenario.v1"
+    schema_version: str = "orbitserve.runtime_simulation_spec.v1"
     time_mode: str = "event_driven"
     time_step_s: float | None = None
 
@@ -35,4 +36,4 @@ class RuntimeScenario:
         return to_jsonable(self)
 
 
-__all__ = ["RuntimeScenario"]
+__all__ = ["RuntimeSimulationSpec"]
