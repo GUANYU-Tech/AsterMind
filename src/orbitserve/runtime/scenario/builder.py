@@ -23,14 +23,10 @@ def build_runtime_scenario(
     workload_spec: Any = None,
     constellation: Any = None,
     constellation_architecture: Any = None,
-    serving_spec: Any = None,
-    serving_throughput: Any = None,
+    serving_profile: Any = None,
     simulation_result: Any = None,
     simulation_config: Any = None,
     energy_profile: Any = None,
-    scheduler_spec: Any = None,
-    hardware: Any = None,
-    resolved_hardware: Any = None,
     time_horizon_s: float | None = None,
     warnings: tuple[str, ...] = (),
 ) -> RuntimeScenario:
@@ -41,8 +37,6 @@ def build_runtime_scenario(
     energy_profile_payload = _mapping_from_result(energy_profile)
     constellation_payload = _mapping_from_result(constellation)
     architecture_payload = _mapping_from_result(constellation_architecture)
-    resolved_hardware_payload = _mapping_from_result(resolved_hardware)
-    hardware_payload = _mapping_from_result(hardware)
     scenario_name = scenario_id or str(_first_present(workload_spec_payload.get("name"), "runtime_scenario"))
     design_name = design_id or str(
         _first_present(
@@ -73,10 +67,7 @@ def build_runtime_scenario(
                 _dict(manifest.get("time")).get("time_horizon_s"),
             )
         )
-    serving_profile = ServingCapacityProfile.from_inputs(
-        serving_spec=serving_spec,
-        throughput_estimate=serving_throughput,
-    )
+    serving_profile = ServingCapacityProfile.from_value(serving_profile)
     workload_configured = _workload_bundle_configured(workload_payload, requests, manifest)
     workload_bundle = {
         "status": workload_payload.get("status", "materialized_spec" if workload_spec_payload else "not_configured"),
@@ -170,7 +161,6 @@ def build_runtime_scenario(
                 "modeling_doc": "docs/research/parameters/llm_serving_capacity_model.md",
                 "estimate_schema": "ServingThroughputEstimate",
             },
-            "hardware_config": resolved_hardware_payload or hardware_payload,
             "energy_profile": _dict(energy_profile_payload.get("provenance")),
             "runtime_interface_doc": RUNTIME_INTERFACE_DOC,
             "runtime_performance_model_doc": RUNTIME_PERFORMANCE_DOC,
