@@ -10,7 +10,7 @@ from unittest.mock import patch
 from orbitserve.dse.search import DSESpec, DSERuntimeMatrixSpec, run_dse
 from orbitserve.dse.runtime_matrix import DSEDesignContext, evaluate_runtime_matrix
 from orbitserve.experiments import load_experiment_spec
-from orbitserve.runtime.runtime_optimization import score_runtime_evaluator_result
+from orbitserve.dse.runtime_optimization import score_runtime_evaluator_result
 
 
 ROOT = Path(__file__).resolve().parents[2]

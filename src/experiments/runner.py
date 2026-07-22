@@ -13,7 +13,10 @@ from orbitserve.dse.search import DSEStudyResult, run_dse
 from orbitserve.common import SLOMetrics
 from orbitserve.runtime import RuntimeStrategySpec
 from orbitserve.experiments.runtime_dispatch import evaluate_runtime_performance
-from orbitserve.runtime import RuntimeOptimizationObjective, optimize_runtime_strategy
+from orbitserve.dse.runtime_optimization import (
+    RuntimeOptimizationObjective,
+    optimize_runtime_strategy,
+)
 from orbitserve.dse.satellite_budget import analyze_communication_window_satellite_budget
 from orbitserve.orbit import TRACE_BACKED_RUNTIME_SURROGATE_SCOPE, normalize_trace_scope
 

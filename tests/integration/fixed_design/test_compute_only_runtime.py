@@ -8,7 +8,7 @@ from pathlib import Path
 from orbitserve.experiments import load_experiment_spec, run_experiment
 from orbitserve.runtime.contracts import RuntimeScenario, RuntimeStrategySpec, ServingDeploymentView
 from orbitserve.runtime.evaluation import evaluate_runtime_performance
-from orbitserve.runtime.runtime_optimization import optimize_runtime_strategy
+from orbitserve.dse.runtime_optimization import optimize_runtime_strategy
 
 
 ROOT = Path(__file__).resolve().parents[3]

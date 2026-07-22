@@ -12,7 +12,7 @@ from ..common import DSEMetrics
 from ..runtime import RuntimeStrategySpec
 from ..experiments.runtime_dispatch import evaluate_runtime_performance
 from ..runtime import build_runtime_deployment_catalog
-from ..runtime import RuntimeOptimizationObjective, score_runtime_evaluator_result
+from .runtime_optimization import RuntimeOptimizationObjective, score_runtime_evaluator_result
 
 
 @dataclass(frozen=True)
@@ -372,7 +372,7 @@ def evaluate_runtime_matrix(
             "phase": "dse_runtime_matrix",
             "runtime_evaluator": "orbitserve.runtime.evaluate_runtime_performance",
             "optimizer_called": False,
-            "scorer": "orbitserve.runtime_optimization.score_runtime_evaluator_result",
+            "scorer": "orbitserve.dse.runtime_optimization.score_runtime_evaluator_result",
             "static_screening_enabled": bool(screening["config"].get("enabled", False)),
             "valid_for_paper_main_results": False,
             "pareto_table_scope": "preliminary_runtime_matrix",
@@ -1449,7 +1449,7 @@ def _matrix_row_from_runtime_result(
             "catalog_warnings": catalog_warnings,
             "scope_candidate": to_jsonable(scope_candidate),
             "runtime_evaluator": "orbitserve.runtime.evaluate_runtime_performance",
-            "scorer": "orbitserve.runtime_optimization.score_runtime_evaluator_result",
+            "scorer": "orbitserve.dse.runtime_optimization.score_runtime_evaluator_result",
             "objective_score_scope": scoring.get("objective_score_scope"),
             "valid_for_paper_main_results": bool(scoring.get("valid_for_paper_main_results", False)),
             **_mapping_from_value(scoring.get("provenance")),
