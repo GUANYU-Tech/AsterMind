@@ -188,7 +188,7 @@ def run_trace_backed_runtime(
         },
         provenance={
             "runtime_engine": "trace_backed_runtime_surrogate",
-            "capacity_allocation_assumption": "nominal_equal_share_per_deployed_compute_member",
+            "capacity_allocation_assumption": "full_single_satellite_serving_capacity_per_member",
             "configured_time_horizon_s": time_horizon_s,
             "trace_horizon_s": trace_horizon_s,
             "effective_time_horizon_s": trace_horizon_s,
@@ -356,8 +356,8 @@ def _evaluate_trace_request(
             record.uncompleted_reason or failure_reason,
             warnings=(failure_reason,),
         )
-    prefill_rate_per_sat = float(deployment.prefill_tokens_per_s or 0.0) / eligibility.capacity_member_count
-    decode_rate_per_sat = float(deployment.decode_tokens_per_s or 0.0) / eligibility.capacity_member_count
+    prefill_rate_per_sat = float(deployment.prefill_tokens_per_s or 0.0)
+    decode_rate_per_sat = float(deployment.decode_tokens_per_s or 0.0)
     route_failures: list[str] = []
     route_warnings: list[str] = []
     route_rows = enumerate_compute_candidates(
@@ -882,7 +882,7 @@ def _evaluate_trace_request(
             "shadow_strategy": selected.get("shadow_strategy"),
             "shadow_triggered": _shadow_triggered(action_type, selected.get("access_energy_window"), raw_request_energy_window),
             "shadow_runtime_action": action_type,
-            "capacity_allocation_assumption": "nominal_equal_share_per_deployed_compute_member",
+            "capacity_allocation_assumption": "full_single_satellite_serving_capacity_per_member",
             "energy_model": "event_incremental_per_node_per_physical_leg_v1",
             "energy_ledger": tuple(energy_update.get("energy_ledger", ())),
             "preliminary_surrogate": True,

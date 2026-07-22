@@ -8,7 +8,11 @@ from ...common import to_jsonable
 from .deployment_contracts import RuntimeDeployment, RuntimeDeploymentCatalog
 
 
-def build_runtime_deployment_catalog(scenario: Any) -> RuntimeDeploymentCatalog:
+def build_runtime_deployment_catalog(
+    scenario: Any,
+    *,
+    satellite_catalog: tuple[dict[str, Any], ...] | None = None,
+) -> RuntimeDeploymentCatalog:
     """Build one full-serving deployment from the scenario's public view.
 
     Runtime assumes every listed member satellite can execute both Prefill and
@@ -17,7 +21,6 @@ def build_runtime_deployment_catalog(scenario: Any) -> RuntimeDeploymentCatalog:
 
     serving_deployments = tuple(getattr(scenario, "serving_deployments", ()) or ())
     constellation = _mapping(getattr(scenario, "constellation", None))
-    total_satellites = _constellation_satellite_count(constellation)
     if not serving_deployments:
         return RuntimeDeploymentCatalog(
             warnings=("runtime deployment catalog is empty because serving_deployments is empty",),
@@ -27,18 +30,20 @@ def build_runtime_deployment_catalog(scenario: Any) -> RuntimeDeploymentCatalog:
     payload = _mapping(serving_deployments[0])
     throughput = _mapping(payload.get("throughput_estimate"))
     deployment_id = str(payload.get("deployment_id") or "deployment_0")
-    satellites_per_deployment = _optional_int(
-        _first_present(payload.get("satellites_per_deployment"), throughput.get("satellites_per_deployment"))
+    catalog_rows = satellite_catalog or tuple(
+        _mapping(item)
+        for item in constellation.get("satellite_catalog", ()) or ()
     )
-    member_satellites = _explicit_member_satellites(payload)
+    member_satellites = tuple(
+        str(row["satellite_id"])
+        for row in catalog_rows
+        if row.get("satellite_id") is not None
+    )
     if not member_satellites:
-        member_count = (
-            _serving_satellite_budget_count(payload, throughput)
-            or total_satellites
-            or satellites_per_deployment
-            or 1
+        return RuntimeDeploymentCatalog(
+            warnings=("runtime service catalog requires Orbit satellite_catalog",),
+            provenance={"source": "runtime_deployments.build_runtime_deployment_catalog"},
         )
-        member_satellites = _synthetic_satellite_ids(max(1, member_count))
 
     prefill_tokens_per_s = _optional_float(
         _first_present(payload.get("prefill_tokens_per_s"), throughput.get("prefill_tokens_per_s"))
@@ -46,7 +51,6 @@ def build_runtime_deployment_catalog(scenario: Any) -> RuntimeDeploymentCatalog:
     decode_tokens_per_s = _optional_float(
         _first_present(payload.get("decode_tokens_per_s"), throughput.get("decode_tokens_per_s"))
     )
-    budget_payload = _serving_satellite_budget_payload(payload, throughput)
     warnings = tuple(dict.fromkeys(_string_tuple(payload.get("warnings"))))
     deployment = RuntimeDeployment(
         deployment_id=deployment_id,
@@ -63,16 +67,14 @@ def build_runtime_deployment_catalog(scenario: Any) -> RuntimeDeploymentCatalog:
         kv_cache_bytes_per_token=_optional_float(
             _first_present(payload.get("kv_cache_bytes_per_token"), throughput.get("kv_cache_bytes_per_token"))
         ),
-        satellites_per_deployment=satellites_per_deployment,
+        satellites_per_deployment=1,
         internal_comm_accounting="embedded",
         placement_model="single_satellite_full_serving",
         selection_policy="runtime_scheduler_selects_serving_satellite",
         provenance={
-            "source": "ServingDeploymentView",
-            "input_deployment_id": deployment_id,
-            "member_satellite_assignment": _member_assignment_source(payload, constellation),
-            "serving_assumption": "each_member_satellite_executes_prefill_and_decode",
-            **budget_payload,
+            "source": "single_satellite_serving_capacity",
+            "serving_assumption": "all_orbit_satellites_run_full_prefill_decode_serving",
+            "satellite_id_source": "Orbit satellite_catalog",
         },
         warnings=warnings,
     )
@@ -83,9 +85,8 @@ def build_runtime_deployment_catalog(scenario: Any) -> RuntimeDeploymentCatalog:
         warnings=warnings,
         provenance={
             "source": "runtime_deployments.build_runtime_deployment_catalog",
-            "constellation_satellite_count": total_satellites,
-            "serving_assumption": "single_satellite_full_serving",
-            **budget_payload,
+            "constellation_satellite_count": len(member_satellites),
+            "serving_assumption": "all_orbit_satellites_run_full_prefill_decode_serving",
         },
     )
 
@@ -101,51 +102,6 @@ def _mapping(value: Any) -> dict[str, Any]:
     converted = to_jsonable(value)
     return converted if isinstance(converted, dict) else {}
 
-
-def _serving_satellite_budget_payload(payload: dict[str, Any], throughput: dict[str, Any]) -> dict[str, Any]:
-    keys = (
-        "serving_satellite_budget_count",
-        "constellation_satellite_count",
-        "satellite_budget_mode",
-        "satellite_budget_source",
-        "comparison_group_id",
-        "satellite_budget_unused_count",
-    )
-    return {
-        key: value
-        for key in keys
-        if (value := _first_present(payload.get(key), throughput.get(key))) is not None
-    }
-
-
-def _serving_satellite_budget_count(payload: dict[str, Any], throughput: dict[str, Any]) -> int | None:
-    count = _optional_int(_serving_satellite_budget_payload(payload, throughput).get("serving_satellite_budget_count"))
-    return count if count is not None and count > 0 else None
-
-
-def _constellation_satellite_count(constellation: dict[str, Any]) -> int | None:
-    return _optional_int(
-        _first_present(
-            constellation.get("satellite_count"),
-            _mapping(constellation.get("design")).get("satellite_count"),
-        )
-    )
-
-
-def _explicit_member_satellites(payload: dict[str, Any]) -> tuple[str, ...]:
-    return tuple(str(item) for item in payload.get("member_satellites", ()) or ())
-
-
-def _synthetic_satellite_ids(count: int) -> tuple[str, ...]:
-    return tuple(f"sat-{index:05d}" for index in range(max(0, count)))
-
-
-def _member_assignment_source(payload: dict[str, Any], constellation: dict[str, Any]) -> str:
-    if _explicit_member_satellites(payload):
-        return "payload.member_satellites"
-    if constellation.get("satellite_catalog"):
-        return "constellation.satellite_catalog"
-    return "deterministic synthetic sat-xxxxx ids"
 
 
 def _first_present(*values: Any) -> Any:

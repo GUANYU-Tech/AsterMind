@@ -37,12 +37,10 @@ def try_evaluate_runtime_performance(
     if not trace_manifest.evaluated:
         return None
     deployment_catalog = build_runtime_deployment_catalog(scenario)
-    if not deployment_catalog.default_deployment:
-        return None
     policy = get_runtime_policy(runtime_strategy)
 
     if trace_manifest.trace_model == IDEAL_FULL_VISIBILITY:
-        if policy is None or runtime_strategy.policy != "local_only":
+        if policy is None or runtime_strategy.policy != "local_only" or not deployment_catalog.default_deployment:
             return None
         engine_result = run_compute_only_fifo(
             requests=requests,
@@ -96,6 +94,12 @@ def try_evaluate_runtime_performance(
             warnings=(f"runtime trace loader failed: {exc}",),
         )
     engine_result = run_trace_backed_runtime(
+    deployment_catalog = build_runtime_deployment_catalog(
+        scenario,
+        satellite_catalog=tuple(getattr(trace_bundle, "satellite_catalog", ()) or ()),
+    )
+    if not deployment_catalog.default_deployment:
+        return None
         requests=requests,
         deployment_catalog=deployment_catalog,
         runtime_strategy=runtime_strategy,
