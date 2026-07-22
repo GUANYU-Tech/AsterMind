@@ -196,7 +196,7 @@ def _strategy_defaults(policy: str) -> dict[str, Any]:
             "shadow_dvfs_enabled": True,
             "shadow_dvfs_scale": 0.5,
             "path_policy": "k_shortest_score",
-            "queue_policy": "least_slack_first",
+            "queue_policy": "resource_aware_score",
             "fallback_enabled": False,
             "defer_enabled": True,
         }
@@ -286,8 +286,8 @@ class RuntimeStrategySpec:
             random_seed=_optional_int(data.get("random_seed")),
             trace_level=str(data.get("trace_level", "summary")),
             provenance={
-                "source": "SchedulerSpec-compatible runtime strategy",
-                "runtime_optimization_doc": RUNTIME_OPTIMIZATION_DOC,
+                "source": "fixed RuntimeStrategySpec",
+                "strategy_mutable_during_run": False,
                 **_dict(data.get("provenance")),
             },
         )
