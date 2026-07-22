@@ -10,7 +10,7 @@ from .contracts import (
     RUNTIME_RESULT_FIELDS,
     RuntimePerformanceResult,
 )
-from .scenario.model import RuntimeSimulationSpec
+from .setup.simulation_spec import RuntimeSimulationSpec
 
 
 def run_runtime_simulation(

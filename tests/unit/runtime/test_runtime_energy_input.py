@@ -1,6 +1,6 @@
 import unittest
 
-from orbitserve.runtime.scenario.builder import build_runtime_simulation_spec
+from orbitserve.runtime.setup.builder import build_runtime_simulation_spec
 
 
 class RuntimeEnergyInputTests(unittest.TestCase):

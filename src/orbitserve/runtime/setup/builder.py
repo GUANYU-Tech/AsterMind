@@ -13,7 +13,7 @@ from ..contracts import (
     RuntimeStrategySpec,
     ServingCapacityProfile,
 )
-from .model import RuntimeSimulationSpec
+from .simulation_spec import RuntimeSimulationSpec
 
 
 def build_runtime_simulation_spec(
