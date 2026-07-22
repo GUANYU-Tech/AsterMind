@@ -44,18 +44,14 @@ def aggregate_runtime_records(
             runtime_metrics=_empty_runtime_metrics(trace_model=trace_model, scope=scope),
             performance=PerformanceMetrics(warnings=warnings),
             bottleneck_breakdown={},
-            communication_metrics=_unevaluated_group("link model is not implemented in compute-only runtime"),
-            energy_metrics=_unevaluated_group("energy model is not implemented in compute-only runtime"),
+            communication_metrics=_unevaluated_group("link metrics require a supported Runtime trace"),
+            energy_metrics=_unevaluated_group("energy metrics require a supported Runtime trace"),
             warnings=warnings,
         )
 
     completed = [record for record in records if record.completed]
     uncompleted = [record for record in records if not record.completed]
     fallback = [record for record in records if getattr(record, "fallback_used", False)]
-    terrestrial = [record for record in records if _is_ground_record(record)]
-    cross_region_ground = [
-        record for record in terrestrial if getattr(record, "ground_cross_region", False)
-    ]
     deferred = [record for record in records if getattr(record, "deferred", False)]
     energy_violations = [record for record in records if getattr(record, "energy_violation", False)]
     session_action_counts = _session_action_counts(records)
@@ -115,30 +111,10 @@ def aggregate_runtime_records(
             [
                 record
                 for record in completed
-                if not getattr(record, "fallback_used", False) and not _is_ground_record(record)
+                if not getattr(record, "fallback_used", False)
             ]
         )
         / total,
-        "terrestrial_completion_ratio": len([record for record in completed if _is_ground_record(record)]) / total,
-        "ground_cross_region_request_count": len(cross_region_ground),
-        "ground_cross_region_request_fraction": (
-            len(cross_region_ground) / len(terrestrial) if terrestrial else None
-        ),
-        "ground_network_delay_p50_s": _percentile(
-            [getattr(record, "ground_network_delay_s", None) for record in terrestrial], 0.50
-        ),
-        "ground_network_delay_p95_s": _percentile(
-            [getattr(record, "ground_network_delay_s", None) for record in terrestrial], 0.95
-        ),
-        "ground_network_delay_p99_s": _percentile(
-            [getattr(record, "ground_network_delay_s", None) for record in terrestrial], 0.99
-        ),
-        "ground_load_balancer_queue_wait_p95_s": _percentile(
-            [getattr(record, "ground_load_balancer_queue_wait_s", None) for record in terrestrial], 0.95
-        ),
-        "ground_replica_pending_wait_p95_s": _percentile(
-            [getattr(record, "ground_replica_pending_wait_s", None) for record in terrestrial], 0.95
-        ),
         "action_type_counts": action_type_counts,
         "shadow_affected_request_count": len(shadow_records),
         "shadow_affected_request_fraction": len(shadow_records) / total,
@@ -161,12 +137,9 @@ def aggregate_runtime_records(
         "e2e_p99_s": _percentile([record.e2e_s for record in completed], 0.99),
         "useful_request_throughput_per_s": len(completed) / horizon if horizon > 0 else None,
         "useful_token_throughput_per_s": completed_tokens / horizon if horizon > 0 else None,
-        "completed_request_throughput_per_s": len(completed) / horizon if horizon > 0 else None,
-        "completed_token_throughput_per_s": completed_tokens / horizon if horizon > 0 else None,
         "completed_output_token_throughput_per_s": (
             completed_output_tokens / horizon if horizon > 0 else None
         ),
-        "completed_throughput_token_accounting": "prompt_plus_output_and_output_only_both_reported",
         "prefill_queue_wait_p95_s": _percentile([record.prefill_queue_wait_s for record in completed], 0.95),
         "decode_queue_wait_p95_s": _percentile([record.decode_queue_wait_s for record in completed], 0.95),
         "sticky_kv_owner_requests": kv_serve_action_counts.get("sticky_kv_owner", session_action_counts.get("sticky_kv_owner", 0)),
@@ -203,11 +176,6 @@ def aggregate_runtime_records(
         "link_queue_wait_p95_s": (
             _percentile(_link_queue_waits(completed), 0.95)
             if _uses_trace_backed_surrogate_model(trace_model, scope)
-            else _percentile(
-                [getattr(record, "ground_network_delay_s", None) for record in completed],
-                0.95,
-            )
-            if _uses_terrestrial_ground_model(trace_model, scope)
             else None
         ),
         "access_wait_p95_s": _percentile([record.access_wait_s for record in completed], 0.95),
@@ -247,11 +215,7 @@ def aggregate_runtime_records(
             runtime_metrics["prefill_queue_wait_p95_s"] or 0.0,
             runtime_metrics["decode_queue_wait_p95_s"] or 0.0,
         ),
-        link_delay_p95_s=(
-            runtime_metrics["ground_network_delay_p95_s"]
-            if _uses_terrestrial_ground_model(trace_model, scope)
-            else runtime_metrics["link_queue_wait_p95_s"]
-        ),
+        link_delay_p95_s=runtime_metrics["link_queue_wait_p95_s"],
         feasible=True,
         bottleneck=max(bottlenecks, key=bottlenecks.get) if bottlenecks else None,
         details={
@@ -282,14 +246,6 @@ def _empty_runtime_metrics(*, trace_model: str, scope: str) -> dict[str, Any]:
         "uncompleted_ratio": None,
         "uncompleted_stage_breakdown": {},
         "uncompleted_reason_breakdown": {},
-        "terrestrial_completion_ratio": None,
-        "ground_cross_region_request_count": 0,
-        "ground_cross_region_request_fraction": None,
-        "ground_network_delay_p50_s": None,
-        "ground_network_delay_p95_s": None,
-        "ground_network_delay_p99_s": None,
-        "ground_load_balancer_queue_wait_p95_s": None,
-        "ground_replica_pending_wait_p95_s": None,
         "action_type_counts": {},
         "shadow_affected_request_count": 0,
         "shadow_affected_request_fraction": None,
@@ -305,10 +261,7 @@ def _empty_runtime_metrics(*, trace_model: str, scope: str) -> dict[str, Any]:
         "e2e_p95_s": None,
         "useful_request_throughput_per_s": None,
         "useful_token_throughput_per_s": None,
-        "completed_request_throughput_per_s": None,
-        "completed_token_throughput_per_s": None,
         "completed_output_token_throughput_per_s": None,
-        "completed_throughput_token_accounting": "prompt_plus_output_and_output_only_both_reported",
         "sticky_kv_owner_requests": 0,
         "recompute_context_requests": 0,
         "kv_serve_action_counts": {},
@@ -344,33 +297,8 @@ def _communication_metrics(
     scope: str,
 ) -> dict[str, Any]:
     scope = normalize_trace_scope(scope)
-    if _uses_terrestrial_ground_model(trace_model, scope):
-        completed = [record for record in records if record.completed]
-        terrestrial = [record for record in completed if _is_ground_record(record)]
-        cross_region = [
-            record for record in terrestrial if getattr(record, "ground_cross_region", False)
-        ]
-        return {
-            "evaluated": True,
-            "model": "terrestrial_internet_rtt_surrogate",
-            "ground_network_delay_p50_s": _percentile(
-                [getattr(record, "ground_network_delay_s", None) for record in terrestrial], 0.50
-            ),
-            "ground_network_delay_p95_s": _percentile(
-                [getattr(record, "ground_network_delay_s", None) for record in terrestrial], 0.95
-            ),
-            "ground_network_delay_p99_s": _percentile(
-                [getattr(record, "ground_network_delay_s", None) for record in terrestrial], 0.99
-            ),
-            "ground_cross_region_request_fraction": (
-                len(cross_region) / len(terrestrial) if terrestrial else None
-            ),
-            "warnings": (
-                "terrestrial Internet delay is a configurable RTT/geometry surrogate, not a packet-level trace",
-            ),
-        }
     if not _uses_trace_backed_surrogate_model(trace_model, scope):
-        return _unevaluated_group("link model is not implemented in compute-only runtime")
+        return _unevaluated_group("link metrics require a supported Runtime trace")
     completed = [record for record in records if record.completed]
     return {
         "evaluated": True,
@@ -388,15 +316,8 @@ def _energy_metrics(
     scope: str,
 ) -> dict[str, Any]:
     scope = normalize_trace_scope(scope)
-    if _uses_terrestrial_ground_model(trace_model, scope):
-        return {
-            "evaluated": False,
-            "not_applicable": True,
-            "value": None,
-            "warnings": ("orbital energy/SOC is not applicable to the terrestrial baseline",),
-        }
     if not _uses_trace_backed_surrogate_model(trace_model, scope):
-        return _unevaluated_group("energy model is not implemented in compute-only runtime")
+        return _unevaluated_group("energy metrics require a supported Runtime trace")
     soc_values = [
         getattr(record, "soc_after", None)
         for record in records
@@ -425,14 +346,6 @@ def _energy_metrics(
 
 def _warnings_for_scope(*, trace_model: str, scope: str) -> tuple[str, ...]:
     scope = normalize_trace_scope(scope)
-    if _uses_terrestrial_ground_model(trace_model, scope):
-        return (
-            "scope=skywalker_ground_reproduction_surrogate",
-            "trace_model=terrestrial_network_surrogate",
-            "valid_for_paper_main_results=false",
-            "SkyWalker control logic is reproduced, while unpublished workload/network/engine parameters remain explicit surrogates",
-            "ground cost_per_served_* remains null unless a separate terrestrial cost model is configured",
-        )
     if trace_model == SURROGATE_ORBIT_TRACE and scope == TRACE_BACKED_RUNTIME_SURROGATE_SCOPE:
         return (
             f"scope={TRACE_BACKED_RUNTIME_SURROGATE_SCOPE}",
@@ -468,18 +381,6 @@ def _uses_trace_backed_surrogate_model(trace_model: str, scope: str) -> bool:
         and scope == "geometry_trace_surrogate"
     )
 
-
-def _uses_terrestrial_ground_model(trace_model: str, scope: str) -> bool:
-    return (
-        str(trace_model) == "terrestrial_network_surrogate"
-        and str(scope) == "skywalker_ground_reproduction_surrogate"
-    )
-
-
-def _is_ground_record(record: RuntimeRequestRecord) -> bool:
-    return str(getattr(record, "action_type", "")).startswith("ground_") or getattr(
-        record, "ground_serving_region_id", None
-    ) is not None
 
 
 def _effective_horizon(records: tuple[RuntimeRequestRecord, ...], configured_horizon_s: float | None) -> float:

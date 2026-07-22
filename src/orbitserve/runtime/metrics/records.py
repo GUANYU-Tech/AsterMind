@@ -14,7 +14,7 @@ _SECTION_DEFAULTS: dict[str, dict[str, Any]] = {
         "output_tokens": 0, "session_id": None,
     },
     "decision": {
-        "strategy": None, "action": "reject_drop", "action_components": (),
+        "strategy": None, "action_type": "reject_drop", "action_components": (),
         "deployment_id": None, "access_satellite_id": None,
         "serving_satellite_id": None, "dvfs_scale": None,
         "fallback_used": False, "deferred": False, "defer_until_s": None,
@@ -35,16 +35,11 @@ _SECTION_DEFAULTS: dict[str, dict[str, Any]] = {
         "return_path_s": None, "first_token_return_s": None,
         "ttft_breakdown_s": {}, "ttft_s": None, "e2e_s": None,
         "response_streaming_model": None,
-        "ground_network_delay_s": None,
-        "ground_load_balancer_queue_wait_s": None,
-        "ground_replica_pending_wait_s": None,
     },
     "routing": {
         "ingress": None, "input_route_nodes": (), "output_route_nodes": (),
         "route_node_ids": (), "route_links": (), "hop_count": 0,
-        "selected_path": (), "ground_origin_region_id": None,
-        "ground_serving_region_id": None, "ground_replica_id": None,
-        "ground_cross_region": None,
+        "selected_path": (),
     },
     "energy": {
         "soc_before": None, "soc_after": None, "compute_energy_j": None,
@@ -60,7 +55,6 @@ _SECTION_DEFAULTS: dict[str, dict[str, Any]] = {
         "kv_pages_required": None, "kv_pages_hit": None,
         "kv_pages_evicted": None, "hbm_admission_result": None,
         "hbm_occupancy_before": None, "hbm_occupancy_after": None,
-        "ground_prefix_cache_hit_ratio": None,
     },
     "outcome": {
         "completed": False, "uncompleted_stage": None,
@@ -72,10 +66,6 @@ _SECTION_DEFAULTS: dict[str, dict[str, Any]] = {
     },
 }
 
-_ALIASES = {
-    "action_type": ("decision", "action"),
-    "assigned_satellite_id": ("decision", "serving_satellite_id"),
-}
 _FIELD_SECTION = {
     key: section
     for section, defaults in _SECTION_DEFAULTS.items()
@@ -112,13 +102,10 @@ class RuntimeRequestRecord:
                 raise TypeError("provenance must be a mapping")
             sections["provenance"].update(detail_provenance)
         for key, value in values.items():
-            target = _ALIASES.get(key)
-            if target is None:
-                section_name = _FIELD_SECTION.get(key)
-                if section_name is None:
-                    raise TypeError(f"unexpected RuntimeRequestRecord field: {key}")
-                target = (section_name, key)
-            sections[target[0]][target[1]] = value
+            section_name = _FIELD_SECTION.get(key)
+            if section_name is None:
+                raise TypeError(f"unexpected RuntimeRequestRecord field: {key}")
+            sections[section_name][key] = value
 
         path = tuple(sections["routing"].get("selected_path") or ())
         if path:
@@ -149,9 +136,6 @@ class RuntimeRequestRecord:
             object.__setattr__(self, name, payload)
 
     def __getattr__(self, name: str) -> Any:
-        target = _ALIASES.get(name)
-        if target is not None:
-            return object.__getattribute__(self, target[0]).get(target[1])
         section_name = _FIELD_SECTION.get(name)
         if section_name is not None:
             return object.__getattribute__(self, section_name).get(name)
@@ -160,13 +144,10 @@ class RuntimeRequestRecord:
     def with_updates(self, **values: Any) -> "RuntimeRequestRecord":
         payload = self.to_dict()
         for key, value in values.items():
-            target = _ALIASES.get(key)
-            if target is None:
-                section_name = _FIELD_SECTION.get(key)
-                if section_name is None:
-                    raise TypeError(f"unexpected RuntimeRequestRecord field: {key}")
-                target = (section_name, key)
-            payload[target[0]][target[1]] = value
+            section_name = _FIELD_SECTION.get(key)
+            if section_name is None:
+                raise TypeError(f"unexpected RuntimeRequestRecord field: {key}")
+            payload[section_name][key] = value
         return RuntimeRequestRecord(**payload)
 
     def to_dict(self) -> dict[str, Any]:

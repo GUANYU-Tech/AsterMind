@@ -15,7 +15,7 @@ def _record(request_id: str, **overrides):
         "output_tokens": 4,
         "ttft_s": 1.0,
         "e2e_s": 4.0,
-        "assigned_satellite_id": "sat-01",
+        "serving_satellite_id": "sat-01",
         "compute_owner_satellite_id": "sat-01",
         "compute_owner_satellite_ids": ("sat-01",),
         "scope": "trace_backed_runtime_surrogate",
