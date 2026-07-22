@@ -17,7 +17,6 @@ REQUIRED_RUNTIME_ENERGY_WINDOW_FIELDS = (
     "compute_energy_j_per_token",
     "link_energy_j_per_byte",
     "soc_min",
-    "dvfs_scale",
     "energy_accounting_mode",
 )
 
@@ -198,7 +197,6 @@ def advance_satellite_energy(satellite_state: Any, trace_bundle: Any, to_s: floa
         satellite_state.soc = soc
         satellite_state.last_energy_update_s = to_s
         satellite_state.sunlit = bool(final_window.get("sunlit", True))
-        satellite_state.dvfs_scale = float(final_window.get("dvfs_scale", 1.0))
         satellite_state.energy_ledger = tuple(ledger)
         satellite_state.materialized_energy_event_ids = tuple(sorted(materialized_ids))
         return
@@ -236,7 +234,6 @@ def advance_satellite_energy(satellite_state: Any, trace_bundle: Any, to_s: floa
     satellite_state.soc = soc
     satellite_state.last_energy_update_s = to_s
     satellite_state.sunlit = bool(final_window.get("sunlit", True))
-    satellite_state.dvfs_scale = float(final_window.get("dvfs_scale", 1.0))
     satellite_state.energy_ledger = tuple(ledger)
     satellite_state.materialized_energy_event_ids = tuple(str(event["event_id"]) for event in events)
 
@@ -696,18 +693,6 @@ def _validate_runtime_energy_window(window: dict[str, Any], *, satellite_id: str
     ):
         _nonnegative_finite(window[field_name], field_name, satellite_id=satellite_id, time_s=time_s)
     _finite_fraction(window["soc_min"], "soc_min", satellite_id=satellite_id, time_s=time_s)
-    dvfs_scale = _positive_finite(
-        window["dvfs_scale"],
-        "dvfs_scale",
-        satellite_id=satellite_id,
-        time_s=time_s,
-    )
-    if dvfs_scale > 1.0:
-        raise _energy_value_error(
-            "dvfs_scale",
-            satellite_id=satellite_id,
-            time_s=time_s,
-        )
     _efficiency(window.get("battery_charge_efficiency", 1.0), "battery_charge_efficiency", satellite_id=satellite_id, time_s=time_s)
     _efficiency(window.get("battery_discharge_efficiency", 1.0), "battery_discharge_efficiency", satellite_id=satellite_id, time_s=time_s)
     if str(window["energy_accounting_mode"]) != "event_incremental_v1":

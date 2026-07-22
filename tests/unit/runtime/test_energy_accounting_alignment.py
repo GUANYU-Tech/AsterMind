@@ -20,7 +20,6 @@ def _window(**overrides):
         "start_s": 0.0,
         "end_s": 10.0,
         "sunlit": False,
-        "dvfs_scale": 1.0,
         "charge_rate_w": 0.0,
         "idle_power_w": 0.0,
         "compute_energy_j_per_token": 2.0,
@@ -37,7 +36,11 @@ def _window(**overrides):
 
 class EnergyAccountingAlignmentTests(unittest.TestCase):
     def test_shadow_dvfs_scales_capacity_without_double_scaling_token_energy(self):
-        strategy = type("Strategy", (), {"hard_gate_overrides": {}, "dvfs_modes_enabled": ("shadow_dvfs",)})()
+        strategy = type(
+            "Strategy",
+            (),
+            {"shadow_dvfs_enabled": True, "shadow_dvfs_scale": 0.5},
+        )()
 
         adjusted = _energy_window_for_runtime_action(
             _window(),

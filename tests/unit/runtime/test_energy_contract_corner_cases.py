@@ -139,8 +139,6 @@ class EnergyContractCornerCaseTests(unittest.TestCase):
             ("idle_power_w", float("nan")),
             ("compute_energy_j_per_token", float("inf")),
             ("soc_min", 1.1),
-            ("dvfs_scale", 0.0),
-            ("dvfs_scale", 1.1),
             ("battery_charge_efficiency", 0.0),
             ("battery_discharge_efficiency", 1.1),
             ("energy_accounting_mode", "bogus"),

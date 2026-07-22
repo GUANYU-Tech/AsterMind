@@ -497,6 +497,7 @@ def _evaluate_trace_request(
         action_type=action_type,
     )
     dvfs_scale = float(request_energy_window.get("dvfs_scale", 1.0))
+    satellite.dvfs_scale = dvfs_scale
     prefill_service_s = _safe_service_time(request["prompt_tokens"], prefill_rate_per_sat) / dvfs_scale
     decode_service_s = _safe_service_time(request["output_tokens"], decode_rate_per_sat) / dvfs_scale
     if not math.isfinite(prefill_service_s) or not math.isfinite(decode_service_s):
@@ -876,7 +877,7 @@ def _evaluate_trace_request(
             "predicted_energy_risk": selected.get("predicted_energy_risk"),
             "access_sunlit": selected.get("access_sunlit"),
             "compute_sunlit": _energy_window_sunlit(raw_request_energy_window),
-            "raw_dvfs_scale": raw_request_energy_window.get("dvfs_scale"),
+            "configured_shadow_dvfs_scale": runtime_strategy.shadow_dvfs_scale,
             "effective_dvfs_scale": request_energy_window.get("dvfs_scale"),
             "shadow_strategy": selected.get("shadow_strategy"),
             "shadow_triggered": _shadow_triggered(action_type, selected.get("access_energy_window"), raw_request_energy_window),
@@ -1376,7 +1377,7 @@ def _build_scheduler_candidates(
                 "path_id": route_plan.path_id,
                 "access_sunlit": _energy_window_sunlit(access_energy_window),
                 "compute_sunlit": _energy_window_sunlit(raw_request_energy_window),
-                "raw_dvfs_scale": raw_request_energy_window.get("dvfs_scale"),
+                "configured_shadow_dvfs_scale": runtime_strategy.shadow_dvfs_scale,
                 "effective_dvfs_scale": request_energy_window.get("dvfs_scale"),
                 "shadow_strategy": _shadow_strategy_label(action_type, raw_request_energy_window),
                 "shadow_triggered": _shadow_triggered(action_type, access_energy_window, raw_request_energy_window),
@@ -1431,7 +1432,8 @@ def _shadow_candidate_action_type(
 
 
 def _runtime_dvfs_enabled(runtime_strategy: Any, mode: str) -> bool:
-    return mode in {str(item) for item in tuple(getattr(runtime_strategy, "dvfs_modes_enabled", ()) or ())}
+    del mode
+    return bool(getattr(runtime_strategy, "shadow_dvfs_enabled", False))
 
 
 
@@ -1466,12 +1468,11 @@ def _energy_window_for_runtime_action(
     )
     adjusted["runtime_compute_energy_scale"] = 1.0
     adjusted["runtime_link_energy_scale"] = 1.0
+    adjusted["dvfs_scale"] = 1.0
     if _energy_window_sunlit(energy_window) is not False:
         return adjusted
-    overrides = _dict(getattr(runtime_strategy, "hard_gate_overrides", {}))
     if action_type == "shadow_dvfs":
-        dvfs_scale = _optional_float(overrides.get("shadow_dvfs_scale"))
-        effective_scale = dvfs_scale if dvfs_scale is not None else 0.5
+        effective_scale = float(getattr(runtime_strategy, "shadow_dvfs_scale", 0.5))
         if not 0.0 < effective_scale <= 1.0:
             raise ValueError("shadow_dvfs_scale must be in (0, 1]")
         adjusted["dvfs_scale"] = effective_scale
@@ -1480,8 +1481,6 @@ def _energy_window_for_runtime_action(
         # the per-token dynamic-energy coefficient, so that coefficient must
         # not be scaled a second time here.
         return adjusted
-    if not _runtime_dvfs_enabled(runtime_strategy, "shadow_dvfs"):
-        adjusted["dvfs_scale"] = 1.0
     adjusted["shadow_strategy"] = "shadow_local_compute" if action_type == "shadow_local_compute" else action_type
     return adjusted
 

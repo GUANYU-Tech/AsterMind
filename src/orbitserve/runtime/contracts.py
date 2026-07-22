@@ -166,7 +166,8 @@ def _strategy_defaults(policy: str) -> dict[str, Any]:
                 "reject_drop",
             ),
             "session_actions_enabled": ("none", "recompute_context"),
-            "dvfs_modes_enabled": ("shadow_dvfs",),
+            "shadow_dvfs_enabled": True,
+            "shadow_dvfs_scale": 0.5,
             "path_policy": "energy_aware",
             "queue_policy": "fifo",
             "fallback_enabled": False,
@@ -192,7 +193,8 @@ def _strategy_defaults(policy: str) -> dict[str, Any]:
                 "recompute_context",
                 "evict_session",
             ),
-            "dvfs_modes_enabled": ("shadow_dvfs",),
+            "shadow_dvfs_enabled": True,
+            "shadow_dvfs_scale": 0.5,
             "path_policy": "k_shortest_score",
             "queue_policy": "least_slack_first",
             "fallback_enabled": False,
@@ -213,7 +215,8 @@ class RuntimeStrategySpec:
     policy_family: str = "orbitserve"
     enabled_actions: tuple[str, ...] = ()
     session_actions_enabled: tuple[str, ...] = ()
-    dvfs_modes_enabled: tuple[str, ...] = ()
+    shadow_dvfs_enabled: bool = False
+    shadow_dvfs_scale: float = 0.5
     lookahead_orbits: float | None = 1.0
     h_lookahead_s: float | None = None
     max_hop_count: int | None = None
@@ -230,6 +233,10 @@ class RuntimeStrategySpec:
     random_seed: int | None = None
     trace_level: str = "summary"
     provenance: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not 0.0 < float(self.shadow_dvfs_scale) <= 1.0:
+            raise ValueError("shadow_dvfs_scale must be in (0, 1]")
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "RuntimeStrategySpec":
@@ -261,11 +268,8 @@ class RuntimeStrategySpec:
                 "session_actions_enabled",
                 tuple(defaults["session_actions_enabled"]),
             ),
-            dvfs_modes_enabled=_string_tuple_or_default(
-                data,
-                "dvfs_modes_enabled",
-                tuple(defaults.get("dvfs_modes_enabled", ())),
-            ),
+            shadow_dvfs_enabled=bool(data.get("shadow_dvfs_enabled", defaults.get("shadow_dvfs_enabled", False))),
+            shadow_dvfs_scale=float(data.get("shadow_dvfs_scale", defaults.get("shadow_dvfs_scale", 0.5))),
             lookahead_orbits=_optional_float(data.get("lookahead_orbits", 1.0)),
             h_lookahead_s=_optional_float(data.get("h_lookahead_s", data.get("H_lookahead"))),
             max_hop_count=_optional_int(data.get("max_hop_count", defaults.get("max_hop_count"))),
