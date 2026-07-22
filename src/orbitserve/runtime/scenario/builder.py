@@ -12,7 +12,6 @@ from ..contracts import (
     RUNTIME_PERFORMANCE_DOC,
     ServingDeploymentView,
 )
-from .runtime_energy_profile import derive_runtime_energy_profile
 from .model import RuntimeScenario
 
 
@@ -28,7 +27,7 @@ def build_runtime_scenario(
     serving_throughput: Any = None,
     simulation_result: Any = None,
     simulation_config: Any = None,
-    cost_result: Any = None,
+    energy_profile: Any = None,
     scheduler_spec: Any = None,
     hardware: Any = None,
     resolved_hardware: Any = None,
@@ -39,7 +38,7 @@ def build_runtime_scenario(
     workload_spec_payload = _mapping_from_result(workload_spec)
     simulation_payload = _mapping_from_result(simulation_result)
     simulation_config_payload = _mapping_from_result(simulation_config)
-    cost_payload = _mapping_from_result(cost_result)
+    energy_profile_payload = _mapping_from_result(energy_profile)
     constellation_payload = _mapping_from_result(constellation)
     architecture_payload = _mapping_from_result(constellation_architecture)
     resolved_hardware_payload = _mapping_from_result(resolved_hardware)
@@ -126,19 +125,13 @@ def build_runtime_scenario(
         "scope": trace_manifest.get("scope"),
         "valid_for_paper_main_results": bool(trace_manifest.get("valid_for_paper_main_results", False)),
     }
-    runtime_energy_profile = derive_runtime_energy_profile(
-        cost_result,
-        resolved_hardware=resolved_hardware,
-        base_trace_options=simulation_config_payload.get("trace_options", {}),
-    )
     scenario_warnings = tuple(
         dict.fromkeys(
             (
                 *warnings,
                 *_warnings_from_payload(workload_payload),
                 *_warnings_from_payload(simulation_payload),
-                *_warnings_from_payload(cost_payload),
-                *runtime_energy_profile.warnings,
+                *_warnings_from_payload(energy_profile_payload),
                 *serving_profile.warnings,
             )
         )
@@ -161,7 +154,7 @@ def build_runtime_scenario(
             **({"satellite_catalog": list(satellite_catalog)} if satellite_catalog else {}),
         },
         serving_profile=serving_profile,
-        energy_profile=runtime_energy_profile.to_dict(),
+        energy_profile=energy_profile_payload,
         provenance={
             "workload_bundle": {
                 "bundle_dir": workload_bundle["bundle_dir"],
@@ -179,7 +172,7 @@ def build_runtime_scenario(
                 "estimate_schema": "ServingThroughputEstimate",
             },
             "hardware_config": resolved_hardware_payload or hardware_payload,
-            "energy_profile": runtime_energy_profile.provenance,
+            "energy_profile": _dict(energy_profile_payload.get("provenance")),
             "runtime_interface_doc": RUNTIME_INTERFACE_DOC,
             "runtime_performance_model_doc": RUNTIME_PERFORMANCE_DOC,
         },

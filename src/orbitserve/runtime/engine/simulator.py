@@ -2696,10 +2696,14 @@ def _trace_bundle_with_scenario_energy(trace_bundle: Any, scenario: Any) -> Any:
     """Overlay static scenario energy parameters onto Orbit sunlight windows."""
 
     profile = getattr(scenario, "energy_profile", {}) or {}
-    if not isinstance(profile, dict) or not bool(profile.get("evaluated", False)):
+    if not isinstance(profile, dict) or profile.get("evaluated") is False:
         return trace_bundle
-    fields = profile.get("trace_options") or {}
-    if not isinstance(fields, dict) or not fields:
+    fields = {
+        key: value
+        for key, value in profile.items()
+        if key not in {"evaluated", "provenance", "warnings"}
+    }
+    if not fields:
         return trace_bundle
     windows = tuple(
         {**dict(window), **fields}
