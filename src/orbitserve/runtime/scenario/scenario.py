@@ -10,7 +10,6 @@ from ...common import to_jsonable
 from ..contracts import (
     RUNTIME_INTERFACE_DOC,
     RUNTIME_PERFORMANCE_DOC,
-    RUNTIME_OPTIMIZATION_DOC,
     RuntimeStrategySpec,
     ServingDeploymentView,
 )
@@ -198,7 +197,6 @@ def build_runtime_scenario(
             "energy_profile": runtime_energy_profile.provenance,
             "runtime_interface_doc": RUNTIME_INTERFACE_DOC,
             "runtime_performance_model_doc": RUNTIME_PERFORMANCE_DOC,
-            "runtime_optimization_model_doc": RUNTIME_OPTIMIZATION_DOC,
         },
         warnings=scenario_warnings,
     )

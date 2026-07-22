@@ -7,7 +7,6 @@ from typing import Any
 from .contracts import (
     RUNTIME_INTERFACE_DOC,
     RUNTIME_PERFORMANCE_DOC,
-    RUNTIME_OPTIMIZATION_DOC,
     RUNTIME_RESULT_FIELDS,
     RuntimePerformanceResult,
     RuntimeStrategySpec,
@@ -160,7 +159,6 @@ def evaluate_runtime_performance(
             "runtime_performance_schema": "orbitserve.runtime_performance.v1",
             "runtime_interface_doc": RUNTIME_INTERFACE_DOC,
             "runtime_performance_model_doc": RUNTIME_PERFORMANCE_DOC,
-            "runtime_optimization_model_doc": RUNTIME_OPTIMIZATION_DOC,
         },
         warnings=tuple(dict.fromkeys(warnings)),
     )

@@ -90,13 +90,12 @@ class CircularGeometryTraceManifestTests(unittest.TestCase):
                 replace(spec, simulation=replace(spec.simulation, trace_output_dir=tmpdir))
             ).to_dict()
         runtime = payload["performance"]["details"]["runtime"]
-        optimizer = payload["performance"]["details"]["runtime_optimization"]
         self.assertTrue(payload["cost"]["evaluated"])
         self.assertTrue(payload["performance"]["evaluated"])
         self.assertEqual(runtime["provenance"]["simulation_trace"]["trace_model"], CIRCULAR_TRACE_MODEL)
         self.assertFalse(runtime["valid_for_paper_main_results"])
-        self.assertTrue(optimizer["closed_loop_evaluated"])
-        self.assertIsNotNone(optimizer["selected_strategy"])
+        self.assertNotIn("runtime_optimization", payload["performance"]["details"])
+        self.assertEqual(payload["module_status"]["runtime_performance"], "evaluated")
         self.assertIn("valid_for_paper_main_results=false", " ".join(payload["warnings"]))
 
     def test_cli_smoke_path_writes_json_without_runtime_promotion(self):

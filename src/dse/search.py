@@ -100,7 +100,6 @@ class DSERuntimeMatrixSpec:
     candidate_schedulers: tuple[dict[str, Any], ...] = ()
     ground_config: dict[str, Any] = field(default_factory=dict)
     kv_policy_candidates: tuple[dict[str, Any], ...] = ()
-    placement_scope_candidates: tuple[dict[str, Any], ...] = ()
     static_screening: dict[str, Any] = field(default_factory=dict)
     closed_loop: dict[str, Any] = field(default_factory=dict)
     allow_preliminary_runtime_metrics: bool = False
@@ -132,7 +131,6 @@ class DSERuntimeMatrixSpec:
             ),
             ground_config=dict(data.get("ground_config") or {}),
             kv_policy_candidates=_kv_policy_candidates_from_dict(data),
-            placement_scope_candidates=_placement_scope_candidates_from_dict(data),
             static_screening=dict(
                 data.get("static_screening")
                 or data.get("static_to_runtime")
@@ -152,67 +150,6 @@ class DSERuntimeMatrixSpec:
 
     def to_dict(self) -> dict[str, Any]:
         return to_jsonable(self)
-
-
-def _placement_scope_candidates_from_dict(data: dict[str, Any]) -> tuple[dict[str, Any], ...]:
-    raw_candidates = (
-        data.get("placement_scope_candidates")
-        or data.get("scope_candidates")
-        or data.get("pd_placement_scope_candidates")
-        or data.get("pd_scope_candidates")
-        or data.get("placement_scopes")
-        or dict(data.get("placement_scope_search_space") or {}).get("scope_candidates")
-        or ()
-    )
-    candidates: list[dict[str, Any]] = []
-    for item in raw_candidates:
-        if isinstance(item, str):
-            candidates.append(
-                {
-                    "strategy_id": item,
-                    "pd_placement": {"placement_scope": item},
-                }
-            )
-            continue
-        if not isinstance(item, dict):
-            continue
-        payload = dict(item)
-        pd_placement = dict(payload.get("pd_placement") or {})
-        placement_scope = payload.get("placement_scope") or payload.get("pd_placement_scope")
-        if placement_scope is not None:
-            pd_placement.setdefault("placement_scope", placement_scope)
-        for key in (
-            "explicit_pairs",
-            "pairs",
-            "hybrid_template",
-            "template",
-            "hybrid_template_name",
-            "max_pairs_per_prefill",
-            "max_pairs_per_prefill_group",
-            "max_pair_count",
-            "max_cross_plane_pairs_per_prefill",
-            "max_cross_plane_pairs_per_prefill_group",
-            "fail_closed_on_unsupported_scope",
-        ):
-            if key in payload and key not in pd_placement:
-                pd_placement[key] = payload[key]
-        if not pd_placement:
-            continue
-        strategy_id = str(
-            payload.get("strategy_id")
-            or payload.get("placement_scope_strategy_id")
-            or pd_placement.get("placement_scope")
-            or f"pd_scope_{len(candidates)}"
-        )
-        candidates.append(
-            {
-                **payload,
-                "strategy_id": strategy_id,
-                "placement_scope_strategy_id": strategy_id,
-                "pd_placement": pd_placement,
-            }
-        )
-    return tuple(candidates)
 
 
 def _kv_policy_candidates_from_dict(data: dict[str, Any]) -> tuple[dict[str, Any], ...]:

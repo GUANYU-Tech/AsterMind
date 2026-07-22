@@ -496,8 +496,10 @@ KNOWN_POLICIES = {
 
 
 def get_scheduler(
-    policy_or_spec: str | RuntimeStrategySpec | dict[str, Any] | Any = "orbitserve",
+    policy_or_spec: str | RuntimeStrategySpec | dict[str, Any] = "orbitserve",
 ) -> RuntimeScheduler:
+    if not isinstance(policy_or_spec, (str, RuntimeStrategySpec, dict)):
+        raise TypeError("scheduler value must be a policy string, RuntimeStrategySpec, or mapping")
     spec = RuntimeStrategySpec.from_value(
         {"policy": policy_or_spec} if isinstance(policy_or_spec, str) else policy_or_spec
     )

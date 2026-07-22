@@ -12,7 +12,7 @@ from orbitserve.experiments.design_evaluation import evaluate_materialized_desig
 from orbitserve.dse.search import DSEStudyResult, run_dse
 from orbitserve.common import SLOMetrics
 from orbitserve.dse.satellite_budget import analyze_communication_window_satellite_budget
-from orbitserve.orbit import normalize_trace_scope
+from orbitserve.orbit import TRACE_BACKED_RUNTIME_SURROGATE_SCOPE, normalize_trace_scope
 
 try:
     from orbitserve.workload import materialize_workload_bundle
@@ -306,7 +306,7 @@ def _performance_with_runtime_metrics(performance: Any, runtime_performance: Any
         if runtime_scope == TRACE_BACKED_RUNTIME_SURROGATE_SCOPE
         else "top-level performance contains circular geometry trace-backed preliminary surrogate metrics"
         if runtime_scope == "geometry_trace_surrogate"
-        else "top-level performance contains idealized compute-only runtime metrics"
+        else "top-level performance contains preliminary runtime metrics"
     )
     warnings = tuple(
         dict.fromkeys(

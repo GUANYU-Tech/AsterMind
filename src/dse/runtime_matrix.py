@@ -38,16 +38,6 @@ class DSERuntimeMatrixRow:
     static_e2e_p95_s: float | None
     static_ttft_p95_s: float | None
     static_annualized_cost_usd_per_year: float | None
-    placement_scope_strategy_id: str | None
-    pd_placement_scope: str | None
-    pd_pairing_rule: str | None
-    pd_scope_candidate_count: int | None
-    pd_pair_candidate_count: int | None
-    serving_satellite_budget_count: int | None
-    satellite_budget_mode: str | None
-    comparison_group_id: str | None
-    prefill_pool_satellites: int | None
-    decode_pool_satellites: int | None
     kv_policy_id: str | None
     kv_serve_actions_enabled: tuple[str, ...]
     kv_post_turn_actions_enabled: tuple[str, ...]
@@ -58,9 +48,6 @@ class DSERuntimeMatrixRow:
     eviction_policy: str | None
     kv_hbm_model: str | None
     kv_transfer_model: str | None
-    catalog_rebuilt: bool
-    catalog_builder: str | None
-    catalog_warnings: tuple[str, ...]
     scheduler: dict[str, Any]
     runtime_evaluated: bool
     objective_score: float | None
@@ -109,12 +96,10 @@ class DSERuntimeMatrixResult:
     analysis_scope: str = "not_evaluated"
     design_count: int = 0
     policy_count: int = 0
-    placement_scope_candidate_count: int = 0
     row_count: int = 0
     matrix_rows: tuple[DSERuntimeMatrixRow, ...] = ()
     selected_rows: tuple[dict[str, Any], ...] = ()
     selected_by_design: dict[str, dict[str, Any]] = field(default_factory=dict)
-    selected_scope_by_design: dict[str, dict[str, Any]] = field(default_factory=dict)
     pareto_table: tuple[dict[str, Any], ...] = ()
     metrics: DSEMetrics = field(default_factory=DSEMetrics)
     static_screening: dict[str, Any] = field(default_factory=dict)
@@ -174,7 +159,6 @@ def evaluate_runtime_matrix(
         ignore_optional_cost=ignore_optional_cost,
     )
     draft_rows: list[DSERuntimeMatrixRow] = []
-    scope_candidates = _placement_scope_candidates(spec)
     candidate_cache = {
         context.design_id: _candidate_schedulers(context, spec)
         for context in context_tuple
@@ -226,12 +210,8 @@ def evaluate_runtime_matrix(
         row = _matrix_row_from_runtime_result(
             context=reference_context,
             strategy_id=f"terrestrial_reference::{base_strategy_id}",
-            placement_scope_strategy_id=None,
-            scope_candidate={"current_scope": True, "terrestrial_reference": True},
-            scope_candidate_count=0,
             static_info={},
             static_screen_reason="not_applicable_terrestrial_reference",
-            catalog_preview=None,
             scheduler={**strategy.to_dict(), "kv_policy_id": None},
             runtime_result=runtime_result,
             scoring=scoring,
@@ -251,38 +231,29 @@ def evaluate_runtime_matrix(
             for candidate in candidate_cache.get(context.design_id, ())
             if not _is_terrestrial_policy(candidate.get("policy"))
         )
-        for scope_candidate in scope_candidates:
-            scoped_scenario = _runtime_scenario_for_scope_candidate(context.runtime_scenario, scope_candidate)
-            scope_strategy_id = _optional_str(scope_candidate.get("strategy_id"))
-            catalog_preview = None
-            for scheduler in candidates:
-                scheduler_payload = dict(scheduler)
-                base_strategy_id = str(scheduler_payload.pop("strategy_id"))
-                strategy_id = _matrix_strategy_id(base_strategy_id, scope_strategy_id, scope_candidate)
-                strategy = RuntimeStrategySpec.from_dict(scheduler_payload)
-                full_runtime_result = evaluate_runtime_performance(scoped_scenario, strategy)
-                runtime_result = _runtime_result_with_cost_efficiency(
-                    _compact_runtime_result(full_runtime_result),
-                    context=context,
-                    scheduler=scheduler_payload,
-                )
-                scoring = score_runtime_evaluator_result(runtime_result, objective)
-                row = _matrix_row_from_runtime_result(
-                    context=context,
-                    strategy_id=strategy_id,
-                    placement_scope_strategy_id=scope_strategy_id,
-                    scope_candidate=scope_candidate,
-                    scope_candidate_count=len(scope_candidates),
-                    static_info=static_infos.get(context.design_id, {}),
-                    static_screen_reason=_optional_str(
-                        _mapping_from_value(screening.get("selection_reasons")).get(context.design_id)
-                    ),
-                    catalog_preview=catalog_preview,
-                    scheduler={**strategy.to_dict(), "kv_policy_id": scheduler_payload.get("kv_policy_id")},
-                    runtime_result=runtime_result,
-                    scoring=scoring,
-                )
-                draft_rows.append(row)
+        for scheduler in candidates:
+            scheduler_payload = dict(scheduler)
+            strategy_id = str(scheduler_payload.pop("strategy_id"))
+            strategy = RuntimeStrategySpec.from_dict(scheduler_payload)
+            full_runtime_result = evaluate_runtime_performance(context.runtime_scenario, strategy)
+            runtime_result = _runtime_result_with_cost_efficiency(
+                _compact_runtime_result(full_runtime_result),
+                context=context,
+                scheduler=scheduler_payload,
+            )
+            scoring = score_runtime_evaluator_result(runtime_result, objective)
+            row = _matrix_row_from_runtime_result(
+                context=context,
+                strategy_id=strategy_id,
+                static_info=static_infos.get(context.design_id, {}),
+                static_screen_reason=_optional_str(
+                    _mapping_from_value(screening.get("selection_reasons")).get(context.design_id)
+                ),
+                scheduler={**strategy.to_dict(), "kv_policy_id": scheduler_payload.get("kv_policy_id")},
+                runtime_result=runtime_result,
+                scoring=scoring,
+            )
+            draft_rows.append(row)
     context_by_design = {context.design_id: context for context in context_tuple}
     for skipped in tuple(screening.get("skipped_designs", ()) or ()):
         skipped_payload = _mapping_from_value(skipped)
@@ -309,14 +280,6 @@ def evaluate_runtime_matrix(
     )
     selected_rows = tuple(row.to_dict() for row in rows if row.selected)
     selected_by_design = {row["design_id"]: row for row in selected_rows}
-    selected_scope_by_design = {
-        row["design_id"]: {
-            "placement_scope_strategy_id": row.get("placement_scope_strategy_id"),
-            "pd_placement_scope": row.get("pd_placement_scope"),
-            "pd_pairing_rule": row.get("pd_pairing_rule"),
-        }
-        for row in selected_rows
-    }
     pareto_table = tuple(
         _pareto_payload(row)
         for row in rows
@@ -349,12 +312,10 @@ def evaluate_runtime_matrix(
         analysis_scope="preliminary_model" if allow_preliminary else "strict_unscored",
         design_count=len(context_tuple),
         policy_count=len(policy_ids),
-        placement_scope_candidate_count=len(scope_candidates),
         row_count=len(rows),
         matrix_rows=rows,
         selected_rows=selected_rows,
         selected_by_design=selected_by_design,
-        selected_scope_by_design=selected_scope_by_design,
         pareto_table=pareto_table,
         metrics=matrix_metrics,
         static_screening=_static_screening_payload(screening, static_infos),
@@ -909,96 +870,6 @@ def _append_candidate(
     candidates.append(to_jsonable(candidate))
 
 
-def _placement_scope_candidates(spec: Any) -> tuple[dict[str, Any], ...]:
-    raw_candidates = tuple(
-        getattr(spec, "placement_scope_candidates", ())
-        or getattr(spec, "scope_candidates", ())
-        or _mapping_from_value(getattr(spec, "placement_scope_search_space", None)).get("scope_candidates", ())
-        or ()
-    )
-    if not raw_candidates:
-        return ({"strategy_id": None, "pd_placement": None, "current_scope": True},)
-    candidates: list[dict[str, Any]] = []
-    for index, raw_candidate in enumerate(raw_candidates):
-        payload = _mapping_from_value(raw_candidate)
-        pd_placement = _mapping_from_value(payload.get("pd_placement"))
-        placement_scope = _optional_str(payload.get("placement_scope") or payload.get("pd_placement_scope"))
-        if placement_scope is not None:
-            pd_placement.setdefault("placement_scope", placement_scope)
-        for key in (
-            "explicit_pairs",
-            "pairs",
-            "hybrid_template",
-            "template",
-            "hybrid_template_name",
-            "max_pairs_per_prefill",
-            "max_pairs_per_prefill_group",
-            "max_pair_count",
-            "max_cross_plane_pairs_per_prefill",
-            "max_cross_plane_pairs_per_prefill_group",
-            "fail_closed_on_unsupported_scope",
-        ):
-            if key in payload and key not in pd_placement:
-                pd_placement[key] = payload[key]
-        if not pd_placement:
-            continue
-        strategy_id = (
-            _optional_str(payload.get("strategy_id"))
-            or _optional_str(payload.get("placement_scope_strategy_id"))
-            or _optional_str(pd_placement.get("placement_scope"))
-            or f"pd_scope_{index}"
-        )
-        candidates.append(
-            to_jsonable(
-                {
-                    **payload,
-                    "strategy_id": strategy_id,
-                    "placement_scope_strategy_id": strategy_id,
-                    "pd_placement": pd_placement,
-                    "current_scope": False,
-                }
-            )
-        )
-    return tuple(candidates) or ({"strategy_id": None, "pd_placement": None, "current_scope": True},)
-
-
-def _runtime_scenario_for_scope_candidate(runtime_scenario: Any, scope_candidate: Mapping[str, Any]) -> Any:
-    pd_placement = _mapping_from_value(scope_candidate.get("pd_placement"))
-    if not pd_placement:
-        return runtime_scenario
-    deployments = tuple(
-        _deployment_with_pd_placement(deployment, pd_placement=pd_placement)
-        for deployment in tuple(getattr(runtime_scenario, "serving_deployments", ()) or ())
-    )
-    provenance = {
-        **_mapping_from_value(getattr(runtime_scenario, "provenance", {})),
-        "runtime_matrix_scope_candidate": {
-            "strategy_id": scope_candidate.get("strategy_id"),
-            "pd_placement": pd_placement,
-            "catalog_rebuild_required": True,
-        },
-    }
-    try:
-        return replace(
-            runtime_scenario,
-            scenario_id=f"{getattr(runtime_scenario, 'scenario_id', 'runtime_scenario')}:{scope_candidate.get('strategy_id')}",
-            serving_deployments=deployments,
-            provenance=provenance,
-        )
-    except TypeError:
-        pass
-    if hasattr(runtime_scenario, "__dict__"):
-        attrs = dict(vars(runtime_scenario))
-        attrs["scenario_id"] = f"{getattr(runtime_scenario, 'scenario_id', 'runtime_scenario')}:{scope_candidate.get('strategy_id')}"
-        attrs["serving_deployments"] = deployments
-        attrs["provenance"] = provenance
-        try:
-            return type(runtime_scenario)(**attrs)
-        except TypeError:
-            pass
-    return runtime_scenario
-
-
 def _terrestrial_reference_context(
     context: DSEDesignContext, *, policy: str
 ) -> DSEDesignContext:
@@ -1013,7 +884,7 @@ def _terrestrial_reference_context(
         "scenario_id": f"terrestrial_reference:{policy}",
         "design_id": None,
         "constellation": {},
-        "serving_deployments": (),
+        "serving_profile": None,
         "cost_power": {},
         "simulation_trace_ref": {},
         "provenance": provenance,
@@ -1051,52 +922,6 @@ def _terrestrial_workload_fingerprint(runtime_scenario: Any) -> str:
         to_jsonable(payload), sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
-
-
-def _deployment_with_pd_placement(deployment: Any, *, pd_placement: dict[str, Any]) -> Any:
-    serving_payload = _mapping_from_value(getattr(deployment, "serving_spec", None))
-    throughput_payload = _mapping_from_value(getattr(deployment, "throughput_estimate", None))
-    if not serving_payload and isinstance(deployment, Mapping):
-        serving_payload = _mapping_from_value(deployment.get("serving_spec"))
-    if not throughput_payload and isinstance(deployment, Mapping):
-        throughput_payload = _mapping_from_value(deployment.get("throughput_estimate"))
-    serving_payload = {**serving_payload, "pd_placement": pd_placement}
-    throughput_payload = {
-        **throughput_payload,
-        "pd_placement": pd_placement,
-        "pd_placement_scope": pd_placement.get("placement_scope"),
-    }
-    if hasattr(deployment, "to_dict") and hasattr(deployment, "serving_spec"):
-        try:
-            return replace(
-                deployment,
-                serving_spec=serving_payload,
-                throughput_estimate=throughput_payload,
-            )
-        except TypeError:
-            pass
-    if hasattr(deployment, "__dict__"):
-        attrs = dict(vars(deployment))
-        attrs["serving_spec"] = serving_payload
-        attrs["throughput_estimate"] = throughput_payload
-        try:
-            return type(deployment)(**attrs)
-        except TypeError:
-            pass
-    payload = _mapping_from_value(deployment)
-    return {
-        **payload,
-        "serving_spec": serving_payload,
-        "throughput_estimate": throughput_payload,
-        "pd_placement": pd_placement,
-        "pd_placement_scope": pd_placement.get("placement_scope"),
-    }
-
-
-def _matrix_strategy_id(base_strategy_id: str, scope_strategy_id: str | None, scope_candidate: Mapping[str, Any]) -> str:
-    if bool(scope_candidate.get("current_scope", False)) or scope_strategy_id is None:
-        return base_strategy_id
-    return f"{scope_strategy_id}::{base_strategy_id}"
 
 
 def _runtime_result_with_cost_efficiency(
@@ -1162,6 +987,8 @@ def _runtime_result_with_cost_efficiency(
 
     slo = {
         **_mapping_from_value(runtime_result.get("slo")),
+        "completion_ratio": runtime_metrics.get("completion_ratio"),
+        "uncompleted_ratio": runtime_metrics.get("uncompleted_ratio"),
         "cost_per_served_request_usd": runtime_metrics.get("cost_per_served_request_usd"),
         "cost_per_served_mtoken_usd": runtime_metrics.get("cost_per_served_mtoken_usd"),
     }
@@ -1240,12 +1067,8 @@ def _matrix_row_from_runtime_result(
     *,
     context: DSEDesignContext,
     strategy_id: str,
-    placement_scope_strategy_id: str | None,
-    scope_candidate: Mapping[str, Any],
-    scope_candidate_count: int,
     static_info: Mapping[str, Any],
     static_screen_reason: str | None,
-    catalog_preview: Any,
     scheduler: dict[str, Any],
     runtime_result: dict[str, Any],
     scoring: dict[str, Any],
@@ -1254,29 +1077,6 @@ def _matrix_row_from_runtime_result(
     performance = _mapping_from_value(runtime_result.get("performance"))
     slo = _mapping_from_value(runtime_result.get("slo"))
     terrestrial_baseline = _is_terrestrial_policy(str(scheduler.get("policy", "")))
-    pd_scope, pairing_rule = (
-        (None, None)
-        if terrestrial_baseline
-        else _pd_scope_from_runtime_result(runtime_result, scope_candidate, catalog_preview)
-    )
-    pair_candidate_count = None if terrestrial_baseline else _pd_pair_candidate_count(catalog_preview)
-    satellite_budget = (
-        {}
-        if terrestrial_baseline
-        else _satellite_budget_from_matrix_inputs(
-            context=context,
-            runtime_result=runtime_result,
-            catalog_preview=catalog_preview,
-        )
-    )
-    catalog_warnings = (
-        () if terrestrial_baseline else tuple(getattr(catalog_preview, "warnings", ()) or ())
-    )
-    catalog_fail_closed = (
-        False
-        if terrestrial_baseline
-        else bool(getattr(catalog_preview, "provenance", {}).get("fail_closed"))
-    )
     cost_payload = _mapping_from_value(context.cost_result)
     single_satellite_cost = _mapping_from_value(cost_payload.get("single_satellite"))
     cost_feasible = single_satellite_cost.get("feasible")
@@ -1290,8 +1090,6 @@ def _matrix_row_from_runtime_result(
         dict.fromkeys(
             (
                 *_string_tuple(runtime_result.get("warnings")),
-                *catalog_warnings,
-                *(("pd_scope_candidate_catalog_fail_closed",) if catalog_fail_closed else ()),
                 *_string_tuple(scoring.get("warnings")),
             )
         )
@@ -1310,16 +1108,6 @@ def _matrix_row_from_runtime_result(
         static_e2e_p95_s=_optional_float(static_info.get("e2e_p95_s")),
         static_ttft_p95_s=_optional_float(static_info.get("ttft_p95_s")),
         static_annualized_cost_usd_per_year=_optional_float(static_info.get("annualized_cost_usd_per_year")),
-        placement_scope_strategy_id=placement_scope_strategy_id,
-        pd_placement_scope=pd_scope,
-        pd_pairing_rule=pairing_rule,
-        pd_scope_candidate_count=scope_candidate_count,
-        pd_pair_candidate_count=pair_candidate_count,
-        serving_satellite_budget_count=_optional_int(satellite_budget.get("serving_satellite_budget_count")),
-        satellite_budget_mode=_optional_str(satellite_budget.get("satellite_budget_mode")),
-        comparison_group_id=_optional_str(satellite_budget.get("comparison_group_id")),
-        prefill_pool_satellites=_optional_int(satellite_budget.get("prefill_pool_satellites")),
-        decode_pool_satellites=_optional_int(satellite_budget.get("decode_pool_satellites")),
         kv_policy_id=kv_policy_id,
         kv_serve_actions_enabled=_string_tuple(kv_policy.get("kv_serve_actions_enabled")),
         kv_post_turn_actions_enabled=_string_tuple(kv_policy.get("kv_post_turn_actions_enabled")),
@@ -1330,30 +1118,21 @@ def _matrix_row_from_runtime_result(
         eviction_policy=_optional_str(kv_policy.get("eviction_policy")),
         kv_hbm_model=_optional_str(kv_policy.get("hbm_model")),
         kv_transfer_model="page_chunk_store_and_forward" if kv_policy.get("kv_transfer_chunk_bytes") is not None else None,
-        catalog_rebuilt=not terrestrial_baseline,
-        catalog_builder=(
-            None
-            if terrestrial_baseline
-            else "orbitserve.runtime_deployments.build_runtime_deployment_catalog"
-        ),
-        catalog_warnings=catalog_warnings,
         scheduler=scheduler,
-        runtime_evaluated=bool(runtime_result.get("evaluated", False)) and not catalog_fail_closed,
+        runtime_evaluated=bool(runtime_result.get("evaluated", False)),
         objective_score=(
-            None
-            if catalog_fail_closed or cost_feasible is False
-            else _optional_float(scoring.get("objective_score"))
+            None if cost_feasible is False else _optional_float(scoring.get("objective_score"))
         ),
         selected=False,
         pareto_member=False,
         objective_score_scope=(
             None
-            if catalog_fail_closed or cost_feasible is False
+            if cost_feasible is False
             else _optional_str(scoring.get("objective_score_scope"))
         ),
         valid_for_paper_main_results=(
             False
-            if catalog_fail_closed or cost_feasible is False
+            if cost_feasible is False
             else bool(scoring.get("valid_for_paper_main_results", False))
         ),
         cost_total_usd=(
@@ -1370,8 +1149,8 @@ def _matrix_row_from_runtime_result(
             if terrestrial_baseline
             else _optional_float(cost_payload.get("annualized_cost_usd_per_year"))
         ),
-        served_ratio=_optional_float(_first_present(slo.get("served_ratio"), runtime_metrics.get("served_ratio"))),
-        leo_served_ratio=_optional_float(runtime_metrics.get("leo_served_ratio")),
+        served_ratio=_optional_float(_first_present(slo.get("completion_ratio"), runtime_metrics.get("completion_ratio"))),
+        leo_served_ratio=_optional_float(runtime_metrics.get("leo_completion_ratio")),
         rejected_ratio=_optional_float(_first_present(slo.get("rejected_ratio"), runtime_metrics.get("rejected_ratio"))),
         timeout_ratio=_optional_float(_first_present(slo.get("timeout_ratio"), runtime_metrics.get("timeout_ratio"))),
         ttft_p95_s=_optional_float(
@@ -1418,25 +1197,10 @@ def _matrix_row_from_runtime_result(
         provenance={
             "design_id": context.design_id,
             "strategy_id": strategy_id,
-            "placement_scope_strategy_id": placement_scope_strategy_id,
-            "pd_placement_scope": pd_scope,
-            "pd_pairing_rule": pairing_rule,
-            "satellite_budget": satellite_budget,
             "kv_policy_id": kv_policy_id,
             "kv_policy": kv_policy,
-            "pd_scope_candidate_count": scope_candidate_count,
-            "pd_pair_candidate_count": pair_candidate_count,
-            "catalog_fail_closed": catalog_fail_closed,
             "cost_feasible": cost_feasible,
             "comparison_domain": "terrestrial_reference" if terrestrial_baseline else "leo_co_design",
-            "catalog_rebuilt": not terrestrial_baseline,
-            "catalog_builder": (
-                None
-                if terrestrial_baseline
-                else "orbitserve.runtime_deployments.build_runtime_deployment_catalog"
-            ),
-            "catalog_warnings": catalog_warnings,
-            "scope_candidate": to_jsonable(scope_candidate),
             "runtime_evaluator": "orbitserve.runtime.evaluate_runtime_performance",
             "scorer": "orbitserve.dse.runtime_optimization.score_runtime_evaluator_result",
             "objective_score_scope": scoring.get("objective_score_scope"),
@@ -1468,16 +1232,6 @@ def _skipped_matrix_row(
         static_e2e_p95_s=_optional_float(static_info.get("e2e_p95_s")),
         static_ttft_p95_s=_optional_float(static_info.get("ttft_p95_s")),
         static_annualized_cost_usd_per_year=_optional_float(static_info.get("annualized_cost_usd_per_year")),
-        placement_scope_strategy_id=None,
-        pd_placement_scope=None,
-        pd_pairing_rule=None,
-        pd_scope_candidate_count=None,
-        pd_pair_candidate_count=None,
-        serving_satellite_budget_count=None,
-        satellite_budget_mode=None,
-        comparison_group_id=None,
-        prefill_pool_satellites=None,
-        decode_pool_satellites=None,
         kv_policy_id=None,
         kv_serve_actions_enabled=(),
         kv_post_turn_actions_enabled=(),
@@ -1488,9 +1242,6 @@ def _skipped_matrix_row(
         eviction_policy=None,
         kv_hbm_model=None,
         kv_transfer_model=None,
-        catalog_rebuilt=False,
-        catalog_builder=None,
-        catalog_warnings=(),
         scheduler={},
         runtime_evaluated=False,
         objective_score=None,
@@ -1553,110 +1304,6 @@ def _skipped_matrix_row(
     )
 
 
-def _satellite_budget_from_matrix_inputs(
-    *,
-    context: DSEDesignContext,
-    runtime_result: Mapping[str, Any],
-    catalog_preview: Any,
-) -> dict[str, Any]:
-    details = runtime_result.get("details") if isinstance(runtime_result.get("details"), Mapping) else _mapping_from_value(runtime_result.get("details"))
-    runtime_catalog = details.get("deployment_catalog") if isinstance(details.get("deployment_catalog"), Mapping) else _mapping_from_value(details.get("deployment_catalog"))
-    runtime_catalog_provenance = _mapping_from_value(runtime_catalog.get("provenance"))
-    preview_provenance = _mapping_from_value(getattr(catalog_preview, "provenance", {}))
-    performance_details = _design_row_performance_details(getattr(context, "design_row", None))
-    performance_pd = _mapping_from_value(_mapping_from_value(performance_details.get("provenance")).get("pd"))
-    keys = (
-        "serving_satellite_budget_count",
-        "constellation_satellite_count",
-        "satellite_budget_mode",
-        "satellite_budget_source",
-        "comparison_group_id",
-        "satellite_budget_unused_count",
-        "role_budget_unused_count",
-        "pd_role_budget_source",
-        "prefill_pool_satellites",
-        "decode_pool_satellites",
-    )
-    out: dict[str, Any] = {}
-    for key in keys:
-        value = _first_present(
-            preview_provenance.get(key),
-            runtime_catalog_provenance.get(key),
-            performance_details.get(key),
-            performance_pd.get(key),
-        )
-        if value is not None:
-            out[key] = value
-    return to_jsonable(out)
-
-
-def _design_row_performance_details(row: Any) -> dict[str, Any]:
-    if isinstance(row, Mapping):
-        performance = row.get("performance")
-    else:
-        performance = getattr(row, "performance", None)
-    if isinstance(performance, Mapping):
-        details = performance.get("details")
-    else:
-        details = getattr(performance, "details", None)
-    return details if isinstance(details, dict) else _mapping_from_value(details)
-
-
-def _pd_scope_from_runtime_result(
-    runtime_result: Mapping[str, Any],
-    scope_candidate: Mapping[str, Any],
-    catalog_preview: Any,
-) -> tuple[str | None, str | None]:
-    serving = _mapping_from_value(runtime_result.get("serving"))
-    details = _mapping_from_value(runtime_result.get("details"))
-    catalog = _mapping_from_value(details.get("deployment_catalog")) or serving
-    catalog_provenance = _mapping_from_value(catalog.get("provenance"))
-    preview_provenance = _mapping_from_value(getattr(catalog_preview, "provenance", {}))
-    pd_placement = _mapping_from_value(scope_candidate.get("pd_placement"))
-    candidate_scope = _optional_str(pd_placement.get("placement_scope"))
-    scope = (
-        _optional_str(catalog_provenance.get("placement_scope"))
-        or _optional_str(preview_provenance.get("placement_scope"))
-        or candidate_scope
-    )
-    request_records = tuple(item for item in runtime_result.get("request_records", ()) or () if isinstance(item, dict))
-    pairing_rule = None
-    for record in request_records:
-        pairing_rule = _optional_str(record.get("pd_pairing_rule")) or _optional_str(record.get("pd_placement_scope"))
-        if pairing_rule is not None:
-            break
-    if pairing_rule is None:
-        pairing_rule = _catalog_pairing_rule(catalog_preview, pd_placement)
-    return scope, pairing_rule
-
-
-def _catalog_pairing_rule(catalog_preview: Any, pd_placement: Mapping[str, Any]) -> str | None:
-    for deployment in tuple(getattr(catalog_preview, "prefill_deployments", ()) or ()):
-        rules = getattr(deployment, "paired_deployment_rules", {}) or {}
-        if isinstance(rules, dict) and rules:
-            return str(next(iter(rules.values())))
-    placement_scope = _optional_str(pd_placement.get("placement_scope"))
-    if placement_scope == "hybrid_explicit_pairs":
-        return "user_explicit"
-    if placement_scope == "hybrid_template_mix":
-        template = pd_placement.get("hybrid_template")
-        if isinstance(template, Mapping):
-            template_id = _optional_str(template.get("template_id") or template.get("id") or template.get("name"))
-        else:
-            template_id = _optional_str(template)
-        return f"hybrid_template:{template_id}" if template_id else "hybrid_template"
-    return placement_scope
-
-
-def _pd_pair_candidate_count(catalog_preview: Any) -> int | None:
-    prefill_deployments = tuple(getattr(catalog_preview, "prefill_deployments", ()) or ())
-    if not prefill_deployments:
-        if getattr(catalog_preview, "provenance", {}).get("fail_closed"):
-            return 0
-        return None
-    return sum(len(tuple(getattr(deployment, "paired_deployment_ids", ()) or ())) for deployment in prefill_deployments)
-
-
 def _selected_keys_by_design(rows: list[DSERuntimeMatrixRow]) -> set[tuple[str, str]]:
     selected: set[tuple[str, str]] = set()
     design_ids = tuple(dict.fromkeys(row.design_id for row in rows))
@@ -1716,10 +1363,6 @@ def _pareto_payload(row: DSERuntimeMatrixRow) -> dict[str, Any]:
         "static_frontier_member": row.static_frontier_member,
         "static_served_ratio": row.static_served_ratio,
         "static_e2e_p95_s": row.static_e2e_p95_s,
-        "placement_scope_strategy_id": row.placement_scope_strategy_id,
-        "pd_placement_scope": row.pd_placement_scope,
-        "pd_pairing_rule": row.pd_pairing_rule,
-        "pd_pair_candidate_count": row.pd_pair_candidate_count,
         "objective_score": row.objective_score,
         "objective_score_scope": row.objective_score_scope,
         "valid_for_paper_main_results": row.valid_for_paper_main_results,
@@ -1867,8 +1510,6 @@ def _compact_runtime_details(value: Any) -> dict[str, Any]:
         records = details.get("request_records")
         compact["request_record_count"] = len(records) if isinstance(records, (list, tuple)) else None
         compact["request_record_sample"] = _compact_request_records(records)
-    if "deployment_catalog" in details:
-        compact["deployment_catalog"] = _compact_serving(details.get("deployment_catalog"))
     if "terrestrial_costing" in details:
         terrestrial_costing = _mapping_from_value(details.get("terrestrial_costing"))
         # Preserve the small price contract summary used to populate the
@@ -1947,8 +1588,6 @@ def _compact_request_records(value: Any, *, limit: int = 8) -> tuple[dict[str, A
                     "ground_load_balancer_queue_wait_s",
                     "ground_replica_pending_wait_s",
                     "ground_prefix_cache_hit_ratio",
-                    "pd_placement_scope",
-                    "pd_pairing_rule",
                     "kv_serve_action",
                     "kv_post_turn_action",
                     "kv_handoff_bytes",

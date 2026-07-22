@@ -9,7 +9,6 @@ from ..common import to_jsonable
 
 RUNTIME_INTERFACE_DOC = "docs/research/parameters/llm_serving_runtime_interface.md"
 RUNTIME_PERFORMANCE_DOC = "docs/research/parameters/llm_serving_runtime_performance_model.md"
-RUNTIME_OPTIMIZATION_DOC = "docs/research/parameters/llm_serving_runtime_optimization.md"
 
 RUNTIME_RESULT_FIELDS = frozenset(
     {
@@ -386,79 +385,6 @@ class ServingDeploymentView:
             and self.decode_tokens_per_s
             and self.decode_tokens_per_s > 0
         )
-
-    def to_dict(self) -> dict[str, Any]:
-        return to_jsonable(self)
-
-@dataclass(frozen=True)
-class RuntimePredictionEnvelope:
-    evaluated: bool = False
-    predicted_ttft_s: float | None = None
-    predicted_e2e_s: float | None = None
-    access_wait_s: float | None = None
-    prefill_queue_wait_s: float | None = None
-    decode_queue_wait_s: float | None = None
-    link_queue_wait_s: float | None = None
-    prefill_service_s: float | None = None
-    decode_service_s: float | None = None
-    kv_migration_visible_s: float | None = None
-    context_recompute_s: float | None = None
-    path_setup_delay_s: float | None = None
-    average_hop_count: float | None = None
-    delta_compute_j: float | None = None
-    delta_sgl_j: float | None = None
-    delta_isl_j: float | None = None
-    delta_energy_j: float | None = None
-    soc_min_predicted: float | None = None
-    energy_feasible: bool | None = None
-    bottleneck_reason: str | None = None
-    warnings: tuple[str, ...] = ("runtime prediction is not implemented",)
-
-    def to_dict(self) -> dict[str, Any]:
-        return to_jsonable(self)
-
-@dataclass(frozen=True)
-class RuntimeAction:
-    action_id: str
-    request_id: str | None = None
-    action_type: str = "reject_drop"
-    access_node: str | None = None
-    serving_deployment: str | None = None
-    route_in: Any | None = None
-    route_out: Any | None = None
-    kv_route: Any | None = None
-    session_action: str = "none"
-    energy_action: str = "none"
-    dvfs_profile: str | None = None
-    defer_until_s: float | None = None
-    fallback_mode: str = "none"
-    expected_resource_delta: dict[str, Any] = field(default_factory=dict)
-    hard_gate_results: dict[str, Any] = field(default_factory=dict)
-    prediction: RuntimePredictionEnvelope = field(default_factory=RuntimePredictionEnvelope)
-    provenance: dict[str, Any] = field(default_factory=dict)
-
-    def to_dict(self) -> dict[str, Any]:
-        return to_jsonable(self)
-
-@dataclass(frozen=True)
-class RuntimeDecisionTrace:
-    request_id: str | None = None
-    arrival_time_s: float | None = None
-    decision_time_s: float | None = None
-    policy_name: str | None = None
-    state_view_hash: str | None = None
-    candidate_action_count: int = 0
-    feasible_action_count: int = 0
-    selected_action: RuntimeAction | dict[str, Any] | None = None
-    rejected_actions: tuple[dict[str, Any], ...] = ()
-    gate_results: dict[str, Any] = field(default_factory=dict)
-    prediction: RuntimePredictionEnvelope = field(default_factory=RuntimePredictionEnvelope)
-    score_components: dict[str, Any] = field(default_factory=dict)
-    session_decision: dict[str, Any] = field(default_factory=dict)
-    route_summary: dict[str, Any] = field(default_factory=dict)
-    bottleneck_reason: str | None = "not_implemented"
-    warnings: tuple[str, ...] = ("runtime decision trace is not implemented",)
-    trace_schema_version: str = "orbitserve.runtime_decision_trace.v1"
 
     def to_dict(self) -> dict[str, Any]:
         return to_jsonable(self)

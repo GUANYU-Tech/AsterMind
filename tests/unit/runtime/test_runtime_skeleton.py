@@ -106,23 +106,21 @@ class RuntimeSkeletonTests(unittest.TestCase):
         self.assertTrue(payload["defer_enabled"])
         self.assertEqual(payload["weights"]["fallback"], 10.0)
 
-    def test_top_level_scheduler_exposes_runtime_bridge(self):
+    def test_top_level_scheduler_exposes_fixed_runtime_strategy(self):
         scheduler = get_scheduler("orbitserve")
         decision = scheduler.select_action(state=None, request=None).to_dict()
 
         self.assertIsInstance(scheduler, RuntimeScheduler)
-        self.assertEqual(decision["action"], "scheduler_bridge/runtime_strategy_preview")
+        self.assertEqual(decision["action"], "no_candidate")
         self.assertFalse(decision["evaluated"])
         self.assertEqual(decision["runtime_strategy"]["policy"], "orbitserve")
         self.assertIn("local_compute", decision["runtime_strategy"]["enabled_actions"])
-        self.assertTrue(decision["optimization_support"]["runtime_strategy_available"])
-        self.assertGreaterEqual(decision["optimization_support"]["candidate_strategy_count"], 5)
-        self.assertIn("orbitserve", decision["optimization_support"]["candidate_policies"])
-        self.assertTrue(decision["candidate_strategies"])
+        self.assertFalse(decision["optimization_support"]["strategy_mutable_during_run"])
         self.assertEqual(
-            decision["optimization_support"]["runtime_optimization_entrypoint"],
-            "orbitserve.dse.runtime_optimization.optimize_runtime_strategy",
+            decision["optimization_support"]["selection_mode"],
+            "deterministic_request_candidate_ranking",
         )
+        self.assertEqual(decision["module_status"]["runtime_strategy"], "fixed_for_run")
 
     def test_top_level_scheduler_selects_request_level_candidate(self):
         scheduler = get_scheduler("energy_aware")
@@ -171,8 +169,8 @@ class RuntimeSkeletonTests(unittest.TestCase):
             "request_level_resource_aware_surrogate",
         )
         self.assertEqual(
-            decision["optimization_support"]["paper_rule_status"],
-            "request_level_resource_aware_surrogate",
+            decision["optimization_support"]["selection_mode"],
+            "deterministic_request_candidate_ranking",
         )
 
     def test_hard_gate_mode_controls_candidate_admission(self):
@@ -411,7 +409,7 @@ class RuntimeSkeletonTests(unittest.TestCase):
     def test_scheduler_invalid_object_handling(self):
         with self.assertRaisesRegex(TypeError, "scheduler value must be"):
             get_scheduler(object())
-        with self.assertRaisesRegex(TypeError, "policy field"):
+        with self.assertRaisesRegex(TypeError, "scheduler value must be"):
             get_scheduler(type("NameOnly", (), {"name": "invalid"})())
 
     def test_performance_skeleton_keeps_observed_metrics_null_without_trace(self):
@@ -519,34 +517,19 @@ class RuntimeSkeletonTests(unittest.TestCase):
         self.assertTrue(strategy["defer_enabled"])
         self.assertEqual(strategy["weights"]["fallback"], 10.0)
         self.assertEqual(strategy["normalization_refs"]["latency_s"], "candidate_max")
-        self.assertEqual(payload["module_status"]["scheduling"], "runtime_bridge")
 
     def test_plain_runner_scheduler_uses_runtime_policy_defaults(self):
         payload = run_experiment(
             load_experiment_spec(ROOT / "tests/fixtures/manifests/smoke_single_design.json")
         ).to_dict()
         strategy = payload["performance"]["details"]["runtime"]["strategy"]
-        optimizer = payload["performance"]["details"]["runtime_optimization"]
 
         self.assertEqual(strategy["policy"], "orbitserve")
         self.assertIn("local_compute", strategy["enabled_actions"])
         self.assertIn("ground_fallback", strategy["enabled_actions"])
         self.assertIn("sticky_kv_owner", strategy["session_actions_enabled"])
         self.assertEqual(strategy["path_policy"], "k_shortest_score")
-        self.assertEqual(payload["module_status"]["scheduling"], "runtime_bridge")
-        self.assertEqual(
-            optimizer["scheduler_search_space"]["provenance"]["source"],
-            "scheduler_runtime_bridge",
-        )
-        self.assertEqual(
-            optimizer["scheduler_search_space"]["current_scheduler"]["policy"],
-            "orbitserve",
-        )
-        self.assertGreaterEqual(
-            optimizer["scheduler_search_space"]["provenance"]["candidate_strategy_count"],
-            5,
-        )
-        self.assertTrue(optimizer["scheduler_search_space"]["candidate_schedulers"])
+        self.assertNotIn("runtime_optimization", payload["performance"]["details"])
 
 
 class RuntimeOptimizationSkeletonTests(unittest.TestCase):
