@@ -11,7 +11,7 @@ from .contracts import (
     RuntimePerformanceResult,
     RuntimeStrategySpec,
 )
-from .scenario.runtime_scenario import RuntimeScenario
+from .scenario.model import RuntimeScenario
 
 
 def evaluate_runtime_performance(

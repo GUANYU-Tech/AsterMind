@@ -9,8 +9,8 @@ from .evaluation import evaluate_runtime_performance
 from .state.energy_accounting import EnergyIntensity
 from .metrics.result_builder import build_runtime_performance_result
 from .metrics.runtime_records import RuntimeRequestRecord
-from .scenario.runtime_scenario import RuntimeScenario
-from .scenario.scenario import build_runtime_scenario
+from .scenario.model import RuntimeScenario
+from .scenario.builder import build_runtime_scenario
 from .strategy.schedulers import get_scheduler
 
 __all__ = [

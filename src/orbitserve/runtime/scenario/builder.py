@@ -14,7 +14,7 @@ from ..contracts import (
     ServingDeploymentView,
 )
 from .runtime_energy_profile import derive_runtime_energy_profile
-from .runtime_scenario import RuntimeScenario
+from .model import RuntimeScenario
 
 
 def build_runtime_scenario(
