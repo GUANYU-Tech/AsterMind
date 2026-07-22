@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from ..metrics.runtime_records import RuntimeRequestRecord
+from ..metrics.records import RuntimeRequestRecord
 
 @dataclass(frozen=True)
 class RuntimeEngineResult:

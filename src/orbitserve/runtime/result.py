@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..contracts import RuntimePerformanceResult
-from .runtime_metrics import aggregate_runtime_records
-from .runtime_records import records_to_jsonable
-from ...orbit import CIRCULAR_GEOMETRY_TRACE, SURROGATE_ORBIT_TRACE
+from .contracts import RuntimePerformanceResult
+from .metrics.aggregation import aggregate_runtime_records
+from .metrics.records import records_to_jsonable
+from ..orbit import CIRCULAR_GEOMETRY_TRACE, SURROGATE_ORBIT_TRACE
 
 def build_runtime_performance_result(
     *,

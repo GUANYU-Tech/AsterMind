@@ -7,7 +7,7 @@ from typing import Any
 
 from ...common import to_jsonable
 from ...common import PerformanceMetrics
-from .runtime_records import RuntimeRequestRecord
+from .records import RuntimeRequestRecord
 from ...orbit import (
     CIRCULAR_GEOMETRY_TRACE,
     SURROGATE_ORBIT_TRACE,

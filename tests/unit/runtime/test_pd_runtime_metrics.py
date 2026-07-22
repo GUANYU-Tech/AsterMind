@@ -1,7 +1,7 @@
 import unittest
 
-from orbitserve.runtime.metrics.runtime_metrics import aggregate_runtime_records
-from orbitserve.runtime.metrics.runtime_records import RuntimeRequestRecord, records_to_jsonable
+from orbitserve.runtime.metrics.aggregation import aggregate_runtime_records
+from orbitserve.runtime.metrics.records import RuntimeRequestRecord, records_to_jsonable
 
 
 def _record(request_id: str, **overrides):

@@ -7,8 +7,8 @@ from .contracts import (
 )
 from .api import evaluate_runtime_performance
 from .state.energy_accounting import EnergyIntensity
-from .metrics.result_builder import build_runtime_performance_result
-from .metrics.runtime_records import RuntimeRequestRecord
+from .result import build_runtime_performance_result
+from .metrics.records import RuntimeRequestRecord
 from .scenario.model import RuntimeScenario
 from .scenario.builder import build_runtime_scenario
 from .strategy.schedulers import get_scheduler

@@ -26,7 +26,7 @@ from .routing import (
 )
 from ..contracts import ServingDeploymentView
 from .runtime_eligibility import ComputeEligibilitySet, build_compute_eligibility_set
-from ..metrics.runtime_records import RuntimeRequestRecord
+from ..metrics.records import RuntimeRequestRecord
 from ..state.runtime_state import RuntimeState
 from .runtime_timing import TTFT_DEFINITION, ttft_breakdown
 from ..state.kv_runtime import (
@@ -2596,7 +2596,7 @@ from dataclasses import replace
 from typing import Any
 
 from ..contracts import RuntimePerformanceResult, RuntimeStrategySpec
-from ..metrics.result_builder import build_runtime_performance_result
+from ..result import build_runtime_performance_result
 from ...orbit import (
     CIRCULAR_GEOMETRY_TRACE,
     SURROGATE_ORBIT_TRACE,

@@ -3,8 +3,8 @@ import unittest
 from orbitserve.runtime import RuntimePerformanceResult
 from orbitserve.runtime.engine.simulator import try_evaluate_runtime_performance
 from orbitserve.runtime.engine.simulator import normalize_runtime_request
-from orbitserve.runtime.metrics.runtime_metrics import aggregate_runtime_records
-from orbitserve.runtime.metrics.runtime_records import RuntimeRequestRecord
+from orbitserve.runtime.metrics.aggregation import aggregate_runtime_records
+from orbitserve.runtime.metrics.records import RuntimeRequestRecord
 
 
 class RuntimeResultContractTests(unittest.TestCase):
