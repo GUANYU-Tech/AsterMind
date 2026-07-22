@@ -18,7 +18,7 @@ def evaluate_runtime_performance(
     scenario: RuntimeScenario,
     strategy: RuntimeStrategySpec | dict[str, Any] | Any | None = None,
 ) -> RuntimePerformanceResult:
-    runtime_strategy = RuntimeStrategySpec.from_value(strategy or scenario.runtime_config)
+    runtime_strategy = RuntimeStrategySpec.from_value(strategy)
     leakage = _runtime_leakage_records(scenario.requests, scenario.sessions)
     if leakage:
         leaked_fields = sorted({field for record in leakage for field in record["fields"]})
@@ -46,7 +46,6 @@ def evaluate_runtime_performance(
         if serving_evaluated
         else "missing"
     )
-    cost_status = "annualized" if scenario.cost_power.get("annualized_cost_usd_per_year") is not None else "static_cost_only"
     warnings = list(scenario.warnings)
     if not serving_evaluated:
         warnings.append("serving_throughput.evaluated=false; cannot compute service time")

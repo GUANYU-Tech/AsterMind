@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ...common import to_jsonable
-from ..contracts import RuntimeStrategySpec, ServingDeploymentView
+from ..contracts import ServingDeploymentView
 
 
 @dataclass(frozen=True)
@@ -24,11 +24,7 @@ class RuntimeScenario:
     simulation_trace_ref: dict[str, Any] = field(default_factory=dict)
     constellation: dict[str, Any] = field(default_factory=dict)
     serving_profile: ServingDeploymentView | None = None
-    cost_power: dict[str, Any] = field(default_factory=dict)
     energy_profile: dict[str, Any] = field(default_factory=dict)
-    runtime_config: RuntimeStrategySpec = field(
-        default_factory=lambda: RuntimeStrategySpec.from_value(None)
-    )
     provenance: dict[str, Any] = field(default_factory=dict)
     warnings: tuple[str, ...] = ()
     schema_version: str = "orbitserve.runtime_scenario.v1"

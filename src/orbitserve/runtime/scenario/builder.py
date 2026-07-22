@@ -10,7 +10,6 @@ from ...common import to_jsonable
 from ..contracts import (
     RUNTIME_INTERFACE_DOC,
     RUNTIME_PERFORMANCE_DOC,
-    RuntimeStrategySpec,
     ServingDeploymentView,
 )
 from .runtime_energy_profile import derive_runtime_energy_profile
@@ -43,7 +42,6 @@ def build_runtime_scenario(
     cost_payload = _mapping_from_result(cost_result)
     constellation_payload = _mapping_from_result(constellation)
     architecture_payload = _mapping_from_result(constellation_architecture)
-    runtime_strategy = RuntimeStrategySpec.from_value(scheduler_spec)
     resolved_hardware_payload = _mapping_from_result(resolved_hardware)
     hardware_payload = _mapping_from_result(hardware)
     scenario_name = scenario_id or str(_first_present(workload_spec_payload.get("name"), "runtime_scenario"))
@@ -133,16 +131,6 @@ def build_runtime_scenario(
         resolved_hardware=resolved_hardware,
         base_trace_options=simulation_config_payload.get("trace_options", {}),
     )
-    cost_power = {
-        "evaluated": bool(cost_payload.get("evaluated", False)),
-        "satellite_count": cost_payload.get("satellite_count"),
-        "total_cost_usd": cost_payload.get("total_cost_usd"),
-        "annualized_cost_usd_per_year": cost_payload.get("annualized_cost_usd_per_year"),
-        "total_mass_kg": cost_payload.get("total_mass_kg"),
-        "peak_power_w": cost_payload.get("peak_power_w"),
-        "single_satellite": cost_payload.get("single_satellite"),
-        "provenance": cost_payload.get("provenance", {}),
-    }
     scenario_warnings = tuple(
         dict.fromkeys(
             (
@@ -173,9 +161,7 @@ def build_runtime_scenario(
             **({"satellite_catalog": list(satellite_catalog)} if satellite_catalog else {}),
         },
         serving_profile=serving_profile,
-        cost_power=cost_power,
         energy_profile=runtime_energy_profile.to_dict(),
-        runtime_config=runtime_strategy,
         provenance={
             "workload_bundle": {
                 "bundle_dir": workload_bundle["bundle_dir"],
@@ -193,7 +179,6 @@ def build_runtime_scenario(
                 "estimate_schema": "ServingThroughputEstimate",
             },
             "hardware_config": resolved_hardware_payload or hardware_payload,
-            "cost_model": cost_power["provenance"],
             "energy_profile": runtime_energy_profile.provenance,
             "runtime_interface_doc": RUNTIME_INTERFACE_DOC,
             "runtime_performance_model_doc": RUNTIME_PERFORMANCE_DOC,

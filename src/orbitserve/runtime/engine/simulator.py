@@ -2610,7 +2610,7 @@ def try_evaluate_runtime_performance(
     strategy: RuntimeStrategySpec | dict[str, Any] | Any | None = None,
 ) -> RuntimePerformanceResult | None:
     runtime_strategy = RuntimeStrategySpec.from_value(
-        strategy or getattr(scenario, "runtime_config", None)
+        strategy
     )
     if runtime_strategy.policy.startswith("ground_") or runtime_strategy.policy == "skywalker_like_ground":
         return None
