@@ -24,10 +24,10 @@ from .routing import (
     sample_route_leg,
 )
 from ..contracts import ServingCapacityProfile
-from .runtime_eligibility import ComputeEligibilitySet, build_compute_eligibility_set
+from .eligibility import ComputeEligibilitySet, build_compute_eligibility_set
 from ..metrics.records import RuntimeRequestRecord
 from ..state.runtime_state import RuntimeState
-from .runtime_timing import TTFT_DEFINITION, ttft_breakdown
+from .timing import TTFT_DEFINITION, ttft_breakdown
 from ..state.kv_cache import (
     _admit_session_kv,
     _remove_session_kv,
