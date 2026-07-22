@@ -32,7 +32,7 @@ from ..state.kv_cache import (
     _admit_session_kv,
     _remove_session_kv,
 )
-from ..strategy.schedulers import SchedulerCandidate, get_scheduler
+from .decision import SchedulerCandidate, build_candidate_selector
 from ...orbit import TRACE_BACKED_RUNTIME_SURROGATE_SCOPE, normalize_trace_scope
 
 
@@ -115,7 +115,7 @@ def run_trace_backed_runtime(
     decision_traces: list[dict[str, Any]] = []
     session_action_counts: dict[str, int] = {}
     max_hop_count = getattr(runtime_strategy, "max_hop_count", None)
-    scheduler = get_scheduler(runtime_strategy)
+    scheduler = build_candidate_selector(runtime_strategy)
     trace_horizon_s, horizon_warnings = _trace_horizon_s(trace_bundle)
     if trace_horizon_s is None:
         warnings.append("trace_horizon_missing")

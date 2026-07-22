@@ -2,7 +2,7 @@ import importlib
 import unittest
 
 from orbitserve.runtime.contracts import ServingCapacityProfile
-from orbitserve.runtime.strategy.schedulers import RuntimeScheduler, SchedulerCandidate, get_scheduler
+from orbitserve.runtime.engine.decision import CandidateSelector, SchedulerCandidate, build_candidate_selector
 
 
 def _optional_import(module_name):
@@ -98,10 +98,10 @@ class RuntimeSkeletonTests(unittest.TestCase):
         self.assertEqual(payload["weights"]["fallback"], 10.0)
 
     def test_top_level_scheduler_exposes_fixed_runtime_strategy(self):
-        scheduler = get_scheduler("orbitserve")
+        scheduler = build_candidate_selector("orbitserve")
         decision = scheduler.select_action(state=None, request=None).to_dict()
 
-        self.assertIsInstance(scheduler, RuntimeScheduler)
+        self.assertIsInstance(scheduler, CandidateSelector)
         self.assertEqual(decision["action"], "no_candidate")
         self.assertFalse(decision["evaluated"])
         self.assertEqual(decision["runtime_strategy"]["policy"], "orbitserve")
@@ -114,7 +114,7 @@ class RuntimeSkeletonTests(unittest.TestCase):
         self.assertEqual(decision["module_status"]["runtime_strategy"], "fixed_for_run")
 
     def test_top_level_scheduler_selects_request_level_candidate(self):
-        scheduler = get_scheduler("energy_aware")
+        scheduler = build_candidate_selector("energy_aware")
         local_candidate = SchedulerCandidate(
             candidate_id="local",
             action_type="local_compute",
@@ -207,13 +207,13 @@ class RuntimeSkeletonTests(unittest.TestCase):
             "energy": 0.0,
             "hop": 0.0,
         }
-        strict = get_scheduler(
+        strict = build_candidate_selector(
             {"policy": "orbitserve", "hard_gate_mode": "strict", "weights": gate_mode_test_weights}
         ).select_action(
             state={"candidates": (violating_fast.to_dict(), safe_slow.to_dict())},
             request={"request_id": "req-0"},
         ).to_dict()
-        audit = get_scheduler(
+        audit = build_candidate_selector(
             {"policy": "orbitserve", "hard_gate_mode": "audit_only", "weights": gate_mode_test_weights}
         ).select_action(
             state={"candidates": (violating_fast.to_dict(), safe_slow.to_dict())},
@@ -250,7 +250,7 @@ class RuntimeSkeletonTests(unittest.TestCase):
                 },
             )
 
-        decision = get_scheduler(
+        decision = build_candidate_selector(
             {"policy": "shortest_path", "weights": {"hop": 0.0}}
         ).select_action(
             state={
@@ -309,7 +309,7 @@ class RuntimeSkeletonTests(unittest.TestCase):
             provenance={"compute_satellite_id": "sat-b", "access_satellite_id": "access", "path_id": "slow"},
         )
 
-        decision = get_scheduler("shortest_path").select_action(
+        decision = build_candidate_selector("shortest_path").select_action(
             state={"candidates": (ineligible.to_dict(), eligible.to_dict())},
             request={"request_id": "req-physical-gate"},
         ).to_dict()
@@ -336,7 +336,7 @@ class RuntimeSkeletonTests(unittest.TestCase):
             hard_gate_results={"energy_soc": {"passed": True, "reason": None, "soc_min": 0.2}},
             predicted_nominal_latency_s=2.0,
         )
-        decision = get_scheduler("shortest_path").select_action(
+        decision = build_candidate_selector("shortest_path").select_action(
             state={"candidates": (candidate.to_dict(),)},
             request={},
         ).to_dict()
@@ -360,7 +360,7 @@ class RuntimeSkeletonTests(unittest.TestCase):
             hard_gate_results={"kv_capacity": {"passed": False, "reason": None}},
             predicted_nominal_latency_s=2.0,
         )
-        decision = get_scheduler("shortest_path").select_action(
+        decision = build_candidate_selector("shortest_path").select_action(
             state={"candidates": (candidate.to_dict(),)},
             request={},
         ).to_dict()
@@ -385,7 +385,7 @@ class RuntimeSkeletonTests(unittest.TestCase):
             predicted_nominal_latency_s=2.0,
             provenance={"soc_min": 0.2},
         )
-        decision = get_scheduler(
+        decision = build_candidate_selector(
             {"policy": "shortest_path", "hard_gate_overrides": {"soc_min": 0.4}}
         ).select_action(
             state={"candidates": (candidate.to_dict(),), "soc_min": 0.3},
@@ -399,9 +399,9 @@ class RuntimeSkeletonTests(unittest.TestCase):
 
     def test_scheduler_invalid_object_handling(self):
         with self.assertRaisesRegex(TypeError, "scheduler value must be"):
-            get_scheduler(object())
+            build_candidate_selector(object())
         with self.assertRaisesRegex(TypeError, "scheduler value must be"):
-            get_scheduler(type("NameOnly", (), {"name": "invalid"})())
+            build_candidate_selector(type("NameOnly", (), {"name": "invalid"})())
 
     def test_performance_skeleton_keeps_observed_metrics_null_without_trace(self):
         scenario, strategy, serving_performance = _runtime_scenario(self.runtime)

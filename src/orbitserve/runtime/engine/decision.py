@@ -80,8 +80,8 @@ class SchedulerCandidate:
 
 
 @dataclass(frozen=True)
-class RuntimeScheduler:
-    """Runtime-facing scheduler adapter.
+class CandidateSelector:
+    """Engine-internal deterministic candidate selector.
 
     A RuntimeStrategySpec is fixed for one simulation.  The Runtime engine
     generates request candidates from current state, and this adapter applies
@@ -495,9 +495,9 @@ KNOWN_POLICIES = {
 }
 
 
-def get_scheduler(
+def build_candidate_selector(
     policy_or_spec: str | RuntimeStrategySpec | dict[str, Any] = "orbitserve",
-) -> RuntimeScheduler:
+) -> CandidateSelector:
     if not isinstance(policy_or_spec, (str, RuntimeStrategySpec, dict)):
         raise TypeError("scheduler value must be a policy string, RuntimeStrategySpec, or mapping")
     spec = RuntimeStrategySpec.from_value(
@@ -506,7 +506,7 @@ def get_scheduler(
     if spec.policy not in KNOWN_POLICIES:
         known = ", ".join(sorted(KNOWN_POLICIES))
         raise ValueError(f"unknown scheduler policy '{spec.policy}'. Known policies: {known}")
-    return RuntimeScheduler(spec)
+    return CandidateSelector(spec)
 
 
 def _canonical_policy(value: str) -> str:

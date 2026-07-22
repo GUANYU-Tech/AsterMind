@@ -1,7 +1,7 @@
 import unittest
 
 from orbitserve.runtime import RuntimeStrategySpec
-from orbitserve.runtime.strategy.schedulers import get_scheduler
+from orbitserve.runtime.engine.decision import build_candidate_selector
 
 
 def _candidate(candidate_id, satellite_id):
@@ -43,7 +43,7 @@ class RuntimeDVFSStrategyTests(unittest.TestCase):
 
 
     def test_fixed_strategy_selects_equal_candidates_deterministically(self):
-        scheduler = get_scheduler(RuntimeStrategySpec.from_dict({"policy": "orbitserve"}))
+        scheduler = build_candidate_selector(RuntimeStrategySpec.from_dict({"policy": "orbitserve"}))
         state = {"candidates": (_candidate("candidate-b", "sat-b"), _candidate("candidate-a", "sat-a"))}
         first = scheduler.select_action(state, {"request_id": "request-0"})
         second = scheduler.select_action(state, {"request_id": "request-0"})
