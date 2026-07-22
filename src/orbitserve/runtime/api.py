@@ -14,7 +14,7 @@ from .contracts import (
 from .scenario.model import RuntimeScenario
 
 
-def evaluate_runtime_performance(
+def run_runtime_simulation(
     scenario: RuntimeScenario,
     strategy: RuntimeStrategySpec | dict[str, Any] | Any | None = None,
 ) -> RuntimePerformanceResult:
@@ -26,9 +26,9 @@ def evaluate_runtime_performance(
             "workload runtime leakage detected in canonical bundle: "
             + ", ".join(leaked_fields)
         )
-    from .engine.simulator import try_evaluate_runtime_performance
+    from .engine.simulator import try_run_runtime_simulation
 
-    evaluated_result = try_evaluate_runtime_performance(scenario, runtime_strategy)
+    evaluated_result = try_run_runtime_simulation(scenario, runtime_strategy)
     if evaluated_result is not None:
         return evaluated_result
     serving_profile = scenario.serving_profile

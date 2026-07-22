@@ -4,6 +4,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
+from orbitserve.runtime.contracts import ServingDeploymentView
 
 from orbitserve.experiments import load_experiment_spec, run_experiment
 from orbitserve.dse.runtime_optimization import optimize_runtime_strategy
@@ -42,7 +43,7 @@ def _runtime_scenario(runtime, *, requests=None, sessions=None):
             "weights": {"latency": 1.0, "energy": 0.5, "queue": 1.0, "fallback": 10.0},
         }
     )
-    deployment = runtime.ServingDeploymentView.from_value(performance)
+    deployment = ServingDeploymentView.from_value(performance)
     scenario = runtime.RuntimeScenario(
         scenario_id=spec.experiment_id,
         time_horizon_s=spec.simulation.duration_s,
@@ -413,7 +414,7 @@ class RuntimeSkeletonTests(unittest.TestCase):
 
     def test_performance_skeleton_keeps_observed_metrics_null_without_trace(self):
         scenario, strategy, serving_performance = _runtime_scenario(self.runtime)
-        result = self.runtime.evaluate_runtime_performance(scenario, strategy).to_dict()
+        result = self.runtime.run_runtime_simulation(scenario, strategy).to_dict()
 
         self.assertFalse(result["evaluated"])
         self.assertEqual(result["module_status"]["simulation"], "skeleton")
@@ -451,7 +452,7 @@ class RuntimeSkeletonTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "assigned_satellite|completion_ratio|observed_e2e_s|runtime leakage"):
-            self.runtime.evaluate_runtime_performance(scenario, strategy)
+            self.runtime.run_runtime_simulation(scenario, strategy)
 
     def test_session_runtime_leakage_is_rejected(self):
         scenario, strategy, _performance = _runtime_scenario(
@@ -460,7 +461,7 @@ class RuntimeSkeletonTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "session_action|soc_before|runtime leakage"):
-            self.runtime.evaluate_runtime_performance(scenario, strategy)
+            self.runtime.run_runtime_simulation(scenario, strategy)
 
     def test_runner_runtime_details_use_materialized_workload(self):
         payload = run_experiment(

@@ -1,7 +1,7 @@
 import unittest
 
 from orbitserve.runtime.engine.simulator import _session_action
-from orbitserve.runtime import ServingDeploymentView
+from orbitserve.runtime.contracts import ServingDeploymentView
 from orbitserve.runtime.state.kv_cache import _admit_session_kv
 from orbitserve.runtime.state.runtime_state import RuntimeState
 

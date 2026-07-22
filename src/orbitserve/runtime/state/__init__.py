@@ -1,6 +1,5 @@
-"""Mutable Runtime compute, link, energy, and KV state."""
+"""Mutable state used by the Runtime simulation engine."""
 
-from .energy import EnergyIntensity
 from .runtime_state import RuntimeState
 
-__all__ = ["EnergyIntensity", "RuntimeState"]
+__all__ = ["RuntimeState"]
