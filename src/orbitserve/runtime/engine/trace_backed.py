@@ -1558,7 +1558,6 @@ def _clone_runtime_state_for_preview(state: RuntimeState) -> RuntimeState:
     """Clone only mutable scheduling/energy state needed by a candidate preview."""
 
     return RuntimeState(
-        compute_queues={key: replace(queue) for key, queue in state.compute_queues.items()},
         satellites={
             key: replace(satellite, compute_queue=replace(satellite.compute_queue))
             for key, satellite in state.satellites.items()

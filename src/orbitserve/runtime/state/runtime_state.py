@@ -189,7 +189,6 @@ class KVCacheEntryState:
 
 @dataclass
 class RuntimeState:
-    compute_queues: dict[str, ComputeQueueState] = field(default_factory=dict)
     satellites: dict[str, SatelliteState] = field(default_factory=dict)
     links: dict[str, LinkState] = field(default_factory=dict)
     sessions: dict[str, SessionState] = field(default_factory=dict)
@@ -204,11 +203,6 @@ class RuntimeState:
                 "kv_state": "not_implemented",
             }
     )
-
-    def queue_for(self, deployment_id: str) -> ComputeQueueState:
-        if deployment_id not in self.compute_queues:
-            self.compute_queues[deployment_id] = ComputeQueueState()
-        return self.compute_queues[deployment_id]
 
     def satellite_for(self, satellite_id: str, *, initial_soc: float = 0.8) -> SatelliteState:
         if satellite_id not in self.satellites:
@@ -236,10 +230,6 @@ class RuntimeState:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "compute_queues": {
-                deployment_id: queue.to_dict()
-                for deployment_id, queue in self.compute_queues.items()
-            },
             "satellites": {
                 satellite_id: satellite.to_dict()
                 for satellite_id, satellite in self.satellites.items()

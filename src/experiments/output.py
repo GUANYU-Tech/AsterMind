@@ -493,7 +493,6 @@ def _provenance_summary(provenance: dict[str, Any]) -> dict[str, Any]:
 
 def _state_summary(state_summary: dict[str, Any]) -> dict[str, Any]:
     return {
-        "compute_queue_count": len(state_summary.get("compute_queues", {}) or {}),
         "satellite_count": len(state_summary.get("satellites", {}) or {}),
         "link_count": len(state_summary.get("links", {}) or {}),
         "session_count": len(state_summary.get("sessions", {}) or {}),
