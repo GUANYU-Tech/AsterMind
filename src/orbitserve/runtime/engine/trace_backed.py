@@ -1625,7 +1625,6 @@ def _reserve_route(
         sampled_legs,
         start_s,
         request_id=request_id,
-            session_id=request.get("session_id"),
         energy_stage=energy_stage,
     )
 
@@ -1648,7 +1647,6 @@ def _reserve_sampled_route(
             sampled_legs,
             start_s,
             request_id=request_id,
-            session_id=request.get("session_id"),
             energy_stage=energy_stage,
         )
     except EnergyWindowError as exc:
