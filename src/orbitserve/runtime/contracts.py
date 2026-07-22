@@ -188,10 +188,7 @@ def _strategy_defaults(policy: str) -> dict[str, Any]:
             ),
             "session_actions_enabled": (
                 "sticky_kv_owner",
-                "migrate_kv",
-                "replicate_kv",
                 "recompute_context",
-                "evict_session",
             ),
             "shadow_dvfs_enabled": True,
             "shadow_dvfs_scale": 0.5,
@@ -491,7 +488,6 @@ class RuntimePerformanceResult:
     serving: dict[str, Any] = field(default_factory=dict)
     scheduler: dict[str, Any] = field(default_factory=dict)
     performance: dict[str, Any] = field(default_factory=dict)
-    slo: dict[str, Any] = field(default_factory=dict)
     config: dict[str, Any] = field(default_factory=dict)
     runtime_metrics: dict[str, Any] = field(default_factory=dict)
     bottleneck_breakdown: dict[str, Any] = field(default_factory=dict)

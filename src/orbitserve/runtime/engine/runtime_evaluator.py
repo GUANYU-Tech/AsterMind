@@ -93,13 +93,13 @@ def try_evaluate_runtime_performance(
             details={"valid_for_paper_main_results": False, "trace_model": trace_manifest.trace_model},
             warnings=(f"runtime trace loader failed: {exc}",),
         )
-    engine_result = run_trace_backed_runtime(
     deployment_catalog = build_runtime_deployment_catalog(
         scenario,
         satellite_catalog=tuple(getattr(trace_bundle, "satellite_catalog", ()) or ()),
     )
     if not deployment_catalog.default_deployment:
         return None
+    engine_result = run_trace_backed_runtime(
         requests=requests,
         deployment_catalog=deployment_catalog,
         runtime_strategy=runtime_strategy,

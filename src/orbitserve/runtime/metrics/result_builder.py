@@ -184,7 +184,6 @@ def build_runtime_performance_result(
             "valid_for_paper_main_results": False,
         },
         performance=aggregates.performance.to_dict(),
-        slo=aggregates.slo.to_dict(),
         runtime_metrics=runtime_metrics,
         bottleneck_breakdown=aggregates.bottleneck_breakdown,
         session_metrics=(

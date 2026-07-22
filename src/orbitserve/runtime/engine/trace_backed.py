@@ -58,10 +58,8 @@ def run_trace_backed_runtime(
             "queue_model": "per_satellite_fifo",
             "link_model": "surrogate_link_queue",
             "energy_model": "surrogate_soc_shadow_dvfs",
-            "kv_state": "sticky_or_recompute_only",
-            "kv_transfer_model": "not_implemented",
-            "kv_hbm_model": "not_implemented",
-            "paged_attention_model": "not_implemented",
+            "kv_state": "per_satellite_capacity_pressure_lru",
+            "kv_hbm_model": "per_satellite_capacity",
         }
     )
     warnings = list(getattr(trace_bundle, "warnings", ()))
@@ -74,12 +72,12 @@ def run_trace_backed_runtime(
         return RuntimeEngineResult(
             records=tuple(
                 _reject_record(
-                    normalize_runtime_request(request, index),
+                    normalize_runtime_request(request),
                     "satellite_catalog_empty",
                     scope=scope,
                     trace_model=trace_model,
                 )
-                for index, request in enumerate(requests)
+                for request in requests
             ),
             decision_traces=(),
             state_summary=state.to_dict(),
@@ -93,12 +91,12 @@ def run_trace_backed_runtime(
         return RuntimeEngineResult(
             records=tuple(
                 _reject_record(
-                    normalize_runtime_request(request, index),
+                    normalize_runtime_request(request),
                     "compute_capacity_unavailable",
                     scope=scope,
                     trace_model=trace_model,
                 )
-                for index, request in enumerate(requests)
+                for request in requests
             ),
             decision_traces=(),
             state_summary=state.to_dict(),
@@ -121,7 +119,7 @@ def run_trace_backed_runtime(
         state.link_for(str(link.get("link_id")))
 
     ordered_requests = sorted(
-        ((normalize_runtime_request(request, index), request) for index, request in enumerate(requests)),
+        ((normalize_runtime_request(request), request) for request in requests),
         key=lambda item: (item[0]["arrival_time_s"], item[0]["request_id"]),
     )
     records: list[RuntimeRequestRecord] = []
@@ -200,42 +198,27 @@ def run_trace_backed_runtime(
 
 
 
-def normalize_runtime_request(raw_request: dict[str, Any], index: int = 0) -> dict[str, Any]:
-    declared_prompt_tokens = _first_present(
-        raw_request.get("prompt_tokens"),
-        raw_request.get("input_tokens"),
-    )
+def normalize_runtime_request(raw_request: dict[str, Any]) -> dict[str, Any]:
+    declared_prompt_tokens = raw_request.get("prompt_tokens")
     declared_new_user_tokens = raw_request.get("new_user_tokens")
-    prompt_tokens = max(
-        0,
-        _int(
-            _first_present(
-                declared_prompt_tokens,
-                raw_request.get("new_user_tokens"),
-            ),
-            0,
-        ),
-    )
-    output_tokens = max(
-        0,
-        _int(
-            _first_present(
-                raw_request.get("output_tokens"),
-                raw_request.get("max_output_tokens"),
-                raw_request.get("decode_tokens"),
-            ),
-            0,
-        ),
-    )
+    request_id = _optional_str(raw_request.get("request_id"))
+    if request_id is None:
+        raise ValueError("canonical Runtime request requires request_id")
+    if declared_prompt_tokens is None or raw_request.get("output_tokens") is None:
+        raise ValueError(
+            "canonical Runtime request requires prompt_tokens and output_tokens"
+        )
+    prompt_tokens = max(0, _int(declared_prompt_tokens, 0))
+    output_tokens = max(0, _int(raw_request.get("output_tokens"), 0))
     return {
-        "request_id": str(raw_request.get("request_id") or f"req-{index:06d}"),
-        "arrival_time_s": _float(_first_present(raw_request.get("arrival_time_s"), raw_request.get("time_s")), 0.0),
+        "request_id": request_id,
+        "arrival_time_s": _float(raw_request.get("arrival_time_s"), 0.0),
         "prompt_tokens": prompt_tokens,
         "output_tokens": output_tokens,
         "input_bytes": _float(raw_request.get("input_bytes"), prompt_tokens * 4.0),
         "output_bytes": _float(raw_request.get("output_bytes"), output_tokens * 4.0),
         "session_id": _optional_str(raw_request.get("session_id")),
-        "ingress_id": _optional_str(_first_present(raw_request.get("ingress_id"), raw_request.get("gateway_id"))),
+        "ingress_id": _optional_str(raw_request.get("ingress_id")),
         "prompt_tokens_declared": declared_prompt_tokens is not None,
         "new_user_tokens": _optional_int(declared_new_user_tokens),
         "context_tokens_before_turn": _optional_int(raw_request.get("context_tokens_before_turn")),
@@ -727,26 +710,6 @@ def _evaluate_trace_request(
                 selected_candidate_id=selected.get("selected_candidate_id"),
                 candidate_count=selected.get("candidate_count"),
                 feasible_candidate_count=selected.get("feasible_candidate_count"),
-            )
-            partial_timing = ttft_breakdown(
-                access_wait_s=access_wait_s,
-                uplink_s=max(0.0, inbound_done_s - (arrival_s + access_wait_s)),
-                prefill_queue_s=prefill_wait_s,
-                prefill_compute_s=prefill_service_s,
-                kv_transfer_s=0.0,
-                decode_queue_s=decode_wait_s,
-                first_token_decode_s=first_token_service_s,
-                return_path_s=max(0.0, first_done_s - first_token_ready_s),
-            )
-            record = record.with_updates(
-                ttft_s=float(partial_timing["ttft_s"]),
-                uplink_s=float(partial_timing["uplink_s"]),
-                kv_transfer_s=0.0,
-                first_token_decode_s=first_token_service_s,
-                return_path_s=float(partial_timing["return_path_s"]),
-                ttft_breakdown_s=partial_timing,
-                first_token_return_s=float(partial_timing["return_path_s"]),
-                response_streaming_model="first_token_plus_bulk_remaining",
             )
             return record, _decision_trace(request, policy, access_candidates, route_plan, "route_became_unavailable_after_compute", warnings=exc.warnings or (exc.reason,), scheduler_decision=selected.get("scheduler_decision"))
     route_plan = replace(route_plan, outbound_legs=tuple((*sampled_first_legs, *sampled_remaining_legs)))

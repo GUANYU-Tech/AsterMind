@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ...common import to_jsonable
-from ...common import PerformanceMetrics, SLOMetrics
+from ...common import PerformanceMetrics
 from .runtime_records import RuntimeRequestRecord
 from ...orbit import (
     CIRCULAR_GEOMETRY_TRACE,
@@ -20,7 +20,6 @@ from ...orbit import (
 class RuntimeAggregateMetrics:
     runtime_metrics: dict[str, Any]
     performance: PerformanceMetrics
-    slo: SLOMetrics
     bottleneck_breakdown: dict[str, Any]
     communication_metrics: dict[str, Any]
     energy_metrics: dict[str, Any]
@@ -44,7 +43,6 @@ def aggregate_runtime_records(
         return RuntimeAggregateMetrics(
             runtime_metrics=_empty_runtime_metrics(trace_model=trace_model, scope=scope),
             performance=PerformanceMetrics(warnings=warnings),
-            slo=SLOMetrics(warnings=warnings),
             bottleneck_breakdown={},
             communication_metrics=_unevaluated_group("link model is not implemented in compute-only runtime"),
             energy_metrics=_unevaluated_group("energy model is not implemented in compute-only runtime"),
@@ -62,13 +60,10 @@ def aggregate_runtime_records(
     energy_violations = [record for record in records if getattr(record, "energy_violation", False)]
     session_action_counts = _session_action_counts(records)
     kv_serve_action_counts = _kv_serve_action_counts(records)
-    kv_post_turn_action_counts = _kv_post_turn_action_counts(records)
     kv_hit_tokens_total = _sum_numeric(getattr(record, "kv_hit_tokens", None) for record in records)
     kv_miss_tokens_total = _sum_numeric(getattr(record, "kv_miss_tokens", None) for record in records)
     kv_pages_required_total = _sum_numeric(getattr(record, "kv_pages_required", None) for record in records)
     kv_pages_hit_total = _sum_numeric(getattr(record, "kv_pages_hit", None) for record in records)
-    kv_transfer_attempted_total = _sum_numeric(getattr(record, "kv_transfer_attempted_bytes", None) for record in records)
-    kv_transfer_useful_total = _sum_numeric(getattr(record, "kv_transfer_useful_bytes", None) for record in records)
     horizon = _effective_horizon(records, time_horizon_s)
     completed_tokens = sum(
         record.prompt_tokens + record.output_tokens for record in completed
@@ -176,10 +171,7 @@ def aggregate_runtime_records(
         "decode_queue_wait_p95_s": _percentile([record.decode_queue_wait_s for record in completed], 0.95),
         "sticky_kv_owner_requests": kv_serve_action_counts.get("sticky_kv_owner", session_action_counts.get("sticky_kv_owner", 0)),
         "recompute_context_requests": kv_serve_action_counts.get("recompute_context", session_action_counts.get("recompute_context", 0)),
-        "migrate_kv_requests": kv_serve_action_counts.get("migrate_kv", session_action_counts.get("migrate_kv", 0)),
-        "replicate_kv_requests": kv_post_turn_action_counts.get("replicate_kv", session_action_counts.get("replicate_kv", 0)),
         "kv_serve_action_counts": kv_serve_action_counts,
-        "kv_post_turn_action_counts": kv_post_turn_action_counts,
         "kv_hit_tokens_total": kv_hit_tokens_total,
         "kv_miss_tokens_total": kv_miss_tokens_total,
         "kv_hit_rate_tokens": (
@@ -196,29 +188,13 @@ def aggregate_runtime_records(
         ),
         "kv_reuse_bytes_total": _sum_numeric(getattr(record, "kv_reused_bytes", None) for record in records),
         "kv_generated_bytes_total": _sum_numeric(getattr(record, "kv_generated_bytes", None) for record in records),
-        "kv_migration_bytes_total": _sum_numeric(getattr(record, "kv_migration_bytes", None) for record in records),
-        "kv_replication_bytes_total": _sum_numeric(getattr(record, "kv_replication_bytes", None) for record in records),
         "kv_evicted_bytes_total": _sum_numeric(getattr(record, "kv_evicted_bytes", None) for record in records),
-        "kv_transfer_attempted_bytes_total": kv_transfer_attempted_total,
-        "kv_transfer_useful_bytes_total": kv_transfer_useful_total,
-        "kv_transfer_waste_ratio": (
-            max(0.0, kv_transfer_attempted_total - kv_transfer_useful_total) / kv_transfer_attempted_total
-            if kv_transfer_attempted_total > 0
-            else None
-        ),
-        "kv_transfer_interruption_count": len([record for record in records if getattr(record, "kv_transfer_interrupted", False)]),
         "kv_eviction_count": int(_sum_numeric(
             getattr(record, "kv_evicted_entry_count", None)
             if getattr(record, "kv_evicted_entry_count", None) is not None
             else getattr(record, "kv_pages_evicted", None)
             for record in records
         )),
-        "post_turn_replication_request_fraction": (
-            kv_post_turn_action_counts.get("replicate_kv", 0) / total
-            if total > 0
-            else None
-        ),
-        "replication_event_count": kv_post_turn_action_counts.get("replicate_kv", 0),
         "hbm_occupancy_p50": _percentile([getattr(record, "hbm_occupancy_after", None) for record in records], 0.50),
         "hbm_occupancy_p95": _percentile([getattr(record, "hbm_occupancy_after", None) for record in records], 0.95),
         "hbm_occupancy_max": _max_numeric(getattr(record, "hbm_occupancy_after", None) for record in records),
@@ -287,14 +263,9 @@ def aggregate_runtime_records(
         },
         warnings=warnings,
     )
-    slo = SLOMetrics(
-        evaluated=False,
-        warnings=(*warnings, "SLO evaluation is intentionally outside Runtime"),
-    )
     return RuntimeAggregateMetrics(
         runtime_metrics=runtime_metrics,
         performance=performance,
-        slo=slo,
         bottleneck_breakdown=bottlenecks,
         communication_metrics=_communication_metrics(records, trace_model=trace_model, scope=scope),
         energy_metrics=_energy_metrics(records, trace_model=trace_model, scope=scope),
@@ -340,10 +311,7 @@ def _empty_runtime_metrics(*, trace_model: str, scope: str) -> dict[str, Any]:
         "completed_throughput_token_accounting": "prompt_plus_output_and_output_only_both_reported",
         "sticky_kv_owner_requests": 0,
         "recompute_context_requests": 0,
-        "migrate_kv_requests": 0,
-        "replicate_kv_requests": 0,
         "kv_serve_action_counts": {},
-        "kv_post_turn_action_counts": {},
         "kv_hit_tokens_total": 0.0,
         "kv_miss_tokens_total": 0.0,
         "kv_hit_rate_tokens": None,
@@ -352,16 +320,8 @@ def _empty_runtime_metrics(*, trace_model: str, scope: str) -> dict[str, Any]:
         "kv_hit_rate_pages": None,
         "kv_reuse_bytes_total": 0.0,
         "kv_generated_bytes_total": 0.0,
-        "kv_migration_bytes_total": 0.0,
-        "kv_replication_bytes_total": 0.0,
         "kv_evicted_bytes_total": 0.0,
-        "kv_transfer_attempted_bytes_total": 0.0,
-        "kv_transfer_useful_bytes_total": 0.0,
-        "kv_transfer_waste_ratio": None,
-        "kv_transfer_interruption_count": 0,
         "kv_eviction_count": 0,
-        "post_turn_replication_request_fraction": None,
-        "replication_event_count": 0,
         "hbm_occupancy_p50": None,
         "hbm_occupancy_p95": None,
         "hbm_occupancy_max": None,
@@ -583,17 +543,6 @@ def _kv_serve_action_counts(records: tuple[RuntimeRequestRecord, ...]) -> dict[s
     for record in records:
         action = getattr(record, "kv_serve_action", None)
         if action is None:
-            continue
-        key = str(action)
-        counts[key] = counts.get(key, 0) + 1
-    return counts
-
-
-def _kv_post_turn_action_counts(records: tuple[RuntimeRequestRecord, ...]) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for record in records:
-        action = getattr(record, "kv_post_turn_action", None)
-        if action is None or str(action) == "none":
             continue
         key = str(action)
         counts[key] = counts.get(key, 0) + 1

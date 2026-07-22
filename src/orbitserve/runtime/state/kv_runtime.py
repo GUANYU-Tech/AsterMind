@@ -17,14 +17,9 @@ def _kv_policy(runtime_strategy: Any) -> dict[str, Any]:
     merged = {**policy, **override_policy}
     for key in (
         "kv_serve_actions_enabled",
-        "kv_post_turn_actions_enabled",
-        "replica_count_limit",
-        "replica_target_deployment_id",
         "kv_page_size_tokens",
         "kv_page_metadata_bytes",
         "kv_fragmentation_reserve_fraction",
-        "kv_transfer_chunk_bytes",
-        "max_kv_transfer_hop_count",
         "eviction_policy",
         "hbm_model",
         "cards_per_satellite",

@@ -53,21 +53,13 @@ _SECTION_DEFAULTS: dict[str, dict[str, Any]] = {
     },
     "kv": {
         "kv_capacity_admission": None, "kv_serve_action": None,
-        "kv_post_turn_action": None, "kv_background_event_count": None,
         "kv_hit_tokens": None, "kv_miss_tokens": None,
         "context_recompute_tokens": None, "kv_reused_bytes": None,
-        "kv_generated_bytes": None, "kv_migration_bytes": None,
-        "kv_replication_bytes": None, "kv_evicted_bytes": None,
+        "kv_generated_bytes": None, "kv_evicted_bytes": None,
         "kv_evicted_entry_count": None,
-        "session_kv_migration_bytes": None, "session_kv_visible_s": None,
-        "kv_transfer_attempted_bytes": None, "kv_transfer_delivered_bytes": None,
-        "kv_transfer_committed_page_bytes": None, "kv_transfer_useful_bytes": None,
-        "kv_transfer_interrupted": None, "kv_transfer_interruption_reason": None,
         "kv_pages_required": None, "kv_pages_hit": None,
-        "kv_pages_migrated": None, "kv_pages_replicated": None,
         "kv_pages_evicted": None, "hbm_admission_result": None,
         "hbm_occupancy_before": None, "hbm_occupancy_after": None,
-        "visible_kv_delay_s": None, "hidden_kv_delay_s": None,
         "ground_prefix_cache_hit_ratio": None,
     },
     "outcome": {
@@ -147,6 +139,12 @@ class RuntimeRequestRecord:
             sections["decision"]["strategy"] = sections["provenance"].get("policy")
         if sections["request"].get("request_id") is None:
             raise TypeError("request_id is required")
+        # TTFT and E2E describe a delivered response.  An incomplete request
+        # may retain stage-level timing for diagnosis, but has no end-user
+        # latency value.
+        if not sections["outcome"].get("completed", False):
+            sections["timing"]["ttft_s"] = None
+            sections["timing"]["e2e_s"] = None
         for name, payload in sections.items():
             object.__setattr__(self, name, payload)
 
