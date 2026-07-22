@@ -1,8 +1,8 @@
 import unittest
 
 from orbitserve.runtime import RuntimePerformanceResult
-from orbitserve.runtime.engine.runtime_evaluator import try_evaluate_runtime_performance
-from orbitserve.runtime.engine.trace_backed import normalize_runtime_request
+from orbitserve.runtime.engine.simulator import try_evaluate_runtime_performance
+from orbitserve.runtime.engine.simulator import normalize_runtime_request
 from orbitserve.runtime.metrics.runtime_metrics import aggregate_runtime_records
 from orbitserve.runtime.metrics.runtime_records import RuntimeRequestRecord
 

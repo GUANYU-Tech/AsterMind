@@ -1,7 +1,7 @@
 import unittest
 
 from orbitserve.orbit import RuntimeTraceBundle
-from orbitserve.runtime.engine.trace_backed import _reserve_route
+from orbitserve.runtime.engine.simulator import _reserve_route
 from orbitserve.runtime.state.runtime_state import RuntimeState
 
 

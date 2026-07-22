@@ -14,7 +14,7 @@ from orbitserve.architecture.hardware import resolve_experiment_hardware
 from orbitserve.runtime import ServingDeploymentView
 from orbitserve.runtime.scenario.runtime_energy_profile import derive_runtime_energy_profile
 from orbitserve.runtime import build_runtime_scenario
-from orbitserve.runtime.engine.trace_backed import run_trace_backed_runtime
+from orbitserve.runtime.engine.simulator import run_trace_backed_runtime
 from orbitserve.runtime.contracts import RuntimeStrategySpec
 from orbitserve.orbit.simulation_trace_builder import build_surrogate_orbit_trace
 from orbitserve.orbit.simulation_traces import RuntimeTraceManifest, load_surrogate_trace_bundle
