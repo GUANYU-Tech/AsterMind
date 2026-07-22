@@ -17,7 +17,6 @@ from .constellation_cost import estimate_constellation_cost
 from ..architecture import resolve_experiment_hardware
 from ..runtime import build_runtime_scenario
 from .runtime_dispatch import evaluate_runtime_performance
-from ..runtime import apply_runtime_energy_envelope
 from ..runtime import get_scheduler
 from ..serving import estimate_serving_throughput
 from ..orbit import run_simulation
@@ -42,7 +41,6 @@ class MaterializedDesignEvaluation:
     resolved_hardware: Any
     cost: Any
     simulation_config: Any
-    runtime_energy_envelope: Any
     simulation: Any
     serving_spec: Any
     serving_throughput: Any
@@ -92,13 +90,8 @@ def evaluate_materialized_design(
         cost_config=resolved_hardware.cost_config,
         single_satellite_case_path=resolved_hardware.single_satellite_case_path,
     )
-    resolved_simulation_config, runtime_energy_envelope = apply_runtime_energy_envelope(
-        input_simulation_config,
-        cost_result=cost,
-        resolved_hardware=resolved_hardware,
-    )
     resolved_simulation_config = _simulation_config_with_link_hardware(
-        resolved_simulation_config,
+        input_simulation_config,
         resolved_hardware=resolved_hardware,
     )
     simulation = run_simulation(
@@ -124,7 +117,6 @@ def evaluate_materialized_design(
             *input_warnings,
             *resolved_hardware.warnings,
             *serving_warnings,
-            *runtime_energy_envelope.warnings,
             *cost.warnings,
             *simulation.warnings,
             *serving_throughput.warnings,
@@ -162,7 +154,6 @@ def evaluate_materialized_design(
         resolved_hardware=resolved_hardware,
         cost=cost,
         simulation_config=resolved_simulation_config,
-        runtime_energy_envelope=runtime_energy_envelope,
         simulation=simulation,
         serving_spec=serving_spec,
         serving_throughput=serving_throughput,

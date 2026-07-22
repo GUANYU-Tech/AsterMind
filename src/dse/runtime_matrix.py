@@ -22,7 +22,6 @@ class DSEDesignContext:
     runtime_scenario: Any
     current_scheduler: dict[str, Any]
     cost_result: Any
-    runtime_energy_envelope: Any = None
 
 
 @dataclass(frozen=True)

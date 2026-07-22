@@ -562,7 +562,7 @@ def _evaluate_design_row(
         workload_spec=None,
         serving_throughput=serving_throughput,
         simulation_result=simulation_result,
-        runtime_energy_envelope=evaluation.runtime_energy_envelope,
+        runtime_energy_profile=runtime_scenario.energy_profile,
         base_dir=base_dir,
     )
     row_warnings.extend(static_slo.warnings)
@@ -637,7 +637,6 @@ def _evaluate_design_row(
         runtime_scenario=runtime_scenario,
         current_scheduler=runtime_scenario.runtime_config.to_dict(),
         cost_result=cost,
-        runtime_energy_envelope=evaluation.runtime_energy_envelope,
     )
     return {"row": row, "context": context}
 

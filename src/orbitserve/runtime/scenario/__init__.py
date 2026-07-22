@@ -2,7 +2,7 @@
 
 from .deployment_contracts import RuntimeDeployment, RuntimeDeploymentCatalog
 from .runtime_deployments import build_runtime_deployment_catalog
-from .runtime_energy_envelope import apply_runtime_energy_envelope, derive_runtime_energy_envelope
+from .runtime_energy_envelope import derive_runtime_energy_envelope
 from .runtime_scenario import RuntimeScenario
 from .scenario import build_runtime_scenario
 
@@ -10,7 +10,6 @@ __all__ = [
     "RuntimeDeployment",
     "RuntimeDeploymentCatalog",
     "RuntimeScenario",
-    "apply_runtime_energy_envelope",
     "build_runtime_deployment_catalog",
     "build_runtime_scenario",
     "derive_runtime_energy_envelope",

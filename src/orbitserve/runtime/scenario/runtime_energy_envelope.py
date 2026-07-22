@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Any
 
 from ...common import to_jsonable
@@ -35,34 +35,6 @@ class RuntimeEnergyEnvelope:
 
     def to_dict(self) -> dict[str, Any]:
         return to_jsonable(self)
-
-
-def apply_runtime_energy_envelope(
-    simulation_config: Any,
-    *,
-    cost_result: Any,
-    resolved_hardware: Any = None,
-) -> tuple[Any, RuntimeEnergyEnvelope]:
-    """Return a simulation config whose runtime energy options come from cost/hardware."""
-
-    envelope = derive_runtime_energy_envelope(
-        cost_result,
-        resolved_hardware=resolved_hardware,
-        base_trace_options=getattr(simulation_config, "trace_options", {}) or {},
-    )
-    current_options = dict(getattr(simulation_config, "trace_options", {}) or {})
-    next_options = dict(current_options)
-    next_options["runtime_energy_envelope"] = envelope.to_dict()
-    if envelope.evaluated:
-        next_options.update(envelope.trace_options)
-        next_options["runtime_energy_envelope_required"] = True
-    elif _trace_backed_runtime_model(simulation_config):
-        next_options["runtime_energy_envelope_required"] = True
-        next_options["runtime_energy_envelope_unavailable"] = True
-    try:
-        return replace(simulation_config, trace_options=next_options), envelope
-    except TypeError:
-        return simulation_config, envelope
 
 
 def derive_runtime_energy_envelope(
@@ -274,7 +246,6 @@ def derive_runtime_energy_envelope(
         "energy_sizing": {
             "sizing_mode": power_sizing_mode,
             "uses_runtime_served_requests": False,
-            "planned_energy_demand": single_provenance.get("planned_energy_demand"),
         },
         "overrides": tuple(key for key in COST_ENERGY_TRACE_OPTION_KEYS if key in trace_options),
     }
@@ -323,16 +294,8 @@ def _clip01(value: float) -> float:
     return max(0.0, min(1.0, value))
 
 
-def _trace_backed_runtime_model(simulation_config: Any) -> bool:
-    return str(getattr(simulation_config, "trace_model", "")) in {
-        "surrogate_orbit_trace",
-        "circular_geometry_trace",
-    }
-
-
 __all__ = [
     "COST_ENERGY_TRACE_OPTION_KEYS",
     "RuntimeEnergyEnvelope",
-    "apply_runtime_energy_envelope",
     "derive_runtime_energy_envelope",
 ]

@@ -25,6 +25,7 @@ class RuntimeScenario:
     constellation: dict[str, Any] = field(default_factory=dict)
     serving_deployments: tuple[ServingDeploymentView, ...] = ()
     cost_power: dict[str, Any] = field(default_factory=dict)
+    energy_profile: dict[str, Any] = field(default_factory=dict)
     runtime_config: RuntimeStrategySpec = field(
         default_factory=lambda: RuntimeStrategySpec.from_value(None)
     )

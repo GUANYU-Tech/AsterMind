@@ -14,6 +14,7 @@ from ..contracts import (
     RuntimeStrategySpec,
     ServingDeploymentView,
 )
+from .runtime_energy_envelope import derive_runtime_energy_envelope
 from .runtime_scenario import RuntimeScenario
 
 
@@ -128,6 +129,11 @@ def build_runtime_scenario(
         "scope": trace_manifest.get("scope"),
         "valid_for_paper_main_results": bool(trace_manifest.get("valid_for_paper_main_results", False)),
     }
+    runtime_energy_profile = derive_runtime_energy_envelope(
+        cost_result,
+        resolved_hardware=resolved_hardware,
+        base_trace_options=simulation_config_payload.get("trace_options", {}),
+    )
     cost_power = {
         "evaluated": bool(cost_payload.get("evaluated", False)),
         "satellite_count": cost_payload.get("satellite_count"),
@@ -145,6 +151,7 @@ def build_runtime_scenario(
                 *_warnings_from_payload(workload_payload),
                 *_warnings_from_payload(simulation_payload),
                 *_warnings_from_payload(cost_payload),
+                *runtime_energy_profile.warnings,
                 *deployment.warnings,
             )
         )
@@ -168,6 +175,7 @@ def build_runtime_scenario(
         },
         serving_deployments=(deployment,),
         cost_power=cost_power,
+        energy_profile=runtime_energy_profile.to_dict(),
         runtime_config=runtime_strategy,
         provenance={
             "workload_bundle": {
@@ -187,6 +195,7 @@ def build_runtime_scenario(
             },
             "hardware_config": resolved_hardware_payload or hardware_payload,
             "cost_model": cost_power["provenance"],
+            "energy_profile": runtime_energy_profile.provenance,
             "runtime_interface_doc": RUNTIME_INTERFACE_DOC,
             "runtime_performance_model_doc": RUNTIME_PERFORMANCE_DOC,
             "runtime_optimization_model_doc": RUNTIME_OPTIMIZATION_DOC,

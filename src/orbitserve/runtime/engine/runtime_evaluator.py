@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 from ..contracts import RuntimePerformanceResult, RuntimeStrategySpec
@@ -93,6 +94,7 @@ def try_evaluate_runtime_performance(
             details={"valid_for_paper_main_results": False, "trace_model": trace_manifest.trace_model},
             warnings=(f"runtime trace loader failed: {exc}",),
         )
+    trace_bundle = _trace_bundle_with_scenario_energy(trace_bundle, scenario)
     deployment_catalog = build_runtime_deployment_catalog(
         scenario,
         satellite_catalog=tuple(getattr(trace_bundle, "satellite_catalog", ()) or ()),
@@ -122,6 +124,36 @@ def try_evaluate_runtime_performance(
         queue_model="per_satellite_fifo",
         link_model_status="surrogate_link_queue",
         energy_model_status="surrogate_soc",
+    )
+
+
+def _trace_bundle_with_scenario_energy(trace_bundle: Any, scenario: Any) -> Any:
+    """Overlay static scenario energy parameters onto Orbit sunlight windows."""
+
+    profile = getattr(scenario, "energy_profile", {}) or {}
+    if not isinstance(profile, dict) or not bool(profile.get("evaluated", False)):
+        return trace_bundle
+    fields = profile.get("trace_options") or {}
+    if not isinstance(fields, dict) or not fields:
+        return trace_bundle
+    windows = tuple(
+        {**dict(window), **fields}
+        for window in (getattr(trace_bundle, "energy_windows", ()) or ())
+    )
+    energy_trace = dict(getattr(trace_bundle, "energy_trace", {}) or {})
+    if windows:
+        energy_trace["energy_windows"] = list(windows)
+    satellite_ids = (
+        str(item.get("satellite_id"))
+        for item in (getattr(trace_bundle, "satellite_catalog", ()) or ())
+        if isinstance(item, dict) and item.get("satellite_id") is not None
+    )
+    initial_soc = float(fields.get("initial_soc", 0.8))
+    return replace(
+        trace_bundle,
+        energy_windows=windows,
+        energy_trace=energy_trace,
+        satellite_initial_soc={satellite_id: initial_soc for satellite_id in satellite_ids},
     )
 
 
