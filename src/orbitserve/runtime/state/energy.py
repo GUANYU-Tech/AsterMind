@@ -82,13 +82,6 @@ def _require_nonnegative_finite(value: Any, name: str) -> float:
     return parsed
 
 
-def _require_fraction(value: Any, name: str) -> float:
-    parsed = _require_nonnegative_finite(value, name)
-    if parsed > 1:
-        raise ValueError(f"{name} must be <= 1")
-    return parsed
-
-
 def _number(value: Any, name: str) -> float:
     if isinstance(value, bool):
         raise ValueError(f"{name} must be finite")
@@ -99,23 +92,6 @@ def _number(value: Any, name: str) -> float:
     if not math.isfinite(parsed):
         raise ValueError(f"{name} must be finite")
     return parsed
-
-
-@dataclass(frozen=True)
-class EnergyUpdateResult:
-    evaluated: bool = False
-    soc_before: float | None = None
-    soc_after: float | None = None
-    energy_violation: bool | None = None
-    delta_compute_j: float | None = None
-    delta_link_j: float | None = None
-    warnings: tuple[str, ...] = ("energy/SOC integration is not implemented",)
-    provenance: dict[str, Any] = field(default_factory=dict)
-
-    def to_dict(self) -> dict[str, Any]:
-        return to_jsonable(self)
-
-
 
 
 class EnergyWindowError(ValueError):
@@ -749,10 +725,6 @@ def _dynamic_energy_error_field(exc: Exception) -> str:
     return "dynamic_energy_inputs"
 
 
-def _clip01(value: float) -> float:
-    return max(0.0, min(1.0, value))
-
-
 def _validate_runtime_energy_window(window: dict[str, Any], *, satellite_id: str, time_s: float) -> None:
     missing = tuple(field for field in REQUIRED_RUNTIME_ENERGY_WINDOW_FIELDS if field not in window)
     if missing:
@@ -915,7 +887,6 @@ __all__ = [
     "DynamicEnergyBreakdown",
     "EnergyIntensity",
     "EnergyWindowError",
-    "EnergyUpdateResult",
     "REQUIRED_RUNTIME_ENERGY_WINDOW_FIELDS",
     "advance_satellite_energy",
     "compute_dynamic_energy_j",

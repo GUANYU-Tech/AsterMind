@@ -18,16 +18,6 @@ class RuntimeState:
     links: dict[str, LinkState] = field(default_factory=dict)
     sessions: dict[str, SessionState] = field(default_factory=dict)
     kv_caches: dict[str, KVCacheSatelliteState] = field(default_factory=dict)
-    request_records: list[Any] = field(default_factory=list)
-    decision_traces: list[dict[str, Any]] = field(default_factory=list)
-    module_status: dict[str, str] = field(
-        default_factory=lambda: {
-                "queue_model": "fifo_work_seconds",
-                "link_model": "not_implemented",
-                "energy_model": "not_implemented",
-                "kv_state": "not_implemented",
-            }
-    )
 
     def satellite_for(self, satellite_id: str, *, initial_soc: float = 0.8) -> SatelliteState:
         if satellite_id not in self.satellites:
@@ -73,9 +63,6 @@ class RuntimeState:
                 satellite_id: cache.to_dict()
                 for satellite_id, cache in self.kv_caches.items()
             },
-            "request_count": len(self.request_records),
-            "decision_trace_count": len(self.decision_traces),
-            "module_status": to_jsonable(self.module_status),
         }
 
 

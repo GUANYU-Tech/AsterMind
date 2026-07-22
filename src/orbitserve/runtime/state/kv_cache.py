@@ -16,15 +16,9 @@ if TYPE_CHECKING:
 class SessionState:
     session_id: str
     owner_satellite_id: str | None = None
-    owner_deployment_id: str | None = None
-    owner_satellite_ids: tuple[str, ...] = ()
     context_tokens: int = 0
-    kv_cache_tokens: int = 0
-    kv_cache_bytes: float = 0.0
-    kv_pages: int = 0
     context_version: int = 0
     last_seen_s: float = 0.0
-    replica_deployment_ids: tuple[str, ...] = ()
     last_session_action: str = "none"
     last_kv_event: dict[str, Any] = field(default_factory=dict)
 
@@ -79,32 +73,6 @@ class KVCacheEntryState:
     def to_dict(self) -> dict[str, Any]:
         return to_jsonable(self)
 
-def _kv_policy(runtime_strategy: Any) -> dict[str, Any]:
-    if runtime_strategy is None:
-        return {}
-    policy = _dict(getattr(runtime_strategy, "kv_policy", {}))
-    overrides = _dict(getattr(runtime_strategy, "hard_gate_overrides", {}))
-    override_policy = _dict(overrides.get("kv_policy"))
-    merged = {**policy, **override_policy}
-    for key in (
-        "kv_serve_actions_enabled",
-        "kv_page_size_tokens",
-        "kv_page_metadata_bytes",
-        "kv_fragmentation_reserve_fraction",
-        "eviction_policy",
-        "hbm_model",
-        "cards_per_satellite",
-        "hbm_capacity_gb_per_card",
-        "hbm_usable_fraction",
-        "model_weight_hbm_gb_per_card",
-        "activation_reserve_gb_per_card",
-        "runtime_workspace_gb_per_card",
-    ):
-        if key in overrides and key not in merged:
-            merged[key] = overrides[key]
-    return merged
-
-
 def _kv_page_size_tokens(kv_policy: dict[str, Any]) -> int | None:
     value = _optional_int(kv_policy.get("kv_page_size_tokens"))
     return value if value is not None and value > 0 else None
@@ -115,19 +83,6 @@ def _kv_required_pages(tokens: int | float, page_size_tokens: int | None) -> int
         return 1 if token_count > 0 else 0
     return int(math.ceil(token_count / page_size_tokens))
 
-
-def _satellite_hbm_capacity_bytes(kv_policy: dict[str, Any]) -> float | None:
-    capacity_gb = _optional_float(kv_policy.get("hbm_capacity_gb_per_card"))
-    cards_per_sat = _optional_int(kv_policy.get("cards_per_satellite"))
-    if capacity_gb is None or cards_per_sat is None or cards_per_sat <= 0:
-        return None
-    usable = _optional_float(kv_policy.get("hbm_usable_fraction"))
-    usable = usable if usable is not None else 1.0
-    model_gb = _optional_float(kv_policy.get("model_weight_hbm_gb_per_card")) or 0.0
-    activation_gb = _optional_float(kv_policy.get("activation_reserve_gb_per_card")) or 0.0
-    workspace_gb = _optional_float(kv_policy.get("runtime_workspace_gb_per_card")) or 0.0
-    per_card_available_gb = max(0.0, capacity_gb * usable - model_gb - activation_gb - workspace_gb)
-    return per_card_available_gb * cards_per_sat * (1024.0 ** 3)
 
 def _kv_accounted_bytes(
     tokens: int | float,
@@ -152,16 +107,17 @@ def _kv_accounted_bytes(
 def _sync_kv_cache_state_for_satellite(
     state: RuntimeState,
     satellite_id: str,
-    deployment: Any,
-    runtime_strategy: Any,
+    *,
+    capacity_tokens: int | None,
+    capacity_bytes: float | None,
+    kv_policy: dict[str, Any],
 ) -> None:
     if not satellite_id:
         return
-    kv_policy = _kv_policy(runtime_strategy)
     cache = state.kv_cache_for(satellite_id)
-    cache.capacity_bytes = _satellite_hbm_capacity_bytes(kv_policy)
-    cache.hbm_model = "satellite_hbm_bytes" if cache.capacity_bytes is not None else "satellite_token_capacity"
-    cache.capacity_tokens = _optional_int(getattr(deployment, "kv_cache_capacity_tokens", None))
+    cache.capacity_bytes = capacity_bytes
+    cache.hbm_model = "satellite_hbm_bytes" if capacity_bytes is not None else "satellite_token_capacity"
+    cache.capacity_tokens = capacity_tokens
     cache.page_size_tokens = _kv_page_size_tokens(kv_policy)
     cache.metadata_bytes_per_page = float(_optional_float(kv_policy.get("kv_page_metadata_bytes")) or 0.0)
     cache.fragmentation_reserve_fraction = float(_optional_float(kv_policy.get("kv_fragmentation_reserve_fraction")) or 0.0)
@@ -170,9 +126,10 @@ def _sync_kv_cache_state_for_satellite(
 
 def _admit_session_kv(
     state: RuntimeState,
-    deployment: Any,
-    runtime_strategy: Any,
     *,
+    capacity_tokens: int | None,
+    capacity_bytes: float | None,
+    kv_policy: dict[str, Any],
     session_id: str,
     satellite_id: str,
     tokens: int,
@@ -181,8 +138,13 @@ def _admit_session_kv(
 ) -> dict[str, Any]:
     """Admit one session on one satellite, evicting only under capacity pressure."""
 
-    kv_policy = _kv_policy(runtime_strategy)
-    _sync_kv_cache_state_for_satellite(state, satellite_id, deployment, runtime_strategy)
+    _sync_kv_cache_state_for_satellite(
+        state,
+        satellite_id,
+        capacity_tokens=capacity_tokens,
+        capacity_bytes=capacity_bytes,
+        kv_policy=kv_policy,
+    )
     cache = state.kv_cache_for(satellite_id)
     accounted_bytes = _kv_accounted_bytes(
         tokens,
@@ -231,10 +193,6 @@ def _admit_session_kv(
         victim_session = state.sessions.get(victim.session_id)
         if victim_session is not None and victim_session.owner_satellite_id == satellite_id:
             victim_session.owner_satellite_id = None
-            victim_session.owner_deployment_id = None
-            victim_session.owner_satellite_ids = ()
-            victim_session.kv_cache_tokens = 0
-            victim_session.kv_cache_bytes = 0.0
             victim_session.last_session_action = "evicted"
 
     entry = KVCacheEntryState(
@@ -247,7 +205,13 @@ def _admit_session_kv(
         evictable=current.evictable if current is not None else True,
     )
     cache.entries[session_id] = entry
-    _sync_kv_cache_state_for_satellite(state, satellite_id, deployment, runtime_strategy)
+    _sync_kv_cache_state_for_satellite(
+        state,
+        satellite_id,
+        capacity_tokens=capacity_tokens,
+        capacity_bytes=capacity_bytes,
+        kv_policy=kv_policy,
+    )
     return {
         "admitted": True,
         "admission": "hit" if current is not None else "admitted",
@@ -272,36 +236,8 @@ def _remove_session_kv(state: RuntimeState, satellite_id: str, session_id: str) 
     return True
 
 
-def _token_context_contract_error(request: dict[str, Any]) -> str | None:
-    new_user_tokens = request.get("new_user_tokens")
-    context_tokens_before_turn = request.get("context_tokens_before_turn")
-    if (
-        request.get("prompt_tokens_declared")
-        and new_user_tokens is not None
-        and context_tokens_before_turn is not None
-        and int(request["prompt_tokens"]) != int(new_user_tokens) + int(context_tokens_before_turn)
-    ):
-        return "token_context_contract_ambiguous"
-    return None
-
-
-def _deployment_entry_satellite(deployment: Any) -> str:
-    entries = tuple(getattr(deployment, "entry_satellite_ids", ()) or ())
-    if entries:
-        return str(entries[0])
-    members = tuple(getattr(deployment, "member_satellites", ()) or ())
-    return str(members[0]) if members else str(getattr(deployment, "deployment_id", ""))
-
-
 def _dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
-
-
-def _first_present(*values: Any) -> Any:
-    for value in values:
-        if value is not None:
-            return value
-    return None
 
 
 def _optional_float(value: Any) -> float | None:
@@ -320,20 +256,3 @@ def _optional_int(value: Any) -> int | None:
         return int(round(float(value)))
     except (TypeError, ValueError):
         return None
-
-
-def _optional_str(value: Any) -> str | None:
-    if value is None:
-        return None
-    text = str(value)
-    return text if text else None
-
-
-def _string_tuple(value: Any) -> tuple[str, ...]:
-    if value is None:
-        return ()
-    if isinstance(value, str):
-        return (value,)
-    if isinstance(value, (tuple, list, set)):
-        return tuple(str(item) for item in value if item is not None)
-    return (str(value),)

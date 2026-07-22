@@ -30,7 +30,6 @@ from ..state.runtime_state import RuntimeState
 from .runtime_timing import TTFT_DEFINITION, ttft_breakdown
 from ..state.kv_cache import (
     _admit_session_kv,
-    _kv_policy,
     _remove_session_kv,
 )
 from ..strategy.schedulers import SchedulerCandidate, get_scheduler
@@ -52,15 +51,6 @@ def run_trace_backed_runtime(
 
     state = RuntimeState()
     scope = normalize_trace_scope(scope)
-    state.module_status.update(
-        {
-            "queue_model": "per_satellite_fifo",
-            "link_model": "surrogate_link_queue",
-            "energy_model": "surrogate_soc_shadow_dvfs",
-            "kv_state": "per_satellite_capacity_pressure_lru",
-            "kv_hbm_model": "per_satellite_capacity",
-        }
-    )
     warnings = list(getattr(trace_bundle, "warnings", ()))
     warnings.extend(serving_profile.warnings)
     trace_model = str(getattr(trace_bundle, "trace_model", "surrogate_orbit_trace"))
@@ -122,6 +112,7 @@ def run_trace_backed_runtime(
         key=lambda item: (item[0]["arrival_time_s"], item[0]["request_id"]),
     )
     records: list[RuntimeRequestRecord] = []
+    decision_traces: list[dict[str, Any]] = []
     session_action_counts: dict[str, int] = {}
     max_hop_count = getattr(runtime_strategy, "max_hop_count", None)
     scheduler = get_scheduler(runtime_strategy)
@@ -166,15 +157,14 @@ def run_trace_backed_runtime(
                 trace_horizon_s=trace_horizon_s,
             )
         records.append(record)
-        state.request_records.append(record)
-        state.decision_traces.append(trace)
+        decision_traces.append(trace)
         if record.session_action:
             session_action_counts[record.session_action] = session_action_counts.get(record.session_action, 0) + 1
 
     warnings.append("trace-backed runtime is a preliminary surrogate model, not paper-main STK-calibrated simulation")
     return RuntimeEngineResult(
         records=tuple(records),
-        decision_traces=tuple(state.decision_traces),
+        decision_traces=tuple(decision_traces),
         state_summary=state.to_dict(),
         warnings=tuple(dict.fromkeys(warnings)),
         scope=scope,
@@ -1564,9 +1554,6 @@ def _clone_runtime_state_for_preview(state: RuntimeState) -> RuntimeState:
         links={key: replace(link) for key, link in state.links.items()},
         sessions={},
         kv_caches={},
-        request_records=[],
-        decision_traces=[],
-        module_status=dict(state.module_status),
     )
 
 
@@ -2201,7 +2188,6 @@ def _session_action(
     existed = session_id in state.sessions
     session = state.session_for(session_id)
     previous_owner = session.owner_satellite_id
-    deployment_id = str(getattr(deployment, "deployment_id", ""))
     cache = state.kv_cache_for(satellite_id)
     cache_hit = existed and session_id in cache.entries
     action = "sticky_kv_owner" if cache_hit else "recompute_context"
@@ -2210,8 +2196,9 @@ def _session_action(
     )
     admission = _admit_session_kv(
         state,
-        deployment,
-        runtime_strategy,
+        capacity_tokens=getattr(deployment, "kv_cache_capacity_tokens", None),
+        capacity_bytes=None,
+        kv_policy=dict(getattr(runtime_strategy, "kv_policy", {}) or {}),
         session_id=str(session_id),
         satellite_id=str(satellite_id),
         tokens=tokens,
@@ -2220,8 +2207,6 @@ def _session_action(
     )
     if not admission["admitted"]:
         session.owner_satellite_id = None
-        session.owner_deployment_id = None
-        session.owner_satellite_ids = ()
         session.last_session_action = "recompute_context"
         session.last_kv_event = dict(admission)
         session.last_seen_s = now_s
@@ -2230,10 +2215,6 @@ def _session_action(
         _remove_session_kv(state, previous_owner, str(session_id))
     entry = admission["entry"]
     session.owner_satellite_id = satellite_id
-    session.owner_deployment_id = deployment_id
-    session.owner_satellite_ids = (satellite_id,)
-    session.kv_cache_tokens = int(entry["tokens"])
-    session.kv_cache_bytes = float(entry["bytes"])
     session.context_tokens = tokens
     session.last_seen_s = now_s
     session.last_session_action = action

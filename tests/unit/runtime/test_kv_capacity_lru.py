@@ -25,8 +25,9 @@ class KVCapacityLRUTests(unittest.TestCase):
         self.state.session_for(session_id)
         return _admit_session_kv(
             self.state,
-            self.deployment,
-            self.strategy,
+            capacity_tokens=self.deployment.kv_cache_capacity_tokens,
+            capacity_bytes=None,
+            kv_policy={},
             session_id=session_id,
             satellite_id="sat-a",
             tokens=tokens,
@@ -65,8 +66,9 @@ class KVCapacityLRUTests(unittest.TestCase):
         self.admit("a", 8, 1.0)
         other = _admit_session_kv(
             self.state,
-            self.deployment,
-            self.strategy,
+            capacity_tokens=self.deployment.kv_cache_capacity_tokens,
+            capacity_bytes=None,
+            kv_policy={},
             session_id="b",
             satellite_id="sat-b",
             tokens=8,
