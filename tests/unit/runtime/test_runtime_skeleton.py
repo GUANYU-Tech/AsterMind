@@ -1,4 +1,5 @@
 import importlib
+from copy import deepcopy
 import unittest
 
 from orbitserve.runtime.contracts import ServingCapacityProfile
@@ -402,6 +403,30 @@ class RuntimeSkeletonTests(unittest.TestCase):
             build_candidate_selector(object())
         with self.assertRaisesRegex(TypeError, "scheduler value must be"):
             build_candidate_selector(type("NameOnly", (), {"name": "invalid"})())
+
+    def test_candidate_selection_does_not_mutate_engine_state_view(self):
+        candidate = SchedulerCandidate(
+            candidate_id="candidate",
+            action_type="local_compute",
+            feasible=True,
+            route_plan={"compute_satellite_id": "sat-a"},
+            predicted_ttft_s=1.0,
+            predicted_e2e_s=2.0,
+            predicted_queue_wait_s=0.0,
+            predicted_link_wait_s=0.0,
+            predicted_energy_risk=0.0,
+            predicted_soc_after=0.8,
+            hop_count=0,
+        )
+        state_view = {"candidates": (candidate.to_dict(),), "soc_min": 0.2}
+        before = deepcopy(state_view)
+
+        build_candidate_selector("shortest_path").select_action(
+            state=state_view,
+            request={"request_id": "request"},
+        )
+
+        self.assertEqual(state_view, before)
 
     def test_performance_skeleton_keeps_observed_metrics_null_without_trace(self):
         scenario, strategy, serving_performance = _runtime_scenario(self.runtime)

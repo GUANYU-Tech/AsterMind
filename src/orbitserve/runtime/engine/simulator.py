@@ -115,7 +115,7 @@ def run_trace_backed_runtime(
     decision_traces: list[dict[str, Any]] = []
     session_action_counts: dict[str, int] = {}
     max_hop_count = getattr(runtime_strategy, "max_hop_count", None)
-    scheduler = build_candidate_selector(runtime_strategy)
+    candidate_selector = build_candidate_selector(runtime_strategy)
     trace_horizon_s, horizon_warnings = _trace_horizon_s(trace_bundle)
     if trace_horizon_s is None:
         warnings.append("trace_horizon_missing")
@@ -149,7 +149,7 @@ def run_trace_backed_runtime(
                 trace_bundle=trace_bundle,
                 deployment=deployment,
                 policy=policy,
-                scheduler=scheduler,
+                candidate_selector=candidate_selector,
                 runtime_strategy=runtime_strategy,
                 max_hop_count=max_hop_count,
                 scope=scope,
@@ -223,7 +223,7 @@ def _evaluate_trace_request(
     trace_bundle: Any,
     deployment: ServingCapacityProfile,
     policy: str,
-    scheduler: Any,
+    candidate_selector: Any,
     runtime_strategy: Any,
     max_hop_count: int | None,
     scope: str,
@@ -371,7 +371,7 @@ def _evaluate_trace_request(
         trace_bundle=trace_bundle,
         route_rows=route_rows,
         request=request,
-        scheduler=scheduler,
+        candidate_selector=candidate_selector,
         runtime_strategy=runtime_strategy,
         prefill_rate_per_sat=prefill_rate_per_sat,
         decode_rate_per_sat=decode_rate_per_sat,
@@ -1059,7 +1059,7 @@ def _select_candidate(
     trace_bundle: Any,
     route_rows: tuple[Any, ...],
     request: dict[str, Any],
-    scheduler: Any,
+    candidate_selector: Any,
     runtime_strategy: Any,
     prefill_rate_per_sat: float,
     decode_rate_per_sat: float,
@@ -1083,7 +1083,7 @@ def _select_candidate(
     )
     if not candidates:
         return None
-    decision = scheduler.select_action(
+    decision = candidate_selector.select_action(
         state={
             "runtime_strategy": _jsonable_strategy(runtime_strategy),
             "candidates": tuple(candidate.to_dict() for candidate in candidates),
