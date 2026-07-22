@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ...common import to_jsonable
-from ..contracts import ServingDeploymentView
+from ..contracts import ServingCapacityProfile
 
 
 @dataclass(frozen=True)
@@ -23,7 +23,7 @@ class RuntimeScenario:
     gateways: tuple[dict[str, Any], ...] = ()
     simulation_trace_ref: dict[str, Any] = field(default_factory=dict)
     constellation: dict[str, Any] = field(default_factory=dict)
-    serving_profile: ServingDeploymentView | None = None
+    serving_profile: ServingCapacityProfile | None = None
     energy_profile: dict[str, Any] = field(default_factory=dict)
     provenance: dict[str, Any] = field(default_factory=dict)
     warnings: tuple[str, ...] = ()

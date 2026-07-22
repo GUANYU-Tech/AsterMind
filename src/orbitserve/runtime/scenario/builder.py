@@ -10,7 +10,7 @@ from ...common import to_jsonable
 from ..contracts import (
     RUNTIME_INTERFACE_DOC,
     RUNTIME_PERFORMANCE_DOC,
-    ServingDeploymentView,
+    ServingCapacityProfile,
 )
 from .model import RuntimeScenario
 
@@ -73,8 +73,7 @@ def build_runtime_scenario(
                 _dict(manifest.get("time")).get("time_horizon_s"),
             )
         )
-    serving_profile = ServingDeploymentView.from_inputs(
-        deployment_id="deployment_0",
+    serving_profile = ServingCapacityProfile.from_inputs(
         serving_spec=serving_spec,
         throughput_estimate=serving_throughput,
     )

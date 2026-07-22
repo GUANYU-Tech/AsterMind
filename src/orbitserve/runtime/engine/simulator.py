@@ -23,7 +23,7 @@ from .routing import (
     query_link_sample_at,
     sample_route_leg,
 )
-from ..contracts import ServingDeploymentView
+from ..contracts import ServingCapacityProfile
 from .runtime_eligibility import ComputeEligibilitySet, build_compute_eligibility_set
 from ..metrics.records import RuntimeRequestRecord
 from ..state.runtime_state import RuntimeState
@@ -41,7 +41,7 @@ from ...orbit import TRACE_BACKED_RUNTIME_SURROGATE_SCOPE, normalize_trace_scope
 def run_trace_backed_runtime(
     *,
     requests: tuple[dict[str, Any], ...],
-    serving_profile: ServingDeploymentView,
+    serving_profile: ServingCapacityProfile,
     runtime_strategy: Any,
     trace_bundle: Any,
     time_horizon_s: float | None = None,
@@ -221,7 +221,7 @@ def _evaluate_trace_request(
     request: dict[str, Any],
     raw_request: dict[str, Any],
     trace_bundle: Any,
-    deployment: ServingDeploymentView,
+    deployment: ServingCapacityProfile,
     policy: str,
     scheduler: Any,
     runtime_strategy: Any,
@@ -517,7 +517,6 @@ def _evaluate_trace_request(
         )
         record = _post_compute_route_failure_record(
             request=request,
-            deployment_id=deployment.deployment_id,
             action_type=action_type,
             route_plan=route_plan,
             inbound_path=inbound_path,
@@ -583,7 +582,6 @@ def _evaluate_trace_request(
         )
         record = _post_compute_route_failure_record(
             request=request,
-            deployment_id=deployment.deployment_id,
             action_type=action_type,
             route_plan=route_plan,
             inbound_path=inbound_path,
@@ -670,7 +668,6 @@ def _evaluate_trace_request(
         )
             record = _post_compute_route_failure_record(
                 request=request,
-                deployment_id=deployment.deployment_id,
                 action_type=action_type,
                 route_plan=replace(route_plan, outbound_legs=sampled_first_legs),
                 inbound_path=tuple((*inbound_path, *first_path)),
@@ -748,7 +745,6 @@ def _evaluate_trace_request(
         request_id=request["request_id"],
         session_id=request.get("session_id"),
         arrival_time_s=arrival_s,
-        deployment_id=deployment.deployment_id,
         action_type=action_type,
         completed=True,
         prompt_tokens=request["prompt_tokens"],
@@ -1874,13 +1870,17 @@ def _build_post_compute_outbound_plan(
 
 def _compute_eligibility_at(
     *,
-    deployment: ServingDeploymentView,
+    deployment: ServingCapacityProfile,
     trace_bundle: Any,
     state: RuntimeState,
     time_s: float,
 ) -> ComputeEligibilitySet:
     runtime_exclusions: dict[str, str] = {}
-    for satellite_id in tuple(getattr(deployment, "member_satellites", ()) or ()):
+    for satellite_id in tuple(
+        str(item.get("satellite_id"))
+        for item in (getattr(trace_bundle, "satellite_catalog", ()) or ())
+        if isinstance(item, dict) and item.get("satellite_id") is not None
+    ):
         satellite_id = str(satellite_id)
         try:
             preview = replace(state.satellite_for(satellite_id))
@@ -1893,7 +1893,6 @@ def _compute_eligibility_at(
             runtime_exclusions[satellite_id] = "energy_state_compute_ineligible"
             continue
     return build_compute_eligibility_set(
-        deployment=deployment,
         satellite_catalog=tuple(getattr(trace_bundle, "satellite_catalog", ()) or ()),
         runtime_exclusions=runtime_exclusions,
         evaluated_at_s=time_s,
@@ -1913,7 +1912,6 @@ def _route_node_ids(path: tuple[dict[str, Any], ...]) -> tuple[str, ...]:
 def _post_compute_route_failure_record(
     *,
     request: dict[str, Any],
-    deployment_id: str,
     action_type: str,
     route_plan: Any,
     inbound_path: tuple[dict[str, Any], ...],
@@ -1948,7 +1946,6 @@ def _post_compute_route_failure_record(
         request_id=request["request_id"],
         session_id=request.get("session_id"),
         arrival_time_s=arrival_s,
-        deployment_id=deployment_id,
         action_type=action_type,
         completed=False,
         uncompleted_stage="delivery",
@@ -2084,7 +2081,6 @@ def _fallback_record(
         request_id=request["request_id"],
         session_id=request.get("session_id"),
         arrival_time_s=request["arrival_time_s"],
-        deployment_id=None,
         action_type="ground_fallback",
         completed=completed,
         uncompleted_stage=None if completed else _failure_stage(reason),
@@ -2120,7 +2116,6 @@ def _reject_record(
         request_id=request["request_id"],
         session_id=request.get("session_id"),
         arrival_time_s=request["arrival_time_s"],
-        deployment_id=None,
         action_type="reject_drop",
         completed=False,
         uncompleted_stage=_failure_stage(reason),
@@ -2661,15 +2656,8 @@ def try_evaluate_runtime_performance(
 
 
 def _serving_profile_for_trace(scenario: Any, trace_bundle: Any) -> Any:
-    profile = getattr(scenario, "serving_profile", None)
-    if profile is None:
-        return None
-    satellite_ids = tuple(
-        str(item.get("satellite_id"))
-        for item in (getattr(trace_bundle, "satellite_catalog", ()) or ())
-        if isinstance(item, dict) and item.get("satellite_id") is not None
-    )
-    return replace(profile, member_satellites=satellite_ids)
+    del trace_bundle
+    return getattr(scenario, "serving_profile", None)
 
 
 def _trace_bundle_with_scenario_energy(trace_bundle: Any, scenario: Any) -> Any:

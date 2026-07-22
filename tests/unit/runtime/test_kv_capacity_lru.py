@@ -1,15 +1,13 @@
 import unittest
 
 from orbitserve.runtime.engine.simulator import _session_action
-from orbitserve.runtime.contracts import ServingDeploymentView
+from orbitserve.runtime.contracts import ServingCapacityProfile
 from orbitserve.runtime.state.kv_cache import _admit_session_kv
 from orbitserve.runtime.state.runtime_state import RuntimeState
 
 
 def _deployment(capacity_tokens=10):
-    return ServingDeploymentView(
-        deployment_id="deployment-a",
-        member_satellites=("sat-a",),
+    return ServingCapacityProfile(
         kv_cache_capacity_tokens=capacity_tokens,
         kv_cache_bytes_per_token=1.0,
     )

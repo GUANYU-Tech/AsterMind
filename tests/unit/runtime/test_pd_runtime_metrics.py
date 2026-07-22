@@ -8,7 +8,6 @@ def _record(request_id: str, **overrides):
     values = {
         "request_id": request_id,
         "arrival_time_s": 0.0,
-        "deployment_id": "deployment-0",
         "action_type": "local_compute",
         "completed": True,
         "prompt_tokens": 128,

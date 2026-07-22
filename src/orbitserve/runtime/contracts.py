@@ -292,43 +292,37 @@ class RuntimeStrategySpec:
         return to_jsonable(self)
 
 @dataclass(frozen=True)
-class ServingDeploymentView:
-    deployment_id: str
-    member_satellites: tuple[str, ...] = ()
+class ServingCapacityProfile:
     serving_spec: dict[str, Any] = field(default_factory=dict)
     throughput_estimate: dict[str, Any] = field(default_factory=dict)
     evaluated: bool = False
     feasible: bool | None = None
-    request_throughput_per_s: float | None = None
     prefill_tokens_per_s: float | None = None
     decode_tokens_per_s: float | None = None
     kv_cache_capacity_tokens: int | None = None
     kv_cache_bytes_per_token: float | None = None
-    satellites_per_deployment: int | None = None
-    stage_satellite_count: int | None = None
     internal_comm_summary: dict[str, Any] = field(default_factory=dict)
     internal_comm_accounting: str = "embedded"
     warnings: tuple[str, ...] = ()
 
     @classmethod
-    def from_value(cls, value: Any, *, deployment_id: str = "deployment_0") -> "ServingDeploymentView":
+    def from_value(cls, value: Any) -> "ServingCapacityProfile":
         payload = _mapping_from_result(value)
         details = _dict(payload.get("details"))
         if details:
             throughput_payload = {**details, **{key: item for key, item in payload.items() if item is not None}}
         else:
             throughput_payload = payload
-        return cls.from_inputs(deployment_id=deployment_id, throughput_estimate=throughput_payload)
+        return cls.from_inputs(throughput_estimate=throughput_payload)
 
     @classmethod
     def from_inputs(
         cls,
         *,
-        deployment_id: str,
         serving_spec: Any = None,
         throughput_estimate: Any = None,
         internal_comm_accounting: str = "embedded",
-    ) -> "ServingDeploymentView":
+    ) -> "ServingCapacityProfile":
         serving_payload = _mapping_from_result(serving_spec)
         throughput_payload = _mapping_from_result(throughput_estimate)
         internal_comm_summary = {
@@ -351,27 +345,14 @@ class ServingDeploymentView:
             if key in throughput_payload
         }
         return cls(
-            deployment_id=deployment_id,
-            member_satellites=tuple(
-                str(item)
-                for item in _first_present(
-                    throughput_payload.get("member_satellites"),
-                    serving_payload.get("member_satellites"),
-                    (),
-                )
-                or ()
-            ),
             serving_spec=serving_payload,
             throughput_estimate=throughput_payload,
             evaluated=bool(throughput_payload.get("evaluated", False)),
             feasible=_optional_bool(throughput_payload.get("feasible")),
-            request_throughput_per_s=_optional_float(throughput_payload.get("request_throughput_per_s")),
             prefill_tokens_per_s=_optional_float(throughput_payload.get("prefill_tokens_per_s")),
             decode_tokens_per_s=_optional_float(throughput_payload.get("decode_tokens_per_s")),
             kv_cache_capacity_tokens=_optional_int(throughput_payload.get("kv_cache_capacity_tokens")),
             kv_cache_bytes_per_token=_optional_float(throughput_payload.get("kv_cache_bytes_per_token")),
-            satellites_per_deployment=_optional_int(throughput_payload.get("satellites_per_deployment")),
-            stage_satellite_count=_optional_int(throughput_payload.get("stage_satellite_count")),
             internal_comm_summary=internal_comm_summary,
             internal_comm_accounting=internal_comm_accounting,
             warnings=_warnings_from_payload(throughput_payload),

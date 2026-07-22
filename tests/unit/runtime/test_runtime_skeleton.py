@@ -4,7 +4,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
-from orbitserve.runtime.contracts import ServingDeploymentView
+from orbitserve.runtime.contracts import ServingCapacityProfile
 
 from orbitserve.experiments import load_experiment_spec, run_experiment
 from orbitserve.dse.runtime_optimization import optimize_runtime_strategy
@@ -43,7 +43,7 @@ def _runtime_scenario(runtime, *, requests=None, sessions=None):
             "weights": {"latency": 1.0, "energy": 0.5, "queue": 1.0, "fallback": 10.0},
         }
     )
-    deployment = ServingDeploymentView.from_value(performance)
+    deployment = ServingCapacityProfile.from_value(performance)
     scenario = runtime.RuntimeScenario(
         scenario_id=spec.experiment_id,
         time_horizon_s=spec.simulation.duration_s,

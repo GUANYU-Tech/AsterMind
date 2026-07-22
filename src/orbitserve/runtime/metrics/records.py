@@ -15,7 +15,7 @@ _SECTION_DEFAULTS: dict[str, dict[str, Any]] = {
     },
     "decision": {
         "strategy": None, "action_type": "reject_drop", "action_components": (),
-        "deployment_id": None, "access_satellite_id": None,
+        "access_satellite_id": None,
         "serving_satellite_id": None, "dvfs_scale": None,
         "fallback_used": False, "deferred": False, "defer_until_s": None,
         "session_action": None, "shadow_strategy": None, "shadow_strategies": (),
