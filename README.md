@@ -30,10 +30,9 @@ orbitserve.experiments.cli
   -> load and materialize a canonical workload bundle
   -> evaluate_materialized_design
   -> Architecture + Orbit + Serving
-  -> build RuntimeScenario
-  -> evaluate Runtime
-  -> energy alignment
-  -> optional runtime optimization / DSE
+  -> build RuntimeScenario, including the Runtime energy profile
+  -> evaluate one fixed RuntimeStrategySpec deterministically
+  -> optional DSE runtime-matrix search
   -> structured output
 ```
 

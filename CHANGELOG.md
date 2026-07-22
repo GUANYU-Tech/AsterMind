@@ -61,7 +61,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Renamed the former trace domain to `orbit` and limited it to constellation geometry, visibility, sunlight, and trace generation.
 - Consolidated static per-satellite hardware configuration in `architecture/hardware.py`.
 - Standardized workload input on one unversioned canonical bundle contract.
-- Reorganized runtime code around contracts, scenarios, deployments, schedulers, engines, records, metrics, and energy state.
+- Reorganized Runtime around one `RuntimeScenario`, one fixed `RuntimeStrategySpec`, request-level execution, per-satellite state, records, metrics, and energy state.
+- Moved runtime-strategy search into DSE and made fixed-design evaluation execute exactly the configured strategy.
+- Aligned package metadata and test imports with the `runtime/engine`, `runtime/scenario`, `runtime/state`, `runtime/strategy`, and `runtime/metrics` package tree.
 - Reorganized tests into `unit`, `integration`, `smoke`, and `slow` suites.
 - Synchronized documentation and examples with the current source layout and public interfaces.
 
@@ -71,6 +73,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Removed ISL inventory modeling from Orbit.
 - Removed workload-driven hardware sizing and obsolete runtime contention configuration.
 - Removed confirmed unused scripts, duplicate tests, generated caches, and checked-in experiment outputs.
+- Removed the compute-only Runtime path, deployment catalogs, PD placement search, duplicate queue state, planned-versus-observed energy alignment, and unused decision DTOs.
+- Removed fixed-design runtime-strategy optimization; Runtime strategy search is now owned by DSE.
 
 ### Fixed
 
@@ -79,6 +83,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Verification
 
-- Passed 398 tests, including all 48 slow tests.
-- Verified fixed-design, trace-backed runtime, runtime optimization, terrestrial baseline, and DSE paths.
+- Passed 166 unit tests and 22 smoke tests after the Runtime refactor.
+- Verified the fixed-design, trace-backed Runtime, and DSE integration paths without running the slow suite in this refactor cycle.
 - Kept `results/` and `scripts/` empty in the source repository.

@@ -13,7 +13,7 @@ from ..contracts import (
     RuntimeStrategySpec,
     ServingDeploymentView,
 )
-from .runtime_energy_envelope import derive_runtime_energy_envelope
+from .runtime_energy_profile import derive_runtime_energy_profile
 from .runtime_scenario import RuntimeScenario
 
 
@@ -128,7 +128,7 @@ def build_runtime_scenario(
         "scope": trace_manifest.get("scope"),
         "valid_for_paper_main_results": bool(trace_manifest.get("valid_for_paper_main_results", False)),
     }
-    runtime_energy_profile = derive_runtime_energy_envelope(
+    runtime_energy_profile = derive_runtime_energy_profile(
         cost_result,
         resolved_hardware=resolved_hardware,
         base_trace_options=simulation_config_payload.get("trace_options", {}),

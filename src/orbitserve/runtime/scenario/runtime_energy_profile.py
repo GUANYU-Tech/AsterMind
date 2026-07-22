@@ -9,7 +9,7 @@ from typing import Any
 from ...common import to_jsonable
 
 
-COST_ENERGY_TRACE_OPTION_KEYS = (
+RUNTIME_ENERGY_OPTION_KEYS = (
     "battery_capacity_j",
     "battery_charge_efficiency",
     "battery_discharge_efficiency",
@@ -27,7 +27,7 @@ COST_ENERGY_TRACE_OPTION_KEYS = (
 
 
 @dataclass(frozen=True)
-class RuntimeEnergyEnvelope:
+class RuntimeEnergyProfile:
     evaluated: bool = False
     trace_options: dict[str, Any] = field(default_factory=dict)
     warnings: tuple[str, ...] = ()
@@ -37,26 +37,26 @@ class RuntimeEnergyEnvelope:
         return to_jsonable(self)
 
 
-def derive_runtime_energy_envelope(
+def derive_runtime_energy_profile(
     cost_result: Any,
     *,
     resolved_hardware: Any = None,
     base_trace_options: dict[str, Any] | None = None,
-) -> RuntimeEnergyEnvelope:
+) -> RuntimeEnergyProfile:
     """Project cost-model battery/solar/power closure into runtime trace options."""
 
     cost_payload = _mapping(cost_result)
     if not bool(cost_payload.get("evaluated", False)):
-        return RuntimeEnergyEnvelope(
+        return RuntimeEnergyProfile(
             evaluated=False,
-            warnings=("runtime energy envelope was not derived because cost.evaluated=false",),
+            warnings=("runtime energy profile was not derived because cost.evaluated=false",),
             provenance={"source": "cost_hardware_orbit_runtime", "cost_evaluated": False},
         )
     single = _dict(cost_payload.get("single_satellite"))
     if not single:
-        return RuntimeEnergyEnvelope(
+        return RuntimeEnergyProfile(
             evaluated=False,
-            warnings=("runtime energy envelope was not derived because cost.single_satellite is missing",),
+            warnings=("runtime energy profile was not derived because cost.single_satellite is missing",),
             provenance={"source": "cost_hardware_orbit_runtime", "cost_evaluated": True},
         )
     single_provenance = _dict(single.get("provenance"))
@@ -79,9 +79,9 @@ def derive_runtime_energy_envelope(
         if value is None or not math.isfinite(value) or value <= 0
     ]
     if missing:
-        return RuntimeEnergyEnvelope(
+        return RuntimeEnergyProfile(
             evaluated=False,
-            warnings=(f"runtime energy envelope was not derived because cost fields are missing/nonpositive: {', '.join(missing)}",),
+            warnings=(f"runtime energy profile was not derived because cost fields are missing/nonpositive: {', '.join(missing)}",),
             provenance={"source": "cost_hardware_orbit_runtime", "missing_fields": missing},
         )
 
@@ -155,10 +155,10 @@ def derive_runtime_energy_envelope(
         if value is None or not math.isfinite(value) or value < 0
     )
     if invalid_contract:
-        return RuntimeEnergyEnvelope(
+        return RuntimeEnergyProfile(
             evaluated=False,
             warnings=(
-                "runtime energy envelope was not derived because the event-incremental energy contract "
+                "runtime energy profile was not derived because the event-incremental energy contract "
                 f"is missing/invalid: {', '.join(invalid_contract)}",
             ),
             provenance={"source": "cost_hardware_orbit_runtime", "invalid_contract_fields": invalid_contract},
@@ -188,14 +188,14 @@ def derive_runtime_energy_envelope(
         trace_options["soc_min"] = _clip01(1.0 - dod_max)
     orbit_period_s = _first_float(base_options.get("orbit_period_s"), 5700.0)
     if orbit_period_s is None or not math.isfinite(orbit_period_s) or orbit_period_s <= 0:
-        return RuntimeEnergyEnvelope(
+        return RuntimeEnergyProfile(
             evaluated=False,
-            warnings=("runtime energy envelope was not derived because orbit_period_s is invalid",),
+            warnings=("runtime energy profile was not derived because orbit_period_s is invalid",),
             provenance={"source": "cost_hardware_orbit_runtime", "invalid_contract_fields": ["orbit_period_s"]},
         )
 
     warnings = [
-        "runtime energy envelope uses event_incremental_v1: always-on baseline plus per-event compute/link energy",
+        "runtime energy profile uses event_incremental_v1: always-on baseline plus per-event compute/link energy",
     ]
     for key, next_value in trace_options.items():
         if key in base_options and (
@@ -203,14 +203,14 @@ def derive_runtime_energy_envelope(
             if isinstance(next_value, str)
             else _optional_float(base_options.get(key)) != _optional_float(next_value)
         ):
-            warnings.append(f"simulation.trace_options.{key} overridden by cost/hardware runtime energy envelope")
+            warnings.append(f"simulation.trace_options.{key} overridden by cost/hardware runtime energy profile")
     warnings.append(
         "runtime compute/link per-request energy coefficients are baseline-exclusive and forced from cost/hardware"
     )
 
     provenance = {
         "source": "cost_hardware_orbit_runtime",
-        "adapter": "orbitserve.runtime_energy_envelope.derive_runtime_energy_envelope",
+        "adapter": "orbitserve.runtime_energy_profile.derive_runtime_energy_profile",
         "cost_fields": {
             "battery_nameplate_bol_wh": battery_wh,
             "solar_nameplate_bol_w": solar_w,
@@ -247,9 +247,9 @@ def derive_runtime_energy_envelope(
             "sizing_mode": power_sizing_mode,
             "uses_runtime_served_requests": False,
         },
-        "overrides": tuple(key for key in COST_ENERGY_TRACE_OPTION_KEYS if key in trace_options),
+        "overrides": tuple(key for key in RUNTIME_ENERGY_OPTION_KEYS if key in trace_options),
     }
-    return RuntimeEnergyEnvelope(
+    return RuntimeEnergyProfile(
         evaluated=True,
         trace_options=trace_options,
         warnings=tuple(dict.fromkeys(warnings)),
@@ -295,7 +295,7 @@ def _clip01(value: float) -> float:
 
 
 __all__ = [
-    "COST_ENERGY_TRACE_OPTION_KEYS",
-    "RuntimeEnergyEnvelope",
-    "derive_runtime_energy_envelope",
+    "RUNTIME_ENERGY_OPTION_KEYS",
+    "RuntimeEnergyProfile",
+    "derive_runtime_energy_profile",
 ]

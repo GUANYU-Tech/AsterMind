@@ -19,9 +19,9 @@ from orbitserve.baselines.ground.runtime import (
 from orbitserve.experiments import load_experiment_spec, run_experiment
 from orbitserve.runtime import RuntimeScenario, RuntimeStrategySpec
 from orbitserve.experiments.runtime_dispatch import evaluate_runtime_performance
-from orbitserve.runtime.engines.trace_backed import run_trace_backed_runtime
-from orbitserve.runtime.runtime_metrics import aggregate_runtime_records
-from orbitserve.runtime.runtime_records import RuntimeRequestRecord
+from orbitserve.runtime.engine.trace_backed import run_trace_backed_runtime
+from orbitserve.runtime.metrics.runtime_metrics import aggregate_runtime_records
+from orbitserve.runtime.metrics.runtime_records import RuntimeRequestRecord
 from orbitserve.runtime import RuntimeStrategySpec, get_scheduler
 
 
@@ -1205,7 +1205,6 @@ class GroundBaselineRuntimeTests(unittest.TestCase):
         result = run_experiment(spec)
         payload = result.to_dict()
         runtime = payload["performance"]["details"]["runtime"]
-        optimizer = payload["performance"]["details"]["runtime_optimization"]
 
         self.assertEqual(
             payload["module_status"]["simulation"],
@@ -1215,14 +1214,12 @@ class GroundBaselineRuntimeTests(unittest.TestCase):
             payload["module_status"]["serving_throughput"],
             "ground_service_model_evaluated",
         )
-        self.assertEqual(payload["module_status"]["runtime_optimization"], "disabled")
         self.assertIsNotNone(payload["performance"]["ttft_p99_s"])
         self.assertIsNotNone(payload["performance"]["e2e_p99_s"])
         self.assertEqual(
             payload["performance"]["link_delay_p95_s"],
             runtime["runtime_metrics"]["ground_network_delay_p95_s"],
         )
-        self.assertFalse(optimizer["scheduler_search_space"]["enabled"])
         self.assertEqual(
             runtime["runtime_metrics"]["ground_output_reservation_exceeded_count"],
             0,

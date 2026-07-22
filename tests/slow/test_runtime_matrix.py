@@ -62,7 +62,7 @@ def _matrix_context(design_id, *, served, e2e, annualized_cost):
         },
         runtime_scenario=SimpleNamespace(
             scenario_id=design_id,
-            serving_deployments=(),
+            serving_profile=None,
             provenance={},
         ),
         current_scheduler={"policy": "local_only"},
@@ -167,34 +167,6 @@ class DSERuntimeMatrixTests(unittest.TestCase):
         self.assertTrue(spec.runtime_matrix.static_screening["include_static_frontier"])
         self.assertTrue(spec.runtime_matrix.closed_loop["prefer_static_candidates"])
 
-    def test_runtime_matrix_scope_candidate_schema_accepts_documented_names(self):
-        spec = DSESpec.from_dict(
-            {
-                "enabled": True,
-                "runtime_matrix": {
-                    "enabled": True,
-                    "placement_scope_search_space": {
-                        "scope_candidates": [
-                            {
-                                "placement_scope_strategy_id": "same_plane_overflow.v1",
-                                "placement_scope": "hybrid_template_mix",
-                                "hybrid_template": {
-                                    "template_id": "same_plane_plus_cross_plane_overflow",
-                                    "max_pairs_per_prefill_group": 2,
-                                },
-                            }
-                        ]
-                    },
-                },
-            }
-        )
-
-        candidate = spec.runtime_matrix.placement_scope_candidates[0]
-        self.assertEqual(candidate["strategy_id"], "same_plane_overflow.v1")
-        self.assertEqual(candidate["placement_scope_strategy_id"], "same_plane_overflow.v1")
-        self.assertEqual(candidate["pd_placement"]["placement_scope"], "hybrid_template_mix")
-        self.assertEqual(candidate["pd_placement"]["hybrid_template"]["template_id"], "same_plane_plus_cross_plane_overflow")
-
     def test_runtime_matrix_disabled_preserves_unevaluated_behavior(self):
         result = run_dse(_base_spec())
         payload = result.to_dict()
@@ -208,7 +180,6 @@ class DSERuntimeMatrixTests(unittest.TestCase):
         self.assertEqual(payload["frontier"]["provenance"]["source"], "static_slo_proxy")
         self.assertFalse(payload["frontier"]["valid_for_paper_main_results"])
         self.assertTrue(payload["metrics"]["pareto_frontier_evaluated"])
-        self.assertIn("runtime_current_strategy", payload["rows"][0]["performance"]["details"])
         self.assertTrue(payload["rows"][0]["slo"]["evaluated"])
         self.assertIsNotNone(payload["rows"][0]["slo"]["served_ratio"])
         self.assertIsNotNone(payload["rows"][0]["performance"]["ttft_p95_s"])
@@ -337,132 +308,6 @@ class DSERuntimeMatrixTests(unittest.TestCase):
         }
         self.assertEqual(selected_ids, selected_row_ids)
 
-    def test_runtime_matrix_searches_pd_scope_candidates_per_policy(self):
-        matrix_spec = DSERuntimeMatrixSpec(
-            enabled=True,
-            include_current_policy=False,
-            policies=("local_only", "shortest_path"),
-            placement_scope_candidates=(
-                {"strategy_id": "scope_intra", "pd_placement": {"placement_scope": "intra_cluster"}},
-                {"strategy_id": "scope_cross", "pd_placement": {"placement_scope": "cross_plane"}},
-            ),
-            allow_preliminary_runtime_metrics=True,
-            ignore_optional_cost=True,
-        )
-        deployment = SimpleNamespace(
-            serving_spec={"pd_mode": "disaggregated"},
-            throughput_estimate={
-                "pd_mode": "disaggregated",
-                "evaluated": True,
-                "feasible": True,
-                "prefill_tokens_per_s": 100.0,
-                "decode_tokens_per_s": 50.0,
-                "prefill_deployment_group_count": 1,
-                "decode_deployment_group_count": 2,
-                "satellites_per_deployment": 1,
-                "stage_satellite_count": 1,
-                "serving_satellite_budget_count": 3,
-                "satellite_budget_mode": "fixed_total",
-                "comparison_group_id": "pd-scope-budget",
-                "prefill_pool_satellites": 1,
-                "decode_pool_satellites": 2,
-                "kv_cache_bytes_per_token": 16.0,
-                "kv_cache_capacity_tokens": 1000,
-            },
-        )
-        scenario = SimpleNamespace(
-            scenario_id="runtime_scenario",
-            constellation={
-                "satellite_count": 3,
-                "satellite_catalog": (
-                    {"satellite_id": "sat-p0", "orbital_set_name": "walker", "plane_index": 0, "cell_index": 0, "cluster_id": "c0"},
-                    {"satellite_id": "sat-d0", "orbital_set_name": "walker", "plane_index": 0, "cell_index": 0, "cluster_id": "c0"},
-                    {"satellite_id": "sat-d1", "orbital_set_name": "walker", "plane_index": 1, "cell_index": 1, "cluster_id": "c1"},
-                ),
-            },
-            serving_deployments=(deployment,),
-            provenance={},
-        )
-        context = DSEDesignContext(
-            design_id="design_0",
-            design_row={
-                "performance": {
-                    "details": {
-                        "serving_satellite_budget_count": 3,
-                        "satellite_budget_mode": "fixed_total",
-                        "comparison_group_id": "pd-scope-budget",
-                        "prefill_pool_satellites": 1,
-                        "decode_pool_satellites": 2,
-                    }
-                }
-            },
-            runtime_scenario=scenario,
-            current_scheduler={"policy": "local_only"},
-            cost_result={"total_cost_usd": 100.0, "annualized_cost_usd_per_year": 10.0},
-        )
-        observed_scopes = []
-
-        def fake_evaluate_runtime_performance(scoped_scenario, strategy):
-            scoped_deployment = scoped_scenario.serving_deployments[0]
-            scope = scoped_deployment.throughput_estimate["pd_placement"]["placement_scope"]
-            observed_scopes.append((scope, strategy.policy))
-            return SimpleNamespace(
-                to_dict=lambda: {
-                    "evaluated": True,
-                    "runtime_metrics": {
-                        "served_ratio": 1.0 if scope == "intra_cluster" else 0.9,
-                        "ttft_p95_s": 1.0,
-                        "e2e_p95_s": 2.0 if scope == "intra_cluster" else 3.0,
-                        "scope": "trace_backed_runtime_surrogate",
-                        "trace_model": "surrogate_orbit_trace",
-                        "valid_for_paper_main_results": False,
-                    },
-                    "slo": {"served_ratio": 1.0 if scope == "intra_cluster" else 0.9},
-                    "performance": {"ttft_p95_s": 1.0, "e2e_p95_s": 2.0 if scope == "intra_cluster" else 3.0},
-                    "serving": {"provenance": {"placement_scope": scope}},
-                    "request_records": [{"pd_pairing_rule": scope, "pd_placement_scope": scope}],
-                    "warnings": (),
-                }
-            )
-
-        with patch("orbitserve.dse.runtime_matrix.evaluate_runtime_performance", fake_evaluate_runtime_performance):
-            matrix = evaluate_runtime_matrix((context,), matrix_spec).to_dict()
-
-        self.assertEqual(matrix["design_count"], 1)
-        self.assertEqual(matrix["policy_count"], 2)
-        self.assertEqual(matrix["placement_scope_candidate_count"], 2)
-        self.assertEqual(matrix["row_count"], 4)
-        self.assertEqual(
-            {(scope, policy) for scope, policy in observed_scopes},
-            {
-                ("intra_cluster", "local_only"),
-                ("intra_cluster", "shortest_path"),
-                ("cross_plane", "local_only"),
-                ("cross_plane", "shortest_path"),
-            },
-        )
-        self.assertTrue(all(row["placement_scope_strategy_id"] in {"scope_intra", "scope_cross"} for row in matrix["matrix_rows"]))
-        self.assertEqual({row["pd_placement_scope"] for row in matrix["matrix_rows"]}, {"intra_cluster", "cross_plane"})
-        self.assertTrue(all(row["serving_satellite_budget_count"] == 3 for row in matrix["matrix_rows"]))
-        self.assertTrue(all(row["satellite_budget_mode"] == "fixed_total" for row in matrix["matrix_rows"]))
-        self.assertTrue(all(row["comparison_group_id"] == "pd-scope-budget" for row in matrix["matrix_rows"]))
-        self.assertTrue(all(row["prefill_pool_satellites"] == 1 for row in matrix["matrix_rows"]))
-        self.assertTrue(all(row["decode_pool_satellites"] == 2 for row in matrix["matrix_rows"]))
-        self.assertTrue(all(row["catalog_rebuilt"] for row in matrix["matrix_rows"]))
-        self.assertTrue(all(row["catalog_builder"] == "orbitserve.runtime_deployments.build_runtime_deployment_catalog" for row in matrix["matrix_rows"]))
-        self.assertEqual(len(matrix["selected_rows"]), 1)
-        self.assertEqual(matrix["selected_rows"][0]["pd_placement_scope"], "intra_cluster")
-        self.assertEqual(
-            matrix["selected_scope_by_design"],
-            {
-                "design_0": {
-                    "placement_scope_strategy_id": "scope_intra",
-                    "pd_placement_scope": "intra_cluster",
-                    "pd_pairing_rule": "intra_cluster",
-                }
-            },
-        )
-
     def test_runtime_matrix_expands_kv_policy_candidates(self):
         deployment = SimpleNamespace(
             serving_spec={"pd_mode": "disaggregated"},
@@ -483,7 +328,7 @@ class DSERuntimeMatrixTests(unittest.TestCase):
         scenario = SimpleNamespace(
             scenario_id="runtime_scenario",
             constellation={"satellite_count": 1, "satellite_catalog": ({"satellite_id": "sat-0"},)},
-            serving_deployments=(deployment,),
+            serving_profile=deployment,
             provenance={},
         )
         matrix_spec = SimpleNamespace(
@@ -806,7 +651,7 @@ class DSERuntimeMatrixTests(unittest.TestCase):
             any("terrestrial TCO" in warning for warning in row["warnings"])
         )
 
-    def test_ground_reference_runs_once_outside_leo_design_and_scope_matrix(self):
+    def test_ground_reference_runs_once_outside_leo_design_matrix(self):
         calls = []
         ground_config = {
             "probe_interval_s": 0.1,
@@ -822,16 +667,6 @@ class DSERuntimeMatrixTests(unittest.TestCase):
             include_current_policy=False,
             policies=("skywalker_like_ground",),
             ground_config=ground_config,
-            placement_scope_candidates=(
-                {
-                    "strategy_id": "scope-a",
-                    "pd_placement": {"placement_scope": "same_satellite"},
-                },
-                {
-                    "strategy_id": "scope-b",
-                    "pd_placement": {"placement_scope": "same_plane"},
-                },
-            ),
             static_screening={"enabled": True, "top_k_designs": 1},
             allow_preliminary_runtime_metrics=True,
             ignore_optional_cost=True,

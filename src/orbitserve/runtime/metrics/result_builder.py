@@ -7,7 +7,7 @@ from typing import Any
 from ..contracts import RuntimePerformanceResult
 from .runtime_metrics import aggregate_runtime_records
 from .runtime_records import records_to_jsonable
-from ...orbit import CIRCULAR_GEOMETRY_TRACE, IDEAL_FULL_VISIBILITY, SURROGATE_ORBIT_TRACE
+from ...orbit import CIRCULAR_GEOMETRY_TRACE, SURROGATE_ORBIT_TRACE
 
 def build_runtime_performance_result(
     *,
@@ -50,8 +50,6 @@ def build_runtime_performance_result(
         "workload": "loaded",
         "simulation": "not_required_terrestrial_baseline"
         if terrestrial_baseline
-        else "idealized_trace"
-        if trace_manifest.trace_model == IDEAL_FULL_VISIBILITY
         else "geometry_trace"
         if trace_manifest.trace_model == CIRCULAR_GEOMETRY_TRACE
         else "surrogate_trace",
@@ -93,8 +91,6 @@ def build_runtime_performance_result(
                     if centralized_ground_baseline
                     else "SkyWalker ground runtime reproduces published control logic with explicit surrogate parameters"
                     if terrestrial_baseline
-                    else "Phase 1a runtime metrics are idealized compute-only outputs"
-                    if trace_manifest.trace_model == IDEAL_FULL_VISIBILITY
                     else "circular geometry trace-backed runtime metrics are preliminary surrogate outputs"
                     if trace_manifest.trace_model == CIRCULAR_GEOMETRY_TRACE
                     else "trace-backed runtime metrics are preliminary surrogate outputs"
@@ -207,7 +203,7 @@ def build_runtime_performance_result(
         non_separability={
             "evaluated": False,
             "value": None,
-            "warnings": ("idealized compute-only metrics are not valid for paper main non-separability",),
+            "warnings": ("runtime non-separability is evaluated by the DSE runtime matrix",),
         },
         decision_trace={
             "trace_schema_version": "orbitserve.runtime_decision_trace.v1",

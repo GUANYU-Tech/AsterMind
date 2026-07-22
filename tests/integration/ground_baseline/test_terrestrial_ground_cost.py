@@ -11,7 +11,7 @@ from orbitserve.dse.search import DSERuntimeMatrixSpec
 from orbitserve.dse.runtime_matrix import DSEDesignContext, evaluate_runtime_matrix
 from orbitserve.runtime import RuntimeScenario, RuntimeStrategySpec
 from orbitserve.experiments.runtime_dispatch import evaluate_runtime_performance
-from orbitserve.runtime.runtime_records import RuntimeRequestRecord
+from orbitserve.runtime.metrics.runtime_records import RuntimeRequestRecord
 
 
 def _record(

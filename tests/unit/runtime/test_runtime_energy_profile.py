@@ -12,7 +12,7 @@ from orbitserve.experiments import load_experiment_spec, run_experiment
 from orbitserve.architecture.hardware import SatelliteHardwareProfile
 from orbitserve.architecture.hardware import resolve_experiment_hardware
 from orbitserve.runtime import ServingDeploymentView
-from orbitserve.runtime.scenario.runtime_energy_envelope import derive_runtime_energy_envelope
+from orbitserve.runtime.scenario.runtime_energy_profile import derive_runtime_energy_profile
 from orbitserve.runtime import build_runtime_scenario
 from orbitserve.runtime.engine.trace_backed import run_trace_backed_runtime
 from orbitserve.runtime.contracts import RuntimeStrategySpec
@@ -26,7 +26,7 @@ CIRCULAR_MANIFEST = ROOT / "tests/fixtures/manifests/smoke_circular_geometry_tra
 MATRIX_MANIFEST = ROOT / "tests/fixtures/manifests/smoke_circular_geometry_runtime_matrix.json"
 
 
-class RuntimeEnergyEnvelopeTests(unittest.TestCase):
+class RuntimeEnergyProfileTests(unittest.TestCase):
     def _cost_and_hardware(self, manifest_path=SURROGATE_MANIFEST):
         spec = load_experiment_spec(manifest_path)
         base_dir = Path(spec.base_dir) if spec.base_dir else None
@@ -46,20 +46,20 @@ class RuntimeEnergyEnvelopeTests(unittest.TestCase):
 
     def test_adapter_derives_runtime_energy_fields_from_cost_and_hardware(self):
         spec, resolved, cost = self._cost_and_hardware()
-        envelope = derive_runtime_energy_envelope(
+        profile = derive_runtime_energy_profile(
             cost,
             resolved_hardware=resolved,
             base_trace_options={**spec.simulation.trace_options, "battery_capacity_j": 1.0},
         )
 
         single = cost.single_satellite or {}
-        self.assertTrue(envelope.evaluated)
+        self.assertTrue(profile.evaluated)
         self.assertAlmostEqual(
-            envelope.trace_options["battery_capacity_j"],
+            profile.trace_options["battery_capacity_j"],
             single["E_battery_req_wh"] * 3600.0 * resolved.cost_config.power.battery_eol_fraction,
         )
         self.assertAlmostEqual(
-            envelope.trace_options["charge_rate_w"],
+            profile.trace_options["charge_rate_w"],
             single["P_solar_req_w"]
             * resolved.cost_config.power.eta_pmad
             * resolved.cost_config.power.pv_eol_fraction,
@@ -69,28 +69,28 @@ class RuntimeEnergyEnvelopeTests(unittest.TestCase):
             + resolved.cost_config.power.compute_standby_power_w
             + resolved.cost_config.power.communication_standby_power_w
         )
-        self.assertAlmostEqual(envelope.trace_options["idle_power_w_sunlit"], expected_baseline_w)
-        self.assertAlmostEqual(envelope.trace_options["idle_power_w_shadow"], expected_baseline_w)
-        self.assertEqual(envelope.trace_options["energy_accounting_mode"], "event_incremental_v1")
-        self.assertAlmostEqual(envelope.trace_options["soc_min"], 1.0 - resolved.cost_config.power.dod_max)
+        self.assertAlmostEqual(profile.trace_options["idle_power_w_sunlit"], expected_baseline_w)
+        self.assertAlmostEqual(profile.trace_options["idle_power_w_shadow"], expected_baseline_w)
+        self.assertEqual(profile.trace_options["energy_accounting_mode"], "event_incremental_v1")
+        self.assertAlmostEqual(profile.trace_options["soc_min"], 1.0 - resolved.cost_config.power.dod_max)
         self.assertAlmostEqual(
-            envelope.trace_options["initial_soc"],
+            profile.trace_options["initial_soc"],
             spec.simulation.trace_options.get("initial_soc", 0.8),
         )
         self.assertAlmostEqual(
-            envelope.trace_options["shadow_fraction"],
+            profile.trace_options["shadow_fraction"],
             1.0 - cost.single_satellite["provenance"]["orbit_energy_condition"]["sunlit_fraction"],
         )
         self.assertAlmostEqual(
-            envelope.trace_options["compute_energy_j_per_token"],
+            profile.trace_options["compute_energy_j_per_token"],
             resolved.cost_config.power.compute_energy_j_per_token,
         )
         self.assertAlmostEqual(
-            envelope.trace_options["link_energy_j_per_byte"],
+            profile.trace_options["link_energy_j_per_byte"],
             resolved.cost_config.power.link_energy_j_per_byte,
         )
-        joined_warnings = " ".join(envelope.warnings)
-        self.assertIn("overridden by cost/hardware runtime energy envelope", joined_warnings)
+        joined_warnings = " ".join(profile.warnings)
+        self.assertIn("overridden by cost/hardware runtime energy profile", joined_warnings)
         self.assertIn("baseline-exclusive and forced from cost/hardware", joined_warnings)
 
     def test_adapter_rejects_nonfinite_cost_and_hardware_contract_values(self):
@@ -99,23 +99,23 @@ class RuntimeEnergyEnvelopeTests(unittest.TestCase):
         payload["single_satellite"]["E_battery_req_wh"] = float("nan")
         payload["single_satellite"]["E_battery_req"] = float("nan")
         self.assertFalse(
-            derive_runtime_energy_envelope(payload, resolved_hardware=resolved).evaluated
+            derive_runtime_energy_profile(payload, resolved_hardware=resolved).evaluated
         )
 
         bad_power = replace(resolved.cost_config.power, eta_pmad=float("nan"))
         bad_cost_config = replace(resolved.cost_config, power=bad_power)
         bad_resolved = replace(resolved, cost_config=bad_cost_config)
-        envelope = derive_runtime_energy_envelope(cost, resolved_hardware=bad_resolved)
-        self.assertFalse(envelope.evaluated)
-        self.assertIn("eta_pmad", envelope.provenance["invalid_contract_fields"])
+        profile = derive_runtime_energy_profile(cost, resolved_hardware=bad_resolved)
+        self.assertFalse(profile.evaluated)
+        self.assertIn("eta_pmad", profile.provenance["invalid_contract_fields"])
 
-        envelope = derive_runtime_energy_envelope(
+        profile = derive_runtime_energy_profile(
             cost,
             resolved_hardware=resolved,
             base_trace_options={**spec.simulation.trace_options, "orbit_period_s": float("nan")},
         )
-        self.assertFalse(envelope.evaluated)
-        self.assertIn("orbit_period_s", envelope.provenance["invalid_contract_fields"])
+        self.assertFalse(profile.evaluated)
+        self.assertIn("orbit_period_s", profile.provenance["invalid_contract_fields"])
 
 
     def test_runtime_scenario_owns_static_energy_profile(self):

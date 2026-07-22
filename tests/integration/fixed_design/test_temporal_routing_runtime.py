@@ -4,7 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 
-from orbitserve.runtime.routing import (
+from orbitserve.runtime.engine.routing import (
     TraceQueryResult,
     enumerate_compute_candidates,
     find_access_candidates,
@@ -12,9 +12,9 @@ from orbitserve.runtime.routing import (
 )
 from orbitserve.runtime import RuntimeScenario, RuntimeStrategySpec, ServingDeploymentView
 from orbitserve.runtime.evaluation import evaluate_runtime_performance
-from orbitserve.runtime.runtime_eligibility import build_compute_eligibility_set
-from orbitserve.runtime.engines.trace_backed import run_trace_backed_runtime
-from orbitserve.runtime.runtime_metrics import aggregate_runtime_records
+from orbitserve.runtime.engine.runtime_eligibility import build_compute_eligibility_set
+from orbitserve.runtime.engine.trace_backed import run_trace_backed_runtime
+from orbitserve.runtime.metrics.runtime_metrics import aggregate_runtime_records
 from orbitserve.orbit.simulation_traces import TRACE_BACKED_RUNTIME_SURROGATE_SCOPE
 
 
@@ -379,7 +379,7 @@ class TemporalRoutingRuntimeTests(unittest.TestCase):
             runtime_config=RuntimeStrategySpec.from_dict({"policy": "nearest_visible"}),
         )
 
-        with patch("orbitserve.runtime.runtime_evaluator.load_surrogate_trace_bundle", return_value=bundle):
+        with patch("orbitserve.runtime.engine.runtime_evaluator.load_surrogate_trace_bundle", return_value=bundle):
             payload = evaluate_runtime_performance(scenario).to_dict()
 
         self.assertTrue(payload["evaluated"])

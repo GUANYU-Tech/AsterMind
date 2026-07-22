@@ -463,32 +463,18 @@ class RuntimeSkeletonTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "session_action|soc_before|runtime leakage"):
             self.runtime.evaluate_runtime_performance(scenario, strategy)
 
-    def test_runner_runtime_details_use_materialized_workload_when_integration_exists(self):
+    def test_runner_runtime_details_use_materialized_workload(self):
         payload = run_experiment(
             load_experiment_spec(ROOT / "tests/fixtures/manifests/smoke_single_design.json")
         ).to_dict()
-        details = payload["performance"].get("details", {})
-        if "runtime" not in details or "runtime_optimization" not in details:
-            self.skipTest("runner runtime integration is not available yet")
+        details = payload["performance"]["details"]
 
+        self.assertIn("runtime", details)
         self.assertFalse(details["runtime"]["evaluated"])
         self.assertTrue(details["runtime"]["workload"]["configured"])
         self.assertIsNone(payload["performance"]["ttft_p95_s"])
         self.assertIsNone(payload["performance"]["e2e_p95_s"])
-        self.assertFalse(details["runtime_optimization"]["evaluated"])
-        optimizer = details["runtime_optimization"]
-        self.assertIsNone(optimizer["selected_strategy"])
-        self.assertGreater(len(optimizer["score_table"]), 0)
-        for row in optimizer["score_table"]:
-            self.assertIsNone(row["objective_score"])
-            self.assertFalse(row["evaluator_result"]["evaluated"])
-        row_by_policy = {row["scheduler"]["policy"]: row["scheduler"] for row in optimizer["score_table"]}
-        self.assertIn("local_compute", row_by_policy["orbitserve"]["enabled_actions"])
-        self.assertIn("defer", row_by_policy["orbitserve"]["enabled_actions"])
-        self.assertEqual(row_by_policy["orbitserve"]["path_policy"], "k_shortest_score")
-        self.assertEqual(row_by_policy["local_only"]["enabled_actions"], ["local_compute", "reject_drop"])
-        self.assertEqual(row_by_policy["local_only"]["path_policy"], "nearest")
-        self.assertEqual(row_by_policy["shortest_path"]["path_policy"], "shortest_path")
+        self.assertNotIn("runtime_optimization", details)
 
     def test_runner_preserves_extended_scheduler_fields_in_runtime_strategy(self):
         base = load_experiment_spec(ROOT / "tests/fixtures/manifests/smoke_single_design.json")

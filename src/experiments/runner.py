@@ -10,7 +10,6 @@ from typing import Any
 from orbitserve.common import to_jsonable
 from orbitserve.experiments.design_evaluation import evaluate_materialized_design
 from orbitserve.dse.search import DSEStudyResult, run_dse
-from orbitserve.common import SLOMetrics
 from orbitserve.dse.satellite_budget import analyze_communication_window_satellite_budget
 from orbitserve.orbit import TRACE_BACKED_RUNTIME_SURROGATE_SCOPE, normalize_trace_scope
 
@@ -90,7 +89,7 @@ def run_experiment(spec: ExperimentSpec) -> ExperimentResult:
         serving_workload=serving_workload,
         workload_generation_warnings=workload_generation_warnings,
     )
-    slo = _slo_with_runtime_metrics(simulation.slo, runtime_performance)
+    slo = simulation.slo
     terrestrial_runtime = (
         normalize_trace_scope(getattr(runtime_performance, "scope", None))
         == "skywalker_ground_reproduction_surrogate"
@@ -343,45 +342,6 @@ def _performance_with_runtime_metrics(performance: Any, runtime_performance: Any
             "runtime_trace_model": runtime_metrics.get("trace_model"),
             "valid_for_paper_main_results": runtime_metrics.get("valid_for_paper_main_results"),
         },
-        warnings=warnings,
-    )
-
-
-def _slo_with_runtime_metrics(slo: Any, runtime_performance: Any) -> Any:
-    if not getattr(runtime_performance, "evaluated", False):
-        return slo
-    payload = runtime_performance.to_dict()
-    runtime_slo = payload.get("slo", {})
-    runtime_metrics = payload.get("runtime_metrics", {})
-    runtime_scope = normalize_trace_scope(runtime_metrics.get("scope"))
-    scope_warning = (
-        "top-level SLO contains SkyWalker terrestrial reproduction surrogate metrics"
-        if runtime_scope == "skywalker_ground_reproduction_surrogate"
-        else "top-level SLO contains trace-backed preliminary surrogate metrics"
-        if runtime_scope == TRACE_BACKED_RUNTIME_SURROGATE_SCOPE
-        else "top-level SLO contains circular geometry trace-backed preliminary surrogate metrics"
-        if runtime_scope == "geometry_trace_surrogate"
-        else "top-level SLO contains idealized compute-only runtime metrics"
-    )
-    warnings = tuple(
-        dict.fromkeys(
-            (
-                *tuple(runtime_slo.get("warnings", ())),
-                scope_warning,
-                f"scope={runtime_metrics.get('scope')}",
-                f"trace_model={runtime_metrics.get('trace_model')}",
-                f"valid_for_paper_main_results={str(runtime_metrics.get('valid_for_paper_main_results')).lower()}",
-            )
-        )
-    )
-    return SLOMetrics(
-        evaluated=True,
-        served_ratio=runtime_slo.get("served_ratio"),
-        rejected_ratio=runtime_slo.get("rejected_ratio"),
-        timeout_ratio=runtime_slo.get("timeout_ratio"),
-        energy_violation_count=runtime_slo.get("energy_violation_count"),
-        isl_congestion_p95=runtime_slo.get("isl_congestion_p95"),
-        sgl_congestion_p95=runtime_slo.get("sgl_congestion_p95"),
         warnings=warnings,
     )
 
