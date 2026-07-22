@@ -8,8 +8,7 @@ from typing import Any
 
 from ...common import to_jsonable
 from .contracts import RuntimeEngineResult
-from ..state.energy_state import EnergyWindowError, advance_satellite_energy, apply_request_energy, energy_window_at
-from ..state.energy_accounting import EnergyIntensity, compute_dynamic_energy_j
+from ..state.energy import EnergyWindowError, advance_satellite_energy, apply_request_energy, energy_window_at
 from .routing import (
     RouteLeg,
     RouteSamplingError,
@@ -29,7 +28,7 @@ from .runtime_eligibility import ComputeEligibilitySet, build_compute_eligibilit
 from ..metrics.records import RuntimeRequestRecord
 from ..state.runtime_state import RuntimeState
 from .runtime_timing import TTFT_DEFINITION, ttft_breakdown
-from ..state.kv_runtime import (
+from ..state.kv_cache import (
     _admit_session_kv,
     _kv_policy,
     _remove_session_kv,

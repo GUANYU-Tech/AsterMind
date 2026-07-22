@@ -3,10 +3,81 @@
 from __future__ import annotations
 
 import math
-from typing import Any
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
-from .runtime_state import KVCacheEntryState, RuntimeState
+from ...common import to_jsonable
 
+if TYPE_CHECKING:
+    from .runtime_state import RuntimeState
+
+
+@dataclass
+class SessionState:
+    session_id: str
+    owner_satellite_id: str | None = None
+    owner_deployment_id: str | None = None
+    owner_satellite_ids: tuple[str, ...] = ()
+    context_tokens: int = 0
+    kv_cache_tokens: int = 0
+    kv_cache_bytes: float = 0.0
+    kv_pages: int = 0
+    context_version: int = 0
+    last_seen_s: float = 0.0
+    replica_deployment_ids: tuple[str, ...] = ()
+    last_session_action: str = "none"
+    last_kv_event: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return to_jsonable(self)
+
+
+@dataclass
+class KVCacheSatelliteState:
+    satellite_id: str
+    hbm_model: str = "satellite_token_capacity"
+    capacity_bytes: float | None = None
+    capacity_tokens: int | None = None
+    used_bytes: float = 0.0
+    used_tokens: int = 0
+    page_placement_policy: str = "session_level_page_accounting"
+    page_size_tokens: int | None = None
+    metadata_bytes_per_page: float = 0.0
+    fragmentation_reserve_fraction: float = 0.0
+    entries: dict[str, "KVCacheEntryState"] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "satellite_id": self.satellite_id,
+            "hbm_model": self.hbm_model,
+            "capacity_bytes": self.capacity_bytes,
+            "capacity_tokens": self.capacity_tokens,
+            "used_bytes": self.used_bytes,
+            "used_tokens": self.used_tokens,
+            "page_placement_policy": self.page_placement_policy,
+            "page_size_tokens": self.page_size_tokens,
+            "metadata_bytes_per_page": self.metadata_bytes_per_page,
+            "fragmentation_reserve_fraction": self.fragmentation_reserve_fraction,
+            "entries": {key: entry.to_dict() for key, entry in self.entries.items()},
+        }
+
+
+@dataclass
+class KVCacheEntryState:
+    session_id: str
+    satellite_id: str
+    tokens: int
+    bytes: float
+    last_access_s: float
+    reference_count: int = 0
+    evictable: bool = True
+
+    @property
+    def in_use(self) -> bool:
+        return self.reference_count > 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return to_jsonable(self)
 
 def _kv_policy(runtime_strategy: Any) -> dict[str, Any]:
     if runtime_strategy is None:
