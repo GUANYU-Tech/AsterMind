@@ -32,6 +32,7 @@ from .runtime_timing import TTFT_DEFINITION, ttft_breakdown
 from ..state.kv_runtime import (
     _admit_session_kv,
     _kv_policy,
+    _remove_session_kv,
 )
 from ..strategy.schedulers import SchedulerCandidate, get_scheduler
 from ...orbit import TRACE_BACKED_RUNTIME_SURROGATE_SCOPE, normalize_trace_scope
@@ -1601,7 +1602,7 @@ def _clone_runtime_state_for_preview(state: RuntimeState) -> RuntimeState:
         },
         links={key: replace(link) for key, link in state.links.items()},
         sessions={},
-        kv_cache_deployments={},
+        kv_caches={},
         request_records=[],
         decision_traces=[],
         module_status=dict(state.module_status),
@@ -2238,10 +2239,11 @@ def _session_action(
         return "none"
     existed = session_id in state.sessions
     session = state.session_for(session_id)
+    previous_owner = session.owner_satellite_id
     deployment_id = str(getattr(deployment, "deployment_id", ""))
-    cache = state.kv_cache_for(deployment_id)
-    cache_hit = session_id in cache.entries and cache.entries[session_id].satellite_id == satellite_id
-    action = "sticky_kv_owner" if cache_hit or not existed else "recompute_context"
+    cache = state.kv_cache_for(satellite_id)
+    cache_hit = existed and session_id in cache.entries
+    action = "sticky_kv_owner" if cache_hit else "recompute_context"
     tokens = max(0, int(request.get("prompt_tokens", 0))) + max(
         0, int(request.get("output_tokens", 0))
     )
@@ -2263,6 +2265,8 @@ def _session_action(
         session.last_kv_event = dict(admission)
         session.last_seen_s = now_s
         return "recompute_context"
+    if previous_owner and previous_owner != satellite_id:
+        _remove_session_kv(state, previous_owner, str(session_id))
     entry = admission["entry"]
     session.owner_satellite_id = satellite_id
     session.owner_deployment_id = deployment_id

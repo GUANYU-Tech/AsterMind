@@ -50,7 +50,7 @@ def _kv_required_pages(tokens: int | float, page_size_tokens: int | None) -> int
     return int(math.ceil(token_count / page_size_tokens))
 
 
-def _deployment_hbm_capacity_bytes(deployment: Any, kv_policy: dict[str, Any]) -> float | None:
+def _satellite_hbm_capacity_bytes(kv_policy: dict[str, Any]) -> float | None:
     capacity_gb = _optional_float(kv_policy.get("hbm_capacity_gb_per_card"))
     cards_per_sat = _optional_int(kv_policy.get("cards_per_satellite"))
     if capacity_gb is None or cards_per_sat is None or cards_per_sat <= 0:
@@ -60,9 +60,8 @@ def _deployment_hbm_capacity_bytes(deployment: Any, kv_policy: dict[str, Any]) -
     model_gb = _optional_float(kv_policy.get("model_weight_hbm_gb_per_card")) or 0.0
     activation_gb = _optional_float(kv_policy.get("activation_reserve_gb_per_card")) or 0.0
     workspace_gb = _optional_float(kv_policy.get("runtime_workspace_gb_per_card")) or 0.0
-    member_count = len(tuple(getattr(deployment, "member_satellites", ()) or ())) or 1
     per_card_available_gb = max(0.0, capacity_gb * usable - model_gb - activation_gb - workspace_gb)
-    return per_card_available_gb * cards_per_sat * member_count * (1024.0 ** 3)
+    return per_card_available_gb * cards_per_sat * (1024.0 ** 3)
 
 def _kv_accounted_bytes(
     tokens: int | float,
@@ -84,33 +83,24 @@ def _kv_accounted_bytes(
         + pages * metadata_bytes
     ) * (1.0 + fragmentation)
 
-def _card_level_hbm_enabled(deployment: Any, kv_policy: dict[str, Any]) -> bool:
-    del deployment
-    del kv_policy
-    return False
-
-def _sync_kv_cache_state_for_deployment(state: RuntimeState, deployment: Any, runtime_strategy: Any) -> None:
-    deployment_id = str(getattr(deployment, "deployment_id", ""))
-    if not deployment_id:
+def _sync_kv_cache_state_for_satellite(
+    state: RuntimeState,
+    satellite_id: str,
+    deployment: Any,
+    runtime_strategy: Any,
+) -> None:
+    if not satellite_id:
         return
     kv_policy = _kv_policy(runtime_strategy)
-    cache = state.kv_cache_for(deployment_id)
-    cache.hbm_model = "aggregate_hbm_bytes" if _deployment_hbm_capacity_bytes(deployment, kv_policy) is not None else "deployment_token_capacity_surrogate"
-    cache.aggregate_capacity_bytes = _deployment_hbm_capacity_bytes(deployment, kv_policy)
-    cache.aggregate_capacity_tokens = _optional_int(getattr(deployment, "kv_cache_capacity_tokens", None))
+    cache = state.kv_cache_for(satellite_id)
+    cache.capacity_bytes = _satellite_hbm_capacity_bytes(kv_policy)
+    cache.hbm_model = "satellite_hbm_bytes" if cache.capacity_bytes is not None else "satellite_token_capacity"
+    cache.capacity_tokens = _optional_int(getattr(deployment, "kv_cache_capacity_tokens", None))
     cache.page_size_tokens = _kv_page_size_tokens(kv_policy)
     cache.metadata_bytes_per_page = float(_optional_float(kv_policy.get("kv_page_metadata_bytes")) or 0.0)
     cache.fragmentation_reserve_fraction = float(_optional_float(kv_policy.get("kv_fragmentation_reserve_fraction")) or 0.0)
-    cache.card_level_hbm_admission = False
-    primary_tokens = 0
-    replica_tokens = 0
-    primary_bytes = 0.0
-    replica_bytes = 0.0
-    for entry in cache.entries.values():
-        primary_tokens += max(0, int(entry.tokens))
-        primary_bytes += max(0.0, float(entry.bytes))
-    cache.aggregate_used_tokens_by_kind = {"primary": primary_tokens, "replica": replica_tokens}
-    cache.aggregate_used_bytes_by_kind = {"primary": primary_bytes, "replica": replica_bytes}
+    cache.used_tokens = sum(max(0, int(entry.tokens)) for entry in cache.entries.values())
+    cache.used_bytes = sum(max(0.0, float(entry.bytes)) for entry in cache.entries.values())
 
 def _admit_session_kv(
     state: RuntimeState,
@@ -123,12 +113,11 @@ def _admit_session_kv(
     kv_bytes_per_token: float,
     now_s: float,
 ) -> dict[str, Any]:
-    """Admit or refresh one session entry, evicting by capacity-pressure LRU."""
+    """Admit one session on one satellite, evicting only under capacity pressure."""
 
-    deployment_id = str(getattr(deployment, "deployment_id", ""))
     kv_policy = _kv_policy(runtime_strategy)
-    _sync_kv_cache_state_for_deployment(state, deployment, runtime_strategy)
-    cache = state.kv_cache_for(deployment_id)
+    _sync_kv_cache_state_for_satellite(state, satellite_id, deployment, runtime_strategy)
+    cache = state.kv_cache_for(satellite_id)
     accounted_bytes = _kv_accounted_bytes(
         tokens,
         kv_bytes_per_token=kv_bytes_per_token,
@@ -143,8 +132,8 @@ def _admit_session_kv(
     required_tokens = max(0, int(tokens))
 
     def fits(extra_tokens: int, extra_bytes: float) -> bool:
-        tokens_ok = cache.aggregate_capacity_tokens is None or extra_tokens <= cache.aggregate_capacity_tokens
-        bytes_ok = cache.aggregate_capacity_bytes is None or extra_bytes <= cache.aggregate_capacity_bytes
+        tokens_ok = cache.capacity_tokens is None or extra_tokens <= cache.capacity_tokens
+        bytes_ok = cache.capacity_bytes is None or extra_bytes <= cache.capacity_bytes
         return tokens_ok and bytes_ok
 
     eviction_candidates = sorted(
@@ -174,7 +163,7 @@ def _admit_session_kv(
     for victim in evicted:
         cache.entries.pop(victim.session_id, None)
         victim_session = state.sessions.get(victim.session_id)
-        if victim_session is not None and victim_session.owner_deployment_id == deployment_id:
+        if victim_session is not None and victim_session.owner_satellite_id == satellite_id:
             victim_session.owner_satellite_id = None
             victim_session.owner_deployment_id = None
             victim_session.owner_satellite_ids = ()
@@ -185,7 +174,6 @@ def _admit_session_kv(
     entry = KVCacheEntryState(
         session_id=session_id,
         satellite_id=str(satellite_id),
-        deployment_id=deployment_id,
         tokens=required_tokens,
         bytes=accounted_bytes,
         last_access_s=float(now_s),
@@ -193,7 +181,7 @@ def _admit_session_kv(
         evictable=current.evictable if current is not None else True,
     )
     cache.entries[session_id] = entry
-    _sync_kv_cache_state_for_deployment(state, deployment, runtime_strategy)
+    _sync_kv_cache_state_for_satellite(state, satellite_id, deployment, runtime_strategy)
     return {
         "admitted": True,
         "admission": "hit" if current is not None else "admitted",
@@ -205,6 +193,18 @@ def _admit_session_kv(
         "occupancy_bytes_before": occupancy_bytes_before,
         "occupancy_bytes_after": sum(item.bytes for item in cache.entries.values()),
     }
+
+
+def _remove_session_kv(state: RuntimeState, satellite_id: str, session_id: str) -> bool:
+    """Remove a stale session entry when execution moves to another satellite."""
+
+    cache = state.kv_caches.get(satellite_id)
+    if cache is None or cache.entries.pop(session_id, None) is None:
+        return False
+    cache.used_tokens = sum(max(0, int(entry.tokens)) for entry in cache.entries.values())
+    cache.used_bytes = sum(max(0.0, float(entry.bytes)) for entry in cache.entries.values())
+    return True
+
 
 def _token_context_contract_error(request: dict[str, Any]) -> str | None:
     new_user_tokens = request.get("new_user_tokens")

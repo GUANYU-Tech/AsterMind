@@ -140,47 +140,31 @@ class SessionState:
 
 
 @dataclass
-class KVCacheCardState:
-    card_id: str
-    satellite_id: str | None = None
-    shard_id: str | None = None
+class KVCacheSatelliteState:
+    satellite_id: str
+    hbm_model: str = "satellite_token_capacity"
     capacity_bytes: float | None = None
-    used_bytes_by_kind: dict[str, float] = field(default_factory=dict)
-
-    def to_dict(self) -> dict[str, Any]:
-        return to_jsonable(self)
-
-
-@dataclass
-class KVCacheDeploymentState:
-    deployment_id: str
-    hbm_model: str = "deployment_token_capacity_surrogate"
-    aggregate_capacity_bytes: float | None = None
-    aggregate_capacity_tokens: int | None = None
-    aggregate_used_bytes_by_kind: dict[str, float] = field(default_factory=dict)
-    aggregate_used_tokens_by_kind: dict[str, int] = field(default_factory=dict)
-    cards: dict[str, KVCacheCardState] = field(default_factory=dict)
+    capacity_tokens: int | None = None
+    used_bytes: float = 0.0
+    used_tokens: int = 0
     page_placement_policy: str = "session_level_page_accounting"
     page_size_tokens: int | None = None
     metadata_bytes_per_page: float = 0.0
     fragmentation_reserve_fraction: float = 0.0
-    card_level_hbm_admission: bool = False
     entries: dict[str, "KVCacheEntryState"] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "deployment_id": self.deployment_id,
+            "satellite_id": self.satellite_id,
             "hbm_model": self.hbm_model,
-            "aggregate_capacity_bytes": self.aggregate_capacity_bytes,
-            "aggregate_capacity_tokens": self.aggregate_capacity_tokens,
-            "aggregate_used_bytes_by_kind": to_jsonable(self.aggregate_used_bytes_by_kind),
-            "aggregate_used_tokens_by_kind": to_jsonable(self.aggregate_used_tokens_by_kind),
-            "cards": {card_id: card.to_dict() for card_id, card in self.cards.items()},
+            "capacity_bytes": self.capacity_bytes,
+            "capacity_tokens": self.capacity_tokens,
+            "used_bytes": self.used_bytes,
+            "used_tokens": self.used_tokens,
             "page_placement_policy": self.page_placement_policy,
             "page_size_tokens": self.page_size_tokens,
             "metadata_bytes_per_page": self.metadata_bytes_per_page,
             "fragmentation_reserve_fraction": self.fragmentation_reserve_fraction,
-            "card_level_hbm_admission": self.card_level_hbm_admission,
             "entries": {key: entry.to_dict() for key, entry in self.entries.items()},
         }
 
@@ -189,7 +173,6 @@ class KVCacheDeploymentState:
 class KVCacheEntryState:
     session_id: str
     satellite_id: str
-    deployment_id: str
     tokens: int
     bytes: float
     last_access_s: float
@@ -210,7 +193,7 @@ class RuntimeState:
     satellites: dict[str, SatelliteState] = field(default_factory=dict)
     links: dict[str, LinkState] = field(default_factory=dict)
     sessions: dict[str, SessionState] = field(default_factory=dict)
-    kv_cache_deployments: dict[str, KVCacheDeploymentState] = field(default_factory=dict)
+    kv_caches: dict[str, KVCacheSatelliteState] = field(default_factory=dict)
     request_records: list[Any] = field(default_factory=list)
     decision_traces: list[dict[str, Any]] = field(default_factory=list)
     module_status: dict[str, str] = field(
@@ -246,10 +229,10 @@ class RuntimeState:
             self.sessions[session_id] = SessionState(session_id=session_id)
         return self.sessions[session_id]
 
-    def kv_cache_for(self, deployment_id: str) -> KVCacheDeploymentState:
-        if deployment_id not in self.kv_cache_deployments:
-            self.kv_cache_deployments[deployment_id] = KVCacheDeploymentState(deployment_id=deployment_id)
-        return self.kv_cache_deployments[deployment_id]
+    def kv_cache_for(self, satellite_id: str) -> KVCacheSatelliteState:
+        if satellite_id not in self.kv_caches:
+            self.kv_caches[satellite_id] = KVCacheSatelliteState(satellite_id=satellite_id)
+        return self.kv_caches[satellite_id]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -269,9 +252,9 @@ class RuntimeState:
                 session_id: session.to_dict()
                 for session_id, session in self.sessions.items()
             },
-            "kv_cache_deployments": {
-                deployment_id: deployment.to_dict()
-                for deployment_id, deployment in self.kv_cache_deployments.items()
+            "kv_caches": {
+                satellite_id: cache.to_dict()
+                for satellite_id, cache in self.kv_caches.items()
             },
             "request_count": len(self.request_records),
             "decision_trace_count": len(self.decision_traces),
@@ -281,8 +264,7 @@ class RuntimeState:
 
 __all__ = [
     "ComputeQueueState",
-    "KVCacheCardState",
-    "KVCacheDeploymentState",
+    "KVCacheSatelliteState",
     "KVCacheEntryState",
     "LinkState",
     "SatelliteState",
