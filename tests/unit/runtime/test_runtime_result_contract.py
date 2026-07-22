@@ -1,4 +1,7 @@
+import inspect
 import unittest
+
+import orbitserve.runtime as runtime
 
 from orbitserve.runtime import RuntimePerformanceResult
 from orbitserve.runtime.engine.simulator import try_run_runtime_simulation
@@ -8,6 +11,26 @@ from orbitserve.runtime.metrics.records import RuntimeRequestRecord
 
 
 class RuntimeResultContractTests(unittest.TestCase):
+    def test_public_api_is_frozen_to_simulation_boundary(self):
+        self.assertEqual(
+            set(runtime.__all__),
+            {
+                "RuntimePerformanceResult",
+                "RuntimeSimulationSpec",
+                "RuntimeStrategySpec",
+                "build_runtime_simulation_spec",
+                "run_runtime_simulation",
+            },
+        )
+        self.assertEqual(
+            tuple(inspect.signature(runtime.run_runtime_simulation).parameters),
+            ("simulation_spec",),
+        )
+        self.assertFalse(hasattr(runtime, "RuntimeScenario"))
+        self.assertFalse(hasattr(runtime, "build_runtime_scenario"))
+        self.assertFalse(hasattr(runtime, "SchedulerCandidate"))
+        self.assertFalse(hasattr(runtime, "RuntimeState"))
+
     def test_runtime_evaluator_entrypoint_is_importable(self):
         self.assertTrue(callable(try_run_runtime_simulation))
 

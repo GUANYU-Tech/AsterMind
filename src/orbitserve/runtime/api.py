@@ -152,7 +152,7 @@ def run_runtime_simulation(
         module_status=module_status,
         provenance={
             **scenario.provenance,
-            "runtime_interface_schema": "orbitserve.runtime_scenario.v1",
+            "runtime_interface_schema": "orbitserve.runtime_simulation_spec.v1",
             "performance_evaluator": "conservative_skeleton",
             "runtime_performance_schema": "orbitserve.runtime_performance.v1",
             "runtime_interface_doc": RUNTIME_INTERFACE_DOC,

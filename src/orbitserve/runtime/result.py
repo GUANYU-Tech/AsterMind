@@ -143,7 +143,7 @@ def build_runtime_performance_result(
     return RuntimePerformanceResult(
         evaluated=True,
         scenario={
-            "schema_version": getattr(scenario, "schema_version", "orbitserve.runtime_scenario.v1"),
+            "schema_version": getattr(scenario, "schema_version", "orbitserve.runtime_simulation_spec.v1"),
             "scenario_id": getattr(scenario, "scenario_id", None),
             "design_id": None
             if terrestrial_baseline
@@ -223,7 +223,7 @@ def build_runtime_performance_result(
         provenance={
             **getattr(scenario, "provenance", {}),
             "performance_evaluator": evaluator_name,
-            "runtime_interface_schema": "orbitserve.runtime_scenario.v1",
+            "runtime_interface_schema": "orbitserve.runtime_simulation_spec.v1",
             "runtime_performance_schema": "orbitserve.runtime_performance.v1",
             "trace_manifest": (
                 {

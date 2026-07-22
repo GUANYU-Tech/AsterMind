@@ -2602,7 +2602,7 @@ def try_run_runtime_simulation(
         return RuntimePerformanceResult(
             evaluated=False,
             scenario={
-                "schema_version": getattr(scenario, "schema_version", "orbitserve.runtime_scenario.v1"),
+                "schema_version": getattr(scenario, "schema_version", "orbitserve.runtime_simulation_spec.v1"),
                 "scenario_id": getattr(scenario, "scenario_id", None),
                 "design_id": getattr(scenario, "design_id", None),
                 "time_horizon_s": getattr(scenario, "time_horizon_s", None),
