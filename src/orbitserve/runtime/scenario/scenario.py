@@ -11,10 +11,11 @@ from ..contracts import (
     RUNTIME_INTERFACE_DOC,
     RUNTIME_PERFORMANCE_DOC,
     RUNTIME_OPTIMIZATION_DOC,
-    RuntimeScenario,
     RuntimeStrategySpec,
     ServingDeploymentView,
 )
+from .runtime_scenario import RuntimeScenario
+
 
 def build_runtime_scenario(
     *,

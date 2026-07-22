@@ -5,7 +5,6 @@ from .contracts import (
     RuntimeDecisionTrace,
     RuntimePerformanceResult,
     RuntimePredictionEnvelope,
-    RuntimeScenario,
     RuntimeStrategySpec,
     ServingDeploymentView,
 )
@@ -15,6 +14,7 @@ from .metrics.result_builder import build_runtime_performance_result
 from .scenario.runtime_deployments import build_runtime_deployment_catalog
 from .scenario.runtime_energy_envelope import apply_runtime_energy_envelope
 from .metrics.runtime_records import RuntimeRequestRecord
+from .scenario.runtime_scenario import RuntimeScenario
 from .scenario.scenario import build_runtime_scenario
 from .strategy.schedulers import SchedulerSpec, get_scheduler
 

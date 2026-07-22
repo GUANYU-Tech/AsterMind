@@ -10,9 +10,10 @@ from .contracts import (
     RUNTIME_OPTIMIZATION_DOC,
     RUNTIME_RESULT_FIELDS,
     RuntimePerformanceResult,
-    RuntimeScenario,
     RuntimeStrategySpec,
 )
+from .scenario.runtime_scenario import RuntimeScenario
+
 
 def evaluate_runtime_performance(
     scenario: RuntimeScenario,

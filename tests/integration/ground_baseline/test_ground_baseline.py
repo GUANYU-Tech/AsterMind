@@ -17,7 +17,7 @@ from orbitserve.baselines.ground.runtime import (
     run_ground_runtime,
 )
 from orbitserve.experiments import load_experiment_spec, run_experiment
-from orbitserve.runtime.contracts import RuntimeScenario, RuntimeStrategySpec
+from orbitserve.runtime import RuntimeScenario, RuntimeStrategySpec
 from orbitserve.experiments.runtime_dispatch import evaluate_runtime_performance
 from orbitserve.runtime.deployment_contracts import RuntimeDeploymentCatalog
 from orbitserve.runtime.engines.trace_backed import run_trace_backed_runtime

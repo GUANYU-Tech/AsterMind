@@ -10,7 +10,7 @@ from orbitserve.runtime.routing import (
     find_access_candidates,
     make_route_plan,
 )
-from orbitserve.runtime.contracts import RuntimeScenario, RuntimeStrategySpec, ServingDeploymentView
+from orbitserve.runtime import RuntimeScenario, RuntimeStrategySpec, ServingDeploymentView
 from orbitserve.runtime.evaluation import evaluate_runtime_performance
 from orbitserve.runtime.deployment_contracts import RuntimeDeployment, RuntimeDeploymentCatalog
 from orbitserve.runtime.runtime_eligibility import build_compute_eligibility_set

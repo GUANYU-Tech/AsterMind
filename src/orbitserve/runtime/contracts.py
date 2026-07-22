@@ -455,30 +455,6 @@ class RuntimeDecisionTrace:
         return to_jsonable(self)
 
 @dataclass(frozen=True)
-class RuntimeScenario:
-    scenario_id: str = "runtime_scenario"
-    design_id: str = "runtime_design"
-    time_horizon_s: float | None = None
-    workload_bundle: dict[str, Any] = field(default_factory=dict)
-    requests: tuple[dict[str, Any], ...] = ()
-    sessions: tuple[dict[str, Any], ...] = ()
-    regions: tuple[dict[str, Any], ...] = ()
-    gateways: tuple[dict[str, Any], ...] = ()
-    simulation_trace_ref: dict[str, Any] = field(default_factory=dict)
-    constellation: dict[str, Any] = field(default_factory=dict)
-    serving_deployments: tuple[ServingDeploymentView, ...] = ()
-    cost_power: dict[str, Any] = field(default_factory=dict)
-    runtime_config: RuntimeStrategySpec = field(default_factory=lambda: RuntimeStrategySpec.from_value(None))
-    provenance: dict[str, Any] = field(default_factory=dict)
-    warnings: tuple[str, ...] = ()
-    schema_version: str = "orbitserve.runtime_scenario.v1"
-    time_mode: str = "event_driven"
-    time_step_s: float | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        return to_jsonable(self)
-
-@dataclass(frozen=True)
 class RuntimePerformanceResult:
     evaluated: bool
     scenario: dict[str, Any]

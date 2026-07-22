@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 from orbitserve.experiments import load_experiment_spec, run_experiment
-from orbitserve.runtime.contracts import RuntimeScenario, RuntimeStrategySpec, ServingDeploymentView
+from orbitserve.runtime import RuntimeScenario, RuntimeStrategySpec, ServingDeploymentView
 from orbitserve.runtime.evaluation import evaluate_runtime_performance
 from orbitserve.dse.runtime_optimization import optimize_runtime_strategy
 
