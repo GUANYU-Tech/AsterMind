@@ -8,7 +8,6 @@ from typing import Any
 from ..contracts import RuntimePerformanceResult, RuntimeStrategySpec
 from .trace_backed import run_trace_backed_runtime
 from ..metrics.result_builder import build_runtime_performance_result
-from ..scenario.runtime_deployments import build_runtime_deployment_catalog
 from ...orbit import (
     CIRCULAR_GEOMETRY_TRACE,
     SURROGATE_ORBIT_TRACE,
@@ -34,7 +33,6 @@ def try_evaluate_runtime_performance(
     )
     if not trace_manifest.evaluated:
         return None
-    deployment_catalog = build_runtime_deployment_catalog(scenario)
     if trace_manifest.trace_model not in {SURROGATE_ORBIT_TRACE, CIRCULAR_GEOMETRY_TRACE}:
         return None
     try:
@@ -64,15 +62,12 @@ def try_evaluate_runtime_performance(
             warnings=(f"runtime trace loader failed: {exc}",),
         )
     trace_bundle = _trace_bundle_with_scenario_energy(trace_bundle, scenario)
-    deployment_catalog = build_runtime_deployment_catalog(
-        scenario,
-        satellite_catalog=tuple(getattr(trace_bundle, "satellite_catalog", ()) or ()),
-    )
-    if not deployment_catalog.default_deployment:
+    serving_profile = _serving_profile_for_trace(scenario, trace_bundle)
+    if serving_profile is None or not serving_profile.has_compute_capacity:
         return None
     engine_result = run_trace_backed_runtime(
         requests=requests,
-        deployment_catalog=deployment_catalog,
+        serving_profile=serving_profile,
         runtime_strategy=runtime_strategy,
         trace_bundle=trace_bundle,
         time_horizon_s=getattr(scenario, "time_horizon_s", None),
@@ -86,7 +81,7 @@ def try_evaluate_runtime_performance(
         trace_manifest=trace_manifest,
         effective_trace_model=trace_manifest.trace_model,
         effective_scope=trace_manifest.scope,
-        deployment_catalog=deployment_catalog,
+        serving_profile=serving_profile,
         evaluator_name="circular_geometry_trace_backed_runtime" if circular else "surrogate_trace_backed_runtime",
         path_model="circular_geometry_trace_sgl_isl" if circular else "surrogate_trace_sgl_isl",
         energy_model="circular_geometry_shadow_dvfs" if circular else "surrogate_soc_shadow_dvfs",
@@ -94,6 +89,18 @@ def try_evaluate_runtime_performance(
         link_model_status="surrogate_link_queue",
         energy_model_status="surrogate_soc",
     )
+
+
+def _serving_profile_for_trace(scenario: Any, trace_bundle: Any) -> Any:
+    profile = getattr(scenario, "serving_profile", None)
+    if profile is None:
+        return None
+    satellite_ids = tuple(
+        str(item.get("satellite_id"))
+        for item in (getattr(trace_bundle, "satellite_catalog", ()) or ())
+        if isinstance(item, dict) and item.get("satellite_id") is not None
+    )
+    return replace(profile, member_satellites=satellite_ids)
 
 
 def _trace_bundle_with_scenario_energy(trace_bundle: Any, scenario: Any) -> Any:

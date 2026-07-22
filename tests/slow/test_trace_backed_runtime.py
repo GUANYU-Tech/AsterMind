@@ -8,7 +8,7 @@ from pathlib import Path
 from orbitserve.experiments import load_experiment_spec, run_experiment
 from orbitserve.runtime import RuntimeScenario, RuntimeStrategySpec
 from orbitserve.runtime.evaluation import evaluate_runtime_performance
-from orbitserve.runtime.deployment_contracts import RuntimeDeployment, RuntimeDeploymentCatalog
+from orbitserve.runtime import ServingDeploymentView
 from orbitserve.runtime.engines.trace_backed import run_trace_backed_runtime
 from orbitserve.orbit.simulation_trace_builder import build_surrogate_orbit_trace
 from orbitserve.orbit.simulation_traces import (
@@ -100,7 +100,7 @@ class TraceBackedRuntimeTests(unittest.TestCase):
         )
         result = run_trace_backed_runtime(
             requests=requests,
-            deployment_catalog=catalog,
+            serving_profile=serving_profile,
             runtime_strategy=RuntimeStrategySpec.from_dict(
                 {"policy": "nearest_visible", "hard_gate_mode": "audit_only"}
             ),

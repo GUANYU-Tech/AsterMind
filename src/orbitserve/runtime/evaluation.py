@@ -32,15 +32,15 @@ def evaluate_runtime_performance(
     evaluated_result = try_evaluate_runtime_performance(scenario, runtime_strategy)
     if evaluated_result is not None:
         return evaluated_result
-    primary_deployment = scenario.serving_deployments[0] if scenario.serving_deployments else None
-    serving_evaluated = bool(primary_deployment and primary_deployment.evaluated)
-    serving_feasible = bool(primary_deployment and primary_deployment.feasible is not False)
+    serving_profile = scenario.serving_profile
+    serving_evaluated = bool(serving_profile and serving_profile.evaluated)
+    serving_feasible = bool(serving_profile and serving_profile.feasible is not False)
     simulation_evaluated = bool(scenario.simulation_trace_ref.get("evaluated", False))
     workload_status = _workload_status(scenario, leakage)
     simulation_status = "evaluated" if simulation_evaluated else "skeleton"
     serving_status = (
         "missing"
-        if primary_deployment is None
+        if serving_profile is None
         else "infeasible"
         if not serving_feasible
         else "evaluated"
@@ -75,7 +75,7 @@ def evaluate_runtime_performance(
         "warmup_s": 0,
         "fallback_accounting": "separate_from_leo_only",
         "internal_comm_accounting": (
-            primary_deployment.internal_comm_accounting if primary_deployment else "embedded"
+            serving_profile.internal_comm_accounting if serving_profile else "embedded"
         ),
         "kv_accounting": "active_plus_idle_session",
         "recompute_input_bytes_policy": "new_user_tokens_only",
@@ -115,7 +115,7 @@ def evaluate_runtime_performance(
         "eta_decode_capacity": None,
         "eta_compute_useful": None,
     }
-    serving_summary = primary_deployment.to_dict() if primary_deployment else {}
+    serving_summary = serving_profile.to_dict() if serving_profile else {}
     return RuntimePerformanceResult(
         evaluated=False,
         scenario={

@@ -24,7 +24,7 @@ from .routing import (
     query_link_sample_at,
     sample_route_leg,
 )
-from ..scenario.deployment_contracts import RuntimeDeployment, RuntimeDeploymentCatalog
+from ..contracts import ServingDeploymentView
 from .runtime_eligibility import ComputeEligibilitySet, build_compute_eligibility_set
 from ..metrics.runtime_records import RuntimeRequestRecord
 from ..state.runtime_state import RuntimeState
@@ -43,7 +43,7 @@ from ...orbit import TRACE_BACKED_RUNTIME_SURROGATE_SCOPE, normalize_trace_scope
 def run_trace_backed_runtime(
     *,
     requests: tuple[dict[str, Any], ...],
-    deployment_catalog: RuntimeDeploymentCatalog,
+    serving_profile: ServingDeploymentView,
     runtime_strategy: Any,
     trace_bundle: Any,
     time_horizon_s: float | None = None,
@@ -63,10 +63,10 @@ def run_trace_backed_runtime(
         }
     )
     warnings = list(getattr(trace_bundle, "warnings", ()))
-    warnings.extend(deployment_catalog.warnings)
+    warnings.extend(serving_profile.warnings)
     trace_model = str(getattr(trace_bundle, "trace_model", "surrogate_orbit_trace"))
     policy = str(getattr(runtime_strategy, "policy", "local_only"))
-    deployment = deployment_catalog.default_deployment
+    deployment = serving_profile
     satellite_catalog = tuple(getattr(trace_bundle, "satellite_catalog", ()) or ())
     if len(satellite_catalog) <= 0:
         return RuntimeEngineResult(
@@ -100,7 +100,7 @@ def run_trace_backed_runtime(
             ),
             decision_traces=(),
             state_summary=state.to_dict(),
-            warnings=("runtime deployment catalog has no usable compute capacity",),
+            warnings=("runtime serving profile has no usable compute capacity",),
             scope=scope,
             trace_model=trace_model,
             provenance={"runtime_engine": "trace_backed_runtime_surrogate"},
@@ -232,7 +232,7 @@ def _evaluate_trace_request(
     request: dict[str, Any],
     raw_request: dict[str, Any],
     trace_bundle: Any,
-    deployment: RuntimeDeployment,
+    deployment: ServingDeploymentView,
     policy: str,
     scheduler: Any,
     runtime_strategy: Any,
@@ -1889,7 +1889,7 @@ def _build_post_compute_outbound_plan(
 
 def _compute_eligibility_at(
     *,
-    deployment: RuntimeDeployment,
+    deployment: ServingDeploymentView,
     trace_bundle: Any,
     state: RuntimeState,
     time_s: float,

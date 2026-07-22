@@ -378,6 +378,15 @@ class ServingDeploymentView:
             warnings=_warnings_from_payload(throughput_payload),
         )
 
+    @property
+    def has_compute_capacity(self) -> bool:
+        return bool(
+            self.prefill_tokens_per_s
+            and self.prefill_tokens_per_s > 0
+            and self.decode_tokens_per_s
+            and self.decode_tokens_per_s > 0
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return to_jsonable(self)
 

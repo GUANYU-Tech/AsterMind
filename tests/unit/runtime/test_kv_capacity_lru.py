@@ -1,13 +1,13 @@
 import unittest
 
 from orbitserve.runtime.engine.trace_backed import _session_action
-from orbitserve.runtime.scenario.deployment_contracts import RuntimeDeployment
+from orbitserve.runtime import ServingDeploymentView
 from orbitserve.runtime.state.kv_runtime import _admit_session_kv
 from orbitserve.runtime.state.runtime_state import RuntimeState
 
 
 def _deployment(capacity_tokens=10):
-    return RuntimeDeployment(
+    return ServingDeploymentView(
         deployment_id="deployment-a",
         member_satellites=("sat-a",),
         kv_cache_capacity_tokens=capacity_tokens,

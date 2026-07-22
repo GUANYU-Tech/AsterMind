@@ -77,7 +77,7 @@ def build_runtime_scenario(
                 _dict(manifest.get("time")).get("time_horizon_s"),
             )
         )
-    deployment = ServingDeploymentView.from_inputs(
+    serving_profile = ServingDeploymentView.from_inputs(
         deployment_id="deployment_0",
         serving_spec=serving_spec,
         throughput_estimate=serving_throughput,
@@ -152,7 +152,7 @@ def build_runtime_scenario(
                 *_warnings_from_payload(simulation_payload),
                 *_warnings_from_payload(cost_payload),
                 *runtime_energy_profile.warnings,
-                *deployment.warnings,
+                *serving_profile.warnings,
             )
         )
     )
@@ -173,7 +173,7 @@ def build_runtime_scenario(
             "satellite_count": constellation_payload.get("satellite_count"),
             **({"satellite_catalog": list(satellite_catalog)} if satellite_catalog else {}),
         },
-        serving_deployments=(deployment,),
+        serving_profile=serving_profile,
         cost_power=cost_power,
         energy_profile=runtime_energy_profile.to_dict(),
         runtime_config=runtime_strategy,

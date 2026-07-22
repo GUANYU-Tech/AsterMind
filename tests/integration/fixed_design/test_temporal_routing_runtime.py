@@ -12,7 +12,6 @@ from orbitserve.runtime.routing import (
 )
 from orbitserve.runtime import RuntimeScenario, RuntimeStrategySpec, ServingDeploymentView
 from orbitserve.runtime.evaluation import evaluate_runtime_performance
-from orbitserve.runtime.deployment_contracts import RuntimeDeployment, RuntimeDeploymentCatalog
 from orbitserve.runtime.runtime_eligibility import build_compute_eligibility_set
 from orbitserve.runtime.engines.trace_backed import run_trace_backed_runtime
 from orbitserve.runtime.runtime_metrics import aggregate_runtime_records
@@ -36,15 +35,11 @@ def _request(arrival_time_s=0.0, **overrides):
 
 
 def _deployment_catalog(prefill_tokens_per_s=300.0, decode_tokens_per_s=300.0, member_satellites=("sat-a", "sat-b", "sat-c")):
-    return RuntimeDeploymentCatalog(
-        deployments=(
-            RuntimeDeployment(
-                deployment_id="deployment_0",
-                member_satellites=tuple(member_satellites),
-                prefill_tokens_per_s=prefill_tokens_per_s,
-                decode_tokens_per_s=decode_tokens_per_s,
-            ),
-        )
+    return ServingDeploymentView(
+        deployment_id="deployment_0",
+        member_satellites=tuple(member_satellites),
+        prefill_tokens_per_s=prefill_tokens_per_s,
+        decode_tokens_per_s=decode_tokens_per_s,
     )
 
 
@@ -251,7 +246,7 @@ def _link(link_id, kind, endpoint_a, endpoint_b, propagation_delay_s):
 
 class TemporalRoutingRuntimeTests(unittest.TestCase):
     def test_compute_eligibility_combines_deployment_hardware_fault_and_energy_without_capacity_boost(self):
-        deployment = RuntimeDeployment(
+        deployment = ServingDeploymentView(
             deployment_id="deployment_0",
             member_satellites=("sat-a", "sat-b", "sat-c"),
         )
@@ -309,7 +304,7 @@ class TemporalRoutingRuntimeTests(unittest.TestCase):
         bundle = FakeTemporalTraceBundle(horizon_s=100.0)
         result = run_trace_backed_runtime(
             requests=(_request(100.0),),
-            deployment_catalog=_deployment_catalog(),
+            serving_profile=_deployment_catalog(),
             runtime_strategy=RuntimeStrategySpec.from_dict({"policy": "nearest_visible"}),
             trace_bundle=bundle,
         )
@@ -321,7 +316,7 @@ class TemporalRoutingRuntimeTests(unittest.TestCase):
         bundle = FakeTemporalTraceBundle()
         result = run_trace_backed_runtime(
             requests=(_request(0.0, ttft_deadline_s=0.000001, e2e_deadline_s=0.000001),),
-            deployment_catalog=_deployment_catalog(prefill_tokens_per_s=1.0, decode_tokens_per_s=1.0),
+            serving_profile=_deployment_catalog(prefill_tokens_per_s=1.0, decode_tokens_per_s=1.0),
             runtime_strategy=RuntimeStrategySpec.from_dict({"policy": "orbitserve", "max_hop_count": 2}),
             trace_bundle=bundle,
         )
@@ -339,7 +334,7 @@ class TemporalRoutingRuntimeTests(unittest.TestCase):
         bundle = FakeTemporalTraceBundle(soc_min_by_sat={"sat-a": 0.95})
         result = run_trace_backed_runtime(
             requests=(_request(0.0),),
-            deployment_catalog=_deployment_catalog(),
+            serving_profile=_deployment_catalog(),
             runtime_strategy=RuntimeStrategySpec.from_dict({"policy": "nearest_visible"}),
             trace_bundle=bundle,
         )
@@ -371,8 +366,7 @@ class TemporalRoutingRuntimeTests(unittest.TestCase):
                     "valid_for_paper_main_results": False,
                 },
             },
-            serving_deployments=(
-                ServingDeploymentView.from_inputs(
+            serving_profile=ServingDeploymentView.from_inputs(
                     deployment_id="deployment_0",
                     throughput_estimate={
                         "evaluated": True,
@@ -382,7 +376,6 @@ class TemporalRoutingRuntimeTests(unittest.TestCase):
                         "member_satellites": ("sat-a",),
                     },
                 ),
-            ),
             runtime_config=RuntimeStrategySpec.from_dict({"policy": "nearest_visible"}),
         )
 
@@ -400,7 +393,7 @@ class TemporalRoutingRuntimeTests(unittest.TestCase):
         bundle.energy_windows = ()
         result = run_trace_backed_runtime(
             requests=(_request(0.0),),
-            deployment_catalog=_deployment_catalog(),
+            serving_profile=_deployment_catalog(),
             runtime_strategy=RuntimeStrategySpec.from_dict(
                 {
                     "policy": "nearest_visible",
@@ -422,7 +415,7 @@ class TemporalRoutingRuntimeTests(unittest.TestCase):
         bundle = FakeTemporalTraceBundle(missing_link_samples=("sgl:ingress:sat-a",))
         result = run_trace_backed_runtime(
             requests=(_request(0.0),),
-            deployment_catalog=_deployment_catalog(),
+            serving_profile=_deployment_catalog(),
             runtime_strategy=RuntimeStrategySpec.from_dict(
                 {
                     "policy": "nearest_visible",
@@ -444,7 +437,7 @@ class TemporalRoutingRuntimeTests(unittest.TestCase):
         bundle = FakeTemporalTraceBundle(active_graph_unavailable=True)
         result = run_trace_backed_runtime(
             requests=(_request(0.0),),
-            deployment_catalog=_deployment_catalog(),
+            serving_profile=_deployment_catalog(),
             runtime_strategy=RuntimeStrategySpec.from_dict(
                 {
                     "policy": "shortest_path",
@@ -472,7 +465,7 @@ class TemporalRoutingRuntimeTests(unittest.TestCase):
                     e2e_deadline_s=10.0,
                 ),
             ),
-            deployment_catalog=_deployment_catalog(),
+            serving_profile=_deployment_catalog(),
             runtime_strategy=RuntimeStrategySpec.from_dict(
                 {
                     "policy": "nearest_visible",
@@ -551,7 +544,7 @@ class TemporalRoutingRuntimeTests(unittest.TestCase):
                             e2e_deadline_s=case["e2e_deadline_s"],
                         ),
                     ),
-                    deployment_catalog=_deployment_catalog(),
+                    serving_profile=_deployment_catalog(),
                     runtime_strategy=RuntimeStrategySpec.from_dict(
                         {
                             "policy": "nearest_visible",
@@ -574,7 +567,7 @@ class TemporalRoutingRuntimeTests(unittest.TestCase):
     def test_ground_fallback_missing_latency_is_not_served(self):
         result = run_trace_backed_runtime(
             requests=(_request(0.0),),
-            deployment_catalog=_deployment_catalog(),
+            serving_profile=_deployment_catalog(),
             runtime_strategy=RuntimeStrategySpec.from_dict(
                 {
                     "policy": "nearest_visible",
@@ -602,13 +595,13 @@ class TemporalRoutingRuntimeTests(unittest.TestCase):
 
         shortest = run_trace_backed_runtime(
             requests=requests,
-            deployment_catalog=catalog,
+            serving_profile=catalog,
             runtime_strategy=RuntimeStrategySpec.from_dict({"policy": "shortest_path", "max_hop_count": 2}),
             trace_bundle=FakeTemporalTraceBundle(dual_access=True),
         )
         load_aware = run_trace_backed_runtime(
             requests=requests,
-            deployment_catalog=catalog,
+            serving_profile=catalog,
             runtime_strategy=RuntimeStrategySpec.from_dict({"policy": "load_aware", "max_hop_count": 2}),
             trace_bundle=FakeTemporalTraceBundle(dual_access=True),
         )
@@ -638,7 +631,7 @@ class TemporalRoutingRuntimeTests(unittest.TestCase):
         )
         result = run_trace_backed_runtime(
             requests=requests,
-            deployment_catalog=_deployment_catalog(
+            serving_profile=_deployment_catalog(
                 prefill_tokens_per_s=3.0,
                 decode_tokens_per_s=3.0,
                 member_satellites=("sat-a",),
@@ -664,7 +657,7 @@ class TemporalRoutingRuntimeTests(unittest.TestCase):
         )
         result = run_trace_backed_runtime(
             requests=(_request(0.0),),
-            deployment_catalog=_deployment_catalog(member_satellites=("sat-b",)),
+            serving_profile=_deployment_catalog(member_satellites=("sat-b",)),
             runtime_strategy=RuntimeStrategySpec.from_dict({"policy": "shortest_path", "max_hop_count": 2}),
             trace_bundle=bundle,
         )
@@ -697,7 +690,7 @@ class TemporalRoutingRuntimeTests(unittest.TestCase):
 
         record = run_trace_backed_runtime(
             requests=(_request(0.0, input_bytes=10.0, output_bytes=10.0),),
-            deployment_catalog=_deployment_catalog(member_satellites=("sat-b",)),
+            serving_profile=_deployment_catalog(member_satellites=("sat-b",)),
             runtime_strategy=RuntimeStrategySpec.from_dict({"policy": "shortest_path", "max_hop_count": 2}),
             trace_bundle=bundle,
         ).records[0]
@@ -747,7 +740,7 @@ class TemporalRoutingRuntimeTests(unittest.TestCase):
 
         record = run_trace_backed_runtime(
             requests=(_request(0.0, input_bytes=10.0, output_bytes=10.0),),
-            deployment_catalog=_deployment_catalog(member_satellites=("sat-b",)),
+            serving_profile=_deployment_catalog(member_satellites=("sat-b",)),
             runtime_strategy=RuntimeStrategySpec.from_dict({"policy": "energy_aware", "max_hop_count": 2}),
             trace_bundle=bundle,
         ).records[0]
@@ -758,7 +751,7 @@ class TemporalRoutingRuntimeTests(unittest.TestCase):
     def test_colocated_ttft_breakdown_closes_at_first_token_return(self):
         record = run_trace_backed_runtime(
             requests=(_request(0.0, prompt_tokens=3, output_tokens=3),),
-            deployment_catalog=_deployment_catalog(
+            serving_profile=_deployment_catalog(
                 prefill_tokens_per_s=3.0,
                 decode_tokens_per_s=2.0,
                 member_satellites=("sat-b",),
@@ -787,7 +780,7 @@ class TemporalRoutingRuntimeTests(unittest.TestCase):
 
         shortest = run_trace_backed_runtime(
             requests=(request,),
-            deployment_catalog=catalog,
+            serving_profile=catalog,
             runtime_strategy=RuntimeStrategySpec.from_dict(
                 {"policy": "shortest_path", "max_hop_count": 2, "hard_gate_mode": "audit_only"}
             ),
@@ -795,7 +788,7 @@ class TemporalRoutingRuntimeTests(unittest.TestCase):
         )
         energy_aware = run_trace_backed_runtime(
             requests=(request,),
-            deployment_catalog=catalog,
+            serving_profile=catalog,
             runtime_strategy=RuntimeStrategySpec.from_dict({"policy": "energy_aware", "max_hop_count": 2}),
             trace_bundle=FakeTemporalTraceBundle(
                 dual_access=True,
@@ -840,7 +833,7 @@ class TemporalRoutingRuntimeTests(unittest.TestCase):
                     output_bytes=0.0,
                 ),
             ),
-            deployment_catalog=_deployment_catalog(),
+            serving_profile=_deployment_catalog(),
             runtime_strategy=RuntimeStrategySpec.from_dict({"policy": "nearest_visible"}),
             trace_bundle=bundle,
         )
@@ -885,7 +878,7 @@ class TemporalRoutingRuntimeTests(unittest.TestCase):
 
         shortest = run_trace_backed_runtime(
             requests=(request,),
-            deployment_catalog=catalog,
+            serving_profile=catalog,
             runtime_strategy=RuntimeStrategySpec.from_dict(
                 {"policy": "shortest_path", "max_hop_count": 2, "hard_gate_mode": "audit_only"}
             ),
@@ -893,7 +886,7 @@ class TemporalRoutingRuntimeTests(unittest.TestCase):
         )
         energy_aware = run_trace_backed_runtime(
             requests=(request,),
-            deployment_catalog=catalog,
+            serving_profile=catalog,
             runtime_strategy=RuntimeStrategySpec.from_dict({"policy": "energy_aware", "max_hop_count": 2}),
             trace_bundle=energy_bundle,
         )
@@ -947,7 +940,7 @@ class TemporalRoutingRuntimeTests(unittest.TestCase):
 
         no_dvfs = run_trace_backed_runtime(
             requests=(request,),
-            deployment_catalog=catalog,
+            serving_profile=catalog,
             runtime_strategy=RuntimeStrategySpec.from_dict(
                 {
                     "policy": "orbitserve",
@@ -960,7 +953,7 @@ class TemporalRoutingRuntimeTests(unittest.TestCase):
         )
         dvfs = run_trace_backed_runtime(
             requests=(request,),
-            deployment_catalog=catalog,
+            serving_profile=catalog,
             runtime_strategy=RuntimeStrategySpec.from_dict(
                 {
                     "policy": "orbitserve",
@@ -1022,7 +1015,7 @@ class TemporalRoutingRuntimeTests(unittest.TestCase):
 
         result = run_trace_backed_runtime(
             requests=(request,),
-            deployment_catalog=_deployment_catalog(prefill_tokens_per_s=10.0, decode_tokens_per_s=10.0),
+            serving_profile=_deployment_catalog(prefill_tokens_per_s=10.0, decode_tokens_per_s=10.0),
             runtime_strategy=RuntimeStrategySpec.from_dict(
                 {
                     "policy": "energy_aware",
@@ -1072,7 +1065,7 @@ class TemporalRoutingRuntimeTests(unittest.TestCase):
                 _request(0.0, request_id="req-0", prompt_tokens=50, output_tokens=1, input_bytes=0.0, output_bytes=0.0),
                 _request(0.0, request_id="req-1", prompt_tokens=1, output_tokens=1, input_bytes=0.0, output_bytes=0.0),
             ),
-            deployment_catalog=_deployment_catalog(prefill_tokens_per_s=3.0, decode_tokens_per_s=300.0),
+            serving_profile=_deployment_catalog(prefill_tokens_per_s=3.0, decode_tokens_per_s=300.0),
             runtime_strategy=RuntimeStrategySpec.from_dict({"policy": "local_only"}),
             trace_bundle=bundle,
         )
@@ -1107,7 +1100,7 @@ class TemporalRoutingRuntimeTests(unittest.TestCase):
                     output_bytes=0.0,
                 ),
             ),
-            deployment_catalog=_deployment_catalog(),
+            serving_profile=_deployment_catalog(),
             runtime_strategy=RuntimeStrategySpec.from_dict({"policy": "shortest_path", "max_hop_count": 2}),
             trace_bundle=bundle,
         )
@@ -1127,7 +1120,7 @@ class TemporalRoutingRuntimeTests(unittest.TestCase):
 
         result = run_trace_backed_runtime(
             requests=(_request(50.0),),
-            deployment_catalog=_deployment_catalog(),
+            serving_profile=_deployment_catalog(),
             runtime_strategy=RuntimeStrategySpec.from_dict(
                 {
                     "policy": "nearest_visible",
@@ -1148,7 +1141,7 @@ class TemporalRoutingRuntimeTests(unittest.TestCase):
         bundle = FakeTemporalTraceBundle(stale_access=True)
         result = run_trace_backed_runtime(
             requests=(_request(0.0),),
-            deployment_catalog=_deployment_catalog(),
+            serving_profile=_deployment_catalog(),
             runtime_strategy=RuntimeStrategySpec.from_dict({"policy": "nearest_visible"}),
             trace_bundle=bundle,
         )
@@ -1170,7 +1163,7 @@ class TemporalRoutingRuntimeTests(unittest.TestCase):
         )
         result = run_trace_backed_runtime(
             requests=(_request(0.0),),
-            deployment_catalog=_deployment_catalog(prefill_tokens_per_s=0.3, decode_tokens_per_s=0.3),
+            serving_profile=_deployment_catalog(prefill_tokens_per_s=0.3, decode_tokens_per_s=0.3),
             runtime_strategy=RuntimeStrategySpec.from_dict(
                 {
                     "policy": "nearest_visible",

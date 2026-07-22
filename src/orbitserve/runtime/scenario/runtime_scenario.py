@@ -23,7 +23,7 @@ class RuntimeScenario:
     gateways: tuple[dict[str, Any], ...] = ()
     simulation_trace_ref: dict[str, Any] = field(default_factory=dict)
     constellation: dict[str, Any] = field(default_factory=dict)
-    serving_deployments: tuple[ServingDeploymentView, ...] = ()
+    serving_profile: ServingDeploymentView | None = None
     cost_power: dict[str, Any] = field(default_factory=dict)
     energy_profile: dict[str, Any] = field(default_factory=dict)
     runtime_config: RuntimeStrategySpec = field(

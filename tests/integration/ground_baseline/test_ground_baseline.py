@@ -19,7 +19,6 @@ from orbitserve.baselines.ground.runtime import (
 from orbitserve.experiments import load_experiment_spec, run_experiment
 from orbitserve.runtime import RuntimeScenario, RuntimeStrategySpec
 from orbitserve.experiments.runtime_dispatch import evaluate_runtime_performance
-from orbitserve.runtime.deployment_contracts import RuntimeDeploymentCatalog
 from orbitserve.runtime.engines.trace_backed import run_trace_backed_runtime
 from orbitserve.runtime.runtime_metrics import aggregate_runtime_records
 from orbitserve.runtime.runtime_records import RuntimeRequestRecord
@@ -631,7 +630,7 @@ class GroundBaselineRuntimeTests(unittest.TestCase):
             ),
             regions=({"region_id": "us", "lat_deg": 39.0, "lon_deg": -77.0},),
             simulation_trace_ref={},
-            serving_deployments=(),
+            serving_profile=None,
             runtime_config=strategy,
         )
 

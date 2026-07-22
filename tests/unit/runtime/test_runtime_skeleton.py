@@ -50,7 +50,7 @@ def _runtime_scenario(runtime, *, requests=None, sessions=None):
         requests=tuple(requests or [_request()]),
         sessions=tuple(sessions or ()),
         simulation_trace_ref={"evaluated": False, "warnings": ["simulation is a skeleton"]},
-        serving_deployments=(deployment,),
+        serving_profile=deployment,
         runtime_config=strategy,
         warnings=("simulation trace is not implemented; runtime observed metrics are null",),
     )

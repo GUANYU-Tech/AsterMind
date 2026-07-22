@@ -11,7 +11,7 @@ from orbitserve.runtime.state.energy_state import REQUIRED_RUNTIME_ENERGY_WINDOW
 from orbitserve.experiments import load_experiment_spec, run_experiment
 from orbitserve.architecture.hardware import SatelliteHardwareProfile
 from orbitserve.architecture.hardware import resolve_experiment_hardware
-from orbitserve.runtime.scenario.deployment_contracts import RuntimeDeployment, RuntimeDeploymentCatalog
+from orbitserve.runtime import ServingDeploymentView
 from orbitserve.runtime.scenario.runtime_energy_envelope import derive_runtime_energy_envelope
 from orbitserve.runtime import build_runtime_scenario
 from orbitserve.runtime.engine.trace_backed import run_trace_backed_runtime
@@ -183,14 +183,10 @@ class RuntimeEnergyEnvelopeTests(unittest.TestCase):
 
         runtime = run_trace_backed_runtime(
             requests=workload["requests"],
-            deployment_catalog=RuntimeDeploymentCatalog(
-                deployments=(
-                    RuntimeDeployment(
-                        deployment_id="deployment_0",
-                        prefill_tokens_per_s=1_000_000.0,
-                        decode_tokens_per_s=1_000_000.0,
-                    ),
-                ),
+            serving_profile=ServingDeploymentView(
+                deployment_id="deployment_0",
+                prefill_tokens_per_s=1_000_000.0,
+                decode_tokens_per_s=1_000_000.0,
             ),
             runtime_strategy=RuntimeStrategySpec.from_dict({"policy": "nearest_visible"}),
             trace_bundle=bundle,

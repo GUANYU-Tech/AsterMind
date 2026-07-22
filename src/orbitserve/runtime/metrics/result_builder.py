@@ -17,7 +17,8 @@ def build_runtime_performance_result(
     trace_manifest: Any,
     effective_trace_model: str,
     effective_scope: str,
-    deployment_catalog: Any,
+    serving_profile: Any = None,
+    deployment_catalog: Any = None,
     evaluator_name: str,
     path_model: str,
     energy_model: str,
@@ -28,6 +29,7 @@ def build_runtime_performance_result(
     centralized_ground_baseline: bool = False,
     terrestrial_costing: Any = None,
 ) -> RuntimePerformanceResult:
+    effective_serving_profile = serving_profile or deployment_catalog
     aggregate_horizon_s = _aggregate_horizon_s(
         engine_result=engine_result,
         trace_model=effective_trace_model,
@@ -82,7 +84,7 @@ def build_runtime_performance_result(
             (
                 *scenario_warnings,
                 *trace_warnings,
-                *(deployment_catalog.warnings if deployment_catalog is not None else ()),
+                *(effective_serving_profile.warnings if effective_serving_profile is not None else ()),
                 *engine_result.warnings,
                 *aggregates.warnings,
                 *(terrestrial_costing.warnings if terrestrial_costing is not None else ()),
@@ -107,8 +109,8 @@ def build_runtime_performance_result(
         else None
     )
     deployment_payload = (
-        deployment_catalog.to_dict()
-        if deployment_catalog is not None
+        effective_serving_profile.to_dict()
+        if effective_serving_profile is not None
         else {
             "model": "geo_distributed_terrestrial_llm_serving",
             "policy": runtime_strategy.policy,
@@ -122,7 +124,7 @@ def build_runtime_performance_result(
         "valid_for_paper_main_results": False,
         "request_records": request_records,
         "state_summary": engine_result.state_summary,
-        "deployment_catalog": deployment_payload,
+        **({"deployment_catalog": deployment_payload} if terrestrial_baseline else {"serving_profile": deployment_payload}),
         "engine_provenance": engine_result.provenance or {},
         "metrics_contract": {
             "completion_ratio": "complete output delivered within the Runtime trace horizon",

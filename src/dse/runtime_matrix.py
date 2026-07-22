@@ -11,7 +11,6 @@ from ..common import to_jsonable
 from ..common import DSEMetrics
 from ..runtime import RuntimeStrategySpec
 from ..experiments.runtime_dispatch import evaluate_runtime_performance
-from ..runtime import build_runtime_deployment_catalog
 from .runtime_optimization import RuntimeOptimizationObjective, score_runtime_evaluator_result
 
 
@@ -255,7 +254,7 @@ def evaluate_runtime_matrix(
         for scope_candidate in scope_candidates:
             scoped_scenario = _runtime_scenario_for_scope_candidate(context.runtime_scenario, scope_candidate)
             scope_strategy_id = _optional_str(scope_candidate.get("strategy_id"))
-            catalog_preview = build_runtime_deployment_catalog(scoped_scenario)
+            catalog_preview = None
             for scheduler in candidates:
                 scheduler_payload = dict(scheduler)
                 base_strategy_id = str(scheduler_payload.pop("strategy_id"))

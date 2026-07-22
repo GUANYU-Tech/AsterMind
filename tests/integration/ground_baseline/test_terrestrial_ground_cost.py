@@ -381,7 +381,7 @@ class TerrestrialGroundCostTests(unittest.TestCase):
             design_id="leo-context-that-must-not-leak",
             design_row={},
             runtime_scenario=SimpleNamespace(
-                scenario_id="source", serving_deployments=(), provenance={}
+                scenario_id="source", serving_profile=None, provenance={}
             ),
             current_scheduler={"policy": "local_only"},
             cost_result={
