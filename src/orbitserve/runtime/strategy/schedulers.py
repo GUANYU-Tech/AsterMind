@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from typing import Any, Protocol
+from typing import Any
 
 from ...common import to_jsonable
+from ..contracts import RuntimeStrategySpec
 
 
 @dataclass(frozen=True)
@@ -30,107 +31,6 @@ class SchedulerDecision:
 
     def to_dict(self) -> dict[str, Any]:
         return to_jsonable(self)
-
-
-class SchedulerPolicy(Protocol):
-    name: str
-
-    def select_action(self, state: Any, request: Any) -> SchedulerDecision:
-        """Select a request action from the current simulator state."""
-
-    def to_runtime_strategy(self) -> Any:
-        """Return the runtime strategy that this scheduler exposes to evaluators."""
-
-    def optimization_search_space(self) -> dict[str, Any]:
-        """Return a scheduler search-space payload for runtime optimization."""
-
-
-@dataclass(frozen=True)
-class SchedulerSpec:
-    policy: str = "orbitserve"
-    lookahead_orbits: float = 1.0
-    name: str | None = None
-    policy_family: str | None = None
-    enabled_actions: tuple[str, ...] = ()
-    session_actions_enabled: tuple[str, ...] = ()
-    dvfs_modes_enabled: tuple[str, ...] = ()
-    h_lookahead_s: float | None = None
-    max_hop_count: int | None = None
-    fallback_enabled: bool = False
-    defer_enabled: bool = False
-    path_policy: str | None = None
-    queue_policy: str | None = None
-    hard_gate_mode: str = "strict"
-    hard_gate_overrides: dict[str, Any] = field(default_factory=dict)
-    weights: dict[str, Any] = field(default_factory=dict)
-    normalization_refs: dict[str, Any] = field(default_factory=dict)
-    kv_policy: dict[str, Any] = field(default_factory=dict)
-    ground_config: dict[str, Any] = field(default_factory=dict)
-    random_seed: int | None = None
-    trace_level: str = "summary"
-    runtime_optimization_enabled: bool = True
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any] | None) -> "SchedulerSpec":
-        data = data or {}
-        return cls(
-            policy=_canonical_policy(str(data.get("policy", "orbitserve"))),
-            lookahead_orbits=float(data.get("lookahead_orbits", 1.0)),
-            name=_optional_str(data.get("name")),
-            policy_family=_optional_str(data.get("policy_family")),
-            enabled_actions=_string_tuple(data.get("enabled_actions")),
-            session_actions_enabled=_string_tuple(data.get("session_actions_enabled")),
-            dvfs_modes_enabled=_string_tuple(data.get("dvfs_modes_enabled")),
-            h_lookahead_s=_optional_float(data.get("h_lookahead_s", data.get("H_lookahead"))),
-            max_hop_count=_optional_int(data.get("max_hop_count")),
-            fallback_enabled=bool(data.get("fallback_enabled", False)),
-            defer_enabled=bool(data.get("defer_enabled", False)),
-            path_policy=_optional_str(data.get("path_policy")),
-            queue_policy=_optional_str(data.get("queue_policy")),
-            hard_gate_mode=str(data.get("hard_gate_mode", "strict")),
-            hard_gate_overrides=dict(data.get("hard_gate_overrides") or {}),
-            weights=dict(data.get("weights") or {}),
-            normalization_refs=dict(data.get("normalization_refs") or {}),
-            kv_policy=dict(data.get("kv_policy") or {}),
-            ground_config=dict(data.get("ground_config") or {}),
-            random_seed=_optional_int(data.get("random_seed")),
-            trace_level=str(data.get("trace_level", "summary")),
-            runtime_optimization_enabled=bool(
-                data.get("runtime_optimization_enabled", data.get("optimization_enabled", True))
-            ),
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        payload: dict[str, Any] = {
-            "policy": self.policy,
-            "lookahead_orbits": self.lookahead_orbits,
-        }
-        _set_if_not_none(payload, "name", self.name)
-        _set_if_not_none(payload, "policy_family", self.policy_family)
-        _set_if_not_empty(payload, "enabled_actions", self.enabled_actions)
-        _set_if_not_empty(payload, "session_actions_enabled", self.session_actions_enabled)
-        _set_if_not_empty(payload, "dvfs_modes_enabled", self.dvfs_modes_enabled)
-        _set_if_not_none(payload, "h_lookahead_s", self.h_lookahead_s)
-        _set_if_not_none(payload, "max_hop_count", self.max_hop_count)
-        if self.fallback_enabled:
-            payload["fallback_enabled"] = self.fallback_enabled
-        if self.defer_enabled:
-            payload["defer_enabled"] = self.defer_enabled
-        _set_if_not_none(payload, "path_policy", self.path_policy)
-        _set_if_not_none(payload, "queue_policy", self.queue_policy)
-        if self.hard_gate_mode != "strict":
-            payload["hard_gate_mode"] = self.hard_gate_mode
-        _set_if_not_empty(payload, "hard_gate_overrides", self.hard_gate_overrides)
-        _set_if_not_empty(payload, "weights", self.weights)
-        _set_if_not_empty(payload, "normalization_refs", self.normalization_refs)
-        _set_if_not_empty(payload, "kv_policy", self.kv_policy)
-        _set_if_not_empty(payload, "ground_config", self.ground_config)
-        _set_if_not_none(payload, "random_seed", self.random_seed)
-        if self.trace_level != "summary":
-            payload["trace_level"] = self.trace_level
-        if not self.runtime_optimization_enabled:
-            payload["runtime_optimization_enabled"] = False
-        return to_jsonable(payload)
 
 
 @dataclass(frozen=True)
@@ -179,21 +79,6 @@ class SchedulerCandidate:
         return to_jsonable(self)
 
 
-RUNTIME_OPTIMIZATION_BASELINE_POLICIES = (
-    "local_only",
-    "shortest_path",
-    "load_aware",
-    "energy_aware",
-    "orbitserve",
-)
-
-PAPER_POLICY_IDS = {
-    "local_only": "leo_local_only",
-    "shortest_path": "shortest_path_forwarding",
-    "orbitserve": "full_orbitserve",
-}
-
-
 @dataclass(frozen=True)
 class RuntimeScheduler:
     """Runtime-facing scheduler adapter.
@@ -203,7 +88,7 @@ class RuntimeScheduler:
     the fixed strategy to rank those candidates deterministically.
     """
 
-    spec: SchedulerSpec
+    spec: RuntimeStrategySpec
 
     @property
     def name(self) -> str:
@@ -217,88 +102,8 @@ class RuntimeScheduler:
     def policy(self) -> str:
         return self.spec.policy
 
-    def to_runtime_strategy(self) -> Any:
-        from ..contracts import RuntimeStrategySpec
-
-        strategy = RuntimeStrategySpec.from_value(self.spec)
-        return RuntimeStrategySpec.from_dict(
-            {
-                **strategy.to_dict(),
-                "provenance": {
-                    **strategy.provenance,
-                    "scheduler_bridge": "RuntimeScheduler",
-                    "scheduler_module": "orbitserve.schedulers",
-                },
-            }
-        )
-
     def runtime_strategy_payload(self) -> dict[str, Any]:
-        return self.to_runtime_strategy().to_dict()
-
-    def candidate_strategy_payloads(self, policies: tuple[str, ...] | None = None) -> tuple[dict[str, Any], ...]:
-        from ..contracts import RuntimeStrategySpec
-
-        ordered_policies = _unique_policies(
-            (
-                self.spec.policy,
-                *(policies or RUNTIME_OPTIMIZATION_BASELINE_POLICIES),
-            )
-        )
-        candidates: list[dict[str, Any]] = []
-        for policy in ordered_policies:
-            if policy not in KNOWN_POLICIES:
-                known = ", ".join(sorted(KNOWN_POLICIES))
-                raise ValueError(f"unknown scheduler policy '{policy}'. Known policies: {known}")
-            payload = (
-                self.runtime_strategy_payload()
-                if policy == self.spec.policy
-                else RuntimeStrategySpec.from_dict({"policy": policy}).to_dict()
-            )
-            payload = {
-                **payload,
-                "strategy_id": PAPER_POLICY_IDS.get(policy, policy),
-                "provenance": {
-                    **dict(payload.get("provenance") or {}),
-                    "scheduler_bridge": "RuntimeScheduler",
-                    "scheduler_module": "orbitserve.schedulers",
-                    "scheduler_source_policy": self.spec.policy,
-                },
-            }
-            candidates.append(to_jsonable(payload))
-        return tuple(candidates)
-
-    def optimization_search_space(self) -> dict[str, Any]:
-        if not self.spec.runtime_optimization_enabled:
-            return {
-                "enabled": False,
-                "current_scheduler": self.runtime_strategy_payload(),
-                "candidate_schedulers": (),
-                "include_current_policy": False,
-                "baseline_policies": (),
-                "warnings": ("scheduler.runtime_optimization_enabled=false",),
-                "provenance": {
-                    "source": "scheduler_runtime_bridge",
-                    "scheduler_policy": self.spec.policy,
-                    "scheduler_module": "orbitserve.schedulers",
-                    "runtime_optimization_enabled": False,
-                },
-            }
-        candidates = self.candidate_strategy_payloads()
-        return {
-            "current_scheduler": self.runtime_strategy_payload(),
-            "candidate_schedulers": candidates,
-            "include_current_policy": False,
-            "baseline_policies": RUNTIME_OPTIMIZATION_BASELINE_POLICIES,
-            "provenance": {
-                "source": "scheduler_runtime_bridge",
-                "scheduler_policy": self.spec.policy,
-                "scheduler_module": "orbitserve.schedulers",
-                "candidate_strategy_count": len(candidates),
-            },
-        }
-
-    def runtime_search_space(self) -> dict[str, Any]:
-        return self.optimization_search_space()
+        return self.spec.to_dict()
 
     def select_action(self, state: Any, request: Any) -> SchedulerDecision:
         runtime_strategy = self.runtime_strategy_payload()
@@ -690,55 +495,16 @@ KNOWN_POLICIES = {
 }
 
 
-def get_scheduler(policy_or_spec: str | SchedulerSpec | dict[str, Any] | Any = "orbitserve") -> RuntimeScheduler:
-    spec = _coerce_scheduler_spec(policy_or_spec)
-    policy_name = spec.policy
-    if policy_name not in KNOWN_POLICIES:
+def get_scheduler(
+    policy_or_spec: str | RuntimeStrategySpec | dict[str, Any] | Any = "orbitserve",
+) -> RuntimeScheduler:
+    spec = RuntimeStrategySpec.from_value(
+        {"policy": policy_or_spec} if isinstance(policy_or_spec, str) else policy_or_spec
+    )
+    if spec.policy not in KNOWN_POLICIES:
         known = ", ".join(sorted(KNOWN_POLICIES))
-        raise ValueError(f"unknown scheduler policy '{policy_name}'. Known policies: {known}")
+        raise ValueError(f"unknown scheduler policy '{spec.policy}'. Known policies: {known}")
     return RuntimeScheduler(spec)
-
-
-def _coerce_scheduler_spec(value: str | SchedulerSpec | dict[str, Any] | Any) -> SchedulerSpec:
-    if isinstance(value, RuntimeScheduler):
-        return replace(value.spec, policy=_canonical_policy(value.spec.policy))
-    if isinstance(value, SchedulerSpec):
-        return replace(value, policy=_canonical_policy(value.policy))
-    if isinstance(value, str):
-        return SchedulerSpec.from_dict({"policy": value})
-    if isinstance(value, dict):
-        return SchedulerSpec.from_dict(value)
-    payload = {
-        key: getattr(value, key)
-        for key in (
-            "policy",
-            "lookahead_orbits",
-            "name",
-            "policy_family",
-            "enabled_actions",
-            "session_actions_enabled",
-            "dvfs_modes_enabled",
-            "h_lookahead_s",
-            "max_hop_count",
-            "fallback_enabled",
-            "defer_enabled",
-            "path_policy",
-            "queue_policy",
-            "hard_gate_mode",
-            "hard_gate_overrides",
-            "weights",
-            "normalization_refs",
-            "random_seed",
-            "trace_level",
-            "kv_policy",
-        )
-        if hasattr(value, key)
-    }
-    if not payload:
-        raise TypeError("scheduler value must be a policy string, SchedulerSpec, mapping, or scheduler-like object")
-    if "policy" not in payload:
-        raise TypeError("scheduler-like object must expose a policy field")
-    return SchedulerSpec.from_dict(payload)
 
 
 def _canonical_policy(value: str) -> str:

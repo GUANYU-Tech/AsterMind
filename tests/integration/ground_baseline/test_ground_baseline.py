@@ -22,7 +22,7 @@ from orbitserve.experiments.runtime_dispatch import evaluate_runtime_performance
 from orbitserve.runtime.engines.trace_backed import run_trace_backed_runtime
 from orbitserve.runtime.runtime_metrics import aggregate_runtime_records
 from orbitserve.runtime.runtime_records import RuntimeRequestRecord
-from orbitserve.runtime.schedulers import SchedulerSpec, get_scheduler
+from orbitserve.runtime import RuntimeStrategySpec, get_scheduler
 
 
 class TraceBundleWithoutSatelliteCatalog:
@@ -181,17 +181,15 @@ class GroundBaselineRuntimeTests(unittest.TestCase):
             ],
             "wan_rtt_s": {"us": {"eu": 0.12}, "eu": {"us": 0.12}},
         }
-        scheduler_spec = SchedulerSpec.from_dict(
+        runtime_strategy = RuntimeStrategySpec.from_dict(
             {
                 "policy": "skywalker_like_ground",
                 "ground_config": ground_config,
-                "runtime_optimization_enabled": False,
             }
         )
 
         self.assertEqual(scheduler_spec.ground_config, ground_config)
         self.assertEqual(scheduler_spec.to_dict()["ground_config"], ground_config)
-        runtime_strategy = get_scheduler(scheduler_spec).to_runtime_strategy()
         self.assertEqual(runtime_strategy.ground_config, ground_config)
         self.assertEqual(runtime_strategy.to_dict()["ground_config"], ground_config)
 

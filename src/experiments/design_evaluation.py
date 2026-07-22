@@ -15,9 +15,8 @@ from typing import Any
 
 from .constellation_cost import estimate_constellation_cost
 from ..architecture import resolve_experiment_hardware
-from ..runtime import build_runtime_scenario
+from ..runtime import RuntimeStrategySpec, build_runtime_scenario
 from .runtime_dispatch import evaluate_runtime_performance
-from ..runtime import get_scheduler
 from ..serving import estimate_serving_throughput
 from ..orbit import run_simulation
 
@@ -36,8 +35,6 @@ class MaterializedDesignEvaluation:
 
     design: Any
     constellation_architecture: dict[str, Any]
-    scheduler: Any
-    scheduler_decision: Any
     resolved_hardware: Any
     cost: Any
     simulation_config: Any
@@ -76,8 +73,7 @@ def evaluate_materialized_design(
 
     # Keep this order explicit: it is the shared fixed-design/DSE contract.
     constellation_architecture = design.architecture_analysis()
-    scheduler = get_scheduler(experiment_spec.scheduler)
-    scheduler_decision = scheduler.select_action(state=None, request=None)
+    runtime_strategy = RuntimeStrategySpec.from_value(experiment_spec.scheduler)
     resolved_hardware = resolve_experiment_hardware(
         getattr(experiment_spec, "hardware", None),
         base_dir=base_dir,
@@ -136,7 +132,7 @@ def evaluate_materialized_design(
         simulation_result=simulation,
         simulation_config=resolved_simulation_config,
         cost_result=cost,
-        scheduler_spec=scheduler.to_runtime_strategy(),
+        scheduler_spec=runtime_strategy,
         hardware=getattr(experiment_spec, "hardware", None),
         resolved_hardware=resolved_hardware,
         warnings=pre_runtime_warnings,
@@ -149,8 +145,6 @@ def evaluate_materialized_design(
     return MaterializedDesignEvaluation(
         design=design,
         constellation_architecture=constellation_architecture,
-        scheduler=scheduler,
-        scheduler_decision=scheduler_decision,
         resolved_hardware=resolved_hardware,
         cost=cost,
         simulation_config=resolved_simulation_config,

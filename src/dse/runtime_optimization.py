@@ -519,24 +519,16 @@ def _default_scheduler_for_policy(policy: str) -> dict[str, Any]:
 def _strategy_object(scheduler: Mapping[str, Any]) -> Any:
     payload = {k: v for k, v in scheduler.items() if k != "strategy_id"}
     try:
-        from ..contracts import RuntimeStrategySpec
+        from ..runtime import RuntimeStrategySpec
 
-        if hasattr(RuntimeStrategySpec, "from_dict"):
-            return RuntimeStrategySpec.from_dict(dict(payload))
-        return RuntimeStrategySpec(**payload)
-    except Exception:
-        pass
-    try:
-        from .schedulers import SchedulerSpec
-
-        return SchedulerSpec.from_dict(dict(payload))
-    except Exception:
+        return RuntimeStrategySpec.from_dict(dict(payload))
+    except (ImportError, TypeError, ValueError):
         return dict(payload)
 
 
 def _default_evaluator(scenario: Any, strategy: Any) -> Any:
     try:
-        from ..evaluation import evaluate_runtime_performance
+        from ..runtime import evaluate_runtime_performance
     except Exception as exc:
         return _unevaluated_result(f"default runtime evaluator is unavailable: {exc}")
     try:

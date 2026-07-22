@@ -414,17 +414,6 @@ class RuntimeSkeletonTests(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "policy field"):
             get_scheduler(type("NameOnly", (), {"name": "invalid"})())
 
-    def test_scheduler_can_disable_closed_loop_runtime_optimization(self):
-        scheduler = get_scheduler({"policy": "nearest_visible", "runtime_optimization_enabled": False})
-        search_space = scheduler.optimization_search_space()
-
-        self.assertFalse(search_space["enabled"])
-        self.assertEqual(search_space["candidate_schedulers"], ())
-        result = optimize_runtime_strategy(object(), search_space=search_space).to_dict()
-        self.assertFalse(result["evaluated"])
-        self.assertEqual(result["candidate_count"], 0)
-        self.assertFalse(result["scheduler_search_space"]["enabled"])
-
     def test_performance_skeleton_keeps_observed_metrics_null_without_trace(self):
         scenario, strategy, serving_performance = _runtime_scenario(self.runtime)
         result = self.runtime.evaluate_runtime_performance(scenario, strategy).to_dict()

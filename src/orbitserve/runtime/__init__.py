@@ -14,7 +14,7 @@ from .metrics.result_builder import build_runtime_performance_result
 from .metrics.runtime_records import RuntimeRequestRecord
 from .scenario.runtime_scenario import RuntimeScenario
 from .scenario.scenario import build_runtime_scenario
-from .strategy.schedulers import SchedulerSpec, get_scheduler
+from .strategy.schedulers import get_scheduler
 
 __all__ = [
     "EnergyIntensity",
@@ -25,7 +25,6 @@ __all__ = [
     "RuntimePredictionEnvelope",
     "RuntimeScenario",
     "RuntimeStrategySpec",
-    "SchedulerSpec",
     "ServingDeploymentView",
     "build_runtime_performance_result",
     "build_runtime_scenario",
