@@ -67,7 +67,7 @@ _SECTION_DEFAULTS: dict[str, dict[str, Any]] = {
         "uncompleted_reason": None, "bottleneck_reason": None,
     },
     "provenance": {
-        "scope": "idealized_compute_only", "trace_model": "ideal_full_visibility",
+        "scope": "trace_backed_runtime_surrogate", "trace_model": "surrogate_orbit_trace",
         "valid_for_paper_main_results": False,
     },
 }

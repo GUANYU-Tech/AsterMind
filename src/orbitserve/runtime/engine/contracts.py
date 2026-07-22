@@ -14,8 +14,8 @@ class RuntimeEngineResult:
     state_summary: dict[str, Any]
     warnings: tuple[str, ...]
     evaluated: bool = True
-    scope: str = "idealized_compute_only"
-    trace_model: str = "ideal_full_visibility"
+    scope: str = "trace_backed_runtime_surrogate"
+    trace_model: str = "surrogate_orbit_trace"
     runtime_metrics: dict[str, Any] | None = None
     communication_metrics: dict[str, Any] | None = None
     energy_metrics: dict[str, Any] | None = None

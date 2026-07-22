@@ -18,8 +18,8 @@ def _record(request_id: str, **overrides):
         "assigned_satellite_id": "sat-01",
         "compute_owner_satellite_id": "sat-01",
         "compute_owner_satellite_ids": ("sat-01",),
-        "scope": "idealized_compute_only",
-        "trace_model": "ideal_full_visibility",
+        "scope": "trace_backed_runtime_surrogate",
+        "trace_model": "surrogate_orbit_trace",
     }
     values.update(overrides)
     return RuntimeRequestRecord(**values)
@@ -51,8 +51,8 @@ class SingleSatelliteRuntimeMetricsTests(unittest.TestCase):
         metrics = aggregate_runtime_records(
             (_record("req-0"),),
             time_horizon_s=10.0,
-            trace_model="ideal_full_visibility",
-            scope="idealized_compute_only",
+            trace_model="surrogate_orbit_trace",
+            scope="trace_backed_runtime_surrogate",
         ).runtime_metrics
 
         self.assertEqual(metrics["tpot_p50_s"], 1.0)

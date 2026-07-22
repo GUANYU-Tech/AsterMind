@@ -17,14 +17,13 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def _base_spec(runtime_matrix=None, *, plane_count=(2,)):
-    base = load_experiment_spec(ROOT / "tests/fixtures/manifests/smoke_single_design.json")
+    base = load_experiment_spec(ROOT / "tests/fixtures/manifests/smoke_trace_backed_runtime.json")
     return replace(
         base,
         workload=replace(
             base.workload,
             bundle_dir="tests/fixtures/workloads/smoke_flat_single_turn_direct",
         ),
-        simulation=replace(base.simulation, trace_model="ideal_full_visibility"),
         scheduler=replace(base.scheduler, policy="local_only"),
         dse=DSESpec(
             enabled=True,
@@ -126,7 +125,7 @@ class DSERuntimeMatrixTests(unittest.TestCase):
                             },
                         }
                     ],
-                    "allow_idealized_runtime_metrics": True,
+                    "allow_preliminary_runtime_metrics": True,
                     "ignore_optional_cost": True,
                     "objective": {
                         "name": "preliminary_cost_slo_weighted",
@@ -144,7 +143,6 @@ class DSERuntimeMatrixTests(unittest.TestCase):
         self.assertEqual(matrix["kv_policy_candidates"][0]["kv_policy_id"], "recompute_pages_16")
         self.assertEqual(matrix["kv_policy_candidates"][0]["kv_policy"]["kv_page_size_tokens"], 16)
         self.assertTrue(matrix["allow_preliminary_runtime_metrics"])
-        self.assertTrue(matrix["allow_idealized_runtime_metrics"])
         self.assertTrue(matrix["ignore_optional_cost"])
         self.assertEqual(matrix["objective"]["name"], "preliminary_cost_slo_weighted")
 
@@ -695,8 +693,8 @@ class DSERuntimeMatrixTests(unittest.TestCase):
                 "served_ratio": 0.9,
                 "e2e_p95_s": 4.0,
                 "ttft_p95_s": 0.4,
-                "scope": "idealized_compute_only",
-                "trace_model": "ideal_full_visibility",
+                "scope": "trace_backed_runtime_surrogate",
+                "trace_model": "surrogate_orbit_trace",
                 "valid_for_paper_main_results": False,
             },
         }
@@ -713,7 +711,7 @@ class DSERuntimeMatrixTests(unittest.TestCase):
             },
         )
         self.assertIsNotNone(allowed["objective_score"])
-        self.assertEqual(allowed["objective_score_scope"], "preliminary_idealized")
+        self.assertEqual(allowed["objective_score_scope"], "preliminary_surrogate")
         self.assertFalse(allowed["valid_for_paper_main_results"])
 
         missing_core = score_runtime_evaluator_result(

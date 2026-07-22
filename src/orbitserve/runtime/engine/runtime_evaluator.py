@@ -6,14 +6,11 @@ from dataclasses import replace
 from typing import Any
 
 from ..contracts import RuntimePerformanceResult, RuntimeStrategySpec
-from .compute_only import run_compute_only_fifo
 from .trace_backed import run_trace_backed_runtime
 from ..metrics.result_builder import build_runtime_performance_result
 from ..scenario.runtime_deployments import build_runtime_deployment_catalog
-from ..strategy.runtime_policies import get_runtime_policy
 from ...orbit import (
     CIRCULAR_GEOMETRY_TRACE,
-    IDEAL_FULL_VISIBILITY,
     SURROGATE_ORBIT_TRACE,
     RuntimeTraceManifest,
     load_surrogate_trace_bundle,
@@ -38,34 +35,6 @@ def try_evaluate_runtime_performance(
     if not trace_manifest.evaluated:
         return None
     deployment_catalog = build_runtime_deployment_catalog(scenario)
-    policy = get_runtime_policy(runtime_strategy)
-
-    if trace_manifest.trace_model == IDEAL_FULL_VISIBILITY:
-        if policy is None or runtime_strategy.policy != "local_only" or not deployment_catalog.default_deployment:
-            return None
-        engine_result = run_compute_only_fifo(
-            requests=requests,
-            deployment_catalog=deployment_catalog,
-            policy=policy,
-            trace_model=trace_manifest.trace_model,
-            scope=trace_manifest.scope,
-        )
-        return build_runtime_performance_result(
-            scenario=scenario,
-            runtime_strategy=runtime_strategy,
-            engine_result=engine_result,
-            trace_manifest=trace_manifest,
-            effective_trace_model=trace_manifest.trace_model,
-            effective_scope=trace_manifest.scope,
-            deployment_catalog=deployment_catalog,
-            evaluator_name="compute_only_fifo",
-            path_model="ideal_full_visibility_no_external_link",
-            energy_model="not_implemented",
-            queue_model="fifo_work_seconds",
-            link_model_status="not_implemented",
-            energy_model_status="not_implemented",
-        )
-
     if trace_manifest.trace_model not in {SURROGATE_ORBIT_TRACE, CIRCULAR_GEOMETRY_TRACE}:
         return None
     try:

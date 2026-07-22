@@ -46,8 +46,8 @@ class RuntimeResultContractTests(unittest.TestCase):
         aggregates = aggregate_runtime_records(
             (completed, incomplete),
             time_horizon_s=10.0,
-            trace_model="ideal_full_visibility",
-            scope="idealized_compute_only",
+            trace_model="surrogate_orbit_trace",
+            scope="trace_backed_runtime_surrogate",
         )
 
         self.assertEqual(aggregates.runtime_metrics["ttft_p95_s"], 1.0)

@@ -104,20 +104,18 @@ class DSERuntimeMatrixSpec:
     static_screening: dict[str, Any] = field(default_factory=dict)
     closed_loop: dict[str, Any] = field(default_factory=dict)
     allow_preliminary_runtime_metrics: bool = False
-    allow_idealized_runtime_metrics: bool = False
     ignore_optional_cost: bool = False
     objective: dict[str, Any] = field(default_factory=_default_runtime_matrix_objective)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "DSERuntimeMatrixSpec":
         data = data or {}
-        allow_idealized = bool(data.get("allow_idealized_runtime_metrics", False))
         allow_preliminary = bool(
             data.get(
                 "allow_preliminary_runtime_metrics",
                 data.get(
                     "allow_surrogate_runtime_metrics",
-                    data.get("allow_sanity_runtime_metrics", allow_idealized),
+                    data.get("allow_sanity_runtime_metrics", False),
                 ),
             )
         )
@@ -148,7 +146,6 @@ class DSERuntimeMatrixSpec:
                 or {}
             ),
             allow_preliminary_runtime_metrics=allow_preliminary,
-            allow_idealized_runtime_metrics=allow_idealized,
             ignore_optional_cost=bool(data.get("ignore_optional_cost", False)),
             objective=objective,
         )
@@ -422,7 +419,6 @@ def run_dse(
         if dse_spec.runtime_matrix.enabled
         else unevaluated_runtime_matrix(
             allow_preliminary_runtime_metrics=dse_spec.runtime_matrix.allow_preliminary_runtime_metrics,
-            allow_idealized_runtime_metrics=dse_spec.runtime_matrix.allow_idealized_runtime_metrics,
             ignore_optional_cost=dse_spec.runtime_matrix.ignore_optional_cost,
         )
     )

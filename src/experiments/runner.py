@@ -341,7 +341,6 @@ def _closed_loop_runtime_objective(runtime_performance: Any) -> RuntimeOptimizat
     return RuntimeOptimizationObjective(
         name="closed_loop_cost_slo_weighted",
         allow_preliminary_runtime_metrics=not valid_for_paper,
-        allow_idealized_runtime_metrics=False,
         ignore_optional_cost=True,
         weights={"served": 1.0, "tail": 1.0, "cost": 0.0},
     )

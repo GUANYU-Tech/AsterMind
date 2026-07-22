@@ -451,10 +451,10 @@ def _warnings_for_scope(*, trace_model: str, scope: str) -> tuple[str, ...]:
             "cost_per_served_* is intentionally null for circular geometry runtime surrogate analysis",
         )
     return (
-        "scope=idealized_compute_only",
-        "trace_model=ideal_full_visibility",
+        f"scope={scope}",
+        f"trace_model={trace_model}",
         "valid_for_paper_main_results=false",
-        "cost_per_served_* is intentionally null for Phase 1a",
+        "runtime metric provenance is not a recognized calibrated scope",
     )
 
 

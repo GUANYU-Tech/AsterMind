@@ -68,7 +68,6 @@ class RuntimeOptimizationObjective:
     name: str = "cost_slo_weighted"
     missing_metric_policy: str = "keep_with_warning"
     allow_preliminary_runtime_metrics: bool = False
-    allow_idealized_runtime_metrics: bool = False
     ignore_optional_cost: bool = False
     weights: dict[str, float] = field(
         default_factory=lambda: {"completion": 1.0, "tail": 1.0, "cost": 1.0}
@@ -78,13 +77,12 @@ class RuntimeOptimizationObjective:
     def from_dict(cls, data: Mapping[str, Any] | None) -> "RuntimeOptimizationObjective":
         if data is None:
             return cls()
-        allow_idealized = bool(data.get("allow_idealized_runtime_metrics", False))
         allow_preliminary = bool(
             data.get(
                 "allow_preliminary_runtime_metrics",
                 data.get(
                     "allow_surrogate_runtime_metrics",
-                    data.get("allow_sanity_runtime_metrics", allow_idealized),
+                    data.get("allow_sanity_runtime_metrics", False),
                 ),
             )
         )
@@ -92,7 +90,6 @@ class RuntimeOptimizationObjective:
             name=str(data.get("name", "cost_slo_weighted")),
             missing_metric_policy=str(data.get("missing_metric_policy", "keep_with_warning")),
             allow_preliminary_runtime_metrics=allow_preliminary,
-            allow_idealized_runtime_metrics=allow_idealized,
             ignore_optional_cost=bool(data.get("ignore_optional_cost", False)),
             weights={str(k): float(v) for k, v in dict(data.get("weights") or {}).items()},
         )
@@ -788,7 +785,7 @@ def _selected_strategy_payload(row: RuntimeStrategyScoreRow | None) -> dict[str,
 
 
 def _effective_allow_preliminary_runtime_metrics(objective: RuntimeOptimizationObjective) -> bool:
-    return bool(objective.allow_preliminary_runtime_metrics or objective.allow_idealized_runtime_metrics)
+    return bool(objective.allow_preliminary_runtime_metrics)
 
 
 def _preliminary_score_scope(details: Mapping[str, Any]) -> str:
@@ -796,8 +793,6 @@ def _preliminary_score_scope(details: Mapping[str, Any]) -> str:
     scope = str(details.get("scope") or details.get("runtime_scope") or "")
     if "surrogate" in trace_model or "surrogate" in scope or trace_model == "circular_geometry_trace":
         return "preliminary_surrogate"
-    if scope == "idealized_compute_only" or trace_model == "ideal_full_visibility":
-        return "preliminary_idealized"
     return "preliminary_model"
 
 
@@ -811,7 +806,6 @@ def _score_provenance(
         "objective_score_scope": score_scope,
         "valid_for_paper_main_results": valid_for_paper_main_results,
         "allow_preliminary_runtime_metrics": objective.allow_preliminary_runtime_metrics,
-        "allow_idealized_runtime_metrics": objective.allow_idealized_runtime_metrics,
         "ignore_optional_cost": objective.ignore_optional_cost,
         "missing_metric_policy": objective.missing_metric_policy,
     }

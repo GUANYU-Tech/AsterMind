@@ -16,7 +16,6 @@ from ..common import to_jsonable
 from ..common import PerformanceMetrics, SLOMetrics
 from ..orbit import (
     CIRCULAR_GEOMETRY_TRACE,
-    IDEAL_FULL_VISIBILITY,
     SURROGATE_ORBIT_TRACE,
     RuntimeTraceManifest,
     load_surrogate_trace_bundle,
@@ -360,8 +359,6 @@ def _load_trace_bundle(
             f"trace_model={manifest.trace_model} did not produce an evaluated trace manifest"
         )
         return None, trace_warnings, reason
-    if manifest.trace_model == IDEAL_FULL_VISIBILITY:
-        return None, ("static SLO proxy uses explicitly requested ideal_full_visibility access summary",), None
     if manifest.trace_model not in {SURROGATE_ORBIT_TRACE, CIRCULAR_GEOMETRY_TRACE}:
         reason = f"static SLO proxy is not evaluated because trace_model={manifest.trace_model} is unsupported"
         return None, trace_warnings, reason

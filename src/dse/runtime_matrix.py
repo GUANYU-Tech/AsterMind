@@ -121,7 +121,6 @@ class DSERuntimeMatrixResult:
     static_screening: dict[str, Any] = field(default_factory=dict)
     non_separability: dict[str, Any] = field(default_factory=dict)
     allow_preliminary_runtime_metrics: bool = False
-    allow_idealized_runtime_metrics: bool = False
     ignore_optional_cost: bool = False
     provenance: dict[str, Any] = field(default_factory=dict)
     warnings: tuple[str, ...] = ()
@@ -136,10 +135,9 @@ class DSERuntimeMatrixResult:
 def unevaluated_runtime_matrix(
     *,
     allow_preliminary_runtime_metrics: bool = False,
-    allow_idealized_runtime_metrics: bool = False,
     ignore_optional_cost: bool = False,
 ) -> DSERuntimeMatrixResult:
-    allow_preliminary = bool(allow_preliminary_runtime_metrics or allow_idealized_runtime_metrics)
+    allow_preliminary = bool(allow_preliminary_runtime_metrics)
     warnings = [
         "runtime scheduler matrix is disabled",
     ]
@@ -149,7 +147,6 @@ def unevaluated_runtime_matrix(
         )
     return DSERuntimeMatrixResult(
         allow_preliminary_runtime_metrics=allow_preliminary,
-        allow_idealized_runtime_metrics=allow_idealized_runtime_metrics,
         ignore_optional_cost=ignore_optional_cost,
         warnings=tuple(warnings),
         provenance={"phase": "dse_runtime_matrix", "status": "disabled"},
@@ -170,7 +167,6 @@ def evaluate_runtime_matrix(
         getattr(spec, "allow_preliminary_runtime_metrics", False)
         or getattr(spec, "allow_surrogate_runtime_metrics", False)
         or getattr(spec, "allow_sanity_runtime_metrics", False)
-        or getattr(spec, "allow_idealized_runtime_metrics", False)
     )
     ignore_optional_cost = bool(getattr(spec, "ignore_optional_cost", False))
     objective = _objective_from_spec(
@@ -365,7 +361,6 @@ def evaluate_runtime_matrix(
         static_screening=_static_screening_payload(screening, static_infos),
         non_separability=non_separability,
         allow_preliminary_runtime_metrics=allow_preliminary,
-        allow_idealized_runtime_metrics=bool(getattr(spec, "allow_idealized_runtime_metrics", False)),
         ignore_optional_cost=ignore_optional_cost,
         provenance={
             "phase": "dse_runtime_matrix",
@@ -807,10 +802,6 @@ def _objective_from_spec(
         or payload.get("allow_preliminary_runtime_metrics", False)
         or payload.get("allow_surrogate_runtime_metrics", False)
         or payload.get("allow_sanity_runtime_metrics", False)
-    )
-    payload["allow_idealized_runtime_metrics"] = bool(
-        getattr(spec, "allow_idealized_runtime_metrics", False)
-        or payload.get("allow_idealized_runtime_metrics", False)
     )
     payload["ignore_optional_cost"] = bool(
         ignore_optional_cost or payload.get("ignore_optional_cost", False)
