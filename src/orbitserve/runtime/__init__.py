@@ -5,7 +5,7 @@ from .contracts import (
     RuntimeStrategySpec,
     ServingDeploymentView,
 )
-from .evaluation import evaluate_runtime_performance
+from .api import evaluate_runtime_performance
 from .state.energy_accounting import EnergyIntensity
 from .metrics.result_builder import build_runtime_performance_result
 from .metrics.runtime_records import RuntimeRequestRecord
