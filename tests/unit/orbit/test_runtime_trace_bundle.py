@@ -13,8 +13,16 @@ from orbitserve.runtime.routing import (
     sample_route_leg,
 )
 from orbitserve.runtime.scenario import build_runtime_scenario
+from orbitserve.orbit import (
+    OrbitTraceBundle as PublicOrbitTraceBundle,
+    OrbitTraceManifest as PublicOrbitTraceManifest,
+    RuntimeTraceBundle as PublicRuntimeTraceBundle,
+    RuntimeTraceManifest as PublicRuntimeTraceManifest,
+)
 from orbitserve.orbit.simulation_traces import (
     CIRCULAR_GEOMETRY_TRACE,
+    OrbitTraceBundle,
+    OrbitTraceManifest,
     RuntimeTraceBundle,
     RuntimeTraceManifest,
     SATELLITE_MOTION_TRACE_SCHEMA,
@@ -28,7 +36,20 @@ def _write_json(path, payload):
     path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
 
 
-class RuntimeTraceManifestAndBundleTests(unittest.TestCase):
+class OrbitTraceManifestAndBundleTests(unittest.TestCase):
+    def test_canonical_types_and_compatibility_aliases_are_object_identical(self):
+        self.assertIs(RuntimeTraceManifest, OrbitTraceManifest)
+        self.assertIs(RuntimeTraceBundle, OrbitTraceBundle)
+        self.assertIs(PublicOrbitTraceManifest, OrbitTraceManifest)
+        self.assertIs(PublicOrbitTraceBundle, OrbitTraceBundle)
+        self.assertIs(PublicRuntimeTraceManifest, OrbitTraceManifest)
+        self.assertIs(PublicRuntimeTraceBundle, OrbitTraceBundle)
+
+        manifest = OrbitTraceManifest(trace_id="canonical-type-test")
+        bundle = OrbitTraceBundle(trace_id="canonical-type-test", trace_manifest=manifest)
+        self.assertIsInstance(manifest, RuntimeTraceManifest)
+        self.assertIsInstance(bundle, RuntimeTraceBundle)
+
     def test_nested_manifest_roundtrip_preserves_current_surface(self):
         nested = {
             "schema_version": "orbitserve.satellite_motion_trace.v1",
