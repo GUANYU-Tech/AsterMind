@@ -10,7 +10,6 @@ from typing import Any
 from orbitserve.common import to_jsonable
 from orbitserve.experiments.design_evaluation import evaluate_materialized_design
 from orbitserve.dse.search import DSEStudyResult, run_dse
-from orbitserve.runtime import attach_energy_alignment
 from orbitserve.common import SLOMetrics
 from orbitserve.runtime import RuntimeStrategySpec
 from orbitserve.experiments.runtime_dispatch import evaluate_runtime_performance
@@ -67,13 +66,6 @@ def run_experiment(spec: ExperimentSpec) -> ExperimentResult:
         runtime_scenario,
         initial_runtime_performance,
         scheduler_search_space=scheduler.optimization_search_space(),
-    )
-    runtime_performance, selected_energy_alignment = attach_energy_alignment(
-        runtime_performance,
-        evaluation.planned_energy_demand,
-        runtime_energy_envelope=evaluation.runtime_energy_envelope,
-        runtime_sunlight_summary=evaluation.runtime_sunlight_summary,
-        tolerance_fraction=float(getattr(spec.costing, "energy_alignment_tolerance", 0.05)),
     )
     performance = serving_throughput.to_performance_metrics()
     performance = _performance_with_runtime_metrics(performance, runtime_performance)
@@ -152,11 +144,6 @@ def run_experiment(spec: ExperimentSpec) -> ExperimentResult:
         else "evaluated"
         if runtime_optimization.evaluated
         else "skeleton",
-        "energy_alignment": "consistent"
-        if selected_energy_alignment.consistent
-        else "evaluated_mismatch"
-        if selected_energy_alignment.evaluated
-        else "unavailable",
         "communication_window_budget_analysis": "evaluated"
         if communication_window_budget_analysis is not None
         and communication_window_budget_analysis.get("evaluated")
@@ -171,7 +158,6 @@ def run_experiment(spec: ExperimentSpec) -> ExperimentResult:
         *initial_runtime_performance.warnings,
         *runtime_performance.warnings,
         *runtime_optimization.warnings,
-        *selected_energy_alignment.warnings,
         *(
             communication_window_budget_analysis.get("warnings", ())
             if communication_window_budget_analysis is not None

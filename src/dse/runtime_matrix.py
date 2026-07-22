@@ -8,7 +8,6 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Mapping
 
 from ..common import to_jsonable
-from ..runtime import attach_energy_alignment
 from ..common import DSEMetrics
 from ..runtime import RuntimeStrategySpec
 from ..experiments.runtime_dispatch import evaluate_runtime_performance
@@ -23,10 +22,7 @@ class DSEDesignContext:
     runtime_scenario: Any
     current_scheduler: dict[str, Any]
     cost_result: Any
-    planned_energy_demand: Any = None
     runtime_energy_envelope: Any = None
-    runtime_sunlight_summary: Any = None
-    energy_alignment_tolerance: float = 0.05
 
 
 @dataclass(frozen=True)
@@ -271,14 +267,6 @@ def evaluate_runtime_matrix(
                 strategy_id = _matrix_strategy_id(base_strategy_id, scope_strategy_id, scope_candidate)
                 strategy = RuntimeStrategySpec.from_dict(scheduler_payload)
                 full_runtime_result = evaluate_runtime_performance(scoped_scenario, strategy)
-                if context.planned_energy_demand is not None:
-                    full_runtime_result, _ = attach_energy_alignment(
-                        full_runtime_result,
-                        context.planned_energy_demand,
-                        runtime_energy_envelope=context.runtime_energy_envelope,
-                        runtime_sunlight_summary=context.runtime_sunlight_summary,
-                        tolerance_fraction=context.energy_alignment_tolerance,
-                    )
                 runtime_result = _runtime_result_with_cost_efficiency(
                     _compact_runtime_result(full_runtime_result),
                     context=context,
@@ -1303,10 +1291,6 @@ def _matrix_row_from_runtime_result(
     cost_payload = _mapping_from_value(context.cost_result)
     single_satellite_cost = _mapping_from_value(cost_payload.get("single_satellite"))
     cost_feasible = single_satellite_cost.get("feasible")
-    energy_alignment = _mapping_from_value(
-        _mapping_from_value(runtime_result.get("details")).get("energy_alignment")
-    )
-    energy_requires_resizing = bool(energy_alignment.get("requires_resizing", False))
     terrestrial_cost = _mapping_from_value(
         _mapping_from_value(runtime_result.get("details")).get("terrestrial_costing")
     )
@@ -1320,11 +1304,6 @@ def _matrix_row_from_runtime_result(
                 *catalog_warnings,
                 *(("pd_scope_candidate_catalog_fail_closed",) if catalog_fail_closed else ()),
                 *_string_tuple(scoring.get("warnings")),
-                *(
-                    ("energy alignment requires construction resizing before DSE selection",)
-                    if energy_requires_resizing
-                    else ()
-                ),
             )
         )
     )
@@ -1373,19 +1352,19 @@ def _matrix_row_from_runtime_result(
         runtime_evaluated=bool(runtime_result.get("evaluated", False)) and not catalog_fail_closed,
         objective_score=(
             None
-            if catalog_fail_closed or energy_requires_resizing or cost_feasible is False
+            if catalog_fail_closed or cost_feasible is False
             else _optional_float(scoring.get("objective_score"))
         ),
         selected=False,
         pareto_member=False,
         objective_score_scope=(
             None
-            if catalog_fail_closed or energy_requires_resizing or cost_feasible is False
+            if catalog_fail_closed or cost_feasible is False
             else _optional_str(scoring.get("objective_score_scope"))
         ),
         valid_for_paper_main_results=(
             False
-            if catalog_fail_closed or energy_requires_resizing or cost_feasible is False
+            if catalog_fail_closed or cost_feasible is False
             else bool(scoring.get("valid_for_paper_main_results", False))
         ),
         cost_total_usd=(
@@ -1460,7 +1439,6 @@ def _matrix_row_from_runtime_result(
             "pd_pair_candidate_count": pair_candidate_count,
             "catalog_fail_closed": catalog_fail_closed,
             "cost_feasible": cost_feasible,
-            "energy_requires_resizing": energy_requires_resizing,
             "comparison_domain": "terrestrial_reference" if terrestrial_baseline else "leo_co_design",
             "catalog_rebuilt": not terrestrial_baseline,
             "catalog_builder": (
@@ -1893,8 +1871,6 @@ def _compact_runtime_details(value: Any) -> dict[str, Any]:
             "valid_for_paper_main_results",
             "metrics_contract",
             "engine_provenance",
-            "planned_energy_demand",
-            "energy_alignment",
         )
         if key in details
     }

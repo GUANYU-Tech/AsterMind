@@ -589,12 +589,6 @@ def _evaluate_design_row(
             **performance.details,
             "runtime": runtime_current_strategy,
             "runtime_current_strategy": runtime_current_strategy,
-            "planned_energy_demand": (
-                evaluation.planned_energy_demand.to_dict()
-                if evaluation.planned_energy_demand is not None
-                else None
-            ),
-            "energy_alignment": evaluation.energy_alignment.to_dict(),
             **(
                 {"communication_window_budget_analysis": communication_window_budget_analysis}
                 if communication_window_budget_analysis is not None
@@ -643,12 +637,7 @@ def _evaluate_design_row(
         runtime_scenario=runtime_scenario,
         current_scheduler=runtime_scenario.runtime_config.to_dict(),
         cost_result=cost,
-        planned_energy_demand=evaluation.planned_energy_demand,
         runtime_energy_envelope=evaluation.runtime_energy_envelope,
-        runtime_sunlight_summary=evaluation.runtime_sunlight_summary,
-        energy_alignment_tolerance=float(
-            getattr(experiment_spec.costing, "energy_alignment_tolerance", 0.05)
-        ),
     )
     return {"row": row, "context": context}
 

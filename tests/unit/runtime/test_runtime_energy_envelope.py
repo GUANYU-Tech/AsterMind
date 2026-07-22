@@ -4,12 +4,9 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import patch
 
 
 from orbitserve.experiments.constellation_cost import estimate_constellation_cost
-from orbitserve.experiments.design_evaluation import _runtime_sunlight_summary
 from orbitserve.runtime.state.energy_state import REQUIRED_RUNTIME_ENERGY_WINDOW_FIELDS
 from orbitserve.experiments import load_experiment_spec, run_experiment
 from orbitserve.architecture.hardware import SatelliteHardwareProfile
@@ -94,50 +91,6 @@ class RuntimeEnergyEnvelopeTests(unittest.TestCase):
         joined_warnings = " ".join(envelope.warnings)
         self.assertIn("overridden by cost/hardware runtime energy envelope", joined_warnings)
         self.assertIn("baseline-exclusive and forced from cost/hardware", joined_warnings)
-
-    def test_periodic_sunlight_summary_uses_materialized_trace_period(self):
-        trace_period_s = 7622.0
-        trace_bundle = SimpleNamespace(
-            energy_windows=(
-                {
-                    "satellite_id": "sat-a",
-                    "start_s": 0.0,
-                    "end_s": trace_period_s,
-                    "sunlit": True,
-                },
-            ),
-            energy_trace={"provenance": {"orbit_period_s": trace_period_s}},
-        )
-        simulation = SimpleNamespace(
-            trace_model="surrogate_orbit_trace",
-            trace_evaluated=True,
-            trace_manifest={"trace_id": "period-authority-test"},
-        )
-        envelope = {
-            "trace_options": {"shadow_fraction": 0.36},
-            "provenance": {"runtime_fields": {"orbit_period_s": 5700.0}},
-        }
-
-        with patch(
-            "orbitserve.experiments.design_evaluation.load_surrogate_trace_bundle",
-            return_value=trace_bundle,
-        ):
-            summary, warnings = _runtime_sunlight_summary(
-                simulation,
-                runtime_energy_envelope=envelope,
-                base_dir=None,
-            )
-
-        self.assertEqual(warnings, ())
-        self.assertAlmostEqual(summary["periodic_orbit_period_s"], trace_period_s)
-        self.assertAlmostEqual(
-            summary["maximum_shadow_window_s"],
-            0.36 * trace_period_s,
-        )
-        self.assertEqual(
-            summary["measurement_basis"],
-            "materialized_periodic_shadow_contract",
-        )
 
     def test_adapter_rejects_nonfinite_cost_and_hardware_contract_values(self):
         spec, resolved, cost = self._cost_and_hardware()

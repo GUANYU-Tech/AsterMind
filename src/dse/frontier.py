@@ -301,16 +301,7 @@ def _candidate_from_row(
     runtime_details = _mapping_from_value(
         _mapping_from_value(row.get("runtime_result")).get("details")
     )
-    energy_alignment = _mapping_from_value(
-        _first_present(row.get("energy_alignment"), runtime_details.get("energy_alignment"))
-    )
     cost_feasible = _first_present(row.get("cost_feasible"), row_provenance.get("cost_feasible"))
-    alignment_runtime_energy = _mapping_from_value(energy_alignment.get("runtime_energy"))
-    energy_requires_resizing = bool(
-        energy_alignment.get("requires_resizing", False)
-        or (_optional_float(alignment_runtime_energy.get("invalid_ledger_entry_count")) or 0.0)
-        > 0.0
-    )
     excluded_reason = None
     if not runtime_evaluated:
         excluded_reason = (
@@ -322,8 +313,6 @@ def _candidate_from_row(
         excluded_reason = "calibrated_paper_main frontier is reserved; current evaluator only publishes preliminary_surrogate frontier"
     elif cost_feasible is False:
         excluded_reason = "cost model marked the design infeasible"
-    elif energy_requires_resizing:
-        excluded_reason = "energy alignment requires you to resize the design before frontier selection"
     elif missing_fields:
         excluded_reason = f"missing/invalid core Pareto fields: {', '.join(missing_fields)}"
 
@@ -331,7 +320,6 @@ def _candidate_from_row(
         "source": "runtime_matrix.matrix_rows" if source == "runtime_matrix" else "dse.rows.static_slo_proxy",
         "runtime_matrix_provenance": row_provenance,
         "cost_feasible": cost_feasible,
-        "energy_alignment": energy_alignment,
     }
     return DSEFrontierCandidate(
         candidate_id=candidate_id,
@@ -384,7 +372,6 @@ def _static_row_payload(row: Any) -> dict[str, Any]:
                 "feasible", False
             )
         ),
-        "energy_alignment": _mapping_from_value(details.get("energy_alignment")),
         "annualized_cost_usd_per_year": _row_section_field(row, "cost", "annualized_cost_usd_per_year"),
         "cost_total_usd": _row_section_field(row, "cost", "total_cost_usd"),
         "served_ratio": _row_section_field(row, "slo", "served_ratio"),

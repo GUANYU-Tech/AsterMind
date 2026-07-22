@@ -9,14 +9,11 @@ and current-runtime path.
 from __future__ import annotations
 
 import hashlib
-import math
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 from .constellation_cost import estimate_constellation_cost
-from ..runtime import EnergyIntensity, build_planned_energy_demand
-from ..runtime import attach_energy_alignment, summarize_runtime_sunlight
 from ..architecture import resolve_experiment_hardware
 from ..runtime import build_runtime_scenario
 from .runtime_dispatch import evaluate_runtime_performance
@@ -24,7 +21,6 @@ from ..runtime import apply_runtime_energy_envelope
 from ..runtime import get_scheduler
 from ..serving import estimate_serving_throughput
 from ..orbit import run_simulation
-from ..orbit import load_surrogate_trace_bundle
 
 
 ARCHITECTURE_SURROGATE_WARNING = (
@@ -44,17 +40,14 @@ class MaterializedDesignEvaluation:
     scheduler: Any
     scheduler_decision: Any
     resolved_hardware: Any
-    planned_energy_demand: Any
     cost: Any
     simulation_config: Any
     runtime_energy_envelope: Any
     simulation: Any
-    runtime_sunlight_summary: dict[str, Any]
     serving_spec: Any
     serving_throughput: Any
     runtime_scenario: Any
     runtime_performance: Any
-    energy_alignment: Any
     warnings: tuple[str, ...]
 
 
@@ -91,13 +84,6 @@ def evaluate_materialized_design(
         getattr(experiment_spec, "hardware", None),
         base_dir=base_dir,
     )
-    planned_energy_demand, energy_planning_warnings = _planned_energy_demand_for_design(
-        experiment_spec,
-        workload_generation=workload_generation,
-        satellite_count=design.satellite_count,
-        resolved_hardware=resolved_hardware,
-        simulation_duration_s=getattr(input_simulation_config, "duration_s", None),
-    )
     cost = estimate_constellation_cost(
         design,
         experiment_spec.costing,
@@ -122,11 +108,6 @@ def evaluate_materialized_design(
         base_dir=base_dir,
         experiment_id=evaluation_id,
     )
-    runtime_sunlight_summary, sunlight_summary_warnings = _runtime_sunlight_summary(
-        simulation,
-        runtime_energy_envelope=runtime_energy_envelope,
-        base_dir=base_dir,
-    )
     serving_spec, serving_warnings = _serving_spec_for_resolved_hardware(
         experiment_spec,
         resolved_hardware=resolved_hardware,
@@ -142,12 +123,10 @@ def evaluate_materialized_design(
         (
             *input_warnings,
             *resolved_hardware.warnings,
-            *energy_planning_warnings,
             *serving_warnings,
             *runtime_energy_envelope.warnings,
             *cost.warnings,
             *simulation.warnings,
-            *sunlight_summary_warnings,
             *serving_throughput.warnings,
             ARCHITECTURE_SURROGATE_WARNING,
             *tuple(constellation_architecture.get("warnings", ())),
@@ -174,173 +153,22 @@ def evaluate_materialized_design(
         runtime_scenario,
         runtime_scenario.runtime_config,
     )
-    runtime_performance, energy_alignment = attach_energy_alignment(
-        runtime_performance,
-        planned_energy_demand,
-        runtime_energy_envelope=runtime_energy_envelope,
-        runtime_sunlight_summary=runtime_sunlight_summary,
-        tolerance_fraction=float(
-            getattr(experiment_spec.costing, "energy_alignment_tolerance", 0.05)
-        ),
-    )
-    warnings = _dedupe(
-        (*pre_runtime_warnings, *runtime_performance.warnings, *energy_alignment.warnings)
-    )
+    warnings = _dedupe((*pre_runtime_warnings, *runtime_performance.warnings))
     return MaterializedDesignEvaluation(
         design=design,
         constellation_architecture=constellation_architecture,
         scheduler=scheduler,
         scheduler_decision=scheduler_decision,
         resolved_hardware=resolved_hardware,
-        planned_energy_demand=planned_energy_demand,
         cost=cost,
         simulation_config=resolved_simulation_config,
         runtime_energy_envelope=runtime_energy_envelope,
         simulation=simulation,
-        runtime_sunlight_summary=runtime_sunlight_summary,
         serving_spec=serving_spec,
         serving_throughput=serving_throughput,
         runtime_scenario=runtime_scenario,
         runtime_performance=runtime_performance,
-        energy_alignment=energy_alignment,
         warnings=warnings,
-    )
-
-
-def _runtime_sunlight_summary(
-    simulation: Any,
-    *,
-    runtime_energy_envelope: Any,
-    base_dir: Path | None,
-) -> tuple[dict[str, Any], tuple[str, ...]]:
-    trace_model = str(getattr(simulation, "trace_model", "") or "")
-    if trace_model not in _FILE_BACKED_TRACE_MODELS or not bool(
-        getattr(simulation, "trace_evaluated", False)
-    ):
-        return {}, ()
-    try:
-        trace_bundle = load_surrogate_trace_bundle(
-            getattr(simulation, "trace_manifest", None),
-            base_dir=base_dir,
-        )
-        summary = summarize_runtime_sunlight(trace_bundle.energy_windows)
-    except (OSError, TypeError, ValueError) as exc:
-        return {}, (f"runtime sunlight summary unavailable: {exc}",)
-    if not summary.get("evaluated", False):
-        return summary, (
-            "runtime sunlight summary is invalid; energy alignment cannot validate the cost sunlit fraction",
-        )
-    if trace_model == "surrogate_orbit_trace":
-        envelope_payload = _mapping(runtime_energy_envelope)
-        trace_options = _mapping(envelope_payload.get("trace_options"))
-        shadow_fraction = trace_options.get("shadow_fraction")
-        energy_trace = _mapping(getattr(trace_bundle, "energy_trace", {}))
-        energy_trace_provenance = _mapping(energy_trace.get("provenance"))
-        orbit_period_value = energy_trace_provenance.get("orbit_period_s")
-        if orbit_period_value is None:
-            orbit_period_value = _mapping(
-                _mapping(envelope_payload.get("provenance")).get("runtime_fields")
-            ).get("orbit_period_s")
-        try:
-            declared_sunlit_fraction = 1.0 - float(shadow_fraction)
-            actual_orbit_period_s = float(orbit_period_value)
-        except (TypeError, ValueError, OverflowError):
-            return summary, (
-                "periodic runtime sunlight contract is unavailable from runtime_energy_envelope",
-            )
-        if (
-            not math.isfinite(declared_sunlit_fraction)
-            or not 0.0 <= declared_sunlit_fraction <= 1.0
-            or not math.isfinite(actual_orbit_period_s)
-            or actual_orbit_period_s <= 0.0
-        ):
-            return summary, (
-                "periodic runtime sunlight contract has an invalid shadow fraction or materialized orbit period",
-            )
-        summary = {
-            **summary,
-            "observed_finite_horizon_sunlit_fraction": summary.get(
-                "actual_sunlit_fraction"
-            ),
-            "actual_sunlit_fraction": declared_sunlit_fraction,
-            "maximum_shadow_window_s": float(shadow_fraction) * actual_orbit_period_s,
-            "periodic_orbit_period_s": actual_orbit_period_s,
-            "measurement_basis": "materialized_periodic_shadow_contract",
-        }
-    elif trace_model == "circular_geometry_trace":
-        geometry_summary = _mapping(
-            getattr(trace_bundle, "energy_trace", {}).get(
-                "sunlight_contract_summary"
-            )
-            if isinstance(getattr(trace_bundle, "energy_trace", None), dict)
-            else None
-        )
-        if geometry_summary.get("evaluated", False):
-            summary = {
-                **summary,
-                "observed_finite_horizon_sunlit_fraction": summary.get(
-                    "actual_sunlit_fraction"
-                ),
-                "actual_sunlit_fraction": geometry_summary.get(
-                    "actual_sunlit_fraction"
-                ),
-                "maximum_shadow_window_s": geometry_summary.get(
-                    "maximum_shadow_window_s"
-                ),
-                "measurement_basis": "geometry_full_orbit_sampling",
-                "geometry_orbit_average": geometry_summary,
-            }
-    return summary, ()
-
-
-def _planned_energy_demand_for_design(
-    experiment_spec: Any,
-    *,
-    workload_generation: Any,
-    satellite_count: int,
-    resolved_hardware: Any,
-    simulation_duration_s: float | None,
-) -> tuple[Any | None, tuple[str, ...]]:
-    """Build an offered-workload energy audit without sizing static hardware."""
-
-    costing = experiment_spec.costing
-    workload_payload = _mapping(workload_generation)
-    requests = workload_payload.get("requests")
-    configured = bool(workload_payload.get("configured", False)) or isinstance(requests, (list, tuple))
-    if not configured:
-        return None, (
-            "offered-workload energy accounting is unavailable because canonical offered requests are not configured; "
-            "the energy audit is unavailable",
-        )
-    cost_config = getattr(resolved_hardware, "cost_config", None)
-    power = getattr(cost_config, "power", None)
-    if power is None:
-        return None, (
-            "offered-workload energy accounting is unavailable because resolved cost power configuration is missing; "
-            "the energy audit is unavailable",
-        )
-    intensity = EnergyIntensity(
-        compute_standby_power_w=float(getattr(power, "compute_standby_power_w", 0.0)),
-        communication_standby_power_w=float(
-            getattr(power, "communication_standby_power_w", 0.0)
-        ),
-        compute_energy_j_per_token=float(
-            getattr(power, "compute_energy_j_per_token", 0.5)
-        ),
-        link_energy_j_per_byte=float(getattr(power, "link_energy_j_per_byte", 1e-6)),
-    )
-    planned = build_planned_energy_demand(
-        workload_generation,
-        satellite_count=satellite_count,
-        intensity=intensity,
-        target_served_ratio=float(getattr(costing, "target_served_ratio", 1.0)),
-        nominal_isl_hops_per_request=float(
-            getattr(costing, "nominal_isl_hops_per_request", 0.0)
-        ),
-        simulation_duration_s=simulation_duration_s,
-    )
-    return planned, (
-        "energy alignment audits offered-workload token/byte demand and does not read runtime served requests",
     )
 
 

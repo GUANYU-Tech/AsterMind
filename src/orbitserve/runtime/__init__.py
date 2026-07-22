@@ -10,8 +10,7 @@ from .contracts import (
     ServingDeploymentView,
 )
 from .evaluation import evaluate_runtime_performance
-from .state.energy_accounting import EnergyIntensity, build_planned_energy_demand
-from .metrics.energy_alignment import attach_energy_alignment, summarize_runtime_sunlight
+from .state.energy_accounting import EnergyIntensity
 from .metrics.result_builder import build_runtime_performance_result
 from .scenario.runtime_deployments import build_runtime_deployment_catalog
 from .scenario.runtime_energy_envelope import apply_runtime_energy_envelope
@@ -37,8 +36,6 @@ __all__ = [
     "SchedulerSpec",
     "ServingDeploymentView",
     "apply_runtime_energy_envelope",
-    "attach_energy_alignment",
-    "build_planned_energy_demand",
     "build_runtime_deployment_catalog",
     "build_runtime_performance_result",
     "build_runtime_scenario",
@@ -46,5 +43,4 @@ __all__ = [
     "get_scheduler",
     "optimize_runtime_strategy",
     "score_runtime_evaluator_result",
-    "summarize_runtime_sunlight",
 ]
