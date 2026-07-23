@@ -3,33 +3,30 @@
 ## Status
 
 - Contract ID: `orbitserve.sgp4_element_bundle.v1`
-- Decision status: frozen for SGP4 implementation planning
+- Decision status: implemented
 - Frozen date: 2026-07-20
 - Code status: the public input models, strict validator, direct-element
-  SGP4-to-TEME propagation, pinned-data TEME-to-ITRS transformation, and
-  geometry-only SGL/ISL/sunlight evaluation and opt-in Orbit Trace v2
-  serialization are implemented; default-model and Runtime switching are not
-  yet implemented
+  SGP4-to-TEME propagation, pinned-data TEME-to-ITRS transformation,
+  geometry-only SGL/ISL/sunlight evaluation, and canonical Orbit Trace
+  serialization are implemented
 
 This contract defines the parameters supplied to Orbit for SGP4 propagation.
-It does not change the current circular two-body model, the default simulator,
-or the Orbit Trace v2 file schema.
+The canonical end-to-end public entry point is `generate_orbit_trace`.
 
-The Phase 1 public entry points are `Sgp4ElementBundle`,
+The public input entry points are `Sgp4ElementBundle`,
 `Sgp4SatelliteElements`, `Sgp4ElementProvenance`, and
 `load_sgp4_element_bundle`, exported from `orbitserve.orbit`. The loader accepts
 a JSON path, JSON-compatible mapping, or an already validated bundle. It does
 not initialize an SGP4 engine by itself.
 
-The Phase 2 public propagation entry point is `propagate_sgp4_teme`. It accepts
+The public propagation entry point is `propagate_sgp4_teme`. It accepts
 one validated element bundle, a canonical simulation UTC epoch, and unique
 non-negative relative sample times. It uses `python-sgp4==2.27`, WGS-72, and
 improved mode, fails the complete call on any initialization or sample error,
 and returns records ordered by `(time_s, satellite_id)` in TEME kilometres and
-kilometres per second. This remains opt-in and does not alter the current trace
-writer or default simulation model.
+kilometres per second.
 
-The Phase 3 public frame entry point is `transform_sgp4_teme_to_itrs`. It uses
+The public frame entry point is `transform_sgp4_teme_to_itrs`. It uses
 `astropy==6.1.3`, disables IERS network updates, and requires local IERS-A and
 leap-second files that cover every sample. Their SHA-256 values, data release,
 the installed `astropy-iers-data` version, and whether Earth-orientation values
@@ -40,7 +37,7 @@ before use; callers may supply different immutable files explicitly.
 Out-of-range data fails the complete transformation instead of extrapolating
 silently.
 
-The Phase 4 public entry points are `compute_sgp4_sun_positions_itrs` and
+The public geometry entry points are `compute_sgp4_sun_positions_itrs` and
 `evaluate_sgp4_geometry`. The geometry evaluator accepts a complete
 `Sgp4EarthFixedResult`, geometry-only ground ingresses, and explicit candidate
 ISL endpoint pairs. It produces deterministic samples plus half-open windows
@@ -58,16 +55,16 @@ atmospheric Earth-radius margin. Boolean crossings are refined by linear
 interpolation of the corresponding signed boundary function; this refinement
 is declared by `sgp4-wgs84-geometry-v1`.
 
-The Phase 5 public entry point is `write_sgp4_orbit_trace_v2`. It accepts the
+The trace adapter entry point is `write_sgp4_orbit_trace`. It accepts the
 validated element bundle, TEME propagation result, ITRS transformation result,
 and geometry result from the preceding public stages. Before writing anything,
 it requires identical element-set identity, simulation epoch, ordered sample
 keys, satellite membership, geometry source provenance, and a uniform sample
 grid. It delegates canonical JSON, file hashes, Runtime/Architecture-field
 rejection, and manifest construction to the unchanged public
-`write_orbit_trace_v2` entry point.
+`write_orbit_trace` entry point.
 
-Phase 5 ephemeris records deliberately use explicit `position_teme_km`,
+Trace ephemeris records deliberately use explicit `position_teme_km`,
 `velocity_teme_km_s`, `position_itrs_km`, and `velocity_itrs_km_s` fields. They
 do not overload the legacy `r_eci_km` name. The satellite catalog contains the
 canonical structured SGP4 mean-element records. Window records contain only
@@ -103,10 +100,10 @@ the mean elements. Orbit owns validation, deterministic normalization, SGP4
 initialization and propagation, coordinate transformation, geometric-window
 calculation, and trace serialization.
 
-The upstream provider must not depend on Orbit implementation files. The
-future input is passed through a public `orbitserve.orbit` entry point after
-that entry point is implemented. Runtime consumes only the public Orbit Trace
-contract and must not initialize or call the SGP4 engine itself.
+The upstream provider must not depend on Orbit implementation files. Input is
+passed through the public `orbitserve.orbit` entry points. Runtime consumes
+only the public Orbit Trace contract and must not initialize or call the SGP4
+engine itself.
 
 This contract does not assign Architecture or Runtime data to Orbit. Initial
 SOC, terminal capabilities or allocation, active graphs, bandwidth, routing,
@@ -261,7 +258,7 @@ second in the TEME frame. Any Earth-fixed ground geometry uses an explicit TEME
 to ITRS transformation. A simple Earth-rotation angle or an undeclared ECI/ECEF
 alias is not an acceptable high-precision substitute.
 
-The eventual implementation must pin and record:
+The implementation pins and records:
 
 - the SGP4 library and algorithm version;
 - the WGS-72 constants selection and improved operation mode;
@@ -301,7 +298,7 @@ Before hashing or propagation, Orbit normalizes the bundle as follows:
 
 - satellite records are sorted by `satellite_id`;
 - JSON object keys are sorted lexicographically;
-- UTF-8, LF, one final newline, and the Orbit Trace v2 finite-float rules apply;
+- UTF-8, LF, one final newline, and the Orbit Trace finite-float rules apply;
 - negative zero becomes `0.0`;
 - no implicit angle wrapping, epoch rounding, or duplicate de-duplication is
   performed;
@@ -315,23 +312,16 @@ and satellite records but excludes non-physical provenance. Complete output
 bytes still include deterministic provenance, so changing provenance may
 change file bytes even when `element_set_id` stays the same.
 
-## Explicitly deferred cross-module decisions
+## Cross-module consumer requirements
 
-The following are not changed by this contract-only phase and require owner
-agreement before implementation alters a public interface:
+Runtime, DSE, and Experiments must use public `orbitserve.orbit` entry points
+and structured SGP4 element bundles. The circular configuration, legacy
+`r_eci_km` trace shape, trace builders, and compatibility aliases have been
+removed. DSE/Experiments generation and search policy is deferred to their
+owners; Orbit does not retain a circular fallback.
 
-1. The exact root dependency pins for the SGP4 engine, coordinate transforms,
-   and Earth orientation data.
-2. Ownership and update procedure for the immutable Earth orientation data
-   snapshot.
-3. Switching the default trace model from the circular two-body path to SGP4.
-4. Removal or versioning of `r_eci_km` on legacy trace paths; the opt-in SGP4
-   path does not emit it.
-5. Root package-data configuration needed to include the vendored IERS assets
-   in an installed wheel or source distribution.
-
-Until those decisions are jointly accepted, implementation remains opt-in and
-must preserve the current public writer and Runtime integration behavior.
+Root dependencies and vendored IERS package-data are declared in
+`pyproject.toml`.
 
 ## Acceptance criteria for contract freeze
 
@@ -341,7 +331,5 @@ must preserve the current public writer and Runtime integration behavior.
 - Synthetic and observationally fitted provenance cannot be confused.
 - Validation, error handling, coordinate-frame requirements, and deterministic
   identity are explicit.
-- Cross-module and dependency decisions that are not yet jointly approved are
-  listed as deferred rather than implemented implicitly.
-- No runtime behavior, dependency, or public Python symbol changes in this
-  phase.
+- Cross-module consumers have explicit migration requirements and use only
+  public Orbit interfaces.

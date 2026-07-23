@@ -1,4 +1,4 @@
-"""Strict, deterministic input models for SGP4-compatible mean elements."""
+"""Strict deterministic input models for SGP4-compatible mean elements."""
 
 from __future__ import annotations
 

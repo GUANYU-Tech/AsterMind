@@ -1,17 +1,13 @@
 """Orbit geometry, visibility, sunlight, and trace contracts."""
 
-from .constellation import ConstellationDesign, FormationCluster, OrbitalSet
-from .orbit_trace_v2 import (
-    ORBIT_TRACE_V2_ALGORITHM_VERSION,
-    ORBIT_TRACE_V2_SCHEMA,
-    ORBIT_TRACE_V2_SCOPE,
-    load_orbit_trace_v2,
-    write_orbit_trace_v2,
-)
-from .sgl_access_windows import (
-    active_sgl_access_window,
-    has_sgl_access_windows,
-    sgl_window_link_sample,
+from .trace import (
+    ORBIT_TRACE_ALGORITHM,
+    ORBIT_TRACE_SCHEMA,
+    ORBIT_TRACE_SCOPE,
+    OrbitTraceBundle,
+    OrbitTraceManifest,
+    load_orbit_trace,
+    write_orbit_trace,
 )
 from .sgp4_elements import (
     SGP4_ELEMENT_BUNDLE_SCHEMA,
@@ -23,16 +19,6 @@ from .sgp4_elements import (
     Sgp4ElementProvenance,
     Sgp4SatelliteElements,
     load_sgp4_element_bundle,
-)
-from .sgp4_propagation import (
-    SGP4_ENGINE_NAME,
-    SGP4_ENGINE_VERSION,
-    SGP4_PROPAGATION_ALGORITHM_VERSION,
-    SGP4_REFERENCE_FRAME,
-    Sgp4PropagationError,
-    Sgp4PropagationResult,
-    Sgp4TemeSample,
-    propagate_sgp4_teme,
 )
 from .sgp4_frames import (
     ASTROPY_ENGINE_NAME,
@@ -73,47 +59,37 @@ from .sgp4_geometry import (
     Sgp4SunlightWindow,
     evaluate_sgp4_geometry,
 )
-from .sgp4_trace_v2 import (
+from .sgp4_propagation import (
+    SGP4_ENGINE_NAME,
+    SGP4_ENGINE_VERSION,
+    SGP4_PROPAGATION_ALGORITHM_VERSION,
+    SGP4_REFERENCE_FRAME,
+    Sgp4PropagationError,
+    Sgp4PropagationResult,
+    Sgp4TemeSample,
+    propagate_sgp4_teme,
+)
+from .sgp4_trace import (
     SGP4_ORBIT_TRACE_ADAPTER_ALGORITHM_VERSION,
     SGP4_ORBIT_TRACE_MODEL,
-    write_sgp4_orbit_trace_v2,
-)
-from .simulation import SimulationConfig, SimulationResult, run_simulation
-from .simulation_traces import (
-    CIRCULAR_GEOMETRY_TRACE,
-    IDEAL_FULL_VISIBILITY,
-    OrbitTraceBundle,
-    OrbitTraceManifest,
-    SURROGATE_ORBIT_TRACE,
-    TRACE_BACKED_RUNTIME_SURROGATE_SCOPE,
-    RuntimeTraceBundle,
-    RuntimeTraceManifest,
-    load_surrogate_trace_bundle,
-    normalize_trace_scope,
-    resolve_trace_path,
+    generate_orbit_trace,
+    write_sgp4_orbit_trace,
 )
 
 __all__ = [
-    "CIRCULAR_GEOMETRY_TRACE",
     "C_LIGHT_KM_PER_S",
     "ASTROPY_ENGINE_NAME",
     "ASTROPY_ENGINE_VERSION",
-    "ConstellationDesign",
-    "FormationCluster",
-    "IDEAL_FULL_VISIBILITY",
     "IAU_NOMINAL_SOLAR_RADIUS_KM",
-    "ORBIT_TRACE_V2_ALGORITHM_VERSION",
-    "ORBIT_TRACE_V2_SCHEMA",
-    "ORBIT_TRACE_V2_SCOPE",
+    "ORBIT_TRACE_ALGORITHM",
+    "ORBIT_TRACE_SCHEMA",
+    "ORBIT_TRACE_SCOPE",
     "PINNED_IERS_A_SHA256",
     "PINNED_IERS_DATA_RELEASE",
     "PINNED_IERS_README_SHA256",
     "PINNED_LEAP_SECONDS_SHA256",
     "OrbitTraceBundle",
     "OrbitTraceManifest",
-    "OrbitalSet",
-    "RuntimeTraceBundle",
-    "RuntimeTraceManifest",
     "SGP4_ELEMENT_BUNDLE_SCHEMA",
     "SGP4_ELEMENT_SEMANTICS",
     "SGP4_ENGINE_NAME",
@@ -133,9 +109,6 @@ __all__ = [
     "SGP4_SUNLIGHT_GEOMETRY_MODEL",
     "SGP4_SUN_POSITION_ALGORITHM_VERSION",
     "SGP4_TIME_SCALE",
-    "SURROGATE_ORBIT_TRACE",
-    "SimulationConfig",
-    "SimulationResult",
     "Sgp4ElementBundle",
     "Sgp4ElementProvenance",
     "Sgp4EarthFixedResult",
@@ -155,23 +128,16 @@ __all__ = [
     "Sgp4SunlightGeometrySample",
     "Sgp4SunlightWindow",
     "Sgp4TemeSample",
-    "TRACE_BACKED_RUNTIME_SURROGATE_SCOPE",
     "WGS84_FLATTENING",
     "WGS84_SEMI_MAJOR_AXIS_KM",
     "WGS84_SEMI_MINOR_AXIS_KM",
-    "active_sgl_access_window",
     "compute_sgp4_sun_positions_itrs",
     "evaluate_sgp4_geometry",
-    "has_sgl_access_windows",
-    "load_surrogate_trace_bundle",
-    "load_orbit_trace_v2",
+    "generate_orbit_trace",
+    "load_orbit_trace",
     "load_sgp4_element_bundle",
-    "normalize_trace_scope",
     "propagate_sgp4_teme",
-    "resolve_trace_path",
-    "run_simulation",
-    "sgl_window_link_sample",
     "transform_sgp4_teme_to_itrs",
-    "write_orbit_trace_v2",
-    "write_sgp4_orbit_trace_v2",
+    "write_orbit_trace",
+    "write_sgp4_orbit_trace",
 ]

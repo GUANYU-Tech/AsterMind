@@ -33,7 +33,10 @@ PINNED_IERS_README_SHA256 = "7c6182cc0fd0cbece39711f648d15e48b49168925602e360a57
 PINNED_LEAP_SECONDS_SHA256 = "6f7bc6a25841bc394f82bdfd5d7bb22ffcd4548ee28e9822f2927a909e4f912f"
 
 _PINNED_IERS_ROOT = (
-    Path(__file__).resolve().parent / "data" / "iers" / "0.2026.5.11.1.8.52"
+    Path(__file__).resolve().parent
+    / "data"
+    / "iers"
+    / "0.2026.5.11.1.8.52"
 )
 _PINNED_IERS_A_PATH = _PINNED_IERS_ROOT / "finals2000A.all"
 _PINNED_IERS_README_PATH = _PINNED_IERS_ROOT / "ReadMe.finals2000A"
