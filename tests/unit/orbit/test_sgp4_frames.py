@@ -20,7 +20,7 @@ from orbitserve.orbit import (
     propagate_sgp4_teme,
     transform_sgp4_teme_to_itrs,
 )
-from orbitserve.orbit import sgp4_frames as frame_module
+from orbitserve.orbit.sgp4 import frames as frame_module
 
 from .test_sgp4_propagation import _has_tested_sgp4, _iss_bundle
 from .test_sgp4_elements import _bundle
