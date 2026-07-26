@@ -14,13 +14,15 @@ import csv
 import hashlib
 import json
 import math
+import random
 import re
 import shutil
 from collections import Counter, defaultdict
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 from orbitserve.workload import (
@@ -32,6 +34,17 @@ from orbitserve.workload import (
 
 class AdapterError(ValueError):
     """A deterministic, user-correctable adapter input error."""
+
+
+LOAD_SCALE_FRACTIONS = {"1x": 0.1, "2x": 0.2, "5x": 0.5, "10x": 1.0}
+MONTH_COMPRESSED_DAY_MODE = "month_compressed_day"
+MACRO_REGION_GROUPING = "macro_region"
+COUNTRY_LOCAL_GROUPING = "country_local"
+MACRO_REGION_LOCAL_GROUPING = "macro_region_local"
+SKELETON_GRAFT_TIME_MODE = "skeleton_graft"
+REST_PROFILE_KEY = "__rest__"
+GENERATOR_NAME = "wildchat_workload_adapter"
+GENERATOR_VERSION = "1.5.0"
 
 
 def stable_hex(*parts: str, length: int = 24) -> str:
@@ -88,8 +101,9 @@ def read_source_rows(path: Path) -> list[dict[str, Any]]:
     except ImportError as exc:
         raise AdapterError("Parquet input requires pyarrow") from exc
     try:
-        reader = parquet.ParquetFile(path)
-        rows = [row for batch in reader.iter_batches(batch_size=4096) for row in batch.to_pylist()]
+        schema_names = set(parquet.read_schema(path).names)
+        wanted = [name for name in ("conversation", "model", "timestamp") if name in schema_names]
+        rows = parquet.read_table(path, columns=wanted or None).to_pylist()
     except Exception as exc:  # pyarrow exposes several format-specific exception classes
         raise AdapterError(f"cannot read WildChat Parquet shard {path}: {exc}") from exc
     if not rows:
@@ -156,10 +170,11 @@ class TokenCounter:
             new_user = self._simple_message_tokens(user)
         else:
             assert self.tokenizer is not None
-            history_ids = self.tokenizer.apply_chat_template(history, tokenize=True, add_generation_prompt=False) if history else []
-            prompt_ids = self.tokenizer.apply_chat_template(history + [user], tokenize=True, add_generation_prompt=True)
+            history_ids = _token_id_list(self.tokenizer.apply_chat_template(history, tokenize=True, add_generation_prompt=False)) if history else []
+            prompt_ids = _token_id_list(self.tokenizer.apply_chat_template(history + [user], tokenize=True, add_generation_prompt=True))
             context = len(history_ids)
             new_user = max(1, len(prompt_ids) - context)
+        new_user = min(new_user, context_window)
         context = min(context, max(0, context_window - new_user))
         return context, new_user, context + new_user
 
@@ -297,7 +312,16 @@ def find_region(
     return None
 
 
-def extract_pairs(record: dict[str, Any], source_key: str, config: dict[str, Any]) -> list[dict[str, Any]]:
+def extract_pairs(record: dict[str, Any], source_key: str, config: dict[str, Any], *, light: bool = False, skip_region: bool = False) -> list[dict[str, Any]]:
+    """Extract adjacent user→assistant pairs from one WildChat conversation.
+
+    With ``light=True`` the returned pairs omit message contents (no deepcopy);
+    only arrival/region/index metadata is kept. Filtering is identical.
+    With ``skip_region=True`` (skeleton graft content extraction) pairs keep
+    ``region=None`` and region resolution is skipped entirely; the grafted
+    slot supplies the region later. Content/timestamp/window filters still
+    apply.
+    """
     conversation = record.get("conversation")
     if not isinstance(conversation, list):
         return []
@@ -325,7 +349,7 @@ def extract_pairs(record: dict[str, Any], source_key: str, config: dict[str, Any
             index += 1
             continue
         content_ok = isinstance(item.get("content"), str) and item["content"].strip() and isinstance(assistant.get("content"), str) and assistant["content"].strip()
-        region = find_region(item, mapping, state_centroids, country_centroids)
+        region = None if skip_region else find_region(item, mapping, state_centroids, country_centroids)
         try:
             arrival = (parse_utc(assistant.get("timestamp")) - epoch).total_seconds()
         except AdapterError:
@@ -334,10 +358,10 @@ def extract_pairs(record: dict[str, Any], source_key: str, config: dict[str, Any
                 index += 2
                 continue
             raise
-        if not content_ok or region is None or not (0 <= arrival < horizon):
+        if not content_ok or (region is None and not skip_region) or not (0 <= arrival < horizon):
             if policy["invalid_pair_policy"] != "drop" and not content_ok:
                 raise AdapterError(f"{source_key}: invalid user→assistant pair")
-            if region is None and policy["unknown_region_policy"] != "drop":
+            if region is None and not skip_region and policy["unknown_region_policy"] != "drop":
                 raise AdapterError(f"{source_key}: no configured region for user location")
             history.extend([item, assistant])
             index += 2
@@ -347,43 +371,120 @@ def extract_pairs(record: dict[str, Any], source_key: str, config: dict[str, Any
             "pair_index": len(pairs),
             "arrival_time_s": arrival,
             "region": region,
-            "history": deepcopy(history),
-            "user": item,
-            "assistant": assistant,
+            "history": None if light else deepcopy(history),
+            "user": None if light else item,
+            "assistant": None if light else assistant,
         })
         history.extend([item, assistant])
         index += 2
     return pairs
 
 
-def build_requests(config: dict[str, Any], raw_rows: list[dict[str, Any]], input_sha256: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+def _token_id_list(encoded: Any) -> list[int]:
+    """Unwrap BatchEncoding (transformers>=5) or a plain id list."""
+    return list(encoded["input_ids"]) if hasattr(encoded, "keys") else list(encoded)
+
+
+def _batch_token_counts(
+    token_counter: TokenCounter,
+    flat_pairs: list[dict[str, Any]],
+    context_window: int,
+) -> list[tuple[int, int, int, int]]:
+    """Return (context, new_user, prompt, output) per pair.
+
+    The huggingface_auto path renders chat templates to text and batch-encodes,
+    which is equivalent to apply_chat_template(tokenize=True) but much faster.
+    """
+    if token_counter.backend == "simple_unicode_v1":
+        results = []
+        for pair in flat_pairs:
+            context, new_user, prompt = token_counter.prompt_counts(pair["history"], pair["user"], context_window)
+            results.append((context, new_user, prompt, token_counter.output_tokens(pair["assistant"])))
+        return results
+    tokenizer = token_counter.tokenizer
+    assert tokenizer is not None
+    eos_extra = int(token_counter.spec.get("assistant_token_policy") == "content_plus_eos")
+    results: list[tuple[int, int, int, int]] = []
+    chunk_size = 4096
+    for start in range(0, len(flat_pairs), chunk_size):
+        part = flat_pairs[start : start + chunk_size]
+        prompt_texts = [
+            tokenizer.apply_chat_template(pair["history"] + [pair["user"]], tokenize=False, add_generation_prompt=True)
+            for pair in part
+        ]
+        history_texts = [
+            tokenizer.apply_chat_template(pair["history"], tokenize=False, add_generation_prompt=False)
+            if pair["history"]
+            else ""
+            for pair in part
+        ]
+        contents = [str(pair["assistant"].get("content", "")) for pair in part]
+        prompt_ids = tokenizer(prompt_texts, add_special_tokens=False)["input_ids"]
+        history_ids = tokenizer(history_texts, add_special_tokens=False)["input_ids"]
+        content_ids = tokenizer(contents, add_special_tokens=False)["input_ids"]
+        for pair, prompt, history, content in zip(part, prompt_ids, history_ids, content_ids, strict=True):
+            context = len(history) if pair["history"] else 0
+            new_user = min(max(1, len(prompt) - context), context_window)
+            context = min(context, max(0, context_window - new_user))
+            output = max(1, len(content) + eos_extra)
+            results.append((context, new_user, context + new_user, output))
+    return results
+
+
+def extract_session_pairs(
+    config: dict[str, Any],
+    raw_rows: list[dict[str, Any]],
+    input_sha256: str,
+    *,
+    line_numbers: list[int] | None = None,
+    light: bool = False,
+) -> list[tuple[str, str, dict[str, Any], list[dict[str, Any]]]]:
+    """Extract valid (session_id, source_key, raw, pairs) conversations, kept intact.
+
+    With ``light=True`` the pairs omit message contents (used when token counts
+    are supplied externally and only scheduling metadata is needed).
+    """
+    extracted: list[tuple[str, str, dict[str, Any], list[dict[str, Any]]]] = []
+    for position, raw in enumerate(raw_rows):
+        line_number = position + 1 if line_numbers is None else line_numbers[position]
+        source_key = stable_hex(config["dataset"]["revision"], input_sha256, str(line_number), length=32)
+        pairs = extract_pairs(raw, source_key, config, light=light)
+        if not pairs:
+            continue
+        session_id = f"wc_sess_{stable_hex(config['workload_id'], source_key)}"
+        extracted.append((session_id, source_key, raw, pairs))
+    if not extracted:
+        raise AdapterError("no valid user→assistant pairs remained after filtering")
+    return extracted
+
+
+def assemble_requests(
+    config: dict[str, Any],
+    extracted: list[tuple[str, str, dict[str, Any], list[dict[str, Any]]]],
+    token_counts: list[tuple[int, int, int, int]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     gateways_config = config["gateways"]
     raw_gateways = gateways_config["items"]
     rules = config["slo_policy"]["rules"]
     tokenization = config["tokenization"]
-    token_counter = TokenCounter(tokenization)
     if config["slo_policy"].get("session_assignment") != "max_output_tokens":
         raise AdapterError("slo_policy.session_assignment must be max_output_tokens for canonical workload session consistency")
+    window = int(tokenization["context_window_tokens"])
 
     all_requests: list[dict[str, Any]] = []
     sessions: list[dict[str, Any]] = []
     used_regions: dict[str, dict[str, Any]] = {}
-    for line_number, raw in enumerate(raw_rows, start=1):
-        source_key = stable_hex(config["dataset"]["revision"], input_sha256, str(line_number), length=32)
-        pairs = extract_pairs(raw, source_key, config)
-        if not pairs:
-            continue
-        session_id = f"wc_sess_{stable_hex(config['workload_id'], source_key)}"
-        pair_outputs = [token_counter.output_tokens(pair["assistant"]) for pair in pairs]
-        slo = select_slo(max(pair_outputs), rules)
+    flat_index = 0
+    for session_id, source_key, raw, pairs in extracted:
+        session_counts = token_counts[flat_index : flat_index + len(pairs)]
+        flat_index += len(pairs)
+        slo = select_slo(max(count[3] for count in session_counts), rules)
         previous_arrival: float | None = None
         session_rows: list[dict[str, Any]] = []
-        for pair, output_tokens in zip(pairs, pair_outputs, strict=True):
+        for pair, (context, new_user, prompt, output_tokens) in zip(pairs, session_counts, strict=True):
             arrival = float(pair["arrival_time_s"])
             if previous_arrival is not None and arrival < previous_arrival:
                 raise AdapterError(f"{session_id}: assistant completion proxy moved backwards")
-            window = int(tokenization["context_window_tokens"])
-            context, new_user, prompt = token_counter.prompt_counts(pair["history"], pair["user"], window)
             region = pair["region"]
             gateway = select_gateway(region, raw_gateways, gateways_config["selection_policy"])
             source_turn_key = f"{source_key}:turn:{pair['pair_index']}"
@@ -439,8 +540,6 @@ def build_requests(config: dict[str, Any], raw_rows: list[dict[str, Any]], input
         })
         all_requests.extend(session_rows)
 
-    if not all_requests:
-        raise AdapterError("no valid user→assistant pairs remained after filtering")
     all_requests.sort(key=lambda row: (row["arrival_time_s"], row["request_id"]))
     sessions.sort(key=lambda row: (row["session_start_time_s"], row["session_id"]))
     counts = Counter(row["region_id"] for row in all_requests)
@@ -469,6 +568,15 @@ def build_requests(config: dict[str, Any], raw_rows: list[dict[str, Any]], input
         })
     gateways.sort(key=lambda row: row["gateway_id"])
     return all_requests, sessions, regions, gateways
+
+
+def build_requests(config: dict[str, Any], raw_rows: list[dict[str, Any]], input_sha256: str, *, line_numbers: list[int] | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    extracted = extract_session_pairs(config, raw_rows, input_sha256, line_numbers=line_numbers)
+    flat_pairs = [pair for _, _, _, pairs in extracted for pair in pairs]
+    token_counts = _batch_token_counts(
+        TokenCounter(config["tokenization"]), flat_pairs, int(config["tokenization"]["context_window_tokens"])
+    )
+    return assemble_requests(config, extracted, token_counts)
 
 
 def build_timebins(requests: list[dict[str, Any]], horizon: float, bin_size: float) -> list[dict[str, Any]]:
@@ -574,7 +682,1093 @@ def _description_hash(description: dict[str, Any]) -> str:
     return sha256_bytes(canonical_bytes(digest_view))
 
 
-def build(config_path: Path, input_path: Path, out_dir: Path, overwrite: bool) -> None:
+def _expected_source_shas(dataset: dict[str, Any]) -> dict[str, str]:
+    files = dataset.get("parquet_files")
+    if files:
+        return {
+            Path(str(item["path"])).name: str(item["expected_source_sha256"])
+            for item in files
+        }
+    if dataset.get("parquet_file") and dataset.get("expected_source_sha256"):
+        return {Path(str(dataset["parquet_file"])).name: str(dataset["expected_source_sha256"])}
+    return {}
+
+
+def resolve_load_scale(
+    config: dict[str, Any],
+    load_scale: str | None,
+    scale_flags: dict[str, bool],
+    *,
+    month_mode: bool,
+) -> str:
+    flagged = [name for name, enabled in scale_flags.items() if enabled]
+    if len(flagged) > 1:
+        raise AdapterError(f"load-scale shortcuts are mutually exclusive; got {sorted(flagged)}")
+    if flagged and load_scale is not None:
+        raise AdapterError(f"--load-scale {load_scale} conflicts with --{flagged[0]}")
+    scale = flagged[0] if flagged else load_scale
+    if scale is None:
+        scale = str(config.get("load", {}).get("default_scale", "10x"))
+    if scale not in LOAD_SCALE_FRACTIONS:
+        raise AdapterError(f"unsupported load scale {scale!r}; use one of {sorted(LOAD_SCALE_FRACTIONS)}")
+    if not month_mode and (flagged or load_scale is not None):
+        raise AdapterError(
+            "load-scale options require dataset.time_window.time_mode='month_compressed_day'"
+        )
+    return scale
+
+
+MACRO_REGION_GROUPS = ("US", "CN", "EU", "OTHER")
+
+_EU_COUNTRY_KEYS = frozenset({
+    "albania", "andorra", "austria", "belarus", "belgium", "bosnia_and_herzegovina",
+    "bulgaria", "croatia", "cyprus", "czechia", "denmark", "estonia", "finland",
+    "france", "germany", "greece", "hungary", "iceland", "ireland", "italy",
+    "latvia", "liechtenstein", "lithuania", "luxembourg", "malta", "moldova",
+    "monaco", "montenegro", "netherlands", "north_macedonia", "norway", "poland",
+    "portugal", "romania", "san_marino", "serbia", "slovakia", "slovenia", "spain",
+    "sweden", "switzerland", "ukraine", "united_kingdom", "vatican_city",
+})
+
+
+def macro_region_group(country: Any) -> str:
+    """Map a WildChat country string to a macro region group (US/CN/EU/OTHER)."""
+    if not isinstance(country, str):
+        return "OTHER"
+    key = _location_key(country)
+    if key == "united_states":
+        return "US"
+    if key == "china":
+        return "CN"
+    if key in _EU_COUNTRY_KEYS:
+        return "EU"
+    return "OTHER"
+
+
+def session_location(record: dict[str, Any]) -> tuple[str | None, str | None]:
+    """(country, state) of a conversation, read from its first user turn.
+
+    WildChat Parquet rows carry no top-level country; the country/state fields
+    live on each conversation turn (assistant turns have them null).
+    """
+    conversation = record.get("conversation")
+    if not isinstance(conversation, list):
+        return None, None
+    for item in conversation:
+        if isinstance(item, dict) and item.get("role") == "user" and isinstance(item.get("country"), str):
+            state = item.get("state")
+            return item["country"], state if isinstance(state, str) else None
+    return None, None
+
+
+def session_country(record: dict[str, Any]) -> str | None:
+    """Country of a conversation, read from its first user turn."""
+    return session_location(record)[0]
+
+
+# ---------------- legal (IANA) timezones for country-local envelopes ----------------
+# US states: full names normalized with _location_key (WildChat uses full state
+# names). Arizona has no DST (America/Phoenix). Unknown states fall back to
+# America/New_York. Mirrors scratch/legal_tz_diurnal.py's US_STATE_TZ.
+_US_STATE_TZ: dict[str, str] = {}
+for _s in ("connecticut delaware florida georgia indiana kentucky maine maryland massachusetts "
+           "michigan new_hampshire new_jersey new_york north_carolina ohio pennsylvania "
+           "rhode_island south_carolina vermont virginia west_virginia district_of_columbia").split():
+    _US_STATE_TZ[_s] = "America/New_York"
+for _s in ("alabama arkansas illinois iowa kansas louisiana minnesota mississippi missouri "
+           "nebraska north_dakota oklahoma south_dakota tennessee texas wisconsin").split():
+    _US_STATE_TZ[_s] = "America/Chicago"
+for _s in "colorado montana new_mexico utah wyoming idaho".split():
+    _US_STATE_TZ[_s] = "America/Denver"
+_US_STATE_TZ["arizona"] = "America/Phoenix"  # no DST
+for _s in "california nevada oregon washington".split():
+    _US_STATE_TZ[_s] = "America/Los_Angeles"
+_US_STATE_TZ["alaska"] = "America/Anchorage"
+_US_STATE_TZ["hawaii"] = "Pacific/Honolulu"
+del _s
+
+# Russian states observed in WildChat; unknown/missing states default to Moscow time.
+_RU_STATE_TZ: dict[str, str] = {
+    "moscow": "Europe/Moscow",
+    "moscow_oblast": "Europe/Moscow",
+    "yaroslavl_oblast": "Europe/Moscow",
+    "st_petersburg": "Europe/Moscow",
+    "nizhny_novgorod_oblast": "Europe/Moscow",
+    "tatarstan_republic": "Europe/Moscow",
+    "bashkortostan_republic": "Europe/Moscow",
+    "perm_krai": "Asia/Yekaterinburg",
+    "kemerovo_oblast": "Asia/Krasnoyarsk",
+    "novosibirsk_oblast": "Asia/Krasnoyarsk",
+    "krasnoyarsk_krai": "Asia/Krasnoyarsk",
+}
+
+# Country-level zones: the top-10 content countries plus all of Europe (Europe
+# dominates the REST envelope, so its local times stay legal-tz precise too).
+_COUNTRY_TZ: dict[str, str] = {
+    "china": "Asia/Shanghai",
+    "japan": "Asia/Tokyo",
+    "south_korea": "Asia/Seoul",
+    "india": "Asia/Kolkata",
+    "brazil": "America/Sao_Paulo",
+    "united_kingdom": "Europe/London",
+    "ireland": "Europe/Dublin",
+    "portugal": "Europe/Lisbon",
+    "iceland": "Atlantic/Reykjavik",
+    "finland": "Europe/Helsinki",
+    "greece": "Europe/Athens",
+    "romania": "Europe/Bucharest",
+    "bulgaria": "Europe/Sofia",
+    "latvia": "Europe/Riga",
+    "lithuania": "Europe/Vilnius",
+    "estonia": "Europe/Tallinn",
+    "cyprus": "Asia/Nicosia",
+    "ukraine": "Europe/Kyiv",
+    "moldova": "Europe/Chisinau",
+    "belarus": "Europe/Minsk",
+}
+for _c in ("germany austria belgium denmark spain france italy luxembourg netherlands norway sweden "
+           "switzerland poland czechia slovakia slovenia hungary croatia malta vatican_city san_marino "
+           "monaco liechtenstein andorra albania bosnia_and_herzegovina montenegro north_macedonia serbia").split():
+    _COUNTRY_TZ[_c] = "Europe/Berlin"
+del _c
+
+
+def legal_tz_name(country: Any, state: Any) -> str | None:
+    """IANA timezone name for a WildChat (country, state) pair, if mapped."""
+    if not isinstance(country, str):
+        return None
+    key = _location_key(country)
+    state_key = _location_key(state) if isinstance(state, str) else ""
+    if key == "united_states":
+        return _US_STATE_TZ.get(state_key, "America/New_York")
+    if key == "russia":
+        return _RU_STATE_TZ.get(state_key, "Europe/Moscow")
+    return _COUNTRY_TZ.get(key)
+
+
+_TZ_OFFSET_CACHE: dict[tuple[str, str], int] = {}
+
+
+def local_time_offset_s(country: Any, state: Any, reference_date: str, *, fallback_lon_deg: Any = None) -> int:
+    """UTC offset (seconds) of the session's legal timezone on reference_date.
+
+    The reference date (YYYY-MM-DD) pins the DST regime of the represented
+    month (evaluated at local noon via zoneinfo). Countries without a legal-tz
+    mapping fall back to the region's longitude solar offset. Missing IANA tz
+    data is a hard AdapterError (install the tzdata package), never a silent
+    fallback.
+    """
+    tz_name = legal_tz_name(country, state)
+    if tz_name is None:
+        if fallback_lon_deg is None:
+            raise AdapterError(f"no legal timezone or longitude fallback for country {country!r}")
+        return max(-12, min(14, round(float(fallback_lon_deg) / 15.0))) * 3600
+    cache_key = (tz_name, reference_date)
+    offset = _TZ_OFFSET_CACHE.get(cache_key)
+    if offset is None:
+        try:
+            zone = ZoneInfo(tz_name)
+        except ZoneInfoNotFoundError as exc:
+            raise AdapterError(
+                f"IANA timezone {tz_name!r} is unavailable; install the tzdata package (pip install tzdata)"
+            ) from exc
+        try:
+            year, month, day = (int(part) for part in reference_date.split("-"))
+            delta = zone.utcoffset(datetime(year, month, day, 12, 0))
+        except ValueError as exc:
+            raise AdapterError(f"invalid diurnal_profile reference date {reference_date!r}") from exc
+        if delta is None:
+            raise AdapterError(f"cannot resolve the UTC offset of {tz_name} on {reference_date}")
+        offset = int(delta.total_seconds())
+        _TZ_OFFSET_CACHE[cache_key] = offset
+    return offset
+
+
+def collect_month_pool(
+    config: dict[str, Any],
+    raw_rows: list[dict[str, Any]],
+    input_sha256: str,
+    *,
+    line_offset: int = 0,
+    pools: dict[int, list[dict[str, Any]]] | None = None,
+) -> dict[int, list[dict[str, Any]]]:
+    """Scan source rows and bucket sessions by time-of-day without retaining content.
+
+    Pass an existing pools dict plus line_offset to accumulate across multiple
+    input shards while keeping global (1-based) line numbers stable.
+    """
+    time_window = config["dataset"]["time_window"]
+    bin_s = float(time_window["time_bin_s"])
+    if pools is None:
+        pools = defaultdict(list)
+    for position, raw in enumerate(raw_rows):
+        line_number = position + 1 + line_offset
+        source_key = stable_hex(config["dataset"]["revision"], input_sha256, str(line_number), length=32)
+        pairs = extract_pairs(raw, source_key, config, light=True)
+        if not pairs:
+            continue
+        first = float(pairs[0]["arrival_time_s"])
+        span = float(pairs[-1]["arrival_time_s"]) - first
+        bin_index = int((first % 86400.0) // bin_s)
+        session_id = f"wc_sess_{stable_hex(config['workload_id'], source_key)}"
+        pools[bin_index].append(
+            {
+                "line_number": line_number,
+                "session_id": session_id,
+                "first_arrival": first,
+                "span": span,
+            }
+        )
+    return pools
+
+
+def sample_month_pool(
+    config: dict[str, Any],
+    pools: dict[int, list[dict[str, Any]]],
+    scale: str,
+) -> tuple[dict[str, str], dict[str, float], list[dict[str, Any]], list[str]]:
+    """Deterministically sample each bin's pool and assign session starts."""
+    time_window = config["dataset"]["time_window"]
+    bin_s = float(time_window["time_bin_s"])
+    horizon = float(time_window.get("output_time_horizon_s", 86400.0))
+    fraction = LOAD_SCALE_FRACTIONS[scale]
+    if not pools:
+        raise AdapterError("no valid user→assistant pairs remained after filtering")
+
+    line_to_session: dict[str, float] = {}
+    session_starts: dict[int, float] = {}
+    report: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    for bin_index in sorted(pools):
+        pool = sorted(pools[bin_index], key=lambda entry: entry["session_id"])
+        rng = random.Random(stable_seed(config["workload_id"], scale, str(bin_index)))
+        target = len(pool) if fraction >= 1.0 else int(round(len(pool) * fraction))
+        if target > len(pool):
+            warnings.append(
+                f"bin {bin_index}: target {target} sessions exceeds pool {len(pool)}; taking all"
+            )
+            target = len(pool)
+        chosen = pool if target == len(pool) else sorted(rng.sample(pool, target), key=lambda entry: entry["session_id"])
+        dropped_long = 0
+        for entry in chosen:
+            offset = rng.uniform(0.0, bin_s)
+            max_start = horizon - entry["span"] - 1e-6
+            if max_start < 0:
+                dropped_long += 1
+                continue
+            start = round(min(bin_index * bin_s + offset, max_start), 6)
+            line_to_session[str(entry["line_number"])] = entry["session_id"]
+            session_starts[entry["session_id"]] = start
+        if dropped_long:
+            warnings.append(
+                f"bin {bin_index}: dropped {dropped_long} session(s) spanning more than the synthetic day"
+            )
+        report.append(
+            {"bin": bin_index, "pool": len(pool), "target": target, "actual": len(chosen) - dropped_long}
+        )
+    return line_to_session, session_starts, report, warnings
+
+
+def plan_month_compression(
+    config: dict[str, Any],
+    raw_rows: list[dict[str, Any]],
+    input_sha256: str,
+    scale: str,
+) -> tuple[dict[str, str], dict[str, float], list[dict[str, Any]], list[str]]:
+    """Assign each source conversation to a time-of-day bin and sample per bin.
+
+    Returns (line_number -> session_id, session_id -> compressed first arrival,
+    per-bin report rows, warnings). Conversations are kept intact: the whole
+    session is shifted so its first turn lands inside the sampled bin slot.
+    """
+    pools = collect_month_pool(config, raw_rows, input_sha256)
+    return sample_month_pool(config, pools, scale)
+
+
+def _diurnal_profile_scan_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Config view whose dataset time window matches the profile shards' month.
+
+    The profile shards come from a different month than the content shards, so
+    their pair extraction must filter against the profile window declared in
+    the optional ``diurnal_profile`` config block (defaulting to the dataset
+    window when the block omits it).
+    """
+    profile_block = config.get("diurnal_profile")
+    if not isinstance(profile_block, dict):
+        raise AdapterError("--profile-input requires a diurnal_profile block in the config")
+    grouping = profile_block.get("grouping", MACRO_REGION_GROUPING)
+    if grouping not in (MACRO_REGION_GROUPING, COUNTRY_LOCAL_GROUPING, MACRO_REGION_LOCAL_GROUPING):
+        raise AdapterError(f"unsupported diurnal_profile.grouping: {grouping!r}")
+    scan_config = dict(config)
+    dataset = dict(config["dataset"])
+    time_window = dict(dataset["time_window"])
+    epoch = str(profile_block.get("epoch_utc", time_window["epoch_utc"]))
+    time_window["epoch_utc"] = epoch
+    window_end = profile_block.get("window_end_utc")
+    if window_end:
+        span = (parse_utc(str(window_end)) - parse_utc(epoch)).total_seconds()
+        if span <= 0:
+            raise AdapterError("diurnal_profile.window_end_utc must be after epoch_utc")
+        time_window["time_horizon_s"] = span
+    dataset["time_window"] = time_window
+    scan_config["dataset"] = dataset
+    return scan_config
+
+
+def collect_profile_counts(
+    scan_config: dict[str, Any],
+    raw_rows: list[dict[str, Any]],
+    counts: dict[str, Counter] | None = None,
+) -> dict[str, Counter]:
+    """Count profile sessions per (macro group, time-of-day bin); no content kept.
+
+    Mirrors collect_month_pool's light scan, but only tallies sessions: the bin
+    definition is identical (first-turn arrival_time_s % 86400 // time_bin_s).
+    Pass an existing counts dict to accumulate across profile shards.
+    """
+    bin_s = float(scan_config["dataset"]["time_window"]["time_bin_s"])
+    if counts is None:
+        counts = {group: Counter() for group in MACRO_REGION_GROUPS}
+    for raw in raw_rows:
+        pairs = extract_pairs(raw, "diurnal_profile", scan_config, light=True)
+        if not pairs:
+            continue
+        first = float(pairs[0]["arrival_time_s"])
+        bin_index = int((first % 86400.0) // bin_s)
+        counts[macro_region_group(session_country(raw))][bin_index] += 1
+    return counts
+
+
+def collect_grouped_candidates(
+    config: dict[str, Any],
+    raw_rows: list[dict[str, Any]],
+    input_sha256: str,
+) -> dict[str, list[dict[str, Any]]]:
+    """Scan content shards into per-group candidate sessions (no content kept).
+
+    Every country participates (no allowlist filtering). The state/lon_deg
+    fields are only consumed by local-time groupings.
+    """
+    candidates: dict[str, list[dict[str, Any]]] = {group: [] for group in MACRO_REGION_GROUPS}
+    for position, raw in enumerate(raw_rows):
+        line_number = position + 1
+        source_key = stable_hex(config["dataset"]["revision"], input_sha256, str(line_number), length=32)
+        pairs = extract_pairs(raw, source_key, config, light=True)
+        if not pairs:
+            continue
+        country, state = session_location(raw)
+        first = float(pairs[0]["arrival_time_s"])
+        span = float(pairs[-1]["arrival_time_s"]) - first
+        session_id = f"wc_sess_{stable_hex(config['workload_id'], source_key)}"
+        candidates[macro_region_group(country)].append(
+            {
+                "line_number": line_number,
+                "session_id": session_id,
+                "first_arrival": first,
+                "span": span,
+                "country": country,
+                "state": state,
+                "lon_deg": pairs[0]["region"].get("lon_deg"),
+            }
+        )
+    return candidates
+
+
+def _bin_weights(counts: Counter) -> dict[int, float]:
+    total = sum(counts.values())
+    return {bin_index: count / total for bin_index, count in counts.items() if count > 0}
+
+
+def _largest_remainder_targets(weights: dict[int, float], total: int) -> dict[int, int]:
+    """Apportion ``total`` sessions across bins by weight (largest remainder).
+
+    Ties on fractional parts are broken by ascending bin index so the result
+    is deterministic.
+    """
+    quotas = {bin_index: total * weight for bin_index, weight in weights.items()}
+    targets = {bin_index: int(math.floor(quota)) for bin_index, quota in quotas.items()}
+    remainder = total - sum(targets.values())
+    by_fraction = sorted(quotas, key=lambda bin_index: (-(quotas[bin_index] - targets[bin_index]), bin_index))
+    for bin_index in by_fraction[:remainder]:
+        targets[bin_index] += 1
+    return targets
+
+
+def deal_grouped_sessions(
+    config: dict[str, Any],
+    candidates: dict[str, list[dict[str, Any]]],
+    profile_counts: dict[str, Counter],
+    scale: str,
+) -> tuple[dict[str, str], dict[str, float], list[dict[str, Any]], list[str]]:
+    """Deal each group's sampled sessions into bins following the profile.
+
+    Per group: sample round(N*fraction) candidates (stable_seed(workload_id,
+    scale, group)), apportion them across bins with the largest-remainder
+    method using the group's profile weights (empty groups fall back to the
+    global profile distribution), then shuffle with stable_seed(workload_id,
+    scale, group, "deal") and deal into bins in ascending bin order.
+    """
+    time_window = config["dataset"]["time_window"]
+    bin_s = float(time_window["time_bin_s"])
+    horizon = float(time_window.get("output_time_horizon_s", 86400.0))
+    fraction = LOAD_SCALE_FRACTIONS[scale]
+    if not any(candidates[group] for group in MACRO_REGION_GROUPS):
+        raise AdapterError("no valid user→assistant pairs remained after filtering")
+    global_counts: Counter = Counter()
+    for group in MACRO_REGION_GROUPS:
+        global_counts.update(profile_counts.get(group, {}))
+    if sum(global_counts.values()) == 0:
+        raise AdapterError("diurnal profile shards contain no usable sessions")
+
+    line_to_session: dict[str, str] = {}
+    session_starts: dict[str, float] = {}
+    report: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    for group in MACRO_REGION_GROUPS:
+        pool = sorted(candidates[group], key=lambda entry: entry["session_id"])
+        if not pool:
+            continue
+        target = len(pool) if fraction >= 1.0 else int(round(len(pool) * fraction))
+        chosen = pool
+        if target < len(pool):
+            rng_pick = random.Random(stable_seed(config["workload_id"], scale, group))
+            chosen = sorted(rng_pick.sample(pool, target), key=lambda entry: entry["session_id"])
+        group_counts = profile_counts.get(group, Counter())
+        if sum(group_counts.values()) == 0:
+            warnings.append(
+                f"group {group}: no diurnal profile sessions; falling back to the global profile distribution"
+            )
+            group_counts = global_counts
+        targets = _largest_remainder_targets(_bin_weights(group_counts), len(chosen))
+        rng_deal = random.Random(stable_seed(config["workload_id"], scale, group, "deal"))
+        deck = list(chosen)
+        rng_deal.shuffle(deck)
+        position = 0
+        for bin_index in sorted(targets):
+            bin_target = targets[bin_index]
+            if bin_target == 0:
+                continue
+            dealt = deck[position : position + bin_target]
+            position += bin_target
+            dropped_long = 0
+            for entry in dealt:
+                offset = rng_deal.uniform(0.0, bin_s)
+                max_start = horizon - entry["span"] - 1e-6
+                if max_start < 0:
+                    dropped_long += 1
+                    continue
+                start = round(min(bin_index * bin_s + offset, max_start), 6)
+                line_to_session[str(entry["line_number"])] = entry["session_id"]
+                session_starts[entry["session_id"]] = start
+            if dropped_long:
+                warnings.append(
+                    f"group {group} bin {bin_index}: dropped {dropped_long} session(s) spanning more than the synthetic day"
+                )
+            report.append(
+                {"group": group, "bin": bin_index, "pool": len(pool), "target": bin_target, "actual": len(dealt) - dropped_long}
+            )
+    return line_to_session, session_starts, report, warnings
+
+
+def plan_diurnal_profile_warp(
+    config: dict[str, Any],
+    raw_rows: list[dict[str, Any]],
+    input_sha256: str,
+    profile_counts: dict[str, Counter],
+    scale: str,
+) -> tuple[dict[str, str], dict[str, float], list[dict[str, Any]], list[str]]:
+    """Assign session starts from a foreign-month diurnal profile.
+
+    Returns the same tuple as plan_month_compression
+    (line_number -> session_id, session_id -> warped first arrival, report
+    rows with an extra ``group`` field, warnings) so the downstream shift and
+    validation path is reused unchanged. Arrival times follow the profile
+    shards' per-group day envelope while conversation content comes from the
+    input shards.
+    """
+    candidates = collect_grouped_candidates(config, raw_rows, input_sha256)
+    return deal_grouped_sessions(config, candidates, profile_counts, scale)
+
+
+def _local_envelope_settings(config: dict[str, Any], *, grouping: str) -> dict[str, Any]:
+    """Validated diurnal_profile block for local-time envelope groupings."""
+    profile_block = config.get("diurnal_profile")
+    if not isinstance(profile_block, dict):
+        raise AdapterError("--profile-input requires a diurnal_profile block in the config")
+    required = {"profile_reference_date", "content_reference_date"}
+    if grouping == COUNTRY_LOCAL_GROUPING:
+        required.add("content_countries")
+    missing = required - set(profile_block)
+    if missing:
+        raise AdapterError(f"diurnal_profile ({grouping}) is missing fields: {sorted(missing)}")
+    if grouping == COUNTRY_LOCAL_GROUPING:
+        countries = profile_block["content_countries"]
+        if not isinstance(countries, list) or not countries or any(not isinstance(item, str) for item in countries):
+            raise AdapterError("diurnal_profile.content_countries must be a non-empty array of strings")
+    for key in ("profile_reference_date", "content_reference_date"):
+        try:
+            date.fromisoformat(str(profile_block[key]))
+        except ValueError as exc:
+            raise AdapterError(f"diurnal_profile.{key} must be an ISO date (YYYY-MM-DD)") from exc
+    return profile_block
+
+
+def _country_local_settings(config: dict[str, Any]) -> dict[str, Any]:
+    """Validated diurnal_profile block for grouping='country_local'."""
+    return _local_envelope_settings(config, grouping=COUNTRY_LOCAL_GROUPING)
+
+
+def _country_allowlist_keys(profile_block: dict[str, Any]) -> dict[str, str]:
+    """Normalized country key -> configured display name, in config order."""
+    keys: dict[str, str] = {}
+    for country in profile_block["content_countries"]:
+        keys.setdefault(_location_key(str(country)), str(country))
+    return keys
+
+
+def _scan_local_profile_row(
+    scan_config: dict[str, Any],
+    raw: dict[str, Any],
+    reference_date: str,
+    bin_s: float,
+) -> tuple[str | None, int] | None:
+    """(country, local-time bin) of one profile session, or None if filtered.
+
+    Local bin = ((first-turn arrival + the session's legal UTC offset on
+    reference_date) mod 86400) // bin_s.
+    """
+    pairs = extract_pairs(raw, "diurnal_profile", scan_config, light=True)
+    if not pairs:
+        return None
+    country, state = session_location(raw)
+    first = float(pairs[0]["arrival_time_s"])
+    offset = local_time_offset_s(
+        country, state, reference_date, fallback_lon_deg=pairs[0]["region"].get("lon_deg")
+    )
+    return country, int(((first + offset) % 86400.0) // bin_s)
+
+
+def collect_local_profile_counts(
+    scan_config: dict[str, Any],
+    raw_rows: list[dict[str, Any]],
+    allowlist_keys: dict[str, str],
+    reference_date: str,
+    counts: dict[str, Counter] | None = None,
+) -> dict[str, Counter]:
+    """Count profile sessions per (country, local-time bin); no content kept.
+
+    Allowlisted countries get their own counter; every other session folds
+    into the REST counter.
+    """
+    bin_s = float(scan_config["dataset"]["time_window"]["time_bin_s"])
+    if counts is None:
+        counts = {country: Counter() for country in allowlist_keys.values()}
+        counts[REST_PROFILE_KEY] = Counter()
+    for raw in raw_rows:
+        scanned = _scan_local_profile_row(scan_config, raw, reference_date, bin_s)
+        if scanned is None:
+            continue
+        country, local_bin = scanned
+        key = allowlist_keys.get(_location_key(country) if isinstance(country, str) else "", REST_PROFILE_KEY)
+        counts[key][local_bin] += 1
+    return counts
+
+
+def collect_macro_local_profile_counts(
+    scan_config: dict[str, Any],
+    raw_rows: list[dict[str, Any]],
+    reference_date: str,
+    counts: dict[str, Counter] | None = None,
+) -> dict[str, Counter]:
+    """Count profile sessions per (macro group, local-time bin); no content kept.
+
+    Same local-time binning as collect_local_profile_counts, aggregated by
+    macro_region_group (US/CN/EU/OTHER); every country participates.
+    """
+    bin_s = float(scan_config["dataset"]["time_window"]["time_bin_s"])
+    if counts is None:
+        counts = {group: Counter() for group in MACRO_REGION_GROUPS}
+    for raw in raw_rows:
+        scanned = _scan_local_profile_row(scan_config, raw, reference_date, bin_s)
+        if scanned is None:
+            continue
+        country, local_bin = scanned
+        counts[macro_region_group(country)][local_bin] += 1
+    return counts
+
+
+def collect_country_candidates(
+    config: dict[str, Any],
+    raw_rows: list[dict[str, Any]],
+    input_sha256: str,
+    allowlist_keys: dict[str, str],
+) -> dict[str, list[dict[str, Any]]]:
+    """Scan content shards into per-country candidates (no content kept).
+
+    Sessions whose country is not on the allowlist are skipped outright and
+    never enter the candidate pools.
+    """
+    candidates: dict[str, list[dict[str, Any]]] = {country: [] for country in allowlist_keys.values()}
+    for position, raw in enumerate(raw_rows):
+        country, state = session_location(raw)
+        key = allowlist_keys.get(_location_key(country) if isinstance(country, str) else "")
+        if key is None:
+            continue
+        line_number = position + 1
+        source_key = stable_hex(config["dataset"]["revision"], input_sha256, str(line_number), length=32)
+        pairs = extract_pairs(raw, source_key, config, light=True)
+        if not pairs:
+            continue
+        first = float(pairs[0]["arrival_time_s"])
+        span = float(pairs[-1]["arrival_time_s"]) - first
+        session_id = f"wc_sess_{stable_hex(config['workload_id'], source_key)}"
+        candidates[key].append(
+            {
+                "line_number": line_number,
+                "session_id": session_id,
+                "first_arrival": first,
+                "span": span,
+                "state": state,
+                "lon_deg": pairs[0]["region"].get("lon_deg"),
+            }
+        )
+    return candidates
+
+
+def deal_country_sessions(
+    config: dict[str, Any],
+    candidates: dict[str, list[dict[str, Any]]],
+    profile_counts: dict[str, Counter],
+    scale: str,
+) -> tuple[dict[str, str], dict[str, float], list[dict[str, Any]], list[str], dict[str, Any]]:
+    """Deal each country's sampled sessions into local-time bins.
+
+    Same flow as deal_grouped_sessions, but bins are *local* times: a dealt
+    local start bin*bin_s + rng.uniform(0, bin_s) is converted back to UTC via
+    the session region's legal offset on the content reference date. Countries
+    whose profile holds fewer than min_country_profile_sessions sessions use
+    the REST local-time envelope instead of their own.
+    """
+    profile_block = _country_local_settings(config)
+    allowlist = [str(country) for country in profile_block["content_countries"]]
+    min_sessions = int(profile_block.get("min_country_profile_sessions", 1000))
+    content_reference = str(profile_block["content_reference_date"])
+    time_window = config["dataset"]["time_window"]
+    bin_s = float(time_window["time_bin_s"])
+    horizon = float(time_window.get("output_time_horizon_s", 86400.0))
+    fraction = LOAD_SCALE_FRACTIONS[scale]
+    if not any(candidates.get(country) for country in allowlist):
+        raise AdapterError("no valid user→assistant pairs remained after filtering")
+    rest_counts = profile_counts.get(REST_PROFILE_KEY, Counter())
+    if sum(rest_counts.values()) == 0:
+        raise AdapterError("diurnal profile shards contain no usable REST sessions")
+
+    line_to_session: dict[str, str] = {}
+    session_starts: dict[str, float] = {}
+    report: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    fallback_countries: list[str] = []
+    envelope_sessions: dict[str, int] = {}
+    for country in allowlist:
+        pool = sorted(candidates.get(country, []), key=lambda entry: entry["session_id"])
+        if not pool:
+            continue
+        target = len(pool) if fraction >= 1.0 else int(round(len(pool) * fraction))
+        chosen = pool
+        if target < len(pool):
+            rng_pick = random.Random(stable_seed(config["workload_id"], scale, country))
+            chosen = sorted(rng_pick.sample(pool, target), key=lambda entry: entry["session_id"])
+        country_counts = profile_counts.get(country, Counter())
+        country_total = sum(country_counts.values())
+        if country_total < min_sessions:
+            fallback_countries.append(country)
+            warnings.append(
+                f"country {country}: only {country_total} profile sessions (< {min_sessions}); "
+                f"falling back to the REST local-time envelope"
+            )
+            country_counts = rest_counts
+        envelope_sessions[country] = sum(country_counts.values())
+        targets = _largest_remainder_targets(_bin_weights(country_counts), len(chosen))
+        rng_deal = random.Random(stable_seed(config["workload_id"], scale, country, "deal"))
+        deck = list(chosen)
+        rng_deal.shuffle(deck)
+        position = 0
+        for bin_index in sorted(targets):
+            bin_target = targets[bin_index]
+            if bin_target == 0:
+                continue
+            dealt = deck[position : position + bin_target]
+            position += bin_target
+            dropped_long = 0
+            for entry in dealt:
+                offset = rng_deal.uniform(0.0, bin_s)
+                max_start = horizon - entry["span"] - 1e-6
+                if max_start < 0:
+                    dropped_long += 1
+                    continue
+                local_start = bin_index * bin_s + offset
+                utc_offset = local_time_offset_s(
+                    country, entry.get("state"), content_reference, fallback_lon_deg=entry.get("lon_deg")
+                )
+                utc_start = (local_start - utc_offset) % 86400.0
+                start = round(min(utc_start, max_start), 6)
+                line_to_session[str(entry["line_number"])] = entry["session_id"]
+                session_starts[entry["session_id"]] = start
+            if dropped_long:
+                warnings.append(
+                    f"country {country} bin {bin_index}: dropped {dropped_long} session(s) spanning more than the synthetic day"
+                )
+            report.append(
+                {"country": country, "bin": bin_index, "pool": len(pool), "target": bin_target, "actual": len(dealt) - dropped_long}
+            )
+    info = {"fallback_countries": fallback_countries, "envelope_sessions": envelope_sessions}
+    return line_to_session, session_starts, report, warnings, info
+
+
+def plan_country_local_warp(
+    config: dict[str, Any],
+    raw_rows: list[dict[str, Any]],
+    input_sha256: str,
+    profile_counts: dict[str, Counter],
+    scale: str,
+) -> tuple[dict[str, str], dict[str, float], list[dict[str, Any]], list[str], dict[str, Any]]:
+    """Assign session starts from per-country local-time profile envelopes.
+
+    Returns plan_month_compression's tuple (report rows carry a ``country``
+    field) plus an info dict with the REST-fallback country list and per-
+    country envelope sizes, so the shift/validation path is reused unchanged.
+    """
+    allowlist_keys = _country_allowlist_keys(_country_local_settings(config))
+    candidates = collect_country_candidates(config, raw_rows, input_sha256, allowlist_keys)
+    return deal_country_sessions(config, candidates, profile_counts, scale)
+
+
+def deal_macro_local_sessions(
+    config: dict[str, Any],
+    candidates: dict[str, list[dict[str, Any]]],
+    profile_counts: dict[str, Counter],
+    scale: str,
+) -> tuple[dict[str, str], dict[str, float], list[dict[str, Any]], list[str], dict[str, Any]]:
+    """Deal each macro group's sampled sessions into local-time bins.
+
+    Same flow as deal_country_sessions but grouped by macro_region_group
+    (US/CN/EU/OTHER) with no country filtering: a dealt local start
+    bin*bin_s + rng.uniform(0, bin_s) converts back to UTC via the session
+    region's legal offset on the content reference date. Groups whose profile
+    is empty fall back to the global local-time distribution (all profile
+    sessions merged).
+    """
+    profile_block = _local_envelope_settings(config, grouping=MACRO_REGION_LOCAL_GROUPING)
+    content_reference = str(profile_block["content_reference_date"])
+    time_window = config["dataset"]["time_window"]
+    bin_s = float(time_window["time_bin_s"])
+    horizon = float(time_window.get("output_time_horizon_s", 86400.0))
+    fraction = LOAD_SCALE_FRACTIONS[scale]
+    if not any(candidates[group] for group in MACRO_REGION_GROUPS):
+        raise AdapterError("no valid user→assistant pairs remained after filtering")
+    global_counts: Counter = Counter()
+    for group in MACRO_REGION_GROUPS:
+        global_counts.update(profile_counts.get(group, {}))
+    if sum(global_counts.values()) == 0:
+        raise AdapterError("diurnal profile shards contain no usable sessions")
+
+    line_to_session: dict[str, str] = {}
+    session_starts: dict[str, float] = {}
+    report: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    fallback_groups: list[str] = []
+    envelope_sessions: dict[str, int] = {}
+    for group in MACRO_REGION_GROUPS:
+        pool = sorted(candidates[group], key=lambda entry: entry["session_id"])
+        if not pool:
+            continue
+        target = len(pool) if fraction >= 1.0 else int(round(len(pool) * fraction))
+        chosen = pool
+        if target < len(pool):
+            rng_pick = random.Random(stable_seed(config["workload_id"], scale, group))
+            chosen = sorted(rng_pick.sample(pool, target), key=lambda entry: entry["session_id"])
+        group_counts = profile_counts.get(group, Counter())
+        if sum(group_counts.values()) == 0:
+            fallback_groups.append(group)
+            warnings.append(
+                f"group {group}: no diurnal profile sessions; falling back to the global local-time distribution"
+            )
+            group_counts = global_counts
+        envelope_sessions[group] = sum(group_counts.values())
+        targets = _largest_remainder_targets(_bin_weights(group_counts), len(chosen))
+        rng_deal = random.Random(stable_seed(config["workload_id"], scale, group, "deal"))
+        deck = list(chosen)
+        rng_deal.shuffle(deck)
+        position = 0
+        for bin_index in sorted(targets):
+            bin_target = targets[bin_index]
+            if bin_target == 0:
+                continue
+            dealt = deck[position : position + bin_target]
+            position += bin_target
+            dropped_long = 0
+            for entry in dealt:
+                offset = rng_deal.uniform(0.0, bin_s)
+                max_start = horizon - entry["span"] - 1e-6
+                if max_start < 0:
+                    dropped_long += 1
+                    continue
+                local_start = bin_index * bin_s + offset
+                utc_offset = local_time_offset_s(
+                    entry.get("country"), entry.get("state"), content_reference,
+                    fallback_lon_deg=entry.get("lon_deg"),
+                )
+                utc_start = (local_start - utc_offset) % 86400.0
+                start = round(min(utc_start, max_start), 6)
+                line_to_session[str(entry["line_number"])] = entry["session_id"]
+                session_starts[entry["session_id"]] = start
+            if dropped_long:
+                warnings.append(
+                    f"group {group} bin {bin_index}: dropped {dropped_long} session(s) spanning more than the synthetic day"
+                )
+            report.append(
+                {"group": group, "bin": bin_index, "pool": len(pool), "target": bin_target, "actual": len(dealt) - dropped_long}
+            )
+    info = {"fallback_groups": fallback_groups, "envelope_sessions": envelope_sessions}
+    return line_to_session, session_starts, report, warnings, info
+
+
+def plan_macro_local_warp(
+    config: dict[str, Any],
+    raw_rows: list[dict[str, Any]],
+    input_sha256: str,
+    profile_counts: dict[str, Counter],
+    scale: str,
+) -> tuple[dict[str, str], dict[str, float], list[dict[str, Any]], list[str], dict[str, Any]]:
+    """Assign session starts from per-macro-group local-time profile envelopes.
+
+    Returns plan_month_compression's tuple (report rows carry a ``group``
+    field) plus an info dict with the fallback group list and per-group
+    envelope sizes, so the shift/validation path is reused unchanged.
+    """
+    _local_envelope_settings(config, grouping=MACRO_REGION_LOCAL_GROUPING)
+    candidates = collect_grouped_candidates(config, raw_rows, input_sha256)
+    return deal_macro_local_sessions(config, candidates, profile_counts, scale)
+
+
+# ---------------- skeleton graft ("2023 skeleton + 2025 content") ----------------
+# region_name 的国家部分（"State, Country" 或 "Country"）与 WildChat 内容里的
+# country 字符串之间的已知差异（键为 _location_key 归一化后的槽位国家名）。
+_SLOT_COUNTRY_ALIASES: dict[str, str] = {
+    "netherlands": "The Netherlands",
+    "turkey": "Turkiye",
+    "united_states_of_america": "United States",
+    "russian_federation": "Russia",
+    "republic_of_korea": "South Korea",
+}
+
+
+def slot_country(region_name: str) -> str:
+    """Country of a skeleton slot, parsed from its region_name."""
+    return region_name.split(", ")[-1].strip()
+
+
+def load_skeleton_slots(skeleton_dir: Path, skeleton_block: dict[str, Any]) -> list[dict[str, Any]]:
+    """Load (region, start, country) slots from an existing bundle, kept intact."""
+    regions_name = str(skeleton_block.get("regions_file", "regions.json"))
+    sessions_name = str(skeleton_block.get("sessions_file", "sessions.jsonl"))
+    try:
+        regions = {row["region_id"]: row for row in read_json_array(skeleton_dir / regions_name)}
+    except AdapterError as exc:
+        raise AdapterError(f"cannot read skeleton bundle regions: {exc}") from exc
+    try:
+        session_rows = read_jsonl(skeleton_dir / sessions_name)
+    except AdapterError as exc:
+        raise AdapterError(f"cannot read skeleton bundle sessions: {exc}") from exc
+    slots: list[dict[str, Any]] = []
+    for row in session_rows:
+        region = regions.get(row["user_region_id"])
+        if region is None:
+            raise AdapterError(f"skeleton session {row.get('session_id')} references unknown region {row.get('user_region_id')}")
+        slots.append(
+            {
+                "slot_session_id": str(row["session_id"]),
+                "region_id": region["region_id"],
+                "start": float(row["session_start_time_s"]),
+                "region": region,
+                "country": slot_country(str(region["region_name"])),
+            }
+        )
+    if not slots:
+        raise AdapterError(f"skeleton bundle {skeleton_dir} contains no sessions")
+    slots.sort(key=lambda slot: (slot["start"], slot["slot_session_id"]))
+    return slots
+
+
+def collect_graft_content_pool(
+    config: dict[str, Any],
+    raw_rows: list[dict[str, Any]],
+    input_sha256: str,
+) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
+    """Extract full 2025 content conversations into per-country pools.
+
+    Region resolution is skipped (slots supply regions); conversations whose
+    country is missing form the global fallback pool. Everything else (content,
+    timestamp, content-month window filters) matches extract_pairs.
+    """
+    pool: dict[str, list[dict[str, Any]]] = {}
+    global_pool: list[dict[str, Any]] = []
+    for position, raw in enumerate(raw_rows):
+        line_number = position + 1
+        source_key = stable_hex(config["dataset"]["revision"], input_sha256, str(line_number), length=32)
+        pairs = extract_pairs(raw, source_key, config, skip_region=True)
+        if not pairs:
+            continue
+        first = float(pairs[0]["arrival_time_s"])
+        entry = {
+            "line_number": line_number,
+            "source_key": source_key,
+            "raw": raw,
+            "pairs": pairs,
+            "span": float(pairs[-1]["arrival_time_s"]) - first,
+        }
+        country, _state = session_location(raw)
+        if country is None:
+            global_pool.append(entry)
+        else:
+            pool.setdefault(country, []).append(entry)
+    if not pool and not global_pool:
+        raise AdapterError("no valid user→assistant pairs remained after filtering")
+    return pool, global_pool
+
+
+def _content_pool_key(slot_country_name: str, pool: dict[str, list[dict[str, Any]]]) -> str | None:
+    """Map a skeleton slot country to a content pool key (exact/alias/normalized)."""
+    if slot_country_name in pool:
+        return slot_country_name
+    alias = _SLOT_COUNTRY_ALIASES.get(_location_key(slot_country_name))
+    if alias is not None and alias in pool:
+        return alias
+    key = _location_key(slot_country_name)
+    for name in pool:
+        if _location_key(name) == key:
+            return name
+    return None
+
+
+def plan_skeleton_graft(
+    config: dict[str, Any],
+    slots: list[dict[str, Any]],
+    pool: dict[str, list[dict[str, Any]]],
+    global_pool: list[dict[str, Any]],
+    scale: str,
+) -> tuple[list[tuple[str, str, dict[str, Any], list[dict[str, Any]]]], dict[str, Any], list[str]]:
+    """Graft 2025 content conversations onto 2023 skeleton slots.
+
+    Slot regions and start times are preserved verbatim. Each slot draws one
+    content conversation from its country's pool with replacement
+    (stable_seed(workload_id, slot session_id)); empty country pools fall back
+    to the global (null-country) pool. A grafted session is dropped (with a
+    warning) when slot start + content span would cross the synthetic day.
+    Returns (extracted tuples for assemble_requests, stats, warnings).
+    """
+    fraction = LOAD_SCALE_FRACTIONS[scale]
+    time_window = config["dataset"]["time_window"]
+    horizon = float(time_window.get("output_time_horizon_s", 86400.0))
+    ordered = sorted(slots, key=lambda slot: slot["slot_session_id"])
+    target = len(ordered) if fraction >= 1.0 else int(round(len(ordered) * fraction))
+    chosen = ordered
+    if target < len(ordered):
+        rng_slots = random.Random(stable_seed(config["workload_id"], scale, "slots"))
+        chosen = sorted(rng_slots.sample(ordered, target), key=lambda slot: (slot["start"], slot["slot_session_id"]))
+
+    extracted: list[tuple[str, str, dict[str, Any], list[dict[str, Any]]]] = []
+    warnings: list[str] = []
+    stats: dict[str, dict[str, Any]] = {}
+    pool_key_cache: dict[str, str | None] = {}
+    dropped_long = 0
+    for slot in chosen:
+        slot_country_name = slot["country"]
+        if slot_country_name not in pool_key_cache:
+            pool_key_cache[slot_country_name] = _content_pool_key(slot_country_name, pool)
+        pool_key = pool_key_cache[slot_country_name]
+        country_pool = pool.get(pool_key) if pool_key is not None else None
+        from_fallback = not country_pool
+        use_pool = global_pool if from_fallback else country_pool
+        if not use_pool:
+            raise AdapterError(
+                f"skeleton graft: no content pool for slot country {slot_country_name!r} and the global pool is empty"
+            )
+        rng = random.Random(stable_seed(config["workload_id"], slot["slot_session_id"]))
+        content = use_pool[rng.randrange(len(use_pool))]
+        max_start = horizon - content["span"] - 1e-6
+        if slot["start"] > max_start:
+            dropped_long += 1
+            continue
+        graft_key = stable_hex(config["dataset"]["revision"], slot["slot_session_id"], content["source_key"], length=32)
+        new_session_id = f"wc_sess_{stable_hex(config['workload_id'], graft_key)}"
+        first = float(content["pairs"][0]["arrival_time_s"])
+        new_pairs: list[dict[str, Any]] = []
+        for pair in content["pairs"]:
+            new_pairs.append(
+                {
+                    "source_key": graft_key,
+                    "pair_index": pair["pair_index"],
+                    "arrival_time_s": round(slot["start"] + (float(pair["arrival_time_s"]) - first), 6),
+                    "region": slot["region"],
+                    "history": pair["history"],
+                    "user": pair["user"],
+                    "assistant": pair["assistant"],
+                }
+            )
+        extracted.append((new_session_id, graft_key, content["raw"], new_pairs))
+        country_stats = stats.setdefault(
+            slot_country_name,
+            {"slots": 0, "pool_sessions": 0, "fallback_slots": 0, "distinct_content": set()},
+        )
+        country_stats["slots"] += 1
+        country_stats["fallback_slots"] += int(from_fallback)
+        country_stats["pool_sessions"] = len(global_pool) if from_fallback else len(country_pool)
+        country_stats["distinct_content"].add(content["source_key"])
+    if dropped_long:
+        warnings.append(
+            f"skeleton graft: dropped {dropped_long} session(s) whose slot start plus content span exceeds the synthetic day"
+        )
+    country_report = {
+        country: {
+            "slots": value["slots"],
+            "pool_sessions": value["pool_sessions"],
+            "fallback_slots": value["fallback_slots"],
+            "distinct_content_sessions": len(value["distinct_content"]),
+            "reuse_multiplier": round(value["slots"] / max(1, len(value["distinct_content"])), 4),
+        }
+        for country, value in sorted(stats.items())
+    }
+    info = {
+        "slot_count_total": len(slots),
+        "slot_count_used": len(chosen),
+        "grafted_sessions": len(extracted),
+        "dropped_sessions": dropped_long,
+        "countries": country_report,
+    }
+    return extracted, info, warnings
+
+
+def apply_month_compression_shifts(
+    requests: list[dict[str, Any]],
+    sessions: list[dict[str, Any]],
+    session_starts: dict[str, float],
+) -> None:
+    by_session: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in requests:
+        by_session[row["session_id"]].append(row)
+    for session in sessions:
+        rows = by_session[session["session_id"]]
+        first = min(rows, key=lambda row: row["turn_index"])
+        shift = session_starts[session["session_id"]] - float(first["arrival_time_s"])
+        for row in rows:
+            row["arrival_time_s"] = round(float(row["arrival_time_s"]) + shift, 6)
+        session["session_start_time_s"] = round(float(session["session_start_time_s"]) + shift, 6)
+    requests.sort(key=lambda row: (row["arrival_time_s"], row["request_id"]))
+    sessions.sort(key=lambda row: (row["session_start_time_s"], row["session_id"]))
+
+
+def prepare_config(config_path: Path) -> dict[str, Any]:
     config = read_json(config_path)
     required = {"workload_id", "seed", "dataset", "region_mapping", "gateways", "tokenization", "model_mapping", "slo_policy", "adapter_policy", "bundle_output", "country_centroids_path", "state_centroids_path"}
     missing = required - set(config)
@@ -588,17 +1782,68 @@ def build(config_path: Path, input_path: Path, out_dir: Path, overwrite: bool) -
         if not resolved.is_dir():
             raise AdapterError(f"pinned tokenizer directory is missing: {resolved}")
         config["tokenization"]["_resolved_local_path"] = str(resolved)
-    if input_path.suffix.lower() != ".parquet":
-        raise AdapterError("the experiment adapter accepts an official WildChat .parquet shard")
-    input_sha256 = sha256_bytes(input_path.read_bytes())
-    expected_sha = config["dataset"].get("expected_source_sha256")
-    if expected_sha and input_sha256 != expected_sha:
-        raise AdapterError(f"source SHA-256 mismatch for {input_path}; expected {expected_sha}, got {input_sha256}")
-    raw_rows = read_source_rows(input_path)
-    max_records = int(config["dataset"].get("max_source_records", len(raw_rows)))
-    if max_records <= 0:
-        raise AdapterError("dataset.max_source_records must be positive")
-    raw_rows = raw_rows[:max_records]
+    return config
+
+
+def _hash_parquet_inputs(
+    input_paths: list[Path],
+    expected_shas: dict[str, str],
+    *,
+    label: str,
+) -> tuple[str, list[tuple[str, str]]]:
+    input_paths = list(input_paths)
+    if not input_paths or any(path.suffix.lower() != ".parquet" for path in input_paths):
+        raise AdapterError("the experiment adapter accepts official WildChat .parquet shard(s)")
+    per_file_shas: list[tuple[str, str]] = []
+    for input_path in input_paths:
+        input_sha256 = sha256_bytes(input_path.read_bytes())
+        expected_sha = expected_shas.get(input_path.name)
+        if expected_shas and expected_sha is None:
+            raise AdapterError(f"no expected_source_sha256 configured for {label} {input_path.name}")
+        if expected_sha and input_sha256 != expected_sha:
+            raise AdapterError(f"source SHA-256 mismatch for {input_path}; expected {expected_sha}, got {input_sha256}")
+        per_file_shas.append((input_path.name, input_sha256))
+    combined = sha256_bytes(
+        ("\n".join(f"{name}:{digest}" for name, digest in per_file_shas) + "\n").encode("utf-8")
+    )
+    return combined, per_file_shas
+
+
+def verify_and_hash_inputs(config: dict[str, Any], input_paths: list[Path]) -> tuple[str, list[tuple[str, str]]]:
+    return _hash_parquet_inputs(input_paths, _expected_source_shas(config["dataset"]), label="input")
+
+
+def verify_and_hash_profile_inputs(config: dict[str, Any], profile_paths: list[Path]) -> tuple[str, list[tuple[str, str]]]:
+    """Verify diurnal-profile shards against diurnal_profile.expected_source_sha256."""
+    profile_block = config.get("diurnal_profile")
+    if not isinstance(profile_block, dict):
+        raise AdapterError("--profile-input requires a diurnal_profile block in the config")
+    expected_shas = {
+        Path(str(name)).name: str(digest)
+        for name, digest in profile_block.get("expected_source_sha256", {}).items()
+    }
+    return _hash_parquet_inputs(profile_paths, expected_shas, label="profile input")
+
+
+def compute_bundle_data(
+    config: dict[str, Any],
+    raw_rows: list[dict[str, Any]],
+    input_sha256: str,
+    *,
+    month_mode: bool,
+    scale: str,
+    line_numbers: list[int] | None,
+    session_starts: dict[str, float],
+    compression_report: list[dict[str, Any]],
+    compression_warnings: list[str],
+    out_dir_name: str,
+    token_counts: list[tuple[int, int, int, int]] | None = None,
+    extracted: list[tuple[str, str, dict[str, Any], list[dict[str, Any]]]] | None = None,
+    light_extract: bool = False,
+    diurnal_profile_info: dict[str, Any] | None = None,
+    graft_info: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Assemble all in-memory bundle artifacts (nothing is written to disk)."""
     time_window = config["dataset"]["time_window"]
     if time_window.get("epoch_policy") == "most_populated_utc_day":
         day_counts: Counter[str] = Counter()
@@ -611,17 +1856,146 @@ def build(config_path: Path, input_path: Path, out_dir: Path, overwrite: bool) -
             raise AdapterError("cannot infer an experiment day: no valid top-level WildChat timestamps")
         selected_day = min(day for day, count in day_counts.items() if count == max(day_counts.values()))
         time_window["epoch_utc"] = f"{selected_day}T00:00:00Z"
-    requests, sessions, regions, gateways = build_requests(config, raw_rows, input_sha256)
+    if token_counts is None:
+        requests, sessions, regions, gateways = build_requests(config, raw_rows, input_sha256, line_numbers=line_numbers)
+    else:
+        if extracted is None:
+            extracted = extract_session_pairs(
+                config, raw_rows, input_sha256, line_numbers=line_numbers, light=light_extract
+            )
+        requests, sessions, regions, gateways = assemble_requests(config, extracted, token_counts)
+    if graft_info is not None:
+        # Grafted arrivals are already final (slot start + content offsets);
+        # only the representative-day epoch/horizon metadata is overridden.
+        source_epoch = time_window["epoch_utc"]
+        source_end = str(time_window.get("window_end_utc", ""))
+        time_window["epoch_utc"] = str(time_window.get("output_epoch_utc", time_window["epoch_utc"]))
+        time_window["time_horizon_s"] = float(time_window.get("output_time_horizon_s", 86400.0))
+        time_window["compressed_from"] = f"{source_epoch}/{source_end}"
+    elif month_mode:
+        apply_month_compression_shifts(requests, sessions, session_starts)
+        source_epoch = time_window["epoch_utc"]
+        source_end = str(time_window.get("window_end_utc", ""))
+        time_window["epoch_utc"] = str(time_window.get("output_epoch_utc", time_window["epoch_utc"]))
+        time_window["time_horizon_s"] = float(time_window.get("output_time_horizon_s", 86400.0))
+        time_window["compressed_from"] = f"{source_epoch}/{source_end}"
     time = config["dataset"]["time_window"]
+    description = build_description(config, regions, gateways, input_sha256, out_dir_name)
+    if month_mode and graft_info is None:
+        description["provenance"]["notes"].append(
+            f"month-compressed synthetic day: all WildChat conversations in {time_window['compressed_from']} "
+            f"were pooled into {int(float(time_window['time_bin_s']))}s time-of-day bins; load scale {scale} "
+            f"(fraction {LOAD_SCALE_FRACTIONS[scale]}) was sampled per bin with stable-seeded RNGs."
+        )
+    if graft_info is not None:
+        description["provenance"]["skeleton_graft"] = graft_info
+        description["provenance"]["notes"].append(
+            f"skeleton graft: {graft_info['grafted_sessions']} of {graft_info['slot_count_used']} skeleton slots "
+            f"from {graft_info['skeleton_bundle']} (regions and start times preserved verbatim) were grafted with "
+            f"full 2025 content conversations drawn per slot country with replacement; content shards "
+            f"{time_window['compressed_from']}; load scale {scale} (fraction {LOAD_SCALE_FRACTIONS[scale]}); "
+            f"{graft_info['dropped_sessions']} grafted sessions were dropped for crossing the synthetic day."
+        )
+    if diurnal_profile_info is not None:
+        description["provenance"]["diurnal_profile"] = diurnal_profile_info
+        if diurnal_profile_info["grouping"] == COUNTRY_LOCAL_GROUPING:
+            description["provenance"]["notes"].append(
+                f"diurnal profile warp: session start times were dealt per country against the "
+                f"{diurnal_profile_info.get('profile_window', 'profile-month')} local-time envelopes "
+                f"(legal IANA timezones at reference dates {diurnal_profile_info.get('profile_reference_date')}/"
+                f"{diurnal_profile_info.get('content_reference_date')}; content countries: "
+                f"{', '.join(diurnal_profile_info.get('content_countries', []))}); conversation content comes "
+                f"from the input shards in {time_window['compressed_from'] if month_mode else time_window['epoch_utc']}."
+            )
+        elif diurnal_profile_info["grouping"] == MACRO_REGION_LOCAL_GROUPING:
+            description["provenance"]["notes"].append(
+                f"diurnal profile warp: session start times were dealt per macro region (US/CN/EU/OTHER) "
+                f"against the {diurnal_profile_info.get('profile_window', 'profile-month')} local-time envelopes "
+                f"(legal IANA timezones at reference dates {diurnal_profile_info.get('profile_reference_date')}/"
+                f"{diurnal_profile_info.get('content_reference_date')}; no country filtering); conversation "
+                f"content comes from the input shards in {time_window['compressed_from'] if month_mode else time_window['epoch_utc']}."
+            )
+        else:
+            description["provenance"]["notes"].append(
+                f"diurnal profile warp: session time-of-day bins were dealt per macro region (US/CN/EU/OTHER) "
+                f"to match the {diurnal_profile_info.get('profile_window', 'profile-month')} profile shards "
+                f"(combined sha256 {diurnal_profile_info['profile_sha256']}); conversation content comes from "
+                f"the input shards in {time_window['compressed_from'] if month_mode else time_window['epoch_utc']}."
+            )
+    description_hash = _description_hash(description)
+    timebins = build_timebins(requests, float(time["time_horizon_s"]), float(time["time_bin_s"]))
+    summary = build_summary(requests, sessions, regions, gateways, timebins, description_hash, config)
+    if graft_info is not None:
+        summary["provenance"]["skeleton_graft"] = {
+            "time_mode": SKELETON_GRAFT_TIME_MODE,
+            "skeleton_bundle": graft_info["skeleton_bundle"],
+            "skeleton_bundle_sha256": graft_info.get("skeleton_bundle_sha256"),
+            "content_window": time_window["compressed_from"],
+            "representative_epoch_utc": time_window["epoch_utc"],
+            "load_scale": scale,
+            "load_fraction": LOAD_SCALE_FRACTIONS[scale],
+            "slot_count_total": graft_info["slot_count_total"],
+            "slot_count_used": graft_info["slot_count_used"],
+            "grafted_sessions": graft_info["grafted_sessions"],
+            "dropped_sessions": graft_info["dropped_sessions"],
+            "countries": graft_info["countries"],
+        }
+    elif month_mode:
+        summary["provenance"]["month_compression"] = {
+            "time_mode": MONTH_COMPRESSED_DAY_MODE,
+            "source_window": time_window["compressed_from"],
+            "representative_epoch_utc": time_window["epoch_utc"],
+            "load_scale": scale,
+            "load_fraction": LOAD_SCALE_FRACTIONS[scale],
+            "bin_count": len(compression_report),
+            "bins": compression_report,
+        }
+        if diurnal_profile_info is not None:
+            summary_profile = {
+                "grouping": diurnal_profile_info["grouping"],
+                "profile_window": diurnal_profile_info.get("profile_window"),
+                "profile_sha256": diurnal_profile_info["profile_sha256"],
+            }
+            for key in ("content_countries", "rest_fallback_countries", "rest_fallback_groups", "profile_reference_date", "content_reference_date"):
+                if key in diurnal_profile_info:
+                    summary_profile[key] = diurnal_profile_info[key]
+            summary["provenance"]["month_compression"]["diurnal_profile"] = summary_profile
+    return {
+        "requests": requests,
+        "sessions": sessions,
+        "regions": regions,
+        "gateways": gateways,
+        "description": description,
+        "description_hash": description_hash,
+        "timebins": timebins,
+        "summary": summary,
+        "compression_warnings": list(compression_warnings),
+        "month_mode": month_mode,
+        "scale": scale,
+        "graft": graft_info is not None,
+    }
+
+
+def write_bundle(config: dict[str, Any], data: dict[str, Any], out_dir: Path, overwrite: bool, *, run_validation: bool = True) -> None:
+    """Write the seven canonical bundle files plus sidecars, then validate."""
+    requests = data["requests"]
+    sessions = data["sessions"]
+    regions = data["regions"]
+    gateways = data["gateways"]
+    description = data["description"]
+    description_hash = data["description_hash"]
+    timebins = data["timebins"]
+    summary = data["summary"]
+    month_mode = data["month_mode"]
+    scale = data["scale"]
+    is_graft = bool(data.get("graft"))
+    time = config["dataset"]["time_window"]
+
     out_dir.parent.mkdir(parents=True, exist_ok=True)
     canonical_requests_path = out_dir.parent / "canonical_requests.jsonl"
     canonical_sessions_path = out_dir.parent / "canonical_sessions.jsonl"
     write_jsonl(canonical_requests_path, requests)
     write_jsonl(canonical_sessions_path, sessions)
-    description = build_description(config, regions, gateways, input_sha256, out_dir.name)
-    description_hash = _description_hash(description)
-    timebins = build_timebins(requests, float(time["time_horizon_s"]), float(time["time_bin_s"]))
-    summary = build_summary(requests, sessions, regions, gateways, timebins, description_hash, config)
 
     if out_dir.exists():
         if not overwrite:
@@ -650,12 +2024,194 @@ def build(config_path: Path, input_path: Path, out_dir: Path, overwrite: bool) -
         "source": {"mode": "explicit_requests", "inputs": [{"path": "canonical_requests.jsonl", "sha256": sha256_bytes(canonical_requests_path.read_bytes()), "record_count": len(requests)}, {"path": "canonical_sessions.jsonl", "sha256": sha256_bytes(canonical_sessions_path.read_bytes()), "record_count": len(sessions)}]},
         "files": descriptors, "description_sha256": description_hash, "bundle_sha256": bundle_hash(config["workload_id"], descriptors),
         "counts": {"request_count": len(requests), "session_count": len(sessions), "region_count": len(regions), "gateway_count": len(gateways), "timebin_count": len(timebins)},
+        "tokenizer": {
+            "backend": config["tokenization"]["backend"],
+            "target_model": config["tokenization"]["target_model"],
+            "tokenizer_id": config["tokenization"].get("tokenizer_id"),
+            "revision": config["tokenization"].get("tokenizer_revision"),
+            "local_path": config["tokenization"].get("local_path"),
+            "context_window_tokens": config["tokenization"].get("context_window_tokens"),
+        },
+        "warnings": list(data["compression_warnings"]),
         "provenance": description["provenance"],
     }
+    if is_graft:
+        manifest["time"]["time_mode"] = SKELETON_GRAFT_TIME_MODE
+        manifest["time"]["compressed_from"] = time["compressed_from"]
+        manifest["load_scale"] = scale
+    elif month_mode:
+        manifest["time"]["time_mode"] = MONTH_COMPRESSED_DAY_MODE
+        manifest["time"]["compressed_from"] = time["compressed_from"]
+        manifest["load_scale"] = scale
     write_json(out_dir / "workload_manifest.json", manifest)
     write_json(out_dir.parent / "generated_description.json", description)
-    validate(out_dir, out_dir.parent / "generated_description.json")
+    if run_validation:
+        validate(out_dir, out_dir.parent / "generated_description.json")
     print(f"built {len(requests)} requests, {len(sessions)} sessions, {len(regions)} regions in {out_dir}")
+
+
+def build(
+    config_path: Path,
+    input_paths: list[Path],
+    out_dir: Path,
+    overwrite: bool,
+    load_scale: str | None = None,
+    scale_flags: dict[str, bool] | None = None,
+    profile_paths: list[Path] | None = None,
+    skeleton_bundle: Path | None = None,
+) -> None:
+    config = prepare_config(config_path)
+    time_window = config["dataset"]["time_window"]
+    month_mode = time_window.get("time_mode") == MONTH_COMPRESSED_DAY_MODE
+    if skeleton_bundle is not None and profile_paths:
+        raise AdapterError("--skeleton-bundle conflicts with --profile-input; choose one graft/warp mode")
+    if skeleton_bundle is not None and not month_mode:
+        raise AdapterError(
+            "--skeleton-bundle requires dataset.time_window.time_mode='month_compressed_day'"
+        )
+    if profile_paths and not month_mode:
+        raise AdapterError(
+            "--profile-input requires dataset.time_window.time_mode='month_compressed_day'"
+        )
+    input_sha256, input_file_shas = verify_and_hash_inputs(config, input_paths)
+    raw_rows: list[dict[str, Any]] = []
+    for input_path in input_paths:
+        raw_rows.extend(read_source_rows(input_path))
+    max_records = int(config["dataset"].get("max_source_records", len(raw_rows)))
+    if max_records <= 0:
+        raise AdapterError("dataset.max_source_records must be positive")
+    raw_rows = raw_rows[:max_records]
+    scale = resolve_load_scale(config, load_scale, scale_flags or {}, month_mode=month_mode)
+    compression_report: list[dict[str, Any]] = []
+    compression_warnings: list[str] = []
+    line_numbers: list[int] | None = None
+    session_starts: dict[str, float] = {}
+    diurnal_profile_info: dict[str, Any] | None = None
+    graft_info: dict[str, Any] | None = None
+    graft_extracted: list[tuple[str, str, dict[str, Any], list[dict[str, Any]]]] | None = None
+    graft_token_counts: list[tuple[int, int, int, int]] | None = None
+    if month_mode:
+        config["workload_id"] = f"{config['workload_id']}_{scale}"
+        if skeleton_bundle is not None:
+            skeleton_block = config.get("skeleton_bundle", {}) if isinstance(config.get("skeleton_bundle"), dict) else {}
+            slots = load_skeleton_slots(skeleton_bundle, skeleton_block)
+            pool, global_pool = collect_graft_content_pool(config, raw_rows, input_sha256)
+            graft_extracted, graft_stats, graft_warnings = plan_skeleton_graft(config, slots, pool, global_pool, scale)
+            compression_warnings = list(graft_warnings)
+            flat_pairs = [pair for _, _, _, pairs in graft_extracted for pair in pairs]
+            graft_token_counts = _batch_token_counts(
+                TokenCounter(config["tokenization"]), flat_pairs, int(config["tokenization"]["context_window_tokens"])
+            )
+            graft_info = {
+                "time_mode": SKELETON_GRAFT_TIME_MODE,
+                "skeleton_bundle": str(skeleton_bundle),
+                "skeleton_bundle_sha256": _skeleton_bundle_sha256(skeleton_bundle),
+                "content_files": [{"path": name, "sha256": digest} for name, digest in input_file_shas],
+                "content_sha256": input_sha256,
+                **graft_stats,
+            }
+        elif profile_paths:
+            profile_sha256, profile_file_shas = verify_and_hash_profile_inputs(config, profile_paths)
+            scan_config = _diurnal_profile_scan_config(config)
+            profile_block = config["diurnal_profile"]
+            grouping = str(profile_block.get("grouping", MACRO_REGION_GROUPING))
+            profile_counts: dict[str, Counter] | None = None
+            diurnal_profile_info = {
+                "grouping": grouping,
+                "profile_sha256": profile_sha256,
+                "profile_files": [
+                    {"path": name, "sha256": digest} for name, digest in profile_file_shas
+                ],
+                "profile_window": f"{profile_block.get('epoch_utc', '')}/{profile_block.get('window_end_utc', '')}",
+            }
+            if grouping == COUNTRY_LOCAL_GROUPING:
+                allowlist_keys = _country_allowlist_keys(_country_local_settings(config))
+                for profile_path in profile_paths:
+                    # One shard at a time so profile conversation content is
+                    # freed right after its (light) count scan.
+                    profile_counts = collect_local_profile_counts(
+                        scan_config,
+                        read_source_rows(profile_path),
+                        allowlist_keys,
+                        str(profile_block["profile_reference_date"]),
+                        profile_counts,
+                    )
+                assert profile_counts is not None
+                line_to_session, session_starts, compression_report, compression_warnings, warp_info = plan_country_local_warp(
+                    config, raw_rows, input_sha256, profile_counts, scale
+                )
+                diurnal_profile_info.update({
+                    "content_countries": [str(country) for country in profile_block["content_countries"]],
+                    "min_country_profile_sessions": int(profile_block.get("min_country_profile_sessions", 1000)),
+                    "profile_reference_date": str(profile_block["profile_reference_date"]),
+                    "content_reference_date": str(profile_block["content_reference_date"]),
+                    "rest_fallback_countries": warp_info["fallback_countries"],
+                    "envelope_sessions": warp_info["envelope_sessions"],
+                })
+            elif grouping == MACRO_REGION_LOCAL_GROUPING:
+                _local_envelope_settings(config, grouping=MACRO_REGION_LOCAL_GROUPING)
+                for profile_path in profile_paths:
+                    # One shard at a time so profile conversation content is
+                    # freed right after its (light) count scan.
+                    profile_counts = collect_macro_local_profile_counts(
+                        scan_config,
+                        read_source_rows(profile_path),
+                        str(profile_block["profile_reference_date"]),
+                        profile_counts,
+                    )
+                assert profile_counts is not None
+                line_to_session, session_starts, compression_report, compression_warnings, warp_info = plan_macro_local_warp(
+                    config, raw_rows, input_sha256, profile_counts, scale
+                )
+                diurnal_profile_info.update({
+                    "profile_reference_date": str(profile_block["profile_reference_date"]),
+                    "content_reference_date": str(profile_block["content_reference_date"]),
+                    "rest_fallback_groups": warp_info["fallback_groups"],
+                    "envelope_sessions": warp_info["envelope_sessions"],
+                })
+            else:
+                for profile_path in profile_paths:
+                    # One shard at a time so profile conversation content is
+                    # freed right after its (light) count scan.
+                    profile_counts = collect_profile_counts(scan_config, read_source_rows(profile_path), profile_counts)
+                assert profile_counts is not None
+                line_to_session, session_starts, compression_report, compression_warnings = plan_diurnal_profile_warp(
+                    config, raw_rows, input_sha256, profile_counts, scale
+                )
+        else:
+            line_to_session, session_starts, compression_report, compression_warnings = plan_month_compression(
+                config, raw_rows, input_sha256, scale
+            )
+        if graft_info is None:
+            line_numbers = sorted(int(line) for line in line_to_session)
+            raw_rows = [raw_rows[line - 1] for line in line_numbers]
+    data = compute_bundle_data(
+        config,
+        raw_rows,
+        input_sha256,
+        month_mode=month_mode,
+        scale=scale,
+        line_numbers=line_numbers,
+        session_starts=session_starts,
+        compression_report=compression_report,
+        compression_warnings=compression_warnings,
+        out_dir_name=out_dir.name,
+        diurnal_profile_info=diurnal_profile_info,
+        token_counts=graft_token_counts,
+        extracted=graft_extracted,
+        graft_info=graft_info,
+    )
+    write_bundle(config, data, out_dir, overwrite)
+
+
+def _skeleton_bundle_sha256(skeleton_dir: Path) -> str | None:
+    """bundle_sha256 of the skeleton bundle's manifest, if readable."""
+    try:
+        manifest = read_json(skeleton_dir / "workload_manifest.json")
+    except AdapterError:
+        return None
+    digest = manifest.get("bundle_sha256")
+    return str(digest) if isinstance(digest, str) else None
 
 
 def refresh_metadata(config_path: Path, bundle_dir: Path) -> None:
@@ -696,6 +2252,9 @@ def refresh_metadata(config_path: Path, bundle_dir: Path) -> None:
     write_jsonl(canonical_requests_path, requests)
     write_jsonl(canonical_sessions_path, sessions)
     description = build_description(config, regions, gateways, source_sha, bundle_dir.name)
+    old_profile_info = manifest.get("provenance", {}).get("diurnal_profile")
+    if old_profile_info is not None:
+        description["provenance"]["diurnal_profile"] = old_profile_info
     description_hash = _description_hash(description)
     timebins = build_timebins(requests, float(manifest["time"]["time_horizon_s"]), float(manifest["time"]["time_bin_s"]))
     write_json(bundle_dir / "workload_summary.json", build_summary(requests, sessions, regions, gateways, timebins, description_hash, config))
@@ -810,11 +2369,24 @@ def validate(bundle_dir: Path, description_path: Path | None) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    build_parser = subparsers.add_parser("build", help="map one official WildChat Parquet shard to a bundle")
+    build_parser = subparsers.add_parser("build", help="map official WildChat Parquet shard(s) to a bundle")
     build_parser.add_argument("--config", type=Path, required=True)
-    build_parser.add_argument("--input", type=Path, required=True, help="verified local official .parquet shard")
+    build_parser.add_argument("--input", type=Path, required=True, nargs="+", help="verified local official .parquet shard(s)")
     build_parser.add_argument("--out", type=Path, required=True)
     build_parser.add_argument("--overwrite", action="store_true")
+    build_parser.add_argument("--profile-input", type=Path, default=None, nargs="+",
+                              help="diurnal-profile .parquet shard(s); only valid with "
+                                   "dataset.time_window.time_mode='month_compressed_day' and "
+                                   "a diurnal_profile block in the config")
+    build_parser.add_argument("--skeleton-bundle", type=Path, default=None,
+                              help="existing bundle directory whose session slots (region + start time) "
+                                   "are grafted with content from --input shard(s); mutually exclusive "
+                                   "with --profile-input")
+    build_parser.add_argument("--load-scale", choices=sorted(LOAD_SCALE_FRACTIONS), default=None,
+                              help="load intensity for month_compressed_day mode (default: config load.default_scale or 10x)")
+    for scale_name in sorted(LOAD_SCALE_FRACTIONS):
+        build_parser.add_argument(f"--{scale_name}", dest=f"load_scale_{scale_name}", action="store_true",
+                                  help=f"shortcut for --load-scale {scale_name}")
     refresh_parser = subparsers.add_parser("refresh-metadata", help="repair sidecar metadata for an existing bundle")
     refresh_parser.add_argument("--config", type=Path, required=True)
     refresh_parser.add_argument("--bundle", type=Path, required=True)
@@ -824,7 +2396,8 @@ def main() -> int:
     args = parser.parse_args()
     try:
         if args.command == "build":
-            build(args.config, args.input, args.out, args.overwrite)
+            flags = {name: getattr(args, f"load_scale_{name}") for name in LOAD_SCALE_FRACTIONS}
+            build(args.config, args.input, args.out, args.overwrite, load_scale=args.load_scale, scale_flags=flags, profile_paths=args.profile_input, skeleton_bundle=args.skeleton_bundle)
         elif args.command == "refresh-metadata":
             refresh_metadata(args.config, args.bundle)
         else:

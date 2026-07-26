@@ -1,4 +1,11 @@
-"""Workload specifications for global ChatLLM serving experiments."""
+"""Build-time workload generation tooling (inside the workload package).
+
+Hosts the generation side of the former orbitserve.workload core:
+generate_workload_bundle / compile_workload_description plus all
+synthetic/trace/manifest assembly, write-back, and hashing helpers.
+Shared data types and validation logic come from contract.py; bundle
+loading/path resolution and materialize_workload_bundle live in loader.py.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +13,7 @@ import csv
 import hashlib
 import json
 import math
-from dataclasses import dataclass, field, replace
+from dataclasses import replace
 from pathlib import Path
 import random
 from typing import Any
@@ -14,198 +21,36 @@ from typing import Any
 from ..common import to_jsonable
 from .contract import (
     BUNDLE_FILES, BUNDLE_SCHEMA, CANONICALIZATION, DESCRIPTION_SCHEMA,
-    GATEWAY_KEYS, REGION_KEYS, REQUEST_KEYS, SESSION_KEYS, SUMMARY_SCHEMA,
+    GATEWAY_KEYS, REGION_KEYS, REQUEST_FILES, REQUEST_KEYS, SESSION_KEYS,
+    SUMMARY_SCHEMA, WORKLOAD_BUNDLE_SCHEMA, WORKLOAD_DESCRIPTION_SCHEMA,
+    GatewaySpec, WorkloadGenerationResult, RegionSpec, WorkloadBundleRef,
     bundle_hash, canonical_json_bytes, canonical_jsonl_bytes,
-    canonical_timebin_csv_bytes, descriptor, validate_exact_keys,
-    validate_manifest_and_files,
+    canonical_timebin_csv_bytes, descriptor,
+    validate_exact_keys,
+    coerce_request_row as _coerce_request_row,
+    coerce_session_row as _coerce_session_row,
+    input_bytes as _input_bytes,
+    optional_float as _optional_float,
+    optional_str as _optional_str,
+    output_bytes as _output_bytes,
+    pick as _pick,
+    reject_runtime_fields as _reject_runtime_fields,
+    require_mapping as _dict,
+    validate_session_consistency as _validate_session_consistency,
+)
+from .loader import (
+    _read_csv_rows,
+    _read_jsonl,
+    load_workload_bundle,
+    resolve_bundle_path as _resolve_path,
 )
 
-
-WORKLOAD_DESCRIPTION_SCHEMA = DESCRIPTION_SCHEMA
-WORKLOAD_BUNDLE_SCHEMA = BUNDLE_SCHEMA
 GENERATOR_NAME = "orbitserve_workload_generator_or_loader"
 GENERATOR_VERSION = "0.1.0"
 
 SUPPORTED_SOURCE_MODES = frozenset(
     {"synthetic_generation", "explicit_requests", "trace_replay", "hybrid"}
 )
-RUNTIME_RESULT_FIELDS = frozenset(
-    {
-        "assigned_satellite",
-        "assigned_satellite_id",
-        "assigned_deployment",
-        "access_satellite_id",
-        "selected_path",
-        "session_action",
-        "served",
-        "served_ratio",
-        "TTFT",
-        "E2E",
-        "ttft_s",
-        "ttft_p95_s",
-        "observed_ttft_s",
-        "e2e_latency_s",
-        "e2e_p95_s",
-        "observed_e2e_s",
-        "energy_violation",
-        "energy_violation_fraction",
-        "cost_per_request",
-        "cost_per_served_request_usd",
-        "cost_per_served_mtoken_usd",
-        "soc_before",
-        "soc_after",
-        "sgl_queue_wait_s",
-        "isl_queue_wait_s",
-        "link_transmission_s",
-        "energy_violation_count",
-        "fallback_used",
-        "deferred",
-        "defer_until_s",
-    }
-)
-REQUEST_FILES = {
-    "regions": "regions.json",
-    "gateways": "gateways.json",
-    "requests": "requests.jsonl",
-    "sessions": "sessions.jsonl",
-    "timebin_demand": "timebin_demand.csv",
-    "summary": "workload_summary.json",
-}
-
-
-def _pick(data: dict[str, Any], key: str, default: Any) -> Any:
-    return data[key] if key in data else default
-
-
-@dataclass(frozen=True)
-class TokenDistribution:
-    name: str = "chatllm_smoke"
-    prompt_tokens_p50: int = 512
-    prompt_tokens_p95: int = 2048
-    output_tokens_p50: int = 128
-    output_tokens_p95: int = 512
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any] | None) -> "TokenDistribution":
-        data = data or {}
-        return cls(
-            name=str(_pick(data, "name", "chatllm_smoke")),
-            prompt_tokens_p50=int(_pick(data, "prompt_tokens_p50", 512)),
-            prompt_tokens_p95=int(_pick(data, "prompt_tokens_p95", 2048)),
-            output_tokens_p50=int(_pick(data, "output_tokens_p50", 128)),
-            output_tokens_p95=int(_pick(data, "output_tokens_p95", 512)),
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        return to_jsonable(self)
-
-
-@dataclass(frozen=True)
-class WorkloadBundleRef:
-    """Experiment input reference to one canonical workload bundle."""
-
-    bundle_dir: str | None = None
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any] | None) -> "WorkloadBundleRef":
-        data = data or {}
-        unsupported = sorted(set(data) - {"bundle_dir"})
-        if unsupported:
-            raise ValueError(
-                "experiment workload accepts only a canonical bundle_dir; "
-                f"unsupported fields: {unsupported}"
-            )
-        return cls(bundle_dir=_optional_str(data.get("bundle_dir")))
-
-    def to_dict(self) -> dict[str, Any]:
-        return {"bundle_dir": self.bundle_dir}
-
-
-@dataclass(frozen=True)
-class RegionSpec:
-    region_id: str
-    region_name: str
-    lat_deg: float
-    lon_deg: float
-    timezone_utc_offset_h: float = 0.0
-    demand_weight: float = 1.0
-    weight_source: str = "unspecified"
-    market_class: str | None = None
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "RegionSpec":
-        return cls(
-            region_id=str(data["region_id"]),
-            region_name=str(_pick(data, "region_name", data["region_id"])),
-            lat_deg=float(data["lat_deg"]),
-            lon_deg=float(data["lon_deg"]),
-            timezone_utc_offset_h=float(_pick(data, "timezone_utc_offset_h", 0.0)),
-            demand_weight=float(_pick(data, "demand_weight", 1.0)),
-            weight_source=str(_pick(data, "weight_source", "unspecified")),
-            market_class=str(data["market_class"]) if data.get("market_class") is not None else None,
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        return to_jsonable(self)
-
-
-@dataclass(frozen=True)
-class GatewaySpec:
-    gateway_id: str
-    lat_deg: float
-    lon_deg: float
-    served_region_ids: tuple[str, ...] = ()
-    gateway_bandwidth_bps: float | None = None
-    availability_profile_id: str | None = None
-    cost_usd_per_year: float | None = None
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "GatewaySpec":
-        return cls(
-            gateway_id=str(data["gateway_id"]),
-            lat_deg=float(data["lat_deg"]),
-            lon_deg=float(data["lon_deg"]),
-            served_region_ids=tuple(str(item) for item in data.get("served_region_ids", ())),
-            gateway_bandwidth_bps=float(data["gateway_bandwidth_bps"]) if data.get("gateway_bandwidth_bps") is not None else None,
-            availability_profile_id=str(data["availability_profile_id"]) if data.get("availability_profile_id") is not None else None,
-            cost_usd_per_year=float(data["cost_usd_per_year"]) if data.get("cost_usd_per_year") is not None else None,
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        return to_jsonable(self)
-
-
-@dataclass(frozen=True)
-class WorkloadGenerationResult:
-    bundle_dir: str | None
-    manifest: dict[str, Any]
-    regions: tuple[RegionSpec, ...]
-    gateways: tuple[GatewaySpec, ...]
-    requests: tuple[dict[str, Any], ...]
-    sessions: tuple[dict[str, Any], ...]
-    timebin_demand: tuple[dict[str, Any], ...]
-    summary: dict[str, Any]
-    evaluated: bool = True
-    status: str = "generated"
-    warnings: tuple[str, ...] = ()
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "evaluated": self.evaluated,
-            "status": self.status,
-            "bundle_dir": self.bundle_dir,
-            "request_count": len(self.requests),
-            "session_count": len(self.sessions),
-            "manifest": to_jsonable(self.manifest),
-            "regions": [item.to_dict() for item in self.regions],
-            "gateways": [item.to_dict() for item in self.gateways],
-            "requests": [to_jsonable(item) for item in self.requests],
-            "sessions": [to_jsonable(item) for item in self.sessions],
-            "timebin_demand": [to_jsonable(item) for item in self.timebin_demand],
-            "summary": to_jsonable(self.summary),
-            "warnings": list(self.warnings),
-        }
-
 
 def generate_workload_bundle(
     description: dict[str, Any] | str | Path | WorkloadGenerationResult,
@@ -249,7 +94,6 @@ def generate_workload_bundle(
     _write_workload_bundle(result, bundle_dir, overwrite=bool(output.get("overwrite", False)))
     return result
 
-
 def compile_workload_description(
     path: str | Path,
     base_dir: str | Path | None = None,
@@ -266,69 +110,6 @@ def compile_workload_description(
     desc["_description_file"] = description_path.name
     desc["_description_sha256"] = _sha256_file(description_path)
     return generate_workload_bundle(desc, base_dir=description_base_dir)
-
-
-def load_workload_bundle(bundle_dir: str | Path) -> WorkloadGenerationResult:
-    """Load and fully validate one canonical workload seven-file bundle."""
-
-    root = Path(bundle_dir).expanduser().resolve()
-    manifest = _read_json(root / "workload_manifest.json")
-    paths = validate_manifest_and_files(root, manifest)
-    region_rows = _read_json(paths["regions"])
-    gateway_rows = _read_json(paths["gateways"])
-    request_rows = _read_jsonl(paths["requests"])
-    session_rows = _read_jsonl(paths["sessions"])
-    timebin_rows = _read_csv_rows(paths["timebin_demand"])
-    summary = _read_json(paths["summary"])
-    validate_exact_keys(region_rows, REGION_KEYS, "regions")
-    validate_exact_keys(gateway_rows, GATEWAY_KEYS, "gateways")
-    validate_exact_keys(request_rows, REQUEST_KEYS, "requests")
-    validate_exact_keys(session_rows, SESSION_KEYS, "sessions")
-    for key, rows in (
-        ("regions", region_rows), ("gateways", gateway_rows),
-        ("requests", request_rows), ("sessions", session_rows),
-        ("timebin_demand", timebin_rows),
-    ):
-        expected_count = int(manifest["files"][key]["record_count"])
-        if len(rows) != expected_count:
-            raise ValueError(f"workload record_count mismatch for {key}")
-    requests = tuple(_coerce_request_row(item, seed=_seed_from_manifest(manifest)) for item in request_rows)
-    sessions = tuple(_coerce_session_row(item) for item in session_rows)
-    for index, row in enumerate(requests):
-        _reject_runtime_fields(row, context=f"request row {index}")
-    for index, row in enumerate(sessions):
-        _reject_runtime_fields(row, context=f"session row {index}")
-    return WorkloadGenerationResult(
-        bundle_dir=str(root), manifest=manifest,
-        regions=tuple(RegionSpec.from_dict(item) for item in region_rows),
-        gateways=tuple(GatewaySpec.from_dict(item) for item in gateway_rows),
-        requests=requests, sessions=sessions,
-        timebin_demand=tuple(_coerce_timebin_row(item) for item in timebin_rows),
-        summary=summary, status="loaded",
-    )
-
-
-def materialize_workload_bundle(
-    workload_ref: WorkloadBundleRef | WorkloadGenerationResult,
-    base_dir: str | Path | None = None,
-) -> WorkloadGenerationResult:
-    """Load a canonical bundle referenced by an experiment.
-
-    Workload construction is intentionally separate from experiment execution;
-    callers must compile or adapt external datasets into the canonical workload format before simulation.
-    """
-
-    if isinstance(workload_ref, WorkloadGenerationResult):
-        if workload_ref.bundle_dir is None:
-            raise ValueError("bundle_dir is required for an in-memory workload result")
-        return load_workload_bundle(workload_ref.bundle_dir)
-    if not isinstance(workload_ref, WorkloadBundleRef):
-        raise TypeError("workload_ref must be WorkloadBundleRef or WorkloadGenerationResult")
-    if not workload_ref.bundle_dir:
-        raise ValueError("workload.bundle_dir is required and must reference a workload bundle")
-    root = _base_dir(base_dir)
-    return load_workload_bundle(_resolve_path(workload_ref.bundle_dir, root))
-
 
 def _generate_synthetic_workload(
     desc: dict[str, Any],
@@ -495,7 +276,6 @@ def _generate_synthetic_workload(
         summary=summary,
     )
 
-
 def _load_explicit_requests_workload(
     desc: dict[str, Any],
     base_dir: Path,
@@ -570,7 +350,6 @@ def _load_explicit_requests_workload(
         timebin_demand=tuple(timebin_demand),
         summary=summary,
     )
-
 
 def _load_replayed_trace_workload(
     desc: dict[str, Any],
@@ -705,7 +484,6 @@ def _load_replayed_trace_workload(
         summary=summary,
     )
 
-
 def _build_synthetic_event_rows(
     *,
     event: dict[str, Any],
@@ -811,7 +589,6 @@ def _build_synthetic_event_rows(
     }
     return rows, session_row
 
-
 def _with_manifest(result: WorkloadGenerationResult) -> WorkloadGenerationResult:
     region_rows = [item.to_dict() for item in result.regions]
     gateway_rows = [item.to_dict() for item in result.gateways]
@@ -877,12 +654,24 @@ def _with_manifest(result: WorkloadGenerationResult) -> WorkloadGenerationResult
             "timebin_count": counts["timebin_demand"],
         },
         "provenance": provenance,
+        "tokenizer": previous.get("tokenizer"),
+        "validation": {
+            "status": "validated",
+            "checks": [
+                "exact_keys",
+                "sha256",
+                "bundle_hash",
+                "record_counts",
+                "session_consistency",
+                "reference_resolution",
+            ],
+        },
+        "warnings": list(result.warnings),
     }
     for key in ("arrival", "geography", "tokens", "sessions", "slo", "burst_events", "summary_digest"):
         if key in previous:
             manifest[key] = previous[key]
     return replace(result, manifest=manifest)
-
 
 def _build_manifest(
     *,
@@ -942,6 +731,7 @@ def _build_manifest(
             "model_family": token_cfg.get("model_family") or token_cfg.get("model_family_fallback"),
             "task_mix": _task_mix_label(token_cfg),
         },
+        "tokenizer": to_jsonable(token_cfg.get("tokenizer")),
         "sessions": {
             "session_mode": str(_pick(session_cfg, "session_mode", "open_loop_turn_arrivals")),
             "session_ratio": _optional_float(session_cfg.get("session_ratio")),
@@ -966,7 +756,6 @@ def _build_manifest(
             "expanded_description": to_jsonable(_without_internal_keys(desc)),
         },
     }
-
 
 def _write_workload_bundle(
     result: WorkloadGenerationResult,
@@ -993,7 +782,6 @@ def _write_workload_bundle(
     (bundle_dir / REQUEST_FILES["summary"]).write_bytes(canonical_json_bytes(result.summary))
     (bundle_dir / "workload_manifest.json").write_bytes(canonical_json_bytes(result.manifest))
 
-
 def _load_regions(
     desc: dict[str, Any],
     validation_cfg: dict[str, Any],
@@ -1008,7 +796,6 @@ def _load_regions(
             weight_source=str(_pick(geography_cfg, "mode", "default_named_regions")),
         )
     return _normalize_regions(regions, geography_cfg, validation_cfg)
-
 
 def _load_regions_from_explicit(
     desc: dict[str, Any],
@@ -1044,7 +831,6 @@ def _load_regions_from_explicit(
     )
     return _normalize_regions(regions, geography_cfg, validation_cfg)
 
-
 def _normalize_regions(
     regions: tuple[RegionSpec, ...],
     geography_cfg: dict[str, Any],
@@ -1069,7 +855,6 @@ def _normalize_regions(
         regions = tuple(replace(region, demand_weight=region.demand_weight / total) for region in regions)
     return regions
 
-
 def _load_gateways(
     desc: dict[str, Any],
     regions: tuple[RegionSpec, ...],
@@ -1089,7 +874,6 @@ def _load_gateways(
     if access_mode not in {"direct_user_sgl", "gateway_sgl"}:
         raise ValueError(f"unsupported access_mode: {access_mode!r}")
     return gateways, access_mode, mapping_policy
-
 
 def _infer_gateways_from_requests(requests: list[dict[str, Any]]) -> tuple[GatewaySpec, ...]:
     grouped: dict[str, dict[str, Any]] = {}
@@ -1116,7 +900,6 @@ def _infer_gateways_from_requests(requests: list[dict[str, Any]]) -> tuple[Gatew
         )
         for item in grouped.values()
     )
-
 
 def _default_regions(count: int, weight_source: str) -> tuple[RegionSpec, ...]:
     seeds = (
@@ -1153,7 +936,6 @@ def _default_regions(count: int, weight_source: str) -> tuple[RegionSpec, ...]:
         for region_id, name, lat, lon, tz, market_class in items
     )
 
-
 def _ingress_for_region(
     region: RegionSpec,
     gateways: tuple[GatewaySpec, ...],
@@ -1187,7 +969,6 @@ def _ingress_for_region(
         "gateway_id": gateway.gateway_id,
     }
 
-
 def _sample_task(token_cfg: dict[str, Any], rng: random.Random) -> dict[str, Any]:
     task_mix = token_cfg.get("task_mix") or _default_task_mix()
     task = _choose_weighted([_dict(item) for item in task_mix], rng)
@@ -1196,7 +977,6 @@ def _sample_task(token_cfg: dict[str, Any], rng: random.Random) -> dict[str, Any
         "prompt_distribution": _dict(task.get("prompt_distribution") or _default_task_mix()[0]["prompt_distribution"]),
         "output_distribution": _dict(task.get("output_distribution") or _default_task_mix()[0]["output_distribution"]),
     }
-
 
 def _trace_region(
     row: dict[str, Any],
@@ -1222,7 +1002,6 @@ def _trace_region(
             rng,
         )
     )
-
 
 def _trace_task(
     row: dict[str, Any],
@@ -1250,7 +1029,6 @@ def _trace_task(
         "output_tokens": max(1, output_tokens),
     }
 
-
 def _trace_slo(
     row: dict[str, Any],
     slo_cfg: dict[str, Any],
@@ -1272,7 +1050,6 @@ def _trace_slo(
         sampled = {**sampled, "priority": row[priority_column]}
     return sampled
 
-
 def _sample_slo(slo_cfg: dict[str, Any], rng: random.Random) -> dict[str, Any]:
     classes = slo_cfg.get("classes")
     if not classes:
@@ -1284,7 +1061,6 @@ def _sample_slo(slo_cfg: dict[str, Any], rng: random.Random) -> dict[str, Any]:
         "e2e_deadline_s": float(_pick(item, "e2e_deadline_s", 30.0)),
         "priority": item.get("priority", "normal"),
     }
-
 
 def _expected_rows_per_root_arrival(session_cfg: dict[str, Any]) -> float:
     session_ratio = max(0.0, min(1.0, float(_pick(session_cfg, "session_ratio", 0.0))))
@@ -1302,7 +1078,6 @@ def _expected_rows_per_root_arrival(session_cfg: dict[str, Any]) -> float:
     expected_turns = sum(max(1, turn_count) * weight for turn_count, weight in values.items()) / total_weight
     return (1.0 - session_ratio) + session_ratio * expected_turns
 
-
 def _sample_turn_count(session_cfg: dict[str, Any], rng: random.Random) -> int:
     spec = session_cfg.get("turn_count_distribution", "single_turn_only")
     if isinstance(spec, str):
@@ -1313,7 +1088,6 @@ def _sample_turn_count(session_cfg: dict[str, Any], rng: random.Random) -> int:
             raise ValueError("turn_count_distribution must be categorical or a named preset")
         values = {int(key): float(value) for key, value in _dict(spec_dict.get("values")).items()}
     return int(_choose_weighted([{"value": key, "weight": value} for key, value in values.items()], rng)["value"])
-
 
 def _sample_gap(session_cfg: dict[str, Any], rng: random.Random) -> float:
     spec = session_cfg.get("gap_distribution", "mixed_gap")
@@ -1326,7 +1100,6 @@ def _sample_gap(session_cfg: dict[str, Any], rng: random.Random) -> float:
         raise ValueError("gap_distribution must be bucketed_uniform, constant, or a named preset")
     bucket = _choose_weighted([_dict(item) for item in spec_dict.get("buckets", ())], rng)
     return round(rng.uniform(float(bucket["min_s"]), float(bucket["max_s"])), 6)
-
 
 def _sample_token_count(distribution: dict[str, Any], rng: random.Random) -> int:
     kind = str(_pick(distribution, "type", "quantile_buckets"))
@@ -1354,7 +1127,6 @@ def _sample_token_count(distribution: dict[str, Any], rng: random.Random) -> int
         f"unsupported token distribution {kind!r}; supported types are quantile_buckets and lognormal"
     )
 
-
 def _choose_weighted(items: list[dict[str, Any]], rng: random.Random) -> dict[str, Any]:
     if not items:
         raise ValueError("weighted choice requires at least one item")
@@ -1369,12 +1141,10 @@ def _choose_weighted(items: list[dict[str, Any]], rng: random.Random) -> dict[st
             return item
     return items[-1]
 
-
 def _diurnal_factor(profile: str, local_hour: float) -> float:
     raw = _raw_diurnal(profile, local_hour)
     norm = _diurnal_norm(profile)
     return raw / norm if norm > 0 else 1.0
-
 
 def _raw_diurnal(profile: str, local_hour: float) -> float:
     if profile == "flat":
@@ -1389,16 +1159,13 @@ def _raw_diurnal(profile: str, local_hour: float) -> float:
         f"unsupported diurnal_profile {profile!r}; supported profiles are flat, consumer_chat, enterprise_workday, mixed_chatllm"
     )
 
-
 def _diurnal_norm(profile: str) -> float:
     samples = [_raw_diurnal(profile, index * 24.0 / 288.0) for index in range(288)]
     return sum(samples) / len(samples)
 
-
 def _periodic_gaussian(hour: float, center: float, sigma: float) -> float:
     delta = abs((hour - center + 12.0) % 24.0 - 12.0)
     return math.exp(-((delta * delta) / (sigma * sigma)))
-
 
 def _burst_multiplier_for(
     region_id: str,
@@ -1430,159 +1197,6 @@ def _burst_multiplier_for(
         active_ids.append(str(_pick(burst, "burst_id", "burst")))
     return multiplier, "+".join(active_ids) if active_ids else None
 
-
-def _coerce_request_row(
-    row: dict[str, Any],
-    *,
-    seed: int,
-    desc: dict[str, Any] | None = None,
-    mark_fillable: bool = False,
-) -> dict[str, Any]:
-    _reject_runtime_fields(row, context=f"request {row.get('request_id', '<unknown>')}")
-    token_cfg = _dict(desc.get("tokens")) if desc else {}
-    session_cfg = _dict(desc.get("sessions")) if desc else {}
-    region_lookup = _region_lookup(desc) if desc else {}
-    gateway_lookup = _gateway_lookup(desc) if desc else {}
-    gateway_cfg = _dict(desc.get("gateways")) if desc else {}
-    data = dict(row)
-    new_user_missing = "new_user_tokens" not in data
-    context_missing = "context_tokens_before_turn" not in data
-    input_bytes_missing = "input_bytes" not in data
-    output_bytes_missing = "output_bytes" not in data
-    if "user_region_id" not in data and "region_id" in data:
-        data["user_region_id"] = data["region_id"]
-    if "region_id" not in data and "user_region_id" in data:
-        data["region_id"] = data["user_region_id"]
-    region = region_lookup.get(str(data.get("user_region_id")))
-    if region is not None:
-        data.setdefault("lat_deg", region.lat_deg)
-        data.setdefault("lon_deg", region.lon_deg)
-    if "new_user_tokens" not in data and "prompt_tokens" in data:
-        data["new_user_tokens"] = data["prompt_tokens"]
-    data.setdefault("context_tokens_before_turn", 0)
-    data.setdefault("model_family", token_cfg.get("model_family") or token_cfg.get("model_family_fallback"))
-    data.setdefault("access_mode", gateway_cfg.get("access_mode", "direct_user_sgl"))
-    gateway = gateway_lookup.get(str(data.get("gateway_id")))
-    if gateway is not None:
-        data.setdefault("ingress_id", gateway.gateway_id)
-        data.setdefault("ingress_lat_deg", gateway.lat_deg)
-        data.setdefault("ingress_lon_deg", gateway.lon_deg)
-    data.setdefault("ingress_id", data.get("gateway_id") or data.get("user_region_id"))
-    data.setdefault("ingress_lat_deg", data.get("lat_deg"))
-    data.setdefault("ingress_lon_deg", data.get("lon_deg"))
-    data.setdefault("gateway_id", None)
-    data.setdefault("priority", "normal")
-    data.setdefault("session_id", None)
-    data.setdefault("turn_index", 0 if data.get("session_id") in (None, "") else 1)
-    data.setdefault("session_turn_count", None)
-    data.setdefault("inter_turn_gap_s", None)
-    data.setdefault("session_ttl_s", session_cfg.get("session_ttl_s"))
-    data.setdefault("context_window_tokens", _pick(session_cfg, "context_window_tokens", 32768))
-    data.setdefault("burst_id", None)
-    data.setdefault("burst_multiplier", 1.0)
-    data.setdefault("seed", seed)
-    if mark_fillable:
-        data["_new_user_tokens_missing"] = new_user_missing
-        data["_context_tokens_before_turn_missing"] = context_missing
-        data["_input_bytes_missing"] = input_bytes_missing
-        data["_output_bytes_missing"] = output_bytes_missing
-
-    required = (
-        "request_id",
-        "arrival_time_s",
-        "user_region_id",
-        "region_id",
-        "lat_deg",
-        "lon_deg",
-        "access_mode",
-        "ingress_id",
-        "ingress_lat_deg",
-        "ingress_lon_deg",
-        "task_type",
-        "model_family",
-        "prompt_tokens",
-        "new_user_tokens",
-        "context_tokens_before_turn",
-        "output_tokens",
-        "slo_class",
-        "e2e_deadline_s",
-        "context_window_tokens",
-        "burst_multiplier",
-        "seed",
-    )
-    missing = [key for key in required if data.get(key) is None or data.get(key) == ""]
-    if missing:
-        raise ValueError(f"explicit request row is missing required fields: {missing}")
-
-    data["arrival_time_s"] = float(data["arrival_time_s"])
-    data["lat_deg"] = float(data["lat_deg"])
-    data["lon_deg"] = float(data["lon_deg"])
-    data["ingress_lat_deg"] = float(data["ingress_lat_deg"])
-    data["ingress_lon_deg"] = float(data["ingress_lon_deg"])
-    for key in (
-        "prompt_tokens",
-        "new_user_tokens",
-        "context_tokens_before_turn",
-        "output_tokens",
-        "turn_index",
-        "context_window_tokens",
-        "seed",
-    ):
-        data[key] = int(float(data[key]))
-    for key in ("ttft_deadline_s", "e2e_deadline_s", "inter_turn_gap_s", "session_ttl_s", "burst_multiplier"):
-        data[key] = _optional_float(data.get(key))
-    data["session_turn_count"] = (
-        int(float(data["session_turn_count"])) if data.get("session_turn_count") is not None else None
-    )
-    if data["e2e_deadline_s"] is None:
-        raise ValueError("explicit request row requires e2e_deadline_s")
-    data["input_bytes"] = int(float(data["input_bytes"])) if data.get("input_bytes") is not None else _input_bytes(int(data["new_user_tokens"]), token_cfg)
-    data["output_bytes"] = int(float(data["output_bytes"])) if data.get("output_bytes") is not None else _output_bytes(int(data["output_tokens"]), token_cfg)
-    for key in (
-        "request_id",
-        "user_region_id",
-        "region_id",
-        "access_mode",
-        "ingress_id",
-        "task_type",
-        "model_family",
-        "slo_class",
-    ):
-        data[key] = str(data[key])
-    if data.get("gateway_id") in ("", "None"):
-        data["gateway_id"] = None
-    if data.get("session_id") in ("", "None"):
-        data["session_id"] = None
-    if data.get("burst_id") in ("", "None"):
-        data["burst_id"] = None
-    return to_jsonable(data)
-
-
-def _coerce_session_row(row: dict[str, Any], *, seed: int | None = None) -> dict[str, Any]:
-    _reject_runtime_fields(row, context=f"session {row.get('session_id', '<unknown>')}")
-    data = dict(row)
-    if seed is not None:
-        data.setdefault("seed", seed)
-    required = (
-        "session_id",
-        "user_region_id",
-        "session_start_time_s",
-        "session_turn_count",
-        "session_slo_class",
-        "context_window_tokens",
-        "seed",
-    )
-    missing = [key for key in required if data.get(key) is None or data.get(key) == ""]
-    if missing:
-        raise ValueError(f"session row is missing required fields: {missing}")
-    data["session_start_time_s"] = float(data["session_start_time_s"])
-    data["session_turn_count"] = int(float(data["session_turn_count"]))
-    data["context_window_tokens"] = int(float(data["context_window_tokens"]))
-    data["seed"] = int(float(data["seed"]))
-    data["session_ttl_s"] = _optional_float(data.get("session_ttl_s"))
-    return to_jsonable(data)
-
-
 def _fill_explicit_session_context(requests: list[dict[str, Any]], desc: dict[str, Any]) -> None:
     token_cfg = _dict(desc.get("tokens"))
     grouped: dict[str, list[dict[str, Any]]] = {}
@@ -1605,7 +1219,6 @@ def _fill_explicit_session_context(requests: list[dict[str, Any]], desc: dict[st
                 previous_context_tokens=previous_context_tokens,
                 token_cfg=token_cfg,
             )
-
 
 def _fill_explicit_context_row(
     row: dict[str, Any],
@@ -1639,7 +1252,6 @@ def _fill_explicit_context_row(
         row["output_bytes"] = _output_bytes(output_tokens, token_cfg)
     return min(context_window_tokens, context_before + new_user_tokens + output_tokens)
 
-
 def _drop_internal_request_markers(requests: list[dict[str, Any]]) -> None:
     marker_keys = (
         "_new_user_tokens_missing",
@@ -1650,45 +1262,6 @@ def _drop_internal_request_markers(requests: list[dict[str, Any]]) -> None:
     for row in requests:
         for key in marker_keys:
             row.pop(key, None)
-
-
-def _region_lookup(desc: dict[str, Any]) -> dict[str, RegionSpec]:
-    geography_cfg = _dict(desc.get("geography"))
-    return {
-        region.region_id: region
-        for region in (
-            RegionSpec.from_dict(_dict(item))
-            for item in geography_cfg.get("regions", ())
-        )
-    }
-
-
-def _gateway_lookup(desc: dict[str, Any]) -> dict[str, GatewaySpec]:
-    gateway_cfg = _dict(desc.get("gateways"))
-    return {
-        gateway.gateway_id: gateway
-        for gateway in (
-            GatewaySpec.from_dict(_dict(item))
-            for item in gateway_cfg.get("sites", ())
-        )
-    }
-
-
-def _coerce_timebin_row(row: dict[str, Any]) -> dict[str, Any]:
-    data = dict(row)
-    data["time_bin_start_s"] = float(data["time_bin_start_s"])
-    data["time_bin_end_s"] = float(data["time_bin_end_s"])
-    for key in (
-        "request_count",
-        "prompt_tokens_total",
-        "new_user_tokens_total",
-        "output_tokens_total",
-        "interactive_request_count",
-        "burst_request_count",
-    ):
-        data[key] = int(float(data[key]))
-    return data
-
 
 def _infer_sessions_from_requests(
     requests: list[dict[str, Any]],
@@ -1717,47 +1290,6 @@ def _infer_sessions_from_requests(
         )
     return sessions
 
-
-def _validate_session_consistency(
-    requests: list[dict[str, Any]],
-    sessions: list[dict[str, Any]],
-) -> None:
-    grouped: dict[str, list[dict[str, Any]]] = {}
-    for row in requests:
-        session_id = row.get("session_id")
-        prompt_tokens = int(row["prompt_tokens"])
-        new_user_tokens = int(row["new_user_tokens"])
-        context_tokens = int(row["context_tokens_before_turn"])
-        if prompt_tokens != context_tokens + new_user_tokens:
-            raise ValueError(
-                f"request {row['request_id']} has prompt_tokens != context_tokens_before_turn + new_user_tokens"
-            )
-        if session_id is not None:
-            grouped.setdefault(str(session_id), []).append(row)
-
-    for session_id, rows in grouped.items():
-        ordered = sorted(rows, key=lambda item: (float(item["arrival_time_s"]), int(item["turn_index"])))
-        turn_indices = [int(row["turn_index"]) for row in ordered]
-        expected = list(range(turn_indices[0], turn_indices[0] + len(turn_indices)))
-        if turn_indices != expected:
-            raise ValueError(f"session {session_id} has non-contiguous turn_index values {turn_indices}")
-        for row in ordered:
-            declared_turn_count = row.get("session_turn_count")
-            if declared_turn_count is not None and int(declared_turn_count) != len(rows):
-                raise ValueError(
-                    f"request {row['request_id']} declares session_turn_count={declared_turn_count}, "
-                    f"but session {session_id} has {len(rows)} request rows"
-                )
-
-    session_rows = {str(row["session_id"]): row for row in sessions}
-    for session_id, rows in grouped.items():
-        if session_id in session_rows and int(session_rows[session_id]["session_turn_count"]) != len(rows):
-            raise ValueError(
-                f"session row {session_id} declares session_turn_count="
-                f"{session_rows[session_id]['session_turn_count']}, but requests contain {len(rows)} rows"
-            )
-
-
 def _sort_and_number_requests(
     requests: list[dict[str, Any]],
     *,
@@ -1777,7 +1309,6 @@ def _sort_and_number_requests(
         row["seed"] = seed + index
         _reject_runtime_fields(row, context=row["request_id"])
     return sorted_requests
-
 
 def _build_timebin_demand(
     requests: list[dict[str, Any]],
@@ -1816,7 +1347,6 @@ def _build_timebin_demand(
         if row.get("burst_id") is not None:
             item["burst_request_count"] += 1
     return [bins[key] for key in sorted(bins)]
-
 
 def _build_summary(
     *,
@@ -1879,7 +1409,6 @@ def _build_summary(
         "generation_details": to_jsonable(generation_details or {}),
     }
 
-
 def _count_by(rows: list[dict[str, Any]], key: str) -> dict[str, int]:
     counts: dict[str, int] = {}
     for row in rows:
@@ -1887,7 +1416,6 @@ def _count_by(rows: list[dict[str, Any]], key: str) -> dict[str, int]:
         label = "null" if value is None else str(value)
         counts[label] = counts.get(label, 0) + 1
     return dict(sorted(counts.items()))
-
 
 def _stats(values: list[int | float]) -> dict[str, Any]:
     if not values:
@@ -1902,13 +1430,11 @@ def _stats(values: list[int | float]) -> dict[str, Any]:
         "mean": sum(values) / len(values),
     }
 
-
 def _percentile(values: list[int | float], q: float) -> int | float:
     if not values:
         return None
     index = min(len(values) - 1, max(0, math.ceil(q * len(values)) - 1))
     return values[index]
-
 
 def _read_description_document(path: Path) -> dict[str, Any]:
     suffix = path.suffix.lower()
@@ -1924,7 +1450,6 @@ def _read_description_document(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError(f"workload description {path} did not parse to a mapping")
     return data
-
 
 def _load_markdown_description(text: str, *, source: str) -> dict[str, Any]:
     if text.startswith("---\n"):
@@ -1947,7 +1472,6 @@ def _load_markdown_description(text: str, *, source: str) -> dict[str, Any]:
         "Markdown workload descriptions require YAML front matter or a fenced json/yaml block"
     )
 
-
 def _load_yaml(text: str, *, source: str) -> dict[str, Any]:
     try:
         import yaml  # type: ignore[import-not-found]
@@ -1961,26 +1485,6 @@ def _load_yaml(text: str, *, source: str) -> dict[str, Any]:
         raise ValueError(f"YAML workload description {source} did not parse to a mapping")
     return data
 
-
-def _raise_trace_replay_boundary(desc: dict[str, Any]) -> None:
-    source_mode = str(desc["source_mode"])
-    trace_cfg = _dict(desc.get("trace_replay"))
-    fmt = str(trace_cfg.get("format") or Path(str(trace_cfg.get("path", ""))).suffix.lstrip(".")).lower()
-    if fmt == "parquet":
-        raise ValueError(
-            f"{source_mode} does not support parquet in the stdlib workload core; "
-            "provide JSONL/CSV or pre-normalize the trace into explicit_requests"
-        )
-    if fmt and fmt not in {"jsonl", "csv"}:
-        raise ValueError(
-            f"{source_mode} only has a stdlib boundary for JSONL/CSV traces, got format {fmt!r}"
-        )
-    raise NotImplementedError(
-        f"{source_mode} replay normalization is intentionally left as a TODO in this core; "
-        "JSONL/CSV are the accepted stdlib boundary, and parquet is not silently supported"
-    )
-
-
 def _read_rows_by_format(path: Path, fmt: str) -> list[dict[str, Any]]:
     if fmt == "jsonl":
         return _read_jsonl(path)
@@ -1989,7 +1493,6 @@ def _read_rows_by_format(path: Path, fmt: str) -> list[dict[str, Any]]:
     if fmt == "parquet":
         raise ValueError("parquet is intentionally unsupported by the stdlib workload core")
     raise ValueError(f"unsupported explicit request format: {fmt!r}")
-
 
 def _explicit_format(configured: Any, path: Path) -> str:
     fmt = str(configured or path.suffix.lstrip(".")).lower()
@@ -2001,41 +1504,17 @@ def _explicit_format(configured: Any, path: Path) -> str:
         raise ValueError("parquet is intentionally unsupported by the stdlib workload core")
     return fmt
 
-
-def _read_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
 def _write_json(path: Path, value: Any) -> None:
     path.write_text(
         json.dumps(to_jsonable(value), ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
 
-
-def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-        if not line.strip():
-            continue
-        item = json.loads(line)
-        if not isinstance(item, dict):
-            raise ValueError(f"{path}:{line_number} is not a JSON object")
-        rows.append(item)
-    return rows
-
-
 def _write_jsonl(path: Path, rows: tuple[dict[str, Any], ...]) -> None:
     path.write_text(
         "".join(json.dumps(to_jsonable(row), ensure_ascii=False, sort_keys=True) + "\n" for row in rows),
         encoding="utf-8",
     )
-
-
-def _read_csv_rows(path: Path) -> list[dict[str, Any]]:
-    with path.open("r", encoding="utf-8", newline="") as handle:
-        return [dict(row) for row in csv.DictReader(handle)]
-
 
 def _write_timebin_csv(path: Path, rows: tuple[dict[str, Any], ...]) -> None:
     fieldnames = (
@@ -2054,7 +1533,6 @@ def _write_timebin_csv(path: Path, rows: tuple[dict[str, Any], ...]) -> None:
         writer.writeheader()
         for row in rows:
             writer.writerow({key: row.get(key) for key in fieldnames})
-
 
 def _validate_description_header(desc: dict[str, Any]) -> None:
     schema = str(desc.get("schema_version", ""))
@@ -2079,19 +1557,6 @@ def _validate_description_header(desc: dict[str, Any]) -> None:
         if section not in desc:
             raise ValueError(f"workload description missing required section {section!r}")
 
-
-def _reject_runtime_fields(value: Any, *, context: str) -> None:
-    if isinstance(value, dict):
-        leaked = sorted(str(key) for key in value if str(key) in RUNTIME_RESULT_FIELDS)
-        if leaked:
-            raise ValueError(f"{context} contains runtime-only field(s): {', '.join(leaked)}")
-        for key, item in value.items():
-            _reject_runtime_fields(item, context=f"{context}.{key}")
-    elif isinstance(value, list):
-        for index, item in enumerate(value):
-            _reject_runtime_fields(item, context=f"{context}[{index}]")
-
-
 def _require_unique_request_ids(requests: list[dict[str, Any]]) -> None:
     seen: set[str] = set()
     duplicates: set[str] = set()
@@ -2103,12 +1568,10 @@ def _require_unique_request_ids(requests: list[dict[str, Any]]) -> None:
     if duplicates:
         raise ValueError(f"duplicate request_id values: {sorted(duplicates)}")
 
-
 def _require_sorted_requests(requests: list[dict[str, Any]]) -> None:
     keys = [(float(row["arrival_time_s"]), str(row["request_id"])) for row in requests]
     if keys != sorted(keys):
         raise ValueError("explicit requests are not sorted by arrival_time_s, request_id")
-
 
 def _description_seed(desc: dict[str, Any]) -> int:
     if desc.get("seed") is not None:
@@ -2121,66 +1584,8 @@ def _description_seed(desc: dict[str, Any]) -> int:
         return int(provenance["seed"])
     return 1
 
-
-def _seed_from_manifest(manifest: dict[str, Any]) -> int:
-    return int(manifest.get("seed") or _pick(_dict(manifest.get("generator")), "seed", 1))
-
-
-def _input_bytes(new_user_tokens: int, token_cfg: dict[str, Any]) -> int:
-    return int(
-        new_user_tokens * int(_pick(token_cfg, "bytes_per_input_token", 4))
-        + int(_pick(token_cfg, "request_metadata_bytes", 512))
-    )
-
-
-def _output_bytes(output_tokens: int, token_cfg: dict[str, Any]) -> int:
-    return int(
-        output_tokens * int(_pick(token_cfg, "bytes_per_output_token", 4))
-        + int(_pick(token_cfg, "response_metadata_bytes", 256))
-    )
-
-
-def _dict(value: Any) -> dict[str, Any]:
-    if value is None:
-        return {}
-    if not isinstance(value, dict):
-        raise ValueError(f"expected mapping, got {type(value).__name__}")
-    return value
-
-
-def _optional_float(value: Any) -> float | None:
-    if value is None or value == "":
-        return None
-    return float(value)
-
-
 def _base_dir(base_dir: str | Path | None) -> Path:
     return Path(base_dir).expanduser().resolve() if base_dir is not None else Path.cwd()
-
-
-def _resolve_path(path_value: Any, base_dir: Path) -> Path:
-    path = Path(str(path_value)).expanduser()
-    if path.is_absolute():
-        return path.resolve()
-    base_candidate = (base_dir / path).resolve()
-    cwd_candidate = (Path.cwd() / path).resolve()
-    if path.parts and path.parts[0] in {"data", "docs", "examples", "results"}:
-        return cwd_candidate
-    if base_candidate.exists():
-        return base_candidate
-    if cwd_candidate.exists():
-        return cwd_candidate
-    if cwd_candidate.parent.exists() and not base_candidate.parent.exists():
-        return cwd_candidate
-    return base_candidate
-
-
-def _optional_str(value: Any) -> str | None:
-    if value is None:
-        return None
-    text = str(value)
-    return text if text else None
-
 
 def _source_file_record(path: Path, base_dir: Path) -> dict[str, Any]:
     return {
@@ -2189,13 +1594,11 @@ def _source_file_record(path: Path, base_dir: Path) -> dict[str, Any]:
         "format": path.suffix.lstrip(".").lower(),
     }
 
-
 def _relative_or_absolute(path: Path, base_dir: Path) -> str:
     try:
         return str(path.resolve().relative_to(base_dir.resolve()))
     except ValueError:
         return str(path.resolve())
-
 
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
@@ -2204,22 +1607,17 @@ def _sha256_file(path: Path) -> str:
             digest.update(chunk)
     return digest.hexdigest()
 
-
 def _sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
 
 def _without_internal_keys(data: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in data.items() if not str(key).startswith("_")}
 
-
 def _geo_distance_sq(lat_a: float, lon_a: float, lat_b: float, lon_b: float) -> float:
     return (lat_a - lat_b) ** 2 + ((lon_a - lon_b) * math.cos(math.radians(lat_a))) ** 2
 
-
 def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
-
 
 def _task_mix_label(token_cfg: dict[str, Any]) -> str:
     task_mix = token_cfg.get("task_mix")
@@ -2227,14 +1625,12 @@ def _task_mix_label(token_cfg: dict[str, Any]) -> str:
         return "default_chatllm_mix"
     return ",".join(str(_pick(_dict(item), "task_type", "task")) for item in task_mix)
 
-
 def _distribution_label(value: Any) -> str:
     if isinstance(value, str):
         return value
     if isinstance(value, dict):
         return str(value.get("type", "custom"))
     return "custom"
-
 
 def _default_task_mix() -> list[dict[str, Any]]:
     return [
@@ -2294,7 +1690,6 @@ def _default_task_mix() -> list[dict[str, Any]]:
         },
     ]
 
-
 def _slo_mix_preset(name: str) -> list[dict[str, Any]]:
     presets = {
         "interactive_heavy": [
@@ -2318,7 +1713,6 @@ def _slo_mix_preset(name: str) -> list[dict[str, Any]]:
         )
     return presets[name]
 
-
 def _turn_count_preset(name: str) -> dict[int, float]:
     presets = {
         "single_turn_only": {1: 1.0},
@@ -2329,7 +1723,6 @@ def _turn_count_preset(name: str) -> dict[int, float]:
     if name not in presets:
         raise ValueError(f"unknown turn_count_distribution preset {name!r}")
     return presets[name]
-
 
 def _gap_preset(name: str) -> dict[str, Any]:
     if name not in {"mixed_gap", "bucketed_default"}:
@@ -2342,5 +1735,4 @@ def _gap_preset(name: str) -> dict[str, Any]:
             {"name": "long_gap", "weight": 0.15, "min_s": 600.0, "max_s": 1800.0},
         ],
     }
-
 

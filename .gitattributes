@@ -1,0 +1,6 @@
+# Canonical workload bundle 的 SHA-256 按 LF 字节计算（见 src/workloads/README.md §2.3）。
+# 以下数据文件在任何系统 checkout 后必须保持 LF 字节不变，禁止 git 换行符转换；
+# 否则 bundle 校验会失败（尤其是 Windows core.autocrlf=true 环境）。
+src/workloads/**/*.json   text eol=lf
+src/workloads/**/*.jsonl  text eol=lf
+src/workloads/**/*.csv    text eol=lf

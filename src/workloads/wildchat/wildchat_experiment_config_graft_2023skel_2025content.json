@@ -1,0 +1,374 @@
+{
+  "workload_id": "wildchat_2025_content_on_2023_skeleton_day",
+  "seed": 20260723,
+  "country_centroids_path": "country_centroids.json",
+  "state_centroids_path": "state_centroids.json",
+  "dataset": {
+    "name": "allenai/WildChat-4.8M",
+    "revision": "c827c6df8fcf008219ffaffa4d1dd77491099367",
+    "split": "train",
+    "parquet_files": [
+      {
+        "path": "data/train-00066-of-00086.parquet",
+        "expected_source_sha256": "dd8d7aa249b24f0d095e1faaa3f36bc128a72078f8da62b504e584faf479fdfa"
+      },
+      {
+        "path": "data/train-00067-of-00086.parquet",
+        "expected_source_sha256": "2e6d04701794be220967da3e685acfeea466922b8acaabd8b41ef384932606f4"
+      },
+      {
+        "path": "data/train-00068-of-00086.parquet",
+        "expected_source_sha256": "c822fccefee6c93d9b294fc46b1c6d4ea4a7fc09ecf29ee560f728e1789da138"
+      }
+    ],
+    "time_window": {
+      "time_mode": "month_compressed_day",
+      "epoch_utc": "2025-03-01T00:00:00Z",
+      "window_end_utc": "2025-04-01T00:00:00Z",
+      "time_horizon_s": 2678400,
+      "output_epoch_utc": "2023-05-15T00:00:00Z",
+      "output_time_horizon_s": 86400,
+      "time_bin_s": 300
+    }
+  },
+  "load": {
+    "default_scale": "10x"
+  },
+  "region_mapping": {
+    "China|Beijing": {
+      "region_id": "cn_beijing",
+      "region_name": "Beijing, China",
+      "lat_deg": 39.9042,
+      "lon_deg": 116.4074,
+      "timezone_utc_offset_h": 8,
+      "market_class": null
+    },
+    "China|Hebei": {
+      "region_id": "cn_hebei",
+      "region_name": "Hebei, China",
+      "lat_deg": 38.04,
+      "lon_deg": 114.51,
+      "timezone_utc_offset_h": 8,
+      "market_class": null
+    },
+    "China|Shanghai": {
+      "region_id": "cn_shanghai",
+      "region_name": "Shanghai, China",
+      "lat_deg": 31.2304,
+      "lon_deg": 121.4737,
+      "timezone_utc_offset_h": 8,
+      "market_class": null
+    },
+    "United States|California": {
+      "region_id": "us_california",
+      "region_name": "California, United States",
+      "lat_deg": 36.7783,
+      "lon_deg": -119.4179,
+      "timezone_utc_offset_h": -8,
+      "market_class": null
+    },
+    "United States|New York": {
+      "region_id": "us_new_york",
+      "region_name": "New York, United States",
+      "lat_deg": 42.9538,
+      "lon_deg": -75.5268,
+      "timezone_utc_offset_h": -5,
+      "market_class": null
+    },
+    "United States|Texas": {
+      "region_id": "us_texas",
+      "region_name": "Texas, United States",
+      "lat_deg": 31.0,
+      "lon_deg": -99.0,
+      "timezone_utc_offset_h": -6,
+      "market_class": null
+    }
+  },
+  "gateways": {
+    "selection_policy": "nearest_gateway",
+    "items": [
+      {
+        "gateway_id": "gw_seattle",
+        "lat_deg": 47.6062,
+        "lon_deg": -122.3321,
+        "gateway_bandwidth_bps": 100000000000,
+        "availability_profile_id": null,
+        "cost_usd_per_year": null
+      },
+      {
+        "gateway_id": "gw_los_angeles",
+        "lat_deg": 34.0522,
+        "lon_deg": -118.2437,
+        "gateway_bandwidth_bps": 100000000000,
+        "availability_profile_id": null,
+        "cost_usd_per_year": null
+      },
+      {
+        "gateway_id": "gw_dallas",
+        "lat_deg": 32.7767,
+        "lon_deg": -96.797,
+        "gateway_bandwidth_bps": 100000000000,
+        "availability_profile_id": null,
+        "cost_usd_per_year": null
+      },
+      {
+        "gateway_id": "gw_chicago",
+        "lat_deg": 41.8781,
+        "lon_deg": -87.6298,
+        "gateway_bandwidth_bps": 100000000000,
+        "availability_profile_id": null,
+        "cost_usd_per_year": null
+      },
+      {
+        "gateway_id": "gw_new_york",
+        "lat_deg": 40.7128,
+        "lon_deg": -74.006,
+        "gateway_bandwidth_bps": 100000000000,
+        "availability_profile_id": null,
+        "cost_usd_per_year": null
+      },
+      {
+        "gateway_id": "gw_toronto",
+        "lat_deg": 43.6532,
+        "lon_deg": -79.3832,
+        "gateway_bandwidth_bps": 100000000000,
+        "availability_profile_id": null,
+        "cost_usd_per_year": null
+      },
+      {
+        "gateway_id": "gw_mexico_city",
+        "lat_deg": 19.4326,
+        "lon_deg": -99.1332,
+        "gateway_bandwidth_bps": 100000000000,
+        "availability_profile_id": null,
+        "cost_usd_per_year": null
+      },
+      {
+        "gateway_id": "gw_sao_paulo",
+        "lat_deg": -23.5505,
+        "lon_deg": -46.6333,
+        "gateway_bandwidth_bps": 100000000000,
+        "availability_profile_id": null,
+        "cost_usd_per_year": null
+      },
+      {
+        "gateway_id": "gw_london",
+        "lat_deg": 51.5074,
+        "lon_deg": -0.1278,
+        "gateway_bandwidth_bps": 100000000000,
+        "availability_profile_id": null,
+        "cost_usd_per_year": null
+      },
+      {
+        "gateway_id": "gw_frankfurt",
+        "lat_deg": 50.1109,
+        "lon_deg": 8.6821,
+        "gateway_bandwidth_bps": 100000000000,
+        "availability_profile_id": null,
+        "cost_usd_per_year": null
+      },
+      {
+        "gateway_id": "gw_madrid",
+        "lat_deg": 40.4168,
+        "lon_deg": -3.7038,
+        "gateway_bandwidth_bps": 100000000000,
+        "availability_profile_id": null,
+        "cost_usd_per_year": null
+      },
+      {
+        "gateway_id": "gw_lagos",
+        "lat_deg": 6.5244,
+        "lon_deg": 3.3792,
+        "gateway_bandwidth_bps": 100000000000,
+        "availability_profile_id": null,
+        "cost_usd_per_year": null
+      },
+      {
+        "gateway_id": "gw_nairobi",
+        "lat_deg": -1.2921,
+        "lon_deg": 36.8219,
+        "gateway_bandwidth_bps": 100000000000,
+        "availability_profile_id": null,
+        "cost_usd_per_year": null
+      },
+      {
+        "gateway_id": "gw_johannesburg",
+        "lat_deg": -26.2041,
+        "lon_deg": 28.0473,
+        "gateway_bandwidth_bps": 100000000000,
+        "availability_profile_id": null,
+        "cost_usd_per_year": null
+      },
+      {
+        "gateway_id": "gw_istanbul",
+        "lat_deg": 41.0082,
+        "lon_deg": 28.9784,
+        "gateway_bandwidth_bps": 100000000000,
+        "availability_profile_id": null,
+        "cost_usd_per_year": null
+      },
+      {
+        "gateway_id": "gw_dubai",
+        "lat_deg": 25.2048,
+        "lon_deg": 55.2708,
+        "gateway_bandwidth_bps": 100000000000,
+        "availability_profile_id": null,
+        "cost_usd_per_year": null
+      },
+      {
+        "gateway_id": "gw_mumbai",
+        "lat_deg": 19.076,
+        "lon_deg": 72.8777,
+        "gateway_bandwidth_bps": 100000000000,
+        "availability_profile_id": null,
+        "cost_usd_per_year": null
+      },
+      {
+        "gateway_id": "gw_delhi",
+        "lat_deg": 28.6139,
+        "lon_deg": 77.209,
+        "gateway_bandwidth_bps": 100000000000,
+        "availability_profile_id": null,
+        "cost_usd_per_year": null
+      },
+      {
+        "gateway_id": "gw_singapore",
+        "lat_deg": 1.3521,
+        "lon_deg": 103.8198,
+        "gateway_bandwidth_bps": 100000000000,
+        "availability_profile_id": null,
+        "cost_usd_per_year": null
+      },
+      {
+        "gateway_id": "gw_jakarta",
+        "lat_deg": -6.2088,
+        "lon_deg": 106.8456,
+        "gateway_bandwidth_bps": 100000000000,
+        "availability_profile_id": null,
+        "cost_usd_per_year": null
+      },
+      {
+        "gateway_id": "gw_bangkok",
+        "lat_deg": 13.7563,
+        "lon_deg": 100.5018,
+        "gateway_bandwidth_bps": 100000000000,
+        "availability_profile_id": null,
+        "cost_usd_per_year": null
+      },
+      {
+        "gateway_id": "gw_hong_kong",
+        "lat_deg": 22.3193,
+        "lon_deg": 114.1694,
+        "gateway_bandwidth_bps": 100000000000,
+        "availability_profile_id": null,
+        "cost_usd_per_year": null
+      },
+      {
+        "gateway_id": "gw_beijing",
+        "lat_deg": 39.9042,
+        "lon_deg": 116.4074,
+        "gateway_bandwidth_bps": 100000000000,
+        "availability_profile_id": null,
+        "cost_usd_per_year": null
+      },
+      {
+        "gateway_id": "gw_seoul",
+        "lat_deg": 37.5665,
+        "lon_deg": 126.978,
+        "gateway_bandwidth_bps": 100000000000,
+        "availability_profile_id": null,
+        "cost_usd_per_year": null
+      },
+      {
+        "gateway_id": "gw_tokyo",
+        "lat_deg": 35.6762,
+        "lon_deg": 139.6503,
+        "gateway_bandwidth_bps": 100000000000,
+        "availability_profile_id": null,
+        "cost_usd_per_year": null
+      },
+      {
+        "gateway_id": "gw_sydney",
+        "lat_deg": -33.8688,
+        "lon_deg": 151.2093,
+        "gateway_bandwidth_bps": 100000000000,
+        "availability_profile_id": null,
+        "cost_usd_per_year": null
+      }
+    ]
+  },
+  "tokenization": {
+    "backend": "huggingface_auto",
+    "target_model": "deepseek_v3_671b",
+    "tokenizer_id": "deepseek-ai/DeepSeek-V3",
+    "tokenizer_revision": "e815299b0bcbac849fa540c768ef21845365c9eb",
+    "local_path": "tokenizer_deepseek_v3",
+    "chat_template": "tokenizer_default",
+    "assistant_token_policy": "content_plus_eos",
+    "context_window_tokens": 131072,
+    "bytes_per_input_token": 4,
+    "bytes_per_output_token": 4
+  },
+  "model_mapping": {
+    "gpt-4o-mini": "deepseek_v3_671b",
+    "gpt-4o-mini-2024-07-18": "deepseek_v3_671b",
+    "default": "deepseek_v3_671b"
+  },
+  "slo_policy": {
+    "session_assignment": "max_output_tokens",
+    "rules": [
+      {
+        "max_output_tokens": 256,
+        "slo_class": "interactive_short",
+        "ttft_deadline_s": 3.0,
+        "e2e_deadline_s": 30.0,
+        "priority": "interactive",
+        "session_ttl_s": 600.0
+      },
+      {
+        "max_output_tokens": 512,
+        "slo_class": "interactive_medium",
+        "ttft_deadline_s": 3.0,
+        "e2e_deadline_s": 60.0,
+        "priority": "interactive",
+        "session_ttl_s": 600.0
+      },
+      {
+        "max_output_tokens": 1024,
+        "slo_class": "interactive_long",
+        "ttft_deadline_s": 3.0,
+        "e2e_deadline_s": 120.0,
+        "priority": "interactive",
+        "session_ttl_s": 600.0
+      },
+      {
+        "default": true,
+        "slo_class": "normal_long",
+        "ttft_deadline_s": 10.0,
+        "e2e_deadline_s": 300.0,
+        "priority": "normal",
+        "session_ttl_s": 600.0
+      }
+    ]
+  },
+  "adapter_policy": {
+    "arrival_time_policy": "assistant_completion_proxy",
+    "unknown_region_policy": "drop",
+    "missing_timestamp_policy": "drop",
+    "invalid_pair_policy": "drop",
+    "record_filter": {
+      "require_nonempty_content": true
+    }
+  },
+  "bundle_output": {
+    "module_version": "1.0.0",
+    "float_precision_digits": 6,
+    "overwrite": true
+  },
+  "skeleton_bundle": {
+    "dir": "bundles/2023-05/experiment_bundle_10x",
+    "regions_file": "regions.json",
+    "sessions_file": "sessions.jsonl",
+    "requests_file": "requests.jsonl"
+  }
+}

@@ -11,23 +11,26 @@ from .contract import (
     SESSION_KEYS,
     SUMMARY_SCHEMA,
     TIMEBIN_FIELDS,
-    bundle_hash,
-    canonical_json_bytes,
-    sha256_bytes,
-)
-
-from .core import (
-    GENERATOR_NAME,
-    GENERATOR_VERSION,
     WORKLOAD_BUNDLE_SCHEMA,
     WORKLOAD_DESCRIPTION_SCHEMA,
     GatewaySpec,
     RegionSpec,
     TokenDistribution,
-    WorkloadGenerationResult,
     WorkloadBundleRef,
+    WorkloadGenerationResult,
+    bundle_hash,
+    canonical_json_bytes,
+    sha256_bytes,
+)
+
+from .generation import (
+    GENERATOR_NAME,
+    GENERATOR_VERSION,
     compile_workload_description,
     generate_workload_bundle,
+)
+
+from .loader import (
     load_workload_bundle,
     materialize_workload_bundle,
 )
