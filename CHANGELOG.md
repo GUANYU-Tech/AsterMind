@@ -4,6 +4,46 @@ All notable changes to OrbitServe are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Added a deterministic SGP4 pipeline from validated mean elements through
+  WGS-72 TEME propagation, pinned-data ITRS conversion, WGS-84 geometry, and
+  canonical Orbit Trace generation via `generate_orbit_trace`.
+
+### Changed
+
+- Made `OrbitTraceManifest` and `OrbitTraceBundle` the canonical Orbit trace
+  class names, with geometry-only records and metadata as their complete public
+  output contract.
+- Kept the SGP4 implementation as flat `sgp4_*` modules under
+  `orbitserve.orbit` while keeping cross-module use on the public
+  `orbitserve.orbit` entry point.
+- Removed `v2` from the canonical Orbit Trace schema and public API names;
+  `orbitserve.orbit_trace`, `write_orbit_trace`, and `load_orbit_trace` now
+  define the single current output format.
+- Declared the pinned SGP4, Astropy, Earth-orientation dependencies and vendored
+  IERS package data in `pyproject.toml`.
+
+### Removed
+
+- Removed the legacy circular-orbit constellation configuration, simulator,
+  surrogate trace implementation, trace builders, and SGL compatibility
+  helpers from Orbit.
+- Removed the `RuntimeTraceManifest`, `RuntimeTraceBundle`, and
+  `SurrogateTraceBundle` aliases and the remaining legacy circular-orbit public
+  interfaces.
+
+### Verification
+
+- Passed all 39 Orbit unit tests.
+- Confirmed that remaining module-boundary, fixed-design integration, and smoke
+  failures are limited to Runtime, Experiments, and DSE consumers that still
+  import the removed Orbit interfaces and require owner-led migration.
+- Slow tests were not run because the complete Runtime and DSE SGP4 paths have
+  not yet been migrated.
+
 ## [0.0.1] - 2026-07-19
 
 ### Added
