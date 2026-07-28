@@ -1,0 +1,105 @@
+{
+  "schema_version": "orbitserve.orbit.stk-geometry-corpus",
+  "corpus_id": "stk-geometry-pilot-2026-07",
+  "cases": [
+    {
+      "case_id": "leo-boundary-geometry",
+      "description": "Two inclined LEO satellites exercising SGL horizon, ISL Earth-limb, umbra, and penumbra boundaries.",
+      "coverage": [
+        "isl_earth_limb_boundary",
+        "penumbra_boundary",
+        "sgl_horizon_boundary",
+        "umbra_boundary"
+      ],
+      "simulation_epoch_utc": "2026-07-20T00:00:00.000000Z",
+      "sample_grid_s": {
+        "start": 0,
+        "stop": 21600,
+        "step": 30
+      },
+      "ground_ingresses": [
+        {
+          "ingress_id": "greenwich",
+          "lat_deg": 0.0,
+          "lon_deg": 0.0,
+          "altitude_km": 0.0,
+          "min_elevation_deg": 10.0
+        },
+        {
+          "ingress_id": "shanghai",
+          "lat_deg": 31.2304,
+          "lon_deg": 121.4737,
+          "altitude_km": 0.0,
+          "min_elevation_deg": 5.0
+        }
+      ],
+      "isl_pairs": [
+        [
+          "geo-leo-a",
+          "geo-leo-b"
+        ]
+      ],
+      "isl_clearance_km": 0.0,
+      "shadow_atmosphere_margin_km": 0.0,
+      "minimum_expected_event_counts": {
+        "isl_visible_windows": 1,
+        "penumbra_windows": 1,
+        "sgl_visible_windows": 1,
+        "umbra_windows": 1
+      },
+      "elements": {
+        "schema_version": "orbitserve.sgp4_element_bundle.v1",
+        "element_semantics": "sgp4_mean_elements",
+        "gravity_model": "wgs72",
+        "ops_mode": "improved",
+        "time_scale": "utc",
+        "satellites": [
+          {
+            "satellite_id": "geo-leo-a",
+            "satnum": 92001,
+            "classification": "U",
+            "object_id": "2026-920A",
+            "epoch_utc": "2026-07-20T00:00:00.000000Z",
+            "inclination_deg": 53.0,
+            "raan_deg": 20.0,
+            "eccentricity": 0.001,
+            "argument_of_perigee_deg": 30.0,
+            "mean_anomaly_deg": 40.0,
+            "mean_motion_rev_per_day": 15.25,
+            "mean_motion_dot_rev_per_day2": 0.0,
+            "mean_motion_ddot_rev_per_day3": 0.0,
+            "bstar_inv_earth_radii": 0.00001,
+            "ephemeris_type": 0,
+            "element_set_number": 1,
+            "revolution_number_at_epoch": 100
+          },
+          {
+            "satellite_id": "geo-leo-b",
+            "satnum": 92002,
+            "classification": "U",
+            "object_id": "2026-920B",
+            "epoch_utc": "2026-07-20T00:00:00.000000Z",
+            "inclination_deg": 70.0,
+            "raan_deg": 110.0,
+            "eccentricity": 0.08,
+            "argument_of_perigee_deg": 250.0,
+            "mean_anomaly_deg": 15.0,
+            "mean_motion_rev_per_day": 13.0,
+            "mean_motion_dot_rev_per_day2": 0.0,
+            "mean_motion_ddot_rev_per_day3": 0.0,
+            "bstar_inv_earth_radii": 0.00002,
+            "ephemeris_type": 0,
+            "element_set_number": 1,
+            "revolution_number_at_epoch": 80
+          }
+        ],
+        "provenance": {
+          "source_kind": "synthetic_sgp4_mean_elements",
+          "source_name": "stk-geometry-pilot-corpus",
+          "source_version": "2026-07",
+          "observationally_fitted": false
+        }
+      }
+    }
+  ]
+}

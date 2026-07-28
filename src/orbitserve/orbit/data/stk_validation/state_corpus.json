@@ -1,0 +1,228 @@
+{
+  "schema_version": "orbitserve.orbit.stk-state-corpus",
+  "corpus_id": "stk-state-pilot-2026-07",
+  "cases": [
+    {
+      "case_id": "near-circular-leo",
+      "description": "Near-circular inclined LEO sampled before, at, and after the element epoch.",
+      "coverage": [
+        "epoch_sample",
+        "multi_day_span",
+        "near_circular_leo",
+        "post_epoch_samples",
+        "pre_epoch_samples"
+      ],
+      "simulation_epoch_utc": "2026-07-18T00:00:00.000000Z",
+      "sample_times_s": [
+        0,
+        86400,
+        172800,
+        259200,
+        345600
+      ],
+      "elements": {
+        "schema_version": "orbitserve.sgp4_element_bundle.v1",
+        "element_semantics": "sgp4_mean_elements",
+        "gravity_model": "wgs72",
+        "ops_mode": "improved",
+        "time_scale": "utc",
+        "satellites": [
+          {
+            "satellite_id": "stk-near-circular-leo",
+            "satnum": 91001,
+            "classification": "U",
+            "object_id": "2026-901A",
+            "epoch_utc": "2026-07-20T00:00:00.000000Z",
+            "inclination_deg": 53.0,
+            "raan_deg": 20.0,
+            "eccentricity": 0.001,
+            "argument_of_perigee_deg": 30.0,
+            "mean_anomaly_deg": 40.0,
+            "mean_motion_rev_per_day": 15.25,
+            "mean_motion_dot_rev_per_day2": 0.0,
+            "mean_motion_ddot_rev_per_day3": 0.0,
+            "bstar_inv_earth_radii": 0.00001,
+            "ephemeris_type": 0,
+            "element_set_number": 1,
+            "revolution_number_at_epoch": 100
+          }
+        ],
+        "provenance": {
+          "source_kind": "synthetic_sgp4_mean_elements",
+          "source_name": "stk-state-pilot-corpus",
+          "source_version": "2026-07",
+          "observationally_fitted": false
+        }
+      }
+    },
+    {
+      "case_id": "moderate-eccentricity-leo",
+      "description": "Highly inclined LEO with moderate eccentricity and a half-day sample step.",
+      "coverage": [
+        "epoch_sample",
+        "inclined_moderate_eccentricity_leo",
+        "multi_day_span",
+        "post_epoch_samples",
+        "pre_epoch_samples"
+      ],
+      "simulation_epoch_utc": "2026-07-19T00:00:00.000000Z",
+      "sample_times_s": [
+        0,
+        43200,
+        86400,
+        129600,
+        172800
+      ],
+      "elements": {
+        "schema_version": "orbitserve.sgp4_element_bundle.v1",
+        "element_semantics": "sgp4_mean_elements",
+        "gravity_model": "wgs72",
+        "ops_mode": "improved",
+        "time_scale": "utc",
+        "satellites": [
+          {
+            "satellite_id": "stk-moderate-eccentricity-leo",
+            "satnum": 91002,
+            "classification": "U",
+            "object_id": "2026-902A",
+            "epoch_utc": "2026-07-20T00:00:00.000000Z",
+            "inclination_deg": 70.0,
+            "raan_deg": 110.0,
+            "eccentricity": 0.08,
+            "argument_of_perigee_deg": 250.0,
+            "mean_anomaly_deg": 15.0,
+            "mean_motion_rev_per_day": 13.0,
+            "mean_motion_dot_rev_per_day2": 0.0,
+            "mean_motion_ddot_rev_per_day3": 0.0,
+            "bstar_inv_earth_radii": 0.00002,
+            "ephemeris_type": 0,
+            "element_set_number": 1,
+            "revolution_number_at_epoch": 80
+          }
+        ],
+        "provenance": {
+          "source_kind": "synthetic_sgp4_mean_elements",
+          "source_name": "stk-state-pilot-corpus",
+          "source_version": "2026-07",
+          "observationally_fitted": false
+        }
+      }
+    },
+    {
+      "case_id": "nonzero-drag-derivatives-leo",
+      "description": "Low LEO exercising nonzero BSTAR and both mean-motion derivative fields.",
+      "coverage": [
+        "epoch_sample",
+        "nonzero_bstar",
+        "nonzero_mean_motion_derivatives",
+        "post_epoch_samples",
+        "pre_epoch_samples"
+      ],
+      "simulation_epoch_utc": "2026-07-19T12:00:00.000000Z",
+      "sample_times_s": [
+        0,
+        21600,
+        43200,
+        64800,
+        86400
+      ],
+      "elements": {
+        "schema_version": "orbitserve.sgp4_element_bundle.v1",
+        "element_semantics": "sgp4_mean_elements",
+        "gravity_model": "wgs72",
+        "ops_mode": "improved",
+        "time_scale": "utc",
+        "satellites": [
+          {
+            "satellite_id": "stk-nonzero-drag-derivatives-leo",
+            "satnum": 91003,
+            "classification": "U",
+            "object_id": "2026-903A",
+            "epoch_utc": "2026-07-20T00:00:00.000000Z",
+            "inclination_deg": 51.6,
+            "raan_deg": 305.0,
+            "eccentricity": 0.003,
+            "argument_of_perigee_deg": 80.0,
+            "mean_anomaly_deg": 280.0,
+            "mean_motion_rev_per_day": 15.7,
+            "mean_motion_dot_rev_per_day2": 0.0001,
+            "mean_motion_ddot_rev_per_day3": 0.0000001,
+            "bstar_inv_earth_radii": 0.0005,
+            "ephemeris_type": 0,
+            "element_set_number": 1,
+            "revolution_number_at_epoch": 120
+          }
+        ],
+        "provenance": {
+          "source_kind": "synthetic_sgp4_mean_elements",
+          "source_name": "stk-state-pilot-corpus",
+          "source_version": "2026-07",
+          "observationally_fitted": false
+        }
+      }
+    },
+    {
+      "case_id": "deep-space-geo",
+      "description": "Near-geostationary orbit exercising the SGP4 deep-space branch over two weeks.",
+      "coverage": [
+        "deep_space_geo",
+        "epoch_sample",
+        "multi_day_span",
+        "post_epoch_samples",
+        "pre_epoch_samples"
+      ],
+      "simulation_epoch_utc": "2026-07-13T00:00:00.000000Z",
+      "sample_times_s": [
+        0,
+        86400,
+        172800,
+        259200,
+        345600,
+        432000,
+        518400,
+        604800,
+        691200,
+        777600,
+        864000,
+        950400,
+        1036800,
+        1123200,
+        1209600
+      ],
+      "elements": {
+        "schema_version": "orbitserve.sgp4_element_bundle.v1",
+        "element_semantics": "sgp4_mean_elements",
+        "gravity_model": "wgs72",
+        "ops_mode": "improved",
+        "time_scale": "utc",
+        "satellites": [
+          {
+            "satellite_id": "stk-deep-space-geo",
+            "satnum": 91004,
+            "classification": "U",
+            "object_id": "2026-904A",
+            "epoch_utc": "2026-07-20T00:00:00.000000Z",
+            "inclination_deg": 0.1,
+            "raan_deg": 75.0,
+            "eccentricity": 0.0002,
+            "argument_of_perigee_deg": 180.0,
+            "mean_anomaly_deg": 10.0,
+            "mean_motion_rev_per_day": 1.0027,
+            "mean_motion_dot_rev_per_day2": 0.0,
+            "mean_motion_ddot_rev_per_day3": 0.0,
+            "bstar_inv_earth_radii": 0.0,
+            "ephemeris_type": 0,
+            "element_set_number": 1,
+            "revolution_number_at_epoch": 5
+          }
+        ],
+        "provenance": {
+          "source_kind": "synthetic_sgp4_mean_elements",
+          "source_name": "stk-state-pilot-corpus",
+          "source_version": "2026-07",
+          "observationally_fitted": false
+        }
+      }
+    }
+  ]
+}
