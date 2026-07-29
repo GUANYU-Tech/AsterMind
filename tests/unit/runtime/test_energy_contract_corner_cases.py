@@ -3,8 +3,8 @@ import unittest
 from pathlib import Path
 
 
-from orbitserve.runtime.energy_state import EnergyWindowError, advance_satellite_energy, apply_request_energy, energy_window_at
-from orbitserve.runtime.runtime_state import SatelliteState
+from orbitserve.runtime.state.energy import EnergyWindowError, advance_satellite_energy, apply_request_energy, energy_window_at
+from orbitserve.runtime.state.resources import SatelliteState
 
 
 def _window(start_s, end_s, **overrides):
@@ -13,7 +13,7 @@ def _window(start_s, end_s, **overrides):
         "start_s": float(start_s),
         "end_s": float(end_s),
         "sunlit": True,
-        "dvfs_multiplier": 1.0,
+        "dvfs_scale": 1.0,
         "charge_rate_w": 0.0,
         "idle_power_w": 0.0,
         "compute_energy_j_per_token": 1.0,

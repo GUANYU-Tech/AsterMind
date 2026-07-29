@@ -7,18 +7,17 @@ from typing import Any
 from .contracts import (
     RUNTIME_INTERFACE_DOC,
     RUNTIME_PERFORMANCE_DOC,
-    RUNTIME_OPTIMIZATION_DOC,
     RUNTIME_RESULT_FIELDS,
     RuntimePerformanceResult,
-    RuntimeScenario,
-    RuntimeStrategySpec,
 )
+from .setup.simulation_spec import RuntimeSimulationSpec
 
-def evaluate_runtime_performance(
-    scenario: RuntimeScenario,
-    strategy: RuntimeStrategySpec | dict[str, Any] | Any | None = None,
+
+def run_runtime_simulation(
+    simulation_spec: RuntimeSimulationSpec,
 ) -> RuntimePerformanceResult:
-    runtime_strategy = RuntimeStrategySpec.from_value(strategy or scenario.runtime_config)
+    scenario = simulation_spec
+    runtime_strategy = simulation_spec.strategy
     leakage = _runtime_leakage_records(scenario.requests, scenario.sessions)
     if leakage:
         leaked_fields = sorted({field for record in leakage for field in record["fields"]})
@@ -26,27 +25,26 @@ def evaluate_runtime_performance(
             "workload runtime leakage detected in canonical bundle: "
             + ", ".join(leaked_fields)
         )
-    from .runtime_evaluator import try_evaluate_runtime_performance
+    from .engine.simulator import try_run_runtime_simulation
 
-    evaluated_result = try_evaluate_runtime_performance(scenario, runtime_strategy)
+    evaluated_result = try_run_runtime_simulation(scenario)
     if evaluated_result is not None:
         return evaluated_result
-    primary_deployment = scenario.serving_deployments[0] if scenario.serving_deployments else None
-    serving_evaluated = bool(primary_deployment and primary_deployment.evaluated)
-    serving_feasible = bool(primary_deployment and primary_deployment.feasible is not False)
+    serving_profile = scenario.serving_profile
+    serving_evaluated = bool(serving_profile and serving_profile.evaluated)
+    serving_feasible = bool(serving_profile and serving_profile.feasible is not False)
     simulation_evaluated = bool(scenario.simulation_trace_ref.get("evaluated", False))
     workload_status = _workload_status(scenario, leakage)
     simulation_status = "evaluated" if simulation_evaluated else "skeleton"
     serving_status = (
         "missing"
-        if primary_deployment is None
+        if serving_profile is None
         else "infeasible"
         if not serving_feasible
         else "evaluated"
         if serving_evaluated
         else "missing"
     )
-    cost_status = "annualized" if scenario.cost_power.get("annualized_cost_usd_per_year") is not None else "static_cost_only"
     warnings = list(scenario.warnings)
     if not serving_evaluated:
         warnings.append("serving_throughput.evaluated=false; cannot compute service time")
@@ -54,7 +52,7 @@ def evaluate_runtime_performance(
         warnings.append("serving_throughput.feasible=false; runtime cannot admit LEO actions")
     if not simulation_evaluated:
         warnings.append("simulation trace is not implemented; runtime observed metrics are null")
-    warnings.append("runtime event simulator is not implemented; served_ratio and observed latency metrics are null")
+    warnings.append("runtime event simulator is not implemented; completion_ratio and observed latency metrics are null")
     total_request_count = len(scenario.requests) or scenario.workload_bundle.get("request_count")
     bottleneck_breakdown: dict[str, Any] = {}
     bottleneck_breakdown["not_implemented"] = total_request_count
@@ -66,7 +64,7 @@ def evaluate_runtime_performance(
         "queue_model": "not_implemented",
         "link_model": "not_implemented",
         "energy_model": "not_implemented",
-        "cost_model": cost_status,
+        "cost_model": "not_configured",
     }
     config = {
         "time_mode": scenario.time_mode,
@@ -74,7 +72,7 @@ def evaluate_runtime_performance(
         "warmup_s": 0,
         "fallback_accounting": "separate_from_leo_only",
         "internal_comm_accounting": (
-            primary_deployment.internal_comm_accounting if primary_deployment else "embedded"
+            serving_profile.internal_comm_accounting if serving_profile else "embedded"
         ),
         "kv_accounting": "active_plus_idle_session",
         "recompute_input_bytes_policy": "new_user_tokens_only",
@@ -89,10 +87,10 @@ def evaluate_runtime_performance(
     }
     runtime_metrics = {
         "total_request_count": total_request_count,
-        "served_ratio": None,
-        "accepted_ratio": None,
-        "timeout_ratio": None,
-        "rejected_ratio": None,
+        "completion_ratio": None,
+        "uncompleted_ratio": None,
+        "uncompleted_stage_breakdown": {},
+        "uncompleted_reason_breakdown": {},
         "fallback_request_fraction": None,
         "ttft_p50_s": None,
         "ttft_p95_s": None,
@@ -114,7 +112,7 @@ def evaluate_runtime_performance(
         "eta_decode_capacity": None,
         "eta_compute_useful": None,
     }
-    serving_summary = primary_deployment.to_dict() if primary_deployment else {}
+    serving_summary = serving_profile.to_dict() if serving_profile else {}
     return RuntimePerformanceResult(
         evaluated=False,
         scenario={
@@ -154,12 +152,11 @@ def evaluate_runtime_performance(
         module_status=module_status,
         provenance={
             **scenario.provenance,
-            "runtime_interface_schema": "orbitserve.runtime_scenario.v1",
+            "runtime_interface_schema": "orbitserve.runtime_simulation_spec.v1",
             "performance_evaluator": "conservative_skeleton",
             "runtime_performance_schema": "orbitserve.runtime_performance.v1",
             "runtime_interface_doc": RUNTIME_INTERFACE_DOC,
             "runtime_performance_model_doc": RUNTIME_PERFORMANCE_DOC,
-            "runtime_optimization_model_doc": RUNTIME_OPTIMIZATION_DOC,
         },
         warnings=tuple(dict.fromkeys(warnings)),
     )
@@ -184,7 +181,7 @@ def _runtime_leakage_records(
                 )
     return tuple(leaks)
 
-def _workload_status(scenario: RuntimeScenario, leakage: tuple[dict[str, Any], ...]) -> str:
+def _workload_status(scenario: RuntimeSimulationSpec, leakage: tuple[dict[str, Any], ...]) -> str:
     if leakage:
         return "invalid"
     status = str(scenario.workload_bundle.get("status") or "")

@@ -11,6 +11,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Added a deterministic SGP4 pipeline from validated mean elements through
   WGS-72 TEME propagation, pinned-data ITRS conversion, WGS-84 geometry, and
   canonical Orbit Trace generation via `generate_orbit_trace`.
+- Added `RuntimeSimulationSpec` as the immutable aggregate input for one
+  deterministic Runtime simulation.
+- Added per-satellite capacity-driven LRU management for KV cache state.
 
 ### Changed
 
@@ -25,6 +28,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   define the single current output format.
 - Declared the pinned SGP4, Astropy, Earth-orientation dependencies and vendored
   IERS package data in `pyproject.toml`.
+- Reorganized Runtime into `setup`, `engine`, `state`, and `metrics`, with
+  public contracts and results kept at the package root.
+- Made `RuntimeStrategySpec` part of `RuntimeSimulationSpec` and consolidated
+  execution behind `run_runtime_simulation(simulation_spec)`.
+- Moved deterministic candidate selection into the Runtime engine while making
+  DSE solely responsible for strategy search.
+- Applied one colocated prefill/decode `ServingCapacityProfile` uniformly to
+  all satellites.
+- Standardized DVFS as a strategy-owned capacity scale in the range `(0, 1]`.
+- Simplified request outcomes to completed and uncompleted, and limited
+  TTFT/E2E statistics to completed requests.
+- Made Runtime consume the static satellite energy profile provided by
+  Architecture directly.
 
 ### Removed
 
@@ -34,6 +50,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Removed the `RuntimeTraceManifest`, `RuntimeTraceBundle`, and
   `SurrogateTraceBundle` aliases and the remaining legacy circular-orbit public
   interfaces.
+- Removed compute-only execution, disaggregated prefill/decode deployment,
+  deployment catalogs, and deployment-group placement logic.
+- Removed planned-versus-observed energy alignment, duplicate queue state,
+  redundant decision contracts, and the standalone Runtime strategy package.
+- Removed SLO classification and SLO pass/fail accounting from Runtime results.
+
+### Fixed
+
+- Fixed trace-backed route reservation and isolated mutable KV cache state by
+  satellite.
 
 ### Verification
 

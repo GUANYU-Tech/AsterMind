@@ -6,10 +6,10 @@ from pathlib import Path
 
 
 from orbitserve.experiments import load_experiment_spec, run_experiment
-from orbitserve.runtime.contracts import RuntimeScenario, RuntimeStrategySpec
+from orbitserve.runtime import RuntimeScenario, RuntimeStrategySpec
 from orbitserve.runtime.evaluation import evaluate_runtime_performance
-from orbitserve.runtime.deployment_contracts import RuntimeDeployment, RuntimeDeploymentCatalog
-from orbitserve.runtime.engines.trace_backed import run_trace_backed_runtime
+from orbitserve.runtime import ServingDeploymentView
+from orbitserve.runtime.engine.trace_backed import run_trace_backed_runtime
 from orbitserve.orbit.simulation_trace_builder import build_surrogate_orbit_trace
 from orbitserve.orbit.simulation_traces import (
     RuntimeTraceManifest,
@@ -100,7 +100,7 @@ class TraceBackedRuntimeTests(unittest.TestCase):
         )
         result = run_trace_backed_runtime(
             requests=requests,
-            deployment_catalog=catalog,
+            serving_profile=serving_profile,
             runtime_strategy=RuntimeStrategySpec.from_dict(
                 {"policy": "nearest_visible", "hard_gate_mode": "audit_only"}
             ),
@@ -122,7 +122,6 @@ class TraceBackedRuntimeTests(unittest.TestCase):
             payload = run_experiment(spec).to_dict()
 
         runtime = payload["performance"]["details"]["runtime"]
-        optimizer = payload["performance"]["details"]["runtime_optimization"]
         self.assertTrue(runtime["evaluated"])
         self.assertEqual(runtime["trace_model"], "surrogate_orbit_trace")
         self.assertEqual(runtime["scope"], TRACE_BACKED_RUNTIME_SURROGATE_SCOPE)
@@ -134,10 +133,6 @@ class TraceBackedRuntimeTests(unittest.TestCase):
         self.assertTrue(runtime["energy_metrics"]["evaluated"])
         self.assertEqual(len(runtime["request_records"]), runtime["runtime_metrics"]["total_request_count"])
         self.assertIn("score_terms", runtime["request_records"][0]["provenance"])
-        self.assertTrue(optimizer["evaluated"])
-        self.assertTrue(optimizer["closed_loop_evaluated"])
-        self.assertEqual(runtime["strategy"]["policy"], optimizer["selected_strategy"]["policy"])
-        self.assertIn("runtime_initial", payload["performance"]["details"])
         self.assertFalse(optimizer["hardware_optimization"]["evaluated"])
         self.assertIn("preliminary surrogate", " ".join(payload["performance"]["warnings"]))
 

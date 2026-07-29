@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from typing import Any, Protocol
+from typing import Any
 
-from ..common import to_jsonable
+from ...common import to_jsonable
+from ..contracts import RuntimeStrategySpec
 
 
 @dataclass(frozen=True)
@@ -30,107 +31,6 @@ class SchedulerDecision:
 
     def to_dict(self) -> dict[str, Any]:
         return to_jsonable(self)
-
-
-class SchedulerPolicy(Protocol):
-    name: str
-
-    def select_action(self, state: Any, request: Any) -> SchedulerDecision:
-        """Select a request action from the current simulator state."""
-
-    def to_runtime_strategy(self) -> Any:
-        """Return the runtime strategy that this scheduler exposes to evaluators."""
-
-    def optimization_search_space(self) -> dict[str, Any]:
-        """Return a scheduler search-space payload for runtime optimization."""
-
-
-@dataclass(frozen=True)
-class SchedulerSpec:
-    policy: str = "orbitserve"
-    lookahead_orbits: float = 1.0
-    name: str | None = None
-    policy_family: str | None = None
-    enabled_actions: tuple[str, ...] = ()
-    session_actions_enabled: tuple[str, ...] = ()
-    dvfs_modes_enabled: tuple[str, ...] = ()
-    h_lookahead_s: float | None = None
-    max_hop_count: int | None = None
-    fallback_enabled: bool = False
-    defer_enabled: bool = False
-    path_policy: str | None = None
-    queue_policy: str | None = None
-    hard_gate_mode: str = "strict"
-    hard_gate_overrides: dict[str, Any] = field(default_factory=dict)
-    weights: dict[str, Any] = field(default_factory=dict)
-    normalization_refs: dict[str, Any] = field(default_factory=dict)
-    kv_policy: dict[str, Any] = field(default_factory=dict)
-    ground_config: dict[str, Any] = field(default_factory=dict)
-    random_seed: int | None = None
-    trace_level: str = "summary"
-    runtime_optimization_enabled: bool = True
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any] | None) -> "SchedulerSpec":
-        data = data or {}
-        return cls(
-            policy=_canonical_policy(str(data.get("policy", "orbitserve"))),
-            lookahead_orbits=float(data.get("lookahead_orbits", 1.0)),
-            name=_optional_str(data.get("name")),
-            policy_family=_optional_str(data.get("policy_family")),
-            enabled_actions=_string_tuple(data.get("enabled_actions")),
-            session_actions_enabled=_string_tuple(data.get("session_actions_enabled")),
-            dvfs_modes_enabled=_string_tuple(data.get("dvfs_modes_enabled")),
-            h_lookahead_s=_optional_float(data.get("h_lookahead_s", data.get("H_lookahead"))),
-            max_hop_count=_optional_int(data.get("max_hop_count")),
-            fallback_enabled=bool(data.get("fallback_enabled", False)),
-            defer_enabled=bool(data.get("defer_enabled", False)),
-            path_policy=_optional_str(data.get("path_policy")),
-            queue_policy=_optional_str(data.get("queue_policy")),
-            hard_gate_mode=str(data.get("hard_gate_mode", "strict")),
-            hard_gate_overrides=dict(data.get("hard_gate_overrides") or {}),
-            weights=dict(data.get("weights") or {}),
-            normalization_refs=dict(data.get("normalization_refs") or {}),
-            kv_policy=dict(data.get("kv_policy") or {}),
-            ground_config=dict(data.get("ground_config") or {}),
-            random_seed=_optional_int(data.get("random_seed")),
-            trace_level=str(data.get("trace_level", "summary")),
-            runtime_optimization_enabled=bool(
-                data.get("runtime_optimization_enabled", data.get("optimization_enabled", True))
-            ),
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        payload: dict[str, Any] = {
-            "policy": self.policy,
-            "lookahead_orbits": self.lookahead_orbits,
-        }
-        _set_if_not_none(payload, "name", self.name)
-        _set_if_not_none(payload, "policy_family", self.policy_family)
-        _set_if_not_empty(payload, "enabled_actions", self.enabled_actions)
-        _set_if_not_empty(payload, "session_actions_enabled", self.session_actions_enabled)
-        _set_if_not_empty(payload, "dvfs_modes_enabled", self.dvfs_modes_enabled)
-        _set_if_not_none(payload, "h_lookahead_s", self.h_lookahead_s)
-        _set_if_not_none(payload, "max_hop_count", self.max_hop_count)
-        if self.fallback_enabled:
-            payload["fallback_enabled"] = self.fallback_enabled
-        if self.defer_enabled:
-            payload["defer_enabled"] = self.defer_enabled
-        _set_if_not_none(payload, "path_policy", self.path_policy)
-        _set_if_not_none(payload, "queue_policy", self.queue_policy)
-        if self.hard_gate_mode != "strict":
-            payload["hard_gate_mode"] = self.hard_gate_mode
-        _set_if_not_empty(payload, "hard_gate_overrides", self.hard_gate_overrides)
-        _set_if_not_empty(payload, "weights", self.weights)
-        _set_if_not_empty(payload, "normalization_refs", self.normalization_refs)
-        _set_if_not_empty(payload, "kv_policy", self.kv_policy)
-        _set_if_not_empty(payload, "ground_config", self.ground_config)
-        _set_if_not_none(payload, "random_seed", self.random_seed)
-        if self.trace_level != "summary":
-            payload["trace_level"] = self.trace_level
-        if not self.runtime_optimization_enabled:
-            payload["runtime_optimization_enabled"] = False
-        return to_jsonable(payload)
 
 
 @dataclass(frozen=True)
@@ -179,31 +79,16 @@ class SchedulerCandidate:
         return to_jsonable(self)
 
 
-RUNTIME_OPTIMIZATION_BASELINE_POLICIES = (
-    "local_only",
-    "shortest_path",
-    "load_aware",
-    "energy_aware",
-    "orbitserve",
-)
-
-PAPER_POLICY_IDS = {
-    "local_only": "leo_local_only",
-    "shortest_path": "shortest_path_forwarding",
-    "orbitserve": "full_orbitserve",
-}
-
-
 @dataclass(frozen=True)
-class RuntimeScheduler:
-    """Runtime-facing scheduler adapter.
+class CandidateSelector:
+    """Engine-internal deterministic candidate selector.
 
-    This class exposes RuntimeStrategySpec payloads for evaluation/optimization
-    previews and selects among request-level candidates when runtime_engine
-    provides them.
+    A RuntimeStrategySpec is fixed for one simulation.  The Runtime engine
+    generates request candidates from current state, and this adapter applies
+    the fixed strategy to rank those candidates deterministically.
     """
 
-    spec: SchedulerSpec
+    spec: RuntimeStrategySpec
 
     @property
     def name(self) -> str:
@@ -217,92 +102,11 @@ class RuntimeScheduler:
     def policy(self) -> str:
         return self.spec.policy
 
-    def to_runtime_strategy(self) -> Any:
-        from .contracts import RuntimeStrategySpec
-
-        strategy = RuntimeStrategySpec.from_value(self.spec)
-        return RuntimeStrategySpec.from_dict(
-            {
-                **strategy.to_dict(),
-                "provenance": {
-                    **strategy.provenance,
-                    "scheduler_bridge": "RuntimeScheduler",
-                    "scheduler_module": "orbitserve.schedulers",
-                },
-            }
-        )
-
     def runtime_strategy_payload(self) -> dict[str, Any]:
-        return self.to_runtime_strategy().to_dict()
-
-    def candidate_strategy_payloads(self, policies: tuple[str, ...] | None = None) -> tuple[dict[str, Any], ...]:
-        from .contracts import RuntimeStrategySpec
-
-        ordered_policies = _unique_policies(
-            (
-                self.spec.policy,
-                *(policies or RUNTIME_OPTIMIZATION_BASELINE_POLICIES),
-            )
-        )
-        candidates: list[dict[str, Any]] = []
-        for policy in ordered_policies:
-            if policy not in KNOWN_POLICIES:
-                known = ", ".join(sorted(KNOWN_POLICIES))
-                raise ValueError(f"unknown scheduler policy '{policy}'. Known policies: {known}")
-            payload = (
-                self.runtime_strategy_payload()
-                if policy == self.spec.policy
-                else RuntimeStrategySpec.from_dict({"policy": policy}).to_dict()
-            )
-            payload = {
-                **payload,
-                "strategy_id": PAPER_POLICY_IDS.get(policy, policy),
-                "provenance": {
-                    **dict(payload.get("provenance") or {}),
-                    "scheduler_bridge": "RuntimeScheduler",
-                    "scheduler_module": "orbitserve.schedulers",
-                    "scheduler_source_policy": self.spec.policy,
-                },
-            }
-            candidates.append(to_jsonable(payload))
-        return tuple(candidates)
-
-    def optimization_search_space(self) -> dict[str, Any]:
-        if not self.spec.runtime_optimization_enabled:
-            return {
-                "enabled": False,
-                "current_scheduler": self.runtime_strategy_payload(),
-                "candidate_schedulers": (),
-                "include_current_policy": False,
-                "baseline_policies": (),
-                "warnings": ("scheduler.runtime_optimization_enabled=false",),
-                "provenance": {
-                    "source": "scheduler_runtime_bridge",
-                    "scheduler_policy": self.spec.policy,
-                    "scheduler_module": "orbitserve.schedulers",
-                    "runtime_optimization_enabled": False,
-                },
-            }
-        candidates = self.candidate_strategy_payloads()
-        return {
-            "current_scheduler": self.runtime_strategy_payload(),
-            "candidate_schedulers": candidates,
-            "include_current_policy": False,
-            "baseline_policies": RUNTIME_OPTIMIZATION_BASELINE_POLICIES,
-            "provenance": {
-                "source": "scheduler_runtime_bridge",
-                "scheduler_policy": self.spec.policy,
-                "scheduler_module": "orbitserve.schedulers",
-                "candidate_strategy_count": len(candidates),
-            },
-        }
-
-    def runtime_search_space(self) -> dict[str, Any]:
-        return self.optimization_search_space()
+        return self.spec.to_dict()
 
     def select_action(self, state: Any, request: Any) -> SchedulerDecision:
         runtime_strategy = self.runtime_strategy_payload()
-        candidate_strategies = self.candidate_strategy_payloads()
         request_payload = _mapping_from_value(request)
         state_payload = _mapping_from_value(state)
         candidates = tuple(
@@ -310,35 +114,25 @@ class RuntimeScheduler:
             for candidate in state_payload.get("candidates", ())
         )
         support = {
-            "runtime_strategy_available": True,
-            "runtime_performance_entrypoint": "orbitserve.runtime.evaluate_runtime_performance",
-            "runtime_optimization_entrypoint": "orbitserve.runtime_optimization.optimize_runtime_strategy",
-            "candidate_search_space_available": True,
-            "candidate_strategy_count": len(candidate_strategies),
-            "candidate_policies": tuple(candidate["policy"] for candidate in candidate_strategies),
-            "request_level_execution": "request_level_slo_aware_surrogate_not_full_shadow_kv_marginal_rule",
-            "paper_rule_status": "request_level_slo_aware_surrogate_not_full_shadow_kv_marginal_rule",
+            "strategy_mutable_during_run": False,
+            "selection_mode": "deterministic_request_candidate_ranking",
         }
         if not candidates:
             return SchedulerDecision(
-                action="scheduler_bridge/runtime_strategy_preview",
+                action="no_candidate",
                 evaluated=False,
                 policy_name=self.name,
                 rationale=(
-                    f"{self.name} scheduler exposes a RuntimeStrategySpec bridge for "
-                    "runtime performance evaluation and runtime optimization; "
-                    "request-level action selection requires runtime_engine state/request"
+                    f"{self.name} scheduler requires candidates generated by the Runtime engine"
                 ),
                 runtime_strategy=runtime_strategy,
                 optimization_support=support,
-                candidate_strategies=candidate_strategies,
                 module_status={
-                    "scheduling": "runtime_bridge",
-                    "runtime_strategy": "provided",
-                    "runtime_optimization": "candidate_strategy_payloads_available",
+                    "scheduling": "deterministic_request_selection",
+                    "runtime_strategy": "fixed_for_run",
                 },
                 provenance={
-                    "scheduler_interface": "runtime_bridge",
+                    "scheduler_interface": "deterministic_request_selector",
                     "state_request_available": False,
                 },
             )
@@ -405,16 +199,14 @@ class RuntimeScheduler:
                 gate_results=gate_results,
                 runtime_strategy=runtime_strategy,
                 optimization_support=support,
-                candidate_strategies=candidate_strategies,
                 module_status={
-                    "scheduling": "runtime_request_level",
-                    "runtime_strategy": "provided",
-                    "runtime_optimization": "candidate_strategy_payloads_available",
+                    "scheduling": "deterministic_request_selection",
+                    "runtime_strategy": "fixed_for_run",
                 },
                 provenance={
                     "scheduler_interface": "runtime_request_level",
                     "state_request_available": True,
-                    "score_model": "request_level_slo_aware_surrogate",
+                    "score_model": "request_level_resource_aware_surrogate",
                     "reject_reason": "no_feasible_scheduler_candidate",
                     "hard_gate_mode": hard_gate_mode,
                 },
@@ -434,7 +226,7 @@ class RuntimeScheduler:
             policy_name=self.name,
             rationale=(
                 f"{self.name} scheduler selected a request-level candidate with "
-                "SLO-aware surrogate scoring"
+                "deterministic resource-aware scoring"
             ),
             selected_candidate_id=selected.candidate_id,
             selected_action=selected.to_dict(),
@@ -450,16 +242,14 @@ class RuntimeScheduler:
             gate_results=gate_results,
             runtime_strategy=runtime_strategy,
             optimization_support=support,
-            candidate_strategies=candidate_strategies,
             module_status={
-                "scheduling": "request_level_slo_aware_surrogate_not_full_shadow_kv_marginal_rule",
-                "runtime_strategy": "provided",
-                "runtime_optimization": "candidate_strategy_payloads_available",
+                "scheduling": "request_level_resource_aware_surrogate",
+                "runtime_strategy": "fixed_for_run",
             },
             provenance={
                 "scheduler_interface": "request_level_candidate_selector",
                 "state_request_available": True,
-                "score_model": "request_level_slo_aware_surrogate_not_full_shadow_kv_marginal_rule",
+                "score_model": "request_level_resource_aware_surrogate",
                 "hard_gate_mode": hard_gate_mode,
             },
         )
@@ -480,21 +270,11 @@ class RuntimeScheduler:
         link = _finite_or(candidate.predicted_link_wait_s, 0.0)
         energy_risk = _finite_or(candidate.predicted_energy_risk, 0.0)
         latency_for_score = _finite_or(candidate.predicted_nominal_latency_s, e2e)
-        ttft_deadline = _optional_float(request.get("ttft_deadline_s"))
-        e2e_deadline = _optional_float(request.get("e2e_deadline_s"))
-        ttft_miss = ttft_deadline is not None and ttft > ttft_deadline
-        e2e_miss = e2e_deadline is not None and e2e > e2e_deadline
-        negative_ttft_slack = max(0.0, ttft - ttft_deadline) if ttft_deadline is not None else 0.0
-        negative_e2e_slack = max(0.0, e2e - e2e_deadline) if e2e_deadline is not None else 0.0
         # Hard gates are enforced before ranking in select_action().  Keep this
         # compatibility field at zero so a penalty can never substitute for
         # admission filtering.
         hard_gate_penalty = 0.0
-        slo_miss_penalty = 1_000_000.0 if ttft_miss or e2e_miss else 0.0
         normalized_e2e = latency_for_score / refs["latency_s"]
-        normalized_negative_slack = (
-            negative_ttft_slack / refs["ttft_s"] + negative_e2e_slack / refs["e2e_s"]
-        )
         normalized_queue = queue / refs["queue_s"]
         normalized_link = link / refs["link_s"]
         normalized_energy_risk = energy_risk / refs["energy_risk"]
@@ -504,7 +284,6 @@ class RuntimeScheduler:
         kv_migration_visible_s = _finite_or(provenance.get("kv_migration_visible_s"), 0.0)
         kv_recompute_tokens = _finite_or(provenance.get("context_recompute_tokens"), 0.0)
         kv_hbm_occupancy = _finite_or(provenance.get("hbm_occupancy_after"), 0.0)
-        kv_expiry_risk = _finite_or(provenance.get("kv_transfer_expiry_risk"), 0.0)
         compute_sunlit = provenance.get("compute_sunlit")
         access_sunlit = provenance.get("access_sunlit")
         shadow_triggered = bool(provenance.get("shadow_triggered", False))
@@ -529,11 +308,9 @@ class RuntimeScheduler:
         normalized_kv_migration = kv_migration_visible_s / refs["link_s"]
         normalized_kv_recompute = kv_recompute_tokens / refs["tokens"]
         normalized_kv_hbm = kv_hbm_occupancy / refs["hbm_occupancy"]
-        normalized_kv_expiry = kv_expiry_risk / refs["expiry_risk"]
         normalized_kv_hit_credit = kv_hit_tokens / refs["tokens"]
         weighted_components = {
             "latency": _weight(weights, "latency", 1.0) * normalized_e2e,
-            "slack": _weight(weights, "slack", 10.0) * normalized_negative_slack,
             "queue": _weight(weights, "queue", 1.0) * normalized_queue,
             "link": _weight(weights, "link", 1.0) * normalized_link,
             "energy": _weight(weights, "energy", 10.0) * normalized_energy_risk,
@@ -545,18 +322,13 @@ class RuntimeScheduler:
             )
             * normalized_kv_recompute,
             "kv_hbm": _weight(weights, "kv_hbm", 0.0) * normalized_kv_hbm,
-            "kv_staleness": _weight(weights, "kv_staleness", 0.0) * normalized_kv_expiry,
             "kv_hit": -_weight(weights, "kv_hit", 0.0) * normalized_kv_hit_credit,
             "shadow_local": _weight(weights, "shadow_local", 0.0) * shadow_local_penalty,
             "shadow_dvfs_credit": -_weight(weights, "shadow_dvfs_credit", 0.0) * shadow_dvfs_indicator,
             "shadow_offload_credit": -_weight(weights, "shadow_offload_credit", 0.0)
             * shadow_offload_indicator,
         }
-        score = (
-            hard_gate_penalty
-            + slo_miss_penalty
-            + sum(weighted_components.values())
-        )
+        score = hard_gate_penalty + sum(weighted_components.values())
         score_components = {
             "latency": _score_component(
                 latency_for_score,
@@ -565,15 +337,6 @@ class RuntimeScheduler:
                 weights,
                 "latency",
                 1.0,
-                weighted_components,
-            ),
-            "slack": _score_component(
-                {"negative_ttft_slack_s": negative_ttft_slack, "negative_e2e_slack_s": negative_e2e_slack},
-                {"ttft_s": refs["ttft_s"], "e2e_s": refs["e2e_s"]},
-                normalized_negative_slack,
-                weights,
-                "slack",
-                10.0,
                 weighted_components,
             ),
             "queue": _score_component(
@@ -618,15 +381,6 @@ class RuntimeScheduler:
                 normalized_kv_hbm,
                 weights,
                 "kv_hbm",
-                0.0,
-                weighted_components,
-            ),
-            "kv_staleness": _score_component(
-                kv_expiry_risk,
-                refs["expiry_risk"],
-                normalized_kv_expiry,
-                weights,
-                "kv_staleness",
                 0.0,
                 weighted_components,
             ),
@@ -678,14 +432,8 @@ class RuntimeScheduler:
             "hard_gate_blocking": hard_gate_blocking,
             "hard_gate_violations": candidate.hard_gate_violations,
             "hard_gate_results": candidate.hard_gate_results,
-            "ttft_deadline_s": ttft_deadline,
-            "e2e_deadline_s": e2e_deadline,
-            "negative_ttft_slack_s": negative_ttft_slack,
-            "negative_e2e_slack_s": negative_e2e_slack,
             "hard_gate_penalty": hard_gate_penalty,
-            "slo_miss_penalty": slo_miss_penalty,
             "normalized_e2e": normalized_e2e,
-            "normalized_negative_slack": normalized_negative_slack,
             "normalized_queue": normalized_queue,
             "normalized_link": normalized_link,
             "normalized_energy_risk": normalized_energy_risk,
@@ -694,7 +442,6 @@ class RuntimeScheduler:
             "kv_migration_visible_s": kv_migration_visible_s,
             "context_recompute_tokens": kv_recompute_tokens,
             "hbm_occupancy_after": kv_hbm_occupancy,
-            "kv_transfer_expiry_risk": kv_expiry_risk,
             "compute_sunlit": compute_sunlit,
             "access_sunlit": access_sunlit,
             "shadow_triggered": shadow_triggered,
@@ -705,28 +452,27 @@ class RuntimeScheduler:
             "normalized_kv_migration": normalized_kv_migration,
             "normalized_kv_recompute": normalized_kv_recompute,
             "normalized_kv_hbm": normalized_kv_hbm,
-            "normalized_kv_expiry": normalized_kv_expiry,
             "normalized_kv_hit_credit": normalized_kv_hit_credit,
             "weights": weights,
             "normalization_refs": refs,
             "normalization_scope": "request_candidate_set",
             "score_components": score_components,
-            "score_model": "request_level_slo_aware_surrogate_not_full_shadow_kv_marginal_rule",
+            "score_model": "request_level_resource_aware_surrogate",
         }
         return score, candidate, to_jsonable(score_terms)
 
     def _effective_policy_weights(self, runtime_strategy: dict[str, Any]) -> dict[str, float]:
         policy = str(runtime_strategy.get("policy") or self.spec.policy)
         if policy in {"local_only", "nearest_visible"}:
-            defaults = {"latency": 1.0, "slack": 10.0, "queue": 1.0, "link": 1.0, "energy": 10.0, "hop": 0.0}
+            defaults = {"latency": 1.0, "queue": 1.0, "link": 1.0, "energy": 10.0, "hop": 0.0}
         elif policy == "shortest_path":
-            defaults = {"latency": 1.0, "slack": 0.0, "queue": 0.0, "link": 0.0, "energy": 0.0, "hop": 0.2}
+            defaults = {"latency": 1.0, "queue": 0.0, "link": 0.0, "energy": 0.0, "hop": 0.2}
         elif policy == "load_aware":
-            defaults = {"latency": 0.25, "slack": 5.0, "queue": 5.0, "link": 0.5, "energy": 0.0, "hop": 0.05}
+            defaults = {"latency": 0.25, "queue": 5.0, "link": 0.5, "energy": 0.0, "hop": 0.05}
         elif policy == "energy_aware":
-            defaults = {"latency": 0.25, "slack": 5.0, "queue": 0.5, "link": 0.5, "energy": 50.0, "hop": 0.05}
+            defaults = {"latency": 0.25, "queue": 0.5, "link": 0.5, "energy": 50.0, "hop": 0.05}
         else:
-            defaults = {"latency": 1.0, "slack": 10.0, "queue": 2.0, "link": 1.0, "energy": 10.0, "hop": 0.1}
+            defaults = {"latency": 1.0, "queue": 2.0, "link": 1.0, "energy": 10.0, "hop": 0.1}
         overrides = _mapping_from_value(runtime_strategy.get("weights"))
         for key, value in overrides.items():
             if value is not None:
@@ -749,55 +495,18 @@ KNOWN_POLICIES = {
 }
 
 
-def get_scheduler(policy_or_spec: str | SchedulerSpec | dict[str, Any] | Any = "orbitserve") -> RuntimeScheduler:
-    spec = _coerce_scheduler_spec(policy_or_spec)
-    policy_name = spec.policy
-    if policy_name not in KNOWN_POLICIES:
+def build_candidate_selector(
+    policy_or_spec: str | RuntimeStrategySpec | dict[str, Any] = "orbitserve",
+) -> CandidateSelector:
+    if not isinstance(policy_or_spec, (str, RuntimeStrategySpec, dict)):
+        raise TypeError("scheduler value must be a policy string, RuntimeStrategySpec, or mapping")
+    spec = RuntimeStrategySpec.from_value(
+        {"policy": policy_or_spec} if isinstance(policy_or_spec, str) else policy_or_spec
+    )
+    if spec.policy not in KNOWN_POLICIES:
         known = ", ".join(sorted(KNOWN_POLICIES))
-        raise ValueError(f"unknown scheduler policy '{policy_name}'. Known policies: {known}")
-    return RuntimeScheduler(spec)
-
-
-def _coerce_scheduler_spec(value: str | SchedulerSpec | dict[str, Any] | Any) -> SchedulerSpec:
-    if isinstance(value, RuntimeScheduler):
-        return replace(value.spec, policy=_canonical_policy(value.spec.policy))
-    if isinstance(value, SchedulerSpec):
-        return replace(value, policy=_canonical_policy(value.policy))
-    if isinstance(value, str):
-        return SchedulerSpec.from_dict({"policy": value})
-    if isinstance(value, dict):
-        return SchedulerSpec.from_dict(value)
-    payload = {
-        key: getattr(value, key)
-        for key in (
-            "policy",
-            "lookahead_orbits",
-            "name",
-            "policy_family",
-            "enabled_actions",
-            "session_actions_enabled",
-            "dvfs_modes_enabled",
-            "h_lookahead_s",
-            "max_hop_count",
-            "fallback_enabled",
-            "defer_enabled",
-            "path_policy",
-            "queue_policy",
-            "hard_gate_mode",
-            "hard_gate_overrides",
-            "weights",
-            "normalization_refs",
-            "random_seed",
-            "trace_level",
-            "kv_policy",
-        )
-        if hasattr(value, key)
-    }
-    if not payload:
-        raise TypeError("scheduler value must be a policy string, SchedulerSpec, mapping, or scheduler-like object")
-    if "policy" not in payload:
-        raise TypeError("scheduler-like object must expose a policy field")
-    return SchedulerSpec.from_dict(payload)
+        raise ValueError(f"unknown scheduler policy '{spec.policy}'. Known policies: {known}")
+    return CandidateSelector(spec)
 
 
 def _canonical_policy(value: str) -> str:
@@ -829,8 +538,6 @@ def _normalization_refs(
 ) -> dict[str, float]:
     configured = _mapping_from_value(runtime_strategy.get("normalization_refs"))
     state_refs = _mapping_from_value(state.get("normalization_refs"))
-    e2e_deadline = _optional_float(request.get("e2e_deadline_s"))
-    ttft_deadline = _optional_float(request.get("ttft_deadline_s"))
     candidate_max = {
         "latency_s": max(
             1.0,
@@ -845,19 +552,14 @@ def _normalization_refs(
     }
     latency_default = max(
         1.0,
-        _finite_or(e2e_deadline, 0.0),
         *(_finite_or(candidate.predicted_e2e_s, 0.0) for candidate in candidates),
         *(_finite_or(candidate.predicted_nominal_latency_s, 0.0) for candidate in candidates),
     )
     ttft_default = max(
         1.0,
-        _finite_or(ttft_deadline, 0.0),
         *(_finite_or(candidate.predicted_ttft_s, 0.0) for candidate in candidates),
     )
-    symbolic_values = {
-        "e2e_deadline_s": e2e_deadline,
-        "ttft_deadline_s": ttft_deadline,
-    }
+    symbolic_values: dict[str, float | None] = {}
     return {
         "latency_s": _normalization_ref(
             configured.get("latency_s"),
@@ -903,7 +605,6 @@ def _normalization_refs(
         ),
         "tokens": _positive_float(configured.get("tokens"), state_refs.get("tokens"), request.get("prompt_tokens"), 1.0),
         "hbm_occupancy": _positive_float(configured.get("hbm_occupancy"), state_refs.get("hbm_occupancy"), 1.0),
-        "expiry_risk": _positive_float(configured.get("expiry_risk"), state_refs.get("expiry_risk"), 1.0),
     }
 
 
@@ -916,12 +617,6 @@ def _with_scheduler_gate_results(
     """Make scheduler admission self-contained for direct and runtime callers."""
 
     results = _mapping_from_value(candidate.hard_gate_results)
-    ttft_deadline = _optional_float(request.get("ttft_deadline_s"))
-    e2e_deadline = _optional_float(request.get("e2e_deadline_s"))
-    ttft = _finite_optional(candidate.predicted_ttft_s)
-    e2e = _finite_optional(candidate.predicted_e2e_s)
-    results["slo_ttft"] = _deadline_gate_result("ttft", ttft, ttft_deadline)
-    results["slo_e2e"] = _deadline_gate_result("e2e", e2e, e2e_deadline)
     results["physical_eligibility"] = {
         "passed": candidate.feasible,
         "reason": None if candidate.feasible else "candidate_marked_infeasible",
@@ -947,10 +642,6 @@ def _with_scheduler_gate_results(
             "soc_slack": None if predicted_soc_after is None else predicted_soc_after - soc_min,
         }
     scheduler_owned_reasons = {
-        "predicted_ttft_deadline_miss",
-        "predicted_e2e_deadline_miss",
-        "predicted_ttft_unavailable",
-        "predicted_e2e_unavailable",
         "candidate_marked_infeasible",
     }
     if soc_min is not None:
@@ -970,29 +661,6 @@ def _with_scheduler_gate_results(
         hard_gate_violations=tuple(violations),
         hard_gate_results=to_jsonable(results),
     )
-
-
-def _deadline_gate_result(
-    metric_name: str,
-    predicted_s: float | None,
-    deadline_s: float | None,
-) -> dict[str, Any]:
-    if deadline_s is None:
-        return {"passed": None, "reason": None, "predicted_s": predicted_s, "deadline_s": None}
-    if predicted_s is None:
-        return {
-            "passed": False,
-            "reason": f"predicted_{metric_name}_unavailable",
-            "predicted_s": None,
-            "deadline_s": deadline_s,
-        }
-    passed = predicted_s <= deadline_s
-    return {
-        "passed": passed,
-        "reason": None if passed else f"predicted_{metric_name}_deadline_miss",
-        "predicted_s": predicted_s,
-        "deadline_s": deadline_s,
-    }
 
 
 def _finite_optional(value: Any) -> float | None:

@@ -9,9 +9,9 @@ from unittest.mock import patch
 from orbitserve.baselines.ground.costing import estimate_terrestrial_ground_cost
 from orbitserve.dse.search import DSERuntimeMatrixSpec
 from orbitserve.dse.runtime_matrix import DSEDesignContext, evaluate_runtime_matrix
-from orbitserve.runtime.contracts import RuntimeScenario, RuntimeStrategySpec
+from orbitserve.runtime import RuntimeScenario, RuntimeStrategySpec
 from orbitserve.experiments.runtime_dispatch import evaluate_runtime_performance
-from orbitserve.runtime.runtime_records import RuntimeRequestRecord
+from orbitserve.runtime.metrics.runtime_records import RuntimeRequestRecord
 
 
 def _record(
@@ -381,7 +381,7 @@ class TerrestrialGroundCostTests(unittest.TestCase):
             design_id="leo-context-that-must-not-leak",
             design_row={},
             runtime_scenario=SimpleNamespace(
-                scenario_id="source", serving_deployments=(), provenance={}
+                scenario_id="source", serving_profile=None, provenance={}
             ),
             current_scheduler={"policy": "local_only"},
             cost_result={

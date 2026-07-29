@@ -11,7 +11,7 @@ from orbitserve.experiments.constellation_cost import ConstellationCostResult, C
 from orbitserve.dse.search import DSESpec, DSEStudyResult
 from orbitserve.architecture import HardwareSpec
 from orbitserve.common import PerformanceMetrics, SLOMetrics
-from orbitserve.runtime import SchedulerSpec
+from orbitserve.runtime import RuntimeStrategySpec
 from orbitserve.serving import ServingSpec
 from orbitserve.orbit import SimulationConfig
 from orbitserve.workload import WorkloadBundleRef
@@ -25,7 +25,7 @@ class ExperimentSpec:
     workload: WorkloadBundleRef = field(default_factory=WorkloadBundleRef)
     serving: ServingSpec = field(default_factory=ServingSpec)
     simulation: SimulationConfig = field(default_factory=SimulationConfig)
-    scheduler: SchedulerSpec = field(default_factory=SchedulerSpec)
+    scheduler: RuntimeStrategySpec = field(default_factory=lambda: RuntimeStrategySpec.from_value(None))
     dse: DSESpec = field(default_factory=DSESpec)
     hardware: HardwareSpec | None = None
     description: str = ""
@@ -42,7 +42,7 @@ class ExperimentSpec:
             workload=WorkloadBundleRef.from_dict(data.get("workload")),
             serving=ServingSpec.from_dict(data.get("serving")),
             simulation=SimulationConfig.from_dict(data.get("simulation")),
-            scheduler=SchedulerSpec.from_dict(data.get("scheduler")),
+            scheduler=RuntimeStrategySpec.from_dict(data.get("scheduler")),
             dse=DSESpec.from_dict(data.get("dse")),
             base_dir=base_dir,
         )

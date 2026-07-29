@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 from orbitserve.experiments import load_experiment_spec
-from orbitserve.runtime.routing import find_access_candidates
+from orbitserve.runtime.engine.routing import find_access_candidates
 from orbitserve.orbit.simulation_traces import RuntimeTraceBundle, RuntimeTraceManifest, load_surrogate_trace_bundle
 from orbitserve.workload import GatewaySpec, RegionSpec, WorkloadGenerationResult, materialize_workload_bundle
 

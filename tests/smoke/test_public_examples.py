@@ -22,13 +22,13 @@ class PublicExampleTests(unittest.TestCase):
     def test_fixed_design_geometry_example_runs_full_runtime_path(self):
         payload = self._run_example("fixed_design_geometry")
         self.assertEqual(payload["module_status"]["simulation"], "geometry_trace")
-        self.assertEqual(payload["module_status"]["runtime_performance"], "optimized")
+        self.assertEqual(payload["module_status"]["runtime_performance"], "evaluated")
         self.assertFalse(payload["performance"]["details"]["runtime"]["valid_for_paper_main_results"])
         self.assertEqual(payload["dse"]["design_count"], 0)
 
     def test_orbit_geometry_dse_example_evaluates_four_candidates(self):
         payload = self._run_example("orbit_geometry_dse")
-        self.assertEqual(payload["module_status"]["runtime_performance"], "optimized")
+        self.assertEqual(payload["module_status"]["runtime_performance"], "evaluated")
         self.assertFalse(payload["performance"]["details"]["runtime"]["valid_for_paper_main_results"])
         self.assertTrue(payload["dse"]["evaluated"])
         self.assertEqual(payload["dse"]["design_count"], 4)

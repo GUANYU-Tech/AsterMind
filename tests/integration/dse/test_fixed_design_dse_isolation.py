@@ -70,9 +70,8 @@ class FixedDesignAndDSEIsolationTests(unittest.TestCase):
         self.assertEqual(baseline["constellation_architecture"], fixed["constellation_architecture"])
         self.assertEqual(baseline["cost"], fixed["cost"])
 
-        # DSE adds a static-SLO projection while fixed simulation may add a
-        # scheduler optimization.  Compare their shared serving and current-
-        # runtime evaluation before those caller-specific post-processing steps.
+        # DSE adds a static-SLO projection, while both paths use the same
+        # fixed RuntimeStrategySpec for the shared Runtime evaluation.
         for field in (
             "prefill_tokens_per_s",
             "decode_tokens_per_s",
@@ -83,12 +82,8 @@ class FixedDesignAndDSEIsolationTests(unittest.TestCase):
         baseline_runtime = json.loads(
             json.dumps(_runtime_result_summary(baseline["performance"]["details"]["runtime"]))
         )
-        fixed_runtime = fixed["performance"]["details"]["runtime_initial"]
+        fixed_runtime = json.loads(json.dumps(_runtime_result_summary(fixed["performance"]["details"]["runtime"])))
         self.assertEqual(_without_warnings(baseline_runtime), _without_warnings(fixed_runtime))
-        self.assertEqual(
-            _without_warnings(baseline["performance"]["details"]["runtime_current_strategy"]),
-            _without_warnings(fixed["performance"]["details"]["runtime_current_strategy"]),
-        )
 
 
     def test_duplicate_candidate_names_get_unique_rows_traces_and_runtime_matrix_ids(self):

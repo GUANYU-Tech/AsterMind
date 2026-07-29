@@ -38,9 +38,9 @@ PERFORMANCE_FIELDS = (
 )
 
 SLO_FIELDS = (
-    "served_ratio",
-    "rejected_ratio",
-    "timeout_ratio",
+    "completion_ratio",
+    "uncompleted_ratio",
+
     "energy_violation_count",
     "isl_congestion_p95",
     "sgl_congestion_p95",
@@ -68,23 +68,21 @@ class RuntimeOptimizationObjective:
     name: str = "cost_slo_weighted"
     missing_metric_policy: str = "keep_with_warning"
     allow_preliminary_runtime_metrics: bool = False
-    allow_idealized_runtime_metrics: bool = False
     ignore_optional_cost: bool = False
     weights: dict[str, float] = field(
-        default_factory=lambda: {"served": 1.0, "tail": 1.0, "cost": 1.0}
+        default_factory=lambda: {"completion": 1.0, "tail": 1.0, "cost": 1.0}
     )
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any] | None) -> "RuntimeOptimizationObjective":
         if data is None:
             return cls()
-        allow_idealized = bool(data.get("allow_idealized_runtime_metrics", False))
         allow_preliminary = bool(
             data.get(
                 "allow_preliminary_runtime_metrics",
                 data.get(
                     "allow_surrogate_runtime_metrics",
-                    data.get("allow_sanity_runtime_metrics", allow_idealized),
+                    data.get("allow_sanity_runtime_metrics", False),
                 ),
             )
         )
@@ -92,7 +90,6 @@ class RuntimeOptimizationObjective:
             name=str(data.get("name", "cost_slo_weighted")),
             missing_metric_policy=str(data.get("missing_metric_policy", "keep_with_warning")),
             allow_preliminary_runtime_metrics=allow_preliminary,
-            allow_idealized_runtime_metrics=allow_idealized,
             ignore_optional_cost=bool(data.get("ignore_optional_cost", False)),
             weights={str(k): float(v) for k, v in dict(data.get("weights") or {}).items()},
         )
@@ -277,7 +274,7 @@ def optimize_runtime_strategy(
     if selected is None:
         result_warnings.append(
             "runtime evaluator did not provide complete evaluated metrics; optimizer cannot claim "
-            "served_ratio, TTFT, E2E, or cost-SLO improvements"
+            "completion_ratio, TTFT, E2E, or cost-SLO improvements"
         )
     if any(row.objective_score is None for row in rows):
         result_warnings.append(
@@ -449,7 +446,6 @@ def _kv_policy_candidates(search_space: RuntimeStrategySearchSpace) -> tuple[dic
                 "kv_post_turn_actions_enabled",
                 "replica_count_limit",
                 "replica_target_deployment_id",
-                "session_ttl_s",
                 "kv_page_size_tokens",
                 "kv_page_metadata_bytes",
                 "kv_fragmentation_reserve_fraction",
@@ -487,7 +483,7 @@ def _scheduler_for_policy(
 
 def _default_scheduler_for_policy(policy: str) -> dict[str, Any]:
     try:
-        from .contracts import RuntimeStrategySpec
+        from ..contracts import RuntimeStrategySpec
 
         return RuntimeStrategySpec.from_dict({"policy": policy}).to_dict()
     except Exception:
@@ -523,24 +519,16 @@ def _default_scheduler_for_policy(policy: str) -> dict[str, Any]:
 def _strategy_object(scheduler: Mapping[str, Any]) -> Any:
     payload = {k: v for k, v in scheduler.items() if k != "strategy_id"}
     try:
-        from .contracts import RuntimeStrategySpec
+        from ..runtime import RuntimeStrategySpec
 
-        if hasattr(RuntimeStrategySpec, "from_dict"):
-            return RuntimeStrategySpec.from_dict(dict(payload))
-        return RuntimeStrategySpec(**payload)
-    except Exception:
-        pass
-    try:
-        from .schedulers import SchedulerSpec
-
-        return SchedulerSpec.from_dict(dict(payload))
-    except Exception:
+        return RuntimeStrategySpec.from_dict(dict(payload))
+    except (ImportError, TypeError, ValueError):
         return dict(payload)
 
 
 def _default_evaluator(scenario: Any, strategy: Any) -> Any:
     try:
-        from .evaluation import evaluate_runtime_performance
+        from ..runtime import evaluate_runtime_performance
     except Exception as exc:
         return _unevaluated_result(f"default runtime evaluator is unavailable: {exc}")
     try:
@@ -595,12 +583,11 @@ def _summarize_evaluator_result(result: Any) -> dict[str, Any]:
         }
     if not slo and runtime_metrics:
         slo = {
-            "served_ratio": runtime_metrics.get("served_ratio"),
-            "rejected_ratio": _first_present(
-                runtime_metrics.get("rejected_ratio"),
+            "completion_ratio": runtime_metrics.get("completion_ratio"),
+            "uncompleted_ratio": _first_present(
+                runtime_metrics.get("uncompleted_ratio"),
                 runtime_metrics.get("reject_ratio"),
             ),
-            "timeout_ratio": runtime_metrics.get("timeout_ratio"),
             "energy_violation_count": runtime_metrics.get("energy_violation_count"),
             "isl_congestion_p95": runtime_metrics.get("isl_congestion_p95"),
             "sgl_congestion_p95": runtime_metrics.get("sgl_congestion_p95"),
@@ -732,18 +719,18 @@ def _objective_score(
         )
     performance = _mapping_from_value(evaluator_result.get("performance"))
     slo = _mapping_from_value(evaluator_result.get("slo"))
-    served_ratio = slo.get("served_ratio")
+    completion_ratio = slo.get("completion_ratio")
     e2e_p95_s = performance.get("e2e_p95_s")
-    if served_ratio is None or e2e_p95_s is None:
+    if completion_ratio is None or e2e_p95_s is None:
         return (
             None,
             None,
             valid_for_paper,
-            ("objective_score is null because served_ratio or e2e_p95_s is missing",),
+            ("objective_score is null because completion_ratio or e2e_p95_s is missing",),
             _score_provenance(objective, None, valid_for_paper),
         )
     score = (
-        -objective.weights.get("served", 1.0) * float(served_ratio)
+        -objective.weights.get("completion", 1.0) * float(completion_ratio)
         + objective.weights.get("tail", 1.0) * float(e2e_p95_s)
     )
     cost_weight = objective.weights.get("cost", 0.0)
@@ -790,7 +777,7 @@ def _selected_strategy_payload(row: RuntimeStrategyScoreRow | None) -> dict[str,
 
 
 def _effective_allow_preliminary_runtime_metrics(objective: RuntimeOptimizationObjective) -> bool:
-    return bool(objective.allow_preliminary_runtime_metrics or objective.allow_idealized_runtime_metrics)
+    return bool(objective.allow_preliminary_runtime_metrics)
 
 
 def _preliminary_score_scope(details: Mapping[str, Any]) -> str:
@@ -798,8 +785,6 @@ def _preliminary_score_scope(details: Mapping[str, Any]) -> str:
     scope = str(details.get("scope") or details.get("runtime_scope") or "")
     if "surrogate" in trace_model or "surrogate" in scope or trace_model == "circular_geometry_trace":
         return "preliminary_surrogate"
-    if scope == "idealized_compute_only" or trace_model == "ideal_full_visibility":
-        return "preliminary_idealized"
     return "preliminary_model"
 
 
@@ -813,7 +798,6 @@ def _score_provenance(
         "objective_score_scope": score_scope,
         "valid_for_paper_main_results": valid_for_paper_main_results,
         "allow_preliminary_runtime_metrics": objective.allow_preliminary_runtime_metrics,
-        "allow_idealized_runtime_metrics": objective.allow_idealized_runtime_metrics,
         "ignore_optional_cost": objective.ignore_optional_cost,
         "missing_metric_policy": objective.missing_metric_policy,
     }

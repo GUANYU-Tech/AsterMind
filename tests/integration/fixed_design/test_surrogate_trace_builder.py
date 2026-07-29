@@ -13,7 +13,7 @@ from orbitserve.orbit.simulation_traces import (
     load_surrogate_trace_bundle,
 )
 from orbitserve.workload import materialize_workload_bundle
-from orbitserve.runtime.routing import find_access_candidates, find_next_access_candidate
+from orbitserve.runtime.engine.routing import find_access_candidates, find_next_access_candidate
 
 
 ROOT = Path(__file__).resolve().parents[3]

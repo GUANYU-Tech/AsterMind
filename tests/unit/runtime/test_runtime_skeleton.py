@@ -1,16 +1,9 @@
 import importlib
-import sys
+from copy import deepcopy
 import unittest
-from dataclasses import replace
-from pathlib import Path
 
-
-from orbitserve.experiments import load_experiment_spec, run_experiment
-from orbitserve.runtime.runtime_optimization import optimize_runtime_strategy
-from orbitserve.runtime.schedulers import RuntimeScheduler, SchedulerCandidate, get_scheduler
-
-
-ROOT = Path(__file__).resolve().parents[3]
+from orbitserve.runtime.contracts import ServingCapacityProfile
+from orbitserve.runtime.engine.decision import CandidateSelector, SchedulerCandidate, build_candidate_selector
 
 
 def _optional_import(module_name):
@@ -22,16 +15,15 @@ def _optional_import(module_name):
         raise
 
 
-def _to_dict(value):
-    if hasattr(value, "to_dict"):
-        return value.to_dict()
-    return value
-
-
 def _runtime_scenario(runtime, *, requests=None, sessions=None):
-    spec = load_experiment_spec(ROOT / "tests/fixtures/manifests/smoke_single_design.json")
-    experiment = run_experiment(spec)
-    performance = experiment.performance.to_dict()
+    performance = {
+        "evaluated": True,
+        "feasible": True,
+        "prefill_tokens_per_s": 100.0,
+        "decode_tokens_per_s": 50.0,
+        "kv_cache_capacity_tokens": 100000,
+        "request_throughput_per_s": 1.0,
+    }
     strategy = runtime.RuntimeStrategySpec.from_dict(
         {
             "policy": "orbitserve",
@@ -42,16 +34,16 @@ def _runtime_scenario(runtime, *, requests=None, sessions=None):
             "weights": {"latency": 1.0, "energy": 0.5, "queue": 1.0, "fallback": 10.0},
         }
     )
-    deployment = runtime.ServingDeploymentView.from_value(performance)
-    scenario = runtime.RuntimeScenario(
-        scenario_id=spec.experiment_id,
-        time_horizon_s=spec.simulation.duration_s,
+    deployment = ServingCapacityProfile.from_value(performance)
+    scenario = runtime.RuntimeSimulationSpec(
+        strategy=strategy,
+        scenario_id="runtime-unit",
+        time_horizon_s=60.0,
         workload_bundle={"status": "loaded", "request_count": len(requests or [])},
         requests=tuple(requests or [_request()]),
         sessions=tuple(sessions or ()),
         simulation_trace_ref={"evaluated": False, "warnings": ["simulation is a skeleton"]},
-        serving_deployments=(deployment,),
-        runtime_config=strategy,
+        serving_profile=deployment,
         warnings=("simulation trace is not implemented; runtime observed metrics are null",),
     )
     return scenario, strategy, performance
@@ -70,9 +62,6 @@ def _request(**overrides):
         "output_tokens": 128,
         "input_bytes": 1024,
         "output_bytes": 256,
-        "slo_class": "interactive_5s",
-        "ttft_deadline_s": 5.0,
-        "e2e_deadline_s": 30.0,
         "session_id": "session-0",
         "turn_index": 0,
         "session_turn_count": 1,
@@ -109,26 +98,24 @@ class RuntimeSkeletonTests(unittest.TestCase):
         self.assertTrue(payload["defer_enabled"])
         self.assertEqual(payload["weights"]["fallback"], 10.0)
 
-    def test_top_level_scheduler_exposes_runtime_bridge(self):
-        scheduler = get_scheduler("orbitserve")
+    def test_top_level_scheduler_exposes_fixed_runtime_strategy(self):
+        scheduler = build_candidate_selector("orbitserve")
         decision = scheduler.select_action(state=None, request=None).to_dict()
 
-        self.assertIsInstance(scheduler, RuntimeScheduler)
-        self.assertEqual(decision["action"], "scheduler_bridge/runtime_strategy_preview")
+        self.assertIsInstance(scheduler, CandidateSelector)
+        self.assertEqual(decision["action"], "no_candidate")
         self.assertFalse(decision["evaluated"])
         self.assertEqual(decision["runtime_strategy"]["policy"], "orbitserve")
         self.assertIn("local_compute", decision["runtime_strategy"]["enabled_actions"])
-        self.assertTrue(decision["optimization_support"]["runtime_strategy_available"])
-        self.assertGreaterEqual(decision["optimization_support"]["candidate_strategy_count"], 5)
-        self.assertIn("orbitserve", decision["optimization_support"]["candidate_policies"])
-        self.assertTrue(decision["candidate_strategies"])
+        self.assertFalse(decision["optimization_support"]["strategy_mutable_during_run"])
         self.assertEqual(
-            decision["optimization_support"]["runtime_optimization_entrypoint"],
-            "orbitserve.runtime_optimization.optimize_runtime_strategy",
+            decision["optimization_support"]["selection_mode"],
+            "deterministic_request_candidate_ranking",
         )
+        self.assertEqual(decision["module_status"]["runtime_strategy"], "fixed_for_run")
 
     def test_top_level_scheduler_selects_request_level_candidate(self):
-        scheduler = get_scheduler("energy_aware")
+        scheduler = build_candidate_selector("energy_aware")
         local_candidate = SchedulerCandidate(
             candidate_id="local",
             action_type="local_compute",
@@ -161,7 +148,7 @@ class RuntimeSkeletonTests(unittest.TestCase):
         )
         decision = scheduler.select_action(
             state={"candidates": (local_candidate.to_dict(), offload_candidate.to_dict())},
-            request={"request_id": "req-0", "ttft_deadline_s": 60.0, "e2e_deadline_s": 300.0},
+            request={"request_id": "req-0"},
         ).to_dict()
 
         self.assertTrue(decision["evaluated"])
@@ -171,11 +158,11 @@ class RuntimeSkeletonTests(unittest.TestCase):
         self.assertEqual(decision["feasible_candidate_count"], 2)
         self.assertEqual(
             decision["score_terms"]["score_model"],
-            "request_level_slo_aware_surrogate_not_full_shadow_kv_marginal_rule",
+            "request_level_resource_aware_surrogate",
         )
         self.assertEqual(
-            decision["optimization_support"]["paper_rule_status"],
-            "request_level_slo_aware_surrogate_not_full_shadow_kv_marginal_rule",
+            decision["optimization_support"]["selection_mode"],
+            "deterministic_request_candidate_ranking",
         )
 
     def test_hard_gate_mode_controls_candidate_admission(self):
@@ -221,17 +208,17 @@ class RuntimeSkeletonTests(unittest.TestCase):
             "energy": 0.0,
             "hop": 0.0,
         }
-        strict = get_scheduler(
+        strict = build_candidate_selector(
             {"policy": "orbitserve", "hard_gate_mode": "strict", "weights": gate_mode_test_weights}
         ).select_action(
             state={"candidates": (violating_fast.to_dict(), safe_slow.to_dict())},
-            request={"request_id": "req-0", "ttft_deadline_s": 60.0, "e2e_deadline_s": 300.0},
+            request={"request_id": "req-0"},
         ).to_dict()
-        audit = get_scheduler(
+        audit = build_candidate_selector(
             {"policy": "orbitserve", "hard_gate_mode": "audit_only", "weights": gate_mode_test_weights}
         ).select_action(
             state={"candidates": (violating_fast.to_dict(), safe_slow.to_dict())},
-            request={"request_id": "req-0", "ttft_deadline_s": 60.0, "e2e_deadline_s": 300.0},
+            request={"request_id": "req-0"},
         ).to_dict()
 
         self.assertEqual(strict["selected_candidate_id"], "safe-slow")
@@ -264,7 +251,7 @@ class RuntimeSkeletonTests(unittest.TestCase):
                 },
             )
 
-        decision = get_scheduler(
+        decision = build_candidate_selector(
             {"policy": "shortest_path", "weights": {"hop": 0.0}}
         ).select_action(
             state={
@@ -290,52 +277,6 @@ class RuntimeSkeletonTests(unittest.TestCase):
         self.assertEqual(rejected_slow["score_terms"]["normalization_refs"]["latency_s"], 20.0)
         self.assertEqual(rejected_slow["score_terms"]["normalized_e2e"], 1.0)
 
-    def test_scheduler_hard_rejects_all_candidates_that_miss_deadline(self):
-        def candidate(candidate_id, satellite_id, predicted_e2e_s):
-            return SchedulerCandidate(
-                candidate_id=candidate_id,
-                action_type="cross_satellite_forward",
-                feasible=True,
-                route_plan={"compute_satellite_id": satellite_id},
-                predicted_ttft_s=1.0,
-                predicted_e2e_s=predicted_e2e_s,
-                predicted_queue_wait_s=0.0,
-                predicted_link_wait_s=0.0,
-                predicted_energy_risk=0.0,
-                predicted_soc_after=0.8,
-                hop_count=1,
-                predicted_nominal_latency_s=predicted_e2e_s,
-                provenance={
-                    "compute_satellite_id": satellite_id,
-                    "access_satellite_id": "access",
-                    "path_id": candidate_id,
-                },
-            )
-
-        decision = get_scheduler(
-            {"policy": "shortest_path", "weights": {"hop": 0.0}}
-        ).select_action(
-            state={
-                "candidates": (
-                    candidate("slow", "sat-a", 20.0).to_dict(),
-                    candidate("fast", "sat-b", 10.0).to_dict(),
-                )
-            },
-            request={"request_id": "req-deadline-gate", "e2e_deadline_s": 5.0},
-        ).to_dict()
-
-        self.assertEqual(decision["action"], "reject_drop")
-        self.assertEqual(decision["feasible_candidate_count"], 0)
-        self.assertEqual(
-            decision["gate_results"]["violations_by_gate"]["predicted_e2e_deadline_miss"],
-            2,
-        )
-        self.assertTrue(
-            all(item["rejection_reason"] == "hard_gate_violation" for item in decision["rejected_candidates"])
-        )
-        self.assertTrue(
-            all(item["score_terms"]["hard_gate_penalty"] == 0.0 for item in decision["rejected_candidates"])
-        )
 
     def test_scheduler_hard_rejects_physical_ineligibility(self):
         ineligible = SchedulerCandidate(
@@ -369,7 +310,7 @@ class RuntimeSkeletonTests(unittest.TestCase):
             provenance={"compute_satellite_id": "sat-b", "access_satellite_id": "access", "path_id": "slow"},
         )
 
-        decision = get_scheduler("shortest_path").select_action(
+        decision = build_candidate_selector("shortest_path").select_action(
             state={"candidates": (ineligible.to_dict(), eligible.to_dict())},
             request={"request_id": "req-physical-gate"},
         ).to_dict()
@@ -379,116 +320,6 @@ class RuntimeSkeletonTests(unittest.TestCase):
         self.assertEqual(rejected["rejection_reason"], "candidate_marked_infeasible")
         self.assertFalse(rejected["hard_gate_results"]["physical_eligibility"]["passed"])
 
-    def test_scheduler_recomputes_stale_deadline_gate_results(self):
-        stale = SchedulerCandidate(
-            candidate_id="stale-pass",
-            action_type="local_compute",
-            feasible=True,
-            route_plan={"compute_satellite_id": "sat-a"},
-            predicted_ttft_s=1.0,
-            predicted_e2e_s=20.0,
-            predicted_queue_wait_s=0.0,
-            predicted_link_wait_s=0.0,
-            predicted_energy_risk=0.0,
-            predicted_soc_after=0.8,
-            hop_count=0,
-            hard_gate_results={"slo_e2e": {"passed": True, "reason": None}},
-            predicted_nominal_latency_s=20.0,
-        )
-        valid = SchedulerCandidate(
-            candidate_id="valid",
-            action_type="local_compute",
-            feasible=True,
-            route_plan={"compute_satellite_id": "sat-b"},
-            predicted_ttft_s=1.0,
-            predicted_e2e_s=4.0,
-            predicted_queue_wait_s=2_000_000.0,
-            predicted_link_wait_s=0.0,
-            predicted_energy_risk=0.0,
-            predicted_soc_after=0.8,
-            hop_count=0,
-            predicted_nominal_latency_s=4.0,
-        )
-        decision = get_scheduler(
-            {
-                "policy": "load_aware",
-                "weights": {"latency": 0.0, "slack": 0.0, "queue": 1.0, "link": 0.0, "energy": 0.0, "hop": 0.0},
-                "normalization_refs": {"queue_s": 1.0},
-            }
-        ).select_action(
-            state={"candidates": (stale.to_dict(), valid.to_dict())},
-            request={"e2e_deadline_s": 5.0},
-        ).to_dict()
-
-        self.assertEqual(decision["selected_candidate_id"], "valid")
-        self.assertEqual(decision["feasible_candidate_count"], 1)
-        rejected = decision["rejected_candidates"][0]
-        self.assertIn("predicted_e2e_deadline_miss", rejected["hard_gate_violations"])
-        self.assertFalse(rejected["hard_gate_results"]["slo_e2e"]["passed"])
-
-    def test_scheduler_fail_closes_missing_and_nonfinite_deadline_metrics(self):
-        candidates = tuple(
-            SchedulerCandidate(
-                candidate_id=candidate_id,
-                action_type="local_compute",
-                feasible=True,
-                route_plan={"compute_satellite_id": candidate_id},
-                predicted_ttft_s=1.0,
-                predicted_e2e_s=predicted_e2e_s,
-                predicted_queue_wait_s=0.0,
-                predicted_link_wait_s=0.0,
-                predicted_energy_risk=0.0,
-                predicted_soc_after=0.8,
-                hop_count=0,
-                predicted_nominal_latency_s=predicted_e2e_s,
-            ).to_dict()
-            for candidate_id, predicted_e2e_s in (("missing", None), ("nan", float("nan")))
-        )
-        decision = get_scheduler("shortest_path").select_action(
-            state={"candidates": candidates},
-            request={"e2e_deadline_s": 5.0},
-        ).to_dict()
-
-        self.assertEqual(decision["action"], "reject_drop")
-        self.assertEqual(decision["feasible_candidate_count"], 0)
-        self.assertEqual(
-            decision["gate_results"]["violations_by_gate"]["predicted_e2e_unavailable"],
-            2,
-        )
-
-    def test_scheduler_resolves_symbolic_shared_normalization_refs(self):
-        candidates = tuple(
-            SchedulerCandidate(
-                candidate_id=candidate_id,
-                action_type="local_compute",
-                feasible=True,
-                route_plan={"compute_satellite_id": candidate_id},
-                predicted_ttft_s=1.0,
-                predicted_e2e_s=e2e,
-                predicted_queue_wait_s=queue,
-                predicted_link_wait_s=0.0,
-                predicted_energy_risk=0.0,
-                predicted_soc_after=0.8,
-                hop_count=0,
-                predicted_nominal_latency_s=e2e,
-            ).to_dict()
-            for candidate_id, e2e, queue in (("slow", 20.0, 2.0), ("fast", 10.0, 1.0))
-        )
-        decision = get_scheduler(
-            {
-                "policy": "shortest_path",
-                "hard_gate_mode": "audit_only",
-                "normalization_refs": {"latency_s": "e2e_deadline_s", "queue_s": "candidate_max"},
-            }
-        ).select_action(
-            state={"candidates": candidates},
-            request={"e2e_deadline_s": 5.0},
-        ).to_dict()
-
-        self.assertEqual(decision["selected_candidate_id"], "fast")
-        self.assertEqual(decision["score_terms"]["normalization_refs"]["latency_s"], 5.0)
-        self.assertEqual(decision["score_terms"]["normalization_refs"]["queue_s"], 2.0)
-        self.assertEqual(decision["score_terms"]["normalized_e2e"], 2.0)
 
     def test_scheduler_recomputes_soc_gate_when_threshold_is_available(self):
         candidate = SchedulerCandidate(
@@ -506,7 +337,7 @@ class RuntimeSkeletonTests(unittest.TestCase):
             hard_gate_results={"energy_soc": {"passed": True, "reason": None, "soc_min": 0.2}},
             predicted_nominal_latency_s=2.0,
         )
-        decision = get_scheduler("shortest_path").select_action(
+        decision = build_candidate_selector("shortest_path").select_action(
             state={"candidates": (candidate.to_dict(),)},
             request={},
         ).to_dict()
@@ -530,7 +361,7 @@ class RuntimeSkeletonTests(unittest.TestCase):
             hard_gate_results={"kv_capacity": {"passed": False, "reason": None}},
             predicted_nominal_latency_s=2.0,
         )
-        decision = get_scheduler("shortest_path").select_action(
+        decision = build_candidate_selector("shortest_path").select_action(
             state={"candidates": (candidate.to_dict(),)},
             request={},
         ).to_dict()
@@ -555,7 +386,7 @@ class RuntimeSkeletonTests(unittest.TestCase):
             predicted_nominal_latency_s=2.0,
             provenance={"soc_min": 0.2},
         )
-        decision = get_scheduler(
+        decision = build_candidate_selector(
             {"policy": "shortest_path", "hard_gate_overrides": {"soc_min": 0.4}}
         ).select_action(
             state={"candidates": (candidate.to_dict(),), "soc_min": 0.3},
@@ -569,32 +400,45 @@ class RuntimeSkeletonTests(unittest.TestCase):
 
     def test_scheduler_invalid_object_handling(self):
         with self.assertRaisesRegex(TypeError, "scheduler value must be"):
-            get_scheduler(object())
-        with self.assertRaisesRegex(TypeError, "policy field"):
-            get_scheduler(type("NameOnly", (), {"name": "invalid"})())
+            build_candidate_selector(object())
+        with self.assertRaisesRegex(TypeError, "scheduler value must be"):
+            build_candidate_selector(type("NameOnly", (), {"name": "invalid"})())
 
-    def test_scheduler_can_disable_closed_loop_runtime_optimization(self):
-        scheduler = get_scheduler({"policy": "nearest_visible", "runtime_optimization_enabled": False})
-        search_space = scheduler.optimization_search_space()
+    def test_candidate_selection_does_not_mutate_engine_state_view(self):
+        candidate = SchedulerCandidate(
+            candidate_id="candidate",
+            action_type="local_compute",
+            feasible=True,
+            route_plan={"compute_satellite_id": "sat-a"},
+            predicted_ttft_s=1.0,
+            predicted_e2e_s=2.0,
+            predicted_queue_wait_s=0.0,
+            predicted_link_wait_s=0.0,
+            predicted_energy_risk=0.0,
+            predicted_soc_after=0.8,
+            hop_count=0,
+        )
+        state_view = {"candidates": (candidate.to_dict(),), "soc_min": 0.2}
+        before = deepcopy(state_view)
 
-        self.assertFalse(search_space["enabled"])
-        self.assertEqual(search_space["candidate_schedulers"], ())
-        result = optimize_runtime_strategy(object(), search_space=search_space).to_dict()
-        self.assertFalse(result["evaluated"])
-        self.assertEqual(result["candidate_count"], 0)
-        self.assertFalse(result["scheduler_search_space"]["enabled"])
+        build_candidate_selector("shortest_path").select_action(
+            state=state_view,
+            request={"request_id": "request"},
+        )
+
+        self.assertEqual(state_view, before)
 
     def test_performance_skeleton_keeps_observed_metrics_null_without_trace(self):
         scenario, strategy, serving_performance = _runtime_scenario(self.runtime)
-        result = self.runtime.evaluate_runtime_performance(scenario, strategy).to_dict()
+        result = self.runtime.run_runtime_simulation(scenario).to_dict()
 
         self.assertFalse(result["evaluated"])
         self.assertEqual(result["module_status"]["simulation"], "skeleton")
-        self.assertIsNone(result["runtime_metrics"]["served_ratio"])
+        self.assertIsNone(result["runtime_metrics"]["completion_ratio"])
         self.assertIsNone(result["runtime_metrics"]["ttft_p95_s"])
         self.assertIsNone(result["runtime_metrics"]["e2e_p95_s"])
         self.assertNotEqual(
-            result["runtime_metrics"]["served_ratio"],
+            result["runtime_metrics"]["completion_ratio"],
             serving_performance["request_throughput_per_s"],
         )
         self.assertTrue(result["warnings"])
@@ -615,16 +459,16 @@ class RuntimeSkeletonTests(unittest.TestCase):
             requests=[
                 _request(
                     assigned_satellite="sat-0",
-                    served=True,
-                    served_ratio=1.0,
+                    completed=True,
+                    completion_ratio=1.0,
                     observed_e2e_s=3.0,
                     cost_per_served_mtoken_usd=1.2,
                 )
             ],
         )
 
-        with self.assertRaisesRegex(ValueError, "assigned_satellite|served_ratio|observed_e2e_s|runtime leakage"):
-            self.runtime.evaluate_runtime_performance(scenario, strategy)
+        with self.assertRaisesRegex(ValueError, "assigned_satellite|completion_ratio|observed_e2e_s|runtime leakage"):
+            self.runtime.run_runtime_simulation(scenario)
 
     def test_session_runtime_leakage_is_rejected(self):
         scenario, strategy, _performance = _runtime_scenario(
@@ -633,133 +477,8 @@ class RuntimeSkeletonTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "session_action|soc_before|runtime leakage"):
-            self.runtime.evaluate_runtime_performance(scenario, strategy)
+            self.runtime.run_runtime_simulation(scenario)
 
-    def test_runner_runtime_details_use_materialized_workload_when_integration_exists(self):
-        payload = run_experiment(
-            load_experiment_spec(ROOT / "tests/fixtures/manifests/smoke_single_design.json")
-        ).to_dict()
-        details = payload["performance"].get("details", {})
-        if "runtime" not in details or "runtime_optimization" not in details:
-            self.skipTest("runner runtime integration is not available yet")
-
-        self.assertFalse(details["runtime"]["evaluated"])
-        self.assertTrue(details["runtime"]["workload"]["configured"])
-        self.assertIsNone(payload["performance"]["ttft_p95_s"])
-        self.assertIsNone(payload["performance"]["e2e_p95_s"])
-        self.assertFalse(details["runtime_optimization"]["evaluated"])
-        optimizer = details["runtime_optimization"]
-        self.assertIsNone(optimizer["selected_strategy"])
-        self.assertGreater(len(optimizer["score_table"]), 0)
-        for row in optimizer["score_table"]:
-            self.assertIsNone(row["objective_score"])
-            self.assertFalse(row["evaluator_result"]["evaluated"])
-        row_by_policy = {row["scheduler"]["policy"]: row["scheduler"] for row in optimizer["score_table"]}
-        self.assertIn("local_compute", row_by_policy["orbitserve"]["enabled_actions"])
-        self.assertIn("defer", row_by_policy["orbitserve"]["enabled_actions"])
-        self.assertEqual(row_by_policy["orbitserve"]["path_policy"], "k_shortest_score")
-        self.assertEqual(row_by_policy["local_only"]["enabled_actions"], ["local_compute", "reject_drop"])
-        self.assertEqual(row_by_policy["local_only"]["path_policy"], "nearest")
-        self.assertEqual(row_by_policy["shortest_path"]["path_policy"], "shortest_path")
-
-    def test_runner_preserves_extended_scheduler_fields_in_runtime_strategy(self):
-        base = load_experiment_spec(ROOT / "tests/fixtures/manifests/smoke_single_design.json")
-        spec = replace(
-            base,
-            scheduler=replace(
-                base.scheduler,
-                policy="orbitserve",
-                lookahead_orbits=1.5,
-                h_lookahead_s=8550.0,
-                enabled_actions=("local_compute", "ground_fallback", "reject_drop"),
-                fallback_enabled=True,
-                defer_enabled=True,
-                weights={"latency": 1.0, "energy": 0.25, "queue": 1.0, "fallback": 10.0},
-                normalization_refs={"latency_s": "e2e_deadline_s"},
-            ),
-        )
-        payload = run_experiment(spec).to_dict()
-        strategy = payload["performance"]["details"]["runtime"]["strategy"]
-
-        self.assertEqual(strategy["policy"], "orbitserve")
-        self.assertEqual(strategy["lookahead_orbits"], 1.5)
-        self.assertEqual(strategy["h_lookahead_s"], 8550.0)
-        self.assertEqual(strategy["enabled_actions"], ["local_compute", "ground_fallback", "reject_drop"])
-        self.assertTrue(strategy["fallback_enabled"])
-        self.assertTrue(strategy["defer_enabled"])
-        self.assertEqual(strategy["weights"]["fallback"], 10.0)
-        self.assertEqual(strategy["normalization_refs"]["latency_s"], "e2e_deadline_s")
-        self.assertEqual(payload["module_status"]["scheduling"], "runtime_bridge")
-
-    def test_plain_runner_scheduler_uses_runtime_policy_defaults(self):
-        payload = run_experiment(
-            load_experiment_spec(ROOT / "tests/fixtures/manifests/smoke_single_design.json")
-        ).to_dict()
-        strategy = payload["performance"]["details"]["runtime"]["strategy"]
-        optimizer = payload["performance"]["details"]["runtime_optimization"]
-
-        self.assertEqual(strategy["policy"], "orbitserve")
-        self.assertIn("local_compute", strategy["enabled_actions"])
-        self.assertIn("ground_fallback", strategy["enabled_actions"])
-        self.assertIn("sticky_kv_owner", strategy["session_actions_enabled"])
-        self.assertEqual(strategy["path_policy"], "k_shortest_score")
-        self.assertEqual(payload["module_status"]["scheduling"], "runtime_bridge")
-        self.assertEqual(
-            optimizer["scheduler_search_space"]["provenance"]["source"],
-            "scheduler_runtime_bridge",
-        )
-        self.assertEqual(
-            optimizer["scheduler_search_space"]["current_scheduler"]["policy"],
-            "orbitserve",
-        )
-        self.assertGreaterEqual(
-            optimizer["scheduler_search_space"]["provenance"]["candidate_strategy_count"],
-            5,
-        )
-        self.assertTrue(optimizer["scheduler_search_space"]["candidate_schedulers"])
-
-
-class RuntimeOptimizationSkeletonTests(unittest.TestCase):
-    def test_optimizer_keeps_scores_null_for_unevaluated_evaluator_results(self):
-        runtime = _optional_import("orbitserve.runtime")
-        optimization = _optional_import("orbitserve.runtime.runtime_optimization")
-        if runtime is None or optimization is None:
-            self.skipTest("runtime optimization modules are not available yet")
-
-        scenario, _strategy, _performance = _runtime_scenario(runtime)
-        strategies = [
-            runtime.RuntimeStrategySpec.from_dict({"policy": policy})
-            for policy in ("local_only", "shortest_path", "energy_aware", "orbitserve")
-        ]
-
-        class UnevaluatedEvaluator:
-            def evaluate(self, scenario, strategy):
-                return {
-                    "evaluated": False,
-                    "runtime_metrics": {"served_ratio": None, "ttft_p95_s": None, "e2e_p95_s": None},
-                    "warnings": ["simulation trace is not implemented"],
-                }
-
-        result = optimization.optimize_runtime_strategy(
-            scenario=scenario,
-            search_space=strategies,
-            evaluator=UnevaluatedEvaluator(),
-        )
-        payload = _to_dict(result)
-
-        self.assertFalse(payload["evaluated"])
-        self.assertEqual(len(payload["score_table"]), len(strategies))
-        self.assertEqual(
-            [row["scheduler"]["policy"] for row in payload["score_table"]],
-            ["local_only", "shortest_path", "energy_aware", "orbitserve"],
-        )
-        for row in payload["score_table"]:
-            self.assertIsNone(row["objective_score"])
-            self.assertFalse(row["evaluator_result"]["evaluated"])
-            self.assertIsNone(row["evaluator_result"]["slo"]["served_ratio"])
-            self.assertIsNone(row["evaluator_result"]["performance"]["ttft_p95_s"])
-            self.assertIsNone(row["evaluator_result"]["performance"]["e2e_p95_s"])
-        self.assertIn(payload.get("selected_strategy"), (None, {}))
 
 
 if __name__ == "__main__":

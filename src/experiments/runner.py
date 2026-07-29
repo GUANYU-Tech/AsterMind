@@ -10,11 +10,6 @@ from typing import Any
 from orbitserve.common import to_jsonable
 from orbitserve.experiments.design_evaluation import evaluate_materialized_design
 from orbitserve.dse.search import DSEStudyResult, run_dse
-from orbitserve.runtime import attach_energy_alignment
-from orbitserve.common import SLOMetrics
-from orbitserve.runtime import RuntimeStrategySpec
-from orbitserve.experiments.runtime_dispatch import evaluate_runtime_performance
-from orbitserve.runtime import RuntimeOptimizationObjective, optimize_runtime_strategy
 from orbitserve.dse.satellite_budget import analyze_communication_window_satellite_budget
 from orbitserve.orbit import TRACE_BACKED_RUNTIME_SURROGATE_SCOPE, normalize_trace_scope
 
@@ -43,8 +38,6 @@ def run_experiment(spec: ExperimentSpec) -> ExperimentResult:
         input_warnings=workload_generation_warnings,
     )
     constellation_architecture = evaluation.constellation_architecture
-    scheduler = evaluation.scheduler
-    scheduler_decision = evaluation.scheduler_decision
     resolved_hardware = evaluation.resolved_hardware
     cost = evaluation.cost
     simulation = evaluation.simulation
@@ -62,19 +55,7 @@ def run_experiment(spec: ExperimentSpec) -> ExperimentResult:
         else None
     )
     runtime_scenario = evaluation.runtime_scenario
-    initial_runtime_performance = evaluation.runtime_performance
-    runtime_performance, runtime_optimization = _run_runtime_optimization_closed_loop(
-        runtime_scenario,
-        initial_runtime_performance,
-        scheduler_search_space=scheduler.optimization_search_space(),
-    )
-    runtime_performance, selected_energy_alignment = attach_energy_alignment(
-        runtime_performance,
-        evaluation.planned_energy_demand,
-        runtime_energy_envelope=evaluation.runtime_energy_envelope,
-        runtime_sunlight_summary=evaluation.runtime_sunlight_summary,
-        tolerance_fraction=float(getattr(spec.costing, "energy_alignment_tolerance", 0.05)),
-    )
+    runtime_performance = evaluation.runtime_performance
     performance = serving_throughput.to_performance_metrics()
     performance = _performance_with_runtime_metrics(performance, runtime_performance)
     performance = replace(
@@ -82,9 +63,6 @@ def run_experiment(spec: ExperimentSpec) -> ExperimentResult:
         details={
             **performance.details,
             "runtime": runtime_performance.to_dict(),
-            "runtime_current_strategy": initial_runtime_performance.to_dict(),
-            "runtime_initial": _runtime_result_summary(initial_runtime_performance),
-            "runtime_optimization": runtime_optimization.to_dict(),
             **(
                 {"communication_window_budget_analysis": communication_window_budget_analysis}
                 if communication_window_budget_analysis is not None
@@ -95,9 +73,7 @@ def run_experiment(spec: ExperimentSpec) -> ExperimentResult:
             dict.fromkeys(
                 (
                     *performance.warnings,
-                    *initial_runtime_performance.warnings,
                     *runtime_performance.warnings,
-                    *runtime_optimization.warnings,
                     *(
                         communication_window_budget_analysis.get("warnings", ())
                         if communication_window_budget_analysis is not None
@@ -113,7 +89,7 @@ def run_experiment(spec: ExperimentSpec) -> ExperimentResult:
         serving_workload=serving_workload,
         workload_generation_warnings=workload_generation_warnings,
     )
-    slo = _slo_with_runtime_metrics(simulation.slo, runtime_performance)
+    slo = simulation.slo
     terrestrial_runtime = (
         normalize_trace_scope(getattr(runtime_performance, "scope", None))
         == "skywalker_ground_reproduction_surrogate"
@@ -140,45 +116,26 @@ def run_experiment(spec: ExperimentSpec) -> ExperimentResult:
         else "evaluated"
         if serving_throughput.evaluated
         else "not_configured",
-        "runtime_performance": "optimized"
-        if getattr(runtime_optimization, "closed_loop_evaluated", False)
-        else "evaluated"
+        "runtime_performance": "evaluated"
         if runtime_performance.evaluated
         else "skeleton",
-        "runtime_optimization": "closed_loop"
-        if getattr(runtime_optimization, "closed_loop_evaluated", False)
-        else "disabled"
-        if not getattr(runtime_optimization.scheduler_search_space, "enabled", True)
-        else "evaluated"
-        if runtime_optimization.evaluated
-        else "skeleton",
-        "energy_alignment": "consistent"
-        if selected_energy_alignment.consistent
-        else "evaluated_mismatch"
-        if selected_energy_alignment.evaluated
-        else "unavailable",
         "communication_window_budget_analysis": "evaluated"
         if communication_window_budget_analysis is not None
         and communication_window_budget_analysis.get("evaluated")
         else "not_configured"
         if communication_window_budget_analysis is None
         else "unavailable",
-        "scheduling": scheduler_decision.module_status.get("scheduling", scheduler_decision.action),
         "dse": "skeleton" if spec.dse.enabled else "disabled",
     }
     warnings = _dedupe((
         *evaluation.warnings,
-        *initial_runtime_performance.warnings,
         *runtime_performance.warnings,
-        *runtime_optimization.warnings,
-        *selected_energy_alignment.warnings,
         *(
             communication_window_budget_analysis.get("warnings", ())
             if communication_window_budget_analysis is not None
             else ()
         ),
         *dse.warnings,
-        scheduler_decision.rationale,
     ))
     return ExperimentResult(
         experiment_id=spec.experiment_id,
@@ -222,139 +179,6 @@ def _run_dse_for_experiment(
         workload_generation=workload_generation,
         serving_workload=serving_workload,
         workload_warnings=workload_generation_warnings,
-    )
-
-
-def _run_runtime_optimization_closed_loop(
-    runtime_scenario: Any,
-    initial_runtime_performance: Any,
-    *,
-    scheduler_search_space: Any = None,
-) -> tuple[Any, Any]:
-    """Optimize the scheduler strategy and re-run the selected strategy."""
-
-    initial_summary = _runtime_result_summary(initial_runtime_performance)
-    hardware_optimization = _runtime_hardware_optimization_status()
-    runtime_optimization = optimize_runtime_strategy(
-        runtime_scenario,
-        search_space=scheduler_search_space,
-        objective=_closed_loop_runtime_objective(initial_runtime_performance),
-    )
-    if not getattr(runtime_optimization.scheduler_search_space, "enabled", True):
-        disabled_hardware_optimization = {
-            "evaluated": False,
-            "scope": "not_requested",
-            "searched_parameters": (),
-            "warnings": (),
-        }
-        warnings = _dedupe(
-            (
-                *runtime_optimization.warnings,
-                "runtime optimization closed loop was skipped because it is explicitly disabled",
-            )
-        )
-        return initial_runtime_performance, replace(
-            runtime_optimization,
-            closed_loop_evaluated=False,
-            initial_runtime_summary=initial_summary,
-            hardware_optimization=disabled_hardware_optimization,
-            warnings=warnings,
-        )
-    selected_strategy_payload = runtime_optimization.selected_strategy
-    if not selected_strategy_payload:
-        warnings = _dedupe(
-            (
-                *runtime_optimization.warnings,
-                "runtime optimization closed loop did not rerun because no selected strategy was available",
-                *tuple(hardware_optimization["warnings"]),
-            )
-        )
-        return initial_runtime_performance, replace(
-            runtime_optimization,
-            closed_loop_evaluated=False,
-            initial_runtime_summary=initial_summary,
-            hardware_optimization=hardware_optimization,
-            warnings=warnings,
-        )
-
-    selected_strategy = RuntimeStrategySpec.from_dict(selected_strategy_payload)
-    selected_runtime_performance = evaluate_runtime_performance(runtime_scenario, selected_strategy)
-    strategy_id = str(
-        selected_strategy_payload.get("strategy_id")
-        or selected_strategy.name
-        or selected_strategy.policy
-    )
-    if not getattr(selected_runtime_performance, "evaluated", False):
-        warnings = _dedupe(
-            (
-                *runtime_optimization.warnings,
-                *selected_runtime_performance.warnings,
-                "runtime optimization selected strategy re-evaluation was not evaluated; "
-                "retaining initial runtime metrics",
-                *tuple(hardware_optimization["warnings"]),
-            )
-        )
-        return initial_runtime_performance, replace(
-            runtime_optimization,
-            closed_loop_evaluated=False,
-            closed_loop_strategy_id=strategy_id,
-            closed_loop_runtime=_runtime_result_summary(selected_runtime_performance),
-            initial_runtime_summary=initial_summary,
-            hardware_optimization=hardware_optimization,
-            warnings=warnings,
-        )
-
-    warnings = _dedupe(
-        (
-            *runtime_optimization.warnings,
-            *selected_runtime_performance.warnings,
-            "runtime optimization closed loop re-evaluated the selected scheduler strategy",
-            "runtime optimization closed loop updates top-level performance/SLO with the selected strategy result",
-            "runtime optimization selected runtime metrics remain preliminary unless valid_for_paper_main_results=true",
-            *tuple(hardware_optimization["warnings"]),
-        )
-    )
-    return selected_runtime_performance, replace(
-        runtime_optimization,
-        closed_loop_evaluated=True,
-        closed_loop_strategy_id=strategy_id,
-        closed_loop_runtime=_runtime_result_summary(selected_runtime_performance),
-        initial_runtime_summary=initial_summary,
-        hardware_optimization=hardware_optimization,
-        warnings=warnings,
-    )
-
-
-def _closed_loop_runtime_objective(runtime_performance: Any) -> RuntimeOptimizationObjective | None:
-    if not getattr(runtime_performance, "evaluated", False):
-        return None
-    payload = _lightweight_runtime_payload(runtime_performance)
-    metrics = _mapping_from_result(payload.get("runtime_metrics"))
-    details = _mapping_from_result(payload.get("details"))
-    scope = normalize_trace_scope(
-        _first_present(metrics.get("scope"), payload.get("scope"), details.get("scope"))
-    )
-    trace_model = str(
-        _first_present(metrics.get("trace_model"), payload.get("trace_model"), details.get("trace_model"), "")
-    )
-    valid_for_paper = bool(
-        _first_present(
-            metrics.get("valid_for_paper_main_results"),
-            payload.get("valid_for_paper_main_results"),
-            details.get("valid_for_paper_main_results"),
-            False,
-        )
-    )
-    trace_backed_scope = scope in {TRACE_BACKED_RUNTIME_SURROGATE_SCOPE, "geometry_trace_surrogate"}
-    trace_backed_model = trace_model in {"surrogate_orbit_trace", "circular_geometry_trace"}
-    if not valid_for_paper and not (trace_backed_scope or trace_backed_model):
-        return None
-    return RuntimeOptimizationObjective(
-        name="closed_loop_cost_slo_weighted",
-        allow_preliminary_runtime_metrics=not valid_for_paper,
-        allow_idealized_runtime_metrics=False,
-        ignore_optional_cost=True,
-        weights={"served": 1.0, "tail": 1.0, "cost": 0.0},
     )
 
 
@@ -467,18 +291,6 @@ def _lightweight_runtime_payload(runtime_performance: Any) -> dict[str, Any]:
     return _mapping_from_result(runtime_performance)
 
 
-def _runtime_hardware_optimization_status() -> dict[str, Any]:
-    return {
-        "evaluated": False,
-        "scope": "not_implemented",
-        "searched_parameters": (),
-        "warnings": (
-            "hardware execution parameter optimization is not implemented; "
-            "closed loop currently optimizes and replays scheduler strategy only",
-        ),
-    }
-
-
 def _performance_with_runtime_metrics(performance: Any, runtime_performance: Any) -> Any:
     if not getattr(runtime_performance, "evaluated", False):
         return performance
@@ -493,7 +305,7 @@ def _performance_with_runtime_metrics(performance: Any, runtime_performance: Any
         if runtime_scope == TRACE_BACKED_RUNTIME_SURROGATE_SCOPE
         else "top-level performance contains circular geometry trace-backed preliminary surrogate metrics"
         if runtime_scope == "geometry_trace_surrogate"
-        else "top-level performance contains idealized compute-only runtime metrics"
+        else "top-level performance contains preliminary runtime metrics"
     )
     warnings = tuple(
         dict.fromkeys(
@@ -530,45 +342,6 @@ def _performance_with_runtime_metrics(performance: Any, runtime_performance: Any
             "runtime_trace_model": runtime_metrics.get("trace_model"),
             "valid_for_paper_main_results": runtime_metrics.get("valid_for_paper_main_results"),
         },
-        warnings=warnings,
-    )
-
-
-def _slo_with_runtime_metrics(slo: Any, runtime_performance: Any) -> Any:
-    if not getattr(runtime_performance, "evaluated", False):
-        return slo
-    payload = runtime_performance.to_dict()
-    runtime_slo = payload.get("slo", {})
-    runtime_metrics = payload.get("runtime_metrics", {})
-    runtime_scope = normalize_trace_scope(runtime_metrics.get("scope"))
-    scope_warning = (
-        "top-level SLO contains SkyWalker terrestrial reproduction surrogate metrics"
-        if runtime_scope == "skywalker_ground_reproduction_surrogate"
-        else "top-level SLO contains trace-backed preliminary surrogate metrics"
-        if runtime_scope == TRACE_BACKED_RUNTIME_SURROGATE_SCOPE
-        else "top-level SLO contains circular geometry trace-backed preliminary surrogate metrics"
-        if runtime_scope == "geometry_trace_surrogate"
-        else "top-level SLO contains idealized compute-only runtime metrics"
-    )
-    warnings = tuple(
-        dict.fromkeys(
-            (
-                *tuple(runtime_slo.get("warnings", ())),
-                scope_warning,
-                f"scope={runtime_metrics.get('scope')}",
-                f"trace_model={runtime_metrics.get('trace_model')}",
-                f"valid_for_paper_main_results={str(runtime_metrics.get('valid_for_paper_main_results')).lower()}",
-            )
-        )
-    )
-    return SLOMetrics(
-        evaluated=True,
-        served_ratio=runtime_slo.get("served_ratio"),
-        rejected_ratio=runtime_slo.get("rejected_ratio"),
-        timeout_ratio=runtime_slo.get("timeout_ratio"),
-        energy_violation_count=runtime_slo.get("energy_violation_count"),
-        isl_congestion_p95=runtime_slo.get("isl_congestion_p95"),
-        sgl_congestion_p95=runtime_slo.get("sgl_congestion_p95"),
         warnings=warnings,
     )
 

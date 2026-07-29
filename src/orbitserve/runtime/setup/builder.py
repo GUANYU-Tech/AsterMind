@@ -5,18 +5,18 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from ..orbit import RuntimeTraceManifest, resolve_trace_path
-from ..common import to_jsonable
-from .contracts import (
+from ...orbit import RuntimeTraceManifest, resolve_trace_path
+from ...common import to_jsonable
+from ..contracts import (
     RUNTIME_INTERFACE_DOC,
     RUNTIME_PERFORMANCE_DOC,
-    RUNTIME_OPTIMIZATION_DOC,
-    RuntimeScenario,
     RuntimeStrategySpec,
-    ServingDeploymentView,
+    ServingCapacityProfile,
 )
+from .simulation_spec import RuntimeSimulationSpec
 
-def build_runtime_scenario(
+
+def build_runtime_simulation_spec(
     *,
     scenario_id: str | None = None,
     design_id: str | None = None,
@@ -24,27 +24,21 @@ def build_runtime_scenario(
     workload_spec: Any = None,
     constellation: Any = None,
     constellation_architecture: Any = None,
-    serving_spec: Any = None,
-    serving_throughput: Any = None,
+    serving_profile: Any = None,
     simulation_result: Any = None,
     simulation_config: Any = None,
-    cost_result: Any = None,
-    scheduler_spec: Any = None,
-    hardware: Any = None,
-    resolved_hardware: Any = None,
+    energy_profile: Any = None,
+    strategy: Any = None,
     time_horizon_s: float | None = None,
     warnings: tuple[str, ...] = (),
-) -> RuntimeScenario:
+) -> RuntimeSimulationSpec:
     workload_payload = _mapping_from_result(workload_generation)
     workload_spec_payload = _mapping_from_result(workload_spec)
     simulation_payload = _mapping_from_result(simulation_result)
     simulation_config_payload = _mapping_from_result(simulation_config)
-    cost_payload = _mapping_from_result(cost_result)
+    energy_profile_payload = _mapping_from_result(energy_profile)
     constellation_payload = _mapping_from_result(constellation)
     architecture_payload = _mapping_from_result(constellation_architecture)
-    runtime_strategy = RuntimeStrategySpec.from_value(scheduler_spec)
-    resolved_hardware_payload = _mapping_from_result(resolved_hardware)
-    hardware_payload = _mapping_from_result(hardware)
     scenario_name = scenario_id or str(_first_present(workload_spec_payload.get("name"), "runtime_scenario"))
     design_name = design_id or str(
         _first_present(
@@ -75,11 +69,7 @@ def build_runtime_scenario(
                 _dict(manifest.get("time")).get("time_horizon_s"),
             )
         )
-    deployment = ServingDeploymentView.from_inputs(
-        deployment_id="deployment_0",
-        serving_spec=serving_spec,
-        throughput_estimate=serving_throughput,
-    )
+    serving_profile = ServingCapacityProfile.from_value(serving_profile)
     workload_configured = _workload_bundle_configured(workload_payload, requests, manifest)
     workload_bundle = {
         "status": workload_payload.get("status", "materialized_spec" if workload_spec_payload else "not_configured"),
@@ -127,28 +117,19 @@ def build_runtime_scenario(
         "scope": trace_manifest.get("scope"),
         "valid_for_paper_main_results": bool(trace_manifest.get("valid_for_paper_main_results", False)),
     }
-    cost_power = {
-        "evaluated": bool(cost_payload.get("evaluated", False)),
-        "satellite_count": cost_payload.get("satellite_count"),
-        "total_cost_usd": cost_payload.get("total_cost_usd"),
-        "annualized_cost_usd_per_year": cost_payload.get("annualized_cost_usd_per_year"),
-        "total_mass_kg": cost_payload.get("total_mass_kg"),
-        "peak_power_w": cost_payload.get("peak_power_w"),
-        "single_satellite": cost_payload.get("single_satellite"),
-        "provenance": cost_payload.get("provenance", {}),
-    }
     scenario_warnings = tuple(
         dict.fromkeys(
             (
                 *warnings,
                 *_warnings_from_payload(workload_payload),
                 *_warnings_from_payload(simulation_payload),
-                *_warnings_from_payload(cost_payload),
-                *deployment.warnings,
+                *_warnings_from_payload(energy_profile_payload),
+                *serving_profile.warnings,
             )
         )
     )
-    return RuntimeScenario(
+    return RuntimeSimulationSpec(
+        strategy=RuntimeStrategySpec.from_value(strategy),
         scenario_id=scenario_name,
         design_id=design_name,
         time_horizon_s=time_horizon_s,
@@ -165,9 +146,8 @@ def build_runtime_scenario(
             "satellite_count": constellation_payload.get("satellite_count"),
             **({"satellite_catalog": list(satellite_catalog)} if satellite_catalog else {}),
         },
-        serving_deployments=(deployment,),
-        cost_power=cost_power,
-        runtime_config=runtime_strategy,
+        serving_profile=serving_profile,
+        energy_profile=energy_profile_payload,
         provenance={
             "workload_bundle": {
                 "bundle_dir": workload_bundle["bundle_dir"],
@@ -184,11 +164,9 @@ def build_runtime_scenario(
                 "modeling_doc": "docs/research/parameters/llm_serving_capacity_model.md",
                 "estimate_schema": "ServingThroughputEstimate",
             },
-            "hardware_config": resolved_hardware_payload or hardware_payload,
-            "cost_model": cost_power["provenance"],
+            "energy_profile": _dict(energy_profile_payload.get("provenance")),
             "runtime_interface_doc": RUNTIME_INTERFACE_DOC,
             "runtime_performance_model_doc": RUNTIME_PERFORMANCE_DOC,
-            "runtime_optimization_model_doc": RUNTIME_OPTIMIZATION_DOC,
         },
         warnings=scenario_warnings,
     )
