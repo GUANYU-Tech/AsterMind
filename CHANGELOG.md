@@ -11,6 +11,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Added a deterministic SGP4 pipeline from validated mean elements through
   WGS-72 TEME propagation, pinned-data ITRS conversion, WGS-84 geometry, and
   canonical Orbit Trace generation via `generate_orbit_trace`.
+- Added `RuntimeSimulationSpec` as the immutable aggregate input for one
+  deterministic Runtime simulation.
+- Added per-satellite capacity-driven LRU management for KV cache state.
 
 ### Changed
 
@@ -25,6 +28,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   define the single current output format.
 - Declared the pinned SGP4, Astropy, Earth-orientation dependencies and vendored
   IERS package data in `pyproject.toml`.
+- Reorganized Runtime into `setup`, `engine`, `state`, and `metrics`, with
+  public contracts and results kept at the package root.
+- Made `RuntimeStrategySpec` part of `RuntimeSimulationSpec` and consolidated
+  execution behind `run_runtime_simulation(simulation_spec)`.
+- Moved deterministic candidate selection into the Runtime engine while making
+  DSE solely responsible for strategy search.
+- Applied one colocated prefill/decode `ServingCapacityProfile` uniformly to
+  all satellites.
+- Standardized DVFS as a strategy-owned capacity scale in the range `(0, 1]`.
+- Simplified request outcomes to completed and uncompleted, and limited
+  TTFT/E2E statistics to completed requests.
+- Made Runtime consume the static satellite energy profile provided by
+  Architecture directly.
 
 ### Removed
 
@@ -34,6 +50,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Removed the `RuntimeTraceManifest`, `RuntimeTraceBundle`, and
   `SurrogateTraceBundle` aliases and the remaining legacy circular-orbit public
   interfaces.
+- Removed compute-only execution, disaggregated prefill/decode deployment,
+  deployment catalogs, and deployment-group placement logic.
+- Removed planned-versus-observed energy alignment, duplicate queue state,
+  redundant decision contracts, and the standalone Runtime strategy package.
+- Removed SLO classification and SLO pass/fail accounting from Runtime results.
+
+### Fixed
+
+- Fixed trace-backed route reservation and isolated mutable KV cache state by
+  satellite.
 
 ### Verification
 
@@ -61,9 +87,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Renamed the former trace domain to `orbit` and limited it to constellation geometry, visibility, sunlight, and trace generation.
 - Consolidated static per-satellite hardware configuration in `architecture/hardware.py`.
 - Standardized workload input on one unversioned canonical bundle contract.
-- Reorganized Runtime around one `RuntimeScenario`, one fixed `RuntimeStrategySpec`, request-level execution, per-satellite state, records, metrics, and energy state.
-- Moved runtime-strategy search into DSE and made fixed-design evaluation execute exactly the configured strategy.
-- Aligned package metadata and test imports with the `runtime/engine`, `runtime/scenario`, `runtime/state`, `runtime/strategy`, and `runtime/metrics` package tree.
+- Reorganized runtime code around contracts, scenarios, deployments, schedulers, engines, records, metrics, and energy state.
 - Reorganized tests into `unit`, `integration`, `smoke`, and `slow` suites.
 - Synchronized documentation and examples with the current source layout and public interfaces.
 
@@ -73,8 +97,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Removed ISL inventory modeling from Orbit.
 - Removed workload-driven hardware sizing and obsolete runtime contention configuration.
 - Removed confirmed unused scripts, duplicate tests, generated caches, and checked-in experiment outputs.
-- Removed the compute-only Runtime path, deployment catalogs, PD placement search, duplicate queue state, planned-versus-observed energy alignment, and unused decision DTOs.
-- Removed fixed-design runtime-strategy optimization; Runtime strategy search is now owned by DSE.
 
 ### Fixed
 
@@ -83,6 +105,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Verification
 
-- Passed 166 unit tests and 22 smoke tests after the Runtime refactor.
-- Verified the fixed-design, trace-backed Runtime, and DSE integration paths without running the slow suite in this refactor cycle.
+- Passed 398 tests, including all 48 slow tests.
+- Verified fixed-design, trace-backed runtime, runtime optimization, terrestrial baseline, and DSE paths.
 - Kept `results/` and `scripts/` empty in the source repository.
