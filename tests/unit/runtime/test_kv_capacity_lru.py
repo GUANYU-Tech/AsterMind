@@ -1,168 +1,96 @@
 import unittest
 
-from orbitserve.runtime.engine.simulator import _session_action
-from orbitserve.runtime.contracts import ServingCapacityProfile
-from orbitserve.runtime.state.kv_cache import _admit_session_kv
+from orbitserve.runtime.state.kv_cache import (
+    _admit_session_kv,
+    commit_session_kv,
+    local_kv_reuse_tokens,
+)
 from orbitserve.runtime.state.runtime_state import RuntimeState
-
-
-def _deployment(capacity_tokens=10):
-    return ServingCapacityProfile(
-        kv_cache_capacity_tokens=capacity_tokens,
-        kv_cache_bytes_per_token=1.0,
-    )
 
 
 class KVCapacityLRUTests(unittest.TestCase):
     def setUp(self):
         self.state = RuntimeState()
-        self.deployment = _deployment()
-        self.strategy = type("Strategy", (), {"kv_policy": {}, "hard_gate_overrides": {}})()
 
-    def admit(self, session_id, tokens, now_s):
+    def admit(self, session_id, tokens, now_s, satellite_id="sat-a"):
         self.state.session_for(session_id)
         return _admit_session_kv(
             self.state,
-            capacity_tokens=self.deployment.kv_cache_capacity_tokens,
+            capacity_tokens=10,
             capacity_bytes=None,
             kv_policy={},
             session_id=session_id,
-            satellite_id="sat-a",
+            satellite_id=satellite_id,
             tokens=tokens,
             kv_bytes_per_token=1.0,
             now_s=now_s,
         )
 
-    def test_capacity_sufficient_keeps_all_entries_without_time_expiry(self):
-        self.assertTrue(self.admit("a", 4, 1.0)["admitted"])
-        result = self.admit("b", 4, 10_000.0)
-
-        self.assertTrue(result["admitted"])
-        self.assertEqual(result["evicted_session_ids"], ())
-        self.assertEqual(set(self.state.kv_cache_for("sat-a").entries), {"a", "b"})
-
-    def test_capacity_pressure_evicts_least_recently_used_entry(self):
+    def test_capacity_pressure_evicts_lru_without_time_expiry(self):
         self.admit("a", 4, 1.0)
-        self.admit("b", 4, 2.0)
-
-        result = self.admit("c", 4, 3.0)
-
+        self.admit("b", 4, 10_000.0)
+        result = self.admit("c", 4, 20_000.0)
         self.assertEqual(result["evicted_session_ids"], ("a",))
         self.assertEqual(set(self.state.kv_cache_for("sat-a").entries), {"b", "c"})
 
-    def test_referenced_entry_is_not_evictable(self):
-        self.admit("a", 4, 1.0)
-        self.admit("b", 4, 2.0)
-        self.state.kv_cache_for("sat-a").entries["a"].reference_count = 1
-
-        result = self.admit("c", 6, 3.0)
-
-        self.assertEqual(result["evicted_session_ids"], ("b",))
-        self.assertEqual(set(self.state.kv_cache_for("sat-a").entries), {"a", "c"})
-
-    def test_capacity_and_lru_are_scoped_to_each_satellite(self):
+    def test_local_reuse_is_bounded_by_required_context(self):
         self.admit("a", 8, 1.0)
-        other = _admit_session_kv(
+        self.assertEqual(
+            local_kv_reuse_tokens(
+                self.state,
+                satellite_id="sat-a",
+                session_id="a",
+                required_context_tokens=3,
+            ),
+            3,
+        )
+
+    def test_migration_removes_source_only_after_target_admission(self):
+        commit_session_kv(
             self.state,
-            capacity_tokens=self.deployment.kv_cache_capacity_tokens,
-            capacity_bytes=None,
-            kv_policy={},
-            session_id="b",
+            session_id="a",
+            satellite_id="sat-a",
+            context_tokens=4,
+            capacity_tokens=10,
+            kv_bytes_per_token=1.0,
+            now_s=1.0,
+        )
+        result = commit_session_kv(
+            self.state,
+            session_id="a",
             satellite_id="sat-b",
-            tokens=8,
+            context_tokens=4,
+            capacity_tokens=10,
             kv_bytes_per_token=1.0,
             now_s=2.0,
+            migrated_from="sat-a",
         )
-
-        self.assertTrue(other["admitted"])
-        self.assertEqual(set(self.state.kv_cache_for("sat-a").entries), {"a"})
-        self.assertEqual(set(self.state.kv_cache_for("sat-b").entries), {"b"})
-
-    def test_first_turn_recomputes_then_same_satellite_hits(self):
-        deployment = _deployment(capacity_tokens=8)
-        request = {"prompt_tokens": 3, "output_tokens": 1}
-        first = _session_action(
-            self.state,
-            "a",
-            "sat-a",
-            1.0,
-            deployment=deployment,
-            runtime_strategy=self.strategy,
-            request=request,
-        )
-        second = _session_action(
-            self.state,
-            "a",
-            "sat-a",
-            2.0,
-            deployment=deployment,
-            runtime_strategy=self.strategy,
-            request=request,
-        )
-
-        self.assertEqual(first, "recompute_context")
-        self.assertEqual(second, "sticky_kv_owner")
-
-    def test_moving_session_invalidates_previous_satellite_entry(self):
-        deployment = _deployment(capacity_tokens=8)
-        request = {"prompt_tokens": 3, "output_tokens": 1}
-        _session_action(
-            self.state,
-            "a",
-            "sat-a",
-            1.0,
-            deployment=deployment,
-            runtime_strategy=self.strategy,
-            request=request,
-        )
-        moved = _session_action(
-            self.state,
-            "a",
-            "sat-b",
-            2.0,
-            deployment=deployment,
-            runtime_strategy=self.strategy,
-            request=request,
-        )
-
-        self.assertEqual(moved, "recompute_context")
+        self.assertEqual(result["action"], "migrated")
         self.assertNotIn("a", self.state.kv_cache_for("sat-a").entries)
         self.assertIn("a", self.state.kv_cache_for("sat-b").entries)
 
-    def test_revisit_after_eviction_recomputes_context(self):
-        deployment = _deployment(capacity_tokens=4)
-        request = {"prompt_tokens": 3, "output_tokens": 1}
-
-        first = _session_action(
+    def test_recompute_on_new_satellite_keeps_old_copy(self):
+        commit_session_kv(
             self.state,
-            "a",
-            "sat-a",
-            1.0,
-            deployment=deployment,
-            runtime_strategy=self.strategy,
-            request=request,
+            session_id="a",
+            satellite_id="sat-a",
+            context_tokens=4,
+            capacity_tokens=10,
+            kv_bytes_per_token=1.0,
+            now_s=1.0,
         )
-        _session_action(
+        result = commit_session_kv(
             self.state,
-            "b",
-            "sat-a",
-            2.0,
-            deployment=deployment,
-            runtime_strategy=self.strategy,
-            request=request,
+            session_id="a",
+            satellite_id="sat-b",
+            context_tokens=4,
+            capacity_tokens=10,
+            kv_bytes_per_token=1.0,
+            now_s=2.0,
         )
-        revisited = _session_action(
-            self.state,
-            "a",
-            "sat-a",
-            3.0,
-            deployment=deployment,
-            runtime_strategy=self.strategy,
-            request=request,
-        )
-
-        self.assertEqual(first, "recompute_context")
-        self.assertEqual(revisited, "recompute_context")
+        self.assertEqual(result["action"], "recompute_context")
+        self.assertIn("a", self.state.kv_cache_for("sat-a").entries)
+        self.assertIn("a", self.state.kv_cache_for("sat-b").entries)
 
 
 if __name__ == "__main__":

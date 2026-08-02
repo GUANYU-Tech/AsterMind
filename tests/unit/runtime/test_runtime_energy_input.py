@@ -15,6 +15,7 @@ class RuntimeEnergyInputTests(unittest.TestCase):
             "compute_energy_j_per_token": 0.5,
             "link_energy_j_per_byte": 1e-6,
             "soc_min": 0.2,
+            "initial_soc": 0.8,
             "provenance": {"source": "architecture"},
             "warnings": [],
         }
@@ -31,6 +32,21 @@ class RuntimeEnergyInputTests(unittest.TestCase):
         scenario = build_runtime_simulation_spec()
 
         self.assertEqual(scenario.energy_profile, {})
+
+    def test_builder_extracts_communication_ingress_without_putting_it_in_strategy(self):
+        scenario = build_runtime_simulation_spec(
+            simulation_config={
+                "communication_satellite": {
+                    "altitude_km": 550.0,
+                    "uplink_bandwidth_bps": 1e9,
+                    "downlink_bandwidth_bps": 2e9,
+                }
+            }
+        )
+
+        self.assertTrue(scenario.communication_ingress.configured)
+        self.assertEqual(scenario.communication_ingress.altitude_km, 550.0)
+        self.assertNotIn("altitude_km", scenario.strategy.to_dict())
 
 
 if __name__ == "__main__":
