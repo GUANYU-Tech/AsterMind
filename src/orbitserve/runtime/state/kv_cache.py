@@ -236,6 +236,84 @@ def _remove_session_kv(state: RuntimeState, satellite_id: str, session_id: str) 
     return True
 
 
+def local_kv_reuse_tokens(
+    state: RuntimeState,
+    *,
+    satellite_id: str,
+    session_id: str | None,
+    required_context_tokens: int,
+) -> int:
+    if not session_id or required_context_tokens <= 0:
+        return 0
+    cache = state.kv_caches.get(str(satellite_id))
+    entry = cache.entries.get(str(session_id)) if cache is not None else None
+    return min(required_context_tokens, max(0, int(entry.tokens))) if entry is not None else 0
+
+
+def commit_session_kv(
+    state: RuntimeState,
+    *,
+    session_id: str | None,
+    satellite_id: str,
+    context_tokens: int,
+    capacity_tokens: int | None,
+    kv_bytes_per_token: float,
+    now_s: float,
+    migrated_from: str | None = None,
+) -> dict[str, Any]:
+    if not session_id:
+        return {"action": "none", "hit_tokens": 0, "miss_tokens": 0, "migrated_bytes": 0.0}
+    session = state.session_for(str(session_id))
+    local_hit = local_kv_reuse_tokens(
+        state,
+        satellite_id=str(satellite_id),
+        session_id=str(session_id),
+        required_context_tokens=context_tokens,
+    )
+    admission = _admit_session_kv(
+        state,
+        capacity_tokens=capacity_tokens,
+        capacity_bytes=None,
+        kv_policy={},
+        session_id=str(session_id),
+        satellite_id=str(satellite_id),
+        tokens=context_tokens,
+        kv_bytes_per_token=kv_bytes_per_token,
+        now_s=now_s,
+    )
+    if not admission["admitted"]:
+        session.last_session_action = "capacity_unavailable"
+        session.last_kv_event = dict(admission)
+        session.last_seen_s = now_s
+        return {
+            "action": "capacity_unavailable",
+            "hit_tokens": local_hit,
+            "miss_tokens": max(0, context_tokens - local_hit),
+            "migrated_bytes": 0.0,
+            **admission,
+        }
+    if migrated_from and migrated_from != satellite_id:
+        _remove_session_kv(state, str(migrated_from), str(session_id))
+        action = "migrated"
+    elif local_hit > 0:
+        action = "local_hit"
+    else:
+        action = "recompute_context"
+    session.owner_satellite_id = str(satellite_id)
+    session.context_tokens = context_tokens
+    session.context_version += 1
+    session.last_seen_s = now_s
+    session.last_session_action = action
+    session.last_kv_event = {
+        **dict(admission),
+        "action": action,
+        "hit_tokens": local_hit,
+        "miss_tokens": max(0, context_tokens - local_hit),
+        "migrated_from": migrated_from,
+    }
+    return dict(session.last_kv_event)
+
+
 def _dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
@@ -256,3 +334,12 @@ def _optional_int(value: Any) -> int | None:
         return int(round(float(value)))
     except (TypeError, ValueError):
         return None
+
+
+__all__ = [
+    "KVCacheEntryState",
+    "KVCacheSatelliteState",
+    "SessionState",
+    "commit_session_kv",
+    "local_kv_reuse_tokens",
+]

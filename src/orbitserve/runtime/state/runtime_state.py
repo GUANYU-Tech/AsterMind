@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from ...common import to_jsonable
-from .resources import LinkState, SatelliteState
+from .resources import SatelliteState
 
 if TYPE_CHECKING:
     from .kv_cache import KVCacheSatelliteState, SessionState
@@ -15,7 +15,6 @@ if TYPE_CHECKING:
 @dataclass
 class RuntimeState:
     satellites: dict[str, SatelliteState] = field(default_factory=dict)
-    links: dict[str, LinkState] = field(default_factory=dict)
     sessions: dict[str, SessionState] = field(default_factory=dict)
     kv_caches: dict[str, KVCacheSatelliteState] = field(default_factory=dict)
 
@@ -27,11 +26,6 @@ class RuntimeState:
                 initial_soc=initial_soc,
             )
         return self.satellites[satellite_id]
-
-    def link_for(self, link_id: str) -> LinkState:
-        if link_id not in self.links:
-            self.links[link_id] = LinkState(link_id=link_id)
-        return self.links[link_id]
 
     def session_for(self, session_id: str) -> SessionState:
         from .kv_cache import SessionState
@@ -50,10 +44,6 @@ class RuntimeState:
             "satellites": {
                 satellite_id: satellite.to_dict()
                 for satellite_id, satellite in self.satellites.items()
-            },
-            "links": {
-                link_id: link.to_dict()
-                for link_id, link in self.links.items()
             },
             "sessions": {
                 session_id: session.to_dict()

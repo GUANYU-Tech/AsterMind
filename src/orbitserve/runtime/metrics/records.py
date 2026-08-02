@@ -11,10 +11,11 @@ from ...common import to_jsonable
 _SECTION_DEFAULTS: dict[str, dict[str, Any]] = {
     "request": {
         "request_id": None, "arrival_time_s": 0.0, "prompt_tokens": 0,
-        "output_tokens": 0, "session_id": None,
+        "output_tokens": 0, "session_id": None, "region_id": None,
     },
     "decision": {
         "strategy": None, "action_type": "reject_drop", "action_components": (),
+        "access_type": None,
         "access_satellite_id": None,
         "serving_satellite_id": None, "dvfs_scale": None,
         "fallback_used": False, "deferred": False, "defer_until_s": None,
@@ -26,8 +27,7 @@ _SECTION_DEFAULTS: dict[str, dict[str, Any]] = {
         "compute_owner_satellite_id": None, "compute_owner_satellite_ids": (),
     },
     "timing": {
-        "access_wait_s": None, "link_queue_wait_s": None,
-        "sgl_queue_wait_s": None, "isl_queue_wait_s": None,
+        "access_wait_s": None,
         "link_transmission_s": None, "propagation_s": None,
         "prefill_queue_wait_s": None, "prefill_service_s": None,
         "decode_queue_wait_s": None, "decode_service_s": None,
@@ -50,6 +50,7 @@ _SECTION_DEFAULTS: dict[str, dict[str, Any]] = {
         "kv_capacity_admission": None, "kv_serve_action": None,
         "kv_hit_tokens": None, "kv_miss_tokens": None,
         "context_recompute_tokens": None, "kv_reused_bytes": None,
+        "kv_migrated_bytes": None,
         "kv_generated_bytes": None, "kv_evicted_bytes": None,
         "kv_evicted_entry_count": None,
         "kv_pages_required": None, "kv_pages_hit": None,
@@ -59,6 +60,10 @@ _SECTION_DEFAULTS: dict[str, dict[str, Any]] = {
     "outcome": {
         "completed": False, "uncompleted_stage": None,
         "uncompleted_reason": None, "bottleneck_reason": None,
+    },
+    "slo": {
+        "evaluated": False, "slo_class": None,
+        "attained": None, "slack_s": None, "violation_reason": None,
     },
     "provenance": {
         "scope": "trace_backed_runtime_surrogate", "trace_model": "surrogate_orbit_trace",
@@ -83,6 +88,7 @@ class RuntimeRequestRecord:
     energy: dict[str, Any] = field(default_factory=dict)
     kv: dict[str, Any] = field(default_factory=dict)
     outcome: dict[str, Any] = field(default_factory=dict)
+    slo: dict[str, Any] = field(default_factory=dict)
     provenance: dict[str, Any] = field(default_factory=dict)
 
     def __init__(self, **values: Any) -> None:
@@ -155,7 +161,8 @@ class RuntimeRequestRecord:
             "request": self.request, "decision": self.decision,
             "placement": self.placement, "timing": self.timing,
             "routing": self.routing, "energy": self.energy, "kv": self.kv,
-            "outcome": self.outcome, "provenance": self.provenance,
+            "outcome": self.outcome, "slo": self.slo,
+            "provenance": self.provenance,
         })
 
 

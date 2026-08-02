@@ -1,267 +1,144 @@
-"""Assemble engine records into the stable runtime result schema."""
+"""Workload-level aggregation and the stable Runtime result contract."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Any
 
-from .contracts import RuntimePerformanceResult
-from .metrics.aggregation import aggregate_runtime_records
-from .metrics.records import records_to_jsonable
-from ..orbit import CIRCULAR_GEOMETRY_TRACE, SURROGATE_ORBIT_TRACE
+from ..common import to_jsonable
+from .metrics.records import RuntimeRequestRecord, records_to_jsonable
 
-def build_runtime_performance_result(
-    *,
-    scenario: Any,
-    runtime_strategy: Any,
-    engine_result: Any,
-    trace_manifest: Any,
-    effective_trace_model: str,
-    effective_scope: str,
-    serving_profile: Any = None,
-    deployment_catalog: Any = None,
-    evaluator_name: str,
-    path_model: str,
-    energy_model: str,
-    queue_model: str,
-    link_model_status: str,
-    energy_model_status: str,
-    terrestrial_baseline: bool = False,
-    centralized_ground_baseline: bool = False,
-    terrestrial_costing: Any = None,
-) -> RuntimePerformanceResult:
-    effective_serving_profile = serving_profile or deployment_catalog
-    aggregate_horizon_s = _aggregate_horizon_s(
-        engine_result=engine_result,
-        trace_model=effective_trace_model,
-        scenario_horizon_s=getattr(scenario, "time_horizon_s", None),
-    )
-    aggregates = aggregate_runtime_records(
-        engine_result.records,
-        time_horizon_s=aggregate_horizon_s,
-        trace_model=effective_trace_model,
-        scope=effective_scope,
-    )
-    runtime_metrics = {
-        **aggregates.runtime_metrics,
-        **(getattr(engine_result, "runtime_metrics", None) or {}),
-        **(terrestrial_costing.runtime_metrics() if terrestrial_costing is not None else {}),
+
+@dataclass(frozen=True)
+class RuntimePerformanceResult:
+    evaluated: bool
+    scenario: dict[str, Any]
+    strategy: dict[str, Any]
+    workload_metrics: dict[str, Any] = field(default_factory=dict)
+    energy_metrics: dict[str, Any] = field(default_factory=dict)
+    kv_metrics: dict[str, Any] = field(default_factory=dict)
+    region_metrics: tuple[dict[str, Any], ...] = ()
+    slo_metrics: dict[str, Any] = field(default_factory=dict)
+    request_records: tuple[dict[str, Any], ...] = ()
+    state_summary: dict[str, Any] = field(default_factory=dict)
+    decision_trace: tuple[dict[str, Any], ...] = ()
+    provenance: dict[str, Any] = field(default_factory=dict)
+    warnings: tuple[str, ...] = ()
+    schema_version: str = "orbitserve.runtime_performance"
+
+    def to_dict(self) -> dict[str, Any]:
+        return to_jsonable(self)
+
+
+def build_runtime_performance_result(*, simulation_spec: Any, engine_result: Any) -> RuntimePerformanceResult:
+    records = tuple(engine_result.records)
+    completed = tuple(record for record in records if record.completed)
+    uncompleted = tuple(record for record in records if not record.completed)
+    horizon_s = _horizon(records, getattr(simulation_spec, "time_horizon_s", None))
+    completed_tokens = sum(record.prompt_tokens + record.output_tokens for record in completed)
+    workload_metrics = {
+        "total_request_count": len(records),
+        "completed_request_count": len(completed),
+        "uncompleted_request_count": len(uncompleted),
+        "completion_ratio": len(completed) / len(records) if records else None,
+        "uncompleted_ratio": len(uncompleted) / len(records) if records else None,
+        "uncompleted_reason_breakdown": _counts(record.uncompleted_reason or "unknown" for record in uncompleted),
+        "ttft_p50_s": _percentile([record.ttft_s for record in completed], 0.50),
+        "ttft_p95_s": _percentile([record.ttft_s for record in completed], 0.95),
+        "ttft_p99_s": _percentile([record.ttft_s for record in completed], 0.99),
+        "e2e_p50_s": _percentile([record.e2e_s for record in completed], 0.50),
+        "e2e_p95_s": _percentile([record.e2e_s for record in completed], 0.95),
+        "e2e_p99_s": _percentile([record.e2e_s for record in completed], 0.99),
+        "request_throughput_per_s": len(completed) / horizon_s if horizon_s > 0.0 else None,
+        "token_throughput_per_s": completed_tokens / horizon_s if horizon_s > 0.0 else None,
+        "prefill_queue_wait_p95_s": _percentile([record.prefill_queue_wait_s for record in completed], 0.95),
+        "decode_queue_wait_p95_s": _percentile([record.decode_queue_wait_s for record in completed], 0.95),
     }
-    module_status = {
-        "workload": "loaded",
-        "simulation": "not_required_terrestrial_baseline"
-        if terrestrial_baseline
-        else "geometry_trace"
-        if trace_manifest.trace_model == CIRCULAR_GEOMETRY_TRACE
-        else "surrogate_trace",
-        "serving_throughput": "ground_service_model_evaluated"
-        if terrestrial_baseline
-        else "evaluated",
-        "runtime_strategy": runtime_strategy.policy,
-        "queue_model": queue_model,
-        "link_model": link_model_status,
-        "energy_model": energy_model_status,
-        "cost_model": (
-            "terrestrial_cost_evaluated"
-            if terrestrial_costing is not None and terrestrial_costing.evaluated
-            else "terrestrial_cost_not_configured"
-        )
-        if terrestrial_baseline
-        else "static_cost_only",
-        "scope": effective_scope,
-        "trace_model": effective_trace_model,
-        "valid_for_paper_main_results": "false",
+    energy_metrics = {
+        "compute_energy_j": sum(float(record.compute_energy_j or 0.0) for record in records),
+        "communication_energy_j": sum(float(record.communication_energy_j or 0.0) for record in records),
+        "minimum_soc": min((float(record.soc_after) for record in records if record.soc_after is not None), default=None),
+        "energy_violation_count": sum(1 for record in records if record.energy_violation),
     }
-    scenario_warnings = (
-        tuple(getattr(scenario, "workload_bundle", {}).get("warnings", ()) or ())
-        if terrestrial_baseline
-        else tuple(getattr(scenario, "warnings", ()) or ())
-    )
-    trace_warnings = () if terrestrial_baseline else trace_manifest.warnings
-    warnings = tuple(
-        dict.fromkeys(
-            (
-                *scenario_warnings,
-                *trace_warnings,
-                *(effective_serving_profile.warnings if effective_serving_profile is not None else ()),
-                *engine_result.warnings,
-                *aggregates.warnings,
-                *(terrestrial_costing.warnings if terrestrial_costing is not None else ()),
-                (
-                    "centralized/GKE-like terrestrial comparison baseline uses explicit topology and dispatcher surrogates"
-                    if centralized_ground_baseline
-                    else "SkyWalker ground runtime reproduces published control logic with explicit surrogate parameters"
-                    if terrestrial_baseline
-                    else "circular geometry trace-backed runtime metrics are preliminary surrogate outputs"
-                    if trace_manifest.trace_model == CIRCULAR_GEOMETRY_TRACE
-                    else "trace-backed runtime metrics are preliminary surrogate outputs"
-                ),
-            )
-        )
-    )
-    request_records = tuple(records_to_jsonable(engine_result.records))
-    effective_ground_config = (
-        (engine_result.provenance or {}).get("effective_ground_config")
-        if terrestrial_baseline
-        else None
-    )
-    deployment_payload = (
-        effective_serving_profile.to_dict()
-        if effective_serving_profile is not None
-        else {
-            "model": "geo_distributed_terrestrial_llm_serving",
-            "policy": runtime_strategy.policy,
-            "ground_config": effective_ground_config or runtime_strategy.ground_config,
-            "provenance": engine_result.provenance or {},
-        }
-    )
-    details = {
-        "scope": effective_scope,
-        "trace_model": effective_trace_model,
-        "valid_for_paper_main_results": False,
-        "request_records": request_records,
-        "state_summary": engine_result.state_summary,
-        **({"deployment_catalog": deployment_payload} if terrestrial_baseline else {"serving_profile": deployment_payload}),
-        "engine_provenance": engine_result.provenance or {},
-        "metrics_contract": {
-            "completion_ratio": "complete output delivered within the Runtime trace horizon",
-            "uncompleted_ratio": "request output was not completely delivered",
-            "uncompleted_reason_breakdown": "physical reason for incomplete delivery",
-            "cost_per_served": (
-                "explicit terrestrial cloud instance/optional-egress contract"
-                if terrestrial_costing is not None and terrestrial_costing.evaluated
-                else "terrestrial TCO not configured"
-                if terrestrial_baseline
-                else "not evaluated in Phase 1a"
-            ),
-        },
-        **(
-            {"terrestrial_costing": terrestrial_costing.to_dict()}
-            if terrestrial_costing is not None
-            else {}
-        ),
+    hit_tokens = sum(float(record.kv_hit_tokens or 0.0) for record in records)
+    miss_tokens = sum(float(record.kv_miss_tokens or 0.0) for record in records)
+    kv_metrics = {
+        "kv_hit_tokens": hit_tokens,
+        "kv_miss_tokens": miss_tokens,
+        "kv_hit_ratio": hit_tokens / (hit_tokens + miss_tokens) if hit_tokens + miss_tokens > 0.0 else None,
+        "kv_migrated_bytes": sum(float(record.kv_migrated_bytes or 0.0) for record in records),
+        "kv_evicted_bytes": sum(float(record.kv_evicted_bytes or 0.0) for record in records),
     }
     return RuntimePerformanceResult(
         evaluated=True,
         scenario={
-            "schema_version": getattr(scenario, "schema_version", "orbitserve.runtime_simulation_spec.v1"),
-            "scenario_id": getattr(scenario, "scenario_id", None),
-            "design_id": None
-            if terrestrial_baseline
-            else getattr(scenario, "design_id", None),
-            "time_horizon_s": getattr(scenario, "time_horizon_s", None),
-            "simulation_evaluated": False if terrestrial_baseline else True,
-            "simulation_required": not terrestrial_baseline,
-            "trace_model": effective_trace_model,
-            "scope": effective_scope,
-            "valid_for_paper_main_results": False,
+            "scenario_id": simulation_spec.scenario_id,
+            "design_id": simulation_spec.design_id,
+            "time_horizon_s": simulation_spec.time_horizon_s,
+            "schema_version": simulation_spec.schema_version,
         },
-        strategy=runtime_strategy.to_dict(),
-        workload=getattr(scenario, "workload_bundle", {}),
-        constellation={} if terrestrial_baseline else getattr(scenario, "constellation", {}),
-        serving=deployment_payload,
-        scheduler=runtime_strategy.to_dict(),
-        config={
-            "time_mode": getattr(scenario, "time_mode", "event_driven"),
-            "time_step_s": getattr(scenario, "time_step_s", None),
-            "queue_model": queue_model,
-            "path_model": path_model,
-            "energy_model": energy_model,
-            "fallback_accounting": "not_applicable_terrestrial_baseline"
-            if terrestrial_baseline
-            else "not_enabled",
-            "internal_comm_accounting": "explicit_ground_network_and_queue"
-            if terrestrial_baseline
-            else "embedded_in_serving_throughput",
-            "ground_config": (
-                effective_ground_config or runtime_strategy.ground_config
-                if terrestrial_baseline
-                else {}
-            ),
-            "scope": effective_scope,
-            "trace_model": effective_trace_model,
-            "valid_for_paper_main_results": False,
-        },
-        performance=aggregates.performance.to_dict(),
-        runtime_metrics=runtime_metrics,
-        bottleneck_breakdown=aggregates.bottleneck_breakdown,
-        session_metrics=(
-            getattr(engine_result, "session_metrics", None)
-            if getattr(engine_result, "session_metrics", None) is not None
-            else {"evaluated": False, "value": None, "warnings": ("KV/session state is not implemented",)}
-        ),
-        communication_metrics=(
-            getattr(engine_result, "communication_metrics", None)
-            or aggregates.communication_metrics
-        ),
-        energy_metrics=(getattr(engine_result, "energy_metrics", None) or aggregates.energy_metrics),
-        region_metrics=tuple(getattr(engine_result, "region_metrics", ()) or ()),
-        prediction_error={
+        strategy=simulation_spec.strategy.to_dict(),
+        workload_metrics=workload_metrics,
+        energy_metrics=energy_metrics,
+        kv_metrics=kv_metrics,
+        region_metrics=_region_metrics(records),
+        slo_metrics={
             "evaluated": False,
-            "value": None,
-            "warnings": ("observed-vs-predicted error requires a prediction model",),
+            "slo_attainment_ratio": None,
+            "slo_violation_ratio": None,
+            "slo_class_breakdown": {},
+            "warnings": ("SLO evaluation is reserved for future Runtime development",),
         },
-        non_separability={
-            "evaluated": False,
-            "value": None,
-            "warnings": ("runtime non-separability is evaluated by the DSE runtime matrix",),
-        },
-        decision_trace={
-            "trace_schema_version": "orbitserve.runtime_decision_trace.v1",
-            "evaluated": True,
-            "trace_level": runtime_strategy.trace_level,
-            "records": engine_result.decision_traces,
-            "request_records_path": None,
-            "warnings": (),
-        },
-        request_records_path=None,
-        request_records=request_records,
-        trace_model=effective_trace_model,
-        scope=effective_scope,
-        valid_for_paper_main_results=False,
-        module_status=module_status,
-        details=details,
-        provenance={
-            **getattr(scenario, "provenance", {}),
-            "performance_evaluator": evaluator_name,
-            "runtime_interface_schema": "orbitserve.runtime_simulation_spec.v1",
-            "runtime_performance_schema": "orbitserve.runtime_performance.v1",
-            "trace_manifest": (
-                {
-                    "evaluated": True,
-                    "trace_model": effective_trace_model,
-                    "scope": effective_scope,
-                    "source": "ground_config_and_workload_regions",
-                }
-                if terrestrial_baseline
-                else trace_manifest.to_dict()
-            ),
-            "runtime_engine": engine_result.provenance or {},
-            "valid_for_paper_main_results": False,
-        },
-        warnings=warnings,
+        request_records=records_to_jsonable(records),
+        state_summary=engine_result.state_summary,
+        decision_trace=tuple(engine_result.decision_traces),
+        provenance={**dict(simulation_spec.provenance or {}), **dict(engine_result.provenance or {})},
+        warnings=tuple(dict.fromkeys((*simulation_spec.warnings, *engine_result.warnings))),
     )
 
-def _aggregate_horizon_s(
-    *,
-    engine_result: Any,
-    trace_model: str,
-    scenario_horizon_s: Any,
-) -> float | None:
-    if trace_model == "terrestrial_network_surrogate":
-        return _optional_float((engine_result.provenance or {}).get("effective_time_horizon_s"))
-    if trace_model in {SURROGATE_ORBIT_TRACE, CIRCULAR_GEOMETRY_TRACE}:
-        return _optional_float((engine_result.provenance or {}).get("trace_horizon_s"))
-    return _optional_float(scenario_horizon_s)
+
+def _region_metrics(records: tuple[RuntimeRequestRecord, ...]) -> tuple[dict[str, Any], ...]:
+    by_region: dict[str, list[RuntimeRequestRecord]] = {}
+    for record in records:
+        by_region.setdefault(str(record.request.get("region_id") or "unknown"), []).append(record)
+    return tuple(
+        {
+            "region_id": region,
+            "request_count": len(rows),
+            "completion_ratio": sum(1 for row in rows if row.completed) / len(rows),
+        }
+        for region, rows in sorted(by_region.items())
+    )
 
 
-def _optional_float(value: Any) -> float | None:
-    if value is None:
+def _counts(values: Any) -> dict[str, int]:
+    result: dict[str, int] = {}
+    for value in values:
+        result[str(value)] = result.get(str(value), 0) + 1
+    return result
+
+
+def _horizon(records: tuple[RuntimeRequestRecord, ...], configured: Any) -> float:
+    if configured is not None and float(configured) > 0.0:
+        return float(configured)
+    if not records:
+        return 0.0
+    starts = [float(record.arrival_time_s) for record in records]
+    finishes = [float(record.arrival_time_s) + float(record.e2e_s or 0.0) for record in records if record.completed]
+    return max(1.0, (max(finishes) if finishes else max(starts)) - min(starts))
+
+
+def _percentile(values: list[float | None], percentile: float) -> float | None:
+    numeric = sorted(float(value) for value in values if value is not None)
+    if not numeric:
         return None
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        return None
-    return parsed if parsed > 0 else None
+    if len(numeric) == 1:
+        return numeric[0]
+    position = percentile * (len(numeric) - 1)
+    low = int(position)
+    high = min(low + 1, len(numeric) - 1)
+    fraction = position - low
+    return numeric[low] * (1.0 - fraction) + numeric[high] * fraction
 
 
-__all__ = ["build_runtime_performance_result"]
+__all__ = ["RuntimePerformanceResult", "build_runtime_performance_result"]

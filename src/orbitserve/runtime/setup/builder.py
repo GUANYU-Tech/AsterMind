@@ -1,19 +1,14 @@
-"""Materialize runtime scenarios from evaluated subsystem outputs."""
+"""Assemble the immutable input consumed by Runtime."""
 
 from __future__ import annotations
 
-import json
+from collections.abc import Mapping
 from typing import Any
 
-from ...orbit import RuntimeTraceManifest, resolve_trace_path
 from ...common import to_jsonable
-from ..contracts import (
-    RUNTIME_INTERFACE_DOC,
-    RUNTIME_PERFORMANCE_DOC,
-    RuntimeStrategySpec,
-    ServingCapacityProfile,
-)
-from .simulation_spec import RuntimeSimulationSpec
+from ...orbit import OrbitTraceBundle, OrbitTraceManifest
+from ..contracts import RuntimeStrategySpec, ServingCapacityProfile
+from .simulation_spec import CommunicationIngressProfile, RuntimeSimulationSpec
 
 
 def build_runtime_simulation_spec(
@@ -32,236 +27,154 @@ def build_runtime_simulation_spec(
     time_horizon_s: float | None = None,
     warnings: tuple[str, ...] = (),
 ) -> RuntimeSimulationSpec:
-    workload_payload = _mapping_from_result(workload_generation)
-    workload_spec_payload = _mapping_from_result(workload_spec)
-    simulation_payload = _mapping_from_result(simulation_result)
-    simulation_config_payload = _mapping_from_result(simulation_config)
-    energy_profile_payload = _mapping_from_result(energy_profile)
-    constellation_payload = _mapping_from_result(constellation)
-    architecture_payload = _mapping_from_result(constellation_architecture)
-    scenario_name = scenario_id or str(_first_present(workload_spec_payload.get("name"), "runtime_scenario"))
-    design_name = design_id or str(
-        _first_present(
-            constellation_payload.get("name"),
-            architecture_payload.get("name"),
-            scenario_name,
-        )
+    workload_payload = _mapping(workload_generation)
+    workload_spec_payload = _mapping(workload_spec)
+    constellation_payload = _mapping(constellation)
+    architecture_payload = _mapping(constellation_architecture)
+    simulation_config_payload = _mapping(simulation_config)
+    energy_payload = _mapping(energy_profile)
+    trace_bundle = simulation_result if isinstance(simulation_result, OrbitTraceBundle) else None
+    trace_manifest = _trace_manifest(simulation_result, trace_bundle)
+    trace_payload = trace_manifest.to_dict() if trace_manifest is not None else {}
+
+    requests = _rows(workload_payload.get("requests"))
+    sessions = _rows(workload_payload.get("sessions"))
+    regions = _rows(workload_payload.get("regions"))
+    gateways = _rows(workload_payload.get("gateways"))
+    manifest = _mapping(workload_payload.get("manifest"))
+    summary = _mapping(workload_payload.get("summary"))
+    communication_payload = _communication_ingress_payload(
+        trace_payload,
+        simulation_config_payload,
+        constellation_payload,
     )
-    requests = tuple(_dict(item) for item in workload_payload.get("requests", ()) if isinstance(item, dict))
-    sessions = tuple(_dict(item) for item in workload_payload.get("sessions", ()) if isinstance(item, dict))
-    regions = tuple(_dict(item) for item in workload_payload.get("regions", ()) if isinstance(item, dict))
-    gateways = tuple(_dict(item) for item in workload_payload.get("gateways", ()) if isinstance(item, dict))
-    manifest = _dict(workload_payload.get("manifest"))
-    summary = _dict(workload_payload.get("summary"))
-    request_count = _optional_int(workload_payload.get("request_count")) or len(requests) or None
-    source = _dict(manifest.get("source"))
-    source_mode = _first_present(
-        source.get("source_mode"),
-        manifest.get("source_mode"),
-        summary.get("source_mode"),
-        workload_payload.get("source_mode"),
+    communication_ingress = CommunicationIngressProfile(
+        altitude_km=_positive_optional(
+            _first(communication_payload.get("altitude_km"), communication_payload.get("orbit_altitude_km"))
+        ),
+        uplink_bandwidth_bps=_positive_optional(
+            _first(communication_payload.get("uplink_bandwidth_bps"), communication_payload.get("bandwidth_bps"))
+        ),
+        downlink_bandwidth_bps=_positive_optional(
+            _first(communication_payload.get("downlink_bandwidth_bps"), communication_payload.get("bandwidth_bps"))
+        ),
     )
     if time_horizon_s is None:
-        time_horizon_s = _optional_float(
-            _first_present(
+        time_horizon_s = _positive_optional(
+            _first(
+                _mapping(trace_payload.get("time")).get("duration_s"),
                 simulation_config_payload.get("duration_s"),
                 workload_spec_payload.get("duration_s"),
-                _dict(manifest.get("time")).get("time_horizon_s"),
+                _mapping(manifest.get("time")).get("time_horizon_s"),
             )
         )
-    serving_profile = ServingCapacityProfile.from_value(serving_profile)
-    workload_configured = _workload_bundle_configured(workload_payload, requests, manifest)
     workload_bundle = {
-        "status": workload_payload.get("status", "materialized_spec" if workload_spec_payload else "not_configured"),
-        "configured": workload_configured,
+        "status": workload_payload.get("status", "loaded" if requests else "not_configured"),
+        "configured": bool(requests or manifest or workload_payload.get("bundle_dir")),
         "bundle_dir": workload_payload.get("bundle_dir"),
         "schema_version": manifest.get("schema_version"),
-        "source_mode": source_mode,
-        "files": _dict(manifest.get("files")) or _dict(workload_payload.get("files")),
         "manifest": manifest,
         "summary": summary,
-        "request_count": request_count,
-        "session_count": _optional_int(workload_payload.get("session_count")) or len(sessions) or None,
-        "workload_spec": workload_spec_payload,
-        "warnings": _warnings_from_payload(workload_payload),
-    }
-    trace_manifest_obj = RuntimeTraceManifest.from_value(simulation_payload)
-    trace_manifest = trace_manifest_obj.to_dict()
-    satellite_catalog = _satellite_catalog_from_trace_manifest(trace_manifest_obj)
-    trace_model = _first_present(
-        simulation_payload.get("trace_model"),
-        trace_manifest.get("trace_model"),
-        "skeleton",
-    )
-    simulation_evaluated = bool(
-        simulation_payload.get(
-            "trace_evaluated",
-            simulation_payload.get("evaluated", trace_manifest.get("evaluated", False)),
-        )
-    )
-    simulation_trace_ref = {
-        "evaluated": simulation_evaluated,
-        "status": "evaluated" if simulation_evaluated else "skeleton",
-        "config": simulation_config_payload,
-        "result": simulation_payload,
-        "trace_manifest": trace_manifest,
-        "trace_model": trace_model,
-        "trace_id": trace_manifest.get("trace_id"),
-        "access_trace_sha256": trace_manifest.get("access_trace_sha256"),
-        "link_trace_sha256": trace_manifest.get("link_trace_sha256"),
-        "energy_trace_sha256": trace_manifest.get("energy_trace_sha256"),
-        "files": _dict(trace_manifest.get("files")),
-        "sha256": _dict(trace_manifest.get("sha256")),
-        "time": _dict(trace_manifest.get("time")),
-        "calibration": _dict(trace_manifest.get("calibration")),
-        "scope": trace_manifest.get("scope"),
-        "valid_for_paper_main_results": bool(trace_manifest.get("valid_for_paper_main_results", False)),
+        "request_count": len(requests),
+        "session_count": len(sessions),
+        "warnings": list(_warnings(workload_payload)),
     }
     scenario_warnings = tuple(
         dict.fromkeys(
             (
                 *warnings,
-                *_warnings_from_payload(workload_payload),
-                *_warnings_from_payload(simulation_payload),
-                *_warnings_from_payload(energy_profile_payload),
-                *serving_profile.warnings,
+                *_warnings(workload_payload),
+                *_warnings(trace_payload),
+                *_warnings(energy_payload),
             )
         )
     )
     return RuntimeSimulationSpec(
         strategy=RuntimeStrategySpec.from_value(strategy),
-        scenario_id=scenario_name,
-        design_id=design_name,
+        scenario_id=scenario_id or str(workload_spec_payload.get("name") or "runtime_simulation"),
+        design_id=design_id or str(constellation_payload.get("name") or "runtime_design"),
         time_horizon_s=time_horizon_s,
-        time_step_s=_optional_float(simulation_config_payload.get("step_s")),
+        time_step_s=_positive_optional(simulation_config_payload.get("step_s")),
         workload_bundle=workload_bundle,
         requests=requests,
         sessions=sessions,
         regions=regions,
         gateways=gateways,
-        simulation_trace_ref=simulation_trace_ref,
+        simulation_trace_ref=trace_payload,
+        orbit_trace_bundle=trace_bundle,
         constellation={
             "design": constellation_payload,
             "architecture": architecture_payload,
-            "satellite_count": constellation_payload.get("satellite_count"),
-            **({"satellite_catalog": list(satellite_catalog)} if satellite_catalog else {}),
+            "satellite_count": len(trace_bundle.satellite_catalog) if trace_bundle else constellation_payload.get("satellite_count"),
         },
-        serving_profile=serving_profile,
-        energy_profile=energy_profile_payload,
+        serving_profile=ServingCapacityProfile.from_value(serving_profile),
+        energy_profile=energy_payload,
+        communication_ingress=communication_ingress,
         provenance={
-            "workload_bundle": {
-                "bundle_dir": workload_bundle["bundle_dir"],
-                "request_count": request_count,
-                "source_mode": source_mode,
-            },
-            "simulation_trace": {
-                "trace_id": simulation_trace_ref["trace_id"],
-                "trace_model": trace_model,
-                "evaluated": simulation_evaluated,
-                "valid_for_paper_main_results": simulation_trace_ref["valid_for_paper_main_results"],
-            },
-            "serving_model": {
-                "modeling_doc": "docs/research/parameters/llm_serving_capacity_model.md",
-                "estimate_schema": "ServingThroughputEstimate",
-            },
-            "energy_profile": _dict(energy_profile_payload.get("provenance")),
-            "runtime_interface_doc": RUNTIME_INTERFACE_DOC,
-            "runtime_performance_model_doc": RUNTIME_PERFORMANCE_DOC,
+            "orbit_trace_id": trace_payload.get("trace_id"),
+            "workload_request_count": len(requests),
+            "energy_profile": _mapping(energy_payload.get("provenance")),
         },
         warnings=scenario_warnings,
     )
 
-def _workload_bundle_configured(
-    payload: dict[str, Any],
-    requests: tuple[dict[str, Any], ...],
-    manifest: dict[str, Any],
-) -> bool:
-    if "configured" in payload:
-        return bool(payload.get("configured"))
-    return bool(payload.get("bundle_dir") or requests or manifest)
 
-def _mapping_from_result(value: Any) -> dict[str, Any]:
+def _trace_manifest(value: Any, bundle: OrbitTraceBundle | None) -> OrbitTraceManifest | None:
+    if bundle is not None:
+        return bundle.trace_manifest
+    if isinstance(value, OrbitTraceManifest):
+        return value
+    payload = _mapping(value)
+    nested = _mapping(payload.get("trace_manifest"))
+    candidate = nested or payload
+    if not candidate or not candidate.get("schema_version"):
+        return None
+    return OrbitTraceManifest.from_value(candidate)
+
+
+def _communication_ingress_payload(*payloads: dict[str, Any]) -> dict[str, Any]:
+    for payload in payloads:
+        for container in (payload, _mapping(payload.get("orbit")), _mapping(payload.get("provenance"))):
+            for key in ("communication_ingress", "communication_satellite"):
+                candidate = _mapping(container.get(key))
+                if candidate:
+                    return candidate
+    return {}
+
+
+def _mapping(value: Any) -> dict[str, Any]:
     if value is None:
         return {}
-    if isinstance(value, dict):
-        return to_jsonable(value)
+    if isinstance(value, Mapping):
+        return dict(to_jsonable(value))
     if hasattr(value, "to_dict") and callable(value.to_dict):
-        converted = to_jsonable(value.to_dict())
-        return converted if isinstance(converted, dict) else {}
-    converted = to_jsonable(value)
-    return converted if isinstance(converted, dict) else {}
+        result = value.to_dict()
+        return dict(to_jsonable(result)) if isinstance(result, Mapping) else {}
+    return {}
 
-def _dict(value: Any) -> dict[str, Any]:
-    return value if isinstance(value, dict) else {}
 
-def _warnings_from_payload(payload: dict[str, Any]) -> tuple[str, ...]:
-    raw = payload.get("warnings", ())
-    if raw is None:
-        return ()
-    if isinstance(raw, str):
-        return (raw,)
-    return tuple(str(item) for item in raw)
+def _rows(value: Any) -> tuple[dict[str, Any], ...]:
+    return tuple(dict(item) for item in (value or ()) if isinstance(item, Mapping))
 
-def _satellite_catalog_from_trace_manifest(trace_manifest: RuntimeTraceManifest) -> tuple[dict[str, Any], ...]:
-    trace_dir = _optional_str(trace_manifest.provenance.get("trace_dir"))
-    satellite_catalog = _read_satellite_catalog_json(
-        resolve_trace_path(
-            trace_manifest.satellite_catalog_path,
-            manifest_dir=trace_dir,
-        )
-    )
-    if satellite_catalog:
-        return satellite_catalog
-    access_trace_path = resolve_trace_path(
-        trace_manifest.access_trace_path,
-        manifest_dir=trace_dir,
-    )
-    if access_trace_path is None or not access_trace_path.exists():
-        return ()
-    try:
-        payload = json.loads(access_trace_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return ()
-    return _satellite_catalog_from_value(payload.get("satellite_catalog"))
 
-def _read_satellite_catalog_json(path: Any) -> tuple[dict[str, Any], ...]:
-    if path is None or not path.exists():
+def _warnings(payload: dict[str, Any]) -> tuple[str, ...]:
+    value = payload.get("warnings", ())
+    if value is None:
         return ()
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return ()
-    return _satellite_catalog_from_value(payload)
+    if isinstance(value, str):
+        return (value,)
+    return tuple(str(item) for item in value)
 
-def _satellite_catalog_from_value(payload: Any) -> tuple[dict[str, Any], ...]:
-    if not isinstance(payload, list):
-        return ()
-    return tuple(dict(item) for item in payload if isinstance(item, dict))
 
-def _optional_float(value: Any) -> float | None:
+def _positive_optional(value: Any) -> float | None:
     if value is None:
         return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+    parsed = float(value)
+    return parsed if parsed > 0.0 else None
 
-def _optional_int(value: Any) -> int | None:
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
 
-def _optional_str(value: Any) -> str | None:
-    if value is None:
-        return None
-    text = str(value)
-    return text if text else None
+def _first(*values: Any) -> Any:
+    return next((value for value in values if value is not None), None)
 
-def _first_present(*values: Any) -> Any:
-    for value in values:
-        if value is not None:
-            return value
-    return None
+
+__all__ = ["build_runtime_simulation_spec"]
