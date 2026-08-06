@@ -35,8 +35,9 @@ from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
 from orbitserve.workload import (
-    BUNDLE_FILES, BUNDLE_SCHEMA, CANONICALIZATION, bundle_hash,
-    canonical_json_bytes, load_workload_bundle,
+    BUNDLE_FILES, BUNDLE_SCHEMA, CANONICALIZATION,
+    SESSION_REQUEST_KEYS, REGION_KEYS, GATEWAY_KEYS, TIMEBIN_FIELDS,
+    bundle_hash, canonical_json_bytes, load_workload_bundle,
 )
 
 
@@ -53,7 +54,7 @@ DEFAULT_GATEWAYS = _HERE / "gateways.json"
 DEFAULT_LLAMA_TOKENIZER = _HERE / "tokenizer_llama_31"
 DEFAULT_LLAMA_ID = "meta-llama/Llama-3.1-70B-Instruct"
 
-GENERATOR = {"name": "profound_sharechat_adapter", "version": "1.0.0", "prng": "python-random-seeded-v1"}
+TIME_BIN_S = 60
 HORIZON_S = 86_400.0
 
 # A representative civil timezone for every top-40 country.  Multi-zone
@@ -113,23 +114,12 @@ def write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
 
 
 def timebin_csv_bytes(rows: Iterable[dict[str, Any]]) -> bytes:
-    """Local serialization for this adapter's seven-file bundle output."""
     import io
-
     output = io.StringIO(newline="")
-    writer = csv.DictWriter(output, fieldnames=(
-        "time_bin_start_s", "time_bin_end_s", "region_id", "request_count",
-        "prompt_tokens_total", "new_user_tokens_total", "output_tokens_total",
-        "interactive_request_count", "burst_request_count",
-    ), lineterminator="\n")
+    writer = csv.DictWriter(output, fieldnames=TIMEBIN_FIELDS, lineterminator="\n")
     writer.writeheader()
     writer.writerows(rows)
     return output.getvalue().encode("utf-8")
-
-
-def file_descriptor(path: Path, media_type: str, record_count: int) -> dict[str, Any]:
-    payload = path.read_bytes()
-    return {"path": path.name, "media_type": media_type, "sha256": hashlib.sha256(payload).hexdigest(), "record_count": int(record_count)}
 
 
 def parse_message_time(value: object) -> float | None:
@@ -352,15 +342,31 @@ def nearest_gateway(country: str, items: list[dict[str, Any]]) -> dict[str, Any]
     return min(items, key=lambda item: haversine_km(lat, lon, float(item["lat_deg"]), float(item["lon_deg"])))
 
 
-def slo(output: int) -> tuple[str, float, float, str]:
+def slo(output: int) -> tuple[str, float, float]:
     if output <= 256:
-        return "interactive_short", 3.0, 30.0, "interactive"
+        return "interactive_short", 3.0, 30.0
     if output <= 1024:
-        return "interactive_long", 3.0, 120.0, "interactive"
-    return "normal_long", 10.0, 300.0, "normal"
+        return "interactive_long", 3.0, 120.0
+    return "normal_long", 10.0, 300.0
+
+
+def percentile(sorted_values: list[float], p: float) -> float:
+    """Linear-interpolation percentile (p in 0..100)."""
+    if not sorted_values:
+        return 0.0
+    n = len(sorted_values)
+    k = (p / 100.0) * (n - 1)
+    f = math.floor(k)
+    c = math.ceil(k)
+    if f == c:
+        return sorted_values[int(k)]
+    d0 = sorted_values[f] * (c - k)
+    d1 = sorted_values[c] * (k - f)
+    return d0 + d1
 
 
 def build(args: argparse.Namespace) -> Path:
+    workload_id = f"main_composite_chat_{args.profile_pattern}"
     epoch = datetime.fromisoformat(args.epoch.replace("Z", "+00:00")).astimezone(timezone.utc)
     source = Path(args.input)
     source_hash = sha256_file(source) if getattr(args, "compute_source_sha256", False) else None
@@ -380,16 +386,18 @@ def build(args: argparse.Namespace) -> Path:
     rng = random.Random(args.seed)
     gateway_items = gateways()
 
-    requests: list[dict[str, Any]] = []
-    sessions: list[dict[str, Any]] = []
+    session_requests: list[dict[str, Any]] = []
     used_countries: Counter[str] = Counter()
     dropped = 0
     n_source = len(conversations)
     n_target = args.max_sessions
     oversample = n_target > n_source
     if oversample:
-        print(f"Oversampling: {n_source} source conversations → {n_target} sessions "
-              f"(each source reused ~{n_target / n_source:.1f}× with fresh country/time)")
+        print(f"Oversampling: {n_source} source conversations -> {n_target} sessions "
+              f"(each source reused ~{n_target / n_source:.1f}x with fresh country/time)")
+
+    def _region_id(country: str) -> str:
+        return f"country_{country.lower().replace(' ', '_').replace('(', '').replace(')', '')}"
 
     for ordinal in range(n_target):
         conversation = conversations[ordinal % n_source]
@@ -404,83 +412,155 @@ def build(args: argparse.Namespace) -> Path:
             continue
         session_id = stable_id("sc_sess", conversation["platform"], conversation["url"], ordinal, args.seed)
         gateway = nearest_gateway(country, gateway_items)
-        lat, lon = COORDS[country]
+        model_family = conversation["platform"]  # chatgpt / grok
         history: list[dict[str, str]] = []
         local_rows: list[dict[str, Any]] = []
         for turn, (pair, gap) in enumerate(zip(pairs, relative)):
             context, new_user, output = counter.counts(
                 history, pair["user"], pair["assistant"], args.context_window_tokens
             )
-            slo_class, ttft, e2e, priority = slo(output)
+            slo_class, ttft, e2e = slo(output)
             request_id = stable_id("sc_req", session_id, turn)
             arrival = round(start + gap, 6)
             local_rows.append({
-                "request_id": request_id, "arrival_time_s": arrival, "user_region_id": f"country_{country.lower().replace(' ', '_').replace('(', '').replace(')', '')}",
-                "region_id": f"country_{country.lower().replace(' ', '_').replace('(', '').replace(')', '')}", "lat_deg": lat, "lon_deg": lon,
-                "access_mode": "gateway_sgl", "ingress_id": gateway["gateway_id"], "ingress_lat_deg": float(gateway["lat_deg"]), "ingress_lon_deg": float(gateway["lon_deg"]), "gateway_id": gateway["gateway_id"],
-                "task_type": "conversation", "model_family": "sharechat_target_model", "prompt_tokens": context + new_user, "new_user_tokens": new_user,
-                "context_tokens_before_turn": context, "output_tokens": output, "input_bytes": 4 * (context + new_user), "output_bytes": 4 * output,
-                "context_window_tokens": args.context_window_tokens, "slo_class": slo_class, "ttft_deadline_s": ttft, "e2e_deadline_s": e2e, "priority": priority,
-                "session_id": session_id, "turn_index": turn, "session_turn_count": len(pairs), "inter_turn_gap_s": None if turn == 0 else round(gap - relative[turn - 1], 6),
-                "session_ttl_s": args.session_ttl_s, "burst_id": None, "burst_multiplier": 1.0, "seed": int(hashlib.sha256(request_id.encode()).hexdigest()[:16], 16) & ((1 << 63) - 1),
+                "request_id": request_id,
+                "arrival_time_s": arrival,
+                "user_region_id": _region_id(country),
+                "access_mode": "gateway_sgl",
+                "ingress_id": gateway["gateway_id"],
+                "gateway_id": gateway["gateway_id"],
+                "model_family": model_family,
+                "prompt_tokens": context + new_user,
+                "new_user_tokens": new_user,
+                "context_tokens_before_turn": context,
+                "output_tokens": output,
+                "input_bytes": 4 * (context + new_user),
+                "output_bytes": 4 * output,
+                "context_window_tokens": args.context_window_tokens,
+                "slo_class": slo_class,
+                "ttft_deadline_s": ttft,
+                "e2e_deadline_s": e2e,
+                "session_id": session_id,
+                "turn_index": turn,
+                "session_turn_count": len(pairs),
+                "inter_turn_gap_s": None if turn == 0 else round(gap - relative[turn - 1], 6),
+                "session_start_time_s": local_rows[0]["arrival_time_s"] if local_rows else arrival,
+                "session_ttl_s": args.session_ttl_s,
+                "seed": int(hashlib.sha256(request_id.encode()).hexdigest()[:16], 16) & ((1 << 63) - 1),
             })
             history.extend([pair["user"], pair["assistant"]])
-        sessions.append({"session_id": session_id, "user_region_id": local_rows[0]["user_region_id"], "session_start_time_s": local_rows[0]["arrival_time_s"], "session_turn_count": len(local_rows), "session_slo_class": local_rows[0]["slo_class"], "context_window_tokens": args.context_window_tokens, "session_ttl_s": args.session_ttl_s, "seed": int(hashlib.sha256(session_id.encode()).hexdigest()[:16], 16) & ((1 << 63) - 1)})
-        requests.extend(local_rows)
+        # Fill session_start_time_s in all rows of this session
+        session_start = local_rows[0]["arrival_time_s"]
+        for row in local_rows:
+            row["session_start_time_s"] = session_start
+        session_requests.extend(local_rows)
         used_countries[country] += 1
-    if not requests:
-        raise AdapterError("all sessions spill beyond the one-day horizon")
-    requests.sort(key=lambda row: (row["arrival_time_s"], row["request_id"]))
-    sessions.sort(key=lambda row: (row["session_start_time_s"], row["session_id"]))
 
+    if not session_requests:
+        raise AdapterError("all sessions spill beyond the one-day horizon")
+    session_requests.sort(key=lambda r: (r["arrival_time_s"], r["request_id"]))
+
+    # ── regions.json ────────────────────────────────────────────────
     region_rows = []
     for country in sorted(used_countries):
-        region_id = f"country_{country.lower().replace(' ', '_').replace('(', '').replace(')', '')}"
+        region_id = _region_id(country)
         lat, lon = COORDS[country]
-        region_rows.append({"region_id": region_id, "region_name": country, "lat_deg": lat, "lon_deg": lon, "timezone_utc_offset_h": timezone_offset(TIMEZONES[country], epoch), "demand_weight": used_countries[country] / len(sessions), "weight_source": "country_relative_request_index_top40", "market_class": None})
+        region_rows.append({
+            "region_id": region_id, "region_name": country,
+            "lat_deg": lat, "lon_deg": lon,
+            "demand_weight": used_countries[country] / len(session_requests),
+        })
+
+    # ── gateways.json ───────────────────────────────────────────────
     served = defaultdict(set)
-    for request in requests:
-        served[request["gateway_id"]].add(request["region_id"])
-    gateway_rows = [{"gateway_id": item["gateway_id"], "lat_deg": float(item["lat_deg"]), "lon_deg": float(item["lon_deg"]), "served_region_ids": sorted(served[item["gateway_id"]]), "gateway_bandwidth_bps": int(item["gateway_bandwidth_bps"]), "availability_profile_id": item.get("availability_profile_id"), "cost_usd_per_year": item.get("cost_usd_per_year")} for item in gateway_items]
+    for r in session_requests:
+        served[r["gateway_id"]].add(r["user_region_id"])
+    gateway_rows = [
+        {"gateway_id": gw["gateway_id"],
+         "lat_deg": float(gw["lat_deg"]), "lon_deg": float(gw["lon_deg"]),
+         "served_region_ids": sorted(served[gw["gateway_id"]])}
+        for gw in gateway_items
+    ]
 
+    # ── timebin_demand.csv (60 s bins) ──────────────────────────────
     bins: dict[tuple[int, str], dict[str, Any]] = {}
-    for request in requests:
-        start = math.floor(request["arrival_time_s"] / args.time_bin_s) * args.time_bin_s
-        key = (start, request["region_id"])
-        row = bins.setdefault(key, {"time_bin_start_s": start, "time_bin_end_s": start + args.time_bin_s, "region_id": request["region_id"], "request_count": 0, "prompt_tokens_total": 0, "new_user_tokens_total": 0, "output_tokens_total": 0, "interactive_request_count": 0, "burst_request_count": 0})
-        row["request_count"] += 1; row["prompt_tokens_total"] += request["prompt_tokens"]; row["new_user_tokens_total"] += request["new_user_tokens"]; row["output_tokens_total"] += request["output_tokens"]
-        row["interactive_request_count"] += int(request["priority"] == "interactive")
-    timebins = [bins[key] for key in sorted(bins)]
-    summary = {"workload_id": args.workload_id, "request_count": len(requests), "session_count": len(sessions), "source_session_count": len(conversations), "dropped_horizon_sessions": dropped, "multi_turn_session_count": sum(row["session_turn_count"] > 1 for row in sessions), "time_resolution": "seconds", "tokenization": args.tokenizer_backend, "country_assignment": "synthetic draw from country_relative_request_index_top40", "diurnal_profile": f"Profound Figure 2 digitized per-region {args.profile_pattern}; seconds uniformly sampled within selected local hour"}
+    for r in session_requests:
+        tb = math.floor(r["arrival_time_s"] / TIME_BIN_S) * TIME_BIN_S
+        key = (tb, r["user_region_id"])
+        row = bins.setdefault(key, {
+            "time_bin_start_s": tb, "time_bin_end_s": tb + TIME_BIN_S,
+            "region_id": r["user_region_id"],
+            "request_count": 0, "prompt_tokens_total": 0,
+            "new_user_tokens_total": 0, "output_tokens_total": 0,
+        })
+        row["request_count"] += 1
+        row["prompt_tokens_total"] += r["prompt_tokens"]
+        row["new_user_tokens_total"] += r["new_user_tokens"]
+        row["output_tokens_total"] += r["output_tokens"]
+    timebins = [bins[k] for k in sorted(bins)]
 
+    # ── workload_summary.json ───────────────────────────────────────
+    # Session-level stats
+    session_turn_counts: list[int] = []
+    session_tokens: list[float] = []
+    session_durations: list[float] = []
+    session_map: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for r in session_requests:
+        sid = r.get("session_id")
+        if sid is not None:
+            session_map[sid].append(r)
+    for sid, rows in session_map.items():
+        session_turn_counts.append(len(rows))
+        session_tokens.append(float(sum(r["prompt_tokens"] + r["output_tokens"] for r in rows)))
+        arrivals = sorted(r["arrival_time_s"] for r in rows)
+        session_durations.append(arrivals[-1] - arrivals[0])
+
+    # Per-request token stats
+    prompt_tokens_list = sorted([float(r["prompt_tokens"]) for r in session_requests])
+    output_tokens_list = sorted([float(r["output_tokens"]) for r in session_requests])
+
+    summary = {
+        "workload_id": workload_id,
+        "request_count": len(session_requests),
+        "session_count": len(session_map),
+        "multi_turn_session_count": sum(1 for c in session_turn_counts if c >= 2),
+        "session_turn_count_p50": percentile(sorted(session_turn_counts), 50),
+        "session_turn_count_p95": percentile(sorted(session_turn_counts), 95),
+        "request_prompt_tokens_p50": percentile(prompt_tokens_list, 50),
+        "request_prompt_tokens_p95": percentile(prompt_tokens_list, 95),
+        "request_output_tokens_p50": percentile(output_tokens_list, 50),
+        "request_output_tokens_p95": percentile(output_tokens_list, 95),
+        "session_tokens_p50": percentile(sorted(session_tokens), 50),
+        "session_tokens_p95": percentile(sorted(session_tokens), 95),
+        "session_duration_s_p50": percentile(sorted(session_durations), 50),
+        "session_duration_s_p95": percentile(sorted(session_durations), 95),
+    }
+
+    # ── Write bundle ────────────────────────────────────────────────
     out = Path(args.out)
     if out.exists():
         if not args.overwrite:
             raise AdapterError(f"{out} exists; pass --overwrite")
         shutil.rmtree(out)
     out.mkdir(parents=True)
-    write_json(out / "regions.json", region_rows); write_json(out / "gateways.json", gateway_rows); write_jsonl(out / "requests.jsonl", requests); write_jsonl(out / "sessions.jsonl", sessions)
-    (out / "timebin_demand.csv").write_bytes(timebin_csv_bytes(timebins)); write_json(out / "workload_summary.json", summary)
-    descriptors = {
-        key: file_descriptor(out / name, media_type, count)
-        for key, ((name, media_type), count) in {
-            "regions": (BUNDLE_FILES["regions"], len(region_rows)),
-            "gateways": (BUNDLE_FILES["gateways"], len(gateway_rows)),
-            "requests": (BUNDLE_FILES["requests"], len(requests)),
-            "sessions": (BUNDLE_FILES["sessions"], len(sessions)),
-            "timebin_demand": (BUNDLE_FILES["timebin_demand"], len(timebins)),
-            "summary": (BUNDLE_FILES["summary"], 1),
-        }.items()
+
+    write_json(out / "regions.json", region_rows)
+    write_json(out / "gateways.json", gateway_rows)
+    write_jsonl(out / "session_requests.jsonl", session_requests)
+    (out / "timebin_demand.csv").write_bytes(timebin_csv_bytes(timebins))
+    write_json(out / "workload_summary.json", summary)
+
+    # ── workload_manifest.json ──────────────────────────────────────
+    manifest = {
+        "schema_version": BUNDLE_SCHEMA,
+        "canonicalization": CANONICALIZATION,
+        "workload_id": workload_id,
+        "seed": args.seed,
+        "time_horizon_s": HORIZON_S,
+        "bundle_sha256": bundle_hash(workload_id, out),
     }
-    warnings = [
-        "Country assignment and local-time profile are explicit synthetic assumptions; ShareChat has no country field.",
-        "Only source rows with real per-message timestamps were accepted.",
-    ]
-    if source_hash is None:
-        warnings.append("Source CSV SHA-256 was skipped; pass --compute-source-sha256 for a reproducibility audit.")
-    manifest = {"schema_version": BUNDLE_SCHEMA, "workload_id": args.workload_id, "source_mode": "explicit_requests", "seed": args.seed, "module_version": "1.0.0", "canonicalization": CANONICALIZATION, "generator": GENERATOR, "time": {"epoch_kind": "absolute_utc", "epoch": epoch.isoformat().replace("+00:00", "Z"), "time_horizon_s": HORIZON_S, "time_bin_s": args.time_bin_s, "interval_semantics": "half_open", "time_mode": "country_local_second_resolution"}, "source": {"mode": "explicit_requests", "inputs": [{"path": str(source), "sha256": source_hash, "record_count": len(conversations)}]}, "files": descriptors, "counts": {"request_count": len(requests), "session_count": len(sessions), "region_count": len(region_rows), "gateway_count": len(gateway_rows), "timebin_count": len(timebins)}, "tokenizer": {"backend": args.tokenizer_backend, "target_model": args.tokenizer_id, "local_path": str(args.tokenizer_local_dir), "context_window_tokens": args.context_window_tokens, "output_policy": "assistant_content_plus_eos"}, "warnings": warnings, "provenance": {"sources": [{"source_id": "tucnguyen/ShareChat", "url": "https://huggingface.co/datasets/tucnguyen/ShareChat", "sha256": source_hash}], "timing": "user message timestamp when available; otherwise assistant-completion proxy", "session_key": "platform + url", "relative_gaps": "observed message timestamp differences"}, "bundle_sha256": bundle_hash(args.workload_id, descriptors)}
     write_json(out / "workload_manifest.json", manifest)
-    # Cross-module validation uses OrbitServe's public loader only.
+
     load_workload_bundle(out)
     return out
 
@@ -489,25 +569,21 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", required=True, help="ShareChat ChatGPT or Grok CSV")
     parser.add_argument("--out", required=True)
-    parser.add_argument("--workload-id", default="profound_sharechat")
     parser.add_argument("--countries", default=str(DEFAULT_COUNTRIES))
     parser.add_argument("--profile-pattern", choices=tuple(PROFILE_PATTERNS), default=DEFAULT_PATTERN,
                         help="work_weekday | work_weekend | nonwork_weekday | nonwork_weekend")
     parser.add_argument("--epoch", default="2026-08-03T00:00:00Z")
     parser.add_argument("--max-sessions", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=20260804)
-    parser.add_argument("--time-bin-s", type=int, default=1)
     parser.add_argument("--context-window-tokens", type=int, default=131072)
     parser.add_argument("--session-ttl-s", type=float, default=600.0)
     parser.add_argument("--tokenizer-backend", choices=("huggingface_auto", "simple_unicode_v1"), default="huggingface_auto")
     parser.add_argument("--tokenizer-id", default=DEFAULT_LLAMA_ID)
     parser.add_argument("--tokenizer-local-dir", default=str(DEFAULT_LLAMA_TOKENIZER))
-    parser.add_argument("--compute-source-sha256", action="store_true", help="stream the full source CSV once for an audit hash")
+    parser.add_argument("--compute-source-sha256", action="store_true")
     parser.add_argument("--require-turn-timestamps", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
-    if args.time_bin_s <= 0 or 86400 % args.time_bin_s:
-        parser.error("--time-bin-s must be a positive divisor of 86400")
     try:
         result = build(args)
     except AdapterError as exc:
