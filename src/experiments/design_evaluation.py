@@ -15,10 +15,10 @@ from typing import Any
 
 from .constellation_cost import estimate_constellation_cost
 from ..architecture import resolve_experiment_hardware
-from ..runtime import RuntimeStrategySpec, build_runtime_scenario
-from .runtime_dispatch import evaluate_runtime_performance
+from ..runtime import RuntimeStrategySpec, run_simulation as execute_runtime_simulation
+from .simulation_builder import build_simulation_spec
 from ..serving import estimate_serving_throughput
-from ..orbit import run_simulation
+from ..orbit import run_simulation as run_orbit_simulation
 
 
 ARCHITECTURE_SURROGATE_WARNING = (
@@ -41,7 +41,7 @@ class MaterializedDesignEvaluation:
     simulation: Any
     serving_spec: Any
     serving_throughput: Any
-    runtime_scenario: Any
+    runtime_simulation_spec: Any
     runtime_performance: Any
     warnings: tuple[str, ...]
 
@@ -73,7 +73,7 @@ def evaluate_materialized_design(
 
     # Keep this order explicit: it is the shared fixed-design/DSE contract.
     constellation_architecture = design.architecture_analysis()
-    runtime_strategy = RuntimeStrategySpec.from_value(experiment_spec.scheduler)
+    runtime_strategy = RuntimeStrategySpec.from_value(experiment_spec.runtime_strategy)
     resolved_hardware = resolve_experiment_hardware(
         getattr(experiment_spec, "hardware", None),
         base_dir=base_dir,
@@ -90,7 +90,7 @@ def evaluate_materialized_design(
         input_simulation_config,
         resolved_hardware=resolved_hardware,
     )
-    simulation = run_simulation(
+    simulation = run_orbit_simulation(
         resolved_simulation_config,
         constellation=design,
         workload_generation=workload_generation,
@@ -101,6 +101,8 @@ def evaluate_materialized_design(
         experiment_spec,
         resolved_hardware=resolved_hardware,
     )
+    if str(getattr(serving_spec, "pd_mode", "colocated")) != "colocated":
+        raise ValueError("runtime_pd_disaggregation_unsupported")
     serving_throughput = estimate_serving_throughput(
         serving_spec,
         hardware=resolved_hardware.satellite_profile,
@@ -120,27 +122,21 @@ def evaluate_materialized_design(
             *tuple(constellation_architecture.get("warnings", ())),
         )
     )
-    runtime_scenario = build_runtime_scenario(
+    runtime_simulation_spec = build_simulation_spec(
         scenario_id=evaluation_id,
         design_id=str(design.name),
         workload_generation=workload_generation,
         workload_spec=getattr(experiment_spec, "workload", None),
         constellation=design,
-        constellation_architecture=constellation_architecture,
-        serving_spec=serving_spec,
-        serving_throughput=serving_throughput,
+        constellation_architecture=resolved_hardware.satellite_profile,
+        serving_profile=serving_throughput,
         simulation_result=simulation,
         simulation_config=resolved_simulation_config,
-        cost_result=cost,
-        scheduler_spec=runtime_strategy,
-        hardware=getattr(experiment_spec, "hardware", None),
-        resolved_hardware=resolved_hardware,
+        energy_profile=getattr(resolved_hardware, "energy_profile", None),
+        strategy=runtime_strategy,
         warnings=pre_runtime_warnings,
     )
-    runtime_performance = evaluate_runtime_performance(
-        runtime_scenario,
-        runtime_scenario.runtime_config,
-    )
+    runtime_performance = execute_runtime_simulation(runtime_simulation_spec)
     warnings = _dedupe((*pre_runtime_warnings, *runtime_performance.warnings))
     return MaterializedDesignEvaluation(
         design=design,
@@ -151,7 +147,7 @@ def evaluate_materialized_design(
         simulation=simulation,
         serving_spec=serving_spec,
         serving_throughput=serving_throughput,
-        runtime_scenario=runtime_scenario,
+        runtime_simulation_spec=runtime_simulation_spec,
         runtime_performance=runtime_performance,
         warnings=warnings,
     )
