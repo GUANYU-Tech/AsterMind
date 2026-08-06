@@ -151,6 +151,34 @@ class RuntimeEngineTests(unittest.TestCase):
         self.assertEqual(record["decision"]["dvfs_scale"], 0.5)
         self.assertEqual(record["timing"]["prefill_service_s"], 2.0)
 
+    def test_equal_power_and_compute_dvfs_keeps_energy_per_token_constant(self):
+        full_speed = run_simulation(
+            _scenario(
+                RuntimeStrategySpec(
+                    latency_weight=1.0,
+                    kv_reuse_weight=0.0,
+                    energy_weight=0.0,
+                    compute_load_weight=0.0,
+                )
+            )
+        ).request_records[0]
+        shadow_dvfs = run_simulation(
+            _scenario(
+                RuntimeStrategySpec(
+                    latency_weight=1.0,
+                    kv_reuse_weight=0.0,
+                    energy_weight=0.0,
+                    compute_load_weight=0.0,
+                    shadow_dvfs_enabled=True,
+                    shadow_dvfs_scale=0.5,
+                )
+            )
+        ).request_records[0]
+        self.assertEqual(
+            full_speed["energy"]["compute_energy_j"],
+            shadow_dvfs["energy"]["compute_energy_j"],
+        )
+
     def test_full_kv_copy_reuses_context_and_retains_source(self):
         strategy = RuntimeStrategySpec(
             latency_weight=1.0,

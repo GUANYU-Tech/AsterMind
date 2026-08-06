@@ -319,10 +319,7 @@ def _preview_candidate(
 
     preview = replace(satellite, compute_queue=replace(satellite.compute_queue))
     advance_satellite_energy(preview, energy_trace, prefill_start_s)
-    energy_window = _energy_window_with_dvfs(
-        energy_window_at(energy_trace, compute_satellite_id, prefill_start_s),
-        dvfs_scale,
-    )
+    energy_window = energy_window_at(energy_trace, compute_satellite_id, prefill_start_s)
     physical_paths = (inbound_path, first_path, output_path, copy_path)
     link_bytes_by_satellite = _link_bytes_by_satellite(
         physical_paths,
@@ -590,18 +587,6 @@ def _preview_kv_copy(
         "copied_tokens": copied_tokens,
         "done_s": done_s,
         "path": path,
-    }
-
-
-def _energy_window_with_dvfs(window: dict[str, Any], dvfs_scale: float) -> dict[str, Any]:
-    """Apply Runtime's equal compute-capacity/power DVFS assumption."""
-
-    base = float(window["compute_energy_j_per_token"])
-    return {
-        **dict(window),
-        "compute_energy_j_per_token": base * dvfs_scale,
-        "base_compute_energy_j_per_token": base,
-        "runtime_compute_energy_scale": dvfs_scale,
     }
 
 
