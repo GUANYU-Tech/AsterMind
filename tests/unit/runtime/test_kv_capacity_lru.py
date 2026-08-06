@@ -3,7 +3,9 @@ import unittest
 from orbitserve.runtime.state.kv_cache import (
     _admit_session_kv,
     commit_session_kv,
+    kv_locations_for_session,
     local_kv_reuse_tokens,
+    touch_kv_entry,
 )
 from orbitserve.runtime.state.runtime_state import RuntimeState
 
@@ -12,17 +14,14 @@ class KVCapacityLRUTests(unittest.TestCase):
     def setUp(self):
         self.state = RuntimeState()
 
-    def admit(self, session_id, tokens, now_s, satellite_id="sat-a"):
+    def admit(self, session_id, tokens, now_s, satellite_id="sat-a", capacity=10):
         self.state.session_for(session_id)
+        self.state.kv_cache_for(satellite_id, capacity_tokens=capacity)
         return _admit_session_kv(
             self.state,
-            capacity_tokens=10,
-            capacity_bytes=None,
-            kv_policy={},
             session_id=session_id,
             satellite_id=satellite_id,
-            tokens=tokens,
-            kv_bytes_per_token=1.0,
+            cached_tokens=tokens,
             now_s=now_s,
         )
 
@@ -31,7 +30,9 @@ class KVCapacityLRUTests(unittest.TestCase):
         self.admit("b", 4, 10_000.0)
         result = self.admit("c", 4, 20_000.0)
         self.assertEqual(result["evicted_session_ids"], ("a",))
+        self.assertEqual(result["evicted_tokens"], 4)
         self.assertEqual(set(self.state.kv_cache_for("sat-a").entries), {"b", "c"})
+        self.assertEqual(self.state.kv_cache_for("sat-a").used_tokens, 8)
 
     def test_local_reuse_is_bounded_by_required_context(self):
         self.admit("a", 8, 1.0)
@@ -46,13 +47,13 @@ class KVCapacityLRUTests(unittest.TestCase):
         )
 
     def test_copy_retains_source_after_target_admission(self):
+        self.state.kv_cache_for("sat-a", capacity_tokens=10)
+        self.state.kv_cache_for("sat-b", capacity_tokens=10)
         commit_session_kv(
             self.state,
             session_id="a",
             satellite_id="sat-a",
             context_tokens=4,
-            capacity_tokens=10,
-            kv_bytes_per_token=1.0,
             now_s=1.0,
         )
         result = commit_session_kv(
@@ -60,24 +61,20 @@ class KVCapacityLRUTests(unittest.TestCase):
             session_id="a",
             satellite_id="sat-b",
             context_tokens=4,
-            capacity_tokens=10,
-            kv_bytes_per_token=1.0,
             now_s=2.0,
             copied_from="sat-a",
         )
         self.assertEqual(result["action"], "copied")
-        self.assertIn("a", self.state.kv_cache_for("sat-a").entries)
-        self.assertIn("a", self.state.kv_cache_for("sat-b").entries)
-        self.assertEqual(self.state.session_for("a").satellite_ids, ["sat-a", "sat-b"])
+        self.assertEqual(kv_locations_for_session(self.state, "a"), ("sat-a", "sat-b"))
 
     def test_recompute_on_new_satellite_keeps_old_copy(self):
+        self.state.kv_cache_for("sat-a", capacity_tokens=10)
+        self.state.kv_cache_for("sat-b", capacity_tokens=10)
         commit_session_kv(
             self.state,
             session_id="a",
             satellite_id="sat-a",
             context_tokens=4,
-            capacity_tokens=10,
-            kv_bytes_per_token=1.0,
             now_s=1.0,
         )
         result = commit_session_kv(
@@ -85,28 +82,49 @@ class KVCapacityLRUTests(unittest.TestCase):
             session_id="a",
             satellite_id="sat-b",
             context_tokens=4,
-            capacity_tokens=10,
-            kv_bytes_per_token=1.0,
             now_s=2.0,
         )
         self.assertEqual(result["action"], "recompute_context")
-        self.assertIn("a", self.state.kv_cache_for("sat-a").entries)
-        self.assertIn("a", self.state.kv_cache_for("sat-b").entries)
+        self.assertEqual(kv_locations_for_session(self.state, "a"), ("sat-a", "sat-b"))
 
-    def test_lru_eviction_removes_only_the_evicted_satellite(self):
-        for session_id, now_s in (("a", 1.0), ("b", 2.0), ("c", 3.0)):
-            commit_session_kv(
-                self.state,
-                session_id=session_id,
-                satellite_id="sat-a",
-                context_tokens=4,
-                capacity_tokens=8,
-                kv_bytes_per_token=1.0,
-                now_s=now_s,
-            )
-        self.assertEqual(self.state.session_for("a").satellite_ids, [])
-        self.assertEqual(self.state.session_for("b").satellite_ids, ["sat-a"])
-        self.assertEqual(self.state.session_for("c").satellite_ids, ["sat-a"])
+    def test_lru_eviction_is_local_to_one_satellite(self):
+        self.state.kv_cache_for("sat-a", capacity_tokens=8)
+        self.state.kv_cache_for("sat-b", capacity_tokens=8)
+        self.admit("a", 4, 1.0, "sat-a", 8)
+        self.admit("a", 4, 1.0, "sat-b", 8)
+        self.admit("b", 4, 2.0, "sat-a", 8)
+        self.admit("c", 4, 3.0, "sat-a", 8)
+        self.assertEqual(kv_locations_for_session(self.state, "a"), ("sat-b",))
+        self.assertEqual(set(self.state.kv_cache_for("sat-a").entries), {"b", "c"})
+
+    def test_copy_read_refreshes_source_lru(self):
+        self.admit("a", 4, 1.0)
+        touch_kv_entry(
+            self.state,
+            satellite_id="sat-a",
+            session_id="a",
+            now_s=9.0,
+        )
+        self.assertEqual(
+            self.state.kv_cache_for("sat-a").entries["a"].last_access_s,
+            9.0,
+        )
+
+    def test_entry_larger_than_capacity_does_not_replace_existing_copy(self):
+        self.admit("a", 4, 1.0)
+        result = commit_session_kv(
+            self.state,
+            session_id="a",
+            satellite_id="sat-a",
+            context_tokens=11,
+            now_s=2.0,
+        )
+        self.assertFalse(result["admitted"])
+        self.assertEqual(self.state.session_for("a").context_tokens, 11)
+        self.assertEqual(
+            self.state.kv_cache_for("sat-a").entries["a"].cached_tokens,
+            4,
+        )
 
 
 if __name__ == "__main__":

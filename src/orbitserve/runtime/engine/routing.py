@@ -94,7 +94,7 @@ def communication_access_candidate(profile: Any, request: dict[str, Any], horizo
 
 
 def compute_access_candidates(
-    trace_bundle: Any,
+    environment_state: Any,
     *,
     ingress_id: str,
     time_s: float,
@@ -102,11 +102,11 @@ def compute_access_candidates(
     downlink_bandwidth_bps: float,
 ) -> tuple[AccessCandidate, ...]:
     candidates: list[AccessCandidate] = []
-    for window in trace_bundle.sgl_windows:
+    for window in environment_state.sgl_windows:
         if str(window.get("ingress_id")) != ingress_id or not _active(window, time_s):
             continue
         satellite_id = str(window["satellite_id"])
-        vector = satellite_position_unit(trace_bundle, satellite_id, time_s)
+        vector = satellite_position_unit(environment_state, satellite_id, time_s)
         candidates.append(
             AccessCandidate(
                 access_type="compute_satellite",
@@ -124,7 +124,7 @@ def compute_access_candidates(
 
 
 def build_route_plan(
-    trace_bundle: Any,
+    environment_state: Any,
     *,
     access: AccessCandidate,
     compute_satellite_id: str,
@@ -133,7 +133,7 @@ def build_route_plan(
     output_bytes: float,
     isl_bandwidth_bps: float,
 ) -> RoutePlan | None:
-    target_vector = satellite_position_unit(trace_bundle, compute_satellite_id, time_s)
+    target_vector = satellite_position_unit(environment_state, compute_satellite_id, time_s)
     angle = central_angle(access.anchor_unit_vector, target_vector)
     if access.access_type == "communication_satellite":
         network_propagation = angle * EARTH_RADIUS_KM / C_KM_PER_S
@@ -170,7 +170,7 @@ def build_route_plan(
         )
 
     source = str(access.satellite_id)
-    route = shortest_active_isl_path(trace_bundle, source, compute_satellite_id, time_s)
+    route = shortest_active_isl_path(environment_state, source, compute_satellite_id, time_s)
     if route is None:
         return None
     satellite_ids, windows = route
@@ -263,7 +263,7 @@ def execute_route(legs: tuple[RouteLeg, ...], start_s: float) -> tuple[float, tu
 
 
 def shortest_active_isl_path(
-    trace_bundle: Any,
+    environment_state: Any,
     source: str,
     target: str,
     time_s: float,
@@ -271,7 +271,7 @@ def shortest_active_isl_path(
     if source == target:
         return (source,), ()
     graph: dict[str, list[tuple[float, str, dict[str, Any]]]] = {}
-    for window in trace_bundle.isl_windows:
+    for window in environment_state.isl_windows:
         if not _active(window, time_s):
             continue
         first = str(window["endpoint_a"])
@@ -294,7 +294,7 @@ def shortest_active_isl_path(
 
 
 def build_isl_transfer_legs(
-    trace_bundle: Any,
+    environment_state: Any,
     *,
     source_satellite_id: str,
     target_satellite_id: str,
@@ -303,7 +303,7 @@ def build_isl_transfer_legs(
     bandwidth_bps: float,
 ) -> tuple[RouteLeg, ...] | None:
     route = shortest_active_isl_path(
-        trace_bundle, source_satellite_id, target_satellite_id, time_s
+        environment_state, source_satellite_id, target_satellite_id, time_s
     )
     if route is None:
         return None
@@ -323,9 +323,9 @@ def build_isl_transfer_legs(
     )
 
 
-def satellite_position_unit(trace_bundle: Any, satellite_id: str, time_s: float) -> tuple[float, float, float]:
+def satellite_position_unit(environment_state: Any, satellite_id: str, time_s: float) -> tuple[float, float, float]:
     rows = [
-        row for row in trace_bundle.ephemeris_samples
+        row for row in environment_state.ephemeris_samples
         if str(row.get("satellite_id")) == satellite_id
     ]
     if not rows:

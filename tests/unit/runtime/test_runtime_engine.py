@@ -70,6 +70,7 @@ def _scenario(strategy, requests=None, trace=None):
             "requests": requests or [_request()]
         },
         constellation_architecture={
+            "storage_capacity_tb": 2e-10,
             "communication": {
                 "sgl_bandwidth_bps": 1e9,
                 "isl_bandwidth_bps": 1e9,
@@ -88,7 +89,7 @@ def _scenario(strategy, requests=None, trace=None):
             "feasible": True,
             "prefill_tokens_per_s": 10.0,
             "decode_tokens_per_s": 10.0,
-            "kv_cache_capacity_tokens": 100,
+            "kv_cache_capacity_tokens": 1,
             "kv_cache_bytes_per_token": 2.0,
         },
         energy_profile={
@@ -122,6 +123,10 @@ class RuntimeEngineTests(unittest.TestCase):
         self.assertNotIn("links", result.state_summary)
         self.assertNotIn("link_queue_wait_s", record["timing"])
         self.assertFalse(result.slo_metrics["evaluated"])
+        self.assertEqual(
+            result.state_summary["kv_caches"]["sat-a"]["capacity_tokens"],
+            100,
+        )
 
     def test_ground_access_latency_contains_transmission_and_propagation(self):
         strategy = RuntimeStrategySpec(
@@ -185,7 +190,7 @@ class RuntimeEngineTests(unittest.TestCase):
             kv_reuse_weight=0.0,
             energy_weight=0.0,
             compute_load_weight=0.0,
-            kv_copy_ratio=1.0,
+            kv_migration_fraction=1.0,
         )
         result = run_simulation(
             _scenario(
@@ -202,12 +207,14 @@ class RuntimeEngineTests(unittest.TestCase):
         self.assertEqual(second["timing"]["prefill_service_s"], 0.0)
         self.assertNotIn("kv_migrated_bytes", second["kv"])
         self.assertIn("kv_copy", {leg["kind"] for leg in second["routing"]["selected_path"]})
-        self.assertEqual(
-            result.state_summary["sessions"]["session-0"]["satellite_ids"],
-            ["sat-a", "sat-b"],
-        )
         self.assertIn("session-0", result.state_summary["kv_caches"]["sat-a"]["entries"])
         self.assertIn("session-0", result.state_summary["kv_caches"]["sat-b"]["entries"])
+        self.assertNotIn("satellite_ids", result.state_summary["sessions"]["session-0"])
+        self.assertEqual(second["kv"]["kv_copied_tokens"], 10)
+        self.assertGreater(
+            result.state_summary["kv_caches"]["sat-a"]["entries"]["session-0"]["last_access_s"],
+            10.0,
+        )
 
     def test_partial_kv_copy_recomputes_the_remaining_context(self):
         strategy = RuntimeStrategySpec(
@@ -215,7 +222,7 @@ class RuntimeEngineTests(unittest.TestCase):
             kv_reuse_weight=0.0,
             energy_weight=0.0,
             compute_load_weight=0.0,
-            kv_copy_ratio=0.5,
+            kv_migration_fraction=0.5,
         )
         result = run_simulation(
             _scenario(

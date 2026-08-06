@@ -332,7 +332,7 @@ def _slim_strategy(strategy: dict[str, Any]) -> dict[str, Any]:
         "compute_load_weight",
         "shadow_dvfs_enabled",
         "shadow_dvfs_scale",
-        "kv_copy_ratio",
+        "kv_migration_fraction",
     )
     return {key: strategy.get(key) for key in keep_fields if key in strategy}
 

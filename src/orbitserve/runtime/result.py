@@ -64,8 +64,10 @@ def build_runtime_performance_result(*, simulation_spec: Any, engine_result: Any
     miss_tokens = sum(float(record.kv_miss_tokens or 0.0) for record in records)
     kv_metrics = {
         "kv_hit_tokens": hit_tokens,
+        "kv_copied_tokens": sum(float(record.kv_copied_tokens or 0.0) for record in records),
         "kv_miss_tokens": miss_tokens,
         "kv_hit_ratio": hit_tokens / (hit_tokens + miss_tokens) if hit_tokens + miss_tokens > 0.0 else None,
+        "kv_evicted_tokens": sum(float(record.kv_evicted_tokens or 0.0) for record in records),
         "kv_evicted_bytes": sum(float(record.kv_evicted_bytes or 0.0) for record in records),
     }
     return RuntimePerformanceResult(

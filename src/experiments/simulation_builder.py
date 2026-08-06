@@ -32,8 +32,8 @@ def build_simulation_spec(
     architecture_payload = _mapping(constellation_architecture)
     simulation_config_payload = _mapping(simulation_config)
     energy_payload = _mapping(energy_profile)
-    trace_bundle = simulation_result if isinstance(simulation_result, OrbitTraceBundle) else None
-    trace_manifest = _trace_manifest(simulation_result, trace_bundle)
+    environment_state = simulation_result if isinstance(simulation_result, OrbitTraceBundle) else None
+    trace_manifest = _trace_manifest(simulation_result, environment_state)
     trace_payload = trace_manifest.to_dict() if trace_manifest is not None else {}
 
     requests = _rows(workload_payload.get("requests"))
@@ -100,11 +100,11 @@ def build_simulation_spec(
         regions=regions,
         gateways=gateways,
         simulation_trace_ref=trace_payload,
-        orbit_trace_bundle=trace_bundle,
+        environment_state=environment_state,
         constellation={
             "design": constellation_payload,
             "architecture": architecture_payload,
-            "satellite_count": len(trace_bundle.satellite_catalog) if trace_bundle else constellation_payload.get("satellite_count"),
+            "satellite_count": len(environment_state.satellite_catalog) if environment_state else constellation_payload.get("satellite_count"),
         },
         serving_profile=serving_profile,
         energy_profile=energy_payload,

@@ -16,13 +16,12 @@ _FAILED_STATES = frozenset({"failed", "faulted", "offline", "disabled", "unavail
 class ComputeEligibilitySet:
     """One authoritative separation between route nodes and compute targets.
 
-    ``capacity_member_ids`` are deployed, hardware-capable members used to
+    ``capacity_member_ids`` are hardware-capable members used to
     derive nominal per-member capacity. ``eligible_compute_satellite_ids`` are
     the subset currently allowed to receive work. Relay nodes deliberately do
     not constrain the routing graph.
     """
 
-    deployment_role: str
     capacity_member_ids: tuple[str, ...]
     eligible_compute_satellite_ids: tuple[str, ...]
     relay_satellite_ids: tuple[str, ...]
@@ -60,14 +59,11 @@ def build_compute_eligibility_set(
 
     for satellite_id in members:
         reasons: list[str] = []
-        catalog_row = catalog_by_id.get(satellite_id)
-        if catalog_row is None:
-            reasons.append("deployment_member_missing_from_trace_catalog")
-        else:
-            reasons.extend(_hardware_reasons(catalog_row))
+        catalog_row = catalog_by_id[satellite_id]
+        reasons.extend(_hardware_reasons(catalog_row))
         if not reasons:
             capacity_members.append(satellite_id)
-            reasons.extend(_fault_reasons(catalog_row or {}))
+            reasons.extend(_fault_reasons(catalog_row))
             runtime_reason = runtime_exclusions.get(satellite_id)
             if isinstance(runtime_reason, str) and runtime_reason:
                 reasons.append(runtime_reason)
@@ -81,7 +77,6 @@ def build_compute_eligibility_set(
     capacity_set = set(capacity_members)
     relay_ids = tuple(satellite_id for satellite_id in catalog_by_id if satellite_id not in capacity_set)
     return ComputeEligibilitySet(
-        deployment_role="serving",
         capacity_member_ids=tuple(capacity_members),
         eligible_compute_satellite_ids=tuple(eligible),
         relay_satellite_ids=relay_ids,
@@ -96,7 +91,7 @@ def _hardware_reasons(row: dict[str, Any]) -> tuple[str, ...]:
         reasons.append("hardware_role_not_compute_capable")
     role = str(row.get("hardware_role") or row.get("role") or "").strip().lower()
     roles = {str(item).strip().lower() for item in row.get("hardware_roles", ()) or ()}
-    if role in _NON_COMPUTE_ROLES or (roles and roles.isdisjoint({"compute", "accelerator", "prefill", "decode", "colocated"})):
+    if role in _NON_COMPUTE_ROLES or (roles and roles.isdisjoint({"compute", "accelerator", "colocated"})):
         reasons.append("hardware_role_not_compute_capable")
     return tuple(dict.fromkeys(reasons))
 

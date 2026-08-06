@@ -60,7 +60,7 @@ class RuntimeSimulationSpec:
     regions: tuple[dict[str, Any], ...] = ()
     gateways: tuple[dict[str, Any], ...] = ()
     simulation_trace_ref: dict[str, Any] = field(default_factory=dict)
-    orbit_trace_bundle: Any = None
+    environment_state: Any = None
     constellation: dict[str, Any] = field(default_factory=dict)
     serving_profile: ServingCapacityProfile | None = None
     energy_profile: dict[str, Any] = field(default_factory=dict)

@@ -112,8 +112,8 @@ class EnergyWindowError(ValueError):
         self.warnings = warnings
 
 
-def query_energy_window_at(trace_bundle: Any, satellite_id: str, time_s: float) -> dict[str, Any]:
-    method = getattr(trace_bundle, "energy_window_at", None)
+def query_energy_window_at(environment_state: Any, satellite_id: str, time_s: float) -> dict[str, Any]:
+    method = getattr(environment_state, "energy_window_at", None)
     if callable(method):
         return _as_energy_query_result(
             method(satellite_id, time_s),
@@ -123,7 +123,7 @@ def query_energy_window_at(trace_bundle: Any, satellite_id: str, time_s: float) 
         )
     candidates = [
         window
-        for window in getattr(trace_bundle, "energy_windows", ()) or ()
+        for window in getattr(environment_state, "energy_windows", ()) or ()
         if str(window.get("satellite_id")) == str(satellite_id)
         and float(window.get("start_s", 0.0)) <= time_s < float(window.get("end_s", 0.0))
     ]
@@ -152,8 +152,8 @@ def query_energy_window_at(trace_bundle: Any, satellite_id: str, time_s: float) 
     }
 
 
-def energy_window_at(trace_bundle: Any, satellite_id: str, time_s: float) -> dict[str, Any]:
-    result = query_energy_window_at(trace_bundle, satellite_id, time_s)
+def energy_window_at(environment_state: Any, satellite_id: str, time_s: float) -> dict[str, Any]:
+    result = query_energy_window_at(environment_state, satellite_id, time_s)
     if result["available"] and not result.get("stale", False):
         window = dict(result.get("value") or {})
         _validate_runtime_energy_window(window, satellite_id=satellite_id, time_s=time_s)
@@ -168,7 +168,7 @@ def energy_window_at(trace_bundle: Any, satellite_id: str, time_s: float) -> dic
     )
 
 
-def advance_satellite_energy(satellite_state: Any, trace_bundle: Any, to_s: float) -> None:
+def advance_satellite_energy(satellite_state: Any, environment_state: Any, to_s: float) -> None:
     """Materialize a satellite SOC snapshot at ``to_s`` from its event ledger.
 
     Replaying from the immutable initial SOC makes out-of-order future queue
@@ -230,26 +230,26 @@ def advance_satellite_energy(satellite_state: Any, trace_bundle: Any, to_s: floa
             event_time_s = float(event["event_time_s"])
             soc, rows = _integrate_idle_charge_interval(
                 satellite_state,
-                trace_bundle,
+                environment_state,
                 soc=soc,
                 start_s=current_s,
                 end_s=event_time_s,
             )
             ledger.extend(rows)
-            window = energy_window_at(trace_bundle, satellite_state.satellite_id, event_time_s)
+            window = energy_window_at(environment_state, satellite_state.satellite_id, event_time_s)
             soc, row = _apply_stored_event(satellite_state, event, window, soc=soc)
             ledger.append(row)
             materialized_ids.add(event_id)
             current_s = event_time_s
         soc, rows = _integrate_idle_charge_interval(
             satellite_state,
-            trace_bundle,
+            environment_state,
             soc=soc,
             start_s=current_s,
             end_s=to_s,
         )
         ledger.extend(rows)
-        final_window = _energy_window_at_boundary(trace_bundle, satellite_state.satellite_id, to_s)
+        final_window = _energy_window_at_boundary(environment_state, satellite_state.satellite_id, to_s)
         satellite_state.soc = soc
         satellite_state.last_energy_update_s = to_s
         satellite_state.sunlit = bool(final_window.get("sunlit", True))
@@ -263,13 +263,13 @@ def advance_satellite_energy(satellite_state: Any, trace_bundle: Any, to_s: floa
         event_time_s = float(event.get("event_time_s", 0.0))
         soc, rows = _integrate_idle_charge_interval(
             satellite_state,
-            trace_bundle,
+            environment_state,
             soc=soc,
             start_s=current_s,
             end_s=event_time_s,
         )
         ledger.extend(rows)
-        window = energy_window_at(trace_bundle, satellite_state.satellite_id, event_time_s)
+        window = energy_window_at(environment_state, satellite_state.satellite_id, event_time_s)
         soc, row = _apply_stored_event(
             satellite_state,
             event,
@@ -280,13 +280,13 @@ def advance_satellite_energy(satellite_state: Any, trace_bundle: Any, to_s: floa
         current_s = event_time_s
     soc, rows = _integrate_idle_charge_interval(
         satellite_state,
-        trace_bundle,
+        environment_state,
         soc=soc,
         start_s=current_s,
         end_s=to_s,
     )
     ledger.extend(rows)
-    final_window = _energy_window_at_boundary(trace_bundle, satellite_state.satellite_id, to_s)
+    final_window = _energy_window_at_boundary(environment_state, satellite_state.satellite_id, to_s)
     satellite_state.soc = soc
     satellite_state.last_energy_update_s = to_s
     satellite_state.sunlit = bool(final_window.get("sunlit", True))
@@ -296,7 +296,7 @@ def advance_satellite_energy(satellite_state: Any, trace_bundle: Any, to_s: floa
 
 def _integrate_idle_charge_interval(
     satellite_state: Any,
-    trace_bundle: Any,
+    environment_state: Any,
     *,
     soc: float,
     start_s: float,
@@ -305,11 +305,11 @@ def _integrate_idle_charge_interval(
     if end_s <= start_s:
         return soc, []
     current_s = start_s
-    indexed_windows = getattr(trace_bundle, "_energy_windows_by_satellite", None)
+    indexed_windows = getattr(environment_state, "_energy_windows_by_satellite", None)
     if callable(indexed_windows):
         window_source = indexed_windows().get(str(satellite_state.satellite_id), ())
     else:
-        window_source = getattr(trace_bundle, "energy_windows", ()) or ()
+        window_source = getattr(environment_state, "energy_windows", ()) or ()
     windows = sorted(
         [
             window
@@ -755,11 +755,11 @@ def _validate_runtime_energy_window(window: dict[str, Any], *, satellite_id: str
         )
 
 
-def _energy_window_at_boundary(trace_bundle: Any, satellite_id: str, time_s: float) -> dict[str, Any]:
+def _energy_window_at_boundary(environment_state: Any, satellite_id: str, time_s: float) -> dict[str, Any]:
     try:
-        return energy_window_at(trace_bundle, satellite_id, time_s)
+        return energy_window_at(environment_state, satellite_id, time_s)
     except EnergyWindowError:
-        source = getattr(trace_bundle, "energy_windows", ()) or ()
+        source = getattr(environment_state, "energy_windows", ()) or ()
         matches = [
             dict(window)
             for window in source

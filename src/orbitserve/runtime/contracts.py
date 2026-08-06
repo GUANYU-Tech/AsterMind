@@ -48,7 +48,7 @@ class RuntimeStrategySpec:
     compute_load_weight: float = 0.25
     shadow_dvfs_enabled: bool = False
     shadow_dvfs_scale: float = 0.5
-    kv_copy_ratio: float = 0.0
+    kv_migration_fraction: float = 0.0
 
     def __post_init__(self) -> None:
         if self.ingress_selection not in INGRESS_SELECTIONS:
@@ -61,8 +61,8 @@ class RuntimeStrategySpec:
             raise ValueError("Runtime strategy weights must sum to 1")
         if not math.isfinite(self.shadow_dvfs_scale) or not 0.0 < self.shadow_dvfs_scale <= 1.0:
             raise ValueError("shadow_dvfs_scale must be in (0, 1]")
-        if not math.isfinite(self.kv_copy_ratio) or not 0.0 <= self.kv_copy_ratio <= 1.0:
-            raise ValueError("kv_copy_ratio must be in [0, 1]")
+        if not math.isfinite(self.kv_migration_fraction) or not 0.0 <= self.kv_migration_fraction <= 1.0:
+            raise ValueError("kv_migration_fraction must be in [0, 1]")
 
     @property
     def weights(self) -> dict[str, float]:
@@ -103,7 +103,6 @@ class ServingCapacityProfile:
     feasible: bool | None = None
     prefill_tokens_per_s: float | None = None
     decode_tokens_per_s: float | None = None
-    kv_cache_capacity_tokens: int | None = None
     kv_cache_bytes_per_token: float | None = None
     internal_comm_summary: dict[str, Any] = field(default_factory=dict)
     internal_comm_accounting: str = "embedded"
@@ -121,7 +120,6 @@ class ServingCapacityProfile:
             feasible=_optional_bool(throughput.get("feasible")),
             prefill_tokens_per_s=_optional_float(throughput.get("prefill_tokens_per_s")),
             decode_tokens_per_s=_optional_float(throughput.get("decode_tokens_per_s")),
-            kv_cache_capacity_tokens=_optional_int(throughput.get("kv_cache_capacity_tokens")),
             kv_cache_bytes_per_token=_optional_float(throughput.get("kv_cache_bytes_per_token")),
             internal_comm_summary=_dict(throughput.get("internal_comm_summary")),
             internal_comm_accounting=str(throughput.get("internal_comm_accounting", "embedded")),
@@ -169,10 +167,6 @@ def _warnings_from_payload(payload: dict[str, Any]) -> tuple[str, ...]:
 
 def _optional_float(value: Any) -> float | None:
     return None if value is None else float(value)
-
-
-def _optional_int(value: Any) -> int | None:
-    return None if value is None else int(value)
 
 
 def _optional_bool(value: Any) -> bool | None:

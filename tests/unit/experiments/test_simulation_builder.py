@@ -33,6 +33,13 @@ class SimulationBuilderTests(unittest.TestCase):
 
         self.assertEqual(scenario.energy_profile, {})
 
+    def test_builder_exposes_orbit_data_as_environment_state(self):
+        marker = object()
+        scenario = build_simulation_spec(simulation_result=marker)
+
+        self.assertIsNone(scenario.environment_state)
+        self.assertNotIn("orbit_trace_bundle", scenario.__dataclass_fields__)
+
     def test_builder_extracts_communication_ingress_without_putting_it_in_strategy(self):
         scenario = build_simulation_spec(
             simulation_config={
