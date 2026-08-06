@@ -3,3 +3,8 @@
 
 # Generated experiment output.
 /results/
+
+# Downloaded third-party workload traces and locally materialized BurstGPT bundles.
+/src/workloads/BurstGPT/data/
+/src/workloads/BurstGPT/bundles/
+/src/workloads/BurstGPT/analysis/

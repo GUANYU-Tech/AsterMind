@@ -1,0 +1,937 @@
+country,profound_region,day_type,local_hour,hour_weight,source
+China,Asia,weekend,0,0.0445646651,profound_figure2_nonwork_weekend
+China,Asia,weekend,1,0.0409181935,profound_figure2_nonwork_weekend
+China,Asia,weekend,2,0.0278566518,profound_figure2_nonwork_weekend
+China,Asia,weekend,3,0.0229349115,profound_figure2_nonwork_weekend
+China,Asia,weekend,4,0.0155821901,profound_figure2_nonwork_weekend
+China,Asia,weekend,5,0.0167179763,profound_figure2_nonwork_weekend
+China,Asia,weekend,6,0.0156021161,profound_figure2_nonwork_weekend
+China,Asia,weekend,7,0.0136095087,profound_figure2_nonwork_weekend
+China,Asia,weekend,8,0.0211415648,profound_figure2_nonwork_weekend
+China,Asia,weekend,9,0.0286038796,profound_figure2_nonwork_weekend
+China,Asia,weekend,10,0.0342329956,profound_figure2_nonwork_weekend
+China,Asia,weekend,11,0.0415060127,profound_figure2_nonwork_weekend
+China,Asia,weekend,12,0.0435285092,profound_figure2_nonwork_weekend
+China,Asia,weekend,13,0.0468163115,profound_figure2_nonwork_weekend
+China,Asia,weekend,14,0.0529136902,profound_figure2_nonwork_weekend
+China,Asia,weekend,15,0.0596885555,profound_figure2_nonwork_weekend
+China,Asia,weekend,16,0.0542288111,profound_figure2_nonwork_weekend
+China,Asia,weekend,17,0.0544081458,profound_figure2_nonwork_weekend
+China,Asia,weekend,18,0.0538004005,profound_figure2_nonwork_weekend
+China,Asia,weekend,19,0.0559623796,profound_figure2_nonwork_weekend
+China,Asia,weekend,20,0.0639726614,profound_figure2_nonwork_weekend
+China,Asia,weekend,21,0.0668519792,profound_figure2_nonwork_weekend
+China,Asia,weekend,22,0.0648494087,profound_figure2_nonwork_weekend
+China,Asia,weekend,23,0.0597084815,profound_figure2_nonwork_weekend
+India,Asia,weekend,0,0.0445646651,profound_figure2_nonwork_weekend
+India,Asia,weekend,1,0.0409181935,profound_figure2_nonwork_weekend
+India,Asia,weekend,2,0.0278566518,profound_figure2_nonwork_weekend
+India,Asia,weekend,3,0.0229349115,profound_figure2_nonwork_weekend
+India,Asia,weekend,4,0.0155821901,profound_figure2_nonwork_weekend
+India,Asia,weekend,5,0.0167179763,profound_figure2_nonwork_weekend
+India,Asia,weekend,6,0.0156021161,profound_figure2_nonwork_weekend
+India,Asia,weekend,7,0.0136095087,profound_figure2_nonwork_weekend
+India,Asia,weekend,8,0.0211415648,profound_figure2_nonwork_weekend
+India,Asia,weekend,9,0.0286038796,profound_figure2_nonwork_weekend
+India,Asia,weekend,10,0.0342329956,profound_figure2_nonwork_weekend
+India,Asia,weekend,11,0.0415060127,profound_figure2_nonwork_weekend
+India,Asia,weekend,12,0.0435285092,profound_figure2_nonwork_weekend
+India,Asia,weekend,13,0.0468163115,profound_figure2_nonwork_weekend
+India,Asia,weekend,14,0.0529136902,profound_figure2_nonwork_weekend
+India,Asia,weekend,15,0.0596885555,profound_figure2_nonwork_weekend
+India,Asia,weekend,16,0.0542288111,profound_figure2_nonwork_weekend
+India,Asia,weekend,17,0.0544081458,profound_figure2_nonwork_weekend
+India,Asia,weekend,18,0.0538004005,profound_figure2_nonwork_weekend
+India,Asia,weekend,19,0.0559623796,profound_figure2_nonwork_weekend
+India,Asia,weekend,20,0.0639726614,profound_figure2_nonwork_weekend
+India,Asia,weekend,21,0.0668519792,profound_figure2_nonwork_weekend
+India,Asia,weekend,22,0.0648494087,profound_figure2_nonwork_weekend
+India,Asia,weekend,23,0.0597084815,profound_figure2_nonwork_weekend
+United States,North America,weekend,0,0.0153872185,profound_figure2_nonwork_weekend
+United States,North America,weekend,1,0.015317548,profound_figure2_nonwork_weekend
+United States,North America,weekend,2,0.0225732286,profound_figure2_nonwork_weekend
+United States,North America,weekend,3,0.0264946802,profound_figure2_nonwork_weekend
+United States,North America,weekend,4,0.0405083953,profound_figure2_nonwork_weekend
+United States,North America,weekend,5,0.0447582933,profound_figure2_nonwork_weekend
+United States,North America,weekend,6,0.060882028,profound_figure2_nonwork_weekend
+United States,North America,weekend,7,0.0706358922,profound_figure2_nonwork_weekend
+United States,North America,weekend,8,0.0708548565,profound_figure2_nonwork_weekend
+United States,North America,weekend,9,0.0695808824,profound_figure2_nonwork_weekend
+United States,North America,weekend,10,0.0775432206,profound_figure2_nonwork_weekend
+United States,North America,weekend,11,0.0659779244,profound_figure2_nonwork_weekend
+United States,North America,weekend,12,0.0561742956,profound_figure2_nonwork_weekend
+United States,North America,weekend,13,0.0468185483,profound_figure2_nonwork_weekend
+United States,North America,weekend,14,0.0349845232,profound_figure2_nonwork_weekend
+United States,North America,weekend,15,0.0279776656,profound_figure2_nonwork_weekend
+United States,North America,weekend,16,0.0308540603,profound_figure2_nonwork_weekend
+United States,North America,weekend,17,0.0273605844,profound_figure2_nonwork_weekend
+United States,North America,weekend,18,0.0306948135,profound_figure2_nonwork_weekend
+United States,North America,weekend,19,0.0414539229,profound_figure2_nonwork_weekend
+United States,North America,weekend,20,0.0429170026,profound_figure2_nonwork_weekend
+United States,North America,weekend,21,0.0376519065,profound_figure2_nonwork_weekend
+United States,North America,weekend,22,0.0236381914,profound_figure2_nonwork_weekend
+United States,North America,weekend,23,0.0189603177,profound_figure2_nonwork_weekend
+Brazil,Latin America,weekend,0,0.0169209956,profound_figure2_nonwork_weekend
+Brazil,Latin America,weekend,1,0.0118775242,profound_figure2_nonwork_weekend
+Brazil,Latin America,weekend,2,0.0142450709,profound_figure2_nonwork_weekend
+Brazil,Latin America,weekend,3,0.0195372341,profound_figure2_nonwork_weekend
+Brazil,Latin America,weekend,4,0.0274655313,profound_figure2_nonwork_weekend
+Brazil,Latin America,weekend,5,0.0372341484,profound_figure2_nonwork_weekend
+Brazil,Latin America,weekend,6,0.04343155,profound_figure2_nonwork_weekend
+Brazil,Latin America,weekend,7,0.0558661441,profound_figure2_nonwork_weekend
+Brazil,Latin America,weekend,8,0.068519587,profound_figure2_nonwork_weekend
+Brazil,Latin America,weekend,9,0.0715237849,profound_figure2_nonwork_weekend
+Brazil,Latin America,weekend,10,0.071643157,profound_figure2_nonwork_weekend
+Brazil,Latin America,weekend,11,0.0722002268,profound_figure2_nonwork_weekend
+Brazil,Latin America,weekend,12,0.0720908024,profound_figure2_nonwork_weekend
+Brazil,Latin America,weekend,13,0.0661818833,profound_figure2_nonwork_weekend
+Brazil,Latin America,weekend,14,0.06273004,profound_figure2_nonwork_weekend
+Brazil,Latin America,weekend,15,0.0549012196,profound_figure2_nonwork_weekend
+Brazil,Latin America,weekend,16,0.045669777,profound_figure2_nonwork_weekend
+Brazil,Latin America,weekend,17,0.0338519388,profound_figure2_nonwork_weekend
+Brazil,Latin America,weekend,18,0.0250382985,profound_figure2_nonwork_weekend
+Brazil,Latin America,weekend,19,0.0187712632,profound_figure2_nonwork_weekend
+Brazil,Latin America,weekend,20,0.0167717804,profound_figure2_nonwork_weekend
+Brazil,Latin America,weekend,21,0.0381592822,profound_figure2_nonwork_weekend
+Brazil,Latin America,weekend,22,0.0321508863,profound_figure2_nonwork_weekend
+Brazil,Latin America,weekend,23,0.023217874,profound_figure2_nonwork_weekend
+Indonesia,Asia,weekend,0,0.0445646651,profound_figure2_nonwork_weekend
+Indonesia,Asia,weekend,1,0.0409181935,profound_figure2_nonwork_weekend
+Indonesia,Asia,weekend,2,0.0278566518,profound_figure2_nonwork_weekend
+Indonesia,Asia,weekend,3,0.0229349115,profound_figure2_nonwork_weekend
+Indonesia,Asia,weekend,4,0.0155821901,profound_figure2_nonwork_weekend
+Indonesia,Asia,weekend,5,0.0167179763,profound_figure2_nonwork_weekend
+Indonesia,Asia,weekend,6,0.0156021161,profound_figure2_nonwork_weekend
+Indonesia,Asia,weekend,7,0.0136095087,profound_figure2_nonwork_weekend
+Indonesia,Asia,weekend,8,0.0211415648,profound_figure2_nonwork_weekend
+Indonesia,Asia,weekend,9,0.0286038796,profound_figure2_nonwork_weekend
+Indonesia,Asia,weekend,10,0.0342329956,profound_figure2_nonwork_weekend
+Indonesia,Asia,weekend,11,0.0415060127,profound_figure2_nonwork_weekend
+Indonesia,Asia,weekend,12,0.0435285092,profound_figure2_nonwork_weekend
+Indonesia,Asia,weekend,13,0.0468163115,profound_figure2_nonwork_weekend
+Indonesia,Asia,weekend,14,0.0529136902,profound_figure2_nonwork_weekend
+Indonesia,Asia,weekend,15,0.0596885555,profound_figure2_nonwork_weekend
+Indonesia,Asia,weekend,16,0.0542288111,profound_figure2_nonwork_weekend
+Indonesia,Asia,weekend,17,0.0544081458,profound_figure2_nonwork_weekend
+Indonesia,Asia,weekend,18,0.0538004005,profound_figure2_nonwork_weekend
+Indonesia,Asia,weekend,19,0.0559623796,profound_figure2_nonwork_weekend
+Indonesia,Asia,weekend,20,0.0639726614,profound_figure2_nonwork_weekend
+Indonesia,Asia,weekend,21,0.0668519792,profound_figure2_nonwork_weekend
+Indonesia,Asia,weekend,22,0.0648494087,profound_figure2_nonwork_weekend
+Indonesia,Asia,weekend,23,0.0597084815,profound_figure2_nonwork_weekend
+France,Europe,weekend,0,0.0400111836,profound_figure2_nonwork_weekend
+France,Europe,weekend,1,0.0309644822,profound_figure2_nonwork_weekend
+France,Europe,weekend,2,0.0223072084,profound_figure2_nonwork_weekend
+France,Europe,weekend,3,0.0162161622,profound_figure2_nonwork_weekend
+France,Europe,weekend,4,0.009595894,profound_figure2_nonwork_weekend
+France,Europe,weekend,5,0.0062607966,profound_figure2_nonwork_weekend
+France,Europe,weekend,6,0.0062907526,profound_figure2_nonwork_weekend
+France,Europe,weekend,7,0.0075289325,profound_figure2_nonwork_weekend
+France,Europe,weekend,8,0.0114431785,profound_figure2_nonwork_weekend
+France,Europe,weekend,9,0.0207594836,profound_figure2_nonwork_weekend
+France,Europe,weekend,10,0.0320428969,profound_figure2_nonwork_weekend
+France,Europe,weekend,11,0.0428570002,profound_figure2_nonwork_weekend
+France,Europe,weekend,12,0.052662586,profound_figure2_nonwork_weekend
+France,Europe,weekend,13,0.057475511,profound_figure2_nonwork_weekend
+France,Europe,weekend,14,0.0594126634,profound_figure2_nonwork_weekend
+France,Europe,weekend,15,0.0654837389,profound_figure2_nonwork_weekend
+France,Europe,weekend,16,0.065643504,profound_figure2_nonwork_weekend
+France,Europe,weekend,17,0.0672511408,profound_figure2_nonwork_weekend
+France,Europe,weekend,18,0.0683595115,profound_figure2_nonwork_weekend
+France,Europe,weekend,19,0.0661128142,profound_figure2_nonwork_weekend
+France,Europe,weekend,20,0.0682696436,profound_figure2_nonwork_weekend
+France,Europe,weekend,21,0.0646349866,profound_figure2_nonwork_weekend
+France,Europe,weekend,22,0.0633668507,profound_figure2_nonwork_weekend
+France,Europe,weekend,23,0.0550490779,profound_figure2_nonwork_weekend
+United Kingdom,Europe,weekend,0,0.0400111836,profound_figure2_nonwork_weekend
+United Kingdom,Europe,weekend,1,0.0309644822,profound_figure2_nonwork_weekend
+United Kingdom,Europe,weekend,2,0.0223072084,profound_figure2_nonwork_weekend
+United Kingdom,Europe,weekend,3,0.0162161622,profound_figure2_nonwork_weekend
+United Kingdom,Europe,weekend,4,0.009595894,profound_figure2_nonwork_weekend
+United Kingdom,Europe,weekend,5,0.0062607966,profound_figure2_nonwork_weekend
+United Kingdom,Europe,weekend,6,0.0062907526,profound_figure2_nonwork_weekend
+United Kingdom,Europe,weekend,7,0.0075289325,profound_figure2_nonwork_weekend
+United Kingdom,Europe,weekend,8,0.0114431785,profound_figure2_nonwork_weekend
+United Kingdom,Europe,weekend,9,0.0207594836,profound_figure2_nonwork_weekend
+United Kingdom,Europe,weekend,10,0.0320428969,profound_figure2_nonwork_weekend
+United Kingdom,Europe,weekend,11,0.0428570002,profound_figure2_nonwork_weekend
+United Kingdom,Europe,weekend,12,0.052662586,profound_figure2_nonwork_weekend
+United Kingdom,Europe,weekend,13,0.057475511,profound_figure2_nonwork_weekend
+United Kingdom,Europe,weekend,14,0.0594126634,profound_figure2_nonwork_weekend
+United Kingdom,Europe,weekend,15,0.0654837389,profound_figure2_nonwork_weekend
+United Kingdom,Europe,weekend,16,0.065643504,profound_figure2_nonwork_weekend
+United Kingdom,Europe,weekend,17,0.0672511408,profound_figure2_nonwork_weekend
+United Kingdom,Europe,weekend,18,0.0683595115,profound_figure2_nonwork_weekend
+United Kingdom,Europe,weekend,19,0.0661128142,profound_figure2_nonwork_weekend
+United Kingdom,Europe,weekend,20,0.0682696436,profound_figure2_nonwork_weekend
+United Kingdom,Europe,weekend,21,0.0646349866,profound_figure2_nonwork_weekend
+United Kingdom,Europe,weekend,22,0.0633668507,profound_figure2_nonwork_weekend
+United Kingdom,Europe,weekend,23,0.0550490779,profound_figure2_nonwork_weekend
+Vietnam,Asia,weekend,0,0.0445646651,profound_figure2_nonwork_weekend
+Vietnam,Asia,weekend,1,0.0409181935,profound_figure2_nonwork_weekend
+Vietnam,Asia,weekend,2,0.0278566518,profound_figure2_nonwork_weekend
+Vietnam,Asia,weekend,3,0.0229349115,profound_figure2_nonwork_weekend
+Vietnam,Asia,weekend,4,0.0155821901,profound_figure2_nonwork_weekend
+Vietnam,Asia,weekend,5,0.0167179763,profound_figure2_nonwork_weekend
+Vietnam,Asia,weekend,6,0.0156021161,profound_figure2_nonwork_weekend
+Vietnam,Asia,weekend,7,0.0136095087,profound_figure2_nonwork_weekend
+Vietnam,Asia,weekend,8,0.0211415648,profound_figure2_nonwork_weekend
+Vietnam,Asia,weekend,9,0.0286038796,profound_figure2_nonwork_weekend
+Vietnam,Asia,weekend,10,0.0342329956,profound_figure2_nonwork_weekend
+Vietnam,Asia,weekend,11,0.0415060127,profound_figure2_nonwork_weekend
+Vietnam,Asia,weekend,12,0.0435285092,profound_figure2_nonwork_weekend
+Vietnam,Asia,weekend,13,0.0468163115,profound_figure2_nonwork_weekend
+Vietnam,Asia,weekend,14,0.0529136902,profound_figure2_nonwork_weekend
+Vietnam,Asia,weekend,15,0.0596885555,profound_figure2_nonwork_weekend
+Vietnam,Asia,weekend,16,0.0542288111,profound_figure2_nonwork_weekend
+Vietnam,Asia,weekend,17,0.0544081458,profound_figure2_nonwork_weekend
+Vietnam,Asia,weekend,18,0.0538004005,profound_figure2_nonwork_weekend
+Vietnam,Asia,weekend,19,0.0559623796,profound_figure2_nonwork_weekend
+Vietnam,Asia,weekend,20,0.0639726614,profound_figure2_nonwork_weekend
+Vietnam,Asia,weekend,21,0.0668519792,profound_figure2_nonwork_weekend
+Vietnam,Asia,weekend,22,0.0648494087,profound_figure2_nonwork_weekend
+Vietnam,Asia,weekend,23,0.0597084815,profound_figure2_nonwork_weekend
+Mexico,Latin America,weekend,0,0.0169209956,profound_figure2_nonwork_weekend
+Mexico,Latin America,weekend,1,0.0118775242,profound_figure2_nonwork_weekend
+Mexico,Latin America,weekend,2,0.0142450709,profound_figure2_nonwork_weekend
+Mexico,Latin America,weekend,3,0.0195372341,profound_figure2_nonwork_weekend
+Mexico,Latin America,weekend,4,0.0274655313,profound_figure2_nonwork_weekend
+Mexico,Latin America,weekend,5,0.0372341484,profound_figure2_nonwork_weekend
+Mexico,Latin America,weekend,6,0.04343155,profound_figure2_nonwork_weekend
+Mexico,Latin America,weekend,7,0.0558661441,profound_figure2_nonwork_weekend
+Mexico,Latin America,weekend,8,0.068519587,profound_figure2_nonwork_weekend
+Mexico,Latin America,weekend,9,0.0715237849,profound_figure2_nonwork_weekend
+Mexico,Latin America,weekend,10,0.071643157,profound_figure2_nonwork_weekend
+Mexico,Latin America,weekend,11,0.0722002268,profound_figure2_nonwork_weekend
+Mexico,Latin America,weekend,12,0.0720908024,profound_figure2_nonwork_weekend
+Mexico,Latin America,weekend,13,0.0661818833,profound_figure2_nonwork_weekend
+Mexico,Latin America,weekend,14,0.06273004,profound_figure2_nonwork_weekend
+Mexico,Latin America,weekend,15,0.0549012196,profound_figure2_nonwork_weekend
+Mexico,Latin America,weekend,16,0.045669777,profound_figure2_nonwork_weekend
+Mexico,Latin America,weekend,17,0.0338519388,profound_figure2_nonwork_weekend
+Mexico,Latin America,weekend,18,0.0250382985,profound_figure2_nonwork_weekend
+Mexico,Latin America,weekend,19,0.0187712632,profound_figure2_nonwork_weekend
+Mexico,Latin America,weekend,20,0.0167717804,profound_figure2_nonwork_weekend
+Mexico,Latin America,weekend,21,0.0381592822,profound_figure2_nonwork_weekend
+Mexico,Latin America,weekend,22,0.0321508863,profound_figure2_nonwork_weekend
+Mexico,Latin America,weekend,23,0.023217874,profound_figure2_nonwork_weekend
+Pakistan,Asia,weekend,0,0.0445646651,profound_figure2_nonwork_weekend
+Pakistan,Asia,weekend,1,0.0409181935,profound_figure2_nonwork_weekend
+Pakistan,Asia,weekend,2,0.0278566518,profound_figure2_nonwork_weekend
+Pakistan,Asia,weekend,3,0.0229349115,profound_figure2_nonwork_weekend
+Pakistan,Asia,weekend,4,0.0155821901,profound_figure2_nonwork_weekend
+Pakistan,Asia,weekend,5,0.0167179763,profound_figure2_nonwork_weekend
+Pakistan,Asia,weekend,6,0.0156021161,profound_figure2_nonwork_weekend
+Pakistan,Asia,weekend,7,0.0136095087,profound_figure2_nonwork_weekend
+Pakistan,Asia,weekend,8,0.0211415648,profound_figure2_nonwork_weekend
+Pakistan,Asia,weekend,9,0.0286038796,profound_figure2_nonwork_weekend
+Pakistan,Asia,weekend,10,0.0342329956,profound_figure2_nonwork_weekend
+Pakistan,Asia,weekend,11,0.0415060127,profound_figure2_nonwork_weekend
+Pakistan,Asia,weekend,12,0.0435285092,profound_figure2_nonwork_weekend
+Pakistan,Asia,weekend,13,0.0468163115,profound_figure2_nonwork_weekend
+Pakistan,Asia,weekend,14,0.0529136902,profound_figure2_nonwork_weekend
+Pakistan,Asia,weekend,15,0.0596885555,profound_figure2_nonwork_weekend
+Pakistan,Asia,weekend,16,0.0542288111,profound_figure2_nonwork_weekend
+Pakistan,Asia,weekend,17,0.0544081458,profound_figure2_nonwork_weekend
+Pakistan,Asia,weekend,18,0.0538004005,profound_figure2_nonwork_weekend
+Pakistan,Asia,weekend,19,0.0559623796,profound_figure2_nonwork_weekend
+Pakistan,Asia,weekend,20,0.0639726614,profound_figure2_nonwork_weekend
+Pakistan,Asia,weekend,21,0.0668519792,profound_figure2_nonwork_weekend
+Pakistan,Asia,weekend,22,0.0648494087,profound_figure2_nonwork_weekend
+Pakistan,Asia,weekend,23,0.0597084815,profound_figure2_nonwork_weekend
+Japan,Asia,weekend,0,0.0445646651,profound_figure2_nonwork_weekend
+Japan,Asia,weekend,1,0.0409181935,profound_figure2_nonwork_weekend
+Japan,Asia,weekend,2,0.0278566518,profound_figure2_nonwork_weekend
+Japan,Asia,weekend,3,0.0229349115,profound_figure2_nonwork_weekend
+Japan,Asia,weekend,4,0.0155821901,profound_figure2_nonwork_weekend
+Japan,Asia,weekend,5,0.0167179763,profound_figure2_nonwork_weekend
+Japan,Asia,weekend,6,0.0156021161,profound_figure2_nonwork_weekend
+Japan,Asia,weekend,7,0.0136095087,profound_figure2_nonwork_weekend
+Japan,Asia,weekend,8,0.0211415648,profound_figure2_nonwork_weekend
+Japan,Asia,weekend,9,0.0286038796,profound_figure2_nonwork_weekend
+Japan,Asia,weekend,10,0.0342329956,profound_figure2_nonwork_weekend
+Japan,Asia,weekend,11,0.0415060127,profound_figure2_nonwork_weekend
+Japan,Asia,weekend,12,0.0435285092,profound_figure2_nonwork_weekend
+Japan,Asia,weekend,13,0.0468163115,profound_figure2_nonwork_weekend
+Japan,Asia,weekend,14,0.0529136902,profound_figure2_nonwork_weekend
+Japan,Asia,weekend,15,0.0596885555,profound_figure2_nonwork_weekend
+Japan,Asia,weekend,16,0.0542288111,profound_figure2_nonwork_weekend
+Japan,Asia,weekend,17,0.0544081458,profound_figure2_nonwork_weekend
+Japan,Asia,weekend,18,0.0538004005,profound_figure2_nonwork_weekend
+Japan,Asia,weekend,19,0.0559623796,profound_figure2_nonwork_weekend
+Japan,Asia,weekend,20,0.0639726614,profound_figure2_nonwork_weekend
+Japan,Asia,weekend,21,0.0668519792,profound_figure2_nonwork_weekend
+Japan,Asia,weekend,22,0.0648494087,profound_figure2_nonwork_weekend
+Japan,Asia,weekend,23,0.0597084815,profound_figure2_nonwork_weekend
+Germany,Europe,weekend,0,0.0400111836,profound_figure2_nonwork_weekend
+Germany,Europe,weekend,1,0.0309644822,profound_figure2_nonwork_weekend
+Germany,Europe,weekend,2,0.0223072084,profound_figure2_nonwork_weekend
+Germany,Europe,weekend,3,0.0162161622,profound_figure2_nonwork_weekend
+Germany,Europe,weekend,4,0.009595894,profound_figure2_nonwork_weekend
+Germany,Europe,weekend,5,0.0062607966,profound_figure2_nonwork_weekend
+Germany,Europe,weekend,6,0.0062907526,profound_figure2_nonwork_weekend
+Germany,Europe,weekend,7,0.0075289325,profound_figure2_nonwork_weekend
+Germany,Europe,weekend,8,0.0114431785,profound_figure2_nonwork_weekend
+Germany,Europe,weekend,9,0.0207594836,profound_figure2_nonwork_weekend
+Germany,Europe,weekend,10,0.0320428969,profound_figure2_nonwork_weekend
+Germany,Europe,weekend,11,0.0428570002,profound_figure2_nonwork_weekend
+Germany,Europe,weekend,12,0.052662586,profound_figure2_nonwork_weekend
+Germany,Europe,weekend,13,0.057475511,profound_figure2_nonwork_weekend
+Germany,Europe,weekend,14,0.0594126634,profound_figure2_nonwork_weekend
+Germany,Europe,weekend,15,0.0654837389,profound_figure2_nonwork_weekend
+Germany,Europe,weekend,16,0.065643504,profound_figure2_nonwork_weekend
+Germany,Europe,weekend,17,0.0672511408,profound_figure2_nonwork_weekend
+Germany,Europe,weekend,18,0.0683595115,profound_figure2_nonwork_weekend
+Germany,Europe,weekend,19,0.0661128142,profound_figure2_nonwork_weekend
+Germany,Europe,weekend,20,0.0682696436,profound_figure2_nonwork_weekend
+Germany,Europe,weekend,21,0.0646349866,profound_figure2_nonwork_weekend
+Germany,Europe,weekend,22,0.0633668507,profound_figure2_nonwork_weekend
+Germany,Europe,weekend,23,0.0550490779,profound_figure2_nonwork_weekend
+Philippines,Asia,weekend,0,0.0445646651,profound_figure2_nonwork_weekend
+Philippines,Asia,weekend,1,0.0409181935,profound_figure2_nonwork_weekend
+Philippines,Asia,weekend,2,0.0278566518,profound_figure2_nonwork_weekend
+Philippines,Asia,weekend,3,0.0229349115,profound_figure2_nonwork_weekend
+Philippines,Asia,weekend,4,0.0155821901,profound_figure2_nonwork_weekend
+Philippines,Asia,weekend,5,0.0167179763,profound_figure2_nonwork_weekend
+Philippines,Asia,weekend,6,0.0156021161,profound_figure2_nonwork_weekend
+Philippines,Asia,weekend,7,0.0136095087,profound_figure2_nonwork_weekend
+Philippines,Asia,weekend,8,0.0211415648,profound_figure2_nonwork_weekend
+Philippines,Asia,weekend,9,0.0286038796,profound_figure2_nonwork_weekend
+Philippines,Asia,weekend,10,0.0342329956,profound_figure2_nonwork_weekend
+Philippines,Asia,weekend,11,0.0415060127,profound_figure2_nonwork_weekend
+Philippines,Asia,weekend,12,0.0435285092,profound_figure2_nonwork_weekend
+Philippines,Asia,weekend,13,0.0468163115,profound_figure2_nonwork_weekend
+Philippines,Asia,weekend,14,0.0529136902,profound_figure2_nonwork_weekend
+Philippines,Asia,weekend,15,0.0596885555,profound_figure2_nonwork_weekend
+Philippines,Asia,weekend,16,0.0542288111,profound_figure2_nonwork_weekend
+Philippines,Asia,weekend,17,0.0544081458,profound_figure2_nonwork_weekend
+Philippines,Asia,weekend,18,0.0538004005,profound_figure2_nonwork_weekend
+Philippines,Asia,weekend,19,0.0559623796,profound_figure2_nonwork_weekend
+Philippines,Asia,weekend,20,0.0639726614,profound_figure2_nonwork_weekend
+Philippines,Asia,weekend,21,0.0668519792,profound_figure2_nonwork_weekend
+Philippines,Asia,weekend,22,0.0648494087,profound_figure2_nonwork_weekend
+Philippines,Asia,weekend,23,0.0597084815,profound_figure2_nonwork_weekend
+Spain,Europe,weekend,0,0.0400111836,profound_figure2_nonwork_weekend
+Spain,Europe,weekend,1,0.0309644822,profound_figure2_nonwork_weekend
+Spain,Europe,weekend,2,0.0223072084,profound_figure2_nonwork_weekend
+Spain,Europe,weekend,3,0.0162161622,profound_figure2_nonwork_weekend
+Spain,Europe,weekend,4,0.009595894,profound_figure2_nonwork_weekend
+Spain,Europe,weekend,5,0.0062607966,profound_figure2_nonwork_weekend
+Spain,Europe,weekend,6,0.0062907526,profound_figure2_nonwork_weekend
+Spain,Europe,weekend,7,0.0075289325,profound_figure2_nonwork_weekend
+Spain,Europe,weekend,8,0.0114431785,profound_figure2_nonwork_weekend
+Spain,Europe,weekend,9,0.0207594836,profound_figure2_nonwork_weekend
+Spain,Europe,weekend,10,0.0320428969,profound_figure2_nonwork_weekend
+Spain,Europe,weekend,11,0.0428570002,profound_figure2_nonwork_weekend
+Spain,Europe,weekend,12,0.052662586,profound_figure2_nonwork_weekend
+Spain,Europe,weekend,13,0.057475511,profound_figure2_nonwork_weekend
+Spain,Europe,weekend,14,0.0594126634,profound_figure2_nonwork_weekend
+Spain,Europe,weekend,15,0.0654837389,profound_figure2_nonwork_weekend
+Spain,Europe,weekend,16,0.065643504,profound_figure2_nonwork_weekend
+Spain,Europe,weekend,17,0.0672511408,profound_figure2_nonwork_weekend
+Spain,Europe,weekend,18,0.0683595115,profound_figure2_nonwork_weekend
+Spain,Europe,weekend,19,0.0661128142,profound_figure2_nonwork_weekend
+Spain,Europe,weekend,20,0.0682696436,profound_figure2_nonwork_weekend
+Spain,Europe,weekend,21,0.0646349866,profound_figure2_nonwork_weekend
+Spain,Europe,weekend,22,0.0633668507,profound_figure2_nonwork_weekend
+Spain,Europe,weekend,23,0.0550490779,profound_figure2_nonwork_weekend
+Nigeria,Latin America,weekend,0,0.0169209956,profound_figure2_nonwork_weekend
+Nigeria,Latin America,weekend,1,0.0118775242,profound_figure2_nonwork_weekend
+Nigeria,Latin America,weekend,2,0.0142450709,profound_figure2_nonwork_weekend
+Nigeria,Latin America,weekend,3,0.0195372341,profound_figure2_nonwork_weekend
+Nigeria,Latin America,weekend,4,0.0274655313,profound_figure2_nonwork_weekend
+Nigeria,Latin America,weekend,5,0.0372341484,profound_figure2_nonwork_weekend
+Nigeria,Latin America,weekend,6,0.04343155,profound_figure2_nonwork_weekend
+Nigeria,Latin America,weekend,7,0.0558661441,profound_figure2_nonwork_weekend
+Nigeria,Latin America,weekend,8,0.068519587,profound_figure2_nonwork_weekend
+Nigeria,Latin America,weekend,9,0.0715237849,profound_figure2_nonwork_weekend
+Nigeria,Latin America,weekend,10,0.071643157,profound_figure2_nonwork_weekend
+Nigeria,Latin America,weekend,11,0.0722002268,profound_figure2_nonwork_weekend
+Nigeria,Latin America,weekend,12,0.0720908024,profound_figure2_nonwork_weekend
+Nigeria,Latin America,weekend,13,0.0661818833,profound_figure2_nonwork_weekend
+Nigeria,Latin America,weekend,14,0.06273004,profound_figure2_nonwork_weekend
+Nigeria,Latin America,weekend,15,0.0549012196,profound_figure2_nonwork_weekend
+Nigeria,Latin America,weekend,16,0.045669777,profound_figure2_nonwork_weekend
+Nigeria,Latin America,weekend,17,0.0338519388,profound_figure2_nonwork_weekend
+Nigeria,Latin America,weekend,18,0.0250382985,profound_figure2_nonwork_weekend
+Nigeria,Latin America,weekend,19,0.0187712632,profound_figure2_nonwork_weekend
+Nigeria,Latin America,weekend,20,0.0167717804,profound_figure2_nonwork_weekend
+Nigeria,Latin America,weekend,21,0.0381592822,profound_figure2_nonwork_weekend
+Nigeria,Latin America,weekend,22,0.0321508863,profound_figure2_nonwork_weekend
+Nigeria,Latin America,weekend,23,0.023217874,profound_figure2_nonwork_weekend
+South Korea,Asia,weekend,0,0.0445646651,profound_figure2_nonwork_weekend
+South Korea,Asia,weekend,1,0.0409181935,profound_figure2_nonwork_weekend
+South Korea,Asia,weekend,2,0.0278566518,profound_figure2_nonwork_weekend
+South Korea,Asia,weekend,3,0.0229349115,profound_figure2_nonwork_weekend
+South Korea,Asia,weekend,4,0.0155821901,profound_figure2_nonwork_weekend
+South Korea,Asia,weekend,5,0.0167179763,profound_figure2_nonwork_weekend
+South Korea,Asia,weekend,6,0.0156021161,profound_figure2_nonwork_weekend
+South Korea,Asia,weekend,7,0.0136095087,profound_figure2_nonwork_weekend
+South Korea,Asia,weekend,8,0.0211415648,profound_figure2_nonwork_weekend
+South Korea,Asia,weekend,9,0.0286038796,profound_figure2_nonwork_weekend
+South Korea,Asia,weekend,10,0.0342329956,profound_figure2_nonwork_weekend
+South Korea,Asia,weekend,11,0.0415060127,profound_figure2_nonwork_weekend
+South Korea,Asia,weekend,12,0.0435285092,profound_figure2_nonwork_weekend
+South Korea,Asia,weekend,13,0.0468163115,profound_figure2_nonwork_weekend
+South Korea,Asia,weekend,14,0.0529136902,profound_figure2_nonwork_weekend
+South Korea,Asia,weekend,15,0.0596885555,profound_figure2_nonwork_weekend
+South Korea,Asia,weekend,16,0.0542288111,profound_figure2_nonwork_weekend
+South Korea,Asia,weekend,17,0.0544081458,profound_figure2_nonwork_weekend
+South Korea,Asia,weekend,18,0.0538004005,profound_figure2_nonwork_weekend
+South Korea,Asia,weekend,19,0.0559623796,profound_figure2_nonwork_weekend
+South Korea,Asia,weekend,20,0.0639726614,profound_figure2_nonwork_weekend
+South Korea,Asia,weekend,21,0.0668519792,profound_figure2_nonwork_weekend
+South Korea,Asia,weekend,22,0.0648494087,profound_figure2_nonwork_weekend
+South Korea,Asia,weekend,23,0.0597084815,profound_figure2_nonwork_weekend
+Italy,Europe,weekend,0,0.0400111836,profound_figure2_nonwork_weekend
+Italy,Europe,weekend,1,0.0309644822,profound_figure2_nonwork_weekend
+Italy,Europe,weekend,2,0.0223072084,profound_figure2_nonwork_weekend
+Italy,Europe,weekend,3,0.0162161622,profound_figure2_nonwork_weekend
+Italy,Europe,weekend,4,0.009595894,profound_figure2_nonwork_weekend
+Italy,Europe,weekend,5,0.0062607966,profound_figure2_nonwork_weekend
+Italy,Europe,weekend,6,0.0062907526,profound_figure2_nonwork_weekend
+Italy,Europe,weekend,7,0.0075289325,profound_figure2_nonwork_weekend
+Italy,Europe,weekend,8,0.0114431785,profound_figure2_nonwork_weekend
+Italy,Europe,weekend,9,0.0207594836,profound_figure2_nonwork_weekend
+Italy,Europe,weekend,10,0.0320428969,profound_figure2_nonwork_weekend
+Italy,Europe,weekend,11,0.0428570002,profound_figure2_nonwork_weekend
+Italy,Europe,weekend,12,0.052662586,profound_figure2_nonwork_weekend
+Italy,Europe,weekend,13,0.057475511,profound_figure2_nonwork_weekend
+Italy,Europe,weekend,14,0.0594126634,profound_figure2_nonwork_weekend
+Italy,Europe,weekend,15,0.0654837389,profound_figure2_nonwork_weekend
+Italy,Europe,weekend,16,0.065643504,profound_figure2_nonwork_weekend
+Italy,Europe,weekend,17,0.0672511408,profound_figure2_nonwork_weekend
+Italy,Europe,weekend,18,0.0683595115,profound_figure2_nonwork_weekend
+Italy,Europe,weekend,19,0.0661128142,profound_figure2_nonwork_weekend
+Italy,Europe,weekend,20,0.0682696436,profound_figure2_nonwork_weekend
+Italy,Europe,weekend,21,0.0646349866,profound_figure2_nonwork_weekend
+Italy,Europe,weekend,22,0.0633668507,profound_figure2_nonwork_weekend
+Italy,Europe,weekend,23,0.0550490779,profound_figure2_nonwork_weekend
+Egypt,Asia,weekend,0,0.0445646651,profound_figure2_nonwork_weekend
+Egypt,Asia,weekend,1,0.0409181935,profound_figure2_nonwork_weekend
+Egypt,Asia,weekend,2,0.0278566518,profound_figure2_nonwork_weekend
+Egypt,Asia,weekend,3,0.0229349115,profound_figure2_nonwork_weekend
+Egypt,Asia,weekend,4,0.0155821901,profound_figure2_nonwork_weekend
+Egypt,Asia,weekend,5,0.0167179763,profound_figure2_nonwork_weekend
+Egypt,Asia,weekend,6,0.0156021161,profound_figure2_nonwork_weekend
+Egypt,Asia,weekend,7,0.0136095087,profound_figure2_nonwork_weekend
+Egypt,Asia,weekend,8,0.0211415648,profound_figure2_nonwork_weekend
+Egypt,Asia,weekend,9,0.0286038796,profound_figure2_nonwork_weekend
+Egypt,Asia,weekend,10,0.0342329956,profound_figure2_nonwork_weekend
+Egypt,Asia,weekend,11,0.0415060127,profound_figure2_nonwork_weekend
+Egypt,Asia,weekend,12,0.0435285092,profound_figure2_nonwork_weekend
+Egypt,Asia,weekend,13,0.0468163115,profound_figure2_nonwork_weekend
+Egypt,Asia,weekend,14,0.0529136902,profound_figure2_nonwork_weekend
+Egypt,Asia,weekend,15,0.0596885555,profound_figure2_nonwork_weekend
+Egypt,Asia,weekend,16,0.0542288111,profound_figure2_nonwork_weekend
+Egypt,Asia,weekend,17,0.0544081458,profound_figure2_nonwork_weekend
+Egypt,Asia,weekend,18,0.0538004005,profound_figure2_nonwork_weekend
+Egypt,Asia,weekend,19,0.0559623796,profound_figure2_nonwork_weekend
+Egypt,Asia,weekend,20,0.0639726614,profound_figure2_nonwork_weekend
+Egypt,Asia,weekend,21,0.0668519792,profound_figure2_nonwork_weekend
+Egypt,Asia,weekend,22,0.0648494087,profound_figure2_nonwork_weekend
+Egypt,Asia,weekend,23,0.0597084815,profound_figure2_nonwork_weekend
+South Africa,Latin America,weekend,0,0.0169209956,profound_figure2_nonwork_weekend
+South Africa,Latin America,weekend,1,0.0118775242,profound_figure2_nonwork_weekend
+South Africa,Latin America,weekend,2,0.0142450709,profound_figure2_nonwork_weekend
+South Africa,Latin America,weekend,3,0.0195372341,profound_figure2_nonwork_weekend
+South Africa,Latin America,weekend,4,0.0274655313,profound_figure2_nonwork_weekend
+South Africa,Latin America,weekend,5,0.0372341484,profound_figure2_nonwork_weekend
+South Africa,Latin America,weekend,6,0.04343155,profound_figure2_nonwork_weekend
+South Africa,Latin America,weekend,7,0.0558661441,profound_figure2_nonwork_weekend
+South Africa,Latin America,weekend,8,0.068519587,profound_figure2_nonwork_weekend
+South Africa,Latin America,weekend,9,0.0715237849,profound_figure2_nonwork_weekend
+South Africa,Latin America,weekend,10,0.071643157,profound_figure2_nonwork_weekend
+South Africa,Latin America,weekend,11,0.0722002268,profound_figure2_nonwork_weekend
+South Africa,Latin America,weekend,12,0.0720908024,profound_figure2_nonwork_weekend
+South Africa,Latin America,weekend,13,0.0661818833,profound_figure2_nonwork_weekend
+South Africa,Latin America,weekend,14,0.06273004,profound_figure2_nonwork_weekend
+South Africa,Latin America,weekend,15,0.0549012196,profound_figure2_nonwork_weekend
+South Africa,Latin America,weekend,16,0.045669777,profound_figure2_nonwork_weekend
+South Africa,Latin America,weekend,17,0.0338519388,profound_figure2_nonwork_weekend
+South Africa,Latin America,weekend,18,0.0250382985,profound_figure2_nonwork_weekend
+South Africa,Latin America,weekend,19,0.0187712632,profound_figure2_nonwork_weekend
+South Africa,Latin America,weekend,20,0.0167717804,profound_figure2_nonwork_weekend
+South Africa,Latin America,weekend,21,0.0381592822,profound_figure2_nonwork_weekend
+South Africa,Latin America,weekend,22,0.0321508863,profound_figure2_nonwork_weekend
+South Africa,Latin America,weekend,23,0.023217874,profound_figure2_nonwork_weekend
+Canada,North America,weekend,0,0.0153872185,profound_figure2_nonwork_weekend
+Canada,North America,weekend,1,0.015317548,profound_figure2_nonwork_weekend
+Canada,North America,weekend,2,0.0225732286,profound_figure2_nonwork_weekend
+Canada,North America,weekend,3,0.0264946802,profound_figure2_nonwork_weekend
+Canada,North America,weekend,4,0.0405083953,profound_figure2_nonwork_weekend
+Canada,North America,weekend,5,0.0447582933,profound_figure2_nonwork_weekend
+Canada,North America,weekend,6,0.060882028,profound_figure2_nonwork_weekend
+Canada,North America,weekend,7,0.0706358922,profound_figure2_nonwork_weekend
+Canada,North America,weekend,8,0.0708548565,profound_figure2_nonwork_weekend
+Canada,North America,weekend,9,0.0695808824,profound_figure2_nonwork_weekend
+Canada,North America,weekend,10,0.0775432206,profound_figure2_nonwork_weekend
+Canada,North America,weekend,11,0.0659779244,profound_figure2_nonwork_weekend
+Canada,North America,weekend,12,0.0561742956,profound_figure2_nonwork_weekend
+Canada,North America,weekend,13,0.0468185483,profound_figure2_nonwork_weekend
+Canada,North America,weekend,14,0.0349845232,profound_figure2_nonwork_weekend
+Canada,North America,weekend,15,0.0279776656,profound_figure2_nonwork_weekend
+Canada,North America,weekend,16,0.0308540603,profound_figure2_nonwork_weekend
+Canada,North America,weekend,17,0.0273605844,profound_figure2_nonwork_weekend
+Canada,North America,weekend,18,0.0306948135,profound_figure2_nonwork_weekend
+Canada,North America,weekend,19,0.0414539229,profound_figure2_nonwork_weekend
+Canada,North America,weekend,20,0.0429170026,profound_figure2_nonwork_weekend
+Canada,North America,weekend,21,0.0376519065,profound_figure2_nonwork_weekend
+Canada,North America,weekend,22,0.0236381914,profound_figure2_nonwork_weekend
+Canada,North America,weekend,23,0.0189603177,profound_figure2_nonwork_weekend
+Colombia,Latin America,weekend,0,0.0169209956,profound_figure2_nonwork_weekend
+Colombia,Latin America,weekend,1,0.0118775242,profound_figure2_nonwork_weekend
+Colombia,Latin America,weekend,2,0.0142450709,profound_figure2_nonwork_weekend
+Colombia,Latin America,weekend,3,0.0195372341,profound_figure2_nonwork_weekend
+Colombia,Latin America,weekend,4,0.0274655313,profound_figure2_nonwork_weekend
+Colombia,Latin America,weekend,5,0.0372341484,profound_figure2_nonwork_weekend
+Colombia,Latin America,weekend,6,0.04343155,profound_figure2_nonwork_weekend
+Colombia,Latin America,weekend,7,0.0558661441,profound_figure2_nonwork_weekend
+Colombia,Latin America,weekend,8,0.068519587,profound_figure2_nonwork_weekend
+Colombia,Latin America,weekend,9,0.0715237849,profound_figure2_nonwork_weekend
+Colombia,Latin America,weekend,10,0.071643157,profound_figure2_nonwork_weekend
+Colombia,Latin America,weekend,11,0.0722002268,profound_figure2_nonwork_weekend
+Colombia,Latin America,weekend,12,0.0720908024,profound_figure2_nonwork_weekend
+Colombia,Latin America,weekend,13,0.0661818833,profound_figure2_nonwork_weekend
+Colombia,Latin America,weekend,14,0.06273004,profound_figure2_nonwork_weekend
+Colombia,Latin America,weekend,15,0.0549012196,profound_figure2_nonwork_weekend
+Colombia,Latin America,weekend,16,0.045669777,profound_figure2_nonwork_weekend
+Colombia,Latin America,weekend,17,0.0338519388,profound_figure2_nonwork_weekend
+Colombia,Latin America,weekend,18,0.0250382985,profound_figure2_nonwork_weekend
+Colombia,Latin America,weekend,19,0.0187712632,profound_figure2_nonwork_weekend
+Colombia,Latin America,weekend,20,0.0167717804,profound_figure2_nonwork_weekend
+Colombia,Latin America,weekend,21,0.0381592822,profound_figure2_nonwork_weekend
+Colombia,Latin America,weekend,22,0.0321508863,profound_figure2_nonwork_weekend
+Colombia,Latin America,weekend,23,0.023217874,profound_figure2_nonwork_weekend
+Bangladesh,Asia,weekend,0,0.0445646651,profound_figure2_nonwork_weekend
+Bangladesh,Asia,weekend,1,0.0409181935,profound_figure2_nonwork_weekend
+Bangladesh,Asia,weekend,2,0.0278566518,profound_figure2_nonwork_weekend
+Bangladesh,Asia,weekend,3,0.0229349115,profound_figure2_nonwork_weekend
+Bangladesh,Asia,weekend,4,0.0155821901,profound_figure2_nonwork_weekend
+Bangladesh,Asia,weekend,5,0.0167179763,profound_figure2_nonwork_weekend
+Bangladesh,Asia,weekend,6,0.0156021161,profound_figure2_nonwork_weekend
+Bangladesh,Asia,weekend,7,0.0136095087,profound_figure2_nonwork_weekend
+Bangladesh,Asia,weekend,8,0.0211415648,profound_figure2_nonwork_weekend
+Bangladesh,Asia,weekend,9,0.0286038796,profound_figure2_nonwork_weekend
+Bangladesh,Asia,weekend,10,0.0342329956,profound_figure2_nonwork_weekend
+Bangladesh,Asia,weekend,11,0.0415060127,profound_figure2_nonwork_weekend
+Bangladesh,Asia,weekend,12,0.0435285092,profound_figure2_nonwork_weekend
+Bangladesh,Asia,weekend,13,0.0468163115,profound_figure2_nonwork_weekend
+Bangladesh,Asia,weekend,14,0.0529136902,profound_figure2_nonwork_weekend
+Bangladesh,Asia,weekend,15,0.0596885555,profound_figure2_nonwork_weekend
+Bangladesh,Asia,weekend,16,0.0542288111,profound_figure2_nonwork_weekend
+Bangladesh,Asia,weekend,17,0.0544081458,profound_figure2_nonwork_weekend
+Bangladesh,Asia,weekend,18,0.0538004005,profound_figure2_nonwork_weekend
+Bangladesh,Asia,weekend,19,0.0559623796,profound_figure2_nonwork_weekend
+Bangladesh,Asia,weekend,20,0.0639726614,profound_figure2_nonwork_weekend
+Bangladesh,Asia,weekend,21,0.0668519792,profound_figure2_nonwork_weekend
+Bangladesh,Asia,weekend,22,0.0648494087,profound_figure2_nonwork_weekend
+Bangladesh,Asia,weekend,23,0.0597084815,profound_figure2_nonwork_weekend
+Russia,Europe,weekend,0,0.0400111836,profound_figure2_nonwork_weekend
+Russia,Europe,weekend,1,0.0309644822,profound_figure2_nonwork_weekend
+Russia,Europe,weekend,2,0.0223072084,profound_figure2_nonwork_weekend
+Russia,Europe,weekend,3,0.0162161622,profound_figure2_nonwork_weekend
+Russia,Europe,weekend,4,0.009595894,profound_figure2_nonwork_weekend
+Russia,Europe,weekend,5,0.0062607966,profound_figure2_nonwork_weekend
+Russia,Europe,weekend,6,0.0062907526,profound_figure2_nonwork_weekend
+Russia,Europe,weekend,7,0.0075289325,profound_figure2_nonwork_weekend
+Russia,Europe,weekend,8,0.0114431785,profound_figure2_nonwork_weekend
+Russia,Europe,weekend,9,0.0207594836,profound_figure2_nonwork_weekend
+Russia,Europe,weekend,10,0.0320428969,profound_figure2_nonwork_weekend
+Russia,Europe,weekend,11,0.0428570002,profound_figure2_nonwork_weekend
+Russia,Europe,weekend,12,0.052662586,profound_figure2_nonwork_weekend
+Russia,Europe,weekend,13,0.057475511,profound_figure2_nonwork_weekend
+Russia,Europe,weekend,14,0.0594126634,profound_figure2_nonwork_weekend
+Russia,Europe,weekend,15,0.0654837389,profound_figure2_nonwork_weekend
+Russia,Europe,weekend,16,0.065643504,profound_figure2_nonwork_weekend
+Russia,Europe,weekend,17,0.0672511408,profound_figure2_nonwork_weekend
+Russia,Europe,weekend,18,0.0683595115,profound_figure2_nonwork_weekend
+Russia,Europe,weekend,19,0.0661128142,profound_figure2_nonwork_weekend
+Russia,Europe,weekend,20,0.0682696436,profound_figure2_nonwork_weekend
+Russia,Europe,weekend,21,0.0646349866,profound_figure2_nonwork_weekend
+Russia,Europe,weekend,22,0.0633668507,profound_figure2_nonwork_weekend
+Russia,Europe,weekend,23,0.0550490779,profound_figure2_nonwork_weekend
+Iran,Asia,weekend,0,0.0445646651,profound_figure2_nonwork_weekend
+Iran,Asia,weekend,1,0.0409181935,profound_figure2_nonwork_weekend
+Iran,Asia,weekend,2,0.0278566518,profound_figure2_nonwork_weekend
+Iran,Asia,weekend,3,0.0229349115,profound_figure2_nonwork_weekend
+Iran,Asia,weekend,4,0.0155821901,profound_figure2_nonwork_weekend
+Iran,Asia,weekend,5,0.0167179763,profound_figure2_nonwork_weekend
+Iran,Asia,weekend,6,0.0156021161,profound_figure2_nonwork_weekend
+Iran,Asia,weekend,7,0.0136095087,profound_figure2_nonwork_weekend
+Iran,Asia,weekend,8,0.0211415648,profound_figure2_nonwork_weekend
+Iran,Asia,weekend,9,0.0286038796,profound_figure2_nonwork_weekend
+Iran,Asia,weekend,10,0.0342329956,profound_figure2_nonwork_weekend
+Iran,Asia,weekend,11,0.0415060127,profound_figure2_nonwork_weekend
+Iran,Asia,weekend,12,0.0435285092,profound_figure2_nonwork_weekend
+Iran,Asia,weekend,13,0.0468163115,profound_figure2_nonwork_weekend
+Iran,Asia,weekend,14,0.0529136902,profound_figure2_nonwork_weekend
+Iran,Asia,weekend,15,0.0596885555,profound_figure2_nonwork_weekend
+Iran,Asia,weekend,16,0.0542288111,profound_figure2_nonwork_weekend
+Iran,Asia,weekend,17,0.0544081458,profound_figure2_nonwork_weekend
+Iran,Asia,weekend,18,0.0538004005,profound_figure2_nonwork_weekend
+Iran,Asia,weekend,19,0.0559623796,profound_figure2_nonwork_weekend
+Iran,Asia,weekend,20,0.0639726614,profound_figure2_nonwork_weekend
+Iran,Asia,weekend,21,0.0668519792,profound_figure2_nonwork_weekend
+Iran,Asia,weekend,22,0.0648494087,profound_figure2_nonwork_weekend
+Iran,Asia,weekend,23,0.0597084815,profound_figure2_nonwork_weekend
+Saudi Arabia,Asia,weekend,0,0.0445646651,profound_figure2_nonwork_weekend
+Saudi Arabia,Asia,weekend,1,0.0409181935,profound_figure2_nonwork_weekend
+Saudi Arabia,Asia,weekend,2,0.0278566518,profound_figure2_nonwork_weekend
+Saudi Arabia,Asia,weekend,3,0.0229349115,profound_figure2_nonwork_weekend
+Saudi Arabia,Asia,weekend,4,0.0155821901,profound_figure2_nonwork_weekend
+Saudi Arabia,Asia,weekend,5,0.0167179763,profound_figure2_nonwork_weekend
+Saudi Arabia,Asia,weekend,6,0.0156021161,profound_figure2_nonwork_weekend
+Saudi Arabia,Asia,weekend,7,0.0136095087,profound_figure2_nonwork_weekend
+Saudi Arabia,Asia,weekend,8,0.0211415648,profound_figure2_nonwork_weekend
+Saudi Arabia,Asia,weekend,9,0.0286038796,profound_figure2_nonwork_weekend
+Saudi Arabia,Asia,weekend,10,0.0342329956,profound_figure2_nonwork_weekend
+Saudi Arabia,Asia,weekend,11,0.0415060127,profound_figure2_nonwork_weekend
+Saudi Arabia,Asia,weekend,12,0.0435285092,profound_figure2_nonwork_weekend
+Saudi Arabia,Asia,weekend,13,0.0468163115,profound_figure2_nonwork_weekend
+Saudi Arabia,Asia,weekend,14,0.0529136902,profound_figure2_nonwork_weekend
+Saudi Arabia,Asia,weekend,15,0.0596885555,profound_figure2_nonwork_weekend
+Saudi Arabia,Asia,weekend,16,0.0542288111,profound_figure2_nonwork_weekend
+Saudi Arabia,Asia,weekend,17,0.0544081458,profound_figure2_nonwork_weekend
+Saudi Arabia,Asia,weekend,18,0.0538004005,profound_figure2_nonwork_weekend
+Saudi Arabia,Asia,weekend,19,0.0559623796,profound_figure2_nonwork_weekend
+Saudi Arabia,Asia,weekend,20,0.0639726614,profound_figure2_nonwork_weekend
+Saudi Arabia,Asia,weekend,21,0.0668519792,profound_figure2_nonwork_weekend
+Saudi Arabia,Asia,weekend,22,0.0648494087,profound_figure2_nonwork_weekend
+Saudi Arabia,Asia,weekend,23,0.0597084815,profound_figure2_nonwork_weekend
+Poland,Europe,weekend,0,0.0400111836,profound_figure2_nonwork_weekend
+Poland,Europe,weekend,1,0.0309644822,profound_figure2_nonwork_weekend
+Poland,Europe,weekend,2,0.0223072084,profound_figure2_nonwork_weekend
+Poland,Europe,weekend,3,0.0162161622,profound_figure2_nonwork_weekend
+Poland,Europe,weekend,4,0.009595894,profound_figure2_nonwork_weekend
+Poland,Europe,weekend,5,0.0062607966,profound_figure2_nonwork_weekend
+Poland,Europe,weekend,6,0.0062907526,profound_figure2_nonwork_weekend
+Poland,Europe,weekend,7,0.0075289325,profound_figure2_nonwork_weekend
+Poland,Europe,weekend,8,0.0114431785,profound_figure2_nonwork_weekend
+Poland,Europe,weekend,9,0.0207594836,profound_figure2_nonwork_weekend
+Poland,Europe,weekend,10,0.0320428969,profound_figure2_nonwork_weekend
+Poland,Europe,weekend,11,0.0428570002,profound_figure2_nonwork_weekend
+Poland,Europe,weekend,12,0.052662586,profound_figure2_nonwork_weekend
+Poland,Europe,weekend,13,0.057475511,profound_figure2_nonwork_weekend
+Poland,Europe,weekend,14,0.0594126634,profound_figure2_nonwork_weekend
+Poland,Europe,weekend,15,0.0654837389,profound_figure2_nonwork_weekend
+Poland,Europe,weekend,16,0.065643504,profound_figure2_nonwork_weekend
+Poland,Europe,weekend,17,0.0672511408,profound_figure2_nonwork_weekend
+Poland,Europe,weekend,18,0.0683595115,profound_figure2_nonwork_weekend
+Poland,Europe,weekend,19,0.0661128142,profound_figure2_nonwork_weekend
+Poland,Europe,weekend,20,0.0682696436,profound_figure2_nonwork_weekend
+Poland,Europe,weekend,21,0.0646349866,profound_figure2_nonwork_weekend
+Poland,Europe,weekend,22,0.0633668507,profound_figure2_nonwork_weekend
+Poland,Europe,weekend,23,0.0550490779,profound_figure2_nonwork_weekend
+Australia,Asia,weekend,0,0.0445646651,profound_figure2_nonwork_weekend
+Australia,Asia,weekend,1,0.0409181935,profound_figure2_nonwork_weekend
+Australia,Asia,weekend,2,0.0278566518,profound_figure2_nonwork_weekend
+Australia,Asia,weekend,3,0.0229349115,profound_figure2_nonwork_weekend
+Australia,Asia,weekend,4,0.0155821901,profound_figure2_nonwork_weekend
+Australia,Asia,weekend,5,0.0167179763,profound_figure2_nonwork_weekend
+Australia,Asia,weekend,6,0.0156021161,profound_figure2_nonwork_weekend
+Australia,Asia,weekend,7,0.0136095087,profound_figure2_nonwork_weekend
+Australia,Asia,weekend,8,0.0211415648,profound_figure2_nonwork_weekend
+Australia,Asia,weekend,9,0.0286038796,profound_figure2_nonwork_weekend
+Australia,Asia,weekend,10,0.0342329956,profound_figure2_nonwork_weekend
+Australia,Asia,weekend,11,0.0415060127,profound_figure2_nonwork_weekend
+Australia,Asia,weekend,12,0.0435285092,profound_figure2_nonwork_weekend
+Australia,Asia,weekend,13,0.0468163115,profound_figure2_nonwork_weekend
+Australia,Asia,weekend,14,0.0529136902,profound_figure2_nonwork_weekend
+Australia,Asia,weekend,15,0.0596885555,profound_figure2_nonwork_weekend
+Australia,Asia,weekend,16,0.0542288111,profound_figure2_nonwork_weekend
+Australia,Asia,weekend,17,0.0544081458,profound_figure2_nonwork_weekend
+Australia,Asia,weekend,18,0.0538004005,profound_figure2_nonwork_weekend
+Australia,Asia,weekend,19,0.0559623796,profound_figure2_nonwork_weekend
+Australia,Asia,weekend,20,0.0639726614,profound_figure2_nonwork_weekend
+Australia,Asia,weekend,21,0.0668519792,profound_figure2_nonwork_weekend
+Australia,Asia,weekend,22,0.0648494087,profound_figure2_nonwork_weekend
+Australia,Asia,weekend,23,0.0597084815,profound_figure2_nonwork_weekend
+Argentina,Latin America,weekend,0,0.0169209956,profound_figure2_nonwork_weekend
+Argentina,Latin America,weekend,1,0.0118775242,profound_figure2_nonwork_weekend
+Argentina,Latin America,weekend,2,0.0142450709,profound_figure2_nonwork_weekend
+Argentina,Latin America,weekend,3,0.0195372341,profound_figure2_nonwork_weekend
+Argentina,Latin America,weekend,4,0.0274655313,profound_figure2_nonwork_weekend
+Argentina,Latin America,weekend,5,0.0372341484,profound_figure2_nonwork_weekend
+Argentina,Latin America,weekend,6,0.04343155,profound_figure2_nonwork_weekend
+Argentina,Latin America,weekend,7,0.0558661441,profound_figure2_nonwork_weekend
+Argentina,Latin America,weekend,8,0.068519587,profound_figure2_nonwork_weekend
+Argentina,Latin America,weekend,9,0.0715237849,profound_figure2_nonwork_weekend
+Argentina,Latin America,weekend,10,0.071643157,profound_figure2_nonwork_weekend
+Argentina,Latin America,weekend,11,0.0722002268,profound_figure2_nonwork_weekend
+Argentina,Latin America,weekend,12,0.0720908024,profound_figure2_nonwork_weekend
+Argentina,Latin America,weekend,13,0.0661818833,profound_figure2_nonwork_weekend
+Argentina,Latin America,weekend,14,0.06273004,profound_figure2_nonwork_weekend
+Argentina,Latin America,weekend,15,0.0549012196,profound_figure2_nonwork_weekend
+Argentina,Latin America,weekend,16,0.045669777,profound_figure2_nonwork_weekend
+Argentina,Latin America,weekend,17,0.0338519388,profound_figure2_nonwork_weekend
+Argentina,Latin America,weekend,18,0.0250382985,profound_figure2_nonwork_weekend
+Argentina,Latin America,weekend,19,0.0187712632,profound_figure2_nonwork_weekend
+Argentina,Latin America,weekend,20,0.0167717804,profound_figure2_nonwork_weekend
+Argentina,Latin America,weekend,21,0.0381592822,profound_figure2_nonwork_weekend
+Argentina,Latin America,weekend,22,0.0321508863,profound_figure2_nonwork_weekend
+Argentina,Latin America,weekend,23,0.023217874,profound_figure2_nonwork_weekend
+United Arab Emirates,Asia,weekend,0,0.0445646651,profound_figure2_nonwork_weekend
+United Arab Emirates,Asia,weekend,1,0.0409181935,profound_figure2_nonwork_weekend
+United Arab Emirates,Asia,weekend,2,0.0278566518,profound_figure2_nonwork_weekend
+United Arab Emirates,Asia,weekend,3,0.0229349115,profound_figure2_nonwork_weekend
+United Arab Emirates,Asia,weekend,4,0.0155821901,profound_figure2_nonwork_weekend
+United Arab Emirates,Asia,weekend,5,0.0167179763,profound_figure2_nonwork_weekend
+United Arab Emirates,Asia,weekend,6,0.0156021161,profound_figure2_nonwork_weekend
+United Arab Emirates,Asia,weekend,7,0.0136095087,profound_figure2_nonwork_weekend
+United Arab Emirates,Asia,weekend,8,0.0211415648,profound_figure2_nonwork_weekend
+United Arab Emirates,Asia,weekend,9,0.0286038796,profound_figure2_nonwork_weekend
+United Arab Emirates,Asia,weekend,10,0.0342329956,profound_figure2_nonwork_weekend
+United Arab Emirates,Asia,weekend,11,0.0415060127,profound_figure2_nonwork_weekend
+United Arab Emirates,Asia,weekend,12,0.0435285092,profound_figure2_nonwork_weekend
+United Arab Emirates,Asia,weekend,13,0.0468163115,profound_figure2_nonwork_weekend
+United Arab Emirates,Asia,weekend,14,0.0529136902,profound_figure2_nonwork_weekend
+United Arab Emirates,Asia,weekend,15,0.0596885555,profound_figure2_nonwork_weekend
+United Arab Emirates,Asia,weekend,16,0.0542288111,profound_figure2_nonwork_weekend
+United Arab Emirates,Asia,weekend,17,0.0544081458,profound_figure2_nonwork_weekend
+United Arab Emirates,Asia,weekend,18,0.0538004005,profound_figure2_nonwork_weekend
+United Arab Emirates,Asia,weekend,19,0.0559623796,profound_figure2_nonwork_weekend
+United Arab Emirates,Asia,weekend,20,0.0639726614,profound_figure2_nonwork_weekend
+United Arab Emirates,Asia,weekend,21,0.0668519792,profound_figure2_nonwork_weekend
+United Arab Emirates,Asia,weekend,22,0.0648494087,profound_figure2_nonwork_weekend
+United Arab Emirates,Asia,weekend,23,0.0597084815,profound_figure2_nonwork_weekend
+Thailand,Asia,weekend,0,0.0445646651,profound_figure2_nonwork_weekend
+Thailand,Asia,weekend,1,0.0409181935,profound_figure2_nonwork_weekend
+Thailand,Asia,weekend,2,0.0278566518,profound_figure2_nonwork_weekend
+Thailand,Asia,weekend,3,0.0229349115,profound_figure2_nonwork_weekend
+Thailand,Asia,weekend,4,0.0155821901,profound_figure2_nonwork_weekend
+Thailand,Asia,weekend,5,0.0167179763,profound_figure2_nonwork_weekend
+Thailand,Asia,weekend,6,0.0156021161,profound_figure2_nonwork_weekend
+Thailand,Asia,weekend,7,0.0136095087,profound_figure2_nonwork_weekend
+Thailand,Asia,weekend,8,0.0211415648,profound_figure2_nonwork_weekend
+Thailand,Asia,weekend,9,0.0286038796,profound_figure2_nonwork_weekend
+Thailand,Asia,weekend,10,0.0342329956,profound_figure2_nonwork_weekend
+Thailand,Asia,weekend,11,0.0415060127,profound_figure2_nonwork_weekend
+Thailand,Asia,weekend,12,0.0435285092,profound_figure2_nonwork_weekend
+Thailand,Asia,weekend,13,0.0468163115,profound_figure2_nonwork_weekend
+Thailand,Asia,weekend,14,0.0529136902,profound_figure2_nonwork_weekend
+Thailand,Asia,weekend,15,0.0596885555,profound_figure2_nonwork_weekend
+Thailand,Asia,weekend,16,0.0542288111,profound_figure2_nonwork_weekend
+Thailand,Asia,weekend,17,0.0544081458,profound_figure2_nonwork_weekend
+Thailand,Asia,weekend,18,0.0538004005,profound_figure2_nonwork_weekend
+Thailand,Asia,weekend,19,0.0559623796,profound_figure2_nonwork_weekend
+Thailand,Asia,weekend,20,0.0639726614,profound_figure2_nonwork_weekend
+Thailand,Asia,weekend,21,0.0668519792,profound_figure2_nonwork_weekend
+Thailand,Asia,weekend,22,0.0648494087,profound_figure2_nonwork_weekend
+Thailand,Asia,weekend,23,0.0597084815,profound_figure2_nonwork_weekend
+Ethiopia,Latin America,weekend,0,0.0169209956,profound_figure2_nonwork_weekend
+Ethiopia,Latin America,weekend,1,0.0118775242,profound_figure2_nonwork_weekend
+Ethiopia,Latin America,weekend,2,0.0142450709,profound_figure2_nonwork_weekend
+Ethiopia,Latin America,weekend,3,0.0195372341,profound_figure2_nonwork_weekend
+Ethiopia,Latin America,weekend,4,0.0274655313,profound_figure2_nonwork_weekend
+Ethiopia,Latin America,weekend,5,0.0372341484,profound_figure2_nonwork_weekend
+Ethiopia,Latin America,weekend,6,0.04343155,profound_figure2_nonwork_weekend
+Ethiopia,Latin America,weekend,7,0.0558661441,profound_figure2_nonwork_weekend
+Ethiopia,Latin America,weekend,8,0.068519587,profound_figure2_nonwork_weekend
+Ethiopia,Latin America,weekend,9,0.0715237849,profound_figure2_nonwork_weekend
+Ethiopia,Latin America,weekend,10,0.071643157,profound_figure2_nonwork_weekend
+Ethiopia,Latin America,weekend,11,0.0722002268,profound_figure2_nonwork_weekend
+Ethiopia,Latin America,weekend,12,0.0720908024,profound_figure2_nonwork_weekend
+Ethiopia,Latin America,weekend,13,0.0661818833,profound_figure2_nonwork_weekend
+Ethiopia,Latin America,weekend,14,0.06273004,profound_figure2_nonwork_weekend
+Ethiopia,Latin America,weekend,15,0.0549012196,profound_figure2_nonwork_weekend
+Ethiopia,Latin America,weekend,16,0.045669777,profound_figure2_nonwork_weekend
+Ethiopia,Latin America,weekend,17,0.0338519388,profound_figure2_nonwork_weekend
+Ethiopia,Latin America,weekend,18,0.0250382985,profound_figure2_nonwork_weekend
+Ethiopia,Latin America,weekend,19,0.0187712632,profound_figure2_nonwork_weekend
+Ethiopia,Latin America,weekend,20,0.0167717804,profound_figure2_nonwork_weekend
+Ethiopia,Latin America,weekend,21,0.0381592822,profound_figure2_nonwork_weekend
+Ethiopia,Latin America,weekend,22,0.0321508863,profound_figure2_nonwork_weekend
+Ethiopia,Latin America,weekend,23,0.023217874,profound_figure2_nonwork_weekend
+Malaysia,Asia,weekend,0,0.0445646651,profound_figure2_nonwork_weekend
+Malaysia,Asia,weekend,1,0.0409181935,profound_figure2_nonwork_weekend
+Malaysia,Asia,weekend,2,0.0278566518,profound_figure2_nonwork_weekend
+Malaysia,Asia,weekend,3,0.0229349115,profound_figure2_nonwork_weekend
+Malaysia,Asia,weekend,4,0.0155821901,profound_figure2_nonwork_weekend
+Malaysia,Asia,weekend,5,0.0167179763,profound_figure2_nonwork_weekend
+Malaysia,Asia,weekend,6,0.0156021161,profound_figure2_nonwork_weekend
+Malaysia,Asia,weekend,7,0.0136095087,profound_figure2_nonwork_weekend
+Malaysia,Asia,weekend,8,0.0211415648,profound_figure2_nonwork_weekend
+Malaysia,Asia,weekend,9,0.0286038796,profound_figure2_nonwork_weekend
+Malaysia,Asia,weekend,10,0.0342329956,profound_figure2_nonwork_weekend
+Malaysia,Asia,weekend,11,0.0415060127,profound_figure2_nonwork_weekend
+Malaysia,Asia,weekend,12,0.0435285092,profound_figure2_nonwork_weekend
+Malaysia,Asia,weekend,13,0.0468163115,profound_figure2_nonwork_weekend
+Malaysia,Asia,weekend,14,0.0529136902,profound_figure2_nonwork_weekend
+Malaysia,Asia,weekend,15,0.0596885555,profound_figure2_nonwork_weekend
+Malaysia,Asia,weekend,16,0.0542288111,profound_figure2_nonwork_weekend
+Malaysia,Asia,weekend,17,0.0544081458,profound_figure2_nonwork_weekend
+Malaysia,Asia,weekend,18,0.0538004005,profound_figure2_nonwork_weekend
+Malaysia,Asia,weekend,19,0.0559623796,profound_figure2_nonwork_weekend
+Malaysia,Asia,weekend,20,0.0639726614,profound_figure2_nonwork_weekend
+Malaysia,Asia,weekend,21,0.0668519792,profound_figure2_nonwork_weekend
+Malaysia,Asia,weekend,22,0.0648494087,profound_figure2_nonwork_weekend
+Malaysia,Asia,weekend,23,0.0597084815,profound_figure2_nonwork_weekend
+Taiwan,Asia,weekend,0,0.0445646651,profound_figure2_nonwork_weekend
+Taiwan,Asia,weekend,1,0.0409181935,profound_figure2_nonwork_weekend
+Taiwan,Asia,weekend,2,0.0278566518,profound_figure2_nonwork_weekend
+Taiwan,Asia,weekend,3,0.0229349115,profound_figure2_nonwork_weekend
+Taiwan,Asia,weekend,4,0.0155821901,profound_figure2_nonwork_weekend
+Taiwan,Asia,weekend,5,0.0167179763,profound_figure2_nonwork_weekend
+Taiwan,Asia,weekend,6,0.0156021161,profound_figure2_nonwork_weekend
+Taiwan,Asia,weekend,7,0.0136095087,profound_figure2_nonwork_weekend
+Taiwan,Asia,weekend,8,0.0211415648,profound_figure2_nonwork_weekend
+Taiwan,Asia,weekend,9,0.0286038796,profound_figure2_nonwork_weekend
+Taiwan,Asia,weekend,10,0.0342329956,profound_figure2_nonwork_weekend
+Taiwan,Asia,weekend,11,0.0415060127,profound_figure2_nonwork_weekend
+Taiwan,Asia,weekend,12,0.0435285092,profound_figure2_nonwork_weekend
+Taiwan,Asia,weekend,13,0.0468163115,profound_figure2_nonwork_weekend
+Taiwan,Asia,weekend,14,0.0529136902,profound_figure2_nonwork_weekend
+Taiwan,Asia,weekend,15,0.0596885555,profound_figure2_nonwork_weekend
+Taiwan,Asia,weekend,16,0.0542288111,profound_figure2_nonwork_weekend
+Taiwan,Asia,weekend,17,0.0544081458,profound_figure2_nonwork_weekend
+Taiwan,Asia,weekend,18,0.0538004005,profound_figure2_nonwork_weekend
+Taiwan,Asia,weekend,19,0.0559623796,profound_figure2_nonwork_weekend
+Taiwan,Asia,weekend,20,0.0639726614,profound_figure2_nonwork_weekend
+Taiwan,Asia,weekend,21,0.0668519792,profound_figure2_nonwork_weekend
+Taiwan,Asia,weekend,22,0.0648494087,profound_figure2_nonwork_weekend
+Taiwan,Asia,weekend,23,0.0597084815,profound_figure2_nonwork_weekend
+Congo (DRC),Latin America,weekend,0,0.0169209956,profound_figure2_nonwork_weekend
+Congo (DRC),Latin America,weekend,1,0.0118775242,profound_figure2_nonwork_weekend
+Congo (DRC),Latin America,weekend,2,0.0142450709,profound_figure2_nonwork_weekend
+Congo (DRC),Latin America,weekend,3,0.0195372341,profound_figure2_nonwork_weekend
+Congo (DRC),Latin America,weekend,4,0.0274655313,profound_figure2_nonwork_weekend
+Congo (DRC),Latin America,weekend,5,0.0372341484,profound_figure2_nonwork_weekend
+Congo (DRC),Latin America,weekend,6,0.04343155,profound_figure2_nonwork_weekend
+Congo (DRC),Latin America,weekend,7,0.0558661441,profound_figure2_nonwork_weekend
+Congo (DRC),Latin America,weekend,8,0.068519587,profound_figure2_nonwork_weekend
+Congo (DRC),Latin America,weekend,9,0.0715237849,profound_figure2_nonwork_weekend
+Congo (DRC),Latin America,weekend,10,0.071643157,profound_figure2_nonwork_weekend
+Congo (DRC),Latin America,weekend,11,0.0722002268,profound_figure2_nonwork_weekend
+Congo (DRC),Latin America,weekend,12,0.0720908024,profound_figure2_nonwork_weekend
+Congo (DRC),Latin America,weekend,13,0.0661818833,profound_figure2_nonwork_weekend
+Congo (DRC),Latin America,weekend,14,0.06273004,profound_figure2_nonwork_weekend
+Congo (DRC),Latin America,weekend,15,0.0549012196,profound_figure2_nonwork_weekend
+Congo (DRC),Latin America,weekend,16,0.045669777,profound_figure2_nonwork_weekend
+Congo (DRC),Latin America,weekend,17,0.0338519388,profound_figure2_nonwork_weekend
+Congo (DRC),Latin America,weekend,18,0.0250382985,profound_figure2_nonwork_weekend
+Congo (DRC),Latin America,weekend,19,0.0187712632,profound_figure2_nonwork_weekend
+Congo (DRC),Latin America,weekend,20,0.0167717804,profound_figure2_nonwork_weekend
+Congo (DRC),Latin America,weekend,21,0.0381592822,profound_figure2_nonwork_weekend
+Congo (DRC),Latin America,weekend,22,0.0321508863,profound_figure2_nonwork_weekend
+Congo (DRC),Latin America,weekend,23,0.023217874,profound_figure2_nonwork_weekend
+Netherlands,Europe,weekend,0,0.0400111836,profound_figure2_nonwork_weekend
+Netherlands,Europe,weekend,1,0.0309644822,profound_figure2_nonwork_weekend
+Netherlands,Europe,weekend,2,0.0223072084,profound_figure2_nonwork_weekend
+Netherlands,Europe,weekend,3,0.0162161622,profound_figure2_nonwork_weekend
+Netherlands,Europe,weekend,4,0.009595894,profound_figure2_nonwork_weekend
+Netherlands,Europe,weekend,5,0.0062607966,profound_figure2_nonwork_weekend
+Netherlands,Europe,weekend,6,0.0062907526,profound_figure2_nonwork_weekend
+Netherlands,Europe,weekend,7,0.0075289325,profound_figure2_nonwork_weekend
+Netherlands,Europe,weekend,8,0.0114431785,profound_figure2_nonwork_weekend
+Netherlands,Europe,weekend,9,0.0207594836,profound_figure2_nonwork_weekend
+Netherlands,Europe,weekend,10,0.0320428969,profound_figure2_nonwork_weekend
+Netherlands,Europe,weekend,11,0.0428570002,profound_figure2_nonwork_weekend
+Netherlands,Europe,weekend,12,0.052662586,profound_figure2_nonwork_weekend
+Netherlands,Europe,weekend,13,0.057475511,profound_figure2_nonwork_weekend
+Netherlands,Europe,weekend,14,0.0594126634,profound_figure2_nonwork_weekend
+Netherlands,Europe,weekend,15,0.0654837389,profound_figure2_nonwork_weekend
+Netherlands,Europe,weekend,16,0.065643504,profound_figure2_nonwork_weekend
+Netherlands,Europe,weekend,17,0.0672511408,profound_figure2_nonwork_weekend
+Netherlands,Europe,weekend,18,0.0683595115,profound_figure2_nonwork_weekend
+Netherlands,Europe,weekend,19,0.0661128142,profound_figure2_nonwork_weekend
+Netherlands,Europe,weekend,20,0.0682696436,profound_figure2_nonwork_weekend
+Netherlands,Europe,weekend,21,0.0646349866,profound_figure2_nonwork_weekend
+Netherlands,Europe,weekend,22,0.0633668507,profound_figure2_nonwork_weekend
+Netherlands,Europe,weekend,23,0.0550490779,profound_figure2_nonwork_weekend
+Algeria,Asia,weekend,0,0.0445646651,profound_figure2_nonwork_weekend
+Algeria,Asia,weekend,1,0.0409181935,profound_figure2_nonwork_weekend
+Algeria,Asia,weekend,2,0.0278566518,profound_figure2_nonwork_weekend
+Algeria,Asia,weekend,3,0.0229349115,profound_figure2_nonwork_weekend
+Algeria,Asia,weekend,4,0.0155821901,profound_figure2_nonwork_weekend
+Algeria,Asia,weekend,5,0.0167179763,profound_figure2_nonwork_weekend
+Algeria,Asia,weekend,6,0.0156021161,profound_figure2_nonwork_weekend
+Algeria,Asia,weekend,7,0.0136095087,profound_figure2_nonwork_weekend
+Algeria,Asia,weekend,8,0.0211415648,profound_figure2_nonwork_weekend
+Algeria,Asia,weekend,9,0.0286038796,profound_figure2_nonwork_weekend
+Algeria,Asia,weekend,10,0.0342329956,profound_figure2_nonwork_weekend
+Algeria,Asia,weekend,11,0.0415060127,profound_figure2_nonwork_weekend
+Algeria,Asia,weekend,12,0.0435285092,profound_figure2_nonwork_weekend
+Algeria,Asia,weekend,13,0.0468163115,profound_figure2_nonwork_weekend
+Algeria,Asia,weekend,14,0.0529136902,profound_figure2_nonwork_weekend
+Algeria,Asia,weekend,15,0.0596885555,profound_figure2_nonwork_weekend
+Algeria,Asia,weekend,16,0.0542288111,profound_figure2_nonwork_weekend
+Algeria,Asia,weekend,17,0.0544081458,profound_figure2_nonwork_weekend
+Algeria,Asia,weekend,18,0.0538004005,profound_figure2_nonwork_weekend
+Algeria,Asia,weekend,19,0.0559623796,profound_figure2_nonwork_weekend
+Algeria,Asia,weekend,20,0.0639726614,profound_figure2_nonwork_weekend
+Algeria,Asia,weekend,21,0.0668519792,profound_figure2_nonwork_weekend
+Algeria,Asia,weekend,22,0.0648494087,profound_figure2_nonwork_weekend
+Algeria,Asia,weekend,23,0.0597084815,profound_figure2_nonwork_weekend
+Peru,Latin America,weekend,0,0.0169209956,profound_figure2_nonwork_weekend
+Peru,Latin America,weekend,1,0.0118775242,profound_figure2_nonwork_weekend
+Peru,Latin America,weekend,2,0.0142450709,profound_figure2_nonwork_weekend
+Peru,Latin America,weekend,3,0.0195372341,profound_figure2_nonwork_weekend
+Peru,Latin America,weekend,4,0.0274655313,profound_figure2_nonwork_weekend
+Peru,Latin America,weekend,5,0.0372341484,profound_figure2_nonwork_weekend
+Peru,Latin America,weekend,6,0.04343155,profound_figure2_nonwork_weekend
+Peru,Latin America,weekend,7,0.0558661441,profound_figure2_nonwork_weekend
+Peru,Latin America,weekend,8,0.068519587,profound_figure2_nonwork_weekend
+Peru,Latin America,weekend,9,0.0715237849,profound_figure2_nonwork_weekend
+Peru,Latin America,weekend,10,0.071643157,profound_figure2_nonwork_weekend
+Peru,Latin America,weekend,11,0.0722002268,profound_figure2_nonwork_weekend
+Peru,Latin America,weekend,12,0.0720908024,profound_figure2_nonwork_weekend
+Peru,Latin America,weekend,13,0.0661818833,profound_figure2_nonwork_weekend
+Peru,Latin America,weekend,14,0.06273004,profound_figure2_nonwork_weekend
+Peru,Latin America,weekend,15,0.0549012196,profound_figure2_nonwork_weekend
+Peru,Latin America,weekend,16,0.045669777,profound_figure2_nonwork_weekend
+Peru,Latin America,weekend,17,0.0338519388,profound_figure2_nonwork_weekend
+Peru,Latin America,weekend,18,0.0250382985,profound_figure2_nonwork_weekend
+Peru,Latin America,weekend,19,0.0187712632,profound_figure2_nonwork_weekend
+Peru,Latin America,weekend,20,0.0167717804,profound_figure2_nonwork_weekend
+Peru,Latin America,weekend,21,0.0381592822,profound_figure2_nonwork_weekend
+Peru,Latin America,weekend,22,0.0321508863,profound_figure2_nonwork_weekend
+Peru,Latin America,weekend,23,0.023217874,profound_figure2_nonwork_weekend
+Myanmar,Asia,weekend,0,0.0445646651,profound_figure2_nonwork_weekend
+Myanmar,Asia,weekend,1,0.0409181935,profound_figure2_nonwork_weekend
+Myanmar,Asia,weekend,2,0.0278566518,profound_figure2_nonwork_weekend
+Myanmar,Asia,weekend,3,0.0229349115,profound_figure2_nonwork_weekend
+Myanmar,Asia,weekend,4,0.0155821901,profound_figure2_nonwork_weekend
+Myanmar,Asia,weekend,5,0.0167179763,profound_figure2_nonwork_weekend
+Myanmar,Asia,weekend,6,0.0156021161,profound_figure2_nonwork_weekend
+Myanmar,Asia,weekend,7,0.0136095087,profound_figure2_nonwork_weekend
+Myanmar,Asia,weekend,8,0.0211415648,profound_figure2_nonwork_weekend
+Myanmar,Asia,weekend,9,0.0286038796,profound_figure2_nonwork_weekend
+Myanmar,Asia,weekend,10,0.0342329956,profound_figure2_nonwork_weekend
+Myanmar,Asia,weekend,11,0.0415060127,profound_figure2_nonwork_weekend
+Myanmar,Asia,weekend,12,0.0435285092,profound_figure2_nonwork_weekend
+Myanmar,Asia,weekend,13,0.0468163115,profound_figure2_nonwork_weekend
+Myanmar,Asia,weekend,14,0.0529136902,profound_figure2_nonwork_weekend
+Myanmar,Asia,weekend,15,0.0596885555,profound_figure2_nonwork_weekend
+Myanmar,Asia,weekend,16,0.0542288111,profound_figure2_nonwork_weekend
+Myanmar,Asia,weekend,17,0.0544081458,profound_figure2_nonwork_weekend
+Myanmar,Asia,weekend,18,0.0538004005,profound_figure2_nonwork_weekend
+Myanmar,Asia,weekend,19,0.0559623796,profound_figure2_nonwork_weekend
+Myanmar,Asia,weekend,20,0.0639726614,profound_figure2_nonwork_weekend
+Myanmar,Asia,weekend,21,0.0668519792,profound_figure2_nonwork_weekend
+Myanmar,Asia,weekend,22,0.0648494087,profound_figure2_nonwork_weekend
+Myanmar,Asia,weekend,23,0.0597084815,profound_figure2_nonwork_weekend
+Iraq,Asia,weekend,0,0.0445646651,profound_figure2_nonwork_weekend
+Iraq,Asia,weekend,1,0.0409181935,profound_figure2_nonwork_weekend
+Iraq,Asia,weekend,2,0.0278566518,profound_figure2_nonwork_weekend
+Iraq,Asia,weekend,3,0.0229349115,profound_figure2_nonwork_weekend
+Iraq,Asia,weekend,4,0.0155821901,profound_figure2_nonwork_weekend
+Iraq,Asia,weekend,5,0.0167179763,profound_figure2_nonwork_weekend
+Iraq,Asia,weekend,6,0.0156021161,profound_figure2_nonwork_weekend
+Iraq,Asia,weekend,7,0.0136095087,profound_figure2_nonwork_weekend
+Iraq,Asia,weekend,8,0.0211415648,profound_figure2_nonwork_weekend
+Iraq,Asia,weekend,9,0.0286038796,profound_figure2_nonwork_weekend
+Iraq,Asia,weekend,10,0.0342329956,profound_figure2_nonwork_weekend
+Iraq,Asia,weekend,11,0.0415060127,profound_figure2_nonwork_weekend
+Iraq,Asia,weekend,12,0.0435285092,profound_figure2_nonwork_weekend
+Iraq,Asia,weekend,13,0.0468163115,profound_figure2_nonwork_weekend
+Iraq,Asia,weekend,14,0.0529136902,profound_figure2_nonwork_weekend
+Iraq,Asia,weekend,15,0.0596885555,profound_figure2_nonwork_weekend
+Iraq,Asia,weekend,16,0.0542288111,profound_figure2_nonwork_weekend
+Iraq,Asia,weekend,17,0.0544081458,profound_figure2_nonwork_weekend
+Iraq,Asia,weekend,18,0.0538004005,profound_figure2_nonwork_weekend
+Iraq,Asia,weekend,19,0.0559623796,profound_figure2_nonwork_weekend
+Iraq,Asia,weekend,20,0.0639726614,profound_figure2_nonwork_weekend
+Iraq,Asia,weekend,21,0.0668519792,profound_figure2_nonwork_weekend
+Iraq,Asia,weekend,22,0.0648494087,profound_figure2_nonwork_weekend
+Iraq,Asia,weekend,23,0.0597084815,profound_figure2_nonwork_weekend
