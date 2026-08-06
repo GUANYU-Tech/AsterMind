@@ -1,17 +1,16 @@
-"""Assemble the immutable input consumed by Runtime."""
+"""Assemble the immutable input consumed by Runtime for one experiment."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from typing import Any
 
-from ...common import to_jsonable
-from ...orbit import OrbitTraceBundle, OrbitTraceManifest
-from ..contracts import RuntimeStrategySpec, ServingCapacityProfile
-from .simulation_spec import CommunicationIngressProfile, RuntimeSimulationSpec
+from orbitserve.common import to_jsonable
+from orbitserve.orbit import OrbitTraceBundle, OrbitTraceManifest
+from orbitserve.runtime import RuntimeSimulationSpec, RuntimeStrategySpec
 
 
-def build_runtime_simulation_spec(
+def build_simulation_spec(
     *,
     scenario_id: str | None = None,
     design_id: str | None = None,
@@ -48,17 +47,17 @@ def build_runtime_simulation_spec(
         simulation_config_payload,
         constellation_payload,
     )
-    communication_ingress = CommunicationIngressProfile(
-        altitude_km=_positive_optional(
+    communication_ingress = {
+        "altitude_km": _positive_optional(
             _first(communication_payload.get("altitude_km"), communication_payload.get("orbit_altitude_km"))
         ),
-        uplink_bandwidth_bps=_positive_optional(
+        "uplink_bandwidth_bps": _positive_optional(
             _first(communication_payload.get("uplink_bandwidth_bps"), communication_payload.get("bandwidth_bps"))
         ),
-        downlink_bandwidth_bps=_positive_optional(
+        "downlink_bandwidth_bps": _positive_optional(
             _first(communication_payload.get("downlink_bandwidth_bps"), communication_payload.get("bandwidth_bps"))
         ),
-    )
+    }
     if time_horizon_s is None:
         time_horizon_s = _positive_optional(
             _first(
@@ -107,11 +106,16 @@ def build_runtime_simulation_spec(
             "architecture": architecture_payload,
             "satellite_count": len(trace_bundle.satellite_catalog) if trace_bundle else constellation_payload.get("satellite_count"),
         },
-        serving_profile=ServingCapacityProfile.from_value(serving_profile),
+        serving_profile=serving_profile,
         energy_profile=energy_payload,
         communication_ingress=communication_ingress,
         provenance={
             "orbit_trace_id": trace_payload.get("trace_id"),
+            "trace_model": trace_payload.get("trace_model"),
+            "trace_scope": trace_payload.get("scope"),
+            "valid_for_paper_main_results": bool(
+                trace_payload.get("valid_for_paper_main_results", False)
+            ),
             "workload_request_count": len(requests),
             "energy_profile": _mapping(energy_payload.get("provenance")),
         },
@@ -134,7 +138,12 @@ def _trace_manifest(value: Any, bundle: OrbitTraceBundle | None) -> OrbitTraceMa
 
 def _communication_ingress_payload(*payloads: dict[str, Any]) -> dict[str, Any]:
     for payload in payloads:
-        for container in (payload, _mapping(payload.get("orbit")), _mapping(payload.get("provenance"))):
+        for container in (
+            payload,
+            _mapping(payload.get("orbit")),
+            _mapping(payload.get("trace_options")),
+            _mapping(payload.get("provenance")),
+        ):
             for key in ("communication_ingress", "communication_satellite"):
                 candidate = _mapping(container.get(key))
                 if candidate:
@@ -177,4 +186,4 @@ def _first(*values: Any) -> Any:
     return next((value for value in values if value is not None), None)
 
 
-__all__ = ["build_runtime_simulation_spec"]
+__all__ = ["build_simulation_spec"]

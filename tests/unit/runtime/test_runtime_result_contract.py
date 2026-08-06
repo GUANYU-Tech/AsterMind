@@ -16,7 +16,6 @@ class RuntimeResultContractTests(unittest.TestCase):
                 "RuntimePerformanceResult",
                 "RuntimeSimulationSpec",
                 "RuntimeStrategySpec",
-                "build_runtime_simulation_spec",
                 "run_simulation",
             },
         )

@@ -31,6 +31,20 @@ class CommunicationIngressProfile:
     def to_dict(self) -> dict[str, Any]:
         return to_jsonable(self)
 
+    @classmethod
+    def from_value(cls, value: Any) -> "CommunicationIngressProfile":
+        if isinstance(value, cls):
+            return value
+        if value is None:
+            return cls()
+        if not isinstance(value, dict):
+            raise TypeError("communication_ingress must be a mapping")
+        return cls(
+            altitude_km=_optional_float(value.get("altitude_km")),
+            uplink_bandwidth_bps=_optional_float(value.get("uplink_bandwidth_bps")),
+            downlink_bandwidth_bps=_optional_float(value.get("downlink_bandwidth_bps")),
+        )
+
 
 @dataclass(frozen=True)
 class RuntimeSimulationSpec:
@@ -59,8 +73,25 @@ class RuntimeSimulationSpec:
     time_mode: str = "event_driven"
     time_step_s: float | None = None
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "strategy", RuntimeStrategySpec.from_value(self.strategy))
+        object.__setattr__(
+            self,
+            "serving_profile",
+            ServingCapacityProfile.from_value(self.serving_profile),
+        )
+        object.__setattr__(
+            self,
+            "communication_ingress",
+            CommunicationIngressProfile.from_value(self.communication_ingress),
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return to_jsonable(self)
 
 
 __all__ = ["CommunicationIngressProfile", "RuntimeSimulationSpec"]
+
+
+def _optional_float(value: Any) -> float | None:
+    return None if value is None else float(value)

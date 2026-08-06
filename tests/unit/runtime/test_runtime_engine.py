@@ -1,7 +1,8 @@
 import unittest
 
 from orbitserve.orbit import ORBIT_TRACE_SCHEMA, OrbitTraceBundle, OrbitTraceManifest
-from orbitserve.runtime import RuntimeStrategySpec, build_runtime_simulation_spec, run_simulation
+from orbitserve.experiments.simulation_builder import build_simulation_spec
+from orbitserve.runtime import RuntimeStrategySpec, run_simulation
 
 
 def _trace():
@@ -64,7 +65,7 @@ def _request(request_id="request-0", arrival_time_s=0.0, lon_deg=0.0):
 
 
 def _scenario(strategy, requests=None, trace=None):
-    return build_runtime_simulation_spec(
+    return build_simulation_spec(
         workload_generation={
             "requests": requests or [_request()]
         },

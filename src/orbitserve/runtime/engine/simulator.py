@@ -42,12 +42,22 @@ def run_runtime_engine(simulation_spec: Any) -> RuntimeEngineResult:
         energy_trace, initial_soc = _build_energy_trace(trace_bundle, simulation_spec.energy_profile)
         sgl_bandwidth_bps = _architecture_bandwidth(
             simulation_spec.constellation,
-            ("sgl_bandwidth_bps", "sgl_total_bandwidth_bps", "sgl_bandwidth_gbps"),
+            (
+                "sgl_bandwidth_bps",
+                "sgl_total_bandwidth_bps",
+                "sgl_bandwidth_gbps",
+                "ground_link_bandwidth_gbps",
+            ),
             required=simulation_spec.strategy.ingress_selection != "communication_satellite",
         )
         isl_bandwidth_bps = _architecture_bandwidth(
             simulation_spec.constellation,
-            ("isl_bandwidth_bps", "isl_total_bandwidth_bps", "isl_bandwidth_gbps"),
+            (
+                "isl_bandwidth_bps",
+                "isl_total_bandwidth_bps",
+                "isl_bandwidth_gbps",
+                "inter_satellite_bandwidth_gbps",
+            ),
             required=False,
         )
     except ValueError as exc:

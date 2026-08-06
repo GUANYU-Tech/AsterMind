@@ -5,12 +5,17 @@ from typing import Any
 __all__ = [
     "ExperimentResult",
     "ExperimentSpec",
+    "build_simulation_spec",
     "load_experiment_spec",
     "run_experiment",
 ]
 
 
 def __getattr__(name: str) -> Any:
+    if name == "build_simulation_spec":
+        from .simulation_builder import build_simulation_spec
+
+        return build_simulation_spec
     if name == "load_experiment_spec":
         from .loader import load_experiment_spec
 

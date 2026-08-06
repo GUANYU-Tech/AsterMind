@@ -1,9 +1,9 @@
 import unittest
 
-from orbitserve.runtime.setup.builder import build_runtime_simulation_spec
+from orbitserve.experiments.simulation_builder import build_simulation_spec
 
 
-class RuntimeEnergyInputTests(unittest.TestCase):
+class SimulationBuilderTests(unittest.TestCase):
     def test_builder_preserves_architecture_energy_profile(self):
         energy_profile = {
             "evaluated": True,
@@ -20,7 +20,7 @@ class RuntimeEnergyInputTests(unittest.TestCase):
             "warnings": [],
         }
 
-        scenario = build_runtime_simulation_spec(energy_profile=energy_profile)
+        scenario = build_simulation_spec(energy_profile=energy_profile)
 
         self.assertEqual(scenario.energy_profile, energy_profile)
         self.assertEqual(
@@ -29,12 +29,12 @@ class RuntimeEnergyInputTests(unittest.TestCase):
         )
 
     def test_builder_does_not_derive_energy_from_cost(self):
-        scenario = build_runtime_simulation_spec()
+        scenario = build_simulation_spec()
 
         self.assertEqual(scenario.energy_profile, {})
 
     def test_builder_extracts_communication_ingress_without_putting_it_in_strategy(self):
-        scenario = build_runtime_simulation_spec(
+        scenario = build_simulation_spec(
             simulation_config={
                 "communication_satellite": {
                     "altitude_km": 550.0,
