@@ -311,7 +311,7 @@ def build_isl_transfer_legs(
     return tuple(
         RouteLeg(
             link_id=str(window.get("link_id") or f"isl:{first}:{second}"),
-            kind="kv_migration",
+            kind="kv_copy",
             source_node_id=first,
             target_node_id=second,
             payload_bytes=payload_bytes,

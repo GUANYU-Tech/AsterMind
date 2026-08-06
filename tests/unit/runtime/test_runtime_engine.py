@@ -150,13 +150,13 @@ class RuntimeEngineTests(unittest.TestCase):
         self.assertEqual(record["decision"]["dvfs_scale"], 0.5)
         self.assertEqual(record["timing"]["prefill_service_s"], 2.0)
 
-    def test_enabled_kv_migration_moves_one_end_to_end_payload(self):
+    def test_full_kv_copy_reuses_context_and_retains_source(self):
         strategy = RuntimeStrategySpec(
             latency_weight=1.0,
             kv_reuse_weight=0.0,
             energy_weight=0.0,
             compute_load_weight=0.0,
-            kv_migration_enabled=True,
+            kv_copy_ratio=1.0,
         )
         result = run_simulation(
             _scenario(
@@ -170,7 +170,36 @@ class RuntimeEngineTests(unittest.TestCase):
         first, second = result.request_records
         self.assertEqual(first["decision"]["serving_satellite_id"], "sat-a")
         self.assertEqual(second["decision"]["serving_satellite_id"], "sat-b")
-        self.assertEqual(second["kv"]["kv_migrated_bytes"], 24.0)
+        self.assertEqual(second["timing"]["prefill_service_s"], 0.0)
+        self.assertNotIn("kv_migrated_bytes", second["kv"])
+        self.assertIn("kv_copy", {leg["kind"] for leg in second["routing"]["selected_path"]})
+        self.assertEqual(
+            result.state_summary["sessions"]["session-0"]["satellite_ids"],
+            ["sat-a", "sat-b"],
+        )
+        self.assertIn("session-0", result.state_summary["kv_caches"]["sat-a"]["entries"])
+        self.assertIn("session-0", result.state_summary["kv_caches"]["sat-b"]["entries"])
+
+    def test_partial_kv_copy_recomputes_the_remaining_context(self):
+        strategy = RuntimeStrategySpec(
+            latency_weight=1.0,
+            kv_reuse_weight=0.0,
+            energy_weight=0.0,
+            compute_load_weight=0.0,
+            kv_copy_ratio=0.5,
+        )
+        result = run_simulation(
+            _scenario(
+                strategy,
+                requests=(
+                    _request("request-a", 0.0, 0.0),
+                    _request("request-b", 10.0, 90.0),
+                ),
+            )
+        )
+        second = result.request_records[1]
+        self.assertEqual(second["timing"]["prefill_service_s"], 0.5)
+        self.assertEqual(second["kv"]["context_recompute_tokens"], 5)
 
 
 if __name__ == "__main__":

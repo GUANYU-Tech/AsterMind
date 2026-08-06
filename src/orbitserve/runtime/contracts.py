@@ -48,7 +48,7 @@ class RuntimeStrategySpec:
     compute_load_weight: float = 0.25
     shadow_dvfs_enabled: bool = False
     shadow_dvfs_scale: float = 0.5
-    kv_migration_enabled: bool = False
+    kv_copy_ratio: float = 0.0
 
     def __post_init__(self) -> None:
         if self.ingress_selection not in INGRESS_SELECTIONS:
@@ -61,6 +61,8 @@ class RuntimeStrategySpec:
             raise ValueError("Runtime strategy weights must sum to 1")
         if not math.isfinite(self.shadow_dvfs_scale) or not 0.0 < self.shadow_dvfs_scale <= 1.0:
             raise ValueError("shadow_dvfs_scale must be in (0, 1]")
+        if not math.isfinite(self.kv_copy_ratio) or not 0.0 <= self.kv_copy_ratio <= 1.0:
+            raise ValueError("kv_copy_ratio must be in [0, 1]")
 
     @property
     def weights(self) -> dict[str, float]:

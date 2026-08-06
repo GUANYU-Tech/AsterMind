@@ -92,8 +92,6 @@ class CandidateSelector:
             scored,
             key=lambda item: (
                 -item[0],
-                item[1].arc_distance_rad,
-                item[1].compute_queue_wait_s,
                 item[1].compute_satellite_id,
                 item[1].candidate_id,
             ),

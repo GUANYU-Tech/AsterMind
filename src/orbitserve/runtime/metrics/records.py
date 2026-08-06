@@ -50,7 +50,6 @@ _SECTION_DEFAULTS: dict[str, dict[str, Any]] = {
         "kv_capacity_admission": None, "kv_serve_action": None,
         "kv_hit_tokens": None, "kv_miss_tokens": None,
         "context_recompute_tokens": None, "kv_reused_bytes": None,
-        "kv_migrated_bytes": None,
         "kv_generated_bytes": None, "kv_evicted_bytes": None,
         "kv_evicted_entry_count": None,
         "kv_pages_required": None, "kv_pages_hit": None,

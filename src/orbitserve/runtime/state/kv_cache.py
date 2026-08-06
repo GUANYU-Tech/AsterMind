@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 @dataclass
 class SessionState:
     session_id: str
-    owner_satellite_id: str | None = None
+    satellite_ids: list[str] = field(default_factory=list)
     context_tokens: int = 0
     context_version: int = 0
     last_seen_s: float = 0.0
@@ -191,8 +191,10 @@ def _admit_session_kv(
     for victim in evicted:
         cache.entries.pop(victim.session_id, None)
         victim_session = state.sessions.get(victim.session_id)
-        if victim_session is not None and victim_session.owner_satellite_id == satellite_id:
-            victim_session.owner_satellite_id = None
+        if victim_session is not None and satellite_id in victim_session.satellite_ids:
+            victim_session.satellite_ids = sorted(
+                item for item in victim_session.satellite_ids if item != satellite_id
+            )
             victim_session.last_session_action = "evicted"
 
     entry = KVCacheEntryState(
@@ -225,17 +227,6 @@ def _admit_session_kv(
     }
 
 
-def _remove_session_kv(state: RuntimeState, satellite_id: str, session_id: str) -> bool:
-    """Remove a stale session entry when execution moves to another satellite."""
-
-    cache = state.kv_caches.get(satellite_id)
-    if cache is None or cache.entries.pop(session_id, None) is None:
-        return False
-    cache.used_tokens = sum(max(0, int(entry.tokens)) for entry in cache.entries.values())
-    cache.used_bytes = sum(max(0.0, float(entry.bytes)) for entry in cache.entries.values())
-    return True
-
-
 def local_kv_reuse_tokens(
     state: RuntimeState,
     *,
@@ -259,10 +250,10 @@ def commit_session_kv(
     capacity_tokens: int | None,
     kv_bytes_per_token: float,
     now_s: float,
-    migrated_from: str | None = None,
+    copied_from: str | None = None,
 ) -> dict[str, Any]:
     if not session_id:
-        return {"action": "none", "hit_tokens": 0, "miss_tokens": 0, "migrated_bytes": 0.0}
+        return {"action": "none", "hit_tokens": 0, "miss_tokens": 0}
     session = state.session_for(str(session_id))
     local_hit = local_kv_reuse_tokens(
         state,
@@ -289,17 +280,15 @@ def commit_session_kv(
             "action": "capacity_unavailable",
             "hit_tokens": local_hit,
             "miss_tokens": max(0, context_tokens - local_hit),
-            "migrated_bytes": 0.0,
             **admission,
         }
-    if migrated_from and migrated_from != satellite_id:
-        _remove_session_kv(state, str(migrated_from), str(session_id))
-        action = "migrated"
+    if copied_from and copied_from != satellite_id:
+        action = "copied"
     elif local_hit > 0:
         action = "local_hit"
     else:
         action = "recompute_context"
-    session.owner_satellite_id = str(satellite_id)
+    session.satellite_ids = sorted({*session.satellite_ids, str(satellite_id)})
     session.context_tokens = context_tokens
     session.context_version += 1
     session.last_seen_s = now_s
@@ -309,7 +298,7 @@ def commit_session_kv(
         "action": action,
         "hit_tokens": local_hit,
         "miss_tokens": max(0, context_tokens - local_hit),
-        "migrated_from": migrated_from,
+        "copied_from": copied_from,
     }
     return dict(session.last_kv_event)
 

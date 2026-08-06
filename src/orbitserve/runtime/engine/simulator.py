@@ -265,36 +265,36 @@ def _preview_candidate(
         session_id=str(session_id) if session_id else None,
         required_context_tokens=required_context,
     )
-    migration_legs: tuple[Any, ...] = ()
-    migration_path: tuple[dict[str, Any], ...] = ()
-    migrated_from = None
-    migration_done_s = inbound_done_s
-    if strategy.kv_migration_enabled and session_id:
-        session = state.sessions.get(str(session_id))
-        owner = session.owner_satellite_id if session is not None else None
-        if owner and owner != compute_satellite_id and local_hit_tokens == 0:
-            bytes_to_move = float(session.context_tokens) * float(serving.kv_cache_bytes_per_token or 0.0)
-            migration_legs = build_isl_transfer_legs(
-                trace_bundle,
-                source_satellite_id=str(owner),
-                target_satellite_id=compute_satellite_id,
-                time_s=inbound_done_s,
-                payload_bytes=bytes_to_move,
-                bandwidth_bps=isl_bandwidth_bps,
-            )
-            if migration_legs is None:
-                raise RouteUnavailable("kv_migration_route_unavailable")
-            migration_done_s, migration_path = execute_route(migration_legs, inbound_done_s)
-            migrated_from = str(owner)
+    copy_plan = _preview_kv_copy(
+        state=state,
+        session_id=str(session_id) if session_id else None,
+        target_satellite_id=compute_satellite_id,
+        required_context_tokens=required_context,
+        local_hit_tokens=local_hit_tokens,
+        copy_ratio=float(strategy.kv_copy_ratio),
+        kv_bytes_per_token=float(serving.kv_cache_bytes_per_token or 0.0),
+        trace_bundle=trace_bundle,
+        start_s=inbound_done_s,
+        isl_bandwidth_bps=isl_bandwidth_bps,
+    )
+    copy_path = copy_plan["path"]
+    copied_from = copy_plan["source_satellite_id"]
+    copied_tokens = copy_plan["copied_tokens"]
+    copy_done_s = copy_plan["done_s"]
+    effective_reuse_tokens = min(
+        required_context,
+        local_hit_tokens + copied_tokens,
+    )
+    recompute_tokens = max(0, required_context - effective_reuse_tokens)
     satellite = state.satellite_for(compute_satellite_id)
-    compute_ready_s = migration_done_s
+    compute_ready_s = copy_done_s
     raw_window = energy_window_at(energy_trace, compute_satellite_id, max(compute_ready_s, satellite.compute_queue.prefill_available_s))
     dvfs_scale = (
         float(strategy.shadow_dvfs_scale)
         if strategy.shadow_dvfs_enabled and not bool(raw_window.get("sunlit", True))
         else 1.0
     )
-    prefill_service_s = _service_time(request["prompt_tokens"], serving.prefill_tokens_per_s) / dvfs_scale
+    prefill_service_s = _service_time(recompute_tokens, serving.prefill_tokens_per_s) / dvfs_scale
     decode_service_s = _service_time(request["output_tokens"], serving.decode_tokens_per_s) / dvfs_scale
     prefill_start_s, prefill_done_s, prefill_wait_s = satellite.compute_queue.preview_prefill(compute_ready_s, prefill_service_s)
     decode_start_s, decode_done_s, decode_wait_s = satellite.compute_queue.preview_decode(prefill_done_s, decode_service_s)
@@ -309,8 +309,11 @@ def _preview_candidate(
 
     preview = replace(satellite, compute_queue=replace(satellite.compute_queue))
     advance_satellite_energy(preview, energy_trace, prefill_start_s)
-    energy_window = energy_window_at(energy_trace, compute_satellite_id, prefill_start_s)
-    physical_paths = (inbound_path, first_path, output_path, migration_path)
+    energy_window = _energy_window_with_dvfs(
+        energy_window_at(energy_trace, compute_satellite_id, prefill_start_s),
+        dvfs_scale,
+    )
+    physical_paths = (inbound_path, first_path, output_path, copy_path)
     link_bytes_by_satellite = _link_bytes_by_satellite(
         physical_paths,
         {
@@ -330,7 +333,7 @@ def _preview_candidate(
     )
     compute_update = apply_request_energy(
         preview,
-        prompt_tokens=request["prompt_tokens"],
+        prompt_tokens=recompute_tokens,
         output_tokens=request["output_tokens"],
         link_bytes=0.0,
         energy_window=energy_window,
@@ -342,7 +345,7 @@ def _preview_candidate(
     service_time_s = prefill_service_s + decode_service_s
     queue_wait_s = prefill_wait_s + decode_wait_s
     compute_load_score = 1.0 / (1.0 + queue_wait_s / max(service_time_s, 1e-12))
-    kv_score = local_hit_tokens / required_context if required_context > 0 else 0.0
+    kv_score = effective_reuse_tokens / required_context if required_context > 0 else 0.0
     latency_score = 1.0 - max(0.0, min(math.pi, route.arc_distance_rad)) / math.pi
     candidate_id = f"{access.access_type}:{compute_satellite_id}:{route.path_id}"
     violations = (
@@ -369,9 +372,9 @@ def _preview_candidate(
         "inbound_path": inbound_path,
         "first_path": first_path,
         "output_path": output_path,
-        "migration_path": migration_path,
-        "migrated_from": migrated_from,
-        "migration_done_s": migration_done_s,
+        "copy_path": copy_path,
+        "copied_from": copied_from,
+        "copy_done_s": copy_done_s,
         "prefill_start_s": prefill_start_s,
         "prefill_done_s": prefill_done_s,
         "decode_start_s": decode_start_s,
@@ -385,9 +388,10 @@ def _preview_candidate(
         "dvfs_scale": dvfs_scale,
         "projected_soc_after": preview.soc,
         "local_hit_tokens": local_hit_tokens,
+        "effective_reuse_tokens": effective_reuse_tokens,
+        "recompute_tokens": recompute_tokens,
         "energy_window": energy_window,
         "link_bytes_by_satellite": link_bytes_by_satellite,
-        "kv_migrated_bytes": float(migration_legs[0].payload_bytes) if migration_legs else 0.0,
     }
 
 
@@ -411,7 +415,7 @@ def _commit_candidate(
         for satellite_id in affected_ids
     }
     prefill_start_s, prefill_done_s, prefill_wait_s = satellite.compute_queue.reserve_prefill(
-        payload["migration_done_s"], payload["prefill_service_s"]
+        payload["copy_done_s"], payload["prefill_service_s"]
     )
     decode_start_s, decode_done_s, decode_wait_s = satellite.compute_queue.reserve_decode(
         prefill_done_s, payload["decode_service_s"]
@@ -436,7 +440,7 @@ def _commit_candidate(
     advance_satellite_energy(satellite, energy_trace, prefill_start_s)
     compute_update = apply_request_energy(
         satellite,
-        prompt_tokens=request["prompt_tokens"],
+        prompt_tokens=payload["recompute_tokens"],
         output_tokens=request["output_tokens"],
         link_bytes=0.0,
         energy_window=payload["energy_window"],
@@ -453,10 +457,10 @@ def _commit_candidate(
         capacity_tokens=serving.kv_cache_capacity_tokens,
         kv_bytes_per_token=float(serving.kv_cache_bytes_per_token or 0.0),
         now_s=decode_done_s,
-        migrated_from=payload["migrated_from"],
+        copied_from=payload["copied_from"],
     )
     selected_path = tuple(
-        (*payload["inbound_path"], *payload["migration_path"], *payload["output_path"])
+        (*payload["inbound_path"], *payload["copy_path"], *payload["output_path"])
     )
     ttft_s = payload["first_done_s"] - float(request["arrival_time_s"])
     e2e_s = payload["output_done_s"] - float(request["arrival_time_s"])
@@ -495,12 +499,9 @@ def _commit_candidate(
         energy_ledger=energy_ledger,
         compute_sunlit=bool(payload["energy_window"].get("sunlit", True)),
         kv_serve_action=kv_event.get("action"),
-        kv_hit_tokens=payload["local_hit_tokens"],
-        kv_miss_tokens=max(0, int(request["prompt_tokens"]) - payload["local_hit_tokens"]),
-        context_recompute_tokens=(
-            0 if payload["migrated_from"] or payload["local_hit_tokens"] else int(request["prompt_tokens"])
-        ),
-        kv_migrated_bytes=payload["kv_migrated_bytes"],
+        kv_hit_tokens=payload["effective_reuse_tokens"],
+        kv_miss_tokens=payload["recompute_tokens"],
+        context_recompute_tokens=payload["recompute_tokens"],
         kv_evicted_bytes=float(kv_event.get("evicted_bytes", 0.0) or 0.0),
         kv_evicted_entry_count=len(tuple(kv_event.get("evicted_session_ids", ()) or ())),
         hbm_occupancy_after=kv_event.get("occupancy_bytes_after"),
@@ -512,6 +513,86 @@ def _commit_candidate(
             "trace_id": trace_bundle.trace_id,
         },
     )
+
+
+def _preview_kv_copy(
+    *,
+    state: RuntimeState,
+    session_id: str | None,
+    target_satellite_id: str,
+    required_context_tokens: int,
+    local_hit_tokens: int,
+    copy_ratio: float,
+    kv_bytes_per_token: float,
+    trace_bundle: Any,
+    start_s: float,
+    isl_bandwidth_bps: float,
+) -> dict[str, Any]:
+    """Choose one deterministic, routable KV source without mutating state."""
+
+    empty = {
+        "source_satellite_id": None,
+        "copied_tokens": 0,
+        "done_s": float(start_s),
+        "path": (),
+    }
+    if not session_id or copy_ratio <= 0.0 or required_context_tokens <= local_hit_tokens:
+        return empty
+    session = state.sessions.get(session_id)
+    if session is None:
+        return empty
+    options: list[tuple[int, float, str, int, tuple[dict[str, Any], ...]]] = []
+    for source_satellite_id in sorted(set(session.satellite_ids)):
+        if source_satellite_id == target_satellite_id:
+            continue
+        source_reusable_tokens = local_kv_reuse_tokens(
+            state,
+            satellite_id=source_satellite_id,
+            session_id=session_id,
+            required_context_tokens=required_context_tokens,
+        )
+        remote_missing_tokens = max(0, source_reusable_tokens - local_hit_tokens)
+        copied_tokens = int(math.floor(copy_ratio * remote_missing_tokens))
+        if copied_tokens <= 0:
+            continue
+        legs = build_isl_transfer_legs(
+            trace_bundle,
+            source_satellite_id=source_satellite_id,
+            target_satellite_id=target_satellite_id,
+            time_s=start_s,
+            payload_bytes=copied_tokens * kv_bytes_per_token,
+            bandwidth_bps=isl_bandwidth_bps,
+        )
+        if legs is None:
+            continue
+        try:
+            done_s, path = execute_route(legs, start_s)
+        except RouteUnavailable:
+            continue
+        options.append(
+            (-source_reusable_tokens, done_s, source_satellite_id, copied_tokens, path)
+        )
+    if not options:
+        return empty
+    _negative_reusable, done_s, source_satellite_id, copied_tokens, path = min(options)
+    return {
+        "source_satellite_id": source_satellite_id,
+        "copied_tokens": copied_tokens,
+        "done_s": done_s,
+        "path": path,
+    }
+
+
+def _energy_window_with_dvfs(window: dict[str, Any], dvfs_scale: float) -> dict[str, Any]:
+    """Apply Runtime's equal compute-capacity/power DVFS assumption."""
+
+    base = float(window["compute_energy_j_per_token"])
+    return {
+        **dict(window),
+        "compute_energy_j_per_token": base * dvfs_scale,
+        "base_compute_energy_j_per_token": base,
+        "runtime_compute_energy_scale": dvfs_scale,
+    }
 
 
 def _build_energy_trace(trace_bundle: Any, profile: dict[str, Any]) -> tuple[Any, float]:
@@ -593,7 +674,7 @@ def _link_bytes_by_satellite(
             for endpoint in endpoints:
                 if endpoint not in satellite_ids:
                     continue
-                share = payload_bytes / 2.0 if kind in {"isl", "kv_migration"} else payload_bytes
+                share = payload_bytes / 2.0 if kind in {"isl", "kv_copy"} else payload_bytes
                 result[endpoint] = result.get(endpoint, 0.0) + share
     return result
 

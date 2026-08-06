@@ -14,7 +14,7 @@ class RuntimeStrategyTests(unittest.TestCase):
             compute_load_weight=0.1,
             shadow_dvfs_enabled=True,
             shadow_dvfs_scale=0.5,
-            kv_migration_enabled=True,
+            kv_copy_ratio=0.5,
         )
         self.assertAlmostEqual(sum(strategy.weights.values()), 1.0)
         self.assertNotIn("policy", strategy.to_dict())
@@ -22,6 +22,10 @@ class RuntimeStrategyTests(unittest.TestCase):
     def test_weights_must_sum_to_one(self):
         with self.assertRaisesRegex(ValueError, "sum to 1"):
             RuntimeStrategySpec(latency_weight=1.0)
+
+    def test_kv_copy_ratio_must_be_a_fraction(self):
+        with self.assertRaisesRegex(ValueError, "kv_copy_ratio"):
+            RuntimeStrategySpec(kv_copy_ratio=1.1)
 
     def test_unknown_legacy_fields_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "Unsupported"):

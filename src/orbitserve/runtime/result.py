@@ -66,7 +66,6 @@ def build_runtime_performance_result(*, simulation_spec: Any, engine_result: Any
         "kv_hit_tokens": hit_tokens,
         "kv_miss_tokens": miss_tokens,
         "kv_hit_ratio": hit_tokens / (hit_tokens + miss_tokens) if hit_tokens + miss_tokens > 0.0 else None,
-        "kv_migrated_bytes": sum(float(record.kv_migrated_bytes or 0.0) for record in records),
         "kv_evicted_bytes": sum(float(record.kv_evicted_bytes or 0.0) for record in records),
     }
     return RuntimePerformanceResult(

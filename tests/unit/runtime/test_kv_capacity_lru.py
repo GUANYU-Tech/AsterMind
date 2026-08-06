@@ -45,7 +45,7 @@ class KVCapacityLRUTests(unittest.TestCase):
             3,
         )
 
-    def test_migration_removes_source_only_after_target_admission(self):
+    def test_copy_retains_source_after_target_admission(self):
         commit_session_kv(
             self.state,
             session_id="a",
@@ -63,11 +63,12 @@ class KVCapacityLRUTests(unittest.TestCase):
             capacity_tokens=10,
             kv_bytes_per_token=1.0,
             now_s=2.0,
-            migrated_from="sat-a",
+            copied_from="sat-a",
         )
-        self.assertEqual(result["action"], "migrated")
-        self.assertNotIn("a", self.state.kv_cache_for("sat-a").entries)
+        self.assertEqual(result["action"], "copied")
+        self.assertIn("a", self.state.kv_cache_for("sat-a").entries)
         self.assertIn("a", self.state.kv_cache_for("sat-b").entries)
+        self.assertEqual(self.state.session_for("a").satellite_ids, ["sat-a", "sat-b"])
 
     def test_recompute_on_new_satellite_keeps_old_copy(self):
         commit_session_kv(
@@ -91,6 +92,21 @@ class KVCapacityLRUTests(unittest.TestCase):
         self.assertEqual(result["action"], "recompute_context")
         self.assertIn("a", self.state.kv_cache_for("sat-a").entries)
         self.assertIn("a", self.state.kv_cache_for("sat-b").entries)
+
+    def test_lru_eviction_removes_only_the_evicted_satellite(self):
+        for session_id, now_s in (("a", 1.0), ("b", 2.0), ("c", 3.0)):
+            commit_session_kv(
+                self.state,
+                session_id=session_id,
+                satellite_id="sat-a",
+                context_tokens=4,
+                capacity_tokens=8,
+                kv_bytes_per_token=1.0,
+                now_s=now_s,
+            )
+        self.assertEqual(self.state.session_for("a").satellite_ids, [])
+        self.assertEqual(self.state.session_for("b").satellite_ids, ["sat-a"])
+        self.assertEqual(self.state.session_for("c").satellite_ids, ["sat-a"])
 
 
 if __name__ == "__main__":
