@@ -18,10 +18,10 @@ class CoreModuleBoundaryTests(unittest.TestCase):
     def test_public_contracts_are_exported(self):
         for module, names in {
             architecture: ("HardwareSpec", "ResolvedHardware", "SatelliteHardwareProfile", "resolve_experiment_hardware"),
-            orbit: ("ConstellationDesign", "RuntimeTraceBundle", "SimulationConfig", "run_simulation"),
+            orbit: ("OrbitTraceManifest", "OrbitTraceBundle", "generate_orbit_trace", "load_orbit_trace"),
             workload: ("WorkloadBundleRef", "WorkloadGenerationResult", "materialize_workload_bundle"),
             serving: ("ServingSpec", "ServingThroughputEstimate", "estimate_serving_throughput"),
-            runtime: ("RuntimeScenario", "RuntimeStrategySpec", "RuntimePerformanceResult", "run_runtime_simulation"),
+            runtime: ("RuntimeSimulationSpec", "RuntimeStrategySpec", "RuntimePerformanceResult", "run_simulation"),
         }.items():
             with self.subTest(module=module.__name__):
                 for name in names:
@@ -110,9 +110,8 @@ class CoreModuleBoundaryTests(unittest.TestCase):
         hardware_fields = architecture.SatelliteHardwareProfile.__dataclass_fields__
         for field in ("isl_contention_factor", "max_concurrent_isl_links", "laser_terminal_utilization"):
             self.assertNotIn(field, hardware_fields)
-        constellation_fields = orbit.ConstellationDesign.__dataclass_fields__
-        self.assertNotIn("isl_topology", constellation_fields)
-        self.assertFalse(hasattr(orbit.ConstellationDesign, "architecture_isl_inventory"))
+        for removed in ("ConstellationDesign", "RuntimeTraceBundle", "SimulationConfig", "run_simulation"):
+            self.assertFalse(hasattr(orbit, removed))
 
     def test_workload_contract_is_unversioned(self):
         self.assertEqual(workload.WORKLOAD_BUNDLE_SCHEMA, "orbitserve.workload")
