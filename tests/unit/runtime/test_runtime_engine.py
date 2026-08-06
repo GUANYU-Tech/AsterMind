@@ -1,7 +1,7 @@
 import unittest
 
 from orbitserve.orbit import ORBIT_TRACE_SCHEMA, OrbitTraceBundle, OrbitTraceManifest
-from orbitserve.runtime import RuntimeStrategySpec, build_runtime_simulation_spec, run_runtime_simulation
+from orbitserve.runtime import RuntimeStrategySpec, build_runtime_simulation_spec, run_simulation
 
 
 def _trace():
@@ -114,7 +114,7 @@ class RuntimeEngineTests(unittest.TestCase):
             energy_weight=1.0,
             compute_load_weight=0.0,
         )
-        result = run_runtime_simulation(_scenario(strategy))
+        result = run_simulation(_scenario(strategy))
         self.assertTrue(result.evaluated)
         record = result.request_records[0]
         self.assertEqual(record["decision"]["serving_satellite_id"], "sat-b")
@@ -129,7 +129,7 @@ class RuntimeEngineTests(unittest.TestCase):
             energy_weight=0.0,
             compute_load_weight=0.0,
         )
-        result = run_runtime_simulation(_scenario(strategy))
+        result = run_simulation(_scenario(strategy))
         record = result.request_records[0]
         first_leg = record["routing"]["selected_path"][0]
         self.assertAlmostEqual(first_leg["propagation_delay_s"], 550.0 / 299_792.458)
@@ -144,7 +144,7 @@ class RuntimeEngineTests(unittest.TestCase):
             shadow_dvfs_enabled=True,
             shadow_dvfs_scale=0.5,
         )
-        result = run_runtime_simulation(_scenario(strategy))
+        result = run_simulation(_scenario(strategy))
         record = result.request_records[0]
         self.assertEqual(record["decision"]["serving_satellite_id"], "sat-a")
         self.assertEqual(record["decision"]["dvfs_scale"], 0.5)
@@ -158,7 +158,7 @@ class RuntimeEngineTests(unittest.TestCase):
             compute_load_weight=0.0,
             kv_migration_enabled=True,
         )
-        result = run_runtime_simulation(
+        result = run_simulation(
             _scenario(
                 strategy,
                 requests=(

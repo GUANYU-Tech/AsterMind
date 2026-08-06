@@ -17,10 +17,10 @@ class RuntimeResultContractTests(unittest.TestCase):
                 "RuntimeSimulationSpec",
                 "RuntimeStrategySpec",
                 "build_runtime_simulation_spec",
-                "run_runtime_simulation",
+                "run_simulation",
             },
         )
-        self.assertEqual(tuple(inspect.signature(runtime.run_runtime_simulation).parameters), ("simulation_spec",))
+        self.assertEqual(tuple(inspect.signature(runtime.run_simulation).parameters), ("simulation_spec",))
         self.assertFalse(hasattr(runtime, "RuntimeScenario"))
         self.assertFalse(hasattr(runtime, "run_runtime_engine"))
 

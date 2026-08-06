@@ -7,9 +7,9 @@ from .result import RuntimePerformanceResult, build_runtime_performance_result
 from .setup.simulation_spec import RuntimeSimulationSpec
 
 
-def run_runtime_simulation(simulation_spec: RuntimeSimulationSpec) -> RuntimePerformanceResult:
+def run_simulation(simulation_spec: RuntimeSimulationSpec) -> RuntimePerformanceResult:
     if not isinstance(simulation_spec, RuntimeSimulationSpec):
-        raise TypeError("run_runtime_simulation requires RuntimeSimulationSpec")
+        raise TypeError("run_simulation requires RuntimeSimulationSpec")
     if (
         simulation_spec.strategy.ingress_selection == "communication_satellite"
         and not simulation_spec.communication_ingress.configured
@@ -22,4 +22,4 @@ def run_runtime_simulation(simulation_spec: RuntimeSimulationSpec) -> RuntimePer
     )
 
 
-__all__ = ["run_runtime_simulation"]
+__all__ = ["run_simulation"]

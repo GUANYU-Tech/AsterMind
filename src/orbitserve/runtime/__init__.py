@@ -1,6 +1,6 @@
 """Public API for deterministic OrbitServe Runtime simulation."""
 
-from .api import run_runtime_simulation
+from .api import run_simulation
 from .contracts import RuntimeStrategySpec
 from .result import RuntimePerformanceResult
 from .setup.builder import build_runtime_simulation_spec
@@ -11,5 +11,5 @@ __all__ = [
     "RuntimeSimulationSpec",
     "RuntimeStrategySpec",
     "build_runtime_simulation_spec",
-    "run_runtime_simulation",
+    "run_simulation",
 ]
