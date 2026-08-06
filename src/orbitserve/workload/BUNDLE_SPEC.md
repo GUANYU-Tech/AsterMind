@@ -36,14 +36,6 @@ Loads a bundle from disk and returns an in-memory `WorkloadGenerationResult`.
 - Validates: manifest schema -> bundle_sha256 -> exact keys -> session consistency -> reference resolution
 - Returns: `WorkloadGenerationResult` (containing `session_requests`, `regions`, `gateways`, `timebin_demand`, `summary`)
 
-### generation.py
-
-Position: `src/orbitserve/workload/generation.py`
-
-Synthesises a workload bundle from a workload description config (NHPP generation, trace replay, explicit requests). This is an alternative to the adapter layer — adapters build from real datasets, generation builds from statistical descriptions.
-
-Not modified in this round. It continues to work via contract.py's legacy aliases (`REQUEST_KEYS` -> `SESSION_REQUEST_KEYS`, `REQUEST_FILES["requests"]` -> `session_requests.jsonl`, etc.). The fields it reads and writes still follow the old definitions. Future work: upgrade to output the new 24-field `session_requests.jsonl`.
-
 ### upsample.py
 
 Position: `src/orbitserve/workload/upsample.py`
