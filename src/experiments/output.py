@@ -80,35 +80,11 @@ def _summary_payload(payload: dict[str, Any], writer: "_ArtifactWriter") -> dict
             json_path="performance.details.runtime",
         )
 
-    runtime_optimization = performance_details.get("runtime_optimization")
-    if isinstance(runtime_optimization, dict):
-        _externalize_runtime_optimization(runtime_optimization, writer=writer)
-
     dse = summary.get("dse")
     if isinstance(dse, dict):
         _externalize_dse(dse, writer=writer)
 
     return summary
-
-
-def _externalize_runtime_optimization(
-    runtime_optimization: dict[str, Any],
-    *,
-    writer: "_ArtifactWriter",
-) -> None:
-    score_table = runtime_optimization.get("score_table")
-    if isinstance(score_table, list) and score_table:
-        score_ref = writer.write_jsonl(
-            name="runtime_optimization_score_table_full",
-            rel_path=("runtime_optimization", "score_table_full.jsonl"),
-            rows=score_table,
-            json_path="performance.details.runtime_optimization.score_table",
-        )
-        runtime_optimization["score_table"] = [
-            _slim_score_row(row) if isinstance(row, dict) else row
-            for row in score_table
-        ]
-        runtime_optimization["score_table_artifact"] = score_ref
 
 
 def _externalize_dse(dse: dict[str, Any], *, writer: "_ArtifactWriter") -> None:
@@ -219,7 +195,7 @@ def _slim_score_row(row: dict[str, Any]) -> dict[str, Any]:
 def _slim_dse_row(row: dict[str, Any], *, artifact_ref: dict[str, Any] | None) -> dict[str, Any]:
     slim = deepcopy(row)
     details = _dict_at(slim, ("performance", "details"))
-    for key in ("runtime", "runtime_current_strategy"):
+    for key in ("runtime",):
         value = details.get(key)
         if isinstance(value, dict):
             details[key] = _slim_runtime_result(value)
@@ -493,7 +469,6 @@ def _provenance_summary(provenance: dict[str, Any]) -> dict[str, Any]:
 
 def _state_summary(state_summary: dict[str, Any]) -> dict[str, Any]:
     return {
-        "compute_queue_count": len(state_summary.get("compute_queues", {}) or {}),
         "satellite_count": len(state_summary.get("satellites", {}) or {}),
         "link_count": len(state_summary.get("links", {}) or {}),
         "session_count": len(state_summary.get("sessions", {}) or {}),

@@ -16,7 +16,6 @@ from ..common import to_jsonable
 from ..common import PerformanceMetrics, SLOMetrics
 from ..orbit import (
     CIRCULAR_GEOMETRY_TRACE,
-    IDEAL_FULL_VISIBILITY,
     SURROGATE_ORBIT_TRACE,
     RuntimeTraceManifest,
     load_surrogate_trace_bundle,
@@ -59,7 +58,7 @@ def evaluate_static_slo_proxy(
     workload_spec: Any = None,
     serving_throughput: Any,
     simulation_result: Any = None,
-    runtime_energy_envelope: Any = None,
+    runtime_energy_profile: Any = None,
     base_dir: str | Path | None = None,
 ) -> StaticSLOProxyResult:
     """Estimate static served ratio and tail latency for a DSE design row."""
@@ -105,7 +104,7 @@ def evaluate_static_slo_proxy(
         )
     warnings.extend(trace_warnings)
     access_summary = _access_summary(requests, trace_bundle=trace_bundle, simulation_result=simulation_result)
-    energy_summary = _energy_summary(trace_bundle=trace_bundle, runtime_energy_envelope=runtime_energy_envelope)
+    energy_summary = _energy_summary(trace_bundle=trace_bundle, runtime_energy_profile=runtime_energy_profile)
     timebin_summary = _timebin_summary(timebins, request_capacity=request_capacity)
 
     energy_capacity_factor = _positive_float(energy_summary.get("capacity_factor")) or 1.0
@@ -360,8 +359,6 @@ def _load_trace_bundle(
             f"trace_model={manifest.trace_model} did not produce an evaluated trace manifest"
         )
         return None, trace_warnings, reason
-    if manifest.trace_model == IDEAL_FULL_VISIBILITY:
-        return None, ("static SLO proxy uses explicitly requested ideal_full_visibility access summary",), None
     if manifest.trace_model not in {SURROGATE_ORBIT_TRACE, CIRCULAR_GEOMETRY_TRACE}:
         reason = f"static SLO proxy is not evaluated because trace_model={manifest.trace_model} is unsupported"
         return None, trace_warnings, reason
@@ -534,14 +531,14 @@ def _access_estimate(request: dict[str, Any], *, trace_bundle: Any | None) -> _A
     )
 
 
-def _energy_summary(*, trace_bundle: Any | None, runtime_energy_envelope: Any) -> dict[str, Any]:
-    envelope = _mapping(runtime_energy_envelope)
+def _energy_summary(*, trace_bundle: Any | None, runtime_energy_profile: Any) -> dict[str, Any]:
+    profile = _mapping(runtime_energy_profile)
     if trace_bundle is None:
         return {
-            "evaluated": bool(envelope.get("evaluated", False)),
+            "evaluated": bool(profile.get("evaluated", False)),
             "capacity_factor": 1.0,
             "latency_multiplier": 1.0,
-            "source": "runtime_energy_envelope" if envelope else "not_configured",
+            "source": "runtime_scenario.energy_profile" if profile else "not_configured",
             "warnings": ("energy summary unavailable; static proxy applies no energy derating",),
         }
     windows = tuple(_dict(item) for item in getattr(trace_bundle, "energy_windows", ()) or ())

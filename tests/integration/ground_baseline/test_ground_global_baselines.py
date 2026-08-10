@@ -9,7 +9,7 @@ from orbitserve.baselines.ground.global_runtime import (
     run_centralized_ground_runtime,
 )
 from orbitserve.runtime.contracts import RuntimeStrategySpec
-from orbitserve.runtime.contracts import RuntimeScenario
+from orbitserve.runtime import RuntimeScenario
 from orbitserve.experiments.runtime_dispatch import evaluate_runtime_performance
 
 

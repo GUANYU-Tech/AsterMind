@@ -21,7 +21,7 @@ class CoreModuleBoundaryTests(unittest.TestCase):
             orbit: ("ConstellationDesign", "RuntimeTraceBundle", "SimulationConfig", "run_simulation"),
             workload: ("WorkloadBundleRef", "WorkloadGenerationResult", "materialize_workload_bundle"),
             serving: ("ServingSpec", "ServingThroughputEstimate", "estimate_serving_throughput"),
-            runtime: ("RuntimeScenario", "RuntimeStrategySpec", "RuntimePerformanceResult", "evaluate_runtime_performance"),
+            runtime: ("RuntimeScenario", "RuntimeStrategySpec", "RuntimePerformanceResult", "run_runtime_simulation"),
         }.items():
             with self.subTest(module=module.__name__):
                 for name in names:

@@ -6,8 +6,8 @@ import heapq
 from dataclasses import dataclass, field, replace
 from typing import Any
 
-from ..orbit import active_sgl_access_window, has_sgl_access_windows, sgl_window_link_sample
-from ..common import to_jsonable
+from ...orbit import active_sgl_access_window, has_sgl_access_windows, sgl_window_link_sample
+from ...common import to_jsonable
 
 
 @dataclass(frozen=True)

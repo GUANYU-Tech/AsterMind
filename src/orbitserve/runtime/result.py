@@ -5,9 +5,9 @@ from __future__ import annotations
 from typing import Any
 
 from .contracts import RuntimePerformanceResult
-from .runtime_metrics import aggregate_runtime_records
-from .runtime_records import records_to_jsonable
-from ..orbit import CIRCULAR_GEOMETRY_TRACE, IDEAL_FULL_VISIBILITY, SURROGATE_ORBIT_TRACE
+from .metrics.aggregation import aggregate_runtime_records
+from .metrics.records import records_to_jsonable
+from ..orbit import CIRCULAR_GEOMETRY_TRACE, SURROGATE_ORBIT_TRACE
 
 def build_runtime_performance_result(
     *,
@@ -17,7 +17,8 @@ def build_runtime_performance_result(
     trace_manifest: Any,
     effective_trace_model: str,
     effective_scope: str,
-    deployment_catalog: Any,
+    serving_profile: Any = None,
+    deployment_catalog: Any = None,
     evaluator_name: str,
     path_model: str,
     energy_model: str,
@@ -28,6 +29,7 @@ def build_runtime_performance_result(
     centralized_ground_baseline: bool = False,
     terrestrial_costing: Any = None,
 ) -> RuntimePerformanceResult:
+    effective_serving_profile = serving_profile or deployment_catalog
     aggregate_horizon_s = _aggregate_horizon_s(
         engine_result=engine_result,
         trace_model=effective_trace_model,
@@ -48,8 +50,6 @@ def build_runtime_performance_result(
         "workload": "loaded",
         "simulation": "not_required_terrestrial_baseline"
         if terrestrial_baseline
-        else "idealized_trace"
-        if trace_manifest.trace_model == IDEAL_FULL_VISIBILITY
         else "geometry_trace"
         if trace_manifest.trace_model == CIRCULAR_GEOMETRY_TRACE
         else "surrogate_trace",
@@ -82,7 +82,7 @@ def build_runtime_performance_result(
             (
                 *scenario_warnings,
                 *trace_warnings,
-                *(deployment_catalog.warnings if deployment_catalog is not None else ()),
+                *(effective_serving_profile.warnings if effective_serving_profile is not None else ()),
                 *engine_result.warnings,
                 *aggregates.warnings,
                 *(terrestrial_costing.warnings if terrestrial_costing is not None else ()),
@@ -91,8 +91,6 @@ def build_runtime_performance_result(
                     if centralized_ground_baseline
                     else "SkyWalker ground runtime reproduces published control logic with explicit surrogate parameters"
                     if terrestrial_baseline
-                    else "Phase 1a runtime metrics are idealized compute-only outputs"
-                    if trace_manifest.trace_model == IDEAL_FULL_VISIBILITY
                     else "circular geometry trace-backed runtime metrics are preliminary surrogate outputs"
                     if trace_manifest.trace_model == CIRCULAR_GEOMETRY_TRACE
                     else "trace-backed runtime metrics are preliminary surrogate outputs"
@@ -107,8 +105,8 @@ def build_runtime_performance_result(
         else None
     )
     deployment_payload = (
-        deployment_catalog.to_dict()
-        if deployment_catalog is not None
+        effective_serving_profile.to_dict()
+        if effective_serving_profile is not None
         else {
             "model": "geo_distributed_terrestrial_llm_serving",
             "policy": runtime_strategy.policy,
@@ -122,12 +120,12 @@ def build_runtime_performance_result(
         "valid_for_paper_main_results": False,
         "request_records": request_records,
         "state_summary": engine_result.state_summary,
-        "deployment_catalog": deployment_payload,
+        **({"deployment_catalog": deployment_payload} if terrestrial_baseline else {"serving_profile": deployment_payload}),
         "engine_provenance": engine_result.provenance or {},
         "metrics_contract": {
-            "served_ratio": "completed and TTFT/E2E deadlines both satisfied",
-            "rejected_ratio": "arrival-time admission rejection",
-            "timeout_ratio": "accepted request completed after TTFT or E2E deadline",
+            "completion_ratio": "complete output delivered within the Runtime trace horizon",
+            "uncompleted_ratio": "request output was not completely delivered",
+            "uncompleted_reason_breakdown": "physical reason for incomplete delivery",
             "cost_per_served": (
                 "explicit terrestrial cloud instance/optional-egress contract"
                 if terrestrial_costing is not None and terrestrial_costing.evaluated
@@ -145,7 +143,7 @@ def build_runtime_performance_result(
     return RuntimePerformanceResult(
         evaluated=True,
         scenario={
-            "schema_version": getattr(scenario, "schema_version", "orbitserve.runtime_scenario.v1"),
+            "schema_version": getattr(scenario, "schema_version", "orbitserve.runtime_simulation_spec.v1"),
             "scenario_id": getattr(scenario, "scenario_id", None),
             "design_id": None
             if terrestrial_baseline
@@ -184,7 +182,6 @@ def build_runtime_performance_result(
             "valid_for_paper_main_results": False,
         },
         performance=aggregates.performance.to_dict(),
-        slo=aggregates.slo.to_dict(),
         runtime_metrics=runtime_metrics,
         bottleneck_breakdown=aggregates.bottleneck_breakdown,
         session_metrics=(
@@ -206,7 +203,7 @@ def build_runtime_performance_result(
         non_separability={
             "evaluated": False,
             "value": None,
-            "warnings": ("idealized compute-only metrics are not valid for paper main non-separability",),
+            "warnings": ("runtime non-separability is evaluated by the DSE runtime matrix",),
         },
         decision_trace={
             "trace_schema_version": "orbitserve.runtime_decision_trace.v1",
@@ -226,7 +223,7 @@ def build_runtime_performance_result(
         provenance={
             **getattr(scenario, "provenance", {}),
             "performance_evaluator": evaluator_name,
-            "runtime_interface_schema": "orbitserve.runtime_scenario.v1",
+            "runtime_interface_schema": "orbitserve.runtime_simulation_spec.v1",
             "runtime_performance_schema": "orbitserve.runtime_performance.v1",
             "trace_manifest": (
                 {

@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from ..common import to_jsonable
-from .energy_accounting import EnergyIntensity, compute_dynamic_energy_j
-
+from ...common import to_jsonable
 
 REQUIRED_RUNTIME_ENERGY_WINDOW_FIELDS = (
     "battery_capacity_j",
@@ -17,26 +15,83 @@ REQUIRED_RUNTIME_ENERGY_WINDOW_FIELDS = (
     "compute_energy_j_per_token",
     "link_energy_j_per_byte",
     "soc_min",
-    "dvfs_multiplier",
     "energy_accounting_mode",
 )
 
 
 @dataclass(frozen=True)
-class EnergyUpdateResult:
-    evaluated: bool = False
-    soc_before: float | None = None
-    soc_after: float | None = None
-    energy_violation: bool | None = None
-    delta_compute_j: float | None = None
-    delta_link_j: float | None = None
-    warnings: tuple[str, ...] = ("energy/SOC integration is not implemented",)
-    provenance: dict[str, Any] = field(default_factory=dict)
+class EnergyIntensity:
+    """Baseline-exclusive bus-side energy coefficients."""
 
-    def to_dict(self) -> dict[str, Any]:
-        return to_jsonable(self)
+    compute_standby_power_w: float = 0.0
+    communication_standby_power_w: float = 0.0
+    compute_energy_j_per_token: float = 0.5
+    link_energy_j_per_byte: float = 1e-6
+
+    def __post_init__(self) -> None:
+        for name, value in asdict(self).items():
+            _require_nonnegative_finite(value, name)
+
+    @property
+    def standby_power_w(self) -> float:
+        return self.compute_standby_power_w + self.communication_standby_power_w
+
+    def to_dict(self) -> dict[str, float]:
+        return asdict(self)
 
 
+@dataclass(frozen=True)
+class DynamicEnergyBreakdown:
+    compute_j: float
+    link_j: float
+
+    @property
+    def total_j(self) -> float:
+        return self.compute_j + self.link_j
+
+    def to_dict(self) -> dict[str, float]:
+        return {
+            "compute_j": self.compute_j,
+            "link_j": self.link_j,
+            "total_j": self.total_j,
+        }
+
+
+def compute_dynamic_energy_j(
+    *,
+    prompt_tokens: float,
+    output_tokens: float,
+    link_bytes: float,
+    intensity: EnergyIntensity,
+) -> DynamicEnergyBreakdown:
+    """Return baseline-exclusive compute and physical-link bus energy."""
+
+    prompt = _require_nonnegative_finite(prompt_tokens, "prompt_tokens")
+    output = _require_nonnegative_finite(output_tokens, "output_tokens")
+    physical_bytes = _require_nonnegative_finite(link_bytes, "link_bytes")
+    return DynamicEnergyBreakdown(
+        compute_j=(prompt + output) * intensity.compute_energy_j_per_token,
+        link_j=physical_bytes * intensity.link_energy_j_per_byte,
+    )
+
+
+def _require_nonnegative_finite(value: Any, name: str) -> float:
+    parsed = _number(value, name)
+    if parsed < 0:
+        raise ValueError(f"{name} must be non-negative")
+    return parsed
+
+
+def _number(value: Any, name: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be finite")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"{name} must be finite") from None
+    if not math.isfinite(parsed):
+        raise ValueError(f"{name} must be finite")
+    return parsed
 
 
 class EnergyWindowError(ValueError):
@@ -198,7 +253,6 @@ def advance_satellite_energy(satellite_state: Any, trace_bundle: Any, to_s: floa
         satellite_state.soc = soc
         satellite_state.last_energy_update_s = to_s
         satellite_state.sunlit = bool(final_window.get("sunlit", True))
-        satellite_state.dvfs_multiplier = float(final_window.get("dvfs_multiplier", 1.0))
         satellite_state.energy_ledger = tuple(ledger)
         satellite_state.materialized_energy_event_ids = tuple(sorted(materialized_ids))
         return
@@ -236,7 +290,6 @@ def advance_satellite_energy(satellite_state: Any, trace_bundle: Any, to_s: floa
     satellite_state.soc = soc
     satellite_state.last_energy_update_s = to_s
     satellite_state.sunlit = bool(final_window.get("sunlit", True))
-    satellite_state.dvfs_multiplier = float(final_window.get("dvfs_multiplier", 1.0))
     satellite_state.energy_ledger = tuple(ledger)
     satellite_state.materialized_energy_event_ids = tuple(str(event["event_id"]) for event in events)
 
@@ -672,10 +725,6 @@ def _dynamic_energy_error_field(exc: Exception) -> str:
     return "dynamic_energy_inputs"
 
 
-def _clip01(value: float) -> float:
-    return max(0.0, min(1.0, value))
-
-
 def _validate_runtime_energy_window(window: dict[str, Any], *, satellite_id: str, time_s: float) -> None:
     missing = tuple(field for field in REQUIRED_RUNTIME_ENERGY_WINDOW_FIELDS if field not in window)
     if missing:
@@ -696,7 +745,6 @@ def _validate_runtime_energy_window(window: dict[str, Any], *, satellite_id: str
     ):
         _nonnegative_finite(window[field_name], field_name, satellite_id=satellite_id, time_s=time_s)
     _finite_fraction(window["soc_min"], "soc_min", satellite_id=satellite_id, time_s=time_s)
-    _positive_finite(window["dvfs_multiplier"], "dvfs_multiplier", satellite_id=satellite_id, time_s=time_s)
     _efficiency(window.get("battery_charge_efficiency", 1.0), "battery_charge_efficiency", satellite_id=satellite_id, time_s=time_s)
     _efficiency(window.get("battery_discharge_efficiency", 1.0), "battery_discharge_efficiency", satellite_id=satellite_id, time_s=time_s)
     if str(window["energy_accounting_mode"]) != "event_incremental_v1":
@@ -836,10 +884,12 @@ def _optional_float(value: Any) -> float | None:
 
 
 __all__ = [
+    "DynamicEnergyBreakdown",
+    "EnergyIntensity",
     "EnergyWindowError",
-    "EnergyUpdateResult",
     "REQUIRED_RUNTIME_ENERGY_WINDOW_FIELDS",
     "advance_satellite_energy",
+    "compute_dynamic_energy_j",
     "apply_request_energy",
     "energy_window_at",
     "query_energy_window_at",

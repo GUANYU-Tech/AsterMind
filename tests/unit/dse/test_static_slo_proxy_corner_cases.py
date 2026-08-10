@@ -215,20 +215,6 @@ class StaticSLOProxyCornerCaseTests(unittest.TestCase):
         self.assertTrue(any("missing surrogate trace file" in warning for warning in result["warnings"]))
         self.assertFalse(any("assuming full visibility" in warning for warning in result["warnings"]))
 
-    def test_explicit_ideal_full_visibility_remains_evaluated(self):
-        request = _request("explicit-ideal", 0.0)
-        result = evaluate_static_slo_proxy(
-            workload_generation=_workload((request,)),
-            serving_throughput=_serving(),
-            simulation_result={"trace_manifest": RuntimeTraceManifest.ideal_full_visibility().to_dict()},
-        ).to_dict()
-
-        self.assertTrue(result["evaluated"])
-        self.assertTrue(result["slo"]["evaluated"])
-        self.assertEqual(result["access_summary"]["trace_model"], IDEAL_FULL_VISIBILITY)
-        self.assertEqual(result["access_summary"]["assumption"], "full_visibility_zero_access_wait")
-        self.assertTrue(any("explicitly requested ideal_full_visibility" in warning for warning in result["warnings"]))
-
     def test_deadline_equality_and_independent_ttft_e2e_misses(self):
         requests = (
             _request("exact", 0.0, ttft_deadline_s=1.0, e2e_deadline_s=2.0),

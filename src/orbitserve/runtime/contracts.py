@@ -9,7 +9,6 @@ from ..common import to_jsonable
 
 RUNTIME_INTERFACE_DOC = "docs/research/parameters/llm_serving_runtime_interface.md"
 RUNTIME_PERFORMANCE_DOC = "docs/research/parameters/llm_serving_runtime_performance_model.md"
-RUNTIME_OPTIMIZATION_DOC = "docs/research/parameters/llm_serving_runtime_optimization.md"
 
 RUNTIME_RESULT_FIELDS = frozenset(
     {
@@ -19,8 +18,9 @@ RUNTIME_RESULT_FIELDS = frozenset(
         "access_satellite_id",
         "selected_path",
         "session_action",
-        "served",
-        "served_ratio",
+        "completed",
+        "completion_ratio",
+        "uncompleted_reason",
         "TTFT",
         "E2E",
         "ttft_s",
@@ -38,7 +38,7 @@ RUNTIME_RESULT_FIELDS = frozenset(
         "soc_after",
         "compute_sunlit",
         "access_sunlit",
-        "dvfs_multiplier",
+        "dvfs_scale",
         "shadow_strategy",
         "sgl_queue_wait_s",
         "isl_queue_wait_s",
@@ -63,7 +63,6 @@ RUNTIME_RESULT_FIELDS = frozenset(
 def _default_weights() -> dict[str, Any]:
     return {
         "latency": None,
-        "slack": None,
         "energy": None,
         "link": None,
         "queue": None,
@@ -166,7 +165,8 @@ def _strategy_defaults(policy: str) -> dict[str, Any]:
                 "reject_drop",
             ),
             "session_actions_enabled": ("none", "recompute_context"),
-            "dvfs_modes_enabled": ("shadow_dvfs",),
+            "shadow_dvfs_enabled": True,
+            "shadow_dvfs_scale": 0.5,
             "path_policy": "energy_aware",
             "queue_policy": "fifo",
             "fallback_enabled": False,
@@ -187,14 +187,12 @@ def _strategy_defaults(policy: str) -> dict[str, Any]:
             ),
             "session_actions_enabled": (
                 "sticky_kv_owner",
-                "migrate_kv",
-                "replicate_kv",
                 "recompute_context",
-                "evict_session",
             ),
-            "dvfs_modes_enabled": ("shadow_dvfs",),
+            "shadow_dvfs_enabled": True,
+            "shadow_dvfs_scale": 0.5,
             "path_policy": "k_shortest_score",
-            "queue_policy": "least_slack_first",
+            "queue_policy": "resource_aware_score",
             "fallback_enabled": False,
             "defer_enabled": True,
         }
@@ -213,7 +211,8 @@ class RuntimeStrategySpec:
     policy_family: str = "orbitserve"
     enabled_actions: tuple[str, ...] = ()
     session_actions_enabled: tuple[str, ...] = ()
-    dvfs_modes_enabled: tuple[str, ...] = ()
+    shadow_dvfs_enabled: bool = False
+    shadow_dvfs_scale: float = 0.5
     lookahead_orbits: float | None = 1.0
     h_lookahead_s: float | None = None
     max_hop_count: int | None = None
@@ -230,6 +229,10 @@ class RuntimeStrategySpec:
     random_seed: int | None = None
     trace_level: str = "summary"
     provenance: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not 0.0 < float(self.shadow_dvfs_scale) <= 1.0:
+            raise ValueError("shadow_dvfs_scale must be in (0, 1]")
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "RuntimeStrategySpec":
@@ -261,11 +264,8 @@ class RuntimeStrategySpec:
                 "session_actions_enabled",
                 tuple(defaults["session_actions_enabled"]),
             ),
-            dvfs_modes_enabled=_string_tuple_or_default(
-                data,
-                "dvfs_modes_enabled",
-                tuple(defaults.get("dvfs_modes_enabled", ())),
-            ),
+            shadow_dvfs_enabled=bool(data.get("shadow_dvfs_enabled", defaults.get("shadow_dvfs_enabled", False))),
+            shadow_dvfs_scale=float(data.get("shadow_dvfs_scale", defaults.get("shadow_dvfs_scale", 0.5))),
             lookahead_orbits=_optional_float(data.get("lookahead_orbits", 1.0)),
             h_lookahead_s=_optional_float(data.get("h_lookahead_s", data.get("H_lookahead"))),
             max_hop_count=_optional_int(data.get("max_hop_count", defaults.get("max_hop_count"))),
@@ -282,8 +282,8 @@ class RuntimeStrategySpec:
             random_seed=_optional_int(data.get("random_seed")),
             trace_level=str(data.get("trace_level", "summary")),
             provenance={
-                "source": "SchedulerSpec-compatible runtime strategy",
-                "runtime_optimization_doc": RUNTIME_OPTIMIZATION_DOC,
+                "source": "fixed RuntimeStrategySpec",
+                "strategy_mutable_during_run": False,
                 **_dict(data.get("provenance")),
             },
         )
@@ -292,49 +292,39 @@ class RuntimeStrategySpec:
         return to_jsonable(self)
 
 @dataclass(frozen=True)
-class ServingDeploymentView:
-    deployment_id: str
-    role: str
-    member_satellites: tuple[str, ...] = ()
+class ServingCapacityProfile:
     serving_spec: dict[str, Any] = field(default_factory=dict)
     throughput_estimate: dict[str, Any] = field(default_factory=dict)
     evaluated: bool = False
     feasible: bool | None = None
-    request_throughput_per_s: float | None = None
     prefill_tokens_per_s: float | None = None
     decode_tokens_per_s: float | None = None
     kv_cache_capacity_tokens: int | None = None
     kv_cache_bytes_per_token: float | None = None
-    satellites_per_deployment: int | None = None
-    stage_satellite_count: int | None = None
-    pd_mode: str | None = None
     internal_comm_summary: dict[str, Any] = field(default_factory=dict)
     internal_comm_accounting: str = "embedded"
     warnings: tuple[str, ...] = ()
 
     @classmethod
-    def from_value(cls, value: Any, *, deployment_id: str = "deployment_0") -> "ServingDeploymentView":
+    def from_value(cls, value: Any) -> "ServingCapacityProfile":
         payload = _mapping_from_result(value)
         details = _dict(payload.get("details"))
         if details:
             throughput_payload = {**details, **{key: item for key, item in payload.items() if item is not None}}
         else:
             throughput_payload = payload
-        return cls.from_inputs(deployment_id=deployment_id, throughput_estimate=throughput_payload)
+        return cls.from_inputs(throughput_estimate=throughput_payload)
 
     @classmethod
     def from_inputs(
         cls,
         *,
-        deployment_id: str,
         serving_spec: Any = None,
         throughput_estimate: Any = None,
         internal_comm_accounting: str = "embedded",
-    ) -> "ServingDeploymentView":
+    ) -> "ServingCapacityProfile":
         serving_payload = _mapping_from_result(serving_spec)
         throughput_payload = _mapping_from_result(throughput_estimate)
-        pd_mode = _optional_str(throughput_payload.get("pd_mode")) or _optional_str(serving_payload.get("pd_mode"))
-        role = "colocated" if pd_mode in (None, "colocated") else "prefill_decode_pools"
         internal_comm_summary = {
             key: throughput_payload.get(key)
             for key in (
@@ -347,7 +337,6 @@ class ServingDeploymentView:
                 "tp_communication_time_s",
                 "ep_communication_time_s",
                 "pp_communication_time_s",
-                "kv_handoff_time_s",
                 "communication_bottleneck",
                 "bottlenecks",
                 "warnings",
@@ -356,134 +345,27 @@ class ServingDeploymentView:
             if key in throughput_payload
         }
         return cls(
-            deployment_id=deployment_id,
-            role=role,
-            member_satellites=tuple(
-                str(item)
-                for item in _first_present(
-                    throughput_payload.get("member_satellites"),
-                    serving_payload.get("member_satellites"),
-                    (),
-                )
-                or ()
-            ),
             serving_spec=serving_payload,
             throughput_estimate=throughput_payload,
             evaluated=bool(throughput_payload.get("evaluated", False)),
             feasible=_optional_bool(throughput_payload.get("feasible")),
-            request_throughput_per_s=_optional_float(throughput_payload.get("request_throughput_per_s")),
             prefill_tokens_per_s=_optional_float(throughput_payload.get("prefill_tokens_per_s")),
             decode_tokens_per_s=_optional_float(throughput_payload.get("decode_tokens_per_s")),
             kv_cache_capacity_tokens=_optional_int(throughput_payload.get("kv_cache_capacity_tokens")),
             kv_cache_bytes_per_token=_optional_float(throughput_payload.get("kv_cache_bytes_per_token")),
-            satellites_per_deployment=_optional_int(throughput_payload.get("satellites_per_deployment")),
-            stage_satellite_count=_optional_int(throughput_payload.get("stage_satellite_count")),
-            pd_mode=pd_mode,
             internal_comm_summary=internal_comm_summary,
             internal_comm_accounting=internal_comm_accounting,
             warnings=_warnings_from_payload(throughput_payload),
         )
 
-    def to_dict(self) -> dict[str, Any]:
-        return to_jsonable(self)
-
-@dataclass(frozen=True)
-class RuntimePredictionEnvelope:
-    evaluated: bool = False
-    predicted_ttft_s: float | None = None
-    predicted_e2e_s: float | None = None
-    access_wait_s: float | None = None
-    prefill_queue_wait_s: float | None = None
-    decode_queue_wait_s: float | None = None
-    link_queue_wait_s: float | None = None
-    prefill_service_s: float | None = None
-    decode_service_s: float | None = None
-    kv_migration_visible_s: float | None = None
-    context_recompute_s: float | None = None
-    path_setup_delay_s: float | None = None
-    average_hop_count: float | None = None
-    delta_compute_j: float | None = None
-    delta_sgl_j: float | None = None
-    delta_isl_j: float | None = None
-    delta_energy_j: float | None = None
-    soc_min_predicted: float | None = None
-    energy_feasible: bool | None = None
-    deadline_slack_s: float | None = None
-    ttft_slack_s: float | None = None
-    bottleneck_reason: str | None = None
-    warnings: tuple[str, ...] = ("runtime prediction is not implemented",)
-
-    def to_dict(self) -> dict[str, Any]:
-        return to_jsonable(self)
-
-@dataclass(frozen=True)
-class RuntimeAction:
-    action_id: str
-    request_id: str | None = None
-    action_type: str = "reject_drop"
-    access_node: str | None = None
-    serving_deployment: str | None = None
-    prefill_deployment: str | None = None
-    decode_deployment: str | None = None
-    route_in: Any | None = None
-    route_out: Any | None = None
-    kv_route: Any | None = None
-    session_action: str = "none"
-    energy_action: str = "none"
-    dvfs_profile: str | None = None
-    defer_until_s: float | None = None
-    fallback_mode: str = "none"
-    expected_resource_delta: dict[str, Any] = field(default_factory=dict)
-    hard_gate_results: dict[str, Any] = field(default_factory=dict)
-    prediction: RuntimePredictionEnvelope = field(default_factory=RuntimePredictionEnvelope)
-    provenance: dict[str, Any] = field(default_factory=dict)
-
-    def to_dict(self) -> dict[str, Any]:
-        return to_jsonable(self)
-
-@dataclass(frozen=True)
-class RuntimeDecisionTrace:
-    request_id: str | None = None
-    arrival_time_s: float | None = None
-    decision_time_s: float | None = None
-    policy_name: str | None = None
-    state_view_hash: str | None = None
-    candidate_action_count: int = 0
-    feasible_action_count: int = 0
-    selected_action: RuntimeAction | dict[str, Any] | None = None
-    rejected_actions: tuple[dict[str, Any], ...] = ()
-    gate_results: dict[str, Any] = field(default_factory=dict)
-    prediction: RuntimePredictionEnvelope = field(default_factory=RuntimePredictionEnvelope)
-    score_components: dict[str, Any] = field(default_factory=dict)
-    session_decision: dict[str, Any] = field(default_factory=dict)
-    route_summary: dict[str, Any] = field(default_factory=dict)
-    bottleneck_reason: str | None = "not_implemented"
-    warnings: tuple[str, ...] = ("runtime decision trace is not implemented",)
-    trace_schema_version: str = "orbitserve.runtime_decision_trace.v1"
-
-    def to_dict(self) -> dict[str, Any]:
-        return to_jsonable(self)
-
-@dataclass(frozen=True)
-class RuntimeScenario:
-    scenario_id: str = "runtime_scenario"
-    design_id: str = "runtime_design"
-    time_horizon_s: float | None = None
-    workload_bundle: dict[str, Any] = field(default_factory=dict)
-    requests: tuple[dict[str, Any], ...] = ()
-    sessions: tuple[dict[str, Any], ...] = ()
-    regions: tuple[dict[str, Any], ...] = ()
-    gateways: tuple[dict[str, Any], ...] = ()
-    simulation_trace_ref: dict[str, Any] = field(default_factory=dict)
-    constellation: dict[str, Any] = field(default_factory=dict)
-    serving_deployments: tuple[ServingDeploymentView, ...] = ()
-    cost_power: dict[str, Any] = field(default_factory=dict)
-    runtime_config: RuntimeStrategySpec = field(default_factory=lambda: RuntimeStrategySpec.from_value(None))
-    provenance: dict[str, Any] = field(default_factory=dict)
-    warnings: tuple[str, ...] = ()
-    schema_version: str = "orbitserve.runtime_scenario.v1"
-    time_mode: str = "event_driven"
-    time_step_s: float | None = None
+    @property
+    def has_compute_capacity(self) -> bool:
+        return bool(
+            self.prefill_tokens_per_s
+            and self.prefill_tokens_per_s > 0
+            and self.decode_tokens_per_s
+            and self.decode_tokens_per_s > 0
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return to_jsonable(self)
@@ -498,7 +380,6 @@ class RuntimePerformanceResult:
     serving: dict[str, Any] = field(default_factory=dict)
     scheduler: dict[str, Any] = field(default_factory=dict)
     performance: dict[str, Any] = field(default_factory=dict)
-    slo: dict[str, Any] = field(default_factory=dict)
     config: dict[str, Any] = field(default_factory=dict)
     runtime_metrics: dict[str, Any] = field(default_factory=dict)
     bottleneck_breakdown: dict[str, Any] = field(default_factory=dict)

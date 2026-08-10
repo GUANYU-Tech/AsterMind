@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..common import to_jsonable
+from ...common import to_jsonable
 
 
 _NON_COMPUTE_ROLES = frozenset({"relay", "communication", "communications", "gateway", "non_compute", "none"})
@@ -22,7 +22,6 @@ class ComputeEligibilitySet:
     not constrain the routing graph.
     """
 
-    deployment_id: str
     deployment_role: str
     capacity_member_ids: tuple[str, ...]
     eligible_compute_satellite_ids: tuple[str, ...]
@@ -44,7 +43,6 @@ class ComputeEligibilitySet:
 
 def build_compute_eligibility_set(
     *,
-    deployment: Any,
     satellite_catalog: tuple[dict[str, Any], ...],
     runtime_exclusions: dict[str, str | tuple[str, ...]] | None = None,
     evaluated_at_s: float | None = None,
@@ -54,14 +52,7 @@ def build_compute_eligibility_set(
         for item in satellite_catalog
         if item.get("satellite_id") is not None
     }
-    members = tuple(dict.fromkeys(str(item) for item in getattr(deployment, "member_satellites", ()) or ()))
-    if not members:
-        deployment_id = str(getattr(deployment, "deployment_id", ""))
-        members = tuple(
-            satellite_id
-            for satellite_id, row in catalog_by_id.items()
-            if str(row.get("deployment_id") or "") == deployment_id
-        )
+    members = tuple(catalog_by_id)
     excluded: dict[str, tuple[str, ...]] = {}
     capacity_members: list[str] = []
     eligible: list[str] = []
@@ -87,14 +78,10 @@ def build_compute_eligibility_set(
         else:
             eligible.append(satellite_id)
 
-    if not members:
-        excluded["__deployment__"] = ("deployment_membership_unresolved",)
-
     capacity_set = set(capacity_members)
     relay_ids = tuple(satellite_id for satellite_id in catalog_by_id if satellite_id not in capacity_set)
     return ComputeEligibilitySet(
-        deployment_id=str(getattr(deployment, "deployment_id", "")),
-        deployment_role=str(getattr(deployment, "role", "colocated")),
+        deployment_role="serving",
         capacity_member_ids=tuple(capacity_members),
         eligible_compute_satellite_ids=tuple(eligible),
         relay_satellite_ids=relay_ids,
