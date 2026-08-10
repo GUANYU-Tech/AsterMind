@@ -239,19 +239,16 @@ def _slim_runtime_result(
             details["request_records_artifact"] = request_records_artifact
             details["request_records_path"] = request_records_artifact.get("path")
 
-    decision_trace = slim.get("decision_trace")
-    if isinstance(decision_trace, dict):
-        decision_records = _pop_list(decision_trace, "records")
-        if decision_records:
-            decision_trace["record_count"] = len(decision_records)
-        if decision_trace_artifact is not None:
-            decision_trace["records_artifact"] = decision_trace_artifact
-            decision_trace["records_path"] = decision_trace_artifact.get("path")
+    decision_records = _pop_list(slim, "decision_trace")
+    if decision_records:
+        slim["decision_trace_count"] = len(decision_records)
+    if decision_trace_artifact is not None:
+        slim["decision_trace_artifact"] = decision_trace_artifact
+        slim["decision_trace_path"] = decision_trace_artifact.get("path")
 
-    for key in ("strategy", "scheduler"):
-        value = slim.get(key)
-        if isinstance(value, dict):
-            slim[key] = _slim_scheduler(value)
+    strategy = slim.get("strategy")
+    if isinstance(strategy, dict):
+        slim["strategy"] = _slim_strategy(strategy)
 
     constellation = slim.get("constellation")
     if isinstance(constellation, dict):
@@ -264,6 +261,10 @@ def _slim_runtime_result(
     provenance = slim.get("provenance")
     if isinstance(provenance, dict):
         slim["provenance"] = _provenance_summary(provenance)
+
+    state_summary = slim.get("state_summary")
+    if isinstance(state_summary, dict):
+        slim["state_summary"] = _state_summary(state_summary)
 
     if isinstance(details, dict):
         state_summary = details.get("state_summary")
@@ -309,7 +310,6 @@ def _frontier_candidate_summary(candidate: dict[str, Any]) -> dict[str, Any]:
         "cost_usd",
         "annualized_cost_usd_per_year",
         "cost_total_usd",
-        "served_ratio",
         "e2e_p95_s",
         "ttft_p95_s",
         "e2e_p99_s",
@@ -323,32 +323,18 @@ def _frontier_candidate_summary(candidate: dict[str, Any]) -> dict[str, Any]:
     return {key: candidate.get(key) for key in keep_fields if key in candidate}
 
 
-def _slim_scheduler(scheduler: dict[str, Any]) -> dict[str, Any]:
+def _slim_strategy(strategy: dict[str, Any]) -> dict[str, Any]:
     keep_fields = (
-        "policy",
-        "name",
-        "policy_family",
-        "lookahead_orbits",
-        "h_lookahead_s",
-        "max_hop_count",
-        "fallback_enabled",
-        "defer_enabled",
-        "path_policy",
-        "queue_policy",
-        "hard_gate_mode",
-        "enabled_actions",
-        "session_actions_enabled",
-        "dvfs_modes_enabled",
-        "trace_level",
-        "weights",
-        "normalization_refs",
-        "strategy_id",
-        "objective_score",
-        "objective_score_scope",
-        "valid_for_paper_main_results",
-        "warnings",
+        "ingress_selection",
+        "latency_weight",
+        "kv_reuse_weight",
+        "energy_weight",
+        "compute_load_weight",
+        "shadow_dvfs_enabled",
+        "shadow_dvfs_scale",
+        "kv_migration_fraction",
     )
-    return {key: scheduler.get(key) for key in keep_fields if key in scheduler}
+    return {key: strategy.get(key) for key in keep_fields if key in strategy}
 
 
 def _constellation_summary(constellation: dict[str, Any]) -> dict[str, Any]:
@@ -502,10 +488,12 @@ def _request_records_from_runtime(runtime: dict[str, Any]) -> list[Any]:
 
 def _decision_records_from_runtime(runtime: dict[str, Any]) -> list[Any]:
     decision_trace = runtime.get("decision_trace")
-    if not isinstance(decision_trace, dict):
-        return []
-    records = decision_trace.get("records")
-    return records if isinstance(records, list) else []
+    if isinstance(decision_trace, list):
+        return decision_trace
+    if isinstance(decision_trace, dict):
+        records = decision_trace.get("records")
+        return records if isinstance(records, list) else []
+    return []
 
 
 def _pop_list(payload: dict[str, Any], key: str) -> list[Any]:

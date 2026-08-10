@@ -11,7 +11,6 @@ from orbitserve.common import to_jsonable
 from orbitserve.experiments.design_evaluation import evaluate_materialized_design
 from orbitserve.dse.search import DSEStudyResult, run_dse
 from orbitserve.dse.satellite_budget import analyze_communication_window_satellite_budget
-from orbitserve.orbit import TRACE_BACKED_RUNTIME_SURROGATE_SCOPE, normalize_trace_scope
 
 try:
     from orbitserve.workload import materialize_workload_bundle
@@ -54,7 +53,6 @@ def run_experiment(spec: ExperimentSpec) -> ExperimentResult:
         if communication_window_budget_config
         else None
     )
-    runtime_scenario = evaluation.runtime_scenario
     runtime_performance = evaluation.runtime_performance
     performance = serving_throughput.to_performance_metrics()
     performance = _performance_with_runtime_metrics(performance, runtime_performance)
@@ -90,30 +88,17 @@ def run_experiment(spec: ExperimentSpec) -> ExperimentResult:
         workload_generation_warnings=workload_generation_warnings,
     )
     slo = simulation.slo
-    terrestrial_runtime = (
-        normalize_trace_scope(getattr(runtime_performance, "scope", None))
-        == "skywalker_ground_reproduction_surrogate"
-    )
-
     module_status = {
-        "constellation_architecture": "not_required_terrestrial_baseline"
-        if terrestrial_runtime
-        else "evaluated"
+        "constellation_architecture": "evaluated"
         if constellation_architecture.get("evaluated")
         else "not_configured",
         "costing": "evaluated" if cost.evaluated else "not_configured",
-        "hardware": "ground_service_model_configured"
-        if terrestrial_runtime
-        else "resolved"
+        "hardware": "resolved"
         if resolved_hardware.configured
         else "not_configured",
         "workload_generation": str(workload_generation.get("status", "unknown")),
-        "simulation": "not_required_terrestrial_baseline"
-        if terrestrial_runtime
-        else _simulation_status(simulation),
-        "serving_throughput": "ground_service_model_evaluated"
-        if terrestrial_runtime
-        else "evaluated"
+        "simulation": _simulation_status(simulation),
+        "serving_throughput": "evaluated"
         if serving_throughput.evaluated
         else "not_configured",
         "runtime_performance": "evaluated"
@@ -182,145 +167,25 @@ def _run_dse_for_experiment(
     )
 
 
-def _runtime_result_summary(runtime_performance: Any) -> dict[str, Any]:
-    payload = _lightweight_runtime_payload(runtime_performance)
-    runtime_metrics = _mapping_from_result(payload.get("runtime_metrics"))
-    performance = _mapping_from_result(payload.get("performance"))
-    slo = _mapping_from_result(payload.get("slo"))
-    details = _mapping_from_result(payload.get("details"))
-    request_records = payload.get("request_records") or details.get("request_records") or ()
-    scope = normalize_trace_scope(
-        _first_present(runtime_metrics.get("scope"), payload.get("scope"), details.get("scope"))
-    )
-    trace_model = _first_present(
-        runtime_metrics.get("trace_model"),
-        payload.get("trace_model"),
-        details.get("trace_model"),
-    )
-    return {
-        "evaluated": bool(payload.get("evaluated", False)),
-        "strategy": _mapping_from_result(payload.get("strategy")),
-        "trace_model": trace_model,
-        "scope": scope,
-        "valid_for_paper_main_results": bool(
-            _first_present(
-                runtime_metrics.get("valid_for_paper_main_results"),
-                payload.get("valid_for_paper_main_results"),
-                details.get("valid_for_paper_main_results"),
-                False,
-            )
-        ),
-        "runtime_metrics": {
-            key: runtime_metrics.get(key)
-            for key in (
-                "total_request_count",
-                "served_ratio",
-                "accepted_ratio",
-                "rejected_ratio",
-                "timeout_ratio",
-                "ttft_p95_s",
-                "e2e_p95_s",
-                "link_queue_wait_p95_s",
-                "useful_request_throughput_per_s",
-                "useful_token_throughput_per_s",
-                "energy_violation_count",
-                "trace_model",
-                "scope",
-                "valid_for_paper_main_results",
-            )
-        },
-        "performance": {
-            key: performance.get(key)
-            for key in (
-                "request_throughput_per_s",
-                "ttft_p95_s",
-                "e2e_p95_s",
-                "queue_delay_p95_s",
-                "link_delay_p95_s",
-                "bottleneck",
-            )
-        },
-        "slo": {
-            key: slo.get(key)
-            for key in (
-                "served_ratio",
-                "rejected_ratio",
-                "timeout_ratio",
-                "energy_violation_count",
-                "isl_congestion_p95",
-                "sgl_congestion_p95",
-            )
-        },
-        "request_record_count": len(request_records) if isinstance(request_records, (list, tuple)) else None,
-        "warnings": _warnings_from_payload(payload),
-    }
-
-
-def _lightweight_runtime_payload(runtime_performance: Any) -> dict[str, Any]:
-    if runtime_performance is None:
-        return {}
-    if isinstance(runtime_performance, dict):
-        return to_jsonable(runtime_performance)
-    if hasattr(runtime_performance, "runtime_metrics"):
-        raw_details = getattr(runtime_performance, "details", {}) or {}
-        details = {
-            key: raw_details.get(key)
-            for key in (
-                "scope",
-                "runtime_scope",
-                "trace_model",
-                "valid_for_paper_main_results",
-                "hard_gate_summary",
-                "bottleneck_breakdown",
-            )
-            if key in raw_details
-        }
-        return {
-            "evaluated": getattr(runtime_performance, "evaluated", False),
-            "strategy": getattr(runtime_performance, "strategy", {}),
-            "trace_model": getattr(runtime_performance, "trace_model", None),
-            "scope": getattr(runtime_performance, "scope", None),
-            "valid_for_paper_main_results": getattr(runtime_performance, "valid_for_paper_main_results", False),
-            "runtime_metrics": getattr(runtime_performance, "runtime_metrics", {}),
-            "performance": getattr(runtime_performance, "performance", {}),
-            "slo": getattr(runtime_performance, "slo", {}),
-            "details": details,
-            "request_records": getattr(runtime_performance, "request_records", ()),
-            "warnings": getattr(runtime_performance, "warnings", ()),
-        }
-    return _mapping_from_result(runtime_performance)
-
-
 def _performance_with_runtime_metrics(performance: Any, runtime_performance: Any) -> Any:
     if not getattr(runtime_performance, "evaluated", False):
         return performance
-    payload = _lightweight_runtime_payload(runtime_performance)
-    runtime_metrics = payload.get("runtime_metrics", {})
-    runtime_performance_payload = payload.get("performance", {})
-    runtime_scope = normalize_trace_scope(runtime_metrics.get("scope"))
-    scope_warning = (
-        "top-level performance contains SkyWalker terrestrial reproduction surrogate metrics"
-        if runtime_scope == "skywalker_ground_reproduction_surrogate"
-        else "top-level performance contains trace-backed preliminary surrogate metrics"
-        if runtime_scope == TRACE_BACKED_RUNTIME_SURROGATE_SCOPE
-        else "top-level performance contains circular geometry trace-backed preliminary surrogate metrics"
-        if runtime_scope == "geometry_trace_surrogate"
-        else "top-level performance contains preliminary runtime metrics"
-    )
+    runtime_metrics = dict(getattr(runtime_performance, "workload_metrics", {}) or {})
+    provenance = dict(getattr(runtime_performance, "provenance", {}) or {})
     warnings = tuple(
         dict.fromkeys(
             (
                 *getattr(performance, "warnings", ()),
-                *tuple(runtime_performance_payload.get("warnings", ())),
-                scope_warning,
+                *tuple(getattr(runtime_performance, "warnings", ())),
+                "top-level performance contains deterministic Runtime metrics",
             )
         )
     )
     return replace(
         performance,
         evaluated=True,
-        request_throughput_per_s=runtime_metrics.get("useful_request_throughput_per_s"),
-        token_throughput_per_s=runtime_metrics.get("useful_token_throughput_per_s"),
+        request_throughput_per_s=runtime_metrics.get("request_throughput_per_s"),
+        token_throughput_per_s=runtime_metrics.get("token_throughput_per_s"),
         ttft_p95_s=runtime_metrics.get("ttft_p95_s"),
         ttft_p99_s=runtime_metrics.get("ttft_p99_s"),
         e2e_p95_s=runtime_metrics.get("e2e_p95_s"),
@@ -329,18 +194,14 @@ def _performance_with_runtime_metrics(performance: Any, runtime_performance: Any
             runtime_metrics.get("prefill_queue_wait_p95_s") or 0.0,
             runtime_metrics.get("decode_queue_wait_p95_s") or 0.0,
         ),
-        link_delay_p95_s=(
-            runtime_metrics.get("ground_network_delay_p95_s")
-            if runtime_scope == "skywalker_ground_reproduction_surrogate"
-            else runtime_metrics.get("link_queue_wait_p95_s")
-        ),
-        bottleneck=runtime_performance_payload.get("bottleneck", performance.bottleneck),
+        link_delay_p95_s=None,
+        bottleneck=performance.bottleneck,
         details={
             **performance.details,
             "static_serving_throughput": performance.details,
-            "runtime_scope": runtime_metrics.get("scope"),
-            "runtime_trace_model": runtime_metrics.get("trace_model"),
-            "valid_for_paper_main_results": runtime_metrics.get("valid_for_paper_main_results"),
+            "runtime_scope": provenance.get("trace_scope"),
+            "runtime_trace_model": provenance.get("trace_model"),
+            "valid_for_paper_main_results": provenance.get("valid_for_paper_main_results", False),
         },
         warnings=warnings,
     )
@@ -454,13 +315,6 @@ def _warnings_from_payload(payload: dict[str, Any]) -> tuple[str, ...]:
 
 def _dedupe(values: tuple[Any, ...]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(str(value) for value in values if value is not None))
-
-
-def _first_present(*values: Any) -> Any:
-    for value in values:
-        if value is not None:
-            return value
-    return None
 
 
 def _workload_summary_from_result(

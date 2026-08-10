@@ -25,7 +25,7 @@ class ExperimentSpec:
     workload: WorkloadBundleRef = field(default_factory=WorkloadBundleRef)
     serving: ServingSpec = field(default_factory=ServingSpec)
     simulation: SimulationConfig = field(default_factory=SimulationConfig)
-    scheduler: RuntimeStrategySpec = field(default_factory=lambda: RuntimeStrategySpec.from_value(None))
+    runtime_strategy: RuntimeStrategySpec = field(default_factory=RuntimeStrategySpec)
     dse: DSESpec = field(default_factory=DSESpec)
     hardware: HardwareSpec | None = None
     description: str = ""
@@ -33,6 +33,8 @@ class ExperimentSpec:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any], *, base_dir: str | None = None) -> "ExperimentSpec":
+        if "scheduler" in data:
+            raise ValueError("scheduler is unsupported; use runtime_strategy")
         return cls(
             experiment_id=str(data["experiment_id"]),
             description=str(data.get("description", "")),
@@ -42,7 +44,7 @@ class ExperimentSpec:
             workload=WorkloadBundleRef.from_dict(data.get("workload")),
             serving=ServingSpec.from_dict(data.get("serving")),
             simulation=SimulationConfig.from_dict(data.get("simulation")),
-            scheduler=RuntimeStrategySpec.from_dict(data.get("scheduler")),
+            runtime_strategy=RuntimeStrategySpec.from_dict(data.get("runtime_strategy")),
             dse=DSESpec.from_dict(data.get("dse")),
             base_dir=base_dir,
         )
@@ -57,7 +59,7 @@ class ExperimentSpec:
             "workload": self.workload.to_dict(),
             "serving": self.serving.to_dict(),
             "simulation": self.simulation.to_dict(),
-            "scheduler": self.scheduler.to_dict(),
+            "runtime_strategy": self.runtime_strategy.to_dict(),
             "dse": self.dse.to_dict(),
             "base_dir": self.base_dir,
         }

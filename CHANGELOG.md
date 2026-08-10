@@ -47,6 +47,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   TTFT/E2E statistics to completed requests.
 - Made Runtime consume the static satellite energy profile provided by
   Architecture directly.
+- Made Runtime derive per-satellite KV capacity from Architecture storage and
+  Serving's model-specific KV bytes per token.
+- Renamed the Runtime orbit input to `environment_state` and the KV strategy
+  limit to `kv_migration_fraction`.
+- Defined KV movement as source-retaining copy with deterministic single-source
+  selection and token-level LRU capacity accounting.
 
 ### Removed
 
@@ -61,6 +67,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Removed planned-versus-observed energy alignment, duplicate queue state,
   redundant decision contracts, and the standalone Runtime strategy package.
 - Removed SLO classification and SLO pass/fail accounting from Runtime results.
+- Removed Runtime HBM/page-accounting configuration, duplicated session KV
+  locations, and unused context-version state.
 
 ### Fixed
 

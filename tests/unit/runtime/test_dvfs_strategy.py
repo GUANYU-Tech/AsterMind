@@ -1,56 +1,53 @@
 import unittest
 
 from orbitserve.runtime import RuntimeStrategySpec
-from orbitserve.runtime.engine.decision import build_candidate_selector
+from orbitserve.runtime.engine.decision import SchedulerCandidate, build_candidate_selector
 
 
-def _candidate(candidate_id, satellite_id):
-    return {
-        "candidate_id": candidate_id,
-        "action_type": "local_compute",
-        "feasible": True,
-        "route_plan": {},
-        "predicted_ttft_s": 1.0,
-        "predicted_e2e_s": 2.0,
-        "predicted_queue_wait_s": 0.0,
-        "predicted_link_wait_s": 0.0,
-        "predicted_energy_risk": 0.0,
-        "predicted_soc_after": 0.8,
-        "hop_count": 0,
-        "provenance": {
-            "compute_satellite_id": satellite_id,
-            "access_satellite_id": satellite_id,
-            "path_id": satellite_id,
-        },
-
-    }
-class RuntimeDVFSStrategyTests(unittest.TestCase):
-    def test_strategy_owns_shadow_dvfs_configuration(self):
-        strategy = RuntimeStrategySpec.from_dict(
-            {
-                "policy": "orbitserve",
-                "shadow_dvfs_enabled": True,
-                "shadow_dvfs_scale": 0.25,
-            }
+class RuntimeStrategyTests(unittest.TestCase):
+    def test_contract_contains_only_resolved_strategy_parameters(self):
+        strategy = RuntimeStrategySpec(
+            ingress_selection="communication_satellite",
+            latency_weight=0.4,
+            kv_reuse_weight=0.3,
+            energy_weight=0.2,
+            compute_load_weight=0.1,
+            shadow_dvfs_enabled=True,
+            shadow_dvfs_scale=0.5,
+            kv_migration_fraction=0.5,
         )
+        self.assertAlmostEqual(sum(strategy.weights.values()), 1.0)
+        self.assertNotIn("policy", strategy.to_dict())
 
-        self.assertTrue(strategy.shadow_dvfs_enabled)
-        self.assertEqual(strategy.shadow_dvfs_scale, 0.25)
+    def test_weights_must_sum_to_one(self):
+        with self.assertRaisesRegex(ValueError, "sum to 1"):
+            RuntimeStrategySpec(latency_weight=1.0)
 
-    def test_shadow_dvfs_scale_must_not_exceed_nominal_capacity(self):
-        with self.assertRaises(ValueError):
-            RuntimeStrategySpec.from_dict({"shadow_dvfs_scale": 1.1})
+    def test_kv_migration_fraction_must_be_a_fraction(self):
+        with self.assertRaisesRegex(ValueError, "kv_migration_fraction"):
+            RuntimeStrategySpec(kv_migration_fraction=1.1)
 
+    def test_unknown_legacy_fields_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Unsupported"):
+            RuntimeStrategySpec.from_dict({"policy": "orbitserve"})
 
-    def test_fixed_strategy_selects_equal_candidates_deterministically(self):
-        scheduler = build_candidate_selector(RuntimeStrategySpec.from_dict({"policy": "orbitserve"}))
-        state = {"candidates": (_candidate("candidate-b", "sat-b"), _candidate("candidate-a", "sat-a"))}
-        first = scheduler.select_action(state, {"request_id": "request-0"})
-        second = scheduler.select_action(state, {"request_id": "request-0"})
+    def test_candidate_scores_are_weighted_and_ties_are_deterministic(self):
+        strategy = RuntimeStrategySpec(
+            latency_weight=1.0,
+            kv_reuse_weight=0.0,
+            energy_weight=0.0,
+            compute_load_weight=0.0,
+        )
+        candidates = (
+            SchedulerCandidate("b", "sat-b", True, {}, 0.8, 0.0, 0.5, 1.0, 0.2, 0.0),
+            SchedulerCandidate("a", "sat-a", True, {}, 0.8, 0.0, 0.5, 1.0, 0.2, 0.0),
+        )
+        decision = build_candidate_selector(strategy).select_action(
+            {"candidates": tuple(item.to_dict() for item in candidates)}
+        )
+        self.assertEqual(decision.selected_candidate_id, "a")
+        self.assertEqual(decision.score_terms["score_model"], "normalized_compute_satellite_score_v1")
 
-        self.assertEqual(first.selected_candidate_id, "candidate-a")
-        self.assertEqual(second.selected_candidate_id, first.selected_candidate_id)
-        self.assertFalse(first.optimization_support["strategy_mutable_during_run"])
 
 if __name__ == "__main__":
     unittest.main()
