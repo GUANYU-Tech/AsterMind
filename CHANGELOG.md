@@ -11,6 +11,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Added a deterministic SGP4 pipeline from validated mean elements through
   WGS-72 TEME propagation, pinned-data ITRS conversion, WGS-84 geometry, and
   canonical Orbit Trace generation via `generate_orbit_trace`.
+- Added an isolated STK 11.6 validation lane with frozen state-vector and
+  geometry-event corpora, direct-element SGP4 mapping, deterministic evidence,
+  and separate TEME, Fixed, SGL, ISL, lighting, and AER comparisons.
 - Added `RuntimeSimulationSpec` as the immutable aggregate input for one
   deterministic Runtime simulation.
 - Added per-satellite capacity-driven LRU management for KV cache state.
@@ -20,14 +23,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Made `OrbitTraceManifest` and `OrbitTraceBundle` the canonical Orbit trace
   class names, with geometry-only records and metadata as their complete public
   output contract.
-- Kept the SGP4 implementation as flat `sgp4_*` modules under
-  `orbitserve.orbit` while keeping cross-module use on the public
+- Grouped SGP4 implementation details by responsibility under
+  `orbitserve.orbit.sgp4` while keeping cross-module use on the public
   `orbitserve.orbit` entry point.
 - Removed `v2` from the canonical Orbit Trace schema and public API names;
   `orbitserve.orbit_trace`, `write_orbit_trace`, and `load_orbit_trace` now
   define the single current output format.
 - Declared the pinned SGP4, Astropy, Earth-orientation dependencies and vendored
   IERS package data in `pyproject.toml`.
+- Extended the STK validation contract with Facility-side AER sampling,
+  half-open event-window normalization, explicit Umbra/Penumbra handling, and
+  fail-closed temporary-scenario cleanup.
 - Reorganized Runtime into `setup`, `engine`, `state`, and `metrics`, with
   public contracts and results kept at the package root.
 - Made `RuntimeStrategySpec` part of `RuntimeSimulationSpec` and consolidated
@@ -63,7 +69,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Verification
 
-- Passed all 39 Orbit unit tests.
+- Passed all 77 Orbit unit tests.
+- Reproduced the complete STK geometry corpus byte-for-byte across two runs;
+  SGL and ISL sample-state agreement was 100%, while the two satellite Umbra
+  agreement ratios were 99.72% and 99.86%.
+- Kept STK results diagnostic-only; formal acceptance thresholds remain
+  intentionally unfrozen pending review.
 - Confirmed that remaining module-boundary, fixed-design integration, and smoke
   failures are limited to Runtime, Experiments, and DSE consumers that still
   import the removed Orbit interfaces and require owner-led migration.

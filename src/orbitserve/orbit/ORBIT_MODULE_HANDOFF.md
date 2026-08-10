@@ -29,9 +29,9 @@ orbit/
   data/iers/...       # 固定 IERS 与闰秒数据
 ```
 
-旧圆轨道配置、旧 simulator、surrogate trace、旧 trace builder 和
-`RuntimeTrace*` 兼容别名均已删除。其他模块只能从 `orbitserve.orbit` 导入，
-不得直接依赖 `sgp4/` 内部脚本。
+旧圆轨道配置、旧模拟器、代理 Trace、旧 Trace 构建器和 `RuntimeTrace*`
+兼容别名均已删除。其他模块只能从 `orbitserve.orbit` 导入，不得直接依赖
+`sgp4/` 内部脚本。
 
 ## 3. 运行依赖
 
@@ -53,7 +53,7 @@ Orbit 使用仓库内固定的 IERS-A 与闰秒数据，运行时不联网更新
 权威输入；两行 TLE 仅可作为审计工件，不作为生产传播输入。完整字段、单位与
 校验规则见 [`SGP4_INPUT_CONTRACT.md`](SGP4_INPUT_CONTRACT.md)。
 
-### Workload gateway
+### Workload 地面网关
 
 Workload 提供稳定的 `gateway_id`、`lat_deg` 和 `lon_deg`。Runtime 或集成层通过
 Workload 公开入口读取并转换为：
@@ -69,7 +69,7 @@ Workload 公开入口读取并转换为：
 ```
 
 `ingress_id` 必须与请求中的入口 ID 一致；`min_elevation_deg` 是运行场景策略。
-gateway 带宽、成本和运行时可用性不得传给 Orbit。
+地面网关的带宽、成本和运行时可用性不得传给 Orbit。
 
 ### ISL 候选
 
@@ -113,7 +113,7 @@ manifest = generate_orbit_trace(
 - `isl_windows.json`
 - `sunlight_windows.json`
 
-schema 固定为 `orbitserve.orbit_trace`，不带 `v1`/`v2` 格式标记。相同规范化
+模式固定为 `orbitserve.orbit_trace`，不带 `v1`/`v2` 格式标记。相同规范化
 输入必须产生完全相同的文件集合、原始字节、SHA-256 和 `trace_id`。
 
 `load_orbit_trace` 返回 `OrbitTraceBundle`，公开字段为：
@@ -130,7 +130,7 @@ Runtime、DSE、Experiments 或其他使用方需要：
 1. 只导入 `OrbitTraceManifest`、`OrbitTraceBundle`、`generate_orbit_trace` 或
    `load_orbit_trace` 等 `orbitserve.orbit` 公开符号；
 2. 不再导入 `ConstellationDesign`、`SimulationConfig`、`run_simulation`、
-   `RuntimeTrace*`、surrogate/circular 常量或已删除的内部脚本；
+   `RuntimeTrace*`、代理/圆轨道常量或已删除的内部脚本；
 3. 从 `bundle.sgl_windows`、`bundle.isl_windows` 和
    `bundle.sunlight_windows` 读取几何窗口；
 4. 由 Runtime 根据 Orbit 几何、Architecture 和运行配置生成
@@ -152,18 +152,18 @@ python -m unittest discover -s tests/integration/fixed_design -t .
 python -m unittest discover -s tests/smoke -t .
 ```
 
-Orbit 单元测试必须先通过。边界、integration 或 smoke 中仍导入旧 Orbit 接口的
+Orbit 单元测试必须先通过。模块边界、集成或冒烟测试中仍导入旧 Orbit 接口的
 失败应由对应测试/消费模块负责人迁移，Orbit 负责人不越界修改。完整 Runtime 或
-DSE 新路径完成后再补跑 slow tests。
+DSE 新路径完成后再补跑慢速测试。
 
 2026-07-23 验证状态：
 
-- Orbit unit：通过，`39/39`；
-- module boundary：Runtime 仍导入 `CIRCULAR_GEOMETRY_TRACE`，待 Runtime 负责人迁移；
-- fixed-design integration：Experiments 仍导入 `ConstellationDesign`，Runtime
-  仍导入 circular 常量，待对应负责人迁移；
-- smoke：Experiments 与 DSE 仍导入 `ConstellationDesign`，待后续阶段迁移；
-- slow：本阶段不运行，等完整 Runtime/DSE SGP4 路径接通后补跑。
+- Orbit 单元测试：通过，`39/39`；
+- 模块边界测试：Runtime 仍导入 `CIRCULAR_GEOMETRY_TRACE`，待 Runtime 负责人迁移；
+- 固定设计集成测试：Experiments 仍导入 `ConstellationDesign`，Runtime
+  仍导入圆轨道常量，待对应负责人迁移；
+- 冒烟测试：Experiments 与 DSE 仍导入 `ConstellationDesign`，待后续阶段迁移；
+- 慢速测试：本阶段不运行，等完整 Runtime/DSE SGP4 路径接通后补跑。
 
 当前扫描未发现 Workload、Architecture 或 Serving 对已删除 Orbit 接口的直接
 依赖。
