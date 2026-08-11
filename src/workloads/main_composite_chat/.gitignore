@@ -1,0 +1,10 @@
+# ShareChat source CSVs are gated, large, and reproducible from the dataset.
+data/*
+!data/.gitkeep
+
+# Llama tokenizer downloaded from HuggingFace (~10 MB).
+tokenizer_llama_31/
+
+# Generated bundles are large (~100 MB each) and reproducible.
+bundles/*
+!bundles/.gitkeep

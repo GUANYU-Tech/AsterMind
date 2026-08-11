@@ -1,0 +1,210 @@
+[
+  {
+    "gateway_id": "gw_seattle",
+    "lat_deg": 47.6062,
+    "lon_deg": -122.3321,
+    "gateway_bandwidth_bps": 100000000000,
+    "availability_profile_id": null,
+    "cost_usd_per_year": null
+  },
+  {
+    "gateway_id": "gw_los_angeles",
+    "lat_deg": 34.0522,
+    "lon_deg": -118.2437,
+    "gateway_bandwidth_bps": 100000000000,
+    "availability_profile_id": null,
+    "cost_usd_per_year": null
+  },
+  {
+    "gateway_id": "gw_dallas",
+    "lat_deg": 32.7767,
+    "lon_deg": -96.797,
+    "gateway_bandwidth_bps": 100000000000,
+    "availability_profile_id": null,
+    "cost_usd_per_year": null
+  },
+  {
+    "gateway_id": "gw_chicago",
+    "lat_deg": 41.8781,
+    "lon_deg": -87.6298,
+    "gateway_bandwidth_bps": 100000000000,
+    "availability_profile_id": null,
+    "cost_usd_per_year": null
+  },
+  {
+    "gateway_id": "gw_new_york",
+    "lat_deg": 40.7128,
+    "lon_deg": -74.006,
+    "gateway_bandwidth_bps": 100000000000,
+    "availability_profile_id": null,
+    "cost_usd_per_year": null
+  },
+  {
+    "gateway_id": "gw_toronto",
+    "lat_deg": 43.6532,
+    "lon_deg": -79.3832,
+    "gateway_bandwidth_bps": 100000000000,
+    "availability_profile_id": null,
+    "cost_usd_per_year": null
+  },
+  {
+    "gateway_id": "gw_mexico_city",
+    "lat_deg": 19.4326,
+    "lon_deg": -99.1332,
+    "gateway_bandwidth_bps": 100000000000,
+    "availability_profile_id": null,
+    "cost_usd_per_year": null
+  },
+  {
+    "gateway_id": "gw_sao_paulo",
+    "lat_deg": -23.5505,
+    "lon_deg": -46.6333,
+    "gateway_bandwidth_bps": 100000000000,
+    "availability_profile_id": null,
+    "cost_usd_per_year": null
+  },
+  {
+    "gateway_id": "gw_london",
+    "lat_deg": 51.5074,
+    "lon_deg": -0.1278,
+    "gateway_bandwidth_bps": 100000000000,
+    "availability_profile_id": null,
+    "cost_usd_per_year": null
+  },
+  {
+    "gateway_id": "gw_frankfurt",
+    "lat_deg": 50.1109,
+    "lon_deg": 8.6821,
+    "gateway_bandwidth_bps": 100000000000,
+    "availability_profile_id": null,
+    "cost_usd_per_year": null
+  },
+  {
+    "gateway_id": "gw_madrid",
+    "lat_deg": 40.4168,
+    "lon_deg": -3.7038,
+    "gateway_bandwidth_bps": 100000000000,
+    "availability_profile_id": null,
+    "cost_usd_per_year": null
+  },
+  {
+    "gateway_id": "gw_lagos",
+    "lat_deg": 6.5244,
+    "lon_deg": 3.3792,
+    "gateway_bandwidth_bps": 100000000000,
+    "availability_profile_id": null,
+    "cost_usd_per_year": null
+  },
+  {
+    "gateway_id": "gw_nairobi",
+    "lat_deg": -1.2921,
+    "lon_deg": 36.8219,
+    "gateway_bandwidth_bps": 100000000000,
+    "availability_profile_id": null,
+    "cost_usd_per_year": null
+  },
+  {
+    "gateway_id": "gw_johannesburg",
+    "lat_deg": -26.2041,
+    "lon_deg": 28.0473,
+    "gateway_bandwidth_bps": 100000000000,
+    "availability_profile_id": null,
+    "cost_usd_per_year": null
+  },
+  {
+    "gateway_id": "gw_istanbul",
+    "lat_deg": 41.0082,
+    "lon_deg": 28.9784,
+    "gateway_bandwidth_bps": 100000000000,
+    "availability_profile_id": null,
+    "cost_usd_per_year": null
+  },
+  {
+    "gateway_id": "gw_dubai",
+    "lat_deg": 25.2048,
+    "lon_deg": 55.2708,
+    "gateway_bandwidth_bps": 100000000000,
+    "availability_profile_id": null,
+    "cost_usd_per_year": null
+  },
+  {
+    "gateway_id": "gw_mumbai",
+    "lat_deg": 19.076,
+    "lon_deg": 72.8777,
+    "gateway_bandwidth_bps": 100000000000,
+    "availability_profile_id": null,
+    "cost_usd_per_year": null
+  },
+  {
+    "gateway_id": "gw_delhi",
+    "lat_deg": 28.6139,
+    "lon_deg": 77.209,
+    "gateway_bandwidth_bps": 100000000000,
+    "availability_profile_id": null,
+    "cost_usd_per_year": null
+  },
+  {
+    "gateway_id": "gw_singapore",
+    "lat_deg": 1.3521,
+    "lon_deg": 103.8198,
+    "gateway_bandwidth_bps": 100000000000,
+    "availability_profile_id": null,
+    "cost_usd_per_year": null
+  },
+  {
+    "gateway_id": "gw_jakarta",
+    "lat_deg": -6.2088,
+    "lon_deg": 106.8456,
+    "gateway_bandwidth_bps": 100000000000,
+    "availability_profile_id": null,
+    "cost_usd_per_year": null
+  },
+  {
+    "gateway_id": "gw_bangkok",
+    "lat_deg": 13.7563,
+    "lon_deg": 100.5018,
+    "gateway_bandwidth_bps": 100000000000,
+    "availability_profile_id": null,
+    "cost_usd_per_year": null
+  },
+  {
+    "gateway_id": "gw_hong_kong",
+    "lat_deg": 22.3193,
+    "lon_deg": 114.1694,
+    "gateway_bandwidth_bps": 100000000000,
+    "availability_profile_id": null,
+    "cost_usd_per_year": null
+  },
+  {
+    "gateway_id": "gw_beijing",
+    "lat_deg": 39.9042,
+    "lon_deg": 116.4074,
+    "gateway_bandwidth_bps": 100000000000,
+    "availability_profile_id": null,
+    "cost_usd_per_year": null
+  },
+  {
+    "gateway_id": "gw_seoul",
+    "lat_deg": 37.5665,
+    "lon_deg": 126.978,
+    "gateway_bandwidth_bps": 100000000000,
+    "availability_profile_id": null,
+    "cost_usd_per_year": null
+  },
+  {
+    "gateway_id": "gw_tokyo",
+    "lat_deg": 35.6762,
+    "lon_deg": 139.6503,
+    "gateway_bandwidth_bps": 100000000000,
+    "availability_profile_id": null,
+    "cost_usd_per_year": null
+  },
+  {
+    "gateway_id": "gw_sydney",
+    "lat_deg": -33.8688,
+    "lon_deg": 151.2093,
+    "gateway_bandwidth_bps": 100000000000,
+    "availability_profile_id": null,
+    "cost_usd_per_year": null
+  }
+]
