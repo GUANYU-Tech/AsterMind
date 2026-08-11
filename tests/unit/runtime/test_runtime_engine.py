@@ -138,7 +138,10 @@ class RuntimeEngineTests(unittest.TestCase):
         result = run_simulation(_scenario(strategy))
         record = result.request_records[0]
         first_leg = record["routing"]["selected_path"][0]
-        self.assertAlmostEqual(first_leg["propagation_delay_s"], 550.0 / 299_792.458)
+        self.assertAlmostEqual(
+            first_leg["propagation_delay_s"],
+            (450.0 + abs((7000.0 - 6378.137) - 450.0)) / 299_792.458,
+        )
         self.assertAlmostEqual(first_leg["transmission_s"], 1000.0 * 8.0 / 1e9)
 
     def test_shadow_dvfs_scales_compute_capacity(self):

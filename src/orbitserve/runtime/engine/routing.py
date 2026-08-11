@@ -12,6 +12,7 @@ from ...common import to_jsonable
 
 C_KM_PER_S = 299_792.458
 EARTH_RADIUS_KM = 6_378.137
+COMMUNICATION_SHELL_ALTITUDE_KM = 450.0
 
 
 class RouteUnavailable(ValueError):
@@ -88,7 +89,10 @@ def communication_access_candidate(profile: Any, request: dict[str, Any], horizo
         end_s=float(horizon_s),
         uplink_bandwidth_bps=float(profile.uplink_bandwidth_bps),
         downlink_bandwidth_bps=float(profile.downlink_bandwidth_bps),
-        propagation_delay_s=float(profile.altitude_km) / C_KM_PER_S,
+        # The MVP uses one ideal, always-reachable communication shell.  Keep
+        # the existing ingress profile intact for its bandwidth contract, but
+        # do not use its legacy altitude setting as a routing input.
+        propagation_delay_s=COMMUNICATION_SHELL_ALTITUDE_KM / C_KM_PER_S,
         anchor_unit_vector=anchor,
     )
 
@@ -136,7 +140,14 @@ def build_route_plan(
     target_vector = satellite_position_unit(environment_state, compute_satellite_id, time_s)
     angle = central_angle(access.anchor_unit_vector, target_vector)
     if access.access_type == "communication_satellite":
-        network_propagation = angle * EARTH_RADIUS_KM / C_KM_PER_S
+        network_propagation = _shell_arc_network_propagation_s(
+            angle_rad=angle,
+            compute_altitude_km=satellite_altitude_km(
+                environment_state,
+                compute_satellite_id,
+                time_s,
+            ),
+        )
         inbound = (
             RouteLeg(
                 link_id=f"communication:{access.ingress_id}:{compute_satellite_id}",
@@ -167,6 +178,11 @@ def build_route_plan(
             outbound_legs=outbound,
             arc_distance_rad=angle,
             route_satellite_ids=(compute_satellite_id,),
+            provenance={
+                "communication_model": "fixed_shell_arc",
+                "communication_shell_altitude_km": COMMUNICATION_SHELL_ALTITUDE_KM,
+                "reachability_assumption": "always_reachable",
+            },
         )
 
     source = str(access.satellite_id)
@@ -324,6 +340,14 @@ def build_isl_transfer_legs(
 
 
 def satellite_position_unit(environment_state: Any, satellite_id: str, time_s: float) -> tuple[float, float, float]:
+    vector = satellite_position_km(environment_state, satellite_id, time_s)
+    norm = math.sqrt(sum(item * item for item in vector))
+    if norm <= 0.0:
+        raise RouteUnavailable(f"ephemeris_invalid:{satellite_id}")
+    return tuple(item / norm for item in vector)
+
+
+def satellite_position_km(environment_state: Any, satellite_id: str, time_s: float) -> tuple[float, float, float]:
     rows = [
         row for row in environment_state.ephemeris_samples
         if str(row.get("satellite_id")) == satellite_id
@@ -331,11 +355,29 @@ def satellite_position_unit(environment_state: Any, satellite_id: str, time_s: f
     if not rows:
         raise RouteUnavailable(f"ephemeris_missing:{satellite_id}")
     row = min(rows, key=lambda item: (abs(float(item["time_s"]) - time_s), float(item["time_s"])))
-    vector = tuple(float(item) for item in row["position_itrs_km"])
-    norm = math.sqrt(sum(item * item for item in vector))
-    if norm <= 0.0:
-        raise RouteUnavailable(f"ephemeris_invalid:{satellite_id}")
-    return tuple(item / norm for item in vector)
+    return tuple(float(item) for item in row["position_itrs_km"])
+
+
+def satellite_altitude_km(environment_state: Any, satellite_id: str, time_s: float) -> float:
+    vector = satellite_position_km(environment_state, satellite_id, time_s)
+    radius_km = math.sqrt(sum(item * item for item in vector))
+    if radius_km <= EARTH_RADIUS_KM:
+        raise RouteUnavailable(f"ephemeris_inside_earth:{satellite_id}")
+    return radius_km - EARTH_RADIUS_KM
+
+
+def _shell_arc_network_propagation_s(*, angle_rad: float, compute_altitude_km: float) -> float:
+    """Return the shell-arc portion after the ground-to-shell radial segment."""
+
+    if not math.isfinite(angle_rad) or angle_rad < 0.0:
+        raise RouteUnavailable("invalid_shell_arc_angle")
+    if not math.isfinite(compute_altitude_km) or compute_altitude_km < 0.0:
+        raise RouteUnavailable("invalid_compute_altitude")
+    path_km = (
+        (EARTH_RADIUS_KM + COMMUNICATION_SHELL_ALTITUDE_KM) * angle_rad
+        + abs(compute_altitude_km - COMMUNICATION_SHELL_ALTITUDE_KM)
+    )
+    return path_km / C_KM_PER_S
 
 
 def central_angle(first: tuple[float, float, float], second: tuple[float, float, float]) -> float:
@@ -368,6 +410,7 @@ __all__ = [
     "RouteLeg",
     "RoutePlan",
     "RouteUnavailable",
+    "COMMUNICATION_SHELL_ALTITUDE_KM",
     "build_route_plan",
     "build_isl_transfer_legs",
     "central_angle",
@@ -375,5 +418,6 @@ __all__ = [
     "compute_access_candidates",
     "execute_route",
     "satellite_position_unit",
+    "satellite_altitude_km",
     "shortest_active_isl_path",
 ]
