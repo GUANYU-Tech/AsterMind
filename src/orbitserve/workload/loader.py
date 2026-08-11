@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any
 
 from .contract import (
+    CAUSAL_BUNDLE_SCHEMA,
+    CAUSAL_SESSION_REQUEST_KEYS,
     GATEWAY_KEYS,
     MANIFEST_FILE,
     REGION_KEYS,
@@ -94,7 +96,12 @@ def load_workload_bundle(bundle_dir: str | Path) -> WorkloadGenerationResult:
     # Exact-key validation
     validate_exact_keys(region_rows, REGION_KEYS, "regions")
     validate_exact_keys(gateway_rows, GATEWAY_KEYS, "gateways")
-    validate_exact_keys(session_request_rows, SESSION_REQUEST_KEYS, "session_requests")
+    request_keys = (
+        CAUSAL_SESSION_REQUEST_KEYS
+        if manifest.get("schema_version") == CAUSAL_BUNDLE_SCHEMA
+        else SESSION_REQUEST_KEYS
+    )
+    validate_exact_keys(session_request_rows, request_keys, "session_requests")
 
     # Coerce
     seed = seed_from_manifest(manifest)

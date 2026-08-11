@@ -100,6 +100,10 @@ def stream_upsampled_sessions(
                 new_row = dict(row)
                 new_row["request_id"] = new_request_id
                 new_row["session_id"] = new_session_id
+                dependency = row.get("depends_on_request_id")
+                if dependency is not None:
+                    dependency_tag = stable_hex(seed_key, str(dependency), str(copy_index), length=16)
+                    new_row["depends_on_request_id"] = f"{dependency}_up{copy_index}_{dependency_tag}"
                 new_row["arrival_time_s"] = round(float(row["arrival_time_s"]) + shift, 6)
                 new_row["seed"] = stable_seed(seed_key, new_request_id)
                 new_rows.append(new_row)

@@ -163,6 +163,42 @@ class UpsampleTests(unittest.TestCase):
             for row in rows:
                 self.assertEqual(set(row), set(SESSION_REQUEST_KEYS))
 
+    def test_causal_dependencies_are_remapped_with_request_ids(self):
+        workload = _workload()
+        rows = list(workload.session_requests)
+        first_id = rows[0]["request_id"]
+        rows[0] = {
+            **rows[0],
+            "arrival_time_mode": "absolute",
+            "depends_on_request_id": None,
+            "source_trace_time_s": 0.0,
+            "source_api_time_s": 2.0,
+        }
+        rows[1] = {
+            **rows[1],
+            "arrival_time_mode": "after_dependency_completion",
+            "depends_on_request_id": first_id,
+            "source_trace_time_s": 5.0,
+            "source_api_time_s": 1.0,
+        }
+        workload = workload.__class__(
+            bundle_dir=workload.bundle_dir,
+            manifest=workload.manifest,
+            regions=workload.regions,
+            gateways=workload.gateways,
+            session_requests=tuple(rows),
+            timebin_demand=workload.timebin_demand,
+            summary=workload.summary,
+        )
+
+        out = list(stream_upsampled_sessions(workload, 2, seed="causal"))
+        for copied_session, copied_rows in out:
+            if not copied_session["session_id"].startswith("s1_up"):
+                continue
+            copied = {row["turn_index"]: row for row in copied_rows}
+            assert copied[1]["depends_on_request_id"] == copied[0]["request_id"]
+            assert copied[1]["inter_turn_gap_s"] == rows[1]["inter_turn_gap_s"]
+
     def test_factor_validation(self):
         for bad in (0, -2, 1.5, "3", None):
             with self.assertRaises(ValueError, msg=f"factor={bad!r}"):

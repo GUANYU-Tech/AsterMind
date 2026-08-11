@@ -1,5 +1,6 @@
 """Canonical workload contracts, loading, validation, and materialization."""
 from .contract import (
+    CAUSAL_BUNDLE_SCHEMA, CAUSAL_SESSION_REQUEST_KEYS,
     BUNDLE_FILES, BUNDLE_SCHEMA, CANONICALIZATION,
     GATEWAY_KEYS, REGION_KEYS,
     SESSION_REQUEST_KEYS, TIMEBIN_FIELDS,
@@ -10,6 +11,7 @@ from .contract import (
 from .loader import load_workload_bundle, materialize_workload_bundle
 
 __all__ = [
+    "CAUSAL_BUNDLE_SCHEMA", "CAUSAL_SESSION_REQUEST_KEYS",
     "BUNDLE_FILES", "BUNDLE_SCHEMA", "CANONICALIZATION",
     "GATEWAY_KEYS", "REGION_KEYS",
     "SESSION_REQUEST_KEYS", "TIMEBIN_FIELDS",

@@ -6,8 +6,9 @@ ShareChat stores one message per CSV row.  This adapter groups rows by
 ``platform + url`` and emits one OrbitServe session per original shared
 conversation.  A session is assigned a country (from Microsoft-derived top-40
 weights) and a second-level local-time start (drawn from Profound Figure 2
-regional digitized diurnal curves); its later turns retain the observed
-timestamp gaps.
+regional digitized diurnal curves). Later turns are completion-relative: each
+is released after the preceding assistant response completes plus the observed
+client think time.
 
 Four profile patterns are supported via ``--profile-pattern``:
   work_weekday | work_weekend | nonwork_weekday | nonwork_weekend
@@ -35,19 +36,17 @@ from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
 from orbitserve.workload import (
-    BUNDLE_FILES, BUNDLE_SCHEMA, CANONICALIZATION,
+    BUNDLE_FILES, CAUSAL_BUNDLE_SCHEMA, CANONICALIZATION,
     SESSION_REQUEST_KEYS, REGION_KEYS, GATEWAY_KEYS, TIMEBIN_FIELDS,
     bundle_hash, canonical_json_bytes, load_workload_bundle,
 )
-
-
 _HERE = Path(__file__).resolve().parent
 DEFAULT_COUNTRIES = _HERE / "countries.csv"
 PROFILE_PATTERNS = {
-    "work_weekday":      (_HERE / "profiles" / "work_weekday.csv",      "weekday"),
-    "work_weekend":      (_HERE / "profiles" / "work_weekend.csv",      "weekend"),
-    "nonwork_weekday":   (_HERE / "profiles" / "nonwork_weekday.csv",   "weekday"),
-    "nonwork_weekend":   (_HERE / "profiles" / "nonwork_weekend.csv",   "weekend"),
+    "work_weekday": (_HERE / "profiles" / "work_weekday.csv", "weekday"),
+    "work_weekend": (_HERE / "profiles" / "work_weekend.csv", "weekend"),
+    "nonwork_weekday": (_HERE / "profiles" / "nonwork_weekday.csv", "weekday"),
+    "nonwork_weekend": (_HERE / "profiles" / "nonwork_weekend.csv", "weekend"),
 }
 DEFAULT_PATTERN = "work_weekday"
 DEFAULT_GATEWAYS = _HERE / "gateways.json"
@@ -57,9 +56,8 @@ DEFAULT_LLAMA_ID = "meta-llama/Llama-3.1-70B-Instruct"
 TIME_BIN_S = 60
 HORIZON_S = 86_400.0
 
-# A representative civil timezone for every top-40 country.  Multi-zone
-# countries intentionally use their population/economic centre; this is a
-# scheduling assumption, not a ShareChat field.
+
+# Representative civil timezone for every top-40 country.
 TIMEZONES = {
     "China": "Asia/Shanghai", "India": "Asia/Kolkata", "United States": "America/New_York",
     "Brazil": "America/Sao_Paulo", "Indonesia": "Asia/Jakarta", "France": "Europe/Paris",
@@ -77,8 +75,8 @@ TIMEZONES = {
     "Myanmar": "Asia/Yangon", "Iraq": "Asia/Baghdad",
 }
 
-# Representative country locations make an independently usable geography
-# bundle.  More precise regional locations can be substituted later.
+
+# Representative country locations used for regions and nearest-gateway mapping.
 COORDS = {
     "China": (35.86, 104.20), "India": (20.59, 78.96), "United States": (39.83, -98.58),
     "Brazil": (-14.24, -51.93), "Indonesia": (-0.79, 113.92), "France": (46.23, 2.21),
@@ -89,10 +87,11 @@ COORDS = {
     "Egypt": (26.82, 30.80), "Turkiye": (38.96, 35.24), "South Africa": (-30.56, 22.94),
     "Canada": (56.13, -106.35), "Colombia": (4.57, -74.30), "Bangladesh": (23.68, 90.36),
     "Iran": (32.43, 53.69), "Saudi Arabia": (23.89, 45.08), "Poland": (51.92, 19.15),
-    "Australia": (-25.27, 133.78), "Argentina": (-38.42, -63.62), "United Arab Emirates": (23.42, 53.85),
-    "Thailand": (15.87, 100.99), "Ethiopia": (9.15, 40.49), "Malaysia": (4.21, 101.98),
-    "Taiwan": (23.70, 120.96), "Congo (DRC)": (-4.04, 21.76), "Netherlands": (52.13, 5.29),
-    "Algeria": (28.03, 1.66), "Peru": (-9.19, -75.02), "Myanmar": (21.91, 95.96), "Iraq": (33.22, 43.68),
+    "Australia": (-25.27, 133.78), "Argentina": (-38.42, -63.62),
+    "United Arab Emirates": (23.42, 53.85), "Thailand": (15.87, 100.99),
+    "Ethiopia": (9.15, 40.49), "Malaysia": (4.21, 101.98), "Taiwan": (23.70, 120.96),
+    "Congo (DRC)": (-4.04, 21.76), "Netherlands": (52.13, 5.29), "Algeria": (28.03, 1.66),
+    "Peru": (-9.19, -75.02), "Myanmar": (21.91, 95.96), "Iraq": (33.22, 43.68),
 }
 
 
@@ -188,12 +187,32 @@ def read_sharechat(path: Path, *, max_sessions: int, require_timestamps: bool) -
                 continue
             user_time, assistant_time = parse_message_time(user["time"]), parse_message_time(assistant["time"])
             arrival = user_time if user_time is not None else assistant_time
-            pairs.append({"user": user, "assistant": assistant, "arrival": arrival})
-        if len(pairs) < 2 or (require_timestamps and any(pair["arrival"] is None for pair in pairs)):
+            pairs.append({
+                "user": user,
+                "assistant": assistant,
+                "arrival": arrival,
+                "user_time": user_time,
+                "assistant_completion_time": assistant_time,
+            })
+        if len(pairs) < 2 or (
+            require_timestamps
+            and any(
+                pair["user_time"] is None or pair["assistant_completion_time"] is None
+                for pair in pairs
+            )
+        ):
             return
-        arrivals = [float(pair["arrival"]) for pair in pairs if pair["arrival"] is not None]
-        if require_timestamps and any(b <= a for a, b in zip(arrivals, arrivals[1:])):
-            return
+        if require_timestamps:
+            if any(
+                float(pair["assistant_completion_time"]) < float(pair["user_time"])
+                for pair in pairs
+            ):
+                return
+            if any(
+                float(current["user_time"]) < float(previous["assistant_completion_time"])
+                for previous, current in zip(pairs, pairs[1:])
+            ):
+                return
         conversations.append({"platform": platform, "url": url, "pairs": pairs, "model": pairs[0]["assistant"]["model"]})
 
     current_key: tuple[str, str] | None = None
@@ -286,36 +305,30 @@ def load_countries(path: Path) -> list[dict[str, Any]]:
 
 
 def load_regional_hour_weights(path: Path, day_type: str = "workday") -> dict[str, list[float]]:
-    """Read a Profound Figure 2 digitized regional profile CSV.
-
-    Returns ``{country: [24 local-hour weights]}`` where each country gets its
-    region's distinct diurnal shape (4 regions: Asia, Europe, North America,
-    Latin America), manually digitized from Profound 2026 Figure 2.
-    """
+    """Read a Profound Figure 2 digitized regional profile CSV."""
     raw: dict[str, dict[int, float]] = {}
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         for row in csv.DictReader(handle):
             if row["day_type"] != day_type:
                 continue
-            country = row["country"]
-            hour = int(row["local_hour"])
-            weight = float(row["hour_weight"])
-            raw.setdefault(country, {})[hour] = weight
+            raw.setdefault(row["country"], {})[int(row["local_hour"])] = float(row["hour_weight"])
 
     profiles: dict[str, list[float]] = {}
     for country, hour_map in raw.items():
-        weights = [hour_map.get(h, 0.0) for h in range(24)]
+        weights = [hour_map.get(hour, 0.0) for hour in range(24)]
         total = sum(weights)
-        if total <= 0:
-            continue
-        profiles[country] = [w / total for w in weights]
+        if total > 0:
+            profiles[country] = [weight / total for weight in weights]
     if not profiles:
         raise AdapterError(f"no {day_type} profiles found in {path}")
     return profiles
 
 
 def timezone_offset(timezone_name: str, epoch: datetime) -> float:
-    return ZoneInfo(timezone_name).utcoffset(epoch).total_seconds() / 3600.0
+    offset = ZoneInfo(timezone_name).utcoffset(epoch)
+    if offset is None:
+        raise AdapterError(f"cannot resolve UTC offset for {timezone_name}")
+    return offset.total_seconds() / 3600.0
 
 
 def sample_start(rng: random.Random, country: str, weights: list[float], epoch: datetime) -> float:
@@ -330,42 +343,47 @@ def gateways() -> list[dict[str, Any]]:
 
 
 def haversine_km(a_lat: float, a_lon: float, b_lat: float, b_lon: float) -> float:
-    r = 6371.0
+    radius_km = 6371.0
     p1, p2 = math.radians(a_lat), math.radians(b_lat)
     dp, dl = p2 - p1, math.radians(b_lon - a_lon)
-    x = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-    return 2 * r * math.asin(math.sqrt(x))
+    value = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * radius_km * math.asin(math.sqrt(value))
 
 
 def nearest_gateway(country: str, items: list[dict[str, Any]]) -> dict[str, Any]:
     lat, lon = COORDS[country]
-    return min(items, key=lambda item: haversine_km(lat, lon, float(item["lat_deg"]), float(item["lon_deg"])))
+    return min(
+        items,
+        key=lambda item: haversine_km(lat, lon, float(item["lat_deg"]), float(item["lon_deg"])),
+    )
 
 
-def slo(output: int) -> tuple[str, float, float]:
-    if output <= 256:
+def slo(output_tokens: int) -> tuple[str, float, float]:
+    if output_tokens <= 256:
         return "interactive_short", 3.0, 30.0
-    if output <= 1024:
+    if output_tokens <= 1024:
         return "interactive_long", 3.0, 120.0
     return "normal_long", 10.0, 300.0
 
 
 def percentile(sorted_values: list[float], p: float) -> float:
-    """Linear-interpolation percentile (p in 0..100)."""
+    """Linear-interpolation percentile where ``p`` is in the range 0..100."""
     if not sorted_values:
         return 0.0
-    n = len(sorted_values)
-    k = (p / 100.0) * (n - 1)
-    f = math.floor(k)
-    c = math.ceil(k)
-    if f == c:
-        return sorted_values[int(k)]
-    d0 = sorted_values[f] * (c - k)
-    d1 = sorted_values[c] * (k - f)
-    return d0 + d1
+    position = (p / 100.0) * (len(sorted_values) - 1)
+    floor = math.floor(position)
+    ceiling = math.ceil(position)
+    if floor == ceiling:
+        return sorted_values[int(position)]
+    return sorted_values[floor] * (ceiling - position) + sorted_values[ceiling] * (position - floor)
 
 
 def build(args: argparse.Namespace) -> Path:
+    if not args.require_turn_timestamps:
+        raise AdapterError(
+            "completion-relative replay requires both user and assistant timestamps; "
+            "--no-require-turn-timestamps is unsupported"
+        )
     workload_id = f"main_composite_chat_{args.profile_pattern}"
     epoch = datetime.fromisoformat(args.epoch.replace("Z", "+00:00")).astimezone(timezone.utc)
     source = Path(args.input)
@@ -405,8 +423,8 @@ def build(args: argparse.Namespace) -> Path:
         country_profile = regional_profiles.get(country, fallback_profile)
         start = sample_start(rng, country, country_profile, epoch)
         pairs = conversation["pairs"]
-        source_first = float(pairs[0]["arrival"])
-        relative = [float(pair["arrival"]) - source_first for pair in pairs]
+        source_first = float(pairs[0]["user_time"])
+        relative = [float(pair["user_time"]) - source_first for pair in pairs]
         if relative[-1] >= HORIZON_S or start + relative[-1] >= HORIZON_S:
             dropped += 1
             continue
@@ -415,13 +433,23 @@ def build(args: argparse.Namespace) -> Path:
         model_family = conversation["platform"]  # chatgpt / grok
         history: list[dict[str, str]] = []
         local_rows: list[dict[str, Any]] = []
-        for turn, (pair, gap) in enumerate(zip(pairs, relative)):
+        previous_request_id: str | None = None
+        for turn, (pair, source_offset) in enumerate(zip(pairs, relative)):
             context, new_user, output = counter.counts(
                 history, pair["user"], pair["assistant"], args.context_window_tokens
             )
             slo_class, ttft, e2e = slo(output)
             request_id = stable_id("sc_req", session_id, turn)
-            arrival = round(start + gap, 6)
+            arrival = round(start + source_offset, 6)
+            think_time = (
+                None
+                if turn == 0
+                else max(
+                    0.0,
+                    float(pair["user_time"])
+                    - float(pairs[turn - 1]["assistant_completion_time"]),
+                )
+            )
             local_rows.append({
                 "request_id": request_id,
                 "arrival_time_s": arrival,
@@ -443,11 +471,18 @@ def build(args: argparse.Namespace) -> Path:
                 "session_id": session_id,
                 "turn_index": turn,
                 "session_turn_count": len(pairs),
-                "inter_turn_gap_s": None if turn == 0 else round(gap - relative[turn - 1], 6),
+                "inter_turn_gap_s": None if think_time is None else round(think_time, 6),
                 "session_start_time_s": local_rows[0]["arrival_time_s"] if local_rows else arrival,
                 "session_ttl_s": args.session_ttl_s,
                 "seed": int(hashlib.sha256(request_id.encode()).hexdigest()[:16], 16) & ((1 << 63) - 1),
+                "arrival_time_mode": "absolute" if turn == 0 else "after_dependency_completion",
+                "depends_on_request_id": previous_request_id,
+                "source_trace_time_s": round(source_offset, 6),
+                "source_api_time_s": round(
+                    float(pair["assistant_completion_time"]) - float(pair["user_time"]), 6
+                ),
             })
+            previous_request_id = request_id
             history.extend([pair["user"], pair["assistant"]])
         # Fill session_start_time_s in all rows of this session
         session_start = local_rows[0]["arrival_time_s"]
@@ -552,7 +587,7 @@ def build(args: argparse.Namespace) -> Path:
 
     # ── workload_manifest.json ──────────────────────────────────────
     manifest = {
-        "schema_version": BUNDLE_SCHEMA,
+        "schema_version": CAUSAL_BUNDLE_SCHEMA,
         "canonicalization": CANONICALIZATION,
         "workload_id": workload_id,
         "seed": args.seed,

@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 BUNDLE_SCHEMA = "orbitserve.workload"
+CAUSAL_BUNDLE_SCHEMA = "orbitserve.workload.causal.v1"
+BUNDLE_SCHEMAS = frozenset({BUNDLE_SCHEMA, CAUSAL_BUNDLE_SCHEMA})
 DESCRIPTION_SCHEMA = "orbitserve.workload_description"
 SUMMARY_SCHEMA = "orbitserve.workload_summary"
 CANONICALIZATION = "orbitserve-json-c14n"
@@ -43,6 +45,11 @@ SESSION_REQUEST_KEYS = (
     "session_id", "turn_index", "session_turn_count",
     "inter_turn_gap_s", "session_start_time_s", "session_ttl_s",
     "seed",
+)
+
+CAUSAL_SESSION_REQUEST_KEYS = SESSION_REQUEST_KEYS + (
+    "arrival_time_mode", "depends_on_request_id",
+    "source_trace_time_s", "source_api_time_s",
 )
 
 REGION_KEYS = (
@@ -150,9 +157,10 @@ def validate_exact_keys(rows: Iterable[Mapping[str, Any]], keys: tuple[str, ...]
 
 
 def validate_manifest_and_files(bundle_dir: Path, manifest: Mapping[str, Any]) -> dict[str, Path]:
-    if manifest.get("schema_version") != BUNDLE_SCHEMA:
+    if manifest.get("schema_version") not in BUNDLE_SCHEMAS:
         raise ValueError(
-            f"unsupported workload schema {manifest.get('schema_version')!r}; expected {BUNDLE_SCHEMA!r}"
+            f"unsupported workload schema {manifest.get('schema_version')!r}; "
+            f"expected one of {sorted(BUNDLE_SCHEMAS)!r}"
         )
     if manifest.get("canonicalization") != CANONICALIZATION:
         raise ValueError("workload canonicalization is missing or unsupported")
@@ -183,6 +191,7 @@ def validate_manifest_and_files(bundle_dir: Path, manifest: Mapping[str, Any]) -
 def validate_session_consistency(requests: list[dict[str, Any]]) -> None:
     """Check prompt=context+new_user and turn_index contiguity within sessions."""
     grouped: dict[str, list[dict[str, Any]]] = {}
+    request_ids = {str(row.get("request_id")) for row in requests}
     for row in requests:
         prompt_tokens = int(row["prompt_tokens"])
         new_user_tokens = int(row["new_user_tokens"])
@@ -196,8 +205,28 @@ def validate_session_consistency(requests: list[dict[str, Any]]) -> None:
         if session_id is not None:
             grouped.setdefault(str(session_id), []).append(row)
 
+        if "arrival_time_mode" in row:
+            mode = str(row["arrival_time_mode"])
+            dependency = row.get("depends_on_request_id")
+            if mode not in {"absolute", "after_dependency_completion"}:
+                raise ValueError(f"request {row['request_id']} has unsupported arrival_time_mode={mode!r}")
+            if mode == "absolute" and dependency is not None:
+                raise ValueError(f"absolute request {row['request_id']} cannot declare a predecessor")
+            if mode == "after_dependency_completion" and not dependency:
+                raise ValueError(f"request {row['request_id']} requires depends_on_request_id")
+            if mode == "after_dependency_completion" and row.get("inter_turn_gap_s") is None:
+                raise ValueError(f"request {row['request_id']} requires inter_turn_gap_s")
+            if row.get("inter_turn_gap_s") is not None and float(row["inter_turn_gap_s"]) < 0:
+                raise ValueError(f"request {row['request_id']} has negative inter_turn_gap_s")
+            if dependency is not None and str(dependency) not in request_ids:
+                raise ValueError(
+                    f"request {row['request_id']} depends on unknown request {dependency!r}"
+                )
+            if dependency is not None and str(dependency) == str(row["request_id"]):
+                raise ValueError(f"request {row['request_id']} cannot depend on itself")
+
     for session_id, rows in grouped.items():
-        ordered = sorted(rows, key=lambda r: (float(r["arrival_time_s"]), int(r["turn_index"])))
+        ordered = sorted(rows, key=lambda r: int(r["turn_index"]))
         turn_indices = [int(r["turn_index"]) for r in ordered]
         expected = list(range(turn_indices[0], turn_indices[0] + len(turn_indices)))
         if turn_indices != expected:
@@ -521,6 +550,11 @@ def coerce_session_request_row(
         data[key] = int(float(data[key]))
     for key in ("ttft_deadline_s", "e2e_deadline_s", "inter_turn_gap_s", "session_ttl_s"):
         data[key] = optional_float(data.get(key))
+    if "arrival_time_mode" in data:
+        data["arrival_time_mode"] = str(data["arrival_time_mode"])
+        data["depends_on_request_id"] = optional_str(data.get("depends_on_request_id"))
+        for key in ("source_trace_time_s", "source_api_time_s"):
+            data[key] = float(data[key])
     data["session_turn_count"] = (
         int(float(data["session_turn_count"])) if data.get("session_turn_count") is not None else None
     )
@@ -595,7 +629,8 @@ def descriptor(*, path, media_type, payload, record_count):
 # ── Public API ─────────────────────────────────────────────────────
 
 __all__ = [
-    "BUNDLE_FILES", "BUNDLE_SCHEMA", "CANONICALIZATION",
+    "CAUSAL_BUNDLE_SCHEMA", "CAUSAL_SESSION_REQUEST_KEYS",
+    "BUNDLE_FILES", "BUNDLE_SCHEMA", "BUNDLE_SCHEMAS", "CANONICALIZATION",
     "GATEWAY_KEYS", "MANIFEST_FILE", "REGION_KEYS",
     "RUNTIME_RESULT_FIELDS", "SESSION_REQUEST_KEYS", "TIMEBIN_FIELDS",
     "GatewaySpec", "RegionSpec", "TokenDistribution",
