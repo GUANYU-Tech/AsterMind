@@ -17,6 +17,8 @@ _SECTION_DEFAULTS: dict[str, dict[str, Any]] = {
         "strategy": None, "action_type": "reject_drop", "action_components": (),
         "access_type": None,
         "access_satellite_id": None,
+        "access_compute_node_id": None,
+        "serving_compute_node_id": None,
         "serving_satellite_id": None, "dvfs_scale": None,
         "fallback_used": False, "deferred": False, "defer_until_s": None,
         "session_action": None, "shadow_strategy": None, "shadow_strategies": (),
@@ -24,6 +26,7 @@ _SECTION_DEFAULTS: dict[str, dict[str, Any]] = {
         "decode_action_type": None,
     },
     "placement": {
+        "compute_owner_compute_node_id": None, "compute_owner_compute_node_ids": (),
         "compute_owner_satellite_id": None, "compute_owner_satellite_ids": (),
     },
     "timing": {
@@ -33,7 +36,8 @@ _SECTION_DEFAULTS: dict[str, dict[str, Any]] = {
         "decode_queue_wait_s": None, "decode_service_s": None,
         "uplink_s": None, "kv_transfer_s": None, "first_token_decode_s": None,
         "return_path_s": None, "first_token_return_s": None,
-        "ttft_breakdown_s": {}, "ttft_s": None, "e2e_s": None,
+        "ttft_breakdown_s": {}, "ttft_s": None, "tpot_s": None,
+        "e2e_s": None,
         "response_streaming_model": None,
     },
     "routing": {
@@ -57,14 +61,11 @@ _SECTION_DEFAULTS: dict[str, dict[str, Any]] = {
         "kv_occupancy_tokens_before": None,
         "kv_occupancy_tokens_after": None,
         "kv_copy_source_satellite_id": None,
+        "kv_copy_source_compute_node_id": None,
     },
     "outcome": {
         "completed": False, "uncompleted_stage": None,
         "uncompleted_reason": None, "bottleneck_reason": None,
-    },
-    "slo": {
-        "evaluated": False, "slo_class": None,
-        "attained": None, "slack_s": None, "violation_reason": None,
     },
     "provenance": {
         "scope": "trace_backed_runtime_surrogate", "trace_model": "surrogate_orbit_trace",
@@ -89,7 +90,6 @@ class RuntimeRequestRecord:
     energy: dict[str, Any] = field(default_factory=dict)
     kv: dict[str, Any] = field(default_factory=dict)
     outcome: dict[str, Any] = field(default_factory=dict)
-    slo: dict[str, Any] = field(default_factory=dict)
     provenance: dict[str, Any] = field(default_factory=dict)
 
     def __init__(self, **values: Any) -> None:
@@ -133,12 +133,22 @@ class RuntimeRequestRecord:
             sections["decision"]["strategy"] = sections["provenance"].get("policy")
         if sections["request"].get("request_id") is None:
             raise TypeError("request_id is required")
-        # TTFT and E2E describe a delivered response.  An incomplete request
+        # TTFT, TPOT, and E2E describe a delivered response. An incomplete request
         # may retain stage-level timing for diagnosis, but has no end-user
         # latency value.
         if not sections["outcome"].get("completed", False):
             sections["timing"]["ttft_s"] = None
+            sections["timing"]["tpot_s"] = None
             sections["timing"]["e2e_s"] = None
+        else:
+            output_tokens = int(sections["request"].get("output_tokens", 0) or 0)
+            ttft_s = sections["timing"].get("ttft_s")
+            e2e_s = sections["timing"].get("e2e_s")
+            sections["timing"]["tpot_s"] = _tpot_s(
+                ttft_s=ttft_s,
+                e2e_s=e2e_s,
+                output_tokens=output_tokens,
+            )
         for name, payload in sections.items():
             object.__setattr__(self, name, payload)
 
@@ -162,7 +172,7 @@ class RuntimeRequestRecord:
             "request": self.request, "decision": self.decision,
             "placement": self.placement, "timing": self.timing,
             "routing": self.routing, "energy": self.energy, "kv": self.kv,
-            "outcome": self.outcome, "slo": self.slo,
+            "outcome": self.outcome,
             "provenance": self.provenance,
         })
 
@@ -180,6 +190,15 @@ def _sum_path_value(path: tuple[Any, ...], key: str) -> float:
 
 def _sum_ledger_value(ledger: tuple[Any, ...], key: str) -> float:
     return sum(float(row.get(key, 0.0) or 0.0) for row in ledger if isinstance(row, dict))
+
+
+def _tpot_s(*, ttft_s: Any, e2e_s: Any, output_tokens: int) -> float | None:
+    if output_tokens <= 1 or ttft_s is None or e2e_s is None:
+        return None
+    streaming_s = float(e2e_s) - float(ttft_s)
+    if streaming_s < 0.0:
+        raise ValueError("e2e_s must be greater than or equal to ttft_s")
+    return streaming_s / (output_tokens - 1)
 
 
 def records_to_jsonable(records: tuple[RuntimeRequestRecord, ...]) -> tuple[dict[str, Any], ...]:

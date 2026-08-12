@@ -94,7 +94,7 @@ def run_experiment(spec: ExperimentSpec) -> ExperimentResult:
         else "not_configured",
         "costing": "evaluated" if cost.evaluated else "not_configured",
         "hardware": "resolved"
-        if resolved_hardware.configured
+        if resolved_hardware is not None
         else "not_configured",
         "workload_generation": str(workload_generation.get("status", "unknown")),
         "simulation": _simulation_status(simulation),
@@ -170,7 +170,8 @@ def _run_dse_for_experiment(
 def _performance_with_runtime_metrics(performance: Any, runtime_performance: Any) -> Any:
     if not getattr(runtime_performance, "evaluated", False):
         return performance
-    runtime_metrics = dict(getattr(runtime_performance, "workload_metrics", {}) or {})
+    inference_metrics = dict(getattr(runtime_performance, "inference_metrics", {}) or {})
+    request_summary = dict(getattr(runtime_performance, "request_summary", {}) or {})
     provenance = dict(getattr(runtime_performance, "provenance", {}) or {})
     warnings = tuple(
         dict.fromkeys(
@@ -184,21 +185,11 @@ def _performance_with_runtime_metrics(performance: Any, runtime_performance: Any
     return replace(
         performance,
         evaluated=True,
-        request_throughput_per_s=runtime_metrics.get("request_throughput_per_s"),
-        token_throughput_per_s=runtime_metrics.get("token_throughput_per_s"),
-        ttft_p95_s=runtime_metrics.get("ttft_p95_s"),
-        ttft_p99_s=runtime_metrics.get("ttft_p99_s"),
-        e2e_p95_s=runtime_metrics.get("e2e_p95_s"),
-        e2e_p99_s=runtime_metrics.get("e2e_p99_s"),
-        queue_delay_p95_s=max(
-            runtime_metrics.get("prefill_queue_wait_p95_s") or 0.0,
-            runtime_metrics.get("decode_queue_wait_p95_s") or 0.0,
-        ),
-        link_delay_p95_s=None,
+        inference_metrics=inference_metrics,
+        request_summary=request_summary,
         bottleneck=performance.bottleneck,
         details={
             **performance.details,
-            "static_serving_throughput": performance.details,
             "runtime_scope": provenance.get("trace_scope"),
             "runtime_trace_model": provenance.get("trace_model"),
             "valid_for_paper_main_results": provenance.get("valid_for_paper_main_results", False),

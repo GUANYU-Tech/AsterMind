@@ -48,7 +48,13 @@ def _trace():
     )
 
 
-def _request(request_id="request-0", arrival_time_s=0.0, lon_deg=0.0):
+def _request(
+    request_id="request-0",
+    arrival_time_s=0.0,
+    lon_deg=0.0,
+    context_tokens_before_turn=0,
+    session_id="session-0",
+):
     return {
         "request_id": request_id,
         "arrival_time_s": arrival_time_s,
@@ -59,7 +65,8 @@ def _request(request_id="request-0", arrival_time_s=0.0, lon_deg=0.0):
         "output_tokens": 2,
         "input_bytes": 1000.0,
         "output_bytes": 200.0,
-        "session_id": "session-0",
+        "session_id": session_id,
+        "context_tokens_before_turn": context_tokens_before_turn,
         "slo_class": "interactive",
     }
 
@@ -87,9 +94,15 @@ def _scenario(strategy, requests=None, trace=None):
         serving_profile={
             "evaluated": True,
             "feasible": True,
-            "prefill_tokens_per_s": 10.0,
-            "decode_tokens_per_s": 10.0,
-            "kv_cache_capacity_tokens": 1,
+            "prefill_time_table": [
+                {"prompt_length": 1, "prefill_tokens_per_s": 10.0},
+                {"prompt_length": 100, "prefill_tokens_per_s": 10.0},
+            ],
+            "decode_time_table": [
+                {"prompt_length": 1, "decode_tokens_per_s": 10.0},
+                {"prompt_length": 100, "decode_tokens_per_s": 10.0},
+            ],
+            "kv_cache_capacity_tokens": 100,
             "kv_cache_bytes_per_token": 2.0,
         },
         energy_profile={
@@ -122,7 +135,11 @@ class RuntimeEngineTests(unittest.TestCase):
         self.assertEqual(record["decision"]["serving_satellite_id"], "sat-b")
         self.assertNotIn("links", result.state_summary)
         self.assertNotIn("link_queue_wait_s", record["timing"])
-        self.assertFalse(result.slo_metrics["evaluated"])
+        self.assertNotIn("slo_metrics", result.to_dict())
+        self.assertEqual(
+            set(result.inference_metrics),
+            {"ttft_s", "tpot_s", "e2e_s"},
+        )
         self.assertEqual(
             result.state_summary["kv_caches"]["sat-a"]["capacity_tokens"],
             100,
@@ -140,6 +157,10 @@ class RuntimeEngineTests(unittest.TestCase):
         first_leg = record["routing"]["selected_path"][0]
         self.assertAlmostEqual(first_leg["propagation_delay_s"], 550.0 / 299_792.458)
         self.assertAlmostEqual(first_leg["transmission_s"], 1000.0 * 8.0 / 1e9)
+        self.assertAlmostEqual(
+            record["timing"]["tpot_s"],
+            record["timing"]["e2e_s"] - record["timing"]["ttft_s"],
+        )
 
     def test_shadow_dvfs_scales_compute_capacity(self):
         strategy = RuntimeStrategySpec(
@@ -190,25 +211,29 @@ class RuntimeEngineTests(unittest.TestCase):
             kv_reuse_weight=0.0,
             energy_weight=0.0,
             compute_load_weight=0.0,
-            kv_migration_fraction=1.0,
+            kv_cache_copy_enabled=True,
         )
         result = run_simulation(
             _scenario(
                 strategy,
                 requests=(
                     _request("request-a", 0.0, 0.0),
-                    _request("request-b", 10.0, 90.0),
+                    _request("request-b", 10.0, 90.0, 10),
                 ),
             )
         )
         first, second = result.request_records
         self.assertEqual(first["decision"]["serving_satellite_id"], "sat-a")
         self.assertEqual(second["decision"]["serving_satellite_id"], "sat-b")
+        self.assertEqual(first["decision"]["serving_compute_node_id"], "sat-a")
+        self.assertEqual(second["decision"]["serving_compute_node_id"], "sat-b")
         self.assertEqual(second["timing"]["prefill_service_s"], 0.0)
         self.assertNotIn("kv_migrated_bytes", second["kv"])
         self.assertIn("kv_copy", {leg["kind"] for leg in second["routing"]["selected_path"]})
         self.assertIn("session-0", result.state_summary["kv_caches"]["sat-a"]["entries"])
         self.assertIn("session-0", result.state_summary["kv_caches"]["sat-b"]["entries"])
+        self.assertIn("sat-a", result.state_summary["compute_nodes"])
+        self.assertNotIn("satellites", result.state_summary)
         self.assertNotIn("satellite_ids", result.state_summary["sessions"]["session-0"])
         self.assertEqual(second["kv"]["kv_copied_tokens"], 10)
         self.assertGreater(
@@ -216,25 +241,67 @@ class RuntimeEngineTests(unittest.TestCase):
             10.0,
         )
 
-    def test_partial_kv_copy_recomputes_the_remaining_context(self):
+    def test_disabled_kv_copy_recomputes_the_context(self):
         strategy = RuntimeStrategySpec(
             latency_weight=1.0,
             kv_reuse_weight=0.0,
             energy_weight=0.0,
             compute_load_weight=0.0,
-            kv_migration_fraction=0.5,
+            kv_cache_copy_enabled=False,
         )
         result = run_simulation(
             _scenario(
                 strategy,
                 requests=(
                     _request("request-a", 0.0, 0.0),
-                    _request("request-b", 10.0, 90.0),
+                    _request("request-b", 10.0, 90.0, 10),
                 ),
             )
         )
         second = result.request_records[1]
-        self.assertEqual(second["timing"]["prefill_service_s"], 0.5)
+        self.assertEqual(second["timing"]["prefill_service_s"], 1.0)
+        self.assertEqual(second["kv"]["context_recompute_tokens"], 10)
+
+    def test_kv_copy_never_reuses_across_sessions(self):
+        strategy = RuntimeStrategySpec(
+            latency_weight=1.0,
+            kv_reuse_weight=0.0,
+            energy_weight=0.0,
+            compute_load_weight=0.0,
+            kv_cache_copy_enabled=True,
+        )
+        result = run_simulation(
+            _scenario(
+                strategy,
+                requests=(
+                    _request("request-a", 0.0, 0.0, session_id="session-a"),
+                    _request("request-b", 10.0, 90.0, 10, session_id="session-b"),
+                ),
+            )
+        )
+        second = result.request_records[1]
+        self.assertEqual(second["kv"]["kv_copied_tokens"], 0)
+        self.assertEqual(second["kv"]["context_recompute_tokens"], 10)
+
+    def test_reuse_is_capped_by_declared_prior_context(self):
+        strategy = RuntimeStrategySpec(
+            latency_weight=1.0,
+            kv_reuse_weight=0.0,
+            energy_weight=0.0,
+            compute_load_weight=0.0,
+            kv_cache_copy_enabled=True,
+        )
+        result = run_simulation(
+            _scenario(
+                strategy,
+                requests=(
+                    _request("request-a", 0.0, 0.0),
+                    _request("request-b", 10.0, 90.0, 5),
+                ),
+            )
+        )
+        second = result.request_records[1]
+        self.assertEqual(second["kv"]["kv_copied_tokens"], 5)
         self.assertEqual(second["kv"]["context_recompute_tokens"], 5)
 
 

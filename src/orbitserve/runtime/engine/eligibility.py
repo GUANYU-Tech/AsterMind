@@ -17,7 +17,7 @@ class ComputeEligibilitySet:
     """One authoritative separation between route nodes and compute targets.
 
     ``capacity_member_ids`` are hardware-capable members used to
-    derive nominal per-member capacity. ``eligible_compute_satellite_ids`` are
+    derive nominal per-node capacity. ``eligible_compute_node_ids`` are
     the subset currently allowed to receive work. Relay nodes deliberately do
     not constrain the routing graph.
     """
@@ -35,6 +35,14 @@ class ComputeEligibilitySet:
     @property
     def empty(self) -> bool:
         return not self.eligible_compute_satellite_ids
+
+    @property
+    def eligible_compute_node_ids(self) -> tuple[str, ...]:
+        return self.eligible_compute_satellite_ids
+
+    @property
+    def relay_compute_node_ids(self) -> tuple[str, ...]:
+        return self.relay_satellite_ids
 
     def to_dict(self) -> dict[str, Any]:
         return to_jsonable(self)

@@ -59,13 +59,20 @@
     "policy": "shortest_path"
   },
   "serving": {
-    "effective_utilization": 0.5,
     "model": {
-      "max_context_tokens": 8192,
-      "name": "llama-like-34b",
-      "parameter_count_b": 34,
-      "precision": "bf16"
-    }
+      "name": "llama3.3-70b"
+    },
+    "formation": {
+      "member_count": 4,
+      "topology": "ring",
+      "link_bandwidth_gbps": 100.0,
+      "link_propagation_delay_s": 0.00001
+    },
+    "parallelism": {
+      "tp": 4
+    },
+    "prefill_compute_efficiency": 0.5,
+    "decode_memory_efficiency": 0.7
   },
   "simulation": {
     "duration_s": 600,

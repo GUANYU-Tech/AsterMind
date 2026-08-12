@@ -39,15 +39,20 @@ class KVCopySelectionTests(unittest.TestCase):
             session_id="session-0",
             target_satellite_id="sat-target",
             required_context_tokens=100,
+            prompt_length=100,
             local_hit_tokens=local_hit_tokens,
-            migration_fraction=0.5,
+            copy_enabled=True,
             kv_bytes_per_token=2.0,
             environment_state=environment_state,
             start_s=1.0,
             isl_bandwidth_bps=1e9,
+            prefill_time_table=(
+                {"prompt_length": 1, "prefill_tokens_per_s": 10.0},
+                {"prompt_length": 100, "prefill_tokens_per_s": 10.0},
+            ),
         )
 
-    def test_adequate_sources_are_ranked_by_copy_completion_time(self):
+    def test_source_with_shortest_copy_plus_recompute_time_is_selected(self):
         self.store("sat-a", 90)
         self.store("sat-b", 50)
         environment_state = SimpleNamespace(
@@ -59,23 +64,23 @@ class KVCopySelectionTests(unittest.TestCase):
 
         plan = self.preview(environment_state)
 
-        self.assertEqual(plan["source_satellite_id"], "sat-b")
-        self.assertEqual(plan["copied_tokens"], 50)
+        self.assertEqual(plan["source_satellite_id"], "sat-a")
+        self.assertEqual(plan["copied_tokens"], 90)
 
-    def test_largest_source_is_used_when_all_sources_are_below_limit(self):
-        self.store("sat-a", 40)
-        self.store("sat-b", 30)
+    def test_nearer_smaller_source_can_win(self):
+        self.store("sat-a", 90)
+        self.store("sat-b", 50)
         environment_state = SimpleNamespace(
             isl_windows=(
-                _window("sat-a", "sat-target", 0.10),
+                _window("sat-a", "sat-target", 10.0),
                 _window("sat-b", "sat-target", 0.01),
             )
         )
 
         plan = self.preview(environment_state)
 
-        self.assertEqual(plan["source_satellite_id"], "sat-a")
-        self.assertEqual(plan["copied_tokens"], 40)
+        self.assertEqual(plan["source_satellite_id"], "sat-b")
+        self.assertEqual(plan["copied_tokens"], 50)
 
     def test_existing_target_cache_reduces_copy_to_the_missing_prefix(self):
         self.store("sat-a", 40)
@@ -87,6 +92,15 @@ class KVCopySelectionTests(unittest.TestCase):
         plan = self.preview(environment_state, local_hit_tokens=20)
 
         self.assertEqual(plan["copied_tokens"], 20)
+
+    def test_no_copy_when_migration_is_slower_than_local_recompute(self):
+        self.store("sat-a", 90)
+        environment_state = SimpleNamespace(
+            isl_windows=(_window("sat-a", "sat-target", 20.0),)
+        )
+        plan = self.preview(environment_state)
+        self.assertIsNone(plan["source_satellite_id"])
+        self.assertEqual(plan["copied_tokens"], 0)
 
 
 if __name__ == "__main__":

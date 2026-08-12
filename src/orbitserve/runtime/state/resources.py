@@ -40,8 +40,8 @@ class ComputeQueueState:
 
 
 @dataclass
-class SatelliteState:
-    satellite_id: str
+class ComputeNodeState:
+    compute_node_id: str
     compute_queue: ComputeQueueState = field(default_factory=ComputeQueueState)
     soc: float = 0.8
     initial_soc: float = 0.8
@@ -52,9 +52,15 @@ class SatelliteState:
     energy_ledger: tuple[dict[str, Any], ...] = ()
     materialized_energy_event_ids: tuple[str, ...] = ()
 
+    @property
+    def satellite_id(self) -> str:
+        """Geometry-layer compatibility alias for ``compute_node_id``."""
+
+        return self.compute_node_id
+
     def to_dict(self) -> dict[str, Any]:
         return {
-            "satellite_id": self.satellite_id,
+            "compute_node_id": self.compute_node_id,
             "compute_queue": self.compute_queue.to_dict(),
             "soc": self.soc,
             "initial_soc": self.initial_soc,
@@ -67,4 +73,7 @@ class SatelliteState:
         }
 
 
-__all__ = ["ComputeQueueState", "SatelliteState"]
+SatelliteState = ComputeNodeState
+
+
+__all__ = ["ComputeNodeState", "ComputeQueueState", "SatelliteState"]

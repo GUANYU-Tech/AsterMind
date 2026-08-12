@@ -13,6 +13,8 @@ from .serialization import to_jsonable
 @dataclass(frozen=True)
 class PerformanceMetrics:
     evaluated: bool = False
+    inference_metrics: dict[str, Any] = field(default_factory=dict)
+    request_summary: dict[str, Any] = field(default_factory=dict)
     request_throughput_per_s: float | None = None
     token_throughput_per_s: float | None = None
     ttft_p95_s: float | None = None
@@ -60,5 +62,4 @@ class DSEMetrics:
 
     def to_dict(self) -> dict[str, Any]:
         return to_jsonable(self)
-
 

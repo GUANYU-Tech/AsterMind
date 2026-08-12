@@ -14,7 +14,7 @@ class RuntimeStrategyTests(unittest.TestCase):
             compute_load_weight=0.1,
             shadow_dvfs_enabled=True,
             shadow_dvfs_scale=0.5,
-            kv_migration_fraction=0.5,
+            kv_cache_copy_enabled=True,
         )
         self.assertAlmostEqual(sum(strategy.weights.values()), 1.0)
         self.assertNotIn("policy", strategy.to_dict())
@@ -23,9 +23,9 @@ class RuntimeStrategyTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "sum to 1"):
             RuntimeStrategySpec(latency_weight=1.0)
 
-    def test_kv_migration_fraction_must_be_a_fraction(self):
-        with self.assertRaisesRegex(ValueError, "kv_migration_fraction"):
-            RuntimeStrategySpec(kv_migration_fraction=1.1)
+    def test_kv_cache_copy_enabled_must_be_a_bool(self):
+        with self.assertRaisesRegex(ValueError, "kv_cache_copy_enabled"):
+            RuntimeStrategySpec(kv_cache_copy_enabled=1)
 
     def test_unknown_legacy_fields_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "Unsupported"):
@@ -46,7 +46,7 @@ class RuntimeStrategyTests(unittest.TestCase):
             {"candidates": tuple(item.to_dict() for item in candidates)}
         )
         self.assertEqual(decision.selected_candidate_id, "a")
-        self.assertEqual(decision.score_terms["score_model"], "normalized_compute_satellite_score_v1")
+        self.assertEqual(decision.score_terms["score_model"], "normalized_compute_node_score_v1")
 
 
 if __name__ == "__main__":
