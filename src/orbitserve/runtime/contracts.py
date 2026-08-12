@@ -103,9 +103,11 @@ class ServingCapacityProfile:
     throughput_estimate: dict[str, Any] = field(default_factory=dict)
     evaluated: bool = False
     feasible: bool | None = None
-    prefill_tokens_per_s: float | None = None
-    decode_tokens_per_s: float | None = None
+    prefill_time_table: tuple[dict[str, Any], ...] = ()
+    decode_time_table: tuple[dict[str, Any], ...] = ()
     kv_cache_bytes_per_token: float | None = None
+    kv_cache_capacity_tokens: int | None = None
+    max_context_tokens: int | None = None
     internal_comm_summary: dict[str, Any] = field(default_factory=dict)
     internal_comm_accounting: str = "embedded"
     warnings: tuple[str, ...] = ()
@@ -120,9 +122,11 @@ class ServingCapacityProfile:
             throughput_estimate=throughput,
             evaluated=bool(throughput.get("evaluated", False)),
             feasible=_optional_bool(throughput.get("feasible")),
-            prefill_tokens_per_s=_optional_float(throughput.get("prefill_tokens_per_s")),
-            decode_tokens_per_s=_optional_float(throughput.get("decode_tokens_per_s")),
+            prefill_time_table=_table(throughput.get("prefill_time_table")),
+            decode_time_table=_table(throughput.get("decode_time_table")),
             kv_cache_bytes_per_token=_optional_float(throughput.get("kv_cache_bytes_per_token")),
+            kv_cache_capacity_tokens=_optional_int(throughput.get("kv_cache_capacity_tokens")),
+            max_context_tokens=_optional_int(throughput.get("max_context_tokens")),
             internal_comm_summary=_dict(throughput.get("internal_comm_summary")),
             internal_comm_accounting=str(throughput.get("internal_comm_accounting", "embedded")),
             warnings=_warnings_from_payload(throughput),
@@ -133,10 +137,8 @@ class ServingCapacityProfile:
         return bool(
             self.evaluated
             and self.feasible is not False
-            and self.prefill_tokens_per_s
-            and self.prefill_tokens_per_s > 0.0
-            and self.decode_tokens_per_s
-            and self.decode_tokens_per_s > 0.0
+            and bool(self.prefill_time_table)
+            and bool(self.decode_time_table)
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -158,6 +160,14 @@ def _dict(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
 
 
+def _table(value: Any) -> tuple[dict[str, Any], ...]:
+    if value is None:
+        return ()
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        raise TypeError("Serving time table must be a sequence of mappings")
+    return tuple(dict(row) for row in value)
+
+
 def _warnings_from_payload(payload: dict[str, Any]) -> tuple[str, ...]:
     raw = payload.get("warnings", ())
     if raw is None:
@@ -173,6 +183,10 @@ def _optional_float(value: Any) -> float | None:
 
 def _optional_bool(value: Any) -> bool | None:
     return None if value is None else bool(value)
+
+
+def _optional_int(value: Any) -> int | None:
+    return None if value is None else int(value)
 
 
 __all__ = ["INGRESS_SELECTIONS", "RUNTIME_RESULT_FIELDS", "RuntimeStrategySpec", "ServingCapacityProfile"]

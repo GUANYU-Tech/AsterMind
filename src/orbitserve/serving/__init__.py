@@ -3,23 +3,25 @@
 from .capacity import (
     LLMModelProfile,
     L2FormationSpec,
-    ParallelLayout,
-    PrecisionSpec,
     ServingParallelism,
+    ServingPerformanceProfile,
     ServingSpec,
     ServingThroughputEstimate,
-    StageServingProfile,
     estimate_serving_throughput,
+    prefill_flops,
 )
+from .model_profiles import MODEL_SERVING_PROFILES, ModelServingProfile, model_serving_profile
 
 __all__ = [
     "LLMModelProfile",
     "L2FormationSpec",
-    "ParallelLayout",
-    "PrecisionSpec",
+    "MODEL_SERVING_PROFILES",
+    "ModelServingProfile",
     "ServingParallelism",
+    "ServingPerformanceProfile",
     "ServingSpec",
     "ServingThroughputEstimate",
-    "StageServingProfile",
     "estimate_serving_throughput",
+    "model_serving_profile",
+    "prefill_flops",
 ]

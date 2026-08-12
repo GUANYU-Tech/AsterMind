@@ -11,6 +11,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Added a first-order L2 Serving formation model with member count, ring/switch/
   fully-connected topology, link bandwidth, and one-hop propagation delay.
 - Added canonical logical compute-node views for Orbit Trace and Runtime state.
+- Added frozen Serving profiles for Llama 3.3 70B, DeepSeek V3, and Kimi K3,
+  with batch-one prompt-length tables for prefill and decode.
+- Added cumulative-table lookup in Runtime and same-session KV copy decisions
+  that compare transfer-plus-prefill time with local prefill time.
 
 - Added a deterministic SGP4 pipeline from validated mean elements through
   WGS-72 TEME propagation, pinned-data ITRS conversion, WGS-84 geometry, and
@@ -46,6 +50,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   DSE solely responsible for strategy search.
 - Applied one colocated prefill/decode `ServingCapacityProfile` uniformly to
   all satellites.
+- Replaced workload-aggregated Serving rate scalars with one-dimensional
+  prompt-length tables; Runtime now derives each request's service time from
+  those tables without a running-request throughput multiplier.
 - Standardized DVFS as a strategy-owned capacity scale in the range `(0, 1]`.
 - Simplified request outcomes to completed and uncompleted, and limited
   TTFT/E2E statistics to completed requests.
@@ -55,9 +62,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   Serving's model-specific KV bytes per token.
 - Renamed the Runtime orbit input to `environment_state`; KV transfer is now a
   boolean `kv_cache_copy_enabled` strategy.
-- Defined KV movement as source-retaining copy from the node with the longest
-  reusable prefix, with deterministic tie-breaking and token-level LRU capacity
-  accounting.
+- Defined KV movement as source-retaining, same-session copy from the source
+  with minimum transfer-plus-prefill time, only when it beats local prefill;
+  reuse is capped by `context_tokens_before_turn`.
 - Aggregated cost as logical compute-node count times L2 formation member count
   times Architecture's closed single-satellite cost, without a second laser-
   terminal or topology surcharge.
@@ -77,6 +84,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Removed SLO classification and SLO pass/fail accounting from Runtime results.
 - Removed Runtime HBM/page-accounting configuration, duplicated session KV
   locations, and unused context-version state.
+- Removed Serving batch-size, prefill/decode placement, workload-distribution,
+  and duplicated parallel satellite-count inputs.
 
 ### Fixed
 

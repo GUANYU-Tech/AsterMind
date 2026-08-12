@@ -16,6 +16,13 @@ def derive_kv_cache_capacity_tokens(
 ) -> int:
     """Derive uniform per-satellite KV capacity from architecture and model data."""
 
+    direct_capacity = getattr(serving_profile, "kv_cache_capacity_tokens", None)
+    if direct_capacity is not None:
+        capacity = int(direct_capacity)
+        if capacity < 0:
+            raise ValueError("runtime_kv_capacity_invalid")
+        return capacity
+
     payload = dict(constellation or {})
     architecture = payload.get("architecture")
     if not isinstance(architecture, Mapping):

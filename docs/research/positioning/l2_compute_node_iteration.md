@@ -1,55 +1,95 @@
 # L2 compute-node iteration contract
 
-This iteration treats one Orbit/Runtime scheduling object as one logical
-`compute_node`. A compute node contains `serving.formation.member_count`
-physical satellites. Orbit does not expand those members or model their
-internal links, and Runtime schedules, queues, accounts energy, and manages KV
-cache only at compute-node granularity.
+This iteration treats every object exposed by Orbit and scheduled by Runtime as
+one logical `compute_node`. A compute node encapsulates
+`serving.formation.member_count` physical satellites. Orbit does not expand the
+formation, Runtime does not schedule its members, and formation-internal KV
+movement is outside the model.
 
-## Serving input
+## Serving input and validation
 
 ```json
 {
   "serving": {
+    "model": {"name": "llama3.3-70b"},
     "formation": {
       "member_count": 4,
       "topology": "ring",
       "link_bandwidth_gbps": 100.0,
       "link_propagation_delay_s": 0.00001
-    }
+    },
+    "parallelism": {"tp": 4, "pp": 1, "ep": 1},
+    "prefill_compute_efficiency": 0.5,
+    "decode_memory_efficiency": 0.7
   }
 }
 ```
 
 `topology` accepts `ring`, `switch`, or `fully_connected`.
-`link_propagation_delay_s` is one-way, single-hop propagation delay. Bandwidth
-is a direct configured input; this layer does not constrain it from the
-Architecture terminal profile.
+`link_propagation_delay_s` is the one-way propagation delay of one physical
+hop. Link bandwidth is supplied directly and is not constrained by the
+Architecture terminal profile. The number of nodes implied by TP/PP/EP must
+equal `formation.member_count`; the former `parallelism.satellite_count` input
+does not exist.
 
-Serving first estimates one physical member with the unchanged Architecture
-profile. It then uses the provisional analytical wrapper
+Serving has no batch-size input and no prefill/decode placement mode. Every
+estimate represents batch size one with colocated prefill and decode. The only
+supported model names are `llama3.3-70b`, `deepseek-v3`, and `kimi-k3`; their
+model coefficients are frozen in `serving/model_profiles.py` rather than
+repeated in manifests.
 
-`formation_stage_time = single_member_stage_time / member_count + internal_communication_time`
+## Serving calculation and output
 
-to produce the logical node's prefill/decode capacity and KV capacity. The
-communication term is topology-aware but intentionally remains a first-order
-model pending calibration and deeper Serving-model discussion.
+For prompt length `P`, Serving models full-prompt prefill FLOPs as
 
-## Cost aggregation
+`F_prefill(P) = A_model * P + B_model * P^2`.
+
+Prefill is compute-dominant. Decode is memory-dominant and reads active model
+weights plus context KV for every generated token. Both stages add the
+topology-aware alpha-beta communication time implied by TP/PP/EP. Running
+request count does not scale either service rate in this iteration.
+
+Serving emits no workload-aggregated scalar rate. It emits:
+
+- `prefill_time_table`: rows containing only `prompt_length` and
+  `prefill_tokens_per_s`;
+- `decode_time_table`: rows containing only `prompt_length` and
+  `decode_tokens_per_s`;
+- `kv_cache_bytes_per_token`, selected by canonical model name;
+- `kv_cache_capacity_tokens` and the model maximum context length.
+
+Runtime linearly interpolates cumulative prefill time `T_prefill(P)` rather
+than the rate itself. A reusable prefix of length `K` therefore costs
+`T_prefill(P) - T_prefill(K)`. Decode integrates the table's context-dependent
+per-token time over generated output tokens.
+
+## Runtime KV cache decision
+
+`runtime_strategy.kv_cache_copy_enabled` is a boolean. Reuse is legal only for
+the same non-null `session_id`, and reusable tokens are capped by
+`context_tokens_before_turn`; current-turn `new_user_tokens` are never treated
+as a reusable prefix.
+
+For each reachable source holding the same session, Runtime compares
+
+`T_copy(source, target) + T_prefill(P) - T_prefill(S_source)`
+
+with local execution
+
+`T_prefill(P) - T_prefill(L_target)`.
+
+It copies only when the first value is smaller and chooses the source with the
+smallest copy-plus-compute time. This comparison intentionally excludes target
+queue waiting. Copy retains the source entry, introduces no migration ratio,
+and adds no new Runtime result fields.
+
+## Cost aggregation and iteration boundary
 
 Experiments aggregate the closed Architecture cost as
 
 `total_cost = compute_node_count * formation_member_count * single_satellite_cost`.
 
-The single-satellite cost already includes the configured laser terminals,
-so Experiments add no separate topology/link/terminal surcharge. Architecture
-itself remains a single-physical-satellite model.
-
-## Runtime KV cache
-
-`runtime_strategy.kv_cache_copy_enabled` is a boolean. When enabled and the
-selected compute node lacks sufficient reusable context, Runtime copies from
-the reachable compute node holding the longest reusable prefix. The source is
-retained; there is no migration ratio and no formation-internal KV policy.
-
-Topology refresh and fixed-time state updates are outside this iteration.
+The single-satellite cost already includes configured laser terminals, so no
+second formation-link or terminal surcharge is added. Launch-cost removal,
+hardware degradation, formation expansion in Orbit, formation-internal Runtime
+policies, and periodic topology refresh are outside this iteration.

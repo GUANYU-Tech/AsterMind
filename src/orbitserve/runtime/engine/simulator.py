@@ -22,6 +22,7 @@ from .routing import (
 )
 from ..metrics.records import RuntimeRequestRecord
 from ..setup.kv_capacity import derive_kv_cache_capacity_tokens
+from ..setup.serving_time import decode_time_s, prefill_suffix_time_s
 from ..state.energy import (
     EnergyWindowError,
     advance_satellite_energy,
@@ -144,6 +145,9 @@ def normalize_runtime_request(raw_request: dict[str, Any]) -> dict[str, Any]:
         "output_tokens": output_tokens,
         "input_bytes": max(0.0, float(raw_request.get("input_bytes", 0.0))),
         "output_bytes": max(0.0, float(raw_request.get("output_bytes", 0.0))),
+        "context_tokens_before_turn": max(
+            0, int(raw_request.get("context_tokens_before_turn", 0) or 0)
+        ),
     }
 
 
@@ -291,47 +295,75 @@ def _preview_candidate(
         raise RouteUnavailable("no_route_to_compute_satellite")
     inbound_done_s, inbound_path = execute_route(route.inbound_legs, float(request["arrival_time_s"]))
     session_id = request.get("session_id")
-    required_context = int(request["prompt_tokens"])
+    prompt_length = int(request["prompt_tokens"])
+    reusable_context = min(
+        prompt_length,
+        int(request.get("context_tokens_before_turn", 0) or 0),
+    )
     local_hit_tokens = local_kv_reuse_tokens(
         state,
         satellite_id=compute_satellite_id,
         session_id=str(session_id) if session_id else None,
-        required_context_tokens=required_context,
+        required_context_tokens=reusable_context,
     )
     copy_plan = _preview_kv_copy(
         state=state,
         session_id=str(session_id) if session_id else None,
         target_satellite_id=compute_satellite_id,
-        required_context_tokens=required_context,
+        required_context_tokens=reusable_context,
+        prompt_length=prompt_length,
         local_hit_tokens=local_hit_tokens,
         copy_enabled=bool(strategy.kv_cache_copy_enabled),
         kv_bytes_per_token=float(serving.kv_cache_bytes_per_token or 0.0),
         environment_state=environment_state,
         start_s=inbound_done_s,
         isl_bandwidth_bps=isl_bandwidth_bps,
+        prefill_time_table=serving.prefill_time_table,
     )
     copy_path = copy_plan["path"]
     copied_from = copy_plan["source_satellite_id"]
     copied_tokens = copy_plan["copied_tokens"]
     copy_done_s = copy_plan["done_s"]
     effective_reuse_tokens = min(
-        required_context,
+        reusable_context,
         local_hit_tokens + copied_tokens,
     )
-    recompute_tokens = max(0, required_context - effective_reuse_tokens)
+    recompute_tokens = max(0, prompt_length - effective_reuse_tokens)
     satellite = state.satellite_for(compute_satellite_id)
     compute_ready_s = copy_done_s
-    raw_window = energy_window_at(energy_trace, compute_satellite_id, max(compute_ready_s, satellite.compute_queue.prefill_available_s))
+    raw_window = energy_window_at(
+        energy_trace,
+        compute_satellite_id,
+        max(compute_ready_s, satellite.compute_queue.prefill_available_s),
+    )
     dvfs_scale = (
         float(strategy.shadow_dvfs_scale)
         if strategy.shadow_dvfs_enabled and not bool(raw_window.get("sunlit", True))
         else 1.0
     )
-    prefill_service_s = _service_time(recompute_tokens, serving.prefill_tokens_per_s) / dvfs_scale
-    decode_service_s = _service_time(request["output_tokens"], serving.decode_tokens_per_s) / dvfs_scale
-    prefill_start_s, prefill_done_s, prefill_wait_s = satellite.compute_queue.preview_prefill(compute_ready_s, prefill_service_s)
-    decode_start_s, decode_done_s, decode_wait_s = satellite.compute_queue.preview_decode(prefill_done_s, decode_service_s)
-    first_token_service_s = _service_time(1, serving.decode_tokens_per_s) / dvfs_scale
+    prefill_service_s = prefill_suffix_time_s(
+        serving.prefill_time_table,
+        prompt_length=prompt_length,
+        cached_prefix_tokens=effective_reuse_tokens,
+    ) / dvfs_scale
+    decode_service_s = decode_time_s(
+        serving.decode_time_table,
+        prompt_length=prompt_length,
+        output_tokens=request["output_tokens"],
+    ) / dvfs_scale
+    prefill_start_s, prefill_done_s, prefill_wait_s = satellite.compute_queue.preview_prefill(
+        compute_ready_s,
+        prefill_service_s,
+    )
+    decode_start_s, decode_done_s, decode_wait_s = satellite.compute_queue.preview_decode(
+        prefill_done_s,
+        decode_service_s,
+    )
+    first_token_service_s = decode_time_s(
+        serving.decode_time_table,
+        prompt_length=prompt_length,
+        output_tokens=1,
+    ) / dvfs_scale
     first_token_bytes = _first_token_bytes(request)
     first_token_legs = tuple(replace(leg, payload_bytes=first_token_bytes) for leg in route.outbound_legs)
     first_done_s, first_path = execute_route(first_token_legs, decode_start_s + first_token_service_s)
@@ -375,7 +407,7 @@ def _preview_candidate(
     service_time_s = prefill_service_s + decode_service_s
     queue_wait_s = prefill_wait_s + decode_wait_s
     compute_load_score = 1.0 / (1.0 + queue_wait_s / max(service_time_s, 1e-12))
-    kv_score = effective_reuse_tokens / required_context if required_context > 0 else 0.0
+    kv_score = effective_reuse_tokens / reusable_context if reusable_context > 0 else 0.0
     latency_score = 1.0 - max(0.0, min(math.pi, route.arc_distance_rad)) / math.pi
     candidate_id = f"{access.access_type}:{compute_satellite_id}:{route.path_id}"
     violations = (
@@ -570,14 +602,16 @@ def _preview_kv_copy(
     session_id: str | None,
     target_satellite_id: str,
     required_context_tokens: int,
+    prompt_length: int,
     local_hit_tokens: int,
     copy_enabled: bool,
     kv_bytes_per_token: float,
     environment_state: Any,
     start_s: float,
     isl_bandwidth_bps: float,
+    prefill_time_table: tuple[dict[str, Any], ...],
 ) -> dict[str, Any]:
-    """Choose one deterministic, routable KV source without mutating state."""
+    """Choose a same-session source only when copy beats local recompute."""
 
     empty = {
         "source_satellite_id": None,
@@ -591,6 +625,11 @@ def _preview_kv_copy(
         or required_context_tokens <= local_hit_tokens
     ):
         return empty
+    local_prefill_time_s = prefill_suffix_time_s(
+        prefill_time_table,
+        prompt_length=prompt_length,
+        cached_prefix_tokens=local_hit_tokens,
+    )
     options: list[dict[str, Any]] = []
     for source_satellite_id in kv_locations_for_session(state, session_id):
         if source_satellite_id == target_satellite_id:
@@ -621,11 +660,22 @@ def _preview_kv_copy(
             done_s, path = execute_route(legs, start_s)
         except RouteUnavailable:
             continue
+        migration_time_s = done_s - start_s
+        copied_prefill_time_s = prefill_suffix_time_s(
+            prefill_time_table,
+            prompt_length=prompt_length,
+            cached_prefix_tokens=source_reusable_tokens,
+        )
+        total_time_s = migration_time_s + copied_prefill_time_s
+        if total_time_s >= local_prefill_time_s:
+            continue
         options.append({
             "source_satellite_id": source_satellite_id,
             "source_reusable_tokens": source_reusable_tokens,
             "copied_tokens": copied_tokens,
             "done_s": done_s,
+            "migration_time_s": migration_time_s,
+            "total_time_s": total_time_s,
             "path": path,
         })
     if not options:
@@ -633,8 +683,8 @@ def _preview_kv_copy(
     selected = min(
         options,
         key=lambda option: (
-            -option["source_reusable_tokens"],
-            option["done_s"],
+            option["total_time_s"],
+            option["migration_time_s"],
             option["source_satellite_id"],
         ),
     )
@@ -728,13 +778,6 @@ def _link_bytes_by_satellite(
                 share = payload_bytes / 2.0 if kind in {"isl", "kv_copy"} else payload_bytes
                 result[endpoint] = result.get(endpoint, 0.0) + share
     return result
-
-
-def _service_time(tokens: int, rate: Any) -> float:
-    value = float(rate or 0.0)
-    if value <= 0.0:
-        raise ValueError("serving_rate_unavailable")
-    return max(0, int(tokens)) / value
 
 
 def _first_token_bytes(request: dict[str, Any]) -> float:

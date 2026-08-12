@@ -198,7 +198,6 @@ def _performance_with_runtime_metrics(performance: Any, runtime_performance: Any
         bottleneck=performance.bottleneck,
         details={
             **performance.details,
-            "static_serving_throughput": performance.details,
             "runtime_scope": provenance.get("trace_scope"),
             "runtime_trace_model": provenance.get("trace_model"),
             "valid_for_paper_main_results": provenance.get("valid_for_paper_main_results", False),

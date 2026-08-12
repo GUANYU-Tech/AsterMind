@@ -48,7 +48,13 @@ def _trace():
     )
 
 
-def _request(request_id="request-0", arrival_time_s=0.0, lon_deg=0.0):
+def _request(
+    request_id="request-0",
+    arrival_time_s=0.0,
+    lon_deg=0.0,
+    context_tokens_before_turn=0,
+    session_id="session-0",
+):
     return {
         "request_id": request_id,
         "arrival_time_s": arrival_time_s,
@@ -59,7 +65,8 @@ def _request(request_id="request-0", arrival_time_s=0.0, lon_deg=0.0):
         "output_tokens": 2,
         "input_bytes": 1000.0,
         "output_bytes": 200.0,
-        "session_id": "session-0",
+        "session_id": session_id,
+        "context_tokens_before_turn": context_tokens_before_turn,
         "slo_class": "interactive",
     }
 
@@ -87,9 +94,15 @@ def _scenario(strategy, requests=None, trace=None):
         serving_profile={
             "evaluated": True,
             "feasible": True,
-            "prefill_tokens_per_s": 10.0,
-            "decode_tokens_per_s": 10.0,
-            "kv_cache_capacity_tokens": 1,
+            "prefill_time_table": [
+                {"prompt_length": 1, "prefill_tokens_per_s": 10.0},
+                {"prompt_length": 100, "prefill_tokens_per_s": 10.0},
+            ],
+            "decode_time_table": [
+                {"prompt_length": 1, "decode_tokens_per_s": 10.0},
+                {"prompt_length": 100, "decode_tokens_per_s": 10.0},
+            ],
+            "kv_cache_capacity_tokens": 100,
             "kv_cache_bytes_per_token": 2.0,
         },
         energy_profile={
@@ -197,7 +210,7 @@ class RuntimeEngineTests(unittest.TestCase):
                 strategy,
                 requests=(
                     _request("request-a", 0.0, 0.0),
-                    _request("request-b", 10.0, 90.0),
+                    _request("request-b", 10.0, 90.0, 10),
                 ),
             )
         )
@@ -233,13 +246,55 @@ class RuntimeEngineTests(unittest.TestCase):
                 strategy,
                 requests=(
                     _request("request-a", 0.0, 0.0),
-                    _request("request-b", 10.0, 90.0),
+                    _request("request-b", 10.0, 90.0, 10),
                 ),
             )
         )
         second = result.request_records[1]
         self.assertEqual(second["timing"]["prefill_service_s"], 1.0)
         self.assertEqual(second["kv"]["context_recompute_tokens"], 10)
+
+    def test_kv_copy_never_reuses_across_sessions(self):
+        strategy = RuntimeStrategySpec(
+            latency_weight=1.0,
+            kv_reuse_weight=0.0,
+            energy_weight=0.0,
+            compute_load_weight=0.0,
+            kv_cache_copy_enabled=True,
+        )
+        result = run_simulation(
+            _scenario(
+                strategy,
+                requests=(
+                    _request("request-a", 0.0, 0.0, session_id="session-a"),
+                    _request("request-b", 10.0, 90.0, 10, session_id="session-b"),
+                ),
+            )
+        )
+        second = result.request_records[1]
+        self.assertEqual(second["kv"]["kv_copied_tokens"], 0)
+        self.assertEqual(second["kv"]["context_recompute_tokens"], 10)
+
+    def test_reuse_is_capped_by_declared_prior_context(self):
+        strategy = RuntimeStrategySpec(
+            latency_weight=1.0,
+            kv_reuse_weight=0.0,
+            energy_weight=0.0,
+            compute_load_weight=0.0,
+            kv_cache_copy_enabled=True,
+        )
+        result = run_simulation(
+            _scenario(
+                strategy,
+                requests=(
+                    _request("request-a", 0.0, 0.0),
+                    _request("request-b", 10.0, 90.0, 5),
+                ),
+            )
+        )
+        second = result.request_records[1]
+        self.assertEqual(second["kv"]["kv_copied_tokens"], 5)
+        self.assertEqual(second["kv"]["context_recompute_tokens"], 5)
 
 
 if __name__ == "__main__":

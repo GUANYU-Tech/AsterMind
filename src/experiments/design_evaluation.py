@@ -97,13 +97,9 @@ def evaluate_materialized_design(
         experiment_spec,
         resolved_hardware=resolved_hardware,
     )
-    if str(getattr(serving_spec, "pd_mode", "colocated")) != "colocated":
-        raise ValueError("runtime_pd_disaggregation_unsupported")
     serving_throughput = estimate_serving_throughput(
         serving_spec,
         hardware=resolved_hardware.hardware_profile if resolved_hardware else experiment_spec.serving.hardware,
-        token_distribution=serving_workload,
-        constellation_satellite_count=design.satellite_count,
     )
 
     pre_runtime_warnings = _dedupe(
