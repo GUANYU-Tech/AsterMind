@@ -24,6 +24,10 @@ class SchedulerCandidate:
     hard_gate_violations: tuple[str, ...] = ()
     provenance: dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def compute_node_id(self) -> str:
+        return self.compute_satellite_id
+
     @classmethod
     def from_value(cls, value: Any) -> "SchedulerCandidate":
         if isinstance(value, cls):
@@ -112,7 +116,7 @@ class CandidateSelector:
                     "energy": self.spec.energy_weight * selected.energy_score,
                     "compute_load": self.spec.compute_load_weight * selected.compute_load_score,
                 },
-                "score_model": "normalized_compute_satellite_score_v1",
+                "score_model": "normalized_compute_node_score_v1",
             },
             candidate_count=len(candidates),
             feasible_candidate_count=len(feasible),

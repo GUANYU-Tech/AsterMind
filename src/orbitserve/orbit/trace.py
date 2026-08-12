@@ -182,6 +182,20 @@ class OrbitTraceBundle:
         return self.trace_manifest.trace_id
 
     @property
+    def compute_node_catalog(self) -> tuple[dict[str, Any], ...]:
+        """Logical scheduler nodes represented by the geometry trace.
+
+        ``satellite_id`` remains the frozen SGP4 geometry key.  Each row maps
+        one-to-one to a logical compute node; physical formation members are
+        intentionally encapsulated by Serving and never expanded by Orbit.
+        """
+
+        return tuple(
+            {**row, "compute_node_id": str(row["satellite_id"])}
+            for row in self.satellite_catalog
+        )
+
+    @property
     def trace_model(self) -> str:
         return self.trace_manifest.trace_model
 

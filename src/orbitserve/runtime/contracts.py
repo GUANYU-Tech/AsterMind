@@ -14,6 +14,8 @@ RUNTIME_RESULT_FIELDS = frozenset(
         "assigned_satellite",
         "assigned_satellite_id",
         "access_satellite_id",
+        "access_compute_node_id",
+        "assigned_compute_node_id",
         "selected_path",
         "completed",
         "completion_ratio",
@@ -48,7 +50,7 @@ class RuntimeStrategySpec:
     compute_load_weight: float = 0.25
     shadow_dvfs_enabled: bool = False
     shadow_dvfs_scale: float = 0.5
-    kv_migration_fraction: float = 0.0
+    kv_cache_copy_enabled: bool = False
 
     def __post_init__(self) -> None:
         if self.ingress_selection not in INGRESS_SELECTIONS:
@@ -61,8 +63,8 @@ class RuntimeStrategySpec:
             raise ValueError("Runtime strategy weights must sum to 1")
         if not math.isfinite(self.shadow_dvfs_scale) or not 0.0 < self.shadow_dvfs_scale <= 1.0:
             raise ValueError("shadow_dvfs_scale must be in (0, 1]")
-        if not math.isfinite(self.kv_migration_fraction) or not 0.0 <= self.kv_migration_fraction <= 1.0:
-            raise ValueError("kv_migration_fraction must be in [0, 1]")
+        if type(self.kv_cache_copy_enabled) is not bool:
+            raise ValueError("kv_cache_copy_enabled must be a bool")
 
     @property
     def weights(self) -> dict[str, float]:

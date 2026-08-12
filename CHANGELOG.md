@@ -8,6 +8,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- Added a first-order L2 Serving formation model with member count, ring/switch/
+  fully-connected topology, link bandwidth, and one-hop propagation delay.
+- Added canonical logical compute-node views for Orbit Trace and Runtime state.
+
 - Added a deterministic SGP4 pipeline from validated mean elements through
   WGS-72 TEME propagation, pinned-data ITRS conversion, WGS-84 geometry, and
   canonical Orbit Trace generation via `generate_orbit_trace`.
@@ -49,10 +53,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   Architecture directly.
 - Made Runtime derive per-satellite KV capacity from Architecture storage and
   Serving's model-specific KV bytes per token.
-- Renamed the Runtime orbit input to `environment_state` and the KV strategy
-  limit to `kv_migration_fraction`.
-- Defined KV movement as source-retaining copy with deterministic single-source
-  selection and token-level LRU capacity accounting.
+- Renamed the Runtime orbit input to `environment_state`; KV transfer is now a
+  boolean `kv_cache_copy_enabled` strategy.
+- Defined KV movement as source-retaining copy from the node with the longest
+  reusable prefix, with deterministic tie-breaking and token-level LRU capacity
+  accounting.
+- Aggregated cost as logical compute-node count times L2 formation member count
+  times Architecture's closed single-satellite cost, without a second laser-
+  terminal or topology surcharge.
 
 ### Removed
 

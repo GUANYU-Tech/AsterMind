@@ -332,7 +332,7 @@ def _slim_strategy(strategy: dict[str, Any]) -> dict[str, Any]:
         "compute_load_weight",
         "shadow_dvfs_enabled",
         "shadow_dvfs_scale",
-        "kv_migration_fraction",
+        "kv_cache_copy_enabled",
     )
     return {key: strategy.get(key) for key in keep_fields if key in strategy}
 
@@ -454,8 +454,11 @@ def _provenance_summary(provenance: dict[str, Any]) -> dict[str, Any]:
 
 
 def _state_summary(state_summary: dict[str, Any]) -> dict[str, Any]:
+    compute_nodes = state_summary.get("compute_nodes")
+    if compute_nodes is None:
+        compute_nodes = state_summary.get("satellites", {})
     return {
-        "satellite_count": len(state_summary.get("satellites", {}) or {}),
+        "compute_node_count": len(compute_nodes or {}),
         "link_count": len(state_summary.get("links", {}) or {}),
         "session_count": len(state_summary.get("sessions", {}) or {}),
         "request_count": state_summary.get("request_count"),

@@ -190,7 +190,7 @@ class RuntimeEngineTests(unittest.TestCase):
             kv_reuse_weight=0.0,
             energy_weight=0.0,
             compute_load_weight=0.0,
-            kv_migration_fraction=1.0,
+            kv_cache_copy_enabled=True,
         )
         result = run_simulation(
             _scenario(
@@ -204,11 +204,15 @@ class RuntimeEngineTests(unittest.TestCase):
         first, second = result.request_records
         self.assertEqual(first["decision"]["serving_satellite_id"], "sat-a")
         self.assertEqual(second["decision"]["serving_satellite_id"], "sat-b")
+        self.assertEqual(first["decision"]["serving_compute_node_id"], "sat-a")
+        self.assertEqual(second["decision"]["serving_compute_node_id"], "sat-b")
         self.assertEqual(second["timing"]["prefill_service_s"], 0.0)
         self.assertNotIn("kv_migrated_bytes", second["kv"])
         self.assertIn("kv_copy", {leg["kind"] for leg in second["routing"]["selected_path"]})
         self.assertIn("session-0", result.state_summary["kv_caches"]["sat-a"]["entries"])
         self.assertIn("session-0", result.state_summary["kv_caches"]["sat-b"]["entries"])
+        self.assertIn("sat-a", result.state_summary["compute_nodes"])
+        self.assertNotIn("satellites", result.state_summary)
         self.assertNotIn("satellite_ids", result.state_summary["sessions"]["session-0"])
         self.assertEqual(second["kv"]["kv_copied_tokens"], 10)
         self.assertGreater(
@@ -216,13 +220,13 @@ class RuntimeEngineTests(unittest.TestCase):
             10.0,
         )
 
-    def test_partial_kv_copy_recomputes_the_remaining_context(self):
+    def test_disabled_kv_copy_recomputes_the_context(self):
         strategy = RuntimeStrategySpec(
             latency_weight=1.0,
             kv_reuse_weight=0.0,
             energy_weight=0.0,
             compute_load_weight=0.0,
-            kv_migration_fraction=0.5,
+            kv_cache_copy_enabled=False,
         )
         result = run_simulation(
             _scenario(
@@ -234,8 +238,8 @@ class RuntimeEngineTests(unittest.TestCase):
             )
         )
         second = result.request_records[1]
-        self.assertEqual(second["timing"]["prefill_service_s"], 0.5)
-        self.assertEqual(second["kv"]["context_recompute_tokens"], 5)
+        self.assertEqual(second["timing"]["prefill_service_s"], 1.0)
+        self.assertEqual(second["kv"]["context_recompute_tokens"], 10)
 
 
 if __name__ == "__main__":

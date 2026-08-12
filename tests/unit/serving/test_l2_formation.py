@@ -1,18 +1,22 @@
 import unittest
-from pathlib import Path
 
-from orbitserve.architecture.hardware import hardware_from_single_satellite_case
+from orbitserve.architecture import HardwareSpec, resolve_architecture
 from orbitserve.serving import L2FormationSpec, ServingSpec, estimate_serving_throughput
 from orbitserve.workload import TokenDistribution
 
 
-ROOT = Path(__file__).resolve().parents[3]
-
-
 def _hardware():
-    return hardware_from_single_satellite_case(
-        ROOT / "examples/single_satellite/h200_gpu_derived.json"
-    )
+    return resolve_architecture(
+        HardwareSpec.from_dict(
+            {
+                "accelerator": "h200_sxm",
+                "compute_payload": {
+                    "accelerator_count": 3,
+                    "purchase_cost_per_unit_usd": 50000,
+                },
+            }
+        )
+    ).hardware_profile
 
 
 def _workload():

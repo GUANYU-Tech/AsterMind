@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from ...common import to_jsonable
-from .resources import SatelliteState
+from .resources import ComputeNodeState
 
 if TYPE_CHECKING:
     from .kv_cache import KVCacheState, SessionState
@@ -14,18 +14,27 @@ if TYPE_CHECKING:
 
 @dataclass
 class RuntimeState:
-    satellites: dict[str, SatelliteState] = field(default_factory=dict)
+    compute_nodes: dict[str, ComputeNodeState] = field(default_factory=dict)
     sessions: dict[str, SessionState] = field(default_factory=dict)
     kv_caches: dict[str, KVCacheState] = field(default_factory=dict)
 
-    def satellite_for(self, satellite_id: str, *, initial_soc: float = 0.8) -> SatelliteState:
-        if satellite_id not in self.satellites:
-            self.satellites[satellite_id] = SatelliteState(
-                satellite_id=satellite_id,
+    def compute_node_for(self, compute_node_id: str, *, initial_soc: float = 0.8) -> ComputeNodeState:
+        if compute_node_id not in self.compute_nodes:
+            self.compute_nodes[compute_node_id] = ComputeNodeState(
+                compute_node_id=compute_node_id,
                 soc=initial_soc,
                 initial_soc=initial_soc,
             )
-        return self.satellites[satellite_id]
+        return self.compute_nodes[compute_node_id]
+
+    def satellite_for(self, satellite_id: str, *, initial_soc: float = 0.8) -> ComputeNodeState:
+        """Compatibility adapter for geometry code that still uses satellite IDs."""
+
+        return self.compute_node_for(satellite_id, initial_soc=initial_soc)
+
+    @property
+    def satellites(self) -> dict[str, ComputeNodeState]:
+        return self.compute_nodes
 
     def session_for(self, session_id: str) -> SessionState:
         from .kv_cache import SessionState
@@ -51,17 +60,17 @@ class RuntimeState:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "satellites": {
-                satellite_id: satellite.to_dict()
-                for satellite_id, satellite in self.satellites.items()
+            "compute_nodes": {
+                compute_node_id: compute_node.to_dict()
+                for compute_node_id, compute_node in self.compute_nodes.items()
             },
             "sessions": {
                 session_id: session.to_dict()
                 for session_id, session in self.sessions.items()
             },
             "kv_caches": {
-                satellite_id: cache.to_dict()
-                for satellite_id, cache in self.kv_caches.items()
+                compute_node_id: cache.to_dict()
+                for compute_node_id, cache in self.kv_caches.items()
             },
         }
 

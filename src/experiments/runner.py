@@ -94,7 +94,7 @@ def run_experiment(spec: ExperimentSpec) -> ExperimentResult:
         else "not_configured",
         "costing": "evaluated" if cost.evaluated else "not_configured",
         "hardware": "resolved"
-        if resolved_hardware.configured
+        if resolved_hardware is not None
         else "not_configured",
         "workload_generation": str(workload_generation.get("status", "unknown")),
         "simulation": _simulation_status(simulation),

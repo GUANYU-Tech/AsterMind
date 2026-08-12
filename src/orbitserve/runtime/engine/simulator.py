@@ -74,8 +74,14 @@ def run_runtime_engine(simulation_spec: Any) -> RuntimeEngineResult:
         return _all_uncompleted(simulation_spec, str(exc))
 
     state = RuntimeState()
-    for row in environment_state.satellite_catalog:
-        state.satellite_for(str(row["satellite_id"]), initial_soc=initial_soc)
+    compute_node_catalog = getattr(environment_state, "compute_node_catalog", None)
+    if compute_node_catalog is None:
+        compute_node_catalog = tuple(
+            {**row, "compute_node_id": str(row["satellite_id"])}
+            for row in environment_state.satellite_catalog
+        )
+    for row in compute_node_catalog:
+        state.compute_node_for(str(row["compute_node_id"]), initial_soc=initial_soc)
     eligibility = build_compute_eligibility_set(
         satellite_catalog=tuple(environment_state.satellite_catalog)
     )
@@ -113,7 +119,7 @@ def run_runtime_engine(simulation_spec: Any) -> RuntimeEngineResult:
         provenance={
             "runtime_engine": "deterministic_event_runtime",
             "communication_queue_model": "not_modeled",
-            "compute_queue_model": "per_satellite_prefill_decode_fifo",
+            "compute_queue_model": "per_compute_node_prefill_decode_fifo",
             "kv_capacity_model": "architecture_storage_bytes_per_model_token",
             "kv_cache_capacity_tokens": kv_cache_capacity_tokens,
         },
@@ -298,7 +304,7 @@ def _preview_candidate(
         target_satellite_id=compute_satellite_id,
         required_context_tokens=required_context,
         local_hit_tokens=local_hit_tokens,
-        migration_fraction=float(strategy.kv_migration_fraction),
+        copy_enabled=bool(strategy.kv_cache_copy_enabled),
         kv_bytes_per_token=float(serving.kv_cache_bytes_per_token or 0.0),
         environment_state=environment_state,
         start_s=inbound_done_s,
@@ -509,7 +515,11 @@ def _commit_candidate(
         action_type="compute",
         access_type=route.access_type,
         access_satellite_id=route.access_satellite_id,
+        access_compute_node_id=route.access_satellite_id,
+        serving_compute_node_id=route.compute_satellite_id,
         serving_satellite_id=route.compute_satellite_id,
+        compute_owner_compute_node_id=route.compute_satellite_id,
+        compute_owner_compute_node_ids=(route.compute_satellite_id,),
         compute_owner_satellite_id=route.compute_satellite_id,
         compute_owner_satellite_ids=(route.compute_satellite_id,),
         dvfs_scale=payload["dvfs_scale"],
@@ -543,6 +553,7 @@ def _commit_candidate(
         kv_occupancy_tokens_before=kv_event.get("occupancy_tokens_before"),
         kv_occupancy_tokens_after=kv_event.get("occupancy_tokens_after"),
         kv_copy_source_satellite_id=payload["copied_from"],
+        kv_copy_source_compute_node_id=payload["copied_from"],
         bottleneck_reason="compute_queue" if prefill_wait_s + decode_wait_s > 0.0 else "none",
         provenance={
             "score": selection.score,
@@ -560,7 +571,7 @@ def _preview_kv_copy(
     target_satellite_id: str,
     required_context_tokens: int,
     local_hit_tokens: int,
-    migration_fraction: float,
+    copy_enabled: bool,
     kv_bytes_per_token: float,
     environment_state: Any,
     start_s: float,
@@ -576,15 +587,9 @@ def _preview_kv_copy(
     }
     if (
         not session_id
-        or migration_fraction <= 0.0
+        or not copy_enabled
         or required_context_tokens <= local_hit_tokens
     ):
-        return empty
-    desired_reuse_tokens = min(
-        required_context_tokens,
-        int(math.floor(required_context_tokens * migration_fraction)),
-    )
-    if desired_reuse_tokens <= local_hit_tokens:
         return empty
     options: list[dict[str, Any]] = []
     for source_satellite_id in kv_locations_for_session(state, session_id):
@@ -598,7 +603,7 @@ def _preview_kv_copy(
         )
         copied_tokens = max(
             0,
-            min(source_reusable_tokens, desired_reuse_tokens) - local_hit_tokens,
+            min(source_reusable_tokens, required_context_tokens) - local_hit_tokens,
         )
         if copied_tokens <= 0:
             continue
@@ -619,31 +624,20 @@ def _preview_kv_copy(
         options.append({
             "source_satellite_id": source_satellite_id,
             "source_reusable_tokens": source_reusable_tokens,
-            "reaches_limit": source_reusable_tokens >= desired_reuse_tokens,
             "copied_tokens": copied_tokens,
             "done_s": done_s,
             "path": path,
         })
     if not options:
         return empty
-    adequate = tuple(option for option in options if option["reaches_limit"])
-    if adequate:
-        selected = min(
-            adequate,
-            key=lambda option: (
-                option["done_s"],
-                option["source_satellite_id"],
-            ),
-        )
-    else:
-        selected = min(
-            options,
-            key=lambda option: (
-                -option["source_reusable_tokens"],
-                option["done_s"],
-                option["source_satellite_id"],
-            ),
-        )
+    selected = min(
+        options,
+        key=lambda option: (
+            -option["source_reusable_tokens"],
+            option["done_s"],
+            option["source_satellite_id"],
+        ),
+    )
     return {
         "source_satellite_id": selected["source_satellite_id"],
         "copied_tokens": selected["copied_tokens"],

@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .constellation_cost import estimate_constellation_cost
-from ..architecture import resolve_experiment_hardware
+from ..architecture import resolve_architecture
 from ..runtime import RuntimeStrategySpec, run_simulation as execute_runtime_simulation
 from .simulation_builder import build_simulation_spec
 from ..serving import estimate_serving_throughput
@@ -74,17 +74,13 @@ def evaluate_materialized_design(
     # Keep this order explicit: it is the shared fixed-design/DSE contract.
     constellation_architecture = design.architecture_analysis()
     runtime_strategy = RuntimeStrategySpec.from_value(experiment_spec.runtime_strategy)
-    resolved_hardware = resolve_experiment_hardware(
-        getattr(experiment_spec, "hardware", None),
-        base_dir=base_dir,
-    )
+    hardware = getattr(experiment_spec, "hardware", None)
+    resolved_hardware = resolve_architecture(hardware) if hardware is not None else None
     cost = estimate_constellation_cost(
         design,
         experiment_spec.costing,
-        base_dir=base_dir,
-        cost_limits=resolved_hardware.cost_limits,
-        cost_config=resolved_hardware.cost_config,
-        single_satellite_case_path=resolved_hardware.single_satellite_case_path,
+        resolved_architecture=resolved_hardware,
+        formation_member_count=experiment_spec.serving.formation.member_count,
     )
     resolved_simulation_config = _simulation_config_with_link_hardware(
         input_simulation_config,
@@ -105,7 +101,7 @@ def evaluate_materialized_design(
         raise ValueError("runtime_pd_disaggregation_unsupported")
     serving_throughput = estimate_serving_throughput(
         serving_spec,
-        hardware=resolved_hardware.satellite_profile,
+        hardware=resolved_hardware.hardware_profile if resolved_hardware else experiment_spec.serving.hardware,
         token_distribution=serving_workload,
         constellation_satellite_count=design.satellite_count,
     )
@@ -113,7 +109,6 @@ def evaluate_materialized_design(
     pre_runtime_warnings = _dedupe(
         (
             *input_warnings,
-            *resolved_hardware.warnings,
             *serving_warnings,
             *cost.warnings,
             *simulation.warnings,
@@ -128,11 +123,15 @@ def evaluate_materialized_design(
         workload_generation=workload_generation,
         workload_spec=getattr(experiment_spec, "workload", None),
         constellation=design,
-        constellation_architecture=resolved_hardware.satellite_profile,
+        constellation_architecture=(
+            resolved_hardware.hardware_profile
+            if resolved_hardware
+            else experiment_spec.serving.hardware
+        ),
         serving_profile=serving_throughput,
         simulation_result=simulation,
         simulation_config=resolved_simulation_config,
-        energy_profile=getattr(resolved_hardware, "energy_profile", None),
+        energy_profile=resolved_hardware.energy_profile if resolved_hardware else None,
         strategy=runtime_strategy,
         warnings=pre_runtime_warnings,
     )
@@ -161,16 +160,8 @@ def _serving_spec_for_resolved_hardware(
     """Use resolver output as the single-design hardware authority."""
 
     serving = experiment_spec.serving
-    if resolved_hardware.satellite_profile is None:
+    if resolved_hardware is None:
         return serving, ()
-
-    cost_or_top_level_hardware = (
-        getattr(experiment_spec, "hardware", None) is not None
-        or resolved_hardware.single_satellite_case_path is not None
-    )
-    if not cost_or_top_level_hardware:
-        return replace(serving, hardware=None), ()
-
     return replace(serving, hardware=None), ()
 
 
@@ -258,7 +249,7 @@ def _simulation_config_with_default_trace_dir(
 def _simulation_config_with_link_hardware(simulation_config: Any, *, resolved_hardware: Any) -> Any:
     """Inject the immutable single-satellite terminal capability into trace inputs."""
 
-    profile = getattr(resolved_hardware, "satellite_profile", None)
+    profile = getattr(resolved_hardware, "hardware_profile", None)
     if profile is None:
         return simulation_config
     options = dict(getattr(simulation_config, "trace_options", {}) or {})

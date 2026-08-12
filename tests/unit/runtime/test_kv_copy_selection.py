@@ -40,14 +40,14 @@ class KVCopySelectionTests(unittest.TestCase):
             target_satellite_id="sat-target",
             required_context_tokens=100,
             local_hit_tokens=local_hit_tokens,
-            migration_fraction=0.5,
+            copy_enabled=True,
             kv_bytes_per_token=2.0,
             environment_state=environment_state,
             start_s=1.0,
             isl_bandwidth_bps=1e9,
         )
 
-    def test_adequate_sources_are_ranked_by_copy_completion_time(self):
+    def test_source_with_longest_reusable_prefix_is_selected(self):
         self.store("sat-a", 90)
         self.store("sat-b", 50)
         environment_state = SimpleNamespace(
@@ -59,10 +59,10 @@ class KVCopySelectionTests(unittest.TestCase):
 
         plan = self.preview(environment_state)
 
-        self.assertEqual(plan["source_satellite_id"], "sat-b")
-        self.assertEqual(plan["copied_tokens"], 50)
+        self.assertEqual(plan["source_satellite_id"], "sat-a")
+        self.assertEqual(plan["copied_tokens"], 90)
 
-    def test_largest_source_is_used_when_all_sources_are_below_limit(self):
+    def test_largest_source_is_used(self):
         self.store("sat-a", 40)
         self.store("sat-b", 30)
         environment_state = SimpleNamespace(

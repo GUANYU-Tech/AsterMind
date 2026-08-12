@@ -17,6 +17,8 @@ _SECTION_DEFAULTS: dict[str, dict[str, Any]] = {
         "strategy": None, "action_type": "reject_drop", "action_components": (),
         "access_type": None,
         "access_satellite_id": None,
+        "access_compute_node_id": None,
+        "serving_compute_node_id": None,
         "serving_satellite_id": None, "dvfs_scale": None,
         "fallback_used": False, "deferred": False, "defer_until_s": None,
         "session_action": None, "shadow_strategy": None, "shadow_strategies": (),
@@ -24,6 +26,7 @@ _SECTION_DEFAULTS: dict[str, dict[str, Any]] = {
         "decode_action_type": None,
     },
     "placement": {
+        "compute_owner_compute_node_id": None, "compute_owner_compute_node_ids": (),
         "compute_owner_satellite_id": None, "compute_owner_satellite_ids": (),
     },
     "timing": {
@@ -57,6 +60,7 @@ _SECTION_DEFAULTS: dict[str, dict[str, Any]] = {
         "kv_occupancy_tokens_before": None,
         "kv_occupancy_tokens_after": None,
         "kv_copy_source_satellite_id": None,
+        "kv_copy_source_compute_node_id": None,
     },
     "outcome": {
         "completed": False, "uncompleted_stage": None,

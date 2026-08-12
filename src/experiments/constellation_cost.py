@@ -1,28 +1,28 @@
-"""Cost adapters that lift single-satellite estimates to constellation results."""
+"""Experiment-level cost aggregation for logical L2 compute nodes."""
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
+from ..architecture import HardwareSpec, ResolvedArchitecture, resolve_architecture
 from ..common import to_jsonable
-from ..orbit import ConstellationDesign
-from ..architecture import CostResult, estimate_single_satellite_cost
-from ..architecture import SatelliteDesignLimits, SingleSatelliteConfig
 
 
 @dataclass(frozen=True)
 class CostingSpec:
-    single_satellite_case_path: str | None = None
-    scale_by: str = "satellite_count"
+    """Cost aggregation policy; Architecture remains the single-member authority."""
+
+    scale_by: str = "compute_node_count"
     energy_accounting_mode: str = "offered_workload"
     target_served_ratio: float = 1.0
     nominal_isl_hops_per_request: float = 0.0
     energy_alignment_tolerance: float = 0.05
 
     def __post_init__(self) -> None:
+        if self.scale_by not in {"compute_node_count", "satellite_count"}:
+            raise ValueError("costing.scale_by must be 'compute_node_count'")
         if self.energy_accounting_mode != "offered_workload":
             raise ValueError("costing.energy_accounting_mode must be 'offered_workload'")
         if not math.isfinite(self.target_served_ratio) or not 0.0 <= self.target_served_ratio <= 1.0:
@@ -35,15 +35,18 @@ class CostingSpec:
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "CostingSpec":
         data = data or {}
-        result = cls(
-            single_satellite_case_path=data.get("single_satellite_case_path"),
-            scale_by=str(data.get("scale_by", "satellite_count")),
+        unsupported = sorted(set(data) - set(cls.__dataclass_fields__) - {"single_satellite_case_path"})
+        if unsupported:
+            raise ValueError("Unsupported CostingSpec fields: " + ", ".join(unsupported))
+        if data.get("single_satellite_case_path"):
+            raise ValueError("costing.single_satellite_case_path is obsolete; configure hardware")
+        return cls(
+            scale_by=str(data.get("scale_by", "compute_node_count")),
             energy_accounting_mode=str(data.get("energy_accounting_mode", "offered_workload")),
             target_served_ratio=float(data.get("target_served_ratio", 1.0)),
             nominal_isl_hops_per_request=float(data.get("nominal_isl_hops_per_request", 0.0)),
             energy_alignment_tolerance=float(data.get("energy_alignment_tolerance", 0.05)),
         )
-        return result
 
     def to_dict(self) -> dict[str, Any]:
         return to_jsonable(self)
@@ -52,8 +55,9 @@ class CostingSpec:
 @dataclass(frozen=True)
 class ConstellationCostResult:
     evaluated: bool
-    satellite_count: int
-    single_satellite_case_path: str | None
+    compute_node_count: int
+    formation_member_count: int
+    physical_satellite_count: int
     single_satellite: dict[str, Any] | None
     total_cost_usd: float | None
     annualized_cost_usd_per_year: float | None
@@ -62,69 +66,79 @@ class ConstellationCostResult:
     warnings: tuple[str, ...]
     provenance: dict[str, Any]
 
+    @property
+    def satellite_count(self) -> int:
+        """Compatibility alias; canonical outputs use physical_satellite_count."""
+
+        return self.physical_satellite_count
+
     def to_dict(self) -> dict[str, Any]:
         return to_jsonable(self)
 
 
 def estimate_constellation_cost(
-    design: ConstellationDesign,
+    design: Any,
     costing: CostingSpec,
-    base_dir: Path | None = None,
-    cost_limits: SatelliteDesignLimits | None = None,
-    cost_config: SingleSatelliteConfig | None = None,
-    single_satellite_case_path: str | None = None,
+    *,
+    hardware: HardwareSpec | None = None,
+    resolved_architecture: ResolvedArchitecture | None = None,
+    formation_member_count: int = 1,
+    **_: Any,
 ) -> ConstellationCostResult:
-    """Estimate constellation cost by scaling an existing single-satellite case."""
+    """Scale closed single-satellite cost by logical nodes and L2 members.
 
-    if cost_limits is None and cost_config is None and costing.single_satellite_case_path is None:
+    The single-satellite profile already includes its configured communication
+    terminals.  No topology-specific terminal surcharge is added here.
+    """
+
+    compute_node_count = _compute_node_count(design)
+    if formation_member_count < 1:
+        raise ValueError("formation_member_count must be at least 1")
+    physical_satellite_count = compute_node_count * formation_member_count
+    resolved = resolved_architecture or (resolve_architecture(hardware) if hardware else None)
+    if resolved is None:
         return ConstellationCostResult(
             evaluated=False,
-            satellite_count=design.satellite_count,
-            single_satellite_case_path=None,
+            compute_node_count=compute_node_count,
+            formation_member_count=formation_member_count,
+            physical_satellite_count=physical_satellite_count,
             single_satellite=None,
             total_cost_usd=None,
             annualized_cost_usd_per_year=None,
             total_mass_kg=None,
             peak_power_w=None,
-            warnings=("costing.single_satellite_case_path is not configured",),
-            provenance={"scale_by": costing.scale_by},
+            warnings=("hardware is not configured",),
+            provenance={"scale_by": "compute_node_count_x_formation_member_count"},
         )
-    if costing.scale_by != "satellite_count":
-        raise ValueError("only costing.scale_by='satellite_count' is implemented in the skeleton")
-
-    if cost_limits is None or cost_config is None:
-        raise ValueError(
-            "constellation cost requires resolved immutable single-satellite hardware"
-        )
-    single_result = estimate_single_satellite_cost(
-        cost_limits,
-        cost_config,
-        orbit_energy_condition=design.energy_design_condition(),
-    )
-    case_path_text = single_satellite_case_path
-    adapter_warnings: tuple[str, ...] = ()
-
-    n_sat = design.satellite_count
-    warnings = tuple((*single_result.warnings, *adapter_warnings))
+    single = resolved.cost_profile
     return ConstellationCostResult(
         evaluated=True,
-        satellite_count=n_sat,
-        single_satellite_case_path=case_path_text,
-        single_satellite=single_result.to_dict(),
-        total_cost_usd=single_result.C_sat_usd * n_sat,
-        annualized_cost_usd_per_year=single_result.annualized_cost_usd_per_year * n_sat,
-        total_mass_kg=single_result.M_sat_kg * n_sat,
-        peak_power_w=single_result.P_peak_w * n_sat,
-        warnings=warnings,
+        compute_node_count=compute_node_count,
+        formation_member_count=formation_member_count,
+        physical_satellite_count=physical_satellite_count,
+        single_satellite=single.to_dict(),
+        total_cost_usd=single.total_cost_usd * physical_satellite_count,
+        annualized_cost_usd_per_year=(
+            single.annualized_cost_usd_per_year * physical_satellite_count
+        ),
+        total_mass_kg=single.total_mass_kg * physical_satellite_count,
+        peak_power_w=single.peak_power_w * physical_satellite_count,
+        warnings=single.warnings,
         provenance={
-            "scale_by": costing.scale_by,
-            "single_satellite_input": "resolved_hardware" if cost_limits is not None else "case_path",
-            "single_satellite_provenance": single_result.provenance,
+            "scale_by": "compute_node_count_x_formation_member_count",
+            "single_satellite_includes_configured_laser_terminals": True,
+            "topology_specific_cost_added": False,
+            "single_satellite_provenance": single.provenance,
         },
     )
 
 
-
-
-
-
+def _compute_node_count(design: Any) -> int:
+    value = getattr(design, "compute_node_count", None)
+    if value is None:
+        value = getattr(design, "satellite_count", None)
+    if value is None and isinstance(design, dict):
+        value = design.get("compute_node_count", design.get("satellite_count"))
+    if value is None or int(value) < 1:
+        raise ValueError("design must define a positive compute_node_count")
+    return int(value)
