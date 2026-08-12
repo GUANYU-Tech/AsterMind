@@ -2,6 +2,7 @@
 
 from .capacity import (
     LLMModelProfile,
+    L2FormationSpec,
     ParallelLayout,
     PrecisionSpec,
     ServingParallelism,
@@ -13,6 +14,7 @@ from .capacity import (
 
 __all__ = [
     "LLMModelProfile",
+    "L2FormationSpec",
     "ParallelLayout",
     "PrecisionSpec",
     "ServingParallelism",

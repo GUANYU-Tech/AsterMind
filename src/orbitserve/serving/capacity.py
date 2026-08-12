@@ -445,12 +445,57 @@ class ParallelLayout:
     def to_dict(self) -> dict[str, Any]:
         return to_jsonable(self)
 
+
+@dataclass(frozen=True)
+class L2FormationSpec:
+    """Physical-member formation encapsulated as one logical compute node."""
+
+    member_count: int = 1
+    topology: str = "ring"
+    link_bandwidth_gbps: float = 0.0
+    link_propagation_delay_s: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.member_count < 1:
+            raise ValueError("serving.formation.member_count must be at least 1")
+        if self.topology not in {"ring", "switch", "fully_connected"}:
+            raise ValueError(
+                "serving.formation.topology must be one of ring, switch, fully_connected"
+            )
+        for name, value in (
+            ("link_bandwidth_gbps", self.link_bandwidth_gbps),
+            ("link_propagation_delay_s", self.link_propagation_delay_s),
+        ):
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"serving.formation.{name} must be finite and non-negative")
+        if self.member_count > 1 and self.link_bandwidth_gbps <= 0.0:
+            raise ValueError(
+                "serving.formation.link_bandwidth_gbps must be positive when member_count > 1"
+            )
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "L2FormationSpec":
+        data = data or {}
+        return cls(
+            member_count=int(_pick(data, "member_count", 1)),
+            topology=str(_pick(data, "topology", "ring")).lower(),
+            link_bandwidth_gbps=float(_pick(data, "link_bandwidth_gbps", 0.0)),
+            link_propagation_delay_s=float(
+                _pick(data, "link_propagation_delay_s", 0.0)
+            ),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return to_jsonable(self)
+
+
 @dataclass(frozen=True)
 class ServingSpec:
     model: LLMModelProfile = field(default_factory=LLMModelProfile)
     prefill: StageServingProfile = field(default_factory=StageServingProfile)
     decode: StageServingProfile = field(default_factory=StageServingProfile)
     parallelism: ServingParallelism = field(default_factory=ServingParallelism)
+    formation: L2FormationSpec = field(default_factory=L2FormationSpec)
     pd_mode: str = "colocated"
     prefill_satellite_fraction: float | None = None
     decode_satellite_fraction: float | None = None
@@ -482,6 +527,7 @@ class ServingSpec:
             prefill=StageServingProfile.from_dict(data.get("prefill")),
             decode=StageServingProfile.from_dict(data.get("decode")),
             parallelism=ServingParallelism.from_dict(data.get("parallelism")),
+            formation=L2FormationSpec.from_dict(data.get("formation")),
             pd_mode=pd_mode,
             prefill_satellite_fraction=prefill_satellite_fraction,
             decode_satellite_fraction=decode_satellite_fraction,
@@ -501,6 +547,7 @@ class ServingSpec:
             "prefill": self.prefill.to_dict(),
             "decode": self.decode.to_dict(),
             "parallelism": self.parallelism.to_dict(),
+            "formation": self.formation.to_dict(),
             "pd_mode": self.pd_mode,
             "prefill_satellite_fraction": self.prefill_satellite_fraction,
             "decode_satellite_fraction": self.decode_satellite_fraction,
@@ -524,6 +571,11 @@ class ServingThroughputEstimate:
     model: dict[str, Any]
     hardware: dict[str, Any]
     parallelism: dict[str, Any]
+    formation: dict[str, Any]
+    formation_member_count: int
+    formation_topology: str
+    physical_satellite_count: int
+    internal_communication_accounting: str
     stage_satellite_count: int
     satellites_per_deployment: int
     dp: int
@@ -554,6 +606,12 @@ class ServingThroughputEstimate:
     prefill_tokens_per_s: float | None
     decode_tokens_per_s: float | None
     request_throughput_per_s: float | None
+    reference_prefill_service_time_s: float | None
+    reference_decode_time_per_token_s: float | None
+    formation_prefill_communication_time_s: float | None
+    formation_decode_communication_time_s: float | None
+    prefill_scaling_efficiency: float | None
+    decode_scaling_efficiency: float | None
     ttft_s: float | None
     e2e_s: float | None
     prefill_interconnect_time_s: float | None
@@ -725,6 +783,33 @@ def estimate_serving_throughput(
         deployment_group_count=decode_deployment_group_count,
         pd_handoff_active=False,
     )
+    if serving.formation.member_count > 1 and parallelism.satellite_count > 1:
+        warnings.append(
+            "L2 formation scaling is layered over legacy cross-satellite parallelism; "
+            "paper runs should keep serving.parallelism on one logical deployment until "
+            "the two models are unified"
+        )
+    prefill = _apply_l2_formation_to_stage(
+        prefill,
+        formation=serving.formation,
+        payload_bytes=(
+            serving.prefill.batch_size
+            * token_distribution.prompt_tokens_p95
+            * (model.hidden_size or 0)
+            * model.precision.activation_bytes
+        ),
+        batch_tokens=serving.prefill.batch_size * token_distribution.prompt_tokens_p95,
+    )
+    decode = _apply_l2_formation_to_stage(
+        decode,
+        formation=serving.formation,
+        payload_bytes=(
+            serving.decode.batch_size
+            * (model.hidden_size or 0)
+            * model.precision.activation_bytes
+        ),
+        batch_tokens=serving.decode.batch_size,
+    )
     kv_handoff = _kv_handoff_profile(
         serving,
         model,
@@ -743,6 +828,8 @@ def estimate_serving_throughput(
 
     prefill_tokens_per_s = prefill["token_throughput_per_s"]
     decode_tokens_per_s = decode["token_throughput_per_s"]
+    if kv_capacity_tokens is not None:
+        kv_capacity_tokens *= serving.formation.member_count
     request_throughput = None
     if prefill_tokens_per_s and decode_tokens_per_s:
         prefill_request_throughput_per_s = prefill_tokens_per_s / max(1, token_distribution.prompt_tokens_p50)
@@ -775,6 +862,11 @@ def estimate_serving_throughput(
         model=model.to_dict(),
         hardware=resolved_hardware.to_dict(),
         parallelism=parallelism.to_dict(),
+        formation=serving.formation.to_dict(),
+        formation_member_count=serving.formation.member_count,
+        formation_topology=serving.formation.topology,
+        physical_satellite_count=serving.formation.member_count,
+        internal_communication_accounting="embedded",
         stage_satellite_count=layout.stage_satellite_count,
         satellites_per_deployment=layout.satellites_per_deployment,
         dp=layout.dp,
@@ -805,6 +897,12 @@ def estimate_serving_throughput(
         prefill_tokens_per_s=prefill_tokens_per_s,
         decode_tokens_per_s=decode_tokens_per_s,
         request_throughput_per_s=request_throughput,
+        reference_prefill_service_time_s=prefill["throughput_processing_time_s"],
+        reference_decode_time_per_token_s=decode["latency_s"],
+        formation_prefill_communication_time_s=prefill["formation_communication_time_s"],
+        formation_decode_communication_time_s=decode["formation_communication_time_s"],
+        prefill_scaling_efficiency=prefill["formation_scaling_efficiency"],
+        decode_scaling_efficiency=decode["formation_scaling_efficiency"],
         ttft_s=ttft_s,
         e2e_s=e2e_s,
         prefill_interconnect_time_s=prefill["interconnect_time_s"],
@@ -834,6 +932,11 @@ def estimate_serving_throughput(
             },
             "token_distribution": token_distribution.to_dict(),
             "parallel_layout": layout.to_dict(),
+            "formation": {
+                **serving.formation.to_dict(),
+                "internal_communication_accounting": "embedded",
+                "model_status": "first_order_analytical_model_pending_calibration",
+            },
             "data_parallel_replica_semantics": {
                 "dp_replica_model": layout.dp_replica_model,
                 "dp": layout.dp,
@@ -2247,6 +2350,137 @@ def _safe_ratio(numerator: float, denominator: float) -> float:
     return numerator / denominator
 
 
+def _apply_l2_formation_to_stage(
+    stage: dict[str, Any],
+    *,
+    formation: L2FormationSpec,
+    payload_bytes: float,
+    batch_tokens: int,
+) -> dict[str, Any]:
+    """Apply a replaceable first-order L2 formation wrapper to one stage."""
+
+    if formation.member_count == 1:
+        return {
+            **stage,
+            "formation_communication_time_s": 0.0,
+            "formation_scaling_efficiency": 1.0,
+        }
+    base_processing_s = float(stage.get("throughput_processing_time_s", math.inf))
+    base_latency_s = float(stage.get("latency_s", math.inf))
+    communication_s = _estimate_l2_formation_communication_time_s(
+        formation,
+        payload_bytes=max(0.0, float(payload_bytes)),
+    )
+    scaled_processing_s = base_processing_s / formation.member_count + communication_s
+    scaled_latency_s = base_latency_s / formation.member_count + communication_s
+    old_throughput = stage.get("token_throughput_per_s")
+    throughput = None
+    efficiency = None
+    if (
+        old_throughput is not None
+        and float(old_throughput) > 0.0
+        and math.isfinite(base_processing_s)
+        and math.isfinite(scaled_processing_s)
+        and scaled_processing_s > 0.0
+    ):
+        throughput = float(old_throughput) * base_processing_s / scaled_processing_s
+        efficiency = throughput / (float(old_throughput) * formation.member_count)
+    elif batch_tokens > 0 and math.isfinite(scaled_processing_s) and scaled_processing_s > 0.0:
+        throughput = batch_tokens / scaled_processing_s
+    bottleneck = stage.get("bottleneck")
+    compute_or_memory_s = max(
+        float(stage.get("throughput_compute_time_s", 0.0)),
+        float(stage.get("throughput_memory_time_s", 0.0)),
+    ) / formation.member_count
+    if communication_s > compute_or_memory_s:
+        bottleneck = "formation_communication"
+    return {
+        **stage,
+        "latency_s": scaled_latency_s,
+        "throughput_processing_time_s": scaled_processing_s,
+        "token_throughput_per_s": throughput,
+        "formation_communication_time_s": communication_s,
+        "formation_scaling_efficiency": efficiency,
+        "bottleneck": bottleneck,
+    }
+
+
+def _estimate_l2_formation_communication_time_s(
+    formation: L2FormationSpec,
+    *,
+    payload_bytes: float,
+) -> float:
+    """Estimate one collective using topology-specific round/volume factors.
+
+    This deliberately small analytical boundary is provisional.  It can be
+    calibrated or replaced without changing the Serving/Runtime contract.
+    """
+
+    if formation.member_count <= 1 or payload_bytes <= 0.0:
+        return 0.0
+    if formation.topology == "ring":
+        return _estimate_ring_communication(formation, payload_bytes=payload_bytes)
+    if formation.topology == "switch":
+        return _estimate_switch_communication(formation, payload_bytes=payload_bytes)
+    return _estimate_fully_connected_communication(
+        formation,
+        payload_bytes=payload_bytes,
+    )
+
+
+def _estimate_ring_communication(
+    formation: L2FormationSpec,
+    *,
+    payload_bytes: float,
+) -> float:
+    members = formation.member_count
+    rounds = 2 * (members - 1)
+    volume_factor = 2.0 * (members - 1) / members
+    return _formation_round_volume_time_s(
+        formation,
+        rounds=rounds,
+        payload_bytes=payload_bytes * volume_factor,
+    )
+
+
+def _estimate_switch_communication(
+    formation: L2FormationSpec,
+    *,
+    payload_bytes: float,
+) -> float:
+    volume_factor = 2.0 * (formation.member_count - 1) / formation.member_count
+    return _formation_round_volume_time_s(
+        formation,
+        rounds=2,
+        payload_bytes=payload_bytes * volume_factor,
+    )
+
+
+def _estimate_fully_connected_communication(
+    formation: L2FormationSpec,
+    *,
+    payload_bytes: float,
+) -> float:
+    return _formation_round_volume_time_s(
+        formation,
+        rounds=2,
+        payload_bytes=2.0 * payload_bytes / formation.member_count,
+    )
+
+
+def _formation_round_volume_time_s(
+    formation: L2FormationSpec,
+    *,
+    rounds: int,
+    payload_bytes: float,
+) -> float:
+    bandwidth_bytes_per_s = formation.link_bandwidth_gbps * 1e9 / 8.0
+    return (
+        rounds * formation.link_propagation_delay_s
+        + _safe_ratio(payload_bytes, bandwidth_bytes_per_s)
+    )
+
+
 def _unevaluated_throughput(message: str) -> ServingThroughputEstimate:
     return ServingThroughputEstimate(
         evaluated=False,
@@ -2256,6 +2490,11 @@ def _unevaluated_throughput(message: str) -> ServingThroughputEstimate:
         model={},
         hardware={},
         parallelism={},
+        formation={},
+        formation_member_count=0,
+        formation_topology="not_evaluated",
+        physical_satellite_count=0,
+        internal_communication_accounting="embedded",
         stage_satellite_count=0,
         satellites_per_deployment=0,
         dp=0,
@@ -2286,6 +2525,12 @@ def _unevaluated_throughput(message: str) -> ServingThroughputEstimate:
         prefill_tokens_per_s=None,
         decode_tokens_per_s=None,
         request_throughput_per_s=None,
+        reference_prefill_service_time_s=None,
+        reference_decode_time_per_token_s=None,
+        formation_prefill_communication_time_s=None,
+        formation_decode_communication_time_s=None,
+        prefill_scaling_efficiency=None,
+        decode_scaling_efficiency=None,
         ttft_s=None,
         e2e_s=None,
         prefill_interconnect_time_s=None,
