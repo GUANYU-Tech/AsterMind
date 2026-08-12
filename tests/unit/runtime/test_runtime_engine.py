@@ -135,7 +135,11 @@ class RuntimeEngineTests(unittest.TestCase):
         self.assertEqual(record["decision"]["serving_satellite_id"], "sat-b")
         self.assertNotIn("links", result.state_summary)
         self.assertNotIn("link_queue_wait_s", record["timing"])
-        self.assertFalse(result.slo_metrics["evaluated"])
+        self.assertNotIn("slo_metrics", result.to_dict())
+        self.assertEqual(
+            set(result.inference_metrics),
+            {"ttft_s", "tpot_s", "e2e_s"},
+        )
         self.assertEqual(
             result.state_summary["kv_caches"]["sat-a"]["capacity_tokens"],
             100,
@@ -153,6 +157,10 @@ class RuntimeEngineTests(unittest.TestCase):
         first_leg = record["routing"]["selected_path"][0]
         self.assertAlmostEqual(first_leg["propagation_delay_s"], 550.0 / 299_792.458)
         self.assertAlmostEqual(first_leg["transmission_s"], 1000.0 * 8.0 / 1e9)
+        self.assertAlmostEqual(
+            record["timing"]["tpot_s"],
+            record["timing"]["e2e_s"] - record["timing"]["ttft_s"],
+        )
 
     def test_shadow_dvfs_scales_compute_capacity(self):
         strategy = RuntimeStrategySpec(

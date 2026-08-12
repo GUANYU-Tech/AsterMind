@@ -63,6 +63,11 @@ than the rate itself. A reusable prefix of length `K` therefore costs
 `T_prefill(P) - T_prefill(K)`. Decode integrates the table's context-dependent
 per-token time over generated output tokens.
 
+Runtime's inference-efficiency output contains only TTFT, TPOT, and E2E. Each
+is summarized with average, p50, p95, and p99 across completed requests; TPOT
+excludes single-output-token requests. Completion counts are retained as
+request-summary metadata, while Runtime performs no SLO evaluation.
+
 ## Runtime KV cache decision
 
 `runtime_strategy.kv_cache_copy_enabled` is a boolean. Reuse is legal only for
