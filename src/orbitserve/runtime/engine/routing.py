@@ -12,6 +12,7 @@ from ...common import to_jsonable
 
 C_KM_PER_S = 299_792.458
 EARTH_RADIUS_KM = 6_378.137
+COMMUNICATION_SHELL_ALTITUDE_KM = 450.0
 
 
 class RouteUnavailable(ValueError):
@@ -88,7 +89,11 @@ def communication_access_candidate(profile: Any, request: dict[str, Any], horizo
         end_s=float(horizon_s),
         uplink_bandwidth_bps=float(profile.uplink_bandwidth_bps),
         downlink_bandwidth_bps=float(profile.downlink_bandwidth_bps),
-        propagation_delay_s=float(profile.altitude_km) / C_KM_PER_S,
+        # The communication-satellite abstraction always uses the fixed shell.
+        # ``profile.altitude_km`` remains a required configuration field so the
+        # public Runtime input contract is unchanged, but it is not a route
+        # geometry input in this mode.
+        propagation_delay_s=COMMUNICATION_SHELL_ALTITUDE_KM / C_KM_PER_S,
         anchor_unit_vector=anchor,
     )
 
@@ -136,7 +141,12 @@ def build_route_plan(
     target_vector = satellite_position_unit(environment_state, compute_satellite_id, time_s)
     angle = central_angle(access.anchor_unit_vector, target_vector)
     if access.access_type == "communication_satellite":
-        network_propagation = angle * EARTH_RADIUS_KM / C_KM_PER_S
+        compute_altitude_km = satellite_altitude_km(environment_state, compute_satellite_id, time_s)
+        network_distance_km = (
+            (EARTH_RADIUS_KM + COMMUNICATION_SHELL_ALTITUDE_KM) * angle
+            + abs(compute_altitude_km - COMMUNICATION_SHELL_ALTITUDE_KM)
+        )
+        network_propagation = network_distance_km / C_KM_PER_S
         inbound = (
             RouteLeg(
                 link_id=f"communication:{access.ingress_id}:{compute_satellite_id}",
@@ -167,6 +177,11 @@ def build_route_plan(
             outbound_legs=outbound,
             arc_distance_rad=angle,
             route_satellite_ids=(compute_satellite_id,),
+            provenance={
+                "communication_model": "fixed_shell_arc",
+                "communication_shell_altitude_km": COMMUNICATION_SHELL_ALTITUDE_KM,
+                "reachability_assumption": "always_reachable",
+            },
         )
 
     source = str(access.satellite_id)
@@ -324,6 +339,19 @@ def build_isl_transfer_legs(
 
 
 def satellite_position_unit(environment_state: Any, satellite_id: str, time_s: float) -> tuple[float, float, float]:
+    vector = satellite_position_km(environment_state, satellite_id, time_s)
+    norm = math.sqrt(sum(item * item for item in vector))
+    if norm <= 0.0:
+        raise RouteUnavailable(f"ephemeris_invalid:{satellite_id}")
+    return tuple(item / norm for item in vector)
+
+
+def satellite_altitude_km(environment_state: Any, satellite_id: str, time_s: float) -> float:
+    vector = satellite_position_km(environment_state, satellite_id, time_s)
+    return math.sqrt(sum(item * item for item in vector)) - EARTH_RADIUS_KM
+
+
+def satellite_position_km(environment_state: Any, satellite_id: str, time_s: float) -> tuple[float, float, float]:
     rows = [
         row for row in environment_state.ephemeris_samples
         if str(row.get("satellite_id")) == satellite_id
@@ -331,11 +359,7 @@ def satellite_position_unit(environment_state: Any, satellite_id: str, time_s: f
     if not rows:
         raise RouteUnavailable(f"ephemeris_missing:{satellite_id}")
     row = min(rows, key=lambda item: (abs(float(item["time_s"]) - time_s), float(item["time_s"])))
-    vector = tuple(float(item) for item in row["position_itrs_km"])
-    norm = math.sqrt(sum(item * item for item in vector))
-    if norm <= 0.0:
-        raise RouteUnavailable(f"ephemeris_invalid:{satellite_id}")
-    return tuple(item / norm for item in vector)
+    return tuple(float(item) for item in row["position_itrs_km"])
 
 
 def central_angle(first: tuple[float, float, float], second: tuple[float, float, float]) -> float:
@@ -365,6 +389,7 @@ def _window_distance(window: dict[str, Any]) -> float:
 
 __all__ = [
     "AccessCandidate",
+    "COMMUNICATION_SHELL_ALTITUDE_KM",
     "RouteLeg",
     "RoutePlan",
     "RouteUnavailable",
@@ -375,5 +400,6 @@ __all__ = [
     "compute_access_candidates",
     "execute_route",
     "satellite_position_unit",
+    "satellite_altitude_km",
     "shortest_active_isl_path",
 ]
