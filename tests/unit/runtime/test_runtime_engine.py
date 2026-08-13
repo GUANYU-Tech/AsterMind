@@ -1,8 +1,9 @@
 import unittest
 
 from orbitserve.orbit import ORBIT_TRACE_SCHEMA, OrbitTraceBundle, OrbitTraceManifest
-from orbitserve.experiments.simulation_builder import build_simulation_spec
+from experiments.simulation_builder import build_simulation_spec
 from orbitserve.runtime import RuntimeStrategySpec, run_simulation
+from orbitserve.runtime.engine.routing import C_KM_PER_S, COMMUNICATION_SHELL_ALTITUDE_KM, EARTH_RADIUS_KM
 
 
 def _trace():
@@ -155,7 +156,11 @@ class RuntimeEngineTests(unittest.TestCase):
         result = run_simulation(_scenario(strategy))
         record = result.request_records[0]
         first_leg = record["routing"]["selected_path"][0]
-        self.assertAlmostEqual(first_leg["propagation_delay_s"], 550.0 / 299_792.458)
+        expected_propagation_s = (
+            COMMUNICATION_SHELL_ALTITUDE_KM
+            + abs((7000.0 - EARTH_RADIUS_KM) - COMMUNICATION_SHELL_ALTITUDE_KM)
+        ) / C_KM_PER_S
+        self.assertAlmostEqual(first_leg["propagation_delay_s"], expected_propagation_s)
         self.assertAlmostEqual(first_leg["transmission_s"], 1000.0 * 8.0 / 1e9)
         self.assertAlmostEqual(
             record["timing"]["tpot_s"],
