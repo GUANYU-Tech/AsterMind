@@ -1,10 +1,10 @@
 # Serving model profile constants
 
-OrbitServe freezes the following batch-one analytical constants in
+OrbitServe freezes the following model-level analytical constants in
 `src/orbitserve/serving/model_profiles.py`. They are modeling inputs, not
-measured end-to-end throughput. Rates are produced only after combining them
+measured end-to-end throughput. Two-dimensional per-request rates are produced only after combining them
 with the selected single-satellite hardware profile, L2 formation, parallelism,
-efficiency factors, and communication model.
+efficiency factors, communication model, prompt/context length, and static-batch concurrency.
 
 | Canonical model | Total parameters | Active parameters/token | Layers | Hidden size | Prefill A (FLOPs/token) | Prefill B (FLOPs/token²) | KV bytes/token | Max context |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|

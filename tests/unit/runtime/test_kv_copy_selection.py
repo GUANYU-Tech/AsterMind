@@ -46,10 +46,11 @@ class KVCopySelectionTests(unittest.TestCase):
             environment_state=environment_state,
             start_s=1.0,
             isl_bandwidth_bps=1e9,
-            prefill_time_table=(
-                {"prompt_length": 1, "prefill_tokens_per_s": 10.0},
-                {"prompt_length": 100, "prefill_tokens_per_s": 10.0},
+            prefill_rate_table=(
+                {"prompt_length": 1, "concurrency": 1, "prefill_tokens_per_s": 10.0},
+                {"prompt_length": 100, "concurrency": 1, "prefill_tokens_per_s": 10.0},
             ),
+            concurrency=1,
         )
 
     def test_source_with_shortest_copy_plus_recompute_time_is_selected(self):

@@ -1,7 +1,7 @@
 import unittest
 
 from orbitserve.orbit import ORBIT_TRACE_SCHEMA, OrbitTraceBundle, OrbitTraceManifest
-from experiments.simulation_builder import build_simulation_spec
+from orbitserve.experiments.simulation_builder import build_simulation_spec
 from orbitserve.runtime import RuntimeStrategySpec, run_simulation
 from orbitserve.runtime.engine.routing import C_KM_PER_S, COMMUNICATION_SHELL_ALTITUDE_KM, EARTH_RADIUS_KM
 
@@ -95,14 +95,19 @@ def _scenario(strategy, requests=None, trace=None):
         serving_profile={
             "evaluated": True,
             "feasible": True,
-            "prefill_time_table": [
-                {"prompt_length": 1, "prefill_tokens_per_s": 10.0},
-                {"prompt_length": 100, "prefill_tokens_per_s": 10.0},
+            "prefill_rate_table": [
+                {"prompt_length": 1, "concurrency": 1, "prefill_tokens_per_s": 10.0},
+                {"prompt_length": 1, "concurrency": 2, "prefill_tokens_per_s": 5.0},
+                {"prompt_length": 100, "concurrency": 1, "prefill_tokens_per_s": 10.0},
+                {"prompt_length": 100, "concurrency": 2, "prefill_tokens_per_s": 5.0},
             ],
-            "decode_time_table": [
-                {"prompt_length": 1, "decode_tokens_per_s": 10.0},
-                {"prompt_length": 100, "decode_tokens_per_s": 10.0},
+            "decode_rate_table": [
+                {"context_length": 1, "concurrency": 1, "decode_tokens_per_s": 10.0},
+                {"context_length": 1, "concurrency": 2, "decode_tokens_per_s": 5.0},
+                {"context_length": 100, "concurrency": 1, "decode_tokens_per_s": 10.0},
+                {"context_length": 100, "concurrency": 2, "decode_tokens_per_s": 5.0},
             ],
+            "max_concurrency": 2,
             "kv_cache_capacity_tokens": 100,
             "kv_cache_bytes_per_token": 2.0,
         },
@@ -181,6 +186,33 @@ class RuntimeEngineTests(unittest.TestCase):
         self.assertEqual(record["decision"]["serving_satellite_id"], "sat-a")
         self.assertEqual(record["decision"]["dvfs_scale"], 0.5)
         self.assertEqual(record["timing"]["prefill_service_s"], 2.0)
+
+    def test_requests_use_admission_concurrency_and_queue_at_limit(self):
+        strategy = RuntimeStrategySpec(
+            latency_weight=1.0,
+            kv_reuse_weight=0.0,
+            energy_weight=0.0,
+            compute_load_weight=0.0,
+        )
+        requests = (
+            _request("request-a", 0.0),
+            _request("request-b", 0.0, session_id="session-b"),
+            _request("request-c", 0.0, session_id="session-c"),
+        )
+        result = run_simulation(_scenario(strategy, requests=requests))
+        rows = result.request_records
+        self.assertEqual(
+            [row["provenance"]["serving_concurrency_at_admission"] for row in rows],
+            [1, 2, 2],
+        )
+        self.assertEqual(rows[0]["timing"]["prefill_queue_wait_s"], 0.0)
+        self.assertEqual(rows[1]["timing"]["prefill_queue_wait_s"], 0.0)
+        self.assertGreater(rows[2]["timing"]["prefill_queue_wait_s"], 0.0)
+        self.assertTrue(all(row["timing"]["decode_queue_wait_s"] == 0.0 for row in rows))
+        reservations = result.state_summary["compute_nodes"]["sat-a"]["compute_queue"]["reservations"]
+        for time_s in {row["start_s"] for row in reservations}:
+            active = [row for row in reservations if row["start_s"] <= time_s < row["finish_s"]]
+            self.assertLessEqual(len(active), 2)
 
     def test_equal_power_and_compute_dvfs_keeps_energy_per_token_constant(self):
         full_speed = run_simulation(

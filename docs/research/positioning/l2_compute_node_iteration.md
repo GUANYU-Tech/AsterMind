@@ -20,7 +20,8 @@ movement is outside the model.
     },
     "parallelism": {"tp": 4, "pp": 1, "ep": 1},
     "prefill_compute_efficiency": 0.5,
-    "decode_memory_efficiency": 0.7
+    "decode_memory_efficiency": 0.7,
+    "max_concurrency": 8
   }
 }
 ```
@@ -33,7 +34,7 @@ equal `formation.member_count`; the former `parallelism.satellite_count` input
 does not exist.
 
 Serving has no batch-size input and no prefill/decode placement mode. Every
-estimate represents batch size one with colocated prefill and decode. The only
+estimate represents homogeneous static batches with colocated prefill and decode. The only
 supported model names are `llama3.3-70b`, `deepseek-v3`, and `kimi-k3`; their
 model coefficients are frozen in `serving/model_profiles.py` rather than
 repeated in manifests.
@@ -44,24 +45,27 @@ For prompt length `P`, Serving models full-prompt prefill FLOPs as
 
 `F_prefill(P) = A_model * P + B_model * P^2`.
 
-Prefill is compute-dominant. Decode is memory-dominant and reads active model
-weights plus context KV for every generated token. Both stages add the
-topology-aware alpha-beta communication time implied by TP/PP/EP. Running
-request count does not scale either service rate in this iteration.
+For concurrency `C`, Prefill scales total FLOPs and activation communication by
+`C`. Decode reads active weights once per step and scales KV traffic and
+activation communication by `C`. Both stages add topology-aware alpha-beta
+communication implied by TP/PP/EP. Each output rate is a per-request rate.
 
 Serving emits no workload-aggregated scalar rate. It emits:
 
-- `prefill_time_table`: rows containing only `prompt_length` and
+- `prefill_rate_table`: rows containing `prompt_length`, `concurrency`, and
   `prefill_tokens_per_s`;
-- `decode_time_table`: rows containing only `prompt_length` and
+- `decode_rate_table`: rows containing `context_length`, `concurrency`, and
   `decode_tokens_per_s`;
 - `kv_cache_bytes_per_token`, selected by canonical model name;
 - `kv_cache_capacity_tokens` and the model maximum context length.
 
-Runtime linearly interpolates cumulative prefill time `T_prefill(P)` rather
+Runtime selects the exact admission-concurrency slice, then linearly interpolates cumulative prefill time `T_prefill(P,C)` rather
 than the rate itself. A reusable prefix of length `K` therefore costs
 `T_prefill(P) - T_prefill(K)`. Decode integrates the table's context-dependent
-per-token time over generated output tokens.
+per-token time over generated output tokens while keeping `C` fixed. Each
+logical node admits at most `max_concurrency` requests; a request holds one
+slot from Prefill start through Decode completion. Requests that find all slots
+occupied wait FIFO. Existing requests are not re-rated when concurrency changes.
 
 Runtime's inference-efficiency output contains only TTFT, TPOT, and E2E. Each
 is summarized with average, p50, p95, and p99 across completed requests; TPOT
@@ -77,13 +81,14 @@ as a reusable prefix.
 
 For each reachable source holding the same session, Runtime compares
 
-`T_copy(source, target) + T_prefill(P) - T_prefill(S_source)`
+`T_copy(source, target) + T_prefill(P,C_compare) - T_prefill(S_source,C_compare)`
 
 with local execution
 
-`T_prefill(P) - T_prefill(L_target)`.
+`T_prefill(P,C_compare) - T_prefill(L_target,C_compare)`.
 
-It copies only when the first value is smaller and chooses the source with the
+`C_compare` is the same target-node concurrency snapshot for every source. It
+copies only when the first value is smaller and chooses the source with the
 smallest copy-plus-compute time. This comparison intentionally excludes target
 queue waiting. Copy retains the source entry, introduces no migration ratio,
 and adds no new Runtime result fields.

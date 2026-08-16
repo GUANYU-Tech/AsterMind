@@ -103,8 +103,9 @@ class ServingCapacityProfile:
     throughput_estimate: dict[str, Any] = field(default_factory=dict)
     evaluated: bool = False
     feasible: bool | None = None
-    prefill_time_table: tuple[dict[str, Any], ...] = ()
-    decode_time_table: tuple[dict[str, Any], ...] = ()
+    prefill_rate_table: tuple[dict[str, Any], ...] = ()
+    decode_rate_table: tuple[dict[str, Any], ...] = ()
+    max_concurrency: int = 1
     kv_cache_bytes_per_token: float | None = None
     kv_cache_capacity_tokens: int | None = None
     max_context_tokens: int | None = None
@@ -122,8 +123,9 @@ class ServingCapacityProfile:
             throughput_estimate=throughput,
             evaluated=bool(throughput.get("evaluated", False)),
             feasible=_optional_bool(throughput.get("feasible")),
-            prefill_time_table=_table(throughput.get("prefill_time_table")),
-            decode_time_table=_table(throughput.get("decode_time_table")),
+            prefill_rate_table=_table(throughput.get("prefill_rate_table")),
+            decode_rate_table=_table(throughput.get("decode_rate_table")),
+            max_concurrency=_positive_int(throughput.get("max_concurrency", 1)),
             kv_cache_bytes_per_token=_optional_float(throughput.get("kv_cache_bytes_per_token")),
             kv_cache_capacity_tokens=_optional_int(throughput.get("kv_cache_capacity_tokens")),
             max_context_tokens=_optional_int(throughput.get("max_context_tokens")),
@@ -137,8 +139,8 @@ class ServingCapacityProfile:
         return bool(
             self.evaluated
             and self.feasible is not False
-            and bool(self.prefill_time_table)
-            and bool(self.decode_time_table)
+            and bool(self.prefill_rate_table)
+            and bool(self.decode_rate_table)
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -187,6 +189,12 @@ def _optional_bool(value: Any) -> bool | None:
 
 def _optional_int(value: Any) -> int | None:
     return None if value is None else int(value)
+
+
+def _positive_int(value: Any) -> int:
+    if type(value) is not int or value < 1:
+        raise ValueError("Serving max_concurrency must be a positive integer")
+    return value
 
 
 __all__ = ["INGRESS_SELECTIONS", "RUNTIME_RESULT_FIELDS", "RuntimeStrategySpec", "ServingCapacityProfile"]

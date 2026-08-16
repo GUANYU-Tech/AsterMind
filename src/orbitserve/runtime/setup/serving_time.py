@@ -1,4 +1,4 @@
-"""Length-table interpolation used by Runtime service scheduling."""
+"""Two-dimensional Serving-rate interpolation for Runtime scheduling."""
 
 from __future__ import annotations
 
@@ -6,15 +6,23 @@ import math
 from typing import Any
 
 
-def prefill_full_time_s(table: tuple[dict[str, Any], ...], prompt_length: int) -> float:
-    """Return cumulative full-prompt time, interpolating cumulative time."""
-
+def prefill_full_time_s(
+    table: tuple[dict[str, Any], ...],
+    prompt_length: int,
+    concurrency: int,
+) -> float:
+    """Return cumulative full-prompt time for one exact concurrency slice."""
     length = int(prompt_length)
     if length < 0:
         raise ValueError("prompt_length must be non-negative")
     if length == 0:
         return 0.0
-    points = _time_points(table, "prefill_tokens_per_s")
+    points = _time_points(
+        table,
+        length_key="prompt_length",
+        rate_key="prefill_tokens_per_s",
+        concurrency=concurrency,
+    )
     return _interpolate(points, float(length))
 
 
@@ -23,29 +31,38 @@ def prefill_suffix_time_s(
     *,
     prompt_length: int,
     cached_prefix_tokens: int,
+    concurrency: int,
 ) -> float:
-    """Derive suffix compute time from the one-dimensional cumulative table."""
-
+    """Derive suffix compute time from one concurrency slice."""
     prompt = int(prompt_length)
     cached = max(0, min(prompt, int(cached_prefix_tokens)))
-    return max(0.0, prefill_full_time_s(table, prompt) - prefill_full_time_s(table, cached))
+    return max(
+        0.0,
+        prefill_full_time_s(table, prompt, concurrency)
+        - prefill_full_time_s(table, cached, concurrency),
+    )
 
 
 def decode_time_s(
     table: tuple[dict[str, Any], ...],
     *,
-    prompt_length: int,
+    context_length: int,
     output_tokens: int,
+    concurrency: int,
 ) -> float:
-    """Integrate the piecewise-linear per-token time over generated context."""
-
-    start = float(prompt_length)
+    """Integrate context-dependent token time at fixed admission concurrency."""
+    start = float(context_length)
     count = int(output_tokens)
     if start < 0 or count < 0:
         raise ValueError("decode lengths must be non-negative")
     if count == 0:
         return 0.0
-    points = _time_points(table, "decode_tokens_per_s")
+    points = _time_points(
+        table,
+        length_key="context_length",
+        rate_key="decode_tokens_per_s",
+        concurrency=concurrency,
+    )
     end = start + count
     if start < 1.0:
         start = 1.0
@@ -65,21 +82,36 @@ def decode_time_s(
 
 def _time_points(
     table: tuple[dict[str, Any], ...],
+    *,
+    length_key: str,
     rate_key: str,
+    concurrency: int,
 ) -> tuple[tuple[float, float], ...]:
+    if type(concurrency) is not int or concurrency < 1:
+        raise ValueError("serving_concurrency_invalid")
     if not table:
-        raise ValueError("serving_time_table_missing")
+        raise ValueError("serving_rate_table_missing")
+    rows = tuple(
+        row for row in table if int(row.get("concurrency", 0)) == concurrency
+    )
+    if not rows:
+        raise ValueError("serving_concurrency_not_in_table")
     points: list[tuple[float, float]] = []
-    for row in table:
-        length = float(row["prompt_length"])
+    for row in rows:
+        length = float(row[length_key])
         rate = float(row[rate_key])
-        if not math.isfinite(length) or length <= 0.0 or not math.isfinite(rate) or rate <= 0.0:
-            raise ValueError("serving_time_table_invalid")
+        if (
+            not math.isfinite(length)
+            or length <= 0.0
+            or not math.isfinite(rate)
+            or rate <= 0.0
+        ):
+            raise ValueError("serving_rate_table_invalid")
         time_s = length / rate if rate_key == "prefill_tokens_per_s" else 1.0 / rate
         points.append((length, time_s))
     result = tuple(points)
     if tuple(sorted({x for x, _ in result})) != tuple(x for x, _ in result):
-        raise ValueError("serving_time_table_lengths_not_strictly_increasing")
+        raise ValueError("serving_rate_table_lengths_not_strictly_increasing")
     return result
 
 

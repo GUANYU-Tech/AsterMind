@@ -56,7 +56,7 @@ class ServingCapacityTests(unittest.TestCase):
             + profile.prefill_quadratic_flops_coefficient * prompt**2,
         )
 
-    def test_tables_have_exact_two_field_rows_and_cover_context(self):
+    def test_tables_have_length_concurrency_rate_rows_and_cover_context(self):
         spec = ServingSpec.from_dict({
             "model": {"name": "deepseek-v3"},
             "formation": {
@@ -66,22 +66,53 @@ class ServingCapacityTests(unittest.TestCase):
                 "link_propagation_delay_s": 1e-5,
             },
             "parallelism": {"tp": 4, "ep": 1, "pp": 1},
+            "max_concurrency": 3,
         })
         result = estimate_serving_throughput(spec, hardware=_hardware())
         self.assertTrue(result.evaluated)
-        self.assertEqual(result.prefill_time_table[-1]["prompt_length"], 128_000)
-        self.assertEqual(result.decode_time_table[-1]["prompt_length"], 128_000)
+        self.assertEqual(result.prefill_rate_table[-1]["prompt_length"], 128_000)
+        self.assertEqual(result.decode_rate_table[-1]["context_length"], 128_000)
+        self.assertEqual(result.max_concurrency, 3)
         self.assertEqual(
-            set(result.prefill_time_table[0]),
-            {"prompt_length", "prefill_tokens_per_s"},
+            set(result.prefill_rate_table[0]),
+            {"prompt_length", "concurrency", "prefill_tokens_per_s"},
         )
         self.assertEqual(
-            set(result.decode_time_table[0]),
-            {"prompt_length", "decode_tokens_per_s"},
+            set(result.decode_rate_table[0]),
+            {"context_length", "concurrency", "decode_tokens_per_s"},
         )
+        first_length_rows = [
+            row for row in result.prefill_rate_table
+            if row["prompt_length"] == result.prefill_rate_table[0]["prompt_length"]
+        ]
+        self.assertEqual([row["concurrency"] for row in first_length_rows], [1, 2, 3])
         self.assertEqual(result.kv_cache_bytes_per_token, 70_272.0)
-        self.assertFalse(hasattr(result, "prefill_tokens_per_s"))
-        self.assertFalse(hasattr(result, "decode_tokens_per_s"))
+        self.assertFalse(hasattr(result, "prefill_time_table"))
+        self.assertFalse(hasattr(result, "decode_time_table"))
+
+    def test_concurrency_one_matches_batch_one_formula(self):
+        spec = ServingSpec.from_dict({
+            "prompt_length_grid": [16],
+            "context_length_grid": [16],
+            "max_concurrency": 2,
+        })
+        result = estimate_serving_throughput(spec, hardware=_hardware(1))
+        model = MODEL_SERVING_PROFILES["llama3.3-70b"]
+        effective_flops = _hardware(1).total_peak_compute_tflops * 1e12 * 0.5
+        expected = 16 / (prefill_flops(model.name, 16) / effective_flops)
+        row = next(
+            row for row in result.prefill_rate_table
+            if row["prompt_length"] == 16 and row["concurrency"] == 1
+        )
+        self.assertAlmostEqual(row["prefill_tokens_per_s"], expected)
+
+    def test_concurrency_contract_is_strict(self):
+        for value in (0, -1, 1.5, True):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "max_concurrency"):
+                    ServingSpec.from_dict({"max_concurrency": value})
+        with self.assertRaisesRegex(ValueError, "context_length_grid"):
+            ServingSpec.from_dict({"context_length_grid": [16, 8]})
 
     def test_legacy_batch_pd_and_budget_fields_are_rejected(self):
         for field, value in (
@@ -136,12 +167,12 @@ class ServingCapacityTests(unittest.TestCase):
             hardware=_hardware(),
         )
         self.assertGreater(
-            fast.prefill_time_table[5]["prefill_tokens_per_s"],
-            slow.prefill_time_table[5]["prefill_tokens_per_s"],
+            fast.prefill_rate_table[5]["prefill_tokens_per_s"],
+            slow.prefill_rate_table[5]["prefill_tokens_per_s"],
         )
         self.assertGreater(
-            fast.decode_time_table[5]["decode_tokens_per_s"],
-            slow.decode_time_table[5]["decode_tokens_per_s"],
+            fast.decode_rate_table[5]["decode_tokens_per_s"],
+            slow.decode_rate_table[5]["decode_tokens_per_s"],
         )
 
 

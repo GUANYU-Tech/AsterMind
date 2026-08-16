@@ -82,7 +82,11 @@ def run_runtime_engine(simulation_spec: Any) -> RuntimeEngineResult:
             for row in environment_state.satellite_catalog
         )
     for row in compute_node_catalog:
-        state.compute_node_for(str(row["compute_node_id"]), initial_soc=initial_soc)
+        state.compute_node_for(
+            str(row["compute_node_id"]),
+            initial_soc=initial_soc,
+            max_concurrency=serving.max_concurrency,
+        )
     eligibility = build_compute_eligibility_set(
         satellite_catalog=tuple(environment_state.satellite_catalog)
     )
@@ -120,7 +124,9 @@ def run_runtime_engine(simulation_spec: Any) -> RuntimeEngineResult:
         provenance={
             "runtime_engine": "deterministic_event_runtime",
             "communication_queue_model": "not_modeled",
-            "compute_queue_model": "per_compute_node_prefill_decode_fifo",
+            "compute_queue_model": "per_compute_node_concurrency_slots",
+            "serving_rate_model": "arrival_snapshot_fixed_rate",
+            "rate_update_during_execution": False,
             "kv_capacity_model": "architecture_storage_bytes_per_model_token",
             "kv_cache_capacity_tokens": kv_cache_capacity_tokens,
         },
@@ -306,6 +312,10 @@ def _preview_candidate(
         session_id=str(session_id) if session_id else None,
         required_context_tokens=reusable_context,
     )
+    satellite = state.satellite_for(compute_satellite_id)
+    comparison_concurrency = satellite.compute_queue.comparison_concurrency_at(
+        inbound_done_s
+    )
     copy_plan = _preview_kv_copy(
         state=state,
         session_id=str(session_id) if session_id else None,
@@ -318,7 +328,8 @@ def _preview_candidate(
         environment_state=environment_state,
         start_s=inbound_done_s,
         isl_bandwidth_bps=isl_bandwidth_bps,
-        prefill_time_table=serving.prefill_time_table,
+        prefill_rate_table=serving.prefill_rate_table,
+        concurrency=comparison_concurrency,
     )
     copy_path = copy_plan["path"]
     copied_from = copy_plan["source_satellite_id"]
@@ -329,40 +340,62 @@ def _preview_candidate(
         local_hit_tokens + copied_tokens,
     )
     recompute_tokens = max(0, prompt_length - effective_reuse_tokens)
-    satellite = state.satellite_for(compute_satellite_id)
     compute_ready_s = copy_done_s
-    raw_window = energy_window_at(
-        energy_trace,
-        compute_satellite_id,
-        max(compute_ready_s, satellite.compute_queue.prefill_available_s),
+
+    def service_profile(concurrency: int, start_s: float) -> dict[str, Any]:
+        raw_window = energy_window_at(
+            energy_trace,
+            compute_satellite_id,
+            start_s,
+        )
+        dvfs = (
+            float(strategy.shadow_dvfs_scale)
+            if strategy.shadow_dvfs_enabled and not bool(raw_window.get("sunlit", True))
+            else 1.0
+        )
+        prefill_s = prefill_suffix_time_s(
+            serving.prefill_rate_table,
+            prompt_length=prompt_length,
+            cached_prefix_tokens=effective_reuse_tokens,
+            concurrency=concurrency,
+        ) / dvfs
+        decode_s = decode_time_s(
+            serving.decode_rate_table,
+            context_length=prompt_length,
+            output_tokens=request["output_tokens"],
+            concurrency=concurrency,
+        ) / dvfs
+        return {
+            "dvfs_scale": dvfs,
+            "energy_window": raw_window,
+            "prefill_service_s": prefill_s,
+            "decode_service_s": decode_s,
+        }
+
+    reservation = satellite.compute_queue.preview(
+        request_id=request["request_id"],
+        ready_s=compute_ready_s,
+        duration_for=lambda concurrency, start_s: sum(
+            service_profile(concurrency, start_s)[key]
+            for key in ("prefill_service_s", "decode_service_s")
+        ),
     )
-    dvfs_scale = (
-        float(strategy.shadow_dvfs_scale)
-        if strategy.shadow_dvfs_enabled and not bool(raw_window.get("sunlit", True))
-        else 1.0
-    )
-    prefill_service_s = prefill_suffix_time_s(
-        serving.prefill_time_table,
-        prompt_length=prompt_length,
-        cached_prefix_tokens=effective_reuse_tokens,
-    ) / dvfs_scale
-    decode_service_s = decode_time_s(
-        serving.decode_time_table,
-        prompt_length=prompt_length,
-        output_tokens=request["output_tokens"],
-    ) / dvfs_scale
-    prefill_start_s, prefill_done_s, prefill_wait_s = satellite.compute_queue.preview_prefill(
-        compute_ready_s,
-        prefill_service_s,
-    )
-    decode_start_s, decode_done_s, decode_wait_s = satellite.compute_queue.preview_decode(
-        prefill_done_s,
-        decode_service_s,
-    )
+    concurrency = reservation.concurrency_at_admission
+    service = service_profile(concurrency, reservation.start_s)
+    dvfs_scale = service["dvfs_scale"]
+    prefill_service_s = service["prefill_service_s"]
+    decode_service_s = service["decode_service_s"]
+    prefill_start_s = reservation.start_s
+    prefill_done_s = prefill_start_s + prefill_service_s
+    prefill_wait_s = max(0.0, prefill_start_s - compute_ready_s)
+    decode_start_s = prefill_done_s
+    decode_done_s = reservation.finish_s
+    decode_wait_s = 0.0
     first_token_service_s = decode_time_s(
-        serving.decode_time_table,
-        prompt_length=prompt_length,
+        serving.decode_rate_table,
+        context_length=prompt_length,
         output_tokens=1,
+        concurrency=concurrency,
     ) / dvfs_scale
     first_token_bytes = _first_token_bytes(request)
     first_token_legs = tuple(replace(leg, payload_bytes=first_token_bytes) for leg in route.outbound_legs)
@@ -372,9 +405,15 @@ def _preview_candidate(
     remaining_done_s, output_path = execute_route(remaining_legs, decode_done_s)
     output_done_s = max(first_done_s, remaining_done_s)
 
-    preview = replace(satellite, compute_queue=replace(satellite.compute_queue))
+    preview = replace(
+        satellite,
+        compute_queue=replace(
+            satellite.compute_queue,
+            reservations=list(satellite.compute_queue.reservations),
+        ),
+    )
     advance_satellite_energy(preview, energy_trace, prefill_start_s)
-    energy_window = energy_window_at(energy_trace, compute_satellite_id, prefill_start_s)
+    energy_window = service["energy_window"]
     physical_paths = (inbound_path, first_path, output_path, copy_path)
     link_bytes_by_satellite = _link_bytes_by_satellite(
         physical_paths,
@@ -438,6 +477,8 @@ def _preview_candidate(
         "copied_from": copied_from,
         "copied_tokens": copied_tokens,
         "copy_done_s": copy_done_s,
+        "reservation": reservation,
+        "concurrency_at_admission": concurrency,
         "prefill_start_s": prefill_start_s,
         "prefill_done_s": prefill_done_s,
         "decode_start_s": decode_start_s,
@@ -477,12 +518,13 @@ def _commit_candidate(
         satellite_id: len(state.satellite_for(satellite_id).energy_ledger)
         for satellite_id in affected_ids
     }
-    prefill_start_s, prefill_done_s, prefill_wait_s = satellite.compute_queue.reserve_prefill(
-        payload["copy_done_s"], payload["prefill_service_s"]
-    )
-    decode_start_s, decode_done_s, decode_wait_s = satellite.compute_queue.reserve_decode(
-        prefill_done_s, payload["decode_service_s"]
-    )
+    reservation = satellite.compute_queue.reserve(payload["reservation"])
+    prefill_start_s = reservation.start_s
+    prefill_done_s = prefill_start_s + payload["prefill_service_s"]
+    prefill_wait_s = max(0.0, prefill_start_s - payload["copy_done_s"])
+    decode_start_s = prefill_done_s
+    decode_done_s = reservation.finish_s
+    decode_wait_s = 0.0
     if not math.isclose(prefill_start_s, payload["prefill_start_s"], abs_tol=1e-9):
         raise ValueError("candidate_preview_state_changed")
     link_violation = False
@@ -591,6 +633,8 @@ def _commit_candidate(
             "score_terms": selection.score_terms,
             "communication_queue_model": "not_modeled",
             "trace_id": environment_state.trace_id,
+            "serving_concurrency_at_admission": payload["concurrency_at_admission"],
+            "serving_rate_model": "arrival_snapshot_fixed_rate",
         },
     )
 
@@ -608,7 +652,8 @@ def _preview_kv_copy(
     environment_state: Any,
     start_s: float,
     isl_bandwidth_bps: float,
-    prefill_time_table: tuple[dict[str, Any], ...],
+    prefill_rate_table: tuple[dict[str, Any], ...],
+    concurrency: int,
 ) -> dict[str, Any]:
     """Choose a same-session source only when copy beats local recompute."""
 
@@ -625,9 +670,10 @@ def _preview_kv_copy(
     ):
         return empty
     local_prefill_time_s = prefill_suffix_time_s(
-        prefill_time_table,
+        prefill_rate_table,
         prompt_length=prompt_length,
         cached_prefix_tokens=local_hit_tokens,
+        concurrency=concurrency,
     )
     options: list[dict[str, Any]] = []
     for source_satellite_id in kv_locations_for_session(state, session_id):
@@ -661,9 +707,10 @@ def _preview_kv_copy(
             continue
         migration_time_s = done_s - start_s
         copied_prefill_time_s = prefill_suffix_time_s(
-            prefill_time_table,
+            prefill_rate_table,
             prompt_length=prompt_length,
             cached_prefix_tokens=source_reusable_tokens,
+            concurrency=concurrency,
         )
         total_time_s = migration_time_s + copied_prefill_time_s
         if total_time_s >= local_prefill_time_s:
