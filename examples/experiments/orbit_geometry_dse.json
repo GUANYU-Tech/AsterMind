@@ -72,7 +72,8 @@
       "tp": 4
     },
     "prefill_compute_efficiency": 0.5,
-    "decode_memory_efficiency": 0.7
+    "decode_memory_efficiency": 0.7,
+    "max_concurrency": 8
   },
   "simulation": {
     "duration_s": 600,

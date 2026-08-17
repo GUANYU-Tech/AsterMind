@@ -30,8 +30,8 @@ orbitserve.experiments.cli
   -> load and materialize a canonical workload bundle
   -> evaluate_materialized_design
   -> Architecture + Orbit + Serving
-  -> build RuntimeScenario, including the Runtime energy profile
-  -> evaluate one fixed RuntimeStrategySpec deterministically
+  -> build RuntimeSimulationSpec, including Serving rate tables and energy profile
+  -> run one deterministic RuntimeStrategySpec with concurrency-slot reservations
   -> optional DSE runtime-matrix search
   -> structured output
 ```

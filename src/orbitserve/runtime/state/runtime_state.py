@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from ...common import to_jsonable
-from .resources import ComputeNodeState
+from .resources import ComputeConcurrencyState, ComputeNodeState
 
 if TYPE_CHECKING:
     from .kv_cache import KVCacheState, SessionState
@@ -18,13 +18,26 @@ class RuntimeState:
     sessions: dict[str, SessionState] = field(default_factory=dict)
     kv_caches: dict[str, KVCacheState] = field(default_factory=dict)
 
-    def compute_node_for(self, compute_node_id: str, *, initial_soc: float = 0.8) -> ComputeNodeState:
+    def compute_node_for(
+        self,
+        compute_node_id: str,
+        *,
+        initial_soc: float = 0.8,
+        max_concurrency: int | None = None,
+    ) -> ComputeNodeState:
         if compute_node_id not in self.compute_nodes:
             self.compute_nodes[compute_node_id] = ComputeNodeState(
                 compute_node_id=compute_node_id,
+                compute_queue=ComputeConcurrencyState(max_concurrency or 1),
                 soc=initial_soc,
                 initial_soc=initial_soc,
             )
+        elif max_concurrency is not None:
+            queue = self.compute_nodes[compute_node_id].compute_queue
+            if queue.max_concurrency != max_concurrency:
+                if queue.reservations:
+                    raise ValueError("cannot change max_concurrency after reservations exist")
+                queue.max_concurrency = max_concurrency
         return self.compute_nodes[compute_node_id]
 
     def satellite_for(self, satellite_id: str, *, initial_soc: float = 0.8) -> ComputeNodeState:

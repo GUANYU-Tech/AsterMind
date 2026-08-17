@@ -12,7 +12,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   fully-connected topology, link bandwidth, and one-hop propagation delay.
 - Added canonical logical compute-node views for Orbit Trace and Runtime state.
 - Added frozen Serving profiles for Llama 3.3 70B, DeepSeek V3, and Kimi K3,
-  with batch-one prompt-length tables for prefill and decode.
+  with length-and-concurrency rate tables for prefill and decode.
 - Added cumulative-table lookup in Runtime and same-session KV copy decisions
   that compare transfer-plus-prefill time with local prefill time.
 - Added request-level TPOT and aggregate TTFT/TPOT/E2E distributions with
@@ -29,6 +29,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Added per-satellite capacity-driven LRU management for KV cache state.
 
 ### Changed
+
+- Replaced the per-node Prefill/Decode FIFOs with colocated request-concurrency
+  reservations and fixed admission-rate lookup.
+- Serving now emits per-request Prefill and Decode rates indexed by length and
+  homogeneous static-batch concurrency.
 
 - Made `OrbitTraceManifest` and `OrbitTraceBundle` the canonical Orbit trace
   class names, with geometry-only records and metadata as their complete public

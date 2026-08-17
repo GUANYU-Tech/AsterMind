@@ -1,4 +1,4 @@
-"""Batch-one analytical Serving model for one logical L2 compute node."""
+"""Static-batch analytical Serving model for one logical L2 compute node."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ DEFAULT_PROMPT_LENGTH_GRID = (
     1, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384,
     32768, 65536, 131072, 262144, 524288, 1048576,
 )
+DEFAULT_CONTEXT_LENGTH_GRID = DEFAULT_PROMPT_LENGTH_GRID
 
 
 @dataclass(frozen=True)
@@ -135,6 +136,8 @@ class ServingSpec:
     prefill_compute_efficiency: float = 0.5
     decode_memory_efficiency: float = 0.7
     prompt_length_grid: tuple[int, ...] = DEFAULT_PROMPT_LENGTH_GRID
+    context_length_grid: tuple[int, ...] = DEFAULT_CONTEXT_LENGTH_GRID
+    max_concurrency: int = 1
     hardware: SatelliteHardwareProfile | None = None
 
     def __post_init__(self) -> None:
@@ -142,10 +145,10 @@ class ServingSpec:
             value = getattr(self, name)
             if not math.isfinite(value) or not 0.0 < value <= 1.0:
                 raise ValueError(f"serving.{name} must be in (0, 1]")
-        if not self.prompt_length_grid or any(int(value) < 1 for value in self.prompt_length_grid):
-            raise ValueError("serving.prompt_length_grid must contain positive lengths")
-        if tuple(sorted(set(self.prompt_length_grid))) != self.prompt_length_grid:
-            raise ValueError("serving.prompt_length_grid must be strictly increasing")
+        _validate_length_grid("prompt_length_grid", self.prompt_length_grid)
+        _validate_length_grid("context_length_grid", self.context_length_grid)
+        if type(self.max_concurrency) is not int or self.max_concurrency < 1:
+            raise ValueError("serving.max_concurrency must be a positive integer")
         _validate_parallelism(self.model.profile, self.parallelism, self.formation)
 
     @classmethod
@@ -162,6 +165,8 @@ class ServingSpec:
             prefill_compute_efficiency=float(data.get("prefill_compute_efficiency", 0.5)),
             decode_memory_efficiency=float(data.get("decode_memory_efficiency", 0.7)),
             prompt_length_grid=tuple(int(item) for item in data.get("prompt_length_grid", DEFAULT_PROMPT_LENGTH_GRID)),
+            context_length_grid=tuple(int(item) for item in data.get("context_length_grid", DEFAULT_CONTEXT_LENGTH_GRID)),
+            max_concurrency=data.get("max_concurrency", 1),
             hardware=SatelliteHardwareProfile.from_dict(hardware) if isinstance(hardware, dict) else hardware,
         )
 
@@ -173,6 +178,8 @@ class ServingSpec:
             "prefill_compute_efficiency": self.prefill_compute_efficiency,
             "decode_memory_efficiency": self.decode_memory_efficiency,
             "prompt_length_grid": self.prompt_length_grid,
+            "context_length_grid": self.context_length_grid,
+            "max_concurrency": self.max_concurrency,
             "hardware": self.hardware.to_dict() if self.hardware else None,
         }
 
@@ -186,8 +193,9 @@ class ServingPerformanceProfile:
     hardware: dict[str, Any]
     parallelism: dict[str, Any]
     formation: dict[str, Any]
-    prefill_time_table: tuple[dict[str, Any], ...]
-    decode_time_table: tuple[dict[str, Any], ...]
+    prefill_rate_table: tuple[dict[str, Any], ...]
+    decode_rate_table: tuple[dict[str, Any], ...]
+    max_concurrency: int
     kv_cache_bytes_per_token: float
     kv_cache_capacity_tokens: int | None
     max_context_tokens: int
@@ -220,13 +228,14 @@ def estimate_serving_throughput(
     *,
     hardware: SatelliteHardwareProfile | None = None,
 ) -> ServingPerformanceProfile:
-    """Generate batch-one length tables for one logical compute node."""
+    """Generate homogeneous static-batch rate tables for one logical node."""
 
     resolved_hardware = hardware or serving.hardware
     if resolved_hardware is None:
         return _unevaluated(serving, "serving.hardware is not configured")
     model = serving.model.profile
-    lengths = _resolved_prompt_lengths(serving.prompt_length_grid, model.max_context_tokens)
+    prompt_lengths = _resolved_lengths(serving.prompt_length_grid, model.max_context_tokens)
+    context_lengths = _resolved_lengths(serving.context_length_grid, model.max_context_tokens)
     stage_nodes = serving.parallelism.stage_parallel_node_count
     effective_flops = (
         stage_nodes
@@ -245,23 +254,32 @@ def estimate_serving_throughput(
     prefill_table = tuple(
         {
             "prompt_length": length,
+            "concurrency": concurrency,
             "prefill_tokens_per_s": length / (
-                prefill_flops(model.name, length) / effective_flops
-                + _formation_communication_time_s(serving, model, length)
+                concurrency * prefill_flops(model.name, length) / effective_flops
+                + _formation_communication_time_s(
+                    serving, model, concurrency * length
+                )
             ),
         }
-        for length in lengths
+        for length in prompt_lengths
+        for concurrency in range(1, serving.max_concurrency + 1)
     )
     decode_table = tuple(
         {
-            "prompt_length": length,
+            "context_length": length,
+            "concurrency": concurrency,
             "decode_tokens_per_s": 1.0 / (
-                (model.active_weight_bytes + (length + 1) * model.kv_cache_bytes_per_token)
+                (
+                    model.active_weight_bytes
+                    + concurrency * (length + 1) * model.kv_cache_bytes_per_token
+                )
                 / effective_memory_bytes_per_s
-                + _formation_communication_time_s(serving, model, 1)
+                + _formation_communication_time_s(serving, model, concurrency)
             ),
         }
-        for length in lengths
+        for length in context_lengths
+        for concurrency in range(1, serving.max_concurrency + 1)
     )
     capacity = math.floor(
         serving.formation.member_count
@@ -273,7 +291,12 @@ def estimate_serving_throughput(
     member_fast_memory_bytes = resolved_hardware.total_fast_mem_gb * 1e9
     feasible = per_member_weight_bytes <= member_fast_memory_bytes
     warnings = () if feasible else ("model weights do not fit formation member fast memory",)
-    _validate_time_tables(prefill_table, decode_table, model.max_context_tokens)
+    _validate_rate_tables(
+        prefill_table,
+        decode_table,
+        maximum=model.max_context_tokens,
+        max_concurrency=serving.max_concurrency,
+    )
     return ServingPerformanceProfile(
         evaluated=True,
         feasible=feasible,
@@ -291,8 +314,9 @@ def estimate_serving_throughput(
         hardware=resolved_hardware.to_dict(),
         parallelism=serving.parallelism.to_dict(),
         formation=serving.formation.to_dict(),
-        prefill_time_table=prefill_table,
-        decode_time_table=decode_table,
+        prefill_rate_table=prefill_table,
+        decode_rate_table=decode_table,
+        max_concurrency=serving.max_concurrency,
         kv_cache_bytes_per_token=model.kv_cache_bytes_per_token,
         kv_cache_capacity_tokens=capacity,
         max_context_tokens=model.max_context_tokens,
@@ -300,10 +324,13 @@ def estimate_serving_throughput(
         internal_communication_accounting="embedded",
         warnings=warnings,
         provenance={
-            "execution_assumptions": ("batch_size=1", "prefill_decode_colocated"),
+            "execution_model": "homogeneous_static_batch",
+            "execution_assumptions": ("prefill_decode_colocated",),
+            "rate_semantics": "per_request",
+            "concurrency_range": (1, serving.max_concurrency),
             "prefill_model": "compute_dominant_A_times_P_plus_B_times_P_squared",
             "decode_model": "memory_dominant_active_weights_plus_kv",
-            "table_entries": "prompt_length_and_stage_tokens_per_s_only",
+            "table_entries": "length_concurrency_and_per_request_tokens_per_s",
             "formation_communication": "topology_aware_alpha_beta_embedded",
             "model_approximation_notes": model.approximation_notes,
         },
@@ -340,7 +367,14 @@ def _validate_parallelism(
             raise ValueError("model expert_count must be divisible by expert_parallel_degree")
 
 
-def _resolved_prompt_lengths(grid: tuple[int, ...], maximum: int) -> tuple[int, ...]:
+def _validate_length_grid(name: str, grid: tuple[int, ...]) -> None:
+    if not grid or any(type(value) is not int or value < 1 for value in grid):
+        raise ValueError(f"serving.{name} must contain positive integers")
+    if tuple(sorted(set(grid))) != grid:
+        raise ValueError(f"serving.{name} must be strictly increasing")
+
+
+def _resolved_lengths(grid: tuple[int, ...], maximum: int) -> tuple[int, ...]:
     return tuple(sorted({*(value for value in grid if value <= maximum), maximum}))
 
 
@@ -405,23 +439,49 @@ def _point_to_point_time_s(formation: L2FormationSpec, message_bytes: float) -> 
     return hops * formation.link_propagation_delay_s + message_bytes / bandwidth_bytes_per_s
 
 
-def _validate_time_tables(
+def _validate_rate_tables(
     prefill: tuple[dict[str, Any], ...],
     decode: tuple[dict[str, Any], ...],
+    *,
     maximum: int,
+    max_concurrency: int,
 ) -> None:
-    for rows, rate_key in ((prefill, "prefill_tokens_per_s"), (decode, "decode_tokens_per_s")):
-        lengths = tuple(int(row["prompt_length"]) for row in rows)
-        if lengths != tuple(sorted(set(lengths))) or lengths[-1] != maximum:
-            raise ValueError("Serving time table lengths must be unique, sorted, and cover max context")
-        if any(not math.isfinite(float(row[rate_key])) or float(row[rate_key]) <= 0.0 for row in rows):
-            raise ValueError("Serving time table rates must be finite and positive")
-    cumulative = tuple(row["prompt_length"] / row["prefill_tokens_per_s"] for row in prefill)
-    if any(right < left for left, right in zip(cumulative, cumulative[1:])):
-        raise ValueError("Prefill cumulative service time must be non-decreasing")
-    decode_times = tuple(1.0 / row["decode_tokens_per_s"] for row in decode)
-    if any(right < left for left, right in zip(decode_times, decode_times[1:])):
-        raise ValueError("Decode token service time must be non-decreasing")
+    expected_concurrency = tuple(range(1, max_concurrency + 1))
+    for rows, length_key, rate_key in (
+        (prefill, "prompt_length", "prefill_tokens_per_s"),
+        (decode, "context_length", "decode_tokens_per_s"),
+    ):
+        if any(
+            not math.isfinite(float(row[rate_key])) or float(row[rate_key]) <= 0.0
+            for row in rows
+        ):
+            raise ValueError("Serving rate table rates must be finite and positive")
+        lengths = tuple(sorted({int(row[length_key]) for row in rows}))
+        if not lengths or lengths[-1] != maximum:
+            raise ValueError("Serving rate table must cover max context")
+        for length in lengths:
+            concurrency = tuple(
+                int(row["concurrency"])
+                for row in rows
+                if int(row[length_key]) == length
+            )
+            if concurrency != expected_concurrency:
+                raise ValueError("Serving rate table concurrency slices must be complete and sorted")
+        for concurrency in expected_concurrency:
+            sliced = tuple(row for row in rows if int(row["concurrency"]) == concurrency)
+            sliced_lengths = tuple(int(row[length_key]) for row in sliced)
+            if sliced_lengths != lengths:
+                raise ValueError("Serving rate table lengths must be unique and sorted")
+            times = tuple(
+                (
+                    row[length_key] / row[rate_key]
+                    if rate_key == "prefill_tokens_per_s"
+                    else 1.0 / row[rate_key]
+                )
+                for row in sliced
+            )
+            if any(right < left for left, right in zip(times, times[1:])):
+                raise ValueError("Serving rate table service time must be non-decreasing")
 
 
 def _unevaluated(serving: ServingSpec, message: str) -> ServingPerformanceProfile:
@@ -434,8 +494,9 @@ def _unevaluated(serving: ServingSpec, message: str) -> ServingPerformanceProfil
         hardware={},
         parallelism=serving.parallelism.to_dict(),
         formation=serving.formation.to_dict(),
-        prefill_time_table=(),
-        decode_time_table=(),
+        prefill_rate_table=(),
+        decode_rate_table=(),
+        max_concurrency=serving.max_concurrency,
         kv_cache_bytes_per_token=model.kv_cache_bytes_per_token,
         kv_cache_capacity_tokens=None,
         max_context_tokens=model.max_context_tokens,
@@ -447,6 +508,7 @@ def _unevaluated(serving: ServingSpec, message: str) -> ServingPerformanceProfil
 
 
 __all__ = [
+    "DEFAULT_CONTEXT_LENGTH_GRID",
     "DEFAULT_PROMPT_LENGTH_GRID",
     "LLMModelProfile",
     "L2FormationSpec",
