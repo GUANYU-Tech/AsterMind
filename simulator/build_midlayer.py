@@ -18,7 +18,7 @@ def main():
     root = args.midlayer_root.resolve()
     source = root / "src/kernel/csrc/lru_sim.c"
     if not source.is_file():
-        parser.error("initialize the M-L submodule before building")
+        parser.error("the complete M-L source snapshot is missing")
     compiler = args.compiler or shutil.which("cc") or shutil.which("gcc")
     if compiler is None:
         parser.error("a C compiler is required")

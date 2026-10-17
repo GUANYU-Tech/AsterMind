@@ -1,0 +1,52 @@
+{
+  "hardware_id": "metax_c500",
+  "host": {
+    "cpu": "Intel(R) Xeon(R) Gold 6430"
+  },
+  "measurement": {
+    "artifacts": [
+      {
+        "path": "microbench/metax_c500/runtime/host_request_path/references/admission_ipc_region_20260921.json",
+        "sha256": "623861ccce1e946633d9d58c19c7afb99777b9b3a469428a68f6762f65ba90c1"
+      },
+      {
+        "path": "microbench/metax_c500/runtime/host_request_path/references/completion_render_region_cold_20260926.json",
+        "sha256": "67181955086676f578ab04e6e1abfa7c5d784644c9df29bf7c14cca1c70200a8"
+      },
+      {
+        "path": "microbench/metax_c500/runtime/host_request_path/references/host_request_path_20260920.json",
+        "sha256": "88d81290a39ad0ef41dce4d322e0fd0f51f7c28f8bb40f77e1c86d7e325d76bb"
+      },
+      {
+        "path": "microbench/metax_c500/runtime/host_request_path/references/input_processor_20260921.json",
+        "sha256": "488ffa5377539619fb36fa48256aebbe890b8c886efcbf59860989fd3285e002"
+      },
+      {
+        "path": "microbench/metax_c500/runtime/host_request_path/references/output_delivery_chain_20260922.json",
+        "sha256": "fc9ed6945c0d70dd2553b9481a753126cd864cd82d29dbdc4ba40d415243a85b"
+      }
+    ],
+    "boundary": "host_only_no_device_no_model",
+    "statistic": "median_of_independent_primitive_samples",
+    "time_unit": "seconds"
+  },
+  "runtime": {
+    "source_identity": "vllm.entrypoints.serve.render.serving.OpenAIServingRender.render_completion; runtime has no batching tokenizer wrapper",
+    "version": "0.24.0"
+  },
+  "schema_version": 1,
+  "service_time_s": {
+    "admission_enqueue": 1.2e-05,
+    "api_entry": 0.000536866,
+    "engine_core_ipc": 0.0001091,
+    "first_token_delivery": 0.000585,
+    "input_processor_intercept": 6.437309523809523e-05,
+    "input_processor_per_token": 6.8690476190476224e-09,
+    "output_delivery_per_output": 8.8451e-05,
+    "tokenizer_async_call": null,
+    "tokenizer_encode_intercept": null,
+    "tokenizer_encode_per_token": null,
+    "tokenizer_render_region_intercept": 0.000695933693548387,
+    "tokenizer_render_region_per_token": 5.304144153225807e-06
+  }
+}

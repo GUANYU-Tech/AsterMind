@@ -1,0 +1,20 @@
+{
+    "name": "Gemmini",
+    "totalGlobalMem": 1073741824,
+    "computeMajor": 8,
+    "computeMinor": 0,
+    "numSms": 1,
+    "memBandwidth": 16,
+    "l1CacheSize": 256,
+    "sharedMemorySize": 256,
+    "l2CacheSize": 8192,
+    "registerFileSize": 128,
+    "l2CacheBandwidth": 1500,
+    "sharedMemoryBandwidth": 16,
+    "tcBf16": 128,
+    "tcFp8": 0,
+    "xuFp32": 4,
+    "FmaFp32": 16,
+    "smFreq": 1000,
+    "architecture": "gemmini"
+}

@@ -1,0 +1,48 @@
+
+=== elewise (+10 on one timing at a time) ===
+timing               plain column        buffer boundary           row boundary  one work column (c=1)
+(baseline)                    8.0                   67.0                  102.0                   73.0
+tCCDL+10                    +20.0                  +90.0                  +90.0                 +100.0
+tCCDS+10                     +0.0                   +0.0                   +0.0                   +0.0
+tRCDWR+10                    +0.0                   +0.0                   +0.0                   +0.0
+tRCDRD+10                    +0.0                   +0.0                  +10.0                  +10.0
+tRP+10                       +0.0                   +0.0                  +10.0                   +0.0
+tWR+10                       +0.0                   +0.0                  +10.0                   +0.0
+tRTPL+10                     +0.0                   +0.0                   +0.0                   +0.0
+tWTRL+10                     +0.0                  +10.0                   +0.0                   +0.0
+tRTRS+10                     +0.0                   +5.0                   +5.0                   +5.0
+RL+10                        +0.0                  +10.0                  +10.0                  +10.0
+WL+10                        +0.0                   +0.0                   +0.0                   +0.0
+BL+10                        +6.0                  +32.0                  +32.0                  +30.0
+
+=== layernorm (+10 on one timing at a time) ===
+timing               plain column        buffer boundary           row boundary  one work column (c=1)
+(baseline)                   20.0                   80.0                  142.0                  113.0
+tCCDL+10                    +50.0                 +120.0                 +109.0                 +119.0
+tCCDS+10                     +0.0                   +0.0                   +0.0                   +0.0
+tRCDWR+10                    +0.0                   +0.0                   +0.0                   +0.0
+tRCDRD+10                    +0.0                   +0.0                  +20.0                  +20.0
+tRP+10                       +0.0                   +0.0                  +20.0                  +10.0
+tWR+10                       +0.0                   +0.0                  +10.0                   +0.0
+tRTPL+10                     +0.0                   +0.0                  +10.0                  +10.0
+tWTRL+10                     +0.0                  +10.0                   +0.0                   +0.0
+tRTRS+10                     +0.0                   +8.0                   +8.0                   +8.0
+RL+10                        +0.0                  +10.0                  +10.0                  +10.0
+WL+10                        +0.0                   +0.0                   +0.0                   +0.0
+BL+10                       +15.0                  +41.0                  +43.0                  +41.0
+
+=== softmax (+10 on one timing at a time) ===
+timing               plain column        buffer boundary           row boundary  one work column (c=1)
+(baseline)                   12.0                  132.0                  202.0                  173.0
+tCCDL+10                    +30.0                 +170.0                 +170.0                 +180.0
+tCCDS+10                     +0.0                   +0.0                   +0.0                   +0.0
+tRCDWR+10                    +0.0                   +0.0                   +0.0                   +0.0
+tRCDRD+10                    +0.0                   +0.0                  +20.0                  +20.0
+tRP+10                       +0.0                   +0.0                  +20.0                  +10.0
+tWR+10                       +0.0                   +0.0                  +20.0                  +10.0
+tRTPL+10                     +0.0                   +0.0                   +0.0                   +0.0
+tWTRL+10                     +0.0                  +20.0                   +0.0                   +0.0
+tRTRS+10                     +0.0                  +16.0                  +16.0                  +16.0
+RL+10                        +0.0                  +20.0                  +20.0                  +20.0
+WL+10                        +0.0                   +0.0                   +0.0                   +0.0
+BL+10                        +9.0                  +61.0                  +61.0                  +59.0

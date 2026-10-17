@@ -1,0 +1,11 @@
+# Archived Timeloop mapper config: EXHAUSTIVE search for the optimal mapping.
+# This gives the true optimal-mapping latency (vs random which is an upper bound).
+# Slower: ~20-40s per small shape, minutes for large shapes. Run with high -j and
+# long --timeout (e.g. 1800s) so large shapes can complete the search.
+mapper:
+  algorithm: exhaustive
+  optimization_metrics:
+  - delay
+  search_size: 0
+  victory_condition: 5000
+  timeout: 1800

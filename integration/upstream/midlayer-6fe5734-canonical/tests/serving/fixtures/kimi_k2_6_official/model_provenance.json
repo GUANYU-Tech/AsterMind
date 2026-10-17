@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "model_id": "moonshotai/Kimi-K2.6",
+  "revision": "7eb5002f6aadc958aed6a9177b7ed26bb94011bb",
+  "source_config_sha256": "85825ca6e18cbe539eb83ee09eedfb3f4222265929f06e9f535a6d9364f55899",
+  "fixture_config_sha256": "03af24788bd7788c65db1fcb8326c5f5c5270aab717c442df67ba9db01041b3d",
+  "source_url": "https://huggingface.co/moonshotai/Kimi-K2.6/resolve/7eb5002f6aadc958aed6a9177b7ed26bb94011bb/config.json",
+  "model_scope": "text"
+}

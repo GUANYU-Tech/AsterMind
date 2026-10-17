@@ -1,0 +1,14 @@
+# Archived Timeloop mapper config: 50k random search for LPU EagerAttn.
+# LPU skips large-prefill shapes (SRAM > 220 MiB), so eager_attn only runs decode
+# GEMVs + small prefill — shapes where the mapping search converges fast. 50k
+# (the same budget as GEMM's honest-GT mapper.yaml) gives optimal mappings
+# (ratio GT/compute ≈ 1.0), tightening the 5k mapper_fast's loose ~2.75× on GEMVs.
+# A method knob (search budget), not MAPE-fitted (zero-fitting compliant,
+# docs/design.md). GEMM/MoE keep mapper.yaml (50k).
+mapper:
+  algorithm: random
+  optimization_metrics:
+  - delay
+  search_size: 50000       # = GEMM's honest-GT budget; optimal mapping on LPU's decode-only set
+  victory_condition: 50000 # = search_size (no early-stop)
+  timeout: 600             # 16-core pin; LPU decode/small prefill completes well <600s

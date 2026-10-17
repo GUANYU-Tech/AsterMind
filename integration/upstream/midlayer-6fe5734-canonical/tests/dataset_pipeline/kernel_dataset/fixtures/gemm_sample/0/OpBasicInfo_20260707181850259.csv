@@ -1,0 +1,2 @@
+Op Name,Op Type,Task Duration(us),Block Dim,Mix Block Dim,Device Id,Pid,Current Freq,Rated Freq,
+MatMulV2_ND_ND_FP16_FP16_false_true_all_99025,cube,22.959999,23,NA,4,90469,1800,1800,

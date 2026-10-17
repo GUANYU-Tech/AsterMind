@@ -26,12 +26,10 @@ See `CHANGELOG.md` for release history.
 
 The `develop` branch also includes the event-driven Mid-Layer integration in
 [`simulator/`](simulator/README.md), with physical resources, FlowSim/ns-3,
-multi-Cell serving and compatible per-rank KV migration. Mid-Layer is pinned as
-a Git submodule; initialize it before running the integration:
-
-```bash
-git submodule update --init --recursive
-```
+multi-Cell serving and compatible per-rank KV migration. The complete pinned
+Mid-Layer snapshot and its materialized calibration data are included directly
+under `integration/upstream/midlayer-6fe5734-canonical/`; no external Mid-Layer
+repository or Git-LFS download is required for this snapshot.
 
 See [`integration/README.md`](integration/README.md) for the isolated CPU
 Scheduler environment and [`simulator/README.md`](simulator/README.md) for the

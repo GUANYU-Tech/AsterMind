@@ -1,0 +1,28 @@
+# Archived Timeloop mapper config: random search for a low-delay mapping.
+# algorithm=random samples mappings (not exhaustive) → fast (sub-second per
+# shape even for large GEMMs), unlike exhaustive which times out on large
+# shapes. The returned Cycles is a real cycle-accurate latency for a valid
+# (not necessarily optimal) mapping — defensible as groundtruth.
+#
+# search_size / victory_condition (zero-fitting rationale, see
+# docs/goal_gemmini_sub10.md §2 + scripts/diag/timeloop_search_sweep.py):
+# The previous search_size=2000 / victory_condition=1000 was a *weak search*
+# upper bound — random-2k found compute-bound-shape mappings at only 44–88%
+# utilization (mean 71.9%), inflating GT above the forward-peak lower bound
+# and producing the 18.6% GEMM / 27.5% EagerAttn MAPE. A sweep over 8
+# cross-bucket shapes showed search_size=50000 collapses GT to the forward
+# peak (100% utilization on 6 compute-bound shapes); 200k adds nothing over
+# 50k → 50k is the sweet spot. victory_condition MUST equal search_size, else
+# the mapper early-stops after the first 1000 valid mappings (the hidden
+# second half of the shipped-2k suboptimality). search_size/victory_condition
+# are *simulator search-budget parameters* (a method knob, not a constant
+# reverse-fit from eval MAPE), so raising them does not violate the
+# zero-fitting red line in docs/design.md.
+mapper:
+  algorithm: random
+  optimization_metrics:
+  - delay
+  search_size: 50000       # was 2000 — sweep-confirmed sweet spot (50k=200k util)
+  victory_condition: 50000 # = search_size; was 1000 (early-stopped, suboptimal)
+  timeout: 600             # was 120; 50k search needs >2k's budget. 16-core pin
+                           # brings 50k per-shape wall to minutes (see _next_cpu)

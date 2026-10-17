@@ -1,0 +1,1 @@
+"""Serving architecture tests."""

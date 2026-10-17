@@ -1,0 +1,328 @@
+"""Normalized scheduler output for one virtual execution step."""
+
+from dataclasses import asdict, dataclass, field
+import hashlib
+import json
+import math
+from numbers import Real
+from typing import Mapping, Tuple
+
+from src.serving.kv_cache.kv_cache_events import KVCacheEvent
+
+
+@dataclass(frozen=True)
+class ScheduledRequest:
+    request_id: str
+    phase: str
+    input_tokens: int
+    output_tokens: int
+    computed_tokens: int = 0
+    recomputed_tokens: int = 0
+    prefix_replay_tokens: int = 0
+    resumed_from_preemption: bool = False
+    trace_prefix_hit_tokens: int = 0
+    scheduler_prefix_hit_tokens: int = 0
+    prefix_scheduler_delta_tokens: int = field(init=False)
+    raw_model_output_tokens: int = 0
+    mtp_proposed_tokens: int = 0
+    mtp_verified_tokens: int = 0
+    mtp_accepted_tokens: int = 0
+    mtp_rejected_tokens: int = field(init=False)
+    mtp_proposer_tokens: int = 0
+    mtp_next_proposed_tokens: int = 0
+    mtp_proposer_mode: str = "disabled"
+    mtp_acceptance_source_kind: str = "disabled"
+    mtp_acceptance_source_id: str = "disabled"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.request_id, str) or not self.request_id:
+            raise ValueError("scheduled request_id must be a non-empty string")
+        if not isinstance(self.phase, str):
+            raise TypeError("scheduled request phase must be a string")
+        if self.phase not in ("prefill", "decode"):
+            raise ValueError(f"unknown request phase: {self.phase!r}")
+        for name in (
+                "input_tokens", "output_tokens", "computed_tokens",
+                "recomputed_tokens", "prefix_replay_tokens",
+                "trace_prefix_hit_tokens", "scheduler_prefix_hit_tokens",
+                "raw_model_output_tokens",
+                "mtp_proposed_tokens", "mtp_verified_tokens",
+                "mtp_accepted_tokens", "mtp_proposer_tokens",
+                "mtp_next_proposed_tokens"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"scheduled {name} must be an integer")
+        if min(
+                self.input_tokens,
+                self.output_tokens,
+                self.computed_tokens,
+                self.recomputed_tokens,
+                self.prefix_replay_tokens,
+                self.trace_prefix_hit_tokens,
+                self.scheduler_prefix_hit_tokens,
+                self.raw_model_output_tokens,
+                self.mtp_proposed_tokens,
+                self.mtp_verified_tokens,
+                self.mtp_accepted_tokens,
+                self.mtp_proposer_tokens,
+                self.mtp_next_proposed_tokens,
+        ) < 0:
+            raise ValueError("scheduled token counts cannot be negative")
+        if self.input_tokens + self.output_tokens == 0:
+            raise ValueError("a scheduled request must execute at least one token")
+        if self.recomputed_tokens > self.scheduled_tokens:
+            raise ValueError(
+                "recomputed_tokens cannot exceed scheduled tokens")
+        if self.prefix_replay_tokens > self.scheduled_tokens:
+            raise ValueError(
+                "prefix_replay_tokens cannot exceed scheduled tokens")
+        if (self.recomputed_tokens + self.prefix_replay_tokens
+                > self.scheduled_tokens):
+            raise ValueError(
+                "recomputed and prefix replay tokens cannot overlap beyond "
+                "the scheduled work")
+        if not isinstance(self.resumed_from_preemption, bool):
+            raise TypeError(
+                "resumed_from_preemption must be boolean")
+        if self.scheduler_prefix_hit_tokens > self.trace_prefix_hit_tokens:
+            raise ValueError(
+                "scheduler prefix hit cannot exceed the trace oracle hit")
+        if self.scheduler_prefix_hit_tokens > self.computed_tokens:
+            raise ValueError(
+                "scheduler prefix hit cannot exceed computed tokens")
+        object.__setattr__(
+            self,
+            "prefix_scheduler_delta_tokens",
+            self.trace_prefix_hit_tokens - self.scheduler_prefix_hit_tokens,
+        )
+        if self.mtp_verified_tokens > self.mtp_proposed_tokens:
+            raise ValueError(
+                "MTP verified tokens cannot exceed proposed tokens")
+        if self.mtp_accepted_tokens > self.mtp_verified_tokens:
+            raise ValueError(
+                "MTP accepted tokens cannot exceed verified tokens")
+        if self.raw_model_output_tokens:
+            if self.raw_model_output_tokens != self.mtp_accepted_tokens + 1:
+                raise ValueError(
+                    "raw model output must contain the accepted MTP prefix "
+                    "followed by exactly one terminal token")
+        elif self.mtp_verified_tokens:
+            raise ValueError(
+                "an MTP verification step must produce a raw model output")
+        object.__setattr__(
+            self,
+            "mtp_rejected_tokens",
+            self.mtp_verified_tokens - self.mtp_accepted_tokens,
+        )
+        for name in (
+                "mtp_proposer_mode", "mtp_acceptance_source_kind",
+                "mtp_acceptance_source_id"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"scheduled {name} must be a non-empty string")
+        if self.mtp_acceptance_source_kind == "disabled":
+            if self.mtp_proposer_mode != "disabled":
+                raise ValueError(
+                    "disabled MTP source requires proposer mode 'disabled'")
+            if self.mtp_acceptance_source_id != "disabled":
+                raise ValueError(
+                    "disabled MTP source kind requires source ID 'disabled'")
+            if any((
+                    self.mtp_proposed_tokens,
+                    self.mtp_verified_tokens,
+                    self.mtp_accepted_tokens,
+                    self.mtp_proposer_tokens,
+                    self.mtp_next_proposed_tokens,
+            )):
+                raise ValueError(
+                    "disabled MTP source cannot carry speculative tokens")
+        elif self.mtp_acceptance_source_kind in (
+                "explicit_assumption", "replay_observation"):
+            if self.mtp_proposer_mode != "padded":
+                raise ValueError(
+                    "enabled MTP requires pinned padded proposer mode")
+            if self.mtp_acceptance_source_id == "disabled":
+                raise ValueError(
+                    "enabled MTP requires a non-disabled source ID")
+            if (self.mtp_proposed_tokens == 0
+                    and self.mtp_proposer_tokens == 0
+                    and self.mtp_next_proposed_tokens == 0):
+                raise ValueError(
+                    "enabled MTP requires current or next proposed tokens")
+        else:
+            raise ValueError(
+                "unknown MTP acceptance source kind: "
+                f"{self.mtp_acceptance_source_kind!r}")
+
+    @property
+    def scheduled_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+
+@dataclass(frozen=True)
+class ScheduleStep:
+    step_id: str
+    pool_name: str
+    requests: Tuple[ScheduledRequest, ...]
+    finished_request_ids: Tuple[str, ...] = ()
+    preempted_request_ids: Tuple[str, ...] = ()
+    attention_kv_layout: str | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("step_id", "pool_name"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(
+                    f"schedule {name} must be a non-empty string")
+        if not isinstance(self.requests, (list, tuple)):
+            raise TypeError("ScheduleStep requests must be a list or tuple")
+        object.__setattr__(self, "requests", tuple(self.requests))
+        if not self.requests:
+            raise ValueError("ScheduleStep requires at least one request")
+        if any(not isinstance(request, ScheduledRequest)
+               for request in self.requests):
+            raise TypeError("ScheduleStep requests must be ScheduledRequest objects")
+        request_ids = tuple(request.request_id for request in self.requests)
+        if len(request_ids) != len(set(request_ids)):
+            raise ValueError("ScheduleStep request IDs must be unique")
+        if not isinstance(self.finished_request_ids, (list, tuple)):
+            raise TypeError(
+                "finished_request_ids must be a list or tuple")
+        object.__setattr__(
+            self, "finished_request_ids", tuple(self.finished_request_ids))
+        if any(not isinstance(request_id, str) or not request_id
+               for request_id in self.finished_request_ids):
+            raise ValueError(
+                "finished_request_ids must contain non-empty strings")
+        if len(self.finished_request_ids) != len(set(self.finished_request_ids)):
+            raise ValueError("finished_request_ids must be unique")
+        scheduled_ids = set(request_ids)
+        if not set(self.finished_request_ids).issubset(scheduled_ids):
+            raise ValueError(
+                "finished requests must belong to the current schedule step")
+        if not isinstance(self.preempted_request_ids, (list, tuple)):
+            raise TypeError(
+                "preempted_request_ids must be a list or tuple")
+        object.__setattr__(
+            self,
+            "preempted_request_ids",
+            tuple(self.preempted_request_ids),
+        )
+        if any(not isinstance(request_id, str) or not request_id
+               for request_id in self.preempted_request_ids):
+            raise ValueError(
+                "preempted_request_ids must contain non-empty strings")
+        if len(self.preempted_request_ids) != len(
+                set(self.preempted_request_ids)):
+            raise ValueError("preempted_request_ids must be unique")
+        preempted_ids = set(self.preempted_request_ids)
+        if preempted_ids & set(self.finished_request_ids):
+            raise ValueError(
+                "preempted and finished request IDs must be disjoint")
+        if preempted_ids & scheduled_ids:
+            raise ValueError(
+                "preempted requests cannot execute in the same schedule step")
+        if self.attention_kv_layout is not None:
+            if not isinstance(self.attention_kv_layout, str):
+                raise TypeError(
+                    "ScheduleStep attention_kv_layout must be a string or null")
+            if self.attention_kv_layout not in (
+                    "contiguous", "paged", "paged_varlen",
+                    "chunked_prefill", "mla"):
+                raise ValueError(
+                    "unsupported ScheduleStep attention_kv_layout: "
+                    f"{self.attention_kv_layout!r}")
+
+    @property
+    def token_count(self) -> int:
+        return sum(request.scheduled_tokens for request in self.requests)
+
+
+def schedule_step_sha256(step: ScheduleStep) -> str:
+    """Hash the complete normalized Scheduler decision for replay binding."""
+
+    if not isinstance(step, ScheduleStep):
+        raise TypeError("schedule step hashing requires a ScheduleStep")
+    payload = {
+        "schema_version": 1,
+        "schedule_step": asdict(step),
+    }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+@dataclass(frozen=True)
+class BackendStep:
+    schedule: ScheduleStep
+    kv_cache_events: Tuple[KVCacheEvent, ...] = ()
+    generated_tokens: Mapping[str, int] = field(
+        default_factory=dict)
+    scheduler_plan_cpu_s: float = field(default=0.0, compare=False)
+    engine_submit_host_s: float = field(default=0.0, compare=False)
+    engine_wake_host_s: float = field(default=0.0, compare=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.schedule, ScheduleStep):
+            raise TypeError("BackendStep requires a ScheduleStep")
+        if not isinstance(self.kv_cache_events, (list, tuple)):
+            raise TypeError("BackendStep kv_cache_events must be a list or tuple")
+        object.__setattr__(self, "kv_cache_events", tuple(self.kv_cache_events))
+        if any(not isinstance(event, KVCacheEvent)
+               for event in self.kv_cache_events):
+            raise TypeError("BackendStep kv_cache_events must be KVCacheEvent objects")
+        if not isinstance(self.generated_tokens, Mapping):
+            raise TypeError("generated_tokens must be a mapping")
+        requests_by_id = {
+            request.request_id: request for request in self.schedule.requests
+        }
+        scheduled_ids = set(requests_by_id)
+        supplied = dict(self.generated_tokens)
+        unknown = set(supplied) - scheduled_ids
+        missing = scheduled_ids - set(supplied)
+        if unknown or missing:
+            raise ValueError(
+                "generated_tokens must contain exactly the scheduled requests: "
+                f"missing={sorted(missing)}, unknown={sorted(unknown)}")
+        for request_id in scheduled_ids:
+            count = supplied[request_id]
+            if isinstance(count, bool) or not isinstance(count, int):
+                raise TypeError(
+                    "generated token counts must be integers")
+            if count < 0:
+                raise ValueError(
+                    "generated token counts cannot be negative")
+            scheduled_request = requests_by_id[request_id]
+            raw_count = scheduled_request.raw_model_output_tokens
+            if count > raw_count:
+                raise ValueError(
+                    "emitted tokens cannot exceed raw model output tokens: "
+                    f"request={request_id!r}, emitted={count}, raw={raw_count}")
+            if (request_id not in self.schedule.finished_request_ids
+                    and count not in (0, raw_count)):
+                raise ValueError(
+                    "a nonterminal request must emit its complete raw model "
+                    "output or discard it entirely: "
+                    f"request={request_id!r}, emitted={count}, raw={raw_count}")
+        object.__setattr__(self, "generated_tokens", supplied)
+        if (isinstance(self.scheduler_plan_cpu_s, bool)
+                or not isinstance(self.scheduler_plan_cpu_s, Real)
+                or not math.isfinite(self.scheduler_plan_cpu_s)
+                or self.scheduler_plan_cpu_s < 0):
+            raise ValueError(
+                "Scheduler plan CPU time must be finite and non-negative")
+        for name in ("engine_submit_host_s", "engine_wake_host_s"):
+            value = getattr(self, name)
+            if (isinstance(value, bool) or not isinstance(value, Real)
+                    or not math.isfinite(value) or value < 0):
+                raise ValueError(
+                    f"EngineCore host-round {name} must be finite and "
+                    "non-negative")
+
+    @property
+    def finished_request_ids(self) -> Tuple[str, ...]:
+        return self.schedule.finished_request_ids

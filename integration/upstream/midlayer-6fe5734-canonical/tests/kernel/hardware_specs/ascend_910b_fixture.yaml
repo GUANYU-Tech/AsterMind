@@ -1,0 +1,155 @@
+hardware_id: ascend_910b
+
+# HWSpec test input: NPU with a systolic array.
+# No SM/subcore concept — uses compute tiles with MAC arrays.
+
+clock_domains:
+  tile: 800000000
+  dram: 1200000000
+
+components:
+  - name: tile
+    count: 64
+    children:
+      - name: systolic_array
+        role: compute_tensor
+        scope: shared
+        count: 1
+        type: compute
+        primary_variant: int8
+        variants:
+          - name: int8
+            throughput_per_clk: 4096   # 64x64 systolic array, INT8 MAC/clk
+          - name: fp16
+            throughput_per_clk: 2048   # 64x64, FP16 MAC/clk
+      - name: scalar_unit
+        role: compute_fma
+        scope: shared
+        count: 1
+        type: compute
+        throughput_per_clk: 8
+      - name: sfu_unit
+        role: compute_sfu
+        scope: shared
+        count: 1
+        type: compute
+        throughput_per_clk: 2
+      - name: alu_unit
+        role: compute_alu
+        scope: shared
+        count: 1
+        type: compute
+        throughput_per_clk: 8
+      - name: local_sram
+        role: smem
+        scope: shared
+        count: 1
+        type: memory
+        throughput_per_clk: 512
+        traffic_filter: null
+      - name: l1_cache
+        role: l1_cache
+        scope: shared
+        count: 1
+        type: memory
+        throughput_per_clk: 512
+        traffic_filter: null
+
+  - name: noc
+    role: xbar
+    scope: shared
+    clock_domain: tile
+    count: 1
+    type: memory
+    throughput_per_clk: 3000
+    traffic_filter: null
+
+  - name: l2
+    role: l2_cache
+    scope: shared
+    clock_domain: tile
+    count: 1
+    type: memory
+    throughput_per_clk: 2000
+    traffic_filter: lru
+    size_bytes: 16777216
+    num_partitions: 32
+
+  - name: dram
+    role: dram
+    scope: shared
+    clock_domain: dram
+    count: 1
+    type: memory
+    throughput_per_clk: 800
+    traffic_filter: page_conflict
+    size_bytes: 17179869184
+    num_partitions: 4
+
+resource_groups:
+  - name: tensor_pipe
+    members: [systolic_array_int8]
+  - name: fma_sfu_pipe
+    members: [scalar_unit, sfu_unit]
+  - name: alu_pipe
+    members: [alu_unit]
+  - name: smem
+    members: [local_sram]
+  - name: l1_cache
+    members: [l1_cache]
+  - name: xbar
+    members: [noc]
+  - name: l2
+    members: [l2]
+  - name: dram
+    members: [dram]
+
+memory_subsystem:
+  dram_latency_ns: 150
+  # NPU 此处用 systolic array + local SRAM，不存在 GPU 式的 L2 cache 层级。
+  # 结构化 NPU tile path 不实例化 GPU L2 串行修正。这里的零值只表示
+  # 该 fixture 没有 GPU 式 L2 hit endpoint。
+  l2_latency_ns: 0
+  cacheline_bytes: 64
+  l2_conflict_efficiency_moe: 0.75
+  dram_protocol_efficiency: 0.9
+  dram_protocol_efficiency_l1cached: 1.0
+  profiler_per_kernel_traffic_reliable: true
+  # No GPU-style L2 cache layer on this systolic-array NPU.  Sentinel 1
+  # satisfies the compatibility HWSpec validation; the value is unused.
+  dtype_bytes: 2
+  pipeline_fill: 0
+  systolic_dma_bus_bpc: 800
+  memcpy_dtod_floor_ns: null
+
+scheduling:
+  parallel_unit: thread
+  parallel_width: 1
+  num_compute_units: 64
+  max_warps_per_unit: 1
+  max_blocks_per_unit: 1
+  max_regs_per_unit: 256
+  max_smem_per_unit_bytes: 131072
+  max_smem_per_block_bytes: 131072
+  max_threads_per_unit: 1
+  dispatch_overhead_ns: 2000
+  model_clock_domain: tile
+  dram_clock_domain: dram
+
+interconnect:
+  nvlink_unidir_bw_GB_s: null
+  nvlink_signal_latency_ns: null
+  nccl_alpha_ns: null
+  pcie_bw_GB_s: null
+  pcie_latency_ns: null
+  infiniband_unidir_bw_GB_s: null
+
+features:
+  kernel_memory_model: systolic_scratchpad
+  kernel_dtype: bf16
+  l1_cache_enabled: false
+  cluster_supported: false
+  cluster_size: 0
+  multicast_supported: false
+  hw_decompression: false
+  compression_ratio: 1.0

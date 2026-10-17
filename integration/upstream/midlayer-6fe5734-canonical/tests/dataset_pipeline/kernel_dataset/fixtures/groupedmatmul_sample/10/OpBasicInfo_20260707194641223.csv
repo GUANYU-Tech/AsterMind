@@ -1,0 +1,2 @@
+Op Name,Op Type,Task Duration(us),Block Dim,Mix Block Dim,Device Id,Pid,Current Freq,Rated Freq,
+GroupedMatmul_0d2d43751f81d7f29646a862147967c9_1776411_mix_aic,cube,778.440002,24,NA,5,207341,1800,1800,

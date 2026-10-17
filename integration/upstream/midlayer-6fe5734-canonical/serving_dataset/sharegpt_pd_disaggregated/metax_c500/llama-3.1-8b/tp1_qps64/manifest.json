@@ -1,0 +1,345 @@
+{
+  "alignment_steps": {
+    "path": null,
+    "reason": "PD has role-local Scheduling and cross-instance KV handoff; this non-profiler capture does not observe kernel alignment",
+    "sha256": null,
+    "status": "not_collected"
+  },
+  "capture": {
+    "handoff_source_archive_ids": [
+      "router-handoffs",
+      "connector-events-0",
+      "connector-events-1",
+      "connector-events-2"
+    ],
+    "host_boot_id": "7ca2437e-f3d3-4790-adf3-b0990751eaec",
+    "metrics_source_archive_id": "pd-ground-truth",
+    "observer_effect_source_archive_id": "observer-effect",
+    "observer_effect_validation": {
+      "baseline_run_id": "raw/ground_truth.json",
+      "instrumented_run_id": "raw/ground_truth.json",
+      "metric_delta_percent": {
+        "e2e": 2.1268169209236385,
+        "output_token_throughput": 0.0650024445075094,
+        "request_throughput": 0.06500244450750714,
+        "tpot": 2.136680396799675,
+        "ttft": 2.5757578304035995
+      },
+      "passed": true,
+      "status": "inherited_from_representative_case",
+      "threshold_percent": 3.0,
+      "validation_case_id": "metax_c500/qwen3-8b/tp1_qps4"
+    },
+    "profiler_attached": false,
+    "requests_source_archive_id": "frozen-requests",
+    "run_id": "pd-tp1_qps64-3c01d28d932f48849117f7b8e283f0c2",
+    "run_origin_monotonic_ns": 1838588686982709,
+    "scheduler_source_archive_ids": [
+      "scheduler-prefill",
+      "scheduler-decode"
+    ],
+    "scheduler_trace_enabled": true
+  },
+  "converter": {
+    "implementation_id": "dataset_pipeline.serving_dataset.pd_compact_candidate.build_pd_disaggregated_candidate",
+    "selection_rule": "physical_pd_role_trajectory_v1",
+    "source_commit": "eebaca37e9b811f7ebb0c99f9ba3eb14cd74189a"
+  },
+  "identity": {
+    "case_id": "tp1_qps64",
+    "hardware_id": "metax_c500",
+    "model_id": "llama-3.1-8b",
+    "model_revision": null,
+    "raw_model_id": "Llama-3.1-8B",
+    "source_kind": "sharegpt_pd_disaggregated",
+    "tokenizer_revision": null,
+    "topology": "1p1d"
+  },
+  "metrics": {
+    "path": "metrics.json",
+    "reason": null,
+    "sha256": "88ad719b8f6f4e75d5a4272463efb5b18566536da35506e1ef08060d237f1ddf",
+    "status": "available"
+  },
+  "pd_handoffs": {
+    "path": "pd_handoffs.jsonl",
+    "provenance": {
+      "connector_source_archive_ids": [
+        "connector-events-0",
+        "connector-events-1",
+        "connector-events-2"
+      ],
+      "connector_source_sha256s": [
+        "669d3a1ae190ce1b0f015933be8b562f6eddde1cbe2c41d1638bdbf5646faf1e",
+        "aeff7f4ebb2f7d8ff8a58fa449763042ba2e5b8ffa26cb597c670c634480f9bf",
+        "82d30dfd60ccf059906e3846d8ac95f8610d10c78fec9152503312770d659768"
+      ],
+      "profiler_attached": false,
+      "router_source_archive_id": "router-handoffs",
+      "router_source_sha256": "0593309e6e3d8f338b2794b4174f95588ffda46eed3985d024d7fe8509487b9c"
+    },
+    "row_count": 128,
+    "sha256": "6d223e60a7f591bf2b594ac7040bb5141ee5bc0a0d41ab106ded62a834ca584b",
+    "timing_boundary": {
+      "client_first_token": "router_flushed_first_decode_sse_token",
+      "clock": "time.perf_counter_ns",
+      "consumer_load": "connector_observed_consumer_load",
+      "origin": "shared_run_origin_monotonic_ns",
+      "producer_ready": "connector_observed_producer_ready",
+      "router_received": "router_received_client_request",
+      "transfer_end": "connector_observed_transfer_end",
+      "transfer_start": "connector_observed_transfer_start"
+    }
+  },
+  "provenance": {
+    "gaps": [],
+    "raw_source_set_sha256": "defe02a05d944ee8222e3126594bb65e6abc913fc511ae2535beaf72ad20b0db"
+  },
+  "raw_sources": [
+    {
+      "archive_id": "frozen-manifest",
+      "bytes": 10756,
+      "relative_path": "frozen_manifest.json",
+      "role": "frozen_case_manifest",
+      "sha256": "a60db1c2d0c66c7a2973a73310de975c642ba04429029c831a55c4dc279e2d18",
+      "tool": "sharegpt_pd_runner",
+      "tool_version": "1"
+    },
+    {
+      "archive_id": "frozen-requests",
+      "bytes": 3573,
+      "relative_path": "requests.csv",
+      "role": "frozen_requests",
+      "sha256": "347003764edb947d4d3ae8c9f68e020ae352634c30bac54d32b0f9c805068021",
+      "tool": "sharegpt_pd_runner",
+      "tool_version": "1"
+    },
+    {
+      "archive_id": "run-contract",
+      "bytes": 1899,
+      "relative_path": "run_contract.json",
+      "role": "pd_run_contract",
+      "sha256": "48a5e9ba069b8ddaa44d04b753a8f07f5f7cbd03232f91c9f1b012c8ce72b09d",
+      "tool": "sharegpt_pd_runner",
+      "tool_version": "1"
+    },
+    {
+      "archive_id": "pd-ground-truth",
+      "bytes": 55011,
+      "relative_path": "ground_truth.json",
+      "role": "ground_truth",
+      "sha256": "be5e3c17d7200084d9f5f9a62becbcf327d9c49efb50bc006dce6a8c8deb8acf",
+      "tool": "sharegpt_pd_runner",
+      "tool_version": "1"
+    },
+    {
+      "archive_id": "observer-effect",
+      "bytes": 475,
+      "relative_path": "observer_effect.json",
+      "role": "observer_effect",
+      "sha256": "150e3d0f8196af609ec5311f966e9455ba944e83951f4814a4f2ea884a8b78df",
+      "tool": "pd_observer_effect",
+      "tool_version": "1"
+    },
+    {
+      "archive_id": "scheduler-prefill",
+      "bytes": 26426,
+      "relative_path": "scheduler_steps_prefill.raw.jsonl",
+      "role": "scheduler_prefill",
+      "sha256": "75fc6027fad644e646cc5ccd7e20899f0548319db2af33129061adf6d8cd4c2a",
+      "tool": "vllm_scheduler_trace",
+      "tool_version": "1"
+    },
+    {
+      "archive_id": "scheduler-decode",
+      "bytes": 4363126,
+      "relative_path": "scheduler_steps_decode.raw.jsonl",
+      "role": "scheduler_decode",
+      "sha256": "751c13306899381517f66cf4eb130f1aff5f766766a398404d61db7b3bff4e07",
+      "tool": "vllm_scheduler_trace",
+      "tool_version": "1"
+    },
+    {
+      "archive_id": "router-handoffs",
+      "bytes": 142746,
+      "relative_path": "router_handoffs.raw.jsonl",
+      "role": "router_handoffs",
+      "sha256": "0593309e6e3d8f338b2794b4174f95588ffda46eed3985d024d7fe8509487b9c",
+      "tool": "request_router",
+      "tool_version": "1"
+    },
+    {
+      "archive_id": "connector-events-0",
+      "bytes": 390128,
+      "relative_path": "connector_events/decode.connector.runtime.1116527.jsonl",
+      "role": "connector_handoffs",
+      "sha256": "669d3a1ae190ce1b0f015933be8b562f6eddde1cbe2c41d1638bdbf5646faf1e",
+      "tool": "vllm_scheduler_trace",
+      "tool_version": "1"
+    },
+    {
+      "archive_id": "connector-events-1",
+      "bytes": 6219465,
+      "relative_path": "connector_events/decode.connector.scheduler.1116527.jsonl",
+      "role": "connector_handoffs",
+      "sha256": "aeff7f4ebb2f7d8ff8a58fa449763042ba2e5b8ffa26cb597c670c634480f9bf",
+      "tool": "vllm_scheduler_trace",
+      "tool_version": "1"
+    },
+    {
+      "archive_id": "connector-events-2",
+      "bytes": 6200558,
+      "relative_path": "connector_events/prefill.connector.scheduler.1116534.jsonl",
+      "role": "connector_handoffs",
+      "sha256": "82d30dfd60ccf059906e3846d8ac95f8610d10c78fec9152503312770d659768",
+      "tool": "vllm_scheduler_trace",
+      "tool_version": "1"
+    }
+  ],
+  "requests": {
+    "cached_hit_value_evidence": {
+      "derivation": "pd_role_local_scheduler_token_conservation",
+      "kind": "scheduler_equivalent_representative",
+      "logical_prefix_hit_observability": "unavailable",
+      "net_prefix_work_reduction_tokens": 0,
+      "raw_source_set_sha256": "defe02a05d944ee8222e3126594bb65e6abc913fc511ae2535beaf72ad20b0db",
+      "representative_value": 0,
+      "source_archive_ids": [
+        "frozen-requests",
+        "scheduler-prefill",
+        "scheduler-decode"
+      ]
+    },
+    "field_provenance": {
+      "Cached hit [tokens]": {
+        "kind": "scheduler_equivalent_representative",
+        "reason": "logical H unavailable; accepted Scheduler trace proves equivalent zero net prefix-work reduction",
+        "source_archive_id": null
+      },
+      "In Token [tokens]": {
+        "kind": "requested",
+        "reason": null,
+        "source_archive_id": "frozen-requests"
+      },
+      "Out Token [tokens]": {
+        "kind": "requested",
+        "reason": null,
+        "source_archive_id": "frozen-requests"
+      },
+      "Query Time Stamp [ms]": {
+        "kind": "requested",
+        "reason": null,
+        "source_archive_id": "frozen-requests"
+      }
+    },
+    "path": "requests.csv",
+    "row_count": 128,
+    "sha256": "347003764edb947d4d3ae8c9f68e020ae352634c30bac54d32b0f9c805068021"
+  },
+  "runtime": {
+    "capture_enable_prefix_caching": true,
+    "deployment": "pd_disaggregated",
+    "dtype": "bfloat16",
+    "instances": {
+      "decode": {
+        "expert_parallel_size": 1,
+        "graph": {
+          "capture_limit_tokens": 512,
+          "configured_mode": "FULL_AND_PIECEWISE"
+        },
+        "pipeline_parallel_size": 1,
+        "scheduler_pipeline_depth": 2,
+        "scheduler_pipeline_depth_evidence": {
+          "configured_depth": 2,
+          "executor_class": "vllm.v1.executor.uniproc_executor.UniProcExecutor",
+          "pipeline_parallel_size": 1,
+          "runtime_version": "0.24.0",
+          "source_field": "vllm_config.max_concurrent_batches",
+          "source_identity": {
+            "module_file": "/opt/conda/lib/python3.12/site-packages/vllm/config/vllm.py",
+            "module_name": "vllm.v1.executor.uniproc_executor"
+          },
+          "source_kind": "runtime_vllm_config_field"
+        },
+        "tensor_parallel_size": 1
+      },
+      "prefill": {
+        "expert_parallel_size": 1,
+        "graph": {
+          "capture_limit_tokens": 512,
+          "configured_mode": "FULL_AND_PIECEWISE"
+        },
+        "pipeline_parallel_size": 1,
+        "scheduler_pipeline_depth": 2,
+        "scheduler_pipeline_depth_evidence": {
+          "configured_depth": 2,
+          "executor_class": "vllm.v1.executor.uniproc_executor.UniProcExecutor",
+          "pipeline_parallel_size": 1,
+          "runtime_version": "0.24.0",
+          "source_field": "vllm_config.max_concurrent_batches",
+          "source_identity": {
+            "module_file": "/opt/conda/lib/python3.12/site-packages/vllm/config/vllm.py",
+            "module_name": "vllm.v1.executor.uniproc_executor"
+          },
+          "source_kind": "runtime_vllm_config_field"
+        },
+        "tensor_parallel_size": 1
+      }
+    },
+    "runtime_version": "0.24.0",
+    "seed": 42,
+    "source_commit": "9c2926f93a7f29c7cd970b13d0c3148f522f7c6f",
+    "target_qps": 64.0
+  },
+  "scheduler_steps": {
+    "decode": {
+      "compressed_sha256": "8808002a09a29f24b4db2a051b90bbc0170fdb55995f9ad367387e92d34953b5",
+      "compression": "zstd",
+      "path": "scheduler_steps_decode.jsonl.zst",
+      "provenance": {
+        "buffering": "in_memory_append_then_single_write",
+        "capture_run_id": "pd-tp1_qps64-3c01d28d932f48849117f7b8e283f0c2",
+        "instrumentation_id": "dataset_pipeline.serving_dataset.vllm_scheduler_trace",
+        "instrumentation_version": 1,
+        "profiler_attached": false,
+        "source_archive_id": "scheduler-decode",
+        "source_sha256": "751c13306899381517f66cf4eb130f1aff5f766766a398404d61db7b3bff4e07"
+      },
+      "row_count": 1202,
+      "sha256": "9335d2ed977ff6ab42c391f05e10b73d9d494235831a48dd7a3efd8f062317e3",
+      "timing_boundary": {
+        "clock": "time.perf_counter_ns",
+        "origin": "shared_run_origin_monotonic_ns",
+        "schedule_end": "immediately_after_scheduler_schedule",
+        "step_end": "immediately_after_scheduler_output_update",
+        "step_start": "immediately_before_scheduler_schedule",
+        "update_start": "immediately_before_scheduler_output_update"
+      }
+    },
+    "prefill": {
+      "compressed_sha256": "0f0a6a9d4dbd072d164fc0b3450da8b7ae02df9fe982e8fef9621427c07aff64",
+      "compression": "zstd",
+      "path": "scheduler_steps_prefill.jsonl.zst",
+      "provenance": {
+        "buffering": "in_memory_append_then_single_write",
+        "capture_run_id": "pd-tp1_qps64-3c01d28d932f48849117f7b8e283f0c2",
+        "instrumentation_id": "dataset_pipeline.serving_dataset.vllm_scheduler_trace",
+        "instrumentation_version": 1,
+        "profiler_attached": false,
+        "source_archive_id": "scheduler-prefill",
+        "source_sha256": "75fc6027fad644e646cc5ccd7e20899f0548319db2af33129061adf6d8cd4c2a"
+      },
+      "row_count": 9,
+      "sha256": "9aaab2f2d995b9d9486161024f6bb667cfd5ff9fed70aa232150f4a3f8a1b1a8",
+      "timing_boundary": {
+        "clock": "time.perf_counter_ns",
+        "origin": "shared_run_origin_monotonic_ns",
+        "schedule_end": "immediately_after_scheduler_schedule",
+        "step_end": "immediately_after_scheduler_output_update",
+        "step_start": "immediately_before_scheduler_schedule",
+        "update_start": "immediately_before_scheduler_output_update"
+      }
+    }
+  },
+  "schema_version": 6
+}

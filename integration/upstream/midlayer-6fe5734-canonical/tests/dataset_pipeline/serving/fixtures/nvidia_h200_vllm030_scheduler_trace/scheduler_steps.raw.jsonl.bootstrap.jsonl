@@ -1,0 +1,5 @@
+{"event":"formal_scheduler_schedule","process_name":"MainProcess","process_pid":0}
+{"event":"formal_scheduler_update","process_name":"MainProcess","process_pid":0}
+{"event":"scheduler_trace_complete","process_name":"MainProcess","process_pid":0}
+{"event":"scheduler_trace_write_start","process_name":"MainProcess","process_pid":0}
+{"event":"scheduler_trace_write_complete","process_name":"MainProcess","process_pid":0}

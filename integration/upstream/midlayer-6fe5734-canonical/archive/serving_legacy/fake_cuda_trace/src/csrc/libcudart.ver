@@ -1,0 +1,10 @@
+libcudart.so.12 {
+    global:
+        cuda*;
+        cu*;
+        __cuda*;
+        trace_record_direct;
+        g_trace_mutex;
+    local:
+        *;
+};

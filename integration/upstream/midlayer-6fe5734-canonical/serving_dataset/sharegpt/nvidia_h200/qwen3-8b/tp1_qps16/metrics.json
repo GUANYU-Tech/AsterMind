@@ -1,0 +1,914 @@
+{
+  "metric_provenance": {
+    "profiler_attached": false,
+    "source_archive_id": "accepted-ground-truth-v3",
+    "source_kind": "serving_runtime",
+    "source_sha256": "8d8f7db258e5a6853e1329ff105f85998e180b942c8d21f7f45b268558e213f3"
+  },
+  "per_request": [
+    {
+      "actual_output_tokens": 121,
+      "e2e_latency_ms": 673.7093813717365,
+      "request_idx": 0,
+      "tpot_ms": 5.3801787706712885,
+      "ttft_ms": 28.087928891181946
+    },
+    {
+      "actual_output_tokens": 213,
+      "e2e_latency_ms": 1539.6195463836193,
+      "request_idx": 1,
+      "tpot_ms": 7.190428024052449,
+      "ttft_ms": 15.248805284500122
+    },
+    {
+      "actual_output_tokens": 767,
+      "e2e_latency_ms": 4803.775183856487,
+      "request_idx": 2,
+      "tpot_ms": 6.2513972241091045,
+      "ttft_ms": 15.204910188913345
+    },
+    {
+      "actual_output_tokens": 390,
+      "e2e_latency_ms": 2602.2546403110027,
+      "request_idx": 3,
+      "tpot_ms": 6.65576625759007,
+      "ttft_ms": 13.161566108465195
+    },
+    {
+      "actual_output_tokens": 378,
+      "e2e_latency_ms": 2537.0673835277557,
+      "request_idx": 4,
+      "tpot_ms": 6.690371099770543,
+      "ttft_ms": 14.797478914260864
+    },
+    {
+      "actual_output_tokens": 441,
+      "e2e_latency_ms": 2891.3635574281216,
+      "request_idx": 5,
+      "tpot_ms": 6.529350036924535,
+      "ttft_ms": 18.449541181325912
+    },
+    {
+      "actual_output_tokens": 104,
+      "e2e_latency_ms": 578.3637724816799,
+      "request_idx": 6,
+      "tpot_ms": 5.452079752695213,
+      "ttft_ms": 16.799557954072952
+    },
+    {
+      "actual_output_tokens": 201,
+      "e2e_latency_ms": 1501.9099563360214,
+      "request_idx": 7,
+      "tpot_ms": 7.4236201494932175,
+      "ttft_ms": 17.18592643737793
+    },
+    {
+      "actual_output_tokens": 798,
+      "e2e_latency_ms": 5019.672609865665,
+      "request_idx": 8,
+      "tpot_ms": 6.255512802372015,
+      "ttft_ms": 34.028906375169754
+    },
+    {
+      "actual_output_tokens": 6,
+      "e2e_latency_ms": 55.27198687195778,
+      "request_idx": 9,
+      "tpot_ms": 5.286455899477005,
+      "ttft_ms": 28.839707374572754
+    },
+    {
+      "actual_output_tokens": 337,
+      "e2e_latency_ms": 2311.5258030593395,
+      "request_idx": 10,
+      "tpot_ms": 6.79468729400209,
+      "ttft_ms": 28.510872274637222
+    },
+    {
+      "actual_output_tokens": 402,
+      "e2e_latency_ms": 2701.362047344446,
+      "request_idx": 11,
+      "tpot_ms": 6.6997345787777265,
+      "ttft_ms": 14.768481254577637
+    },
+    {
+      "actual_output_tokens": 29,
+      "e2e_latency_ms": 464.16332945227623,
+      "request_idx": 12,
+      "tpot_ms": 12.127864041498729,
+      "ttft_ms": 124.58313629031181
+    },
+    {
+      "actual_output_tokens": 214,
+      "e2e_latency_ms": 1624.1175271570683,
+      "request_idx": 13,
+      "tpot_ms": 7.010118065165802,
+      "ttft_ms": 130.96237927675247
+    },
+    {
+      "actual_output_tokens": 330,
+      "e2e_latency_ms": 2268.1895419955254,
+      "request_idx": 14,
+      "tpot_ms": 6.5327418634050884,
+      "ttft_ms": 118.91746893525124
+    },
+    {
+      "actual_output_tokens": 42,
+      "e2e_latency_ms": 512.3218894004822,
+      "request_idx": 15,
+      "tpot_ms": 9.986486013342695,
+      "ttft_ms": 102.8759628534317
+    },
+    {
+      "actual_output_tokens": 33,
+      "e2e_latency_ms": 440.68771228194237,
+      "request_idx": 16,
+      "tpot_ms": 11.16731355432421,
+      "ttft_ms": 83.33367854356766
+    },
+    {
+      "actual_output_tokens": 316,
+      "e2e_latency_ms": 2113.987758755684,
+      "request_idx": 17,
+      "tpot_ms": 6.5785393473647895,
+      "ttft_ms": 41.747864335775375
+    },
+    {
+      "actual_output_tokens": 24,
+      "e2e_latency_ms": 314.88291919231415,
+      "request_idx": 18,
+      "tpot_ms": 11.416220956522485,
+      "ttft_ms": 52.30983719229698
+    },
+    {
+      "actual_output_tokens": 63,
+      "e2e_latency_ms": 595.0808860361576,
+      "request_idx": 19,
+      "tpot_ms": 9.064815758216765,
+      "ttft_ms": 33.06230902671814
+    },
+    {
+      "actual_output_tokens": 353,
+      "e2e_latency_ms": 2283.481679856777,
+      "request_idx": 20,
+      "tpot_ms": 6.060084973631257,
+      "ttft_ms": 150.3317691385746
+    },
+    {
+      "actual_output_tokens": 31,
+      "e2e_latency_ms": 336.55821159482,
+      "request_idx": 21,
+      "tpot_ms": 6.221695865194002,
+      "ttft_ms": 149.90733563899994
+    },
+    {
+      "actual_output_tokens": 225,
+      "e2e_latency_ms": 1526.612151414156,
+      "request_idx": 22,
+      "tpot_ms": 6.211329600773752,
+      "ttft_ms": 135.27432084083557
+    },
+    {
+      "actual_output_tokens": 11,
+      "e2e_latency_ms": 164.30871188640594,
+      "request_idx": 23,
+      "tpot_ms": 5.8028023689985275,
+      "ttft_ms": 106.28068819642067
+    },
+    {
+      "actual_output_tokens": 395,
+      "e2e_latency_ms": 2439.8474246263504,
+      "request_idx": 24,
+      "tpot_ms": 6.022437603264896,
+      "ttft_ms": 67.00700893998146
+    },
+    {
+      "actual_output_tokens": 50,
+      "e2e_latency_ms": 369.0203055739403,
+      "request_idx": 25,
+      "tpot_ms": 7.208031887302593,
+      "ttft_ms": 15.826743096113205
+    },
+    {
+      "actual_output_tokens": 27,
+      "e2e_latency_ms": 198.6776478588581,
+      "request_idx": 26,
+      "tpot_ms": 6.843255832791328,
+      "ttft_ms": 20.75299620628357
+    },
+    {
+      "actual_output_tokens": 407,
+      "e2e_latency_ms": 2482.7388152480125,
+      "request_idx": 27,
+      "tpot_ms": 6.048285250960312,
+      "ttft_ms": 27.135003358125687
+    },
+    {
+      "actual_output_tokens": 354,
+      "e2e_latency_ms": 2149.671997874975,
+      "request_idx": 28,
+      "tpot_ms": 6.031312037881981,
+      "ttft_ms": 20.618848502635956
+    },
+    {
+      "actual_output_tokens": 28,
+      "e2e_latency_ms": 240.65198376774788,
+      "request_idx": 29,
+      "tpot_ms": 7.871182704413379,
+      "ttft_ms": 28.130050748586655
+    },
+    {
+      "actual_output_tokens": 168,
+      "e2e_latency_ms": 1074.7724138200283,
+      "request_idx": 30,
+      "tpot_ms": 6.219363855030722,
+      "ttft_ms": 36.13865002989769
+    },
+    {
+      "actual_output_tokens": 5,
+      "e2e_latency_ms": 99.29633885622025,
+      "request_idx": 31,
+      "tpot_ms": 15.719654969871044,
+      "ttft_ms": 36.41771897673607
+    },
+    {
+      "actual_output_tokens": 621,
+      "e2e_latency_ms": 3709.72291380167,
+      "request_idx": 32,
+      "tpot_ms": 5.933006318105805,
+      "ttft_ms": 31.258996576070786
+    },
+    {
+      "actual_output_tokens": 90,
+      "e2e_latency_ms": 567.1010501682758,
+      "request_idx": 33,
+      "tpot_ms": 6.046301863166724,
+      "ttft_ms": 28.980184346437454
+    },
+    {
+      "actual_output_tokens": 268,
+      "e2e_latency_ms": 1587.6927115023136,
+      "request_idx": 34,
+      "tpot_ms": 5.8810503713870315,
+      "ttft_ms": 17.452262341976166
+    },
+    {
+      "actual_output_tokens": 12,
+      "e2e_latency_ms": 101.8928699195385,
+      "request_idx": 35,
+      "tpot_ms": 6.343831054188989,
+      "ttft_ms": 32.110728323459625
+    },
+    {
+      "actual_output_tokens": 17,
+      "e2e_latency_ms": 122.9056678712368,
+      "request_idx": 36,
+      "tpot_ms": 5.95465674996376,
+      "ttft_ms": 27.631159871816635
+    },
+    {
+      "actual_output_tokens": 156,
+      "e2e_latency_ms": 929.2313158512115,
+      "request_idx": 37,
+      "tpot_ms": 5.819094469470362,
+      "ttft_ms": 27.27167308330536
+    },
+    {
+      "actual_output_tokens": 52,
+      "e2e_latency_ms": 325.44442266225815,
+      "request_idx": 38,
+      "tpot_ms": 5.96511875297509,
+      "ttft_ms": 21.223366260528564
+    },
+    {
+      "actual_output_tokens": 574,
+      "e2e_latency_ms": 3373.347505927086,
+      "request_idx": 39,
+      "tpot_ms": 5.850069250839959,
+      "ttft_ms": 21.257825195789337
+    },
+    {
+      "actual_output_tokens": 9,
+      "e2e_latency_ms": 81.34598284959793,
+      "request_idx": 40,
+      "tpot_ms": 8.02634796127677,
+      "ttft_ms": 17.135199159383774
+    },
+    {
+      "actual_output_tokens": 790,
+      "e2e_latency_ms": 4688.589416444302,
+      "request_idx": 41,
+      "tpot_ms": 5.894701762646625,
+      "ttft_ms": 37.669725716114044
+    },
+    {
+      "actual_output_tokens": 10,
+      "e2e_latency_ms": 85.4453407227993,
+      "request_idx": 42,
+      "tpot_ms": 5.48541256123119,
+      "ttft_ms": 36.0766276717186
+    },
+    {
+      "actual_output_tokens": 97,
+      "e2e_latency_ms": 567.396204918623,
+      "request_idx": 43,
+      "tpot_ms": 5.716068592543404,
+      "ttft_ms": 18.653620034456253
+    },
+    {
+      "actual_output_tokens": 241,
+      "e2e_latency_ms": 1419.5401594042778,
+      "request_idx": 44,
+      "tpot_ms": 5.842509927848975,
+      "ttft_ms": 17.337776720523834
+    },
+    {
+      "actual_output_tokens": 573,
+      "e2e_latency_ms": 3395.144894719124,
+      "request_idx": 45,
+      "tpot_ms": 5.905425788222493,
+      "ttft_ms": 17.24134385585785
+    },
+    {
+      "actual_output_tokens": 367,
+      "e2e_latency_ms": 2135.975271463394,
+      "request_idx": 46,
+      "tpot_ms": 5.781485459925047,
+      "ttft_ms": 19.95159313082695
+    },
+    {
+      "actual_output_tokens": 488,
+      "e2e_latency_ms": 2864.3778190016747,
+      "request_idx": 47,
+      "tpot_ms": 5.840488872060541,
+      "ttft_ms": 20.0597383081913
+    },
+    {
+      "actual_output_tokens": 12,
+      "e2e_latency_ms": 80.99113777279854,
+      "request_idx": 48,
+      "tpot_ms": 5.601538853211837,
+      "ttft_ms": 19.374210387468338
+    },
+    {
+      "actual_output_tokens": 36,
+      "e2e_latency_ms": 212.61543408036232,
+      "request_idx": 49,
+      "tpot_ms": 5.573327839374542,
+      "ttft_ms": 17.54895970225334
+    },
+    {
+      "actual_output_tokens": 382,
+      "e2e_latency_ms": 2253.337826579809,
+      "request_idx": 50,
+      "tpot_ms": 5.847464689588922,
+      "ttft_ms": 25.453779846429825
+    },
+    {
+      "actual_output_tokens": 775,
+      "e2e_latency_ms": 4630.201272666454,
+      "request_idx": 51,
+      "tpot_ms": 5.952013362901771,
+      "ttft_ms": 23.342929780483246
+    },
+    {
+      "actual_output_tokens": 7,
+      "e2e_latency_ms": 54.33613061904907,
+      "request_idx": 52,
+      "tpot_ms": 5.452089011669159,
+      "ttft_ms": 21.62359654903412
+    },
+    {
+      "actual_output_tokens": 44,
+      "e2e_latency_ms": 281.3800983130932,
+      "request_idx": 53,
+      "tpot_ms": 5.720981071854747,
+      "ttft_ms": 35.37791222333908
+    },
+    {
+      "actual_output_tokens": 45,
+      "e2e_latency_ms": 274.74595233798027,
+      "request_idx": 54,
+      "tpot_ms": 5.7551078498363495,
+      "ttft_ms": 21.521206945180893
+    },
+    {
+      "actual_output_tokens": 55,
+      "e2e_latency_ms": 348.5224284231663,
+      "request_idx": 55,
+      "tpot_ms": 6.036462745180836,
+      "ttft_ms": 22.553440183401108
+    },
+    {
+      "actual_output_tokens": 166,
+      "e2e_latency_ms": 975.8338890969753,
+      "request_idx": 56,
+      "tpot_ms": 5.79510076027928,
+      "ttft_ms": 19.642263650894165
+    },
+    {
+      "actual_output_tokens": 478,
+      "e2e_latency_ms": 2853.423699736595,
+      "request_idx": 57,
+      "tpot_ms": 5.940440643883351,
+      "ttft_ms": 19.833512604236603
+    },
+    {
+      "actual_output_tokens": 83,
+      "e2e_latency_ms": 508.5412673652172,
+      "request_idx": 58,
+      "tpot_ms": 5.956402548202654,
+      "ttft_ms": 20.116258412599564
+    },
+    {
+      "actual_output_tokens": 111,
+      "e2e_latency_ms": 662.487581372261,
+      "request_idx": 59,
+      "tpot_ms": 5.849613012237983,
+      "ttft_ms": 19.030150026082993
+    },
+    {
+      "actual_output_tokens": 49,
+      "e2e_latency_ms": 310.4012794792652,
+      "request_idx": 60,
+      "tpot_ms": 6.056567964454492,
+      "ttft_ms": 19.6860171854496
+    },
+    {
+      "actual_output_tokens": 670,
+      "e2e_latency_ms": 4011.672303080559,
+      "request_idx": 61,
+      "tpot_ms": 5.969249023895806,
+      "ttft_ms": 18.244706094264984
+    },
+    {
+      "actual_output_tokens": 471,
+      "e2e_latency_ms": 2824.7491233050823,
+      "request_idx": 62,
+      "tpot_ms": 5.971280937182143,
+      "ttft_ms": 18.247082829475403
+    },
+    {
+      "actual_output_tokens": 574,
+      "e2e_latency_ms": 3452.319134026766,
+      "request_idx": 63,
+      "tpot_ms": 5.991559534172737,
+      "ttft_ms": 19.15552094578743
+    },
+    {
+      "actual_output_tokens": 122,
+      "e2e_latency_ms": 724.6138118207455,
+      "request_idx": 64,
+      "tpot_ms": 5.7486521680493,
+      "ttft_ms": 29.026899486780167
+    },
+    {
+      "actual_output_tokens": 32,
+      "e2e_latency_ms": 208.23216438293457,
+      "request_idx": 65,
+      "tpot_ms": 5.745895687610873,
+      "ttft_ms": 30.109398066997528
+    },
+    {
+      "actual_output_tokens": 423,
+      "e2e_latency_ms": 2529.5948684215546,
+      "request_idx": 66,
+      "tpot_ms": 5.927209181808182,
+      "ttft_ms": 28.312593698501587
+    },
+    {
+      "actual_output_tokens": 292,
+      "e2e_latency_ms": 1715.747643262148,
+      "request_idx": 67,
+      "tpot_ms": 5.8216353385514,
+      "ttft_ms": 21.65175974369049
+    },
+    {
+      "actual_output_tokens": 418,
+      "e2e_latency_ms": 2491.682533174753,
+      "request_idx": 68,
+      "tpot_ms": 5.923974723052635,
+      "ttft_ms": 21.3850736618042
+    },
+    {
+      "actual_output_tokens": 142,
+      "e2e_latency_ms": 846.3555611670017,
+      "request_idx": 69,
+      "tpot_ms": 5.877527996157923,
+      "ttft_ms": 17.624113708734512
+    },
+    {
+      "actual_output_tokens": 26,
+      "e2e_latency_ms": 162.94411197304726,
+      "request_idx": 70,
+      "tpot_ms": 5.597934871912003,
+      "ttft_ms": 22.995740175247192
+    },
+    {
+      "actual_output_tokens": 224,
+      "e2e_latency_ms": 1333.6961977183819,
+      "request_idx": 71,
+      "tpot_ms": 5.887533801152568,
+      "ttft_ms": 20.776160061359406
+    },
+    {
+      "actual_output_tokens": 248,
+      "e2e_latency_ms": 1496.4244924485683,
+      "request_idx": 72,
+      "tpot_ms": 5.978796676344235,
+      "ttft_ms": 19.661713391542435
+    },
+    {
+      "actual_output_tokens": 144,
+      "e2e_latency_ms": 869.4297783076763,
+      "request_idx": 73,
+      "tpot_ms": 5.935165900867302,
+      "ttft_ms": 20.701054483652115
+    },
+    {
+      "actual_output_tokens": 42,
+      "e2e_latency_ms": 258.6883492767811,
+      "request_idx": 74,
+      "tpot_ms": 5.792670769662392,
+      "ttft_ms": 21.188847720623016
+    },
+    {
+      "actual_output_tokens": 199,
+      "e2e_latency_ms": 1215.8955372869968,
+      "request_idx": 75,
+      "tpot_ms": 6.047556082708667,
+      "ttft_ms": 18.47943291068077
+    },
+    {
+      "actual_output_tokens": 379,
+      "e2e_latency_ms": 2298.220444470644,
+      "request_idx": 76,
+      "tpot_ms": 6.032840008773501,
+      "ttft_ms": 17.806921154260635
+    },
+    {
+      "actual_output_tokens": 83,
+      "e2e_latency_ms": 515.8678255975246,
+      "request_idx": 77,
+      "tpot_ms": 6.049863130944531,
+      "ttft_ms": 19.77904886007309
+    },
+    {
+      "actual_output_tokens": 33,
+      "e2e_latency_ms": 206.16361498832703,
+      "request_idx": 78,
+      "tpot_ms": 5.707018310204148,
+      "ttft_ms": 23.53902906179428
+    },
+    {
+      "actual_output_tokens": 722,
+      "e2e_latency_ms": 4235.004939138889,
+      "request_idx": 79,
+      "tpot_ms": 5.843124353687244,
+      "ttft_ms": 22.112280130386353
+    },
+    {
+      "actual_output_tokens": 376,
+      "e2e_latency_ms": 2301.0120056569576,
+      "request_idx": 80,
+      "tpot_ms": 6.093216111262639,
+      "ttft_ms": 16.055963933467865
+    },
+    {
+      "actual_output_tokens": 646,
+      "e2e_latency_ms": 3810.942806303501,
+      "request_idx": 81,
+      "tpot_ms": 5.8808477869791576,
+      "ttft_ms": 17.79598370194435
+    },
+    {
+      "actual_output_tokens": 271,
+      "e2e_latency_ms": 1667.8235940635204,
+      "request_idx": 82,
+      "tpot_ms": 6.111178712712394,
+      "ttft_ms": 17.805341631174088
+    },
+    {
+      "actual_output_tokens": 527,
+      "e2e_latency_ms": 3169.1616140305996,
+      "request_idx": 83,
+      "tpot_ms": 5.991193349030534,
+      "ttft_ms": 17.793912440538406
+    },
+    {
+      "actual_output_tokens": 494,
+      "e2e_latency_ms": 2987.0156086981297,
+      "request_idx": 84,
+      "tpot_ms": 6.001120671236975,
+      "ttft_ms": 28.46311777830124
+    },
+    {
+      "actual_output_tokens": 11,
+      "e2e_latency_ms": 86.57525852322578,
+      "request_idx": 85,
+      "tpot_ms": 5.826680734753609,
+      "ttft_ms": 28.308451175689697
+    },
+    {
+      "actual_output_tokens": 196,
+      "e2e_latency_ms": 1202.8906233608723,
+      "request_idx": 86,
+      "tpot_ms": 6.085088944587952,
+      "ttft_ms": 16.29827916622162
+    },
+    {
+      "actual_output_tokens": 15,
+      "e2e_latency_ms": 101.01263225078583,
+      "request_idx": 87,
+      "tpot_ms": 5.7584241564784735,
+      "ttft_ms": 20.394694060087204
+    },
+    {
+      "actual_output_tokens": 450,
+      "e2e_latency_ms": 2708.3720825612545,
+      "request_idx": 88,
+      "tpot_ms": 5.992573750244748,
+      "ttft_ms": 17.70646870136261
+    },
+    {
+      "actual_output_tokens": 772,
+      "e2e_latency_ms": 4414.456203579903,
+      "request_idx": 89,
+      "tpot_ms": 5.698176857021223,
+      "ttft_ms": 21.161846816539764
+    },
+    {
+      "actual_output_tokens": 47,
+      "e2e_latency_ms": 286.93313151597977,
+      "request_idx": 90,
+      "tpot_ms": 5.775016449067904,
+      "ttft_ms": 21.2823748588562
+    },
+    {
+      "actual_output_tokens": 33,
+      "e2e_latency_ms": 202.69599929451942,
+      "request_idx": 91,
+      "tpot_ms": 5.779866594821215,
+      "ttft_ms": 17.740268260240555
+    },
+    {
+      "actual_output_tokens": 271,
+      "e2e_latency_ms": 1666.782420128584,
+      "request_idx": 92,
+      "tpot_ms": 6.112769149519779,
+      "ttft_ms": 16.33474975824356
+    },
+    {
+      "actual_output_tokens": 21,
+      "e2e_latency_ms": 131.07144832611084,
+      "request_idx": 93,
+      "tpot_ms": 5.712573789060116,
+      "ttft_ms": 16.819972544908524
+    },
+    {
+      "actual_output_tokens": 571,
+      "e2e_latency_ms": 3331.4972445368767,
+      "request_idx": 94,
+      "tpot_ms": 5.816675317392015,
+      "ttft_ms": 15.992313623428345
+    },
+    {
+      "actual_output_tokens": 15,
+      "e2e_latency_ms": 118.7785416841507,
+      "request_idx": 95,
+      "tpot_ms": 6.972171100122588,
+      "ttft_ms": 21.168146282434464
+    },
+    {
+      "actual_output_tokens": 133,
+      "e2e_latency_ms": 834.5148153603077,
+      "request_idx": 96,
+      "tpot_ms": 6.206618367948316,
+      "ttft_ms": 15.241190791130066
+    },
+    {
+      "actual_output_tokens": 14,
+      "e2e_latency_ms": 128.4269019961357,
+      "request_idx": 97,
+      "tpot_ms": 6.792486860201909,
+      "ttft_ms": 40.124572813510895
+    },
+    {
+      "actual_output_tokens": 1074,
+      "e2e_latency_ms": 5889.744132757187,
+      "request_idx": 98,
+      "tpot_ms": 5.454134223817778,
+      "ttft_ms": 37.458110600709915
+    },
+    {
+      "actual_output_tokens": 14,
+      "e2e_latency_ms": 124.264445155859,
+      "request_idx": 99,
+      "tpot_ms": 6.360531999514653,
+      "ttft_ms": 41.5775291621685
+    },
+    {
+      "actual_output_tokens": 374,
+      "e2e_latency_ms": 2258.2085728645325,
+      "request_idx": 100,
+      "tpot_ms": 5.947019185761025,
+      "ttft_ms": 39.97041657567024
+    },
+    {
+      "actual_output_tokens": 319,
+      "e2e_latency_ms": 1927.8689995408058,
+      "request_idx": 101,
+      "tpot_ms": 6.004984273850543,
+      "ttft_ms": 18.28400045633316
+    },
+    {
+      "actual_output_tokens": 23,
+      "e2e_latency_ms": 157.41301327943802,
+      "request_idx": 102,
+      "tpot_ms": 6.070289252833886,
+      "ttft_ms": 23.866649717092514
+    },
+    {
+      "actual_output_tokens": 26,
+      "e2e_latency_ms": 169.86792162060738,
+      "request_idx": 103,
+      "tpot_ms": 5.721906423568726,
+      "ttft_ms": 26.820261031389236
+    },
+    {
+      "actual_output_tokens": 324,
+      "e2e_latency_ms": 1935.0006841123104,
+      "request_idx": 104,
+      "tpot_ms": 5.93965670134261,
+      "ttft_ms": 16.491569578647614
+    },
+    {
+      "actual_output_tokens": 287,
+      "e2e_latency_ms": 1726.4256849884987,
+      "request_idx": 105,
+      "tpot_ms": 5.9828457741679015,
+      "ttft_ms": 15.331793576478958
+    },
+    {
+      "actual_output_tokens": 185,
+      "e2e_latency_ms": 1129.4514276087284,
+      "request_idx": 106,
+      "tpot_ms": 6.050608849719814,
+      "ttft_ms": 16.139399260282516
+    },
+    {
+      "actual_output_tokens": 203,
+      "e2e_latency_ms": 1236.1354194581509,
+      "request_idx": 107,
+      "tpot_ms": 6.026623457080067,
+      "ttft_ms": 18.75748112797737
+    },
+    {
+      "actual_output_tokens": 7,
+      "e2e_latency_ms": 69.52338293194771,
+      "request_idx": 108,
+      "tpot_ms": 5.892171834905942,
+      "ttft_ms": 34.170351922512054
+    },
+    {
+      "actual_output_tokens": 61,
+      "e2e_latency_ms": 390.0537118315697,
+      "request_idx": 109,
+      "tpot_ms": 6.014525641997655,
+      "ttft_ms": 29.182173311710358
+    },
+    {
+      "actual_output_tokens": 18,
+      "e2e_latency_ms": 117.48001351952553,
+      "request_idx": 110,
+      "tpot_ms": 5.726301494766684,
+      "ttft_ms": 20.132888108491898
+    },
+    {
+      "actual_output_tokens": 477,
+      "e2e_latency_ms": 2740.465607494116,
+      "request_idx": 111,
+      "tpot_ms": 5.715307302209509,
+      "ttft_ms": 19.979331642389297
+    },
+    {
+      "actual_output_tokens": 642,
+      "e2e_latency_ms": 3579.463817179203,
+      "request_idx": 112,
+      "tpot_ms": 5.553720388183728,
+      "ttft_ms": 19.52904835343361
+    },
+    {
+      "actual_output_tokens": 5,
+      "e2e_latency_ms": 54.051607847213745,
+      "request_idx": 113,
+      "tpot_ms": 5.71981817483902,
+      "ttft_ms": 31.172335147857666
+    },
+    {
+      "actual_output_tokens": 15,
+      "e2e_latency_ms": 104.3982058763504,
+      "request_idx": 114,
+      "tpot_ms": 5.59055432677269,
+      "ttft_ms": 26.130445301532745
+    },
+    {
+      "actual_output_tokens": 12,
+      "e2e_latency_ms": 84.51711758971214,
+      "request_idx": 115,
+      "tpot_ms": 5.625014278021726,
+      "ttft_ms": 22.64196053147316
+    },
+    {
+      "actual_output_tokens": 299,
+      "e2e_latency_ms": 1727.5758273899555,
+      "request_idx": 116,
+      "tpot_ms": 5.74530151066364,
+      "ttft_ms": 15.475977212190628
+    },
+    {
+      "actual_output_tokens": 154,
+      "e2e_latency_ms": 938.2742457091808,
+      "request_idx": 117,
+      "tpot_ms": 5.968575018878076,
+      "ttft_ms": 25.082267820835114
+    },
+    {
+      "actual_output_tokens": 139,
+      "e2e_latency_ms": 843.4464484453201,
+      "request_idx": 118,
+      "tpot_ms": 5.994540301785952,
+      "ttft_ms": 16.199886798858643
+    },
+    {
+      "actual_output_tokens": 11,
+      "e2e_latency_ms": 89.17996287345886,
+      "request_idx": 119,
+      "tpot_ms": 5.6590404361486435,
+      "ttft_ms": 32.58955851197243
+    },
+    {
+      "actual_output_tokens": 96,
+      "e2e_latency_ms": 590.7653644680977,
+      "request_idx": 120,
+      "tpot_ms": 5.874495874894293,
+      "ttft_ms": 32.68825635313988
+    },
+    {
+      "actual_output_tokens": 127,
+      "e2e_latency_ms": 750.9186305105686,
+      "request_idx": 121,
+      "tpot_ms": 5.793043988801185,
+      "ttft_ms": 20.995087921619415
+    },
+    {
+      "actual_output_tokens": 631,
+      "e2e_latency_ms": 3384.0318135917187,
+      "request_idx": 122,
+      "tpot_ms": 5.335645655554438,
+      "ttft_ms": 22.575050592422485
+    },
+    {
+      "actual_output_tokens": 272,
+      "e2e_latency_ms": 1526.2560807168484,
+      "request_idx": 123,
+      "tpot_ms": 5.559070138913679,
+      "ttft_ms": 19.74807307124138
+    },
+    {
+      "actual_output_tokens": 198,
+      "e2e_latency_ms": 1130.5234767496586,
+      "request_idx": 124,
+      "tpot_ms": 5.662402487950882,
+      "ttft_ms": 15.030186623334885
+    },
+    {
+      "actual_output_tokens": 143,
+      "e2e_latency_ms": 832.973062992096,
+      "request_idx": 125,
+      "tpot_ms": 5.724808227428249,
+      "ttft_ms": 20.0502946972847
+    },
+    {
+      "actual_output_tokens": 65,
+      "e2e_latency_ms": 395.4407013952732,
+      "request_idx": 126,
+      "tpot_ms": 5.923150107264519,
+      "ttft_ms": 16.35909453034401
+    },
+    {
+      "actual_output_tokens": 291,
+      "e2e_latency_ms": 1614.3185980618,
+      "request_idx": 127,
+      "tpot_ms": 5.450165528675606,
+      "ttft_ms": 33.770594745874405
+    }
+  ],
+  "requests_sha256": "aefc90b259581b642ef1ff8f692c0dae11e6c82dd2f394b12bff7585771d7cc8",
+  "schema_version": 5,
+  "summary": {
+    "output_token_throughput_per_s": 2633.2449313400302,
+    "request_count": 128,
+    "request_throughput_per_s": 11.061875655120573,
+    "total_token_throughput_per_s": 5066.771154563001
+  }
+}

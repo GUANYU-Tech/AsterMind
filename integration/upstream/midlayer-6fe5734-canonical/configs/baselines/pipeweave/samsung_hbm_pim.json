@@ -1,0 +1,20 @@
+{
+    "name": "HBM-PIM (Samsung)",
+    "totalGlobalMem": 17179869184,
+    "computeMajor": 8,
+    "computeMinor": 0,
+    "numSms": 512,
+    "memBandwidth": 2048,
+    "l1CacheSize": 64,
+    "sharedMemorySize": 64,
+    "l2CacheSize": 8192,
+    "registerFileSize": 128,
+    "l2CacheBandwidth": 1500,
+    "sharedMemoryBandwidth": 256,
+    "tcBf16": 6.4,
+    "tcFp8": 0,
+    "xuFp32": 2,
+    "FmaFp32": 4,
+    "smFreq": 1000,
+    "architecture": "pim"
+}

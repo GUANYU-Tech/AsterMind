@@ -1,0 +1,24 @@
+# Archived GEMM problem template for Timeloop. M/K/N are substituted at runtime by
+# build_ucb_gemmini_dataset.py ({{M}}/{{K}}/{{N}} placeholders).
+problem:
+  shape:
+    name: gemm
+    dimensions: [M, N, K]
+    data_spaces:
+      - name: Inputs
+        projection:
+          - [ [M] ]
+          - [ [K] ]
+      - name: Weights
+        projection:
+          - [ [N] ]
+          - [ [K] ]
+      - name: Outputs
+        projection:
+          - [ [M] ]
+          - [ [N] ]
+        read_write: True
+  instance:
+    M: {{M}}
+    K: {{K}}
+    N: {{N}}
