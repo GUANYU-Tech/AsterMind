@@ -1,0 +1,3 @@
+[submodule "integration/upstream/midlayer-6fe5734-canonical"]
+	path = integration/upstream/midlayer-6fe5734-canonical
+	url = https://github.com/Popuffu/midlayer_hw_model.git

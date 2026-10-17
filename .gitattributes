@@ -4,3 +4,9 @@
 src/workloads/**/*.json   text eol=lf
 src/workloads/**/*.jsonl  text eol=lf
 src/workloads/**/*.csv    text eol=lf
+
+# Orbit frame transformations verify these bundled reference bytes by SHA-256.
+src/orbitserve/orbit/data/iers/** -text
+
+# Preserve whitespace markers in the recorded upstream patch.
+network_sim/docs/vendor_changes.patch -whitespace

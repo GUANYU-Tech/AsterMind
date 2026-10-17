@@ -1,0 +1,233 @@
+--- astermind/third_party/flowsim/include/flowsim/flowsim.hh
++++ network_sim/_vendor/flowsim/include/flowsim/flowsim.hh
+@@ -20,6 +20,7 @@
+   double bandwidth_gbps;
+   long double capacity_bytes_per_ns;
+   std::uint64_t latency_ns;
++  bool enabled = true;
+ };
+ 
+ struct Route {
+@@ -38,6 +39,7 @@
+                 bool bidirectional = true);
+ 
+   bool has_node(const std::string &node_id) const;
++  void set_link_enabled(const std::string &source, const std::string &target, bool enabled);
+   Route shortest_latency_route(const std::string &source,
+                                const std::string &target) const;
+   Route ecmp_latency_route(const std::string &source,
+@@ -99,6 +101,21 @@
+   std::vector<LinkResult> links;
+ };
+ 
++// Adapter extension: inspect a running flow without forcing batch completion.
++struct FlowProgress {
++  std::string id;
++  long double remaining_bytes;
++  long double rate_bytes_per_ns;
++  bool transmitting;
++  bool completed;
++  long double transmission_end_time_ns;
++  long double completion_time_ns;
++  bool failed;
++  long double failure_time_ns;
++  std::string failure_reason;
++  std::vector<std::string> path;
++};
++
+ class Simulator {
+ public:
+   explicit Simulator(Topology topology);
+@@ -130,6 +147,11 @@
+   long double now_ns() const;
+   bool has_pending_work() const;
+   SimulationReport report() const;
++  void advance_until(long double absolute_time_ns);
++  long double next_event_time_ns();
++  std::vector<FlowProgress> progress();
++  SimulationReport completed_report() const;
++  void set_link_enabled(const std::string &source, const std::string &target, bool enabled);
+ 
+ private:
+   class Impl;
+--- astermind/third_party/flowsim/src/topology.cc
++++ network_sim/_vendor/flowsim/src/topology.cc
+@@ -141,6 +141,16 @@
+   return nodes_.find(node_id) != nodes_.end();
+ }
+ 
++void Topology::set_link_enabled(const std::string &source, const std::string &target, bool enabled) {
++  for (auto &link : links_) {
++    if (link.source == source && link.target == target) {
++      link.enabled = enabled;
++      return;
++    }
++  }
++  throw std::invalid_argument("unknown directed link");
++}
++
+ Route Topology::shortest_latency_route(const std::string &source,
+                                        const std::string &target) const {
+   if (!has_node(source)) {
+@@ -180,6 +190,12 @@
+ 
+     for (const auto link_index : adjacency_.at(state.node)) {
+       const auto &link = links_[link_index];
++      if (!link.enabled) continue;
++      // Adapter gate edges have zero latency. Reject cycles in tie paths.
++      if (std::find(state.path.begin(), state.path.end(), link.target) !=
++          state.path.end()) {
++        continue;
++      }
+       if (link.latency_ns > infinity - state.latency) {
+         throw std::overflow_error("route latency overflow");
+       }
+@@ -254,6 +270,7 @@
+     }
+     for (const auto link_index : reverse_adjacency_.at(state.node)) {
+       const auto &link = links_[link_index];
++      if (!link.enabled) continue;
+       if (link.latency_ns > infinity - state.latency) {
+         throw std::overflow_error("route latency overflow");
+       }
+@@ -280,6 +297,7 @@
+     std::vector<std::size_t> candidates;
+     for (const auto link_index : adjacency_.at(current)) {
+       const auto &link = links_[link_index];
++      if (!link.enabled) continue;
+       const auto next_distance = distances[link.target];
+       if (next_distance == infinity || link.latency_ns > infinity - next_distance ||
+           link.latency_ns + next_distance != distances[current] ||
+--- astermind/third_party/flowsim/src/event_simulator.cc
++++ network_sim/_vendor/flowsim/src/event_simulator.cc
+@@ -79,7 +79,8 @@
+           "flow completion callback must not be empty");
+     }
+ 
+-    auto route = topology_.ecmp_latency_route(source, target, id);
++    // First-stage adapter policy: deterministic shortest-latency route.
++    auto route = topology_.shortest_latency_route(source, target);
+     const auto start_time = event_ceil_time_ns(current_time_);
+     FlowRequest request{id, source, target, size_bytes, start_time,
+                         is_control};
+@@ -182,9 +183,9 @@
+     return !active_.empty() || !events_.empty();
+   }
+ 
+-  SimulationReport report() const {
++  SimulationReport report(bool completed_only = false) const {
+     for (const auto &flow : flows_) {
+-      if (!flow.completed) {
++      if (!flow.completed && !flow.failed && !completed_only) {
+         throw std::logic_error(
+             "cannot create a report while a flow is unfinished");
+       }
+@@ -194,6 +195,9 @@
+     output.end_time_ns = event_ceil_time_ns(current_time_);
+     output.flows.reserve(flows_.size());
+     for (const auto &flow : flows_) {
++      if (!flow.completed) {
++        continue;
++      }
+       const auto transmission_end =
+           event_ceil_time_ns(flow.transmission_end_time);
+       const auto completion = event_ceil_time_ns(flow.completion_time);
+@@ -229,6 +233,66 @@
+     return output;
+   }
+ 
++  void advance_until(const long double absolute_time_ns) {
++    if (!std::isfinite(absolute_time_ns) || absolute_time_ns < current_time_) {
++      throw std::invalid_argument("advance time must be finite and not in the past");
++    }
++    // Stop at an external clock boundary, preserving all in-flight state.
++    schedule(absolute_time_ns - current_time_, [this]() { stop(); });
++    stop_requested_ = false;
++    run();
++    stop_requested_ = false;
++  }
++
++  long double next_event_time_ns() {
++    recompute_rates_if_needed();
++    auto result = events_.empty() ? std::numeric_limits<long double>::infinity()
++                                 : events_.top().time;
++    for (const auto index : active_) {
++      const auto &flow = flows_[index];
++      result = std::min(result, current_time_ + flow.remaining_bytes /
++                                        flow.rate_bytes_per_ns);
++    }
++    return result;
++  }
++
++  std::vector<FlowProgress> progress() {
++    recompute_rates_if_needed();
++    std::vector<FlowProgress> output;
++    for (const auto &flow : flows_) {
++      output.push_back({flow.request.id, flow.remaining_bytes,
++                        flow.transmitting ? flow.rate_bytes_per_ns : 0.0L,
++                        flow.transmitting, flow.completed,
++                        flow.transmission_end_time, flow.completion_time,
++                        flow.failed, flow.failure_time, flow.failure_reason, flow.route.nodes});
++    }
++    return output;
++  }
++
++  // Adapter extension: stop affected flows before allocating the next interval.
++  // Even propagation-phase flows fail conservatively; no acknowledgement model.
++  void set_link_enabled(const std::string &source, const std::string &target, bool enabled) {
++    topology_.set_link_enabled(source, target, enabled);
++    if (enabled) return;
++    for (auto &flow : flows_) {
++      if (flow.completed || flow.failed) continue;
++      for (const auto index : flow.route.link_indices) {
++        const auto &link = topology_.links()[index];
++        if (link.source != source || link.target != target) continue;
++        flow.failed = true;
++        flow.failure_time = current_time_;
++        flow.failure_reason = "link_down";
++        flow.transmitting = false;
++        flow.rate_bytes_per_ns = 0;
++        ++progress_revision_;
++        break;
++      }
++    }
++    active_.erase(std::remove_if(active_.begin(), active_.end(),
++                                [&](auto index) { return flows_[index].failed; }), active_.end());
++    rates_dirty_ = true;
++  }
++
+ private:
+   struct FlowRuntime {
+     FlowRequest request;
+@@ -240,6 +304,9 @@
+     bool transmitting;
+     bool completed;
+     Callback completion_callback;
++    bool failed = false;
++    long double failure_time = 0;
++    std::string failure_reason;
+   };
+ 
+   struct ScheduledEvent {
+@@ -307,7 +374,7 @@
+ 
+   void complete_delivery(const std::size_t flow_index) {
+     auto &flow = flows_.at(flow_index);
+-    if (flow.completed) {
++    if (flow.completed || flow.failed) {
+       return;
+     }
+     flow.completed = true;
+@@ -468,5 +535,12 @@
+   return impl_->has_pending_work();
+ }
+ SimulationReport EventSimulator::report() const { return impl_->report(); }
++void EventSimulator::advance_until(long double time) { impl_->advance_until(time); }
++long double EventSimulator::next_event_time_ns() { return impl_->next_event_time_ns(); }
++std::vector<FlowProgress> EventSimulator::progress() { return impl_->progress(); }
++SimulationReport EventSimulator::completed_report() const { return impl_->report(true); }
++void EventSimulator::set_link_enabled(const std::string &source, const std::string &target, bool enabled) {
++  impl_->set_link_enabled(source, target, enabled);
++}
+ 
+ } // namespace flowsim

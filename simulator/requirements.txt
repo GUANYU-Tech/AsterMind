@@ -1,0 +1,10 @@
+# Additions to the existing isolated Scheduler/M-L environment.
+pydantic==2.13.5
+numpy==2.2.6
+sympy==1.14.0
+networkx==3.6.1
+pandas==2.3.3
+graphviz==0.21
+tqdm==4.70.1
+sgp4==2.27
+astropy==6.1.3

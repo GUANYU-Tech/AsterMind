@@ -1,0 +1,355 @@
+{
+  "physical": {
+    "cells": [
+      {
+        "id": "ground-resources",
+        "satellites": [
+          "ground"
+        ]
+      },
+      {
+        "id": "cell0",
+        "satellites": [
+          "sat0"
+        ]
+      },
+      {
+        "id": "cell1",
+        "satellites": [
+          "sat1"
+        ]
+      },
+      {
+        "id": "cell2",
+        "satellites": [
+          "sat2"
+        ]
+      },
+      {
+        "id": "cell3",
+        "satellites": [
+          "sat3"
+        ]
+      }
+    ],
+    "satellites": [
+      {
+        "id": "ground"
+      },
+      {
+        "id": "sat0"
+      },
+      {
+        "id": "sat1"
+      },
+      {
+        "id": "sat2"
+      },
+      {
+        "id": "sat3"
+      }
+    ],
+    "devices": [
+      {
+        "id": "user",
+        "satellite": "ground",
+        "kind": "terminal",
+        "external_access": true,
+        "capacity_gbps": 1,
+        "max_external_links": 4
+      },
+      {
+        "id": "gpu0",
+        "satellite": "sat0",
+        "kind": "gpu"
+      },
+      {
+        "id": "exit0",
+        "satellite": "sat0",
+        "kind": "terminal",
+        "external_access": true
+      },
+      {
+        "id": "gpu1",
+        "satellite": "sat1",
+        "kind": "gpu"
+      },
+      {
+        "id": "exit1",
+        "satellite": "sat1",
+        "kind": "terminal",
+        "external_access": true
+      },
+      {
+        "id": "gpu2",
+        "satellite": "sat2",
+        "kind": "gpu"
+      },
+      {
+        "id": "exit2",
+        "satellite": "sat2",
+        "kind": "terminal",
+        "external_access": true
+      },
+      {
+        "id": "gpu3",
+        "satellite": "sat3",
+        "kind": "gpu"
+      },
+      {
+        "id": "exit3",
+        "satellite": "sat3",
+        "kind": "terminal",
+        "external_access": true
+      }
+    ],
+    "links": [
+      {
+        "id": "local0",
+        "source": "gpu0",
+        "target": "exit0",
+        "bandwidth_gbps": 8
+      },
+      {
+        "id": "ground0",
+        "source": "user",
+        "target": "exit0",
+        "bandwidth_gbps": 1,
+        "latency_ns": 10000
+      },
+      {
+        "id": "local1",
+        "source": "gpu1",
+        "target": "exit1",
+        "bandwidth_gbps": 8
+      },
+      {
+        "id": "ground1",
+        "source": "user",
+        "target": "exit1",
+        "bandwidth_gbps": 1,
+        "latency_ns": 10000
+      },
+      {
+        "id": "local2",
+        "source": "gpu2",
+        "target": "exit2",
+        "bandwidth_gbps": 8
+      },
+      {
+        "id": "ground2",
+        "source": "user",
+        "target": "exit2",
+        "bandwidth_gbps": 1,
+        "latency_ns": 10000
+      },
+      {
+        "id": "local3",
+        "source": "gpu3",
+        "target": "exit3",
+        "bandwidth_gbps": 8
+      },
+      {
+        "id": "ground3",
+        "source": "user",
+        "target": "exit3",
+        "bandwidth_gbps": 1,
+        "latency_ns": 10000
+      }
+    ]
+  },
+  "ground_owners": [
+    "ground"
+  ],
+  "satellite_roles": {
+    "sat0": "mixed",
+    "sat1": "mixed",
+    "sat2": "mixed",
+    "sat3": "mixed"
+  },
+  "cells": [
+    {
+      "id": "cell0",
+      "placements": [
+        {
+          "rank": 0,
+          "device": "gpu0"
+        }
+      ],
+      "ingress_device": "gpu0",
+      "output_device": "gpu0",
+      "external_terminals": [
+        "exit0"
+      ],
+      "max_batched_tokens": 32
+    },
+    {
+      "id": "cell1",
+      "placements": [
+        {
+          "rank": 0,
+          "device": "gpu1"
+        }
+      ],
+      "ingress_device": "gpu1",
+      "output_device": "gpu1",
+      "external_terminals": [
+        "exit1"
+      ],
+      "max_batched_tokens": 32
+    },
+    {
+      "id": "cell2",
+      "placements": [
+        {
+          "rank": 0,
+          "device": "gpu2"
+        }
+      ],
+      "ingress_device": "gpu2",
+      "output_device": "gpu2",
+      "external_terminals": [
+        "exit2"
+      ],
+      "max_batched_tokens": 32
+    },
+    {
+      "id": "cell3",
+      "placements": [
+        {
+          "rank": 0,
+          "device": "gpu3"
+        }
+      ],
+      "ingress_device": "gpu3",
+      "output_device": "gpu3",
+      "external_terminals": [
+        "exit3"
+      ],
+      "max_batched_tokens": 32
+    }
+  ],
+  "requests": [
+    {
+      "id": "r0_0",
+      "cell": "cell0",
+      "arrival_ns": 0,
+      "user_device": "user",
+      "input_tokens": 16,
+      "output_tokens": 4,
+      "input_bytes": 250000,
+      "output_bytes_per_token": 10000
+    },
+    {
+      "id": "r1_0",
+      "cell": "cell1",
+      "arrival_ns": 3000000,
+      "user_device": "user",
+      "input_tokens": 16,
+      "output_tokens": 4,
+      "input_bytes": 250000,
+      "output_bytes_per_token": 10000
+    },
+    {
+      "id": "r2_0",
+      "cell": "cell2",
+      "arrival_ns": 6000000,
+      "user_device": "user",
+      "input_tokens": 16,
+      "output_tokens": 4,
+      "input_bytes": 250000,
+      "output_bytes_per_token": 10000
+    },
+    {
+      "id": "r3_0",
+      "cell": "cell3",
+      "arrival_ns": 9000000,
+      "user_device": "user",
+      "input_tokens": 16,
+      "output_tokens": 4,
+      "input_bytes": 250000,
+      "output_bytes_per_token": 10000
+    },
+    {
+      "id": "r0_1",
+      "cell": "cell0",
+      "arrival_ns": 12000000,
+      "user_device": "user",
+      "input_tokens": 32,
+      "output_tokens": 4,
+      "input_bytes": 250000,
+      "output_bytes_per_token": 10000
+    },
+    {
+      "id": "r1_1",
+      "cell": "cell1",
+      "arrival_ns": 15000000,
+      "user_device": "user",
+      "input_tokens": 32,
+      "output_tokens": 4,
+      "input_bytes": 250000,
+      "output_bytes_per_token": 10000
+    },
+    {
+      "id": "r2_1",
+      "cell": "cell2",
+      "arrival_ns": 18000000,
+      "user_device": "user",
+      "input_tokens": 32,
+      "output_tokens": 4,
+      "input_bytes": 250000,
+      "output_bytes_per_token": 10000
+    },
+    {
+      "id": "r3_1",
+      "cell": "cell3",
+      "arrival_ns": 21000000,
+      "user_device": "user",
+      "input_tokens": 32,
+      "output_tokens": 4,
+      "input_bytes": 250000,
+      "output_bytes_per_token": 10000
+    },
+    {
+      "id": "r0_2",
+      "cell": "cell0",
+      "arrival_ns": 24000000,
+      "user_device": "user",
+      "input_tokens": 16,
+      "output_tokens": 4,
+      "input_bytes": 250000,
+      "output_bytes_per_token": 10000
+    },
+    {
+      "id": "r1_2",
+      "cell": "cell1",
+      "arrival_ns": 27000000,
+      "user_device": "user",
+      "input_tokens": 16,
+      "output_tokens": 4,
+      "input_bytes": 250000,
+      "output_bytes_per_token": 10000
+    },
+    {
+      "id": "r2_2",
+      "cell": "cell2",
+      "arrival_ns": 30000000,
+      "user_device": "user",
+      "input_tokens": 16,
+      "output_tokens": 4,
+      "input_bytes": 250000,
+      "output_bytes_per_token": 10000
+    },
+    {
+      "id": "r3_2",
+      "cell": "cell3",
+      "arrival_ns": 33000000,
+      "user_device": "user",
+      "input_tokens": 16,
+      "output_tokens": 4,
+      "input_bytes": 250000,
+      "output_bytes_per_token": 10000
+    }
+  ],
+  "horizon_ns": 1000000000
+}

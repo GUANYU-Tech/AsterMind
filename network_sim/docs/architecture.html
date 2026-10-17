@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>拓扑与通信：三层架构图</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f4f6fa;color:#23304a;font-family:"Microsoft YaHei",system-ui,sans-serif}
+main{max-width:1150px;margin:30px auto;padding:0 24px}h1{font-size:28px;margin:0 0 10px}.intro{color:#58657b;line-height:1.8;margin:0 0 20px}
+nav{display:flex;gap:10px;margin-bottom:18px;flex-wrap:wrap}button{font:inherit;cursor:pointer;border:1px solid #ccd4e3;border-radius:9px;background:white;color:#38455d;padding:11px 20px}button[aria-selected=true]{background:#274a9d;color:white;border-color:#274a9d}
+.panel{background:white;border:1px solid #e0e5ef;border-radius:16px;padding:22px;box-shadow:0 5px 20px #23304a08}.panel[hidden]{display:none}h2{font-size:20px;margin:0 0 12px}.note{line-height:1.85;margin:14px 0 0;background:#f4f7fc;border-radius:8px;padding:14px 18px;font-size:14px}.legend{font-size:13px;color:#617088;margin:12px 0 0}
+svg{display:block;width:100%;height:auto}svg text{font-family:"Microsoft YaHei",system-ui,sans-serif;fill:#23304a;font-size:16px}.small{font-size:13px;fill:#65738a}.title{font-weight:600}.line{stroke:#8494ae;stroke-width:2;fill:none;marker-end:url(#arrow)}.box{fill:#f7f9fd;stroke:#cad4e5;stroke-width:1.5}.blue{fill:#eaf0ff;stroke:#6584c5}.green{fill:#eaf6f1;stroke:#6ba98e}.orange{fill:#fff4e6;stroke:#d7a452}.dashed{stroke-dasharray:6 4}.pill{fill:#edf1f8;stroke:#a8b7d0}.flow0{stroke:#3467ce;stroke-width:3;fill:none}.flow1{stroke:#bd7a29;stroke-width:3;fill:none}
+footer{font-size:13px;color:#65738a;line-height:1.8;margin:18px 0}code{font-family:Consolas,monospace}
+</style>
+<main>
+<h1>拓扑与通信：从职责到设备，再到共享</h1>
+<p class="intro">静态拓扑与动态建链已经实现。计算侧提交传输任务；网络在实际设备图上执行，返回成功／失败事件。三类输入使用同一个运行时。</p>
+<nav aria-label="架构视图"><button aria-selected="true" data-panel="framework">① 框架与代码</button><button aria-selected="false" data-panel="devices">② Cell 与设备</button><button aria-selected="false" data-panel="sharing">③ 共享瓶颈</button><button aria-selected="false" data-panel="links">④ 动态建链</button></nav>
+<section class="panel" id="framework">
+<h2>① 外部只需要任务接口与终态事件</h2>
+<svg viewBox="0 0 1000 525" role="img" aria-label="三个输入方通过任务接口进入通信模块，通信模块查询拓扑并使用FlowSim，输出完成事件">
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10" fill="#8494ae"/></marker></defs>
+<rect class="box" x="25" y="15" width="290" height="90" rx="12"/><text class="title" x="170" y="48" text-anchor="middle">多 GPU 操作层</text><text class="small" x="170" y="76" text-anchor="middle">并行组、rank 部署、通信步骤</text>
+<rect class="box" x="355" y="15" width="290" height="90" rx="12"/><text class="title" x="500" y="48" text-anchor="middle">OrbitServe</text><text class="small" x="500" y="76" text-anchor="middle">KV 迁移、请求转发、输出</text>
+<rect class="box" x="685" y="15" width="290" height="90" rx="12"/><text class="title" x="830" y="48" text-anchor="middle">Mid-Layer</text><text class="small" x="830" y="76" text-anchor="middle">仅跨设备传输；本地计算访存保留</text>
+<path class="line dashed" d="M170 105V135H390V155"/><path class="line dashed" d="M500 105V155"/><path class="line dashed" d="M830 105V135H610V155"/>
+<rect class="box blue" x="325" y="155" width="350" height="75" rx="12"/><text class="title" x="500" y="183" text-anchor="middle">TransferRequest · model.py</text><text class="small" x="500" y="210" text-anchor="middle">起点、终点、字节数、就绪时间、来源</text>
+<path class="line" d="M500 230V270"/>
+<rect class="box green" x="325" y="270" width="350" height="95" rx="12"/><text class="title" x="500" y="301" text-anchor="middle">通信执行 · runtime.py</text><text class="small" x="500" y="328" text-anchor="middle">提交 / next_event / advance_to / 查询</text><text class="small" x="500" y="350" text-anchor="middle">内部：native/bridge.cc → FlowSim</text>
+<rect class="box blue" x="25" y="270" width="250" height="95" rx="12"/><text class="title" x="150" y="302" text-anchor="middle">物理拓扑 · topology.py</text><text class="small" x="150" y="330" text-anchor="middle">设备、连接、可用状态、容量</text><text class="small" x="150" y="352" text-anchor="middle">Switch 容量转换为共享通路</text><path class="line" d="M275 318H325"/>
+<rect class="box orange" x="725" y="270" width="250" height="95" rx="12"/><text class="title" x="850" y="302" text-anchor="middle">全局事件时钟</text><text class="small" x="850" y="330" text-anchor="middle">接口已支持，O-S 尚未接入</text><text class="small" x="850" y="352" text-anchor="middle">动态 run() 需设置截止时间</text><path class="line dashed" d="M725 318H675"/>
+<path class="line" d="M500 365V405"/><rect class="box green" x="325" y="405" width="350" height="75" rx="12"/><text class="title" x="500" y="433" text-anchor="middle">成功 / 失败 · model.py</text><text class="small" x="500" y="460" text-anchor="middle">来源、关联编号、完成时刻、实际路径</text>
+<text class="small" x="500" y="510" text-anchor="middle">上层收到事件，再推进依赖计算或提交 KV 状态。</text>
+</svg>
+<p class="note">实线表示已实现模块之间的连接；虚线表示上层未来接入。通信模块不推断专家路由、不展开集合通信，也不管理 HBM 中 KV 的归属。</p>
+</section>
+<section class="panel" id="devices" hidden>
+<h2>② 同一个 Cell：两颗星、独立设备、多终端</h2>
+<svg viewBox="0 0 1000 440" role="img" aria-label="最小公开示例两星拓扑：星A的两个GPU通过同一个Switch和两个终端分别连接星B两个GPU">
+<rect x="15" y="15" width="970" height="410" rx="15" fill="#f7f9fd" stroke="#b9c7df"/><text class="title" x="40" y="48">Cell 0 · 成员关系不等于传输连接</text>
+<rect x="35" y="70" width="450" height="320" rx="12" fill="white" stroke="#c7d4e8"/><text class="title" x="55" y="101">卫星 A</text>
+<rect x="590" y="70" width="365" height="320" rx="12" fill="white" stroke="#c7d4e8"/><text class="title" x="610" y="101">卫星 B</text>
+<rect class="box blue" x="65" y="145" width="100" height="55" rx="8"/><text x="115" y="178" text-anchor="middle">gpu0</text>
+<rect class="box blue" x="65" y="265" width="100" height="55" rx="8"/><text x="115" y="298" text-anchor="middle">gpu1</text>
+<rect class="box orange" x="205" y="198" width="130" height="72" rx="8"/><text class="title" x="270" y="226" text-anchor="middle">switchA</text><text class="small" x="270" y="251" text-anchor="middle">总容量 8 Gbps</text>
+<rect class="box green" x="375" y="145" width="90" height="55" rx="8"/><text x="420" y="178" text-anchor="middle">termA0</text>
+<rect class="box green" x="375" y="265" width="90" height="55" rx="8"/><text x="420" y="298" text-anchor="middle">termA1</text>
+<rect class="box green" x="610" y="145" width="100" height="55" rx="8"/><text x="660" y="178" text-anchor="middle">termB0</text>
+<rect class="box green" x="610" y="265" width="100" height="55" rx="8"/><text x="660" y="298" text-anchor="middle">termB1</text>
+<rect class="box blue" x="810" y="145" width="100" height="55" rx="8"/><text x="860" y="178" text-anchor="middle">gpu2</text>
+<rect class="box blue" x="810" y="265" width="100" height="55" rx="8"/><text x="860" y="298" text-anchor="middle">gpu3</text>
+<path class="flow0" d="M165 173L205 218M335 218L375 173M465 173H610M710 173H810"/>
+<path class="flow1" d="M165 293L205 250M335 250L375 293M465 293H610M710 293H810"/>
+<text class="small" x="535" y="155" text-anchor="middle">8 Gbps</text><text class="small" x="535" y="275" text-anchor="middle">8 Gbps</text>
+<text class="small" x="260" y="355" text-anchor="middle">星内各连接 16 Gbps；每个终端有独立编号</text>
+<text class="small" x="775" y="355" text-anchor="middle">终端到 GPU 使用等效接入通路</text>
+</svg>
+<p class="note">蓝色路径为 gpu0 → gpu2，橙色路径为 gpu1 → gpu3。两条路径使用不同星间链路，但共同经过 switchA。自由配置可以加入更多 Switch、纯通信星或跨 Cell 出口；这里只展示最小公开示例。</p>
+</section>
+<section class="panel" id="sharing" hidden>
+<h2>③ 不同终端也可能竞争同一份容量</h2>
+<svg viewBox="0 0 1000 350" role="img" aria-label="交换机入口与出口之间的8Gbps共享通路，两笔流各获得4Gbps">
+<rect class="box blue" x="30" y="65" width="160" height="65" rx="10"/><text x="110" y="103" text-anchor="middle">流量 0 · 1 MB</text>
+<rect class="box orange" x="30" y="220" width="160" height="65" rx="10"/><text x="110" y="258" text-anchor="middle">流量 1 · 1 MB</text>
+<rect class="box" x="260" y="140" width="150" height="70" rx="10"/><text x="335" y="181" text-anchor="middle">Switch 入口</text>
+<rect class="box" x="630" y="140" width="150" height="70" rx="10"/><text x="705" y="181" text-anchor="middle">Switch 出口</text>
+<path class="flow0" d="M190 98L260 155M780 155L850 98"/><path class="flow1" d="M190 253L260 195M780 195L850 253"/>
+<path d="M410 175H630" stroke="#647d9f" stroke-width="8"/><text class="title" x="520" y="133" text-anchor="middle">共享通路：8 Gbps</text><text class="small" x="520" y="221" text-anchor="middle">FlowSim 分配：每笔 4 Gbps</text>
+<rect class="box green" x="850" y="65" width="120" height="65" rx="10"/><text x="910" y="103" text-anchor="middle">终端 0</text>
+<rect class="box green" x="850" y="220" width="120" height="65" rx="10"/><text x="910" y="258" text-anchor="middle">终端 1</text>
+<text class="small" x="500" y="320" text-anchor="middle">内部通路只用于执行容量约束，对外查询仍显示一个 Switch。</text>
+</svg>
+<p class="note"><strong>基本示例结果：</strong>单笔执行约 1 ms；两笔并发各约 2 ms，再加各自路径 103 ns 的延迟。若移除 Switch 总容量，两笔走独立链路时不会相互限速。新任务加入和旧任务结束都触发带宽重新分配。</p>
+<p class="legend">参考机制是 max-min 公平共享；这些参数是合成示例。已支持窗口断链失败；协议、换路和重传尚未模拟。</p>
+</section>
+<section class="panel" id="links" hidden><h2>④ 保持旧链与捕获计时</h2><img src="link_policy.png" alt="动态建链与传输事件" style="width:100%;height:auto"><p class="note">simple_keep 保持仍可用的旧链，给空闲终端选伙伴；os_reference 复用 O-S 原连接选择。捕获占名额，尚不能传输。已知失效立即反馈失败，续传尚未实现。</p></section>
+<footer>代码阅读顺序：model.py → topology.py → runtime.py → native/bridge.cc → AsterMind FlowSim。<br>框架与最小示例可分开发布；私有配置和 8-neighbor 等实验内容不进入基础包。</footer>
+</main>
+<script>
+for(const button of document.querySelectorAll('nav button')){
+  button.addEventListener('click',()=>{
+    for(const other of document.querySelectorAll('nav button')) other.setAttribute('aria-selected',String(other===button));
+    for(const panel of document.querySelectorAll('.panel')) panel.hidden=panel.id!==button.dataset.panel;
+  });
+}
+</script>
+</html>
