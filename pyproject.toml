@@ -8,6 +8,7 @@ version = "0.0.1"
 description = "Private research artifact for OrbitServe LEO AI serving cost-SLO co-design."
 requires-python = ">=3.11"
 dependencies = [
+  "numpy==2.2.6",
   "astropy==6.1.3",
   "astropy-iers-data==0.2026.5.11.1.8.52",
   "sgp4==2.27",

@@ -3,7 +3,7 @@
 Run all four suites before integration, including `tests/slow/`:
 
 ```bash
-python -m ruff check src tests
+python -m ruff check src tests .github/scripts
 python -m unittest discover -s tests -t . -v
 ```
 
@@ -13,6 +13,13 @@ installs the C++ compiler, CMake, Boost and Python/pybind11 development headers
 before installing both native backends. It uses pip 26.2.2 and
 `constraints/native-build.txt` to select pybind11 2.13.6 in the isolated SimGrid
 build. It runs on Ubuntu 24.04 with Python 3.12 and fails if any case is skipped.
+The package pins NumPy 2.2.6 with Astropy 6.1.3. Before lint and regression tests,
+CI checks dependency consistency, imports Astropy's coordinate and unit modules,
+and prints the installed core/native dependency versions.
+The causal workload contract checks use `unittest.TestCase` so they are collected
+by the same full-suite command and do not depend on pytest.
+CI runs `.github/scripts/run_native_tests.py`, whose guarded file entry point
+supports the orbit pipeline's `spawn` workers and rejects skipped tests.
 
 ## Preserved behavior during the physical-network migration
 

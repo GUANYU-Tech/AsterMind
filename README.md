@@ -46,6 +46,10 @@ Fixed-design evaluation and DSE candidates share `evaluate_materialized_design()
 python3 -m pip install -e .
 ```
 
+The physical orbit engine pins Astropy 6.1.3 and NumPy 2.2.6 in the package
+dependencies. Keep these versions together; newer NumPy releases remove APIs
+used by this Astropy version. Installing the package applies both pins.
+
 WildChat dependencies such as `pyarrow` and `transformers` are optional and are not required by the core package.
 
 ## Workload Contract

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import pytest
+import unittest
 
 from orbitserve.workload.contract import (
     CAUSAL_SESSION_REQUEST_KEYS,
@@ -44,33 +44,32 @@ def _row(**updates):
     return row
 
 
-def test_causal_contract_uses_one_token_field_set():
-    row = _row()
-    validate_exact_keys((row,), CAUSAL_SESSION_REQUEST_KEYS, "session_requests")
-    validate_session_consistency([row])
-    assert "kv_reusable_tokens" not in row
-    assert "prefill_tokens" not in row
-    assert "kv_block_size_tokens" not in row
+class CausalContractTests(unittest.TestCase):
+    def test_causal_contract_uses_one_token_field_set(self):
+        row = _row()
+        validate_exact_keys((row,), CAUSAL_SESSION_REQUEST_KEYS, "session_requests")
+        validate_session_consistency([row])
+        self.assertNotIn("kv_reusable_tokens", row)
+        self.assertNotIn("prefill_tokens", row)
+        self.assertNotIn("kv_block_size_tokens", row)
 
+    def test_prompt_must_equal_reusable_context_plus_current_prefill(self):
+        with self.assertRaisesRegex(ValueError, "prompt_tokens"):
+            validate_session_consistency([_row(new_user_tokens=19)])
 
-def test_prompt_must_equal_reusable_context_plus_current_prefill():
-    with pytest.raises(ValueError, match="prompt_tokens"):
-        validate_session_consistency([_row(new_user_tokens=19)])
+    def test_completion_relative_request_requires_nonnegative_think_time(self):
+        root = _row(session_turn_count=2)
+        child = _row(
+            request_id="request-1",
+            turn_index=1,
+            session_turn_count=2,
+            arrival_time_mode="after_dependency_completion",
+            depends_on_request_id="request-0",
+            inter_turn_gap_s=None,
+        )
+        with self.assertRaisesRegex(ValueError, "requires inter_turn_gap_s"):
+            validate_session_consistency([root, child])
 
-
-def test_completion_relative_request_requires_nonnegative_think_time():
-    root = _row(session_turn_count=2)
-    child = _row(
-        request_id="request-1",
-        turn_index=1,
-        session_turn_count=2,
-        arrival_time_mode="after_dependency_completion",
-        depends_on_request_id="request-0",
-        inter_turn_gap_s=None,
-    )
-    with pytest.raises(ValueError, match="requires inter_turn_gap_s"):
-        validate_session_consistency([root, child])
-
-    child["inter_turn_gap_s"] = -0.1
-    with pytest.raises(ValueError, match="negative inter_turn_gap_s"):
-        validate_session_consistency([root, child])
+        child["inter_turn_gap_s"] = -0.1
+        with self.assertRaisesRegex(ValueError, "negative inter_turn_gap_s"):
+            validate_session_consistency([root, child])

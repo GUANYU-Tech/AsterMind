@@ -37,17 +37,20 @@ jobs:
           python -m pip install --upgrade 'pip==26.2.2'
           python -m pip install --build-constraint constraints/native-build.txt \
             -e '.[simgrid,ns3]' 'ruff==0.14.0'
-      - name: Lint
-        run: python -m ruff check src tests
-      - name: Full suite including slow and native backend regressions
+      - name: Verify installed dependencies
         run: |
+          python -m pip check
           python - <<'PY'
-          import sys
-          import unittest
+          from importlib import import_module
+          from importlib.metadata import version
 
-          suite = unittest.defaultTestLoader.discover("tests", top_level_dir=".")
-          result = unittest.TextTestRunner(verbosity=2).run(suite)
-          if result.skipped:
-              print("Full native validation must not skip tests:", result.skipped)
-          sys.exit(not result.wasSuccessful() or bool(result.skipped))
+          for package in ("numpy", "astropy", "astropy-iers-data", "sgp4", "simgrid", "ns3"):
+              print(f"{package}=={version(package)}", flush=True)
+          for module in ("astropy.coordinates", "astropy.units"):
+              import_module(module)
+          print("Astropy coordinate and unit imports succeeded")
           PY
+      - name: Lint
+        run: python -m ruff check src tests .github/scripts
+      - name: Full suite including slow and native backend regressions
+        run: python .github/scripts/run_native_tests.py
