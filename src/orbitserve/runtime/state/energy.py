@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from typing import Any
 
-from ...common import to_jsonable
 
 REQUIRED_RUNTIME_ENERGY_WINDOW_FIELDS = (
     "battery_capacity_j",

@@ -1,63 +1,66 @@
 {
-  "constellation": {
-    "name": "smoke_walker_550km",
-    "shells": [
-      {
-        "altitude_km": 550,
-        "inclination_deg": 53,
-        "min_elevation_deg": 25,
-        "name": "walker_550_53",
-        "orbit_family": "walker",
-        "phase_factor": 1,
-        "plane_count": 2,
-        "sats_per_plane": 3
-      }
-    ]
-  },
-  "costing": {
-    "scale_by": "satellite_count"
-  },
-  "description": "Runnable skeleton experiment for one OrbitServe constellation design.",
-  "dse": {
-    "enabled": false,
-    "sweep": {}
-  },
+  "schema_version": "orbitserve.experiment.v1",
   "experiment_id": "smoke_single_design",
-  "scheduler": {
-    "lookahead_orbits": 1,
-    "policy": "orbitserve"
-  },
-  "serving": {
-    "decode": {
-      "batching_window_ms": 20,
-      "power_fraction": null,
-      "token_throughput_per_s_per_accelerator": null
+  "physical_network": "../network/coupled_small.json",
+  "hardware": {
+    "accelerator": "h200_sxm",
+    "compute_payload": {
+      "accelerator_count": 4,
+      "purchase_cost_per_unit_usd": 50000
     },
-    "effective_utilization": 0.5,
-    "kv_cache_capacity_gb": null,
-    "model": {
-      "max_context_tokens": 8192,
-      "name": "llama-like-34b",
-      "parameter_count_b": 34,
-      "precision": "bf16"
+    "communication": {
+      "isl_terminal_count": 6,
+      "isl_terminal_bandwidth_gbps": 100,
+      "ground_link_bandwidth_gbps": 1
     },
-    "prefill": {
-      "batching_window_ms": 20,
-      "power_fraction": null,
-      "token_throughput_per_s_per_accelerator": null
+    "power": {
+      "battery_capacity_wh": 10000,
+      "solar_array_power_w": 10000
     }
   },
-  "simulation": {
-    "duration_s": 21600,
-    "epoch": "2026-06-16T00:00:00Z",
-    "step_s": 60,
-    "use_stk_calibrated_surrogate": false
+  "communication_hardware": {
+    "compute_payload": {
+      "accelerator_count": 0
+    },
+    "communication": {
+      "isl_terminal_count": 6,
+      "isl_terminal_bandwidth_gbps": 100,
+      "ground_link_bandwidth_gbps": 1
+    }
+  },
+  "serving": {
+    "max_concurrency": 2,
+    "prompt_length_grid": [
+      1,
+      32,
+      68,
+      128,
+      256
+    ],
+    "context_length_grid": [
+      1,
+      32,
+      68,
+      128,
+      256
+    ],
+    "formation": {
+      "member_count": 4,
+      "topology": "ring",
+      "link_bandwidth_gbps": 100,
+      "link_propagation_delay_s": 5e-06
+    },
+    "parallelism": {
+      "tp": 4
+    }
   },
   "workload": {
-    "bundle_dir": "tests/fixtures/workloads/smoke_flat_single_turn_direct"
+    "bundle_dir": "../workloads/coupled_physical"
   },
-  "hardware": {
-    "mode": "from_cost_case",
-    "source_case_path": "examples/single_satellite/h200_gpu_derived.json"
+  "runtime_strategy": {
+    "latency_weight": 1,
+    "kv_reuse_weight": 0,
+    "energy_weight": 0,
+    "compute_load_weight": 0
   }
 }

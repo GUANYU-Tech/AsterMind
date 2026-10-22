@@ -13,6 +13,10 @@ dependencies = [
   "sgp4==2.27",
 ]
 
+[project.optional-dependencies]
+simgrid = ["simgrid==4.1"]
+ns3 = ["ns3==3.44.post0"]
+
 [tool.setuptools]
 packages = [
   "orbitserve",

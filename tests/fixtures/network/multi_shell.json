@@ -1,0 +1,195 @@
+{
+  "schema_version": "orbitserve.network_experiment.v1",
+  "time": {
+    "epoch_utc": "2026-07-20T00:00:00.000000Z",
+    "duration_s": 120.0,
+    "step_s": 1.0
+  },
+  "ground_ingresses": [
+    {
+      "ingress_id": "ground-00",
+      "lat_deg": 0.0,
+      "lon_deg": 0.0,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 10.0
+    },
+    {
+      "ingress_id": "ground-01",
+      "lat_deg": 0.0,
+      "lon_deg": 90.0,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 10.0
+    },
+    {
+      "ingress_id": "ground-02",
+      "lat_deg": 0.0,
+      "lon_deg": 180.0,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 10.0
+    },
+    {
+      "ingress_id": "ground-03",
+      "lat_deg": 0.0,
+      "lon_deg": -90.0,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 10.0
+    },
+    {
+      "ingress_id": "ground-04",
+      "lat_deg": 45.0,
+      "lon_deg": 0.0,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 10.0
+    },
+    {
+      "ingress_id": "ground-05",
+      "lat_deg": -45.0,
+      "lon_deg": 90.0,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 10.0
+    }
+  ],
+  "network": {
+    "link_profiles": {
+      "communication_isl": {
+        "bandwidth_bps": 10000000000.0,
+        "setup_time_s": 3.0,
+        "max_distance_km": 6000.0,
+        "capacity_schedule": [
+          [
+            300.0,
+            0.5
+          ],
+          [
+            400.0,
+            1.0
+          ]
+        ]
+      },
+      "cell_isl": {
+        "bandwidth_bps": 100000000000.0,
+        "setup_time_s": 1.0,
+        "max_distance_km": 10.0
+      },
+      "cross_layer": {
+        "bandwidth_bps": 10000000000.0,
+        "setup_time_s": 5.0,
+        "max_distance_km": 4000.0
+      },
+      "sgl": {
+        "bandwidth_bps": 1000000000.0,
+        "setup_time_s": 2.0,
+        "max_distance_km": 2500.0,
+        "capacity_model": "free_space_shannon",
+        "channel_bandwidth_hz": 500000000.0,
+        "frequency_hz": 20000000000.0,
+        "transmit_power_w": 50.0,
+        "transmit_gain_db": 30.0,
+        "receive_gain_db": 30.0,
+        "noise_temperature_k": 290.0,
+        "system_loss_db": 2.0,
+        "implementation_efficiency": 0.7,
+        "sun_exclusion_angle_deg": 3.0
+      }
+    },
+    "communication_topology": "explicit",
+    "wrap_planes": true,
+    "wrap_slots": true,
+    "cell_topology": "ring",
+    "inter_cell_links": false,
+    "ground_roles": [
+      "communication"
+    ],
+    "ground_access_policy": "nearest_distance"
+  },
+  "route_probes": [
+    {
+      "source": "ground-00",
+      "target": "compute-mid-p000-s0000-m000",
+      "payload_bytes": 1000000.0,
+      "policy": "min_hops"
+    },
+    {
+      "source": "ground-00",
+      "target": "compute-mid-p000-s0000-m000",
+      "payload_bytes": 1000000.0,
+      "policy": "min_propagation"
+    },
+    {
+      "source": "ground-00",
+      "target": "compute-mid-p000-s0000-m000",
+      "payload_bytes": 1000000.0,
+      "policy": "earliest_arrival"
+    }
+  ],
+  "constellations": {
+    "communication_shells": [
+      {
+        "shell_id": "comm-low",
+        "source": {
+          "type": "walker_delta",
+          "altitude_km": 550.0,
+          "inclination_deg": 53.0,
+          "planes": 4,
+          "satellites_per_plane": 6,
+          "walker_phase": 1,
+          "raan0_deg": 0.0,
+          "u0_deg": 0.0
+        },
+        "topology": "grid",
+        "isl_terminals": 6,
+        "sgl_terminals": 1,
+        "wrap_planes": true,
+        "wrap_slots": true
+      },
+      {
+        "shell_id": "comm-high",
+        "source": {
+          "type": "walker_delta",
+          "altitude_km": 1200.0,
+          "inclination_deg": 70.0,
+          "planes": 4,
+          "satellites_per_plane": 6,
+          "walker_phase": 1,
+          "raan0_deg": 20.0,
+          "u0_deg": 10.0
+        },
+        "topology": "honeycomb",
+        "isl_terminals": 6,
+        "sgl_terminals": 1,
+        "wrap_planes": true,
+        "wrap_slots": true
+      }
+    ],
+    "compute_formations": [
+      {
+        "name": "compute-mid",
+        "source": {
+          "type": "walker_delta",
+          "altitude_km": 800.0,
+          "inclination_deg": 53.0,
+          "planes": 1,
+          "clusters_per_plane": 2,
+          "walker_phase": 0,
+          "raan0_deg": 0.0,
+          "u0_deg": 0.0
+        },
+        "cluster": {
+          "satellites_per_cluster": 4,
+          "grid_shape": "4x1",
+          "formation_pitch_m": 500.0,
+          "formation_frame": "lvlh",
+          "d_keepout_m": 50.0,
+          "sigma_control_m": 0.0,
+          "sigma_navigation_m": 0.0
+        },
+        "topology": "ring",
+        "ingress_members": [
+          0
+        ],
+        "isl_terminals": 4,
+        "sgl_terminals": 0
+      }
+    ]
+  }
+}

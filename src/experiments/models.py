@@ -1,100 +1,138 @@
-"""Experiment manifest and result dataclasses."""
+"""Experiment-level composition of the current public module contracts."""
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
+from pathlib import Path
+import json
 from typing import Any
 
-from orbitserve.common import to_jsonable
-from orbitserve.orbit import ConstellationDesign
-from orbitserve.experiments.constellation_cost import ConstellationCostResult, CostingSpec
-from orbitserve.dse.search import DSESpec, DSEStudyResult
 from orbitserve.architecture import HardwareSpec
-from orbitserve.common import PerformanceMetrics, SLOMetrics
+from orbitserve.common import to_jsonable
 from orbitserve.runtime import RuntimeStrategySpec
 from orbitserve.serving import ServingSpec
-from orbitserve.orbit import SimulationConfig
 from orbitserve.workload import WorkloadBundleRef
+from .constellation_cost import CostingSpec
 
 
 @dataclass(frozen=True)
 class ExperimentSpec:
     experiment_id: str
-    constellation: ConstellationDesign
-    costing: CostingSpec
-    workload: WorkloadBundleRef = field(default_factory=WorkloadBundleRef)
-    serving: ServingSpec = field(default_factory=ServingSpec)
-    simulation: SimulationConfig = field(default_factory=SimulationConfig)
-    runtime_strategy: RuntimeStrategySpec = field(default_factory=RuntimeStrategySpec)
-    dse: DSESpec = field(default_factory=DSESpec)
+    physical_network: dict[str, Any] | None = None
     hardware: HardwareSpec | None = None
+    serving: ServingSpec = field(default_factory=ServingSpec)
+    workload: WorkloadBundleRef = field(default_factory=WorkloadBundleRef)
+    runtime_strategy: RuntimeStrategySpec = field(default_factory=RuntimeStrategySpec)
+    costing: CostingSpec = field(default_factory=CostingSpec)
+    communication_hardware: HardwareSpec | None = None
+    ground_baseline: dict | None = None
+    dse: dict[str, Any] = field(default_factory=dict)
     description: str = ""
     base_dir: str | None = None
+    physical_dataset: str | None = None
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any], *, base_dir: str | None = None) -> "ExperimentSpec":
-        if "scheduler" in data:
-            raise ValueError("scheduler is unsupported; use runtime_strategy")
+    def from_dict(cls, data, *, base_dir=None):
+        allowed = set(cls.__dataclass_fields__) | {"schema_version"}
+        unknown = set(data) - allowed
+        if unknown:
+            raise ValueError(
+                "Unsupported experiment fields: "
+                + ", ".join(sorted(unknown))
+                + "; use physical_network with current SGP4 constellation inputs"
+            )
+        network = deepcopy(data.get("physical_network"))
+        if network is None and data.get('physical_dataset'):
+            from .physical_dataset import load_dataset
+            folder, _, _ = load_dataset(Path(base_dir or '.') / data['physical_dataset'])
+            network = json.loads((folder / 'materialized_input.json').read_text(encoding='utf-8'))
+        if data.get("ground_baseline") is None and (
+            network is None or data.get("hardware") is None
+        ):
+            raise ValueError(
+                "physical_network and hardware are required for satellite experiments"
+            )
+        if data.get("ground_baseline") is not None and network is not None:
+            raise ValueError(
+                "ground_baseline and physical_network are separate experiment modes"
+            )
+        network = network or {}
+        network_base = Path(base_dir or ".")
+        if isinstance(network, str):
+            path = network_base / network
+            network = json.loads(path.read_text(encoding="utf-8"))
+            network_base = path.parent
+        # Resolve file-backed sources at the file that declared them, including
+        # per-member compute TLE input, without running physical calculations.
+        from .network_inputs import snapshot_network_input
+        network = snapshot_network_input(network, network_base)
+        if network:
+            from .network_inputs import materialize_network_input
+            from orbitserve.runtime import NetworkSpec, candidate_links
+
+            if data.get('physical_dataset'):
+                from .physical_dataset import dataset_physical_input
+                concrete = dataset_physical_input(data['physical_dataset'], network, base_dir or '.')
+            else:
+                concrete = materialize_network_input(network, network_base)
+            allowed_network = {
+                "schema_version",
+                "time",
+                "elements",
+                "constellations",
+                "network",
+                "ground_ingresses",
+                "route_probes",
+                "initialization_provenance",
+                "scenario_type",
+            }
+            if set(network) - allowed_network:
+                raise ValueError(
+                    "Unsupported physical network fields: "
+                    + ", ".join(sorted(set(network) - allowed_network))
+                )
+            candidate_links(NetworkSpec.from_value(concrete["network"]))
         return cls(
             experiment_id=str(data["experiment_id"]),
-            description=str(data.get("description", "")),
-            constellation=ConstellationDesign.from_dict(data["constellation"]),
-            costing=CostingSpec.from_dict(data.get("costing")),
-            hardware=HardwareSpec.from_dict(data["hardware"]) if data.get("hardware") else None,
-            workload=WorkloadBundleRef.from_dict(data.get("workload")),
+            physical_network=network or None,
+            hardware=HardwareSpec.from_dict(data["hardware"])
+            if data.get("hardware")
+            else None,
+            ground_baseline=deepcopy(data.get("ground_baseline")),
+            communication_hardware=HardwareSpec.from_dict(
+                data["communication_hardware"]
+            )
+            if data.get("communication_hardware")
+            else None,
             serving=ServingSpec.from_dict(data.get("serving")),
-            simulation=SimulationConfig.from_dict(data.get("simulation")),
-            runtime_strategy=RuntimeStrategySpec.from_dict(data.get("runtime_strategy")),
-            dse=DSESpec.from_dict(data.get("dse")),
+            workload=WorkloadBundleRef.from_dict(data.get("workload")),
+            runtime_strategy=RuntimeStrategySpec.from_dict(
+                data.get("runtime_strategy")
+            ),
+            costing=CostingSpec.from_dict(data.get("costing")),
+            dse=deepcopy(data.get("dse", {})),
+            description=str(data.get("description", "")),
             base_dir=base_dir,
+            physical_dataset=str(data['physical_dataset']) if data.get('physical_dataset') else None,
         )
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "experiment_id": self.experiment_id,
-            "description": self.description,
-            "constellation": self.constellation.to_dict(),
-            "costing": self.costing.to_dict(),
-            "hardware": self.hardware.to_dict() if self.hardware else None,
-            "workload": self.workload.to_dict(),
-            "serving": self.serving.to_dict(),
-            "simulation": self.simulation.to_dict(),
-            "runtime_strategy": self.runtime_strategy.to_dict(),
-            "dse": self.dse.to_dict(),
-            "base_dir": self.base_dir,
-        }
+    def to_dict(self):
+        return to_jsonable(self)
 
 
 @dataclass(frozen=True)
 class ExperimentResult:
     experiment_id: str
-    manifest: dict[str, Any]
-    constellation_architecture: dict[str, Any]
-    cost: ConstellationCostResult
-    performance: PerformanceMetrics
-    slo: SLOMetrics
-    dse: DSEStudyResult
-    module_status: dict[str, str]
-    warnings: tuple[str, ...]
-    workload_generation: Any | None = None
+    manifest: dict
+    architecture: dict
+    serving: dict
+    network: dict
+    runtime: Any
+    cost: dict
+    dse: dict
+    module_status: dict
+    warnings: tuple[str, ...] = ()
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "result_kind": "fixed_design_simulation",
-            "experiment_id": self.experiment_id,
-            "manifest": to_jsonable(self.manifest),
-            "constellation_architecture": to_jsonable(self.constellation_architecture),
-            "cost": self.cost.to_dict(),
-            "performance": self.performance.to_dict(),
-            "slo": self.slo.to_dict(),
-            "dse": self.dse.to_dict(),
-            "module_status": to_jsonable(self.module_status),
-            "warnings": list(self.warnings),
-            "workload_generation": _jsonable_result(self.workload_generation),
-        }
-
-
-def _jsonable_result(value: Any) -> Any:
-    if value is not None and hasattr(value, "to_dict") and callable(value.to_dict):
-        return to_jsonable(value.to_dict())
-    return to_jsonable(value)
+    def to_dict(self):
+        return {**to_jsonable(self), "runtime": self.runtime.to_dict()}

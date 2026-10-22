@@ -2,7 +2,7 @@ import unittest
 
 from orbitserve.architecture import HardwareSpec, resolve_architecture
 from orbitserve.orbit import ORBIT_TRACE_SCHEMA, OrbitTraceBundle, OrbitTraceManifest
-from orbitserve.runtime import RuntimeSimulationSpec, RuntimeStrategySpec, run_simulation
+from orbitserve.runtime import RuntimeSimulationSpec, RuntimeStrategySpec, run_simulation, NetworkSpec, NetworkNodeSpec, LinkProfile
 from orbitserve.serving import ServingSpec, estimate_serving_throughput
 
 
@@ -19,8 +19,8 @@ def _trace():
     return OrbitTraceBundle(
         trace_manifest=manifest,
         satellite_catalog=({"satellite_id": "sat-a", "compute_capable": True},),
-        ephemeris_samples=({"time_s": 0.0, "satellite_id": "sat-a", "position_itrs_km": [7000.0, 0.0, 0.0]},),
-        sgl_windows=(), isl_windows=(),
+        ephemeris_samples=tuple({"time_s": t, "satellite_id": "sat-a", "position_itrs_km": [7000.0, 0.0, 0.0]} for t in (0.,100.)),
+        sgl_windows=({"ingress_id":"ground","satellite_id":"sat-a","start_s":0.,"end_s":100.},), isl_windows=(),
         sunlight_windows=({"satellite_id": "sat-a", "start_s": 0.0, "end_s": 100.0, "sunlit": True},),
     )
 
@@ -40,7 +40,7 @@ class ServingRuntimeConcurrencyIntegrationTests(unittest.TestCase):
             hardware=hardware,
         )
         requests = tuple({
-            "request_id": f"request-{index}",
+            "request_id": f"request-{index}", "ingress_id":"ground",
             "arrival_time_s": 0.0,
             "prompt_tokens": 10,
             "output_tokens": 2,
@@ -57,11 +57,10 @@ class ServingRuntimeConcurrencyIntegrationTests(unittest.TestCase):
             environment_state=_trace(),
             constellation={"architecture": {"storage_capacity_tb": 1.0}},
             serving_profile=serving,
-            communication_ingress={
-                "altitude_km": 550.0,
-                "uplink_bandwidth_bps": 1e9,
-                "downlink_bandwidth_bps": 1e9,
-            },
+            network=NetworkSpec((NetworkNodeSpec("sat-a","compute",sgl_terminals=1),
+                NetworkNodeSpec("ground","ground",sgl_terminals=1)),
+                {"sgl":LinkProfile(1e9,0.)},communication_topology="explicit",ground_roles=("compute",)),
+            gateways=({"ingress_id":"ground","lat_deg":0.,"lon_deg":0.},),
             energy_profile={
                 "battery_capacity_j": 1e9, "charge_rate_w": 1000.0,
                 "idle_power_w": 1.0, "compute_energy_j_per_token": 0.0,

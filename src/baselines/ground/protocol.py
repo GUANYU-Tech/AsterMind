@@ -19,7 +19,7 @@ from .global_runtime import (
     run_centralized_ground_runtime,
 )
 from .runtime import run_ground_runtime
-from ...runtime import RuntimeStrategySpec
+from .contracts import GroundStrategySpec as RuntimeStrategySpec
 
 
 SKYWALKER_PAPER_POLICY_IDS = (

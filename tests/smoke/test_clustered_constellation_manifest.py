@@ -1,39 +1,14 @@
-import json
+import tempfile
 import unittest
-from pathlib import Path
-
-from orbitserve.experiments import load_experiment_spec, run_experiment
-
-
-ROOT = Path(__file__).resolve().parents[2]
-
+from orbitserve.experiments import run_experiment
+from tests.system_case import physical_case
 
 class ClusteredConstellationManifestTests(unittest.TestCase):
-    def test_smoke_clustered_constellation_manifest_runs(self):
-        spec = load_experiment_spec(ROOT / "tests/fixtures/manifests/smoke_clustered_constellation.json")
-        self.assertEqual(spec.experiment_id, "smoke_clustered_constellation")
-        self.assertEqual(spec.constellation.compute_cell_count, 4)
-        self.assertEqual(spec.constellation.satellite_count, 64)
-
-        analysis = spec.to_dict()["constellation"]["architecture_analysis"]
-        cluster = analysis["orbital_sets"][0]["cluster"]
-        self.assertEqual(cluster["grid_shape"], [4, 4])
-        self.assertEqual(cluster["satellites_per_cluster"], 16)
-        self.assertNotIn("topology", cluster)
-        self.assertNotIn("short_isl_profile", cluster)
-        self.assertNotIn("aggregate_topology", analysis)
-
-        payload = run_experiment(spec).to_dict()
-        self.assertTrue(payload["cost"]["evaluated"])
-        self.assertTrue(payload["performance"]["evaluated"])
-        self.assertFalse(payload["slo"]["evaluated"])
-        self.assertEqual(payload["module_status"]["dse"], "disabled")
-        self.assertEqual(payload["cost"]["satellite_count"], 64)
-        self.assertEqual(payload["cost"]["single_satellite"]["provenance"]["isl_total_bandwidth_gbps"], 400.0)
-        self.assertEqual(payload["performance"]["details"]["hardware"]["inter_satellite_bandwidth_gbps"], 400.0)
-        self.assertEqual(payload["performance"]["details"]["hardware"]["laser_terminal_count"], 4)
-        json.dumps(payload, ensure_ascii=False)
-
-
-if __name__ == "__main__":
-    unittest.main()
+    def test_physical_cell_and_logical_serving_target_are_consistent(self):
+        with tempfile.TemporaryDirectory() as folder:
+            result=run_experiment(physical_case(),output_dir=folder,_workers=1)
+            self.assertEqual(result.serving["physical_satellite_count"],4)
+            self.assertEqual(result.cost["compute"]["compute_node_count"],2)
+            self.assertEqual(result.cost["compute"]["physical_satellite_count"],8)
+            self.assertEqual(result.runtime.request_summary["completed_request_count"],3)
+            self.assertTrue(all(len(row["placement"]["compute_owner_satellite_ids"])==4 for row in result.runtime.request_records))

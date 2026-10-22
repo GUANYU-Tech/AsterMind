@@ -69,6 +69,15 @@ def _summary_payload(payload: dict[str, Any], writer: "_ArtifactWriter") -> dict
         "full_json_mode": "rerun CLI with --output-mode full to reproduce the historical monolithic JSON",
     }
 
+    if isinstance(summary.get("runtime"),dict):
+        runtime=summary["runtime"]
+        state=runtime.get("state_summary",{})
+        events=state.get("event_log",[])
+        event_ref=writer.write_jsonl(name="runtime_events",rel_path=("runtime","events.jsonl"),rows=events,json_path="runtime.state_summary.event_log") if events else None
+        slim=_externalized_runtime_summary(runtime,writer=writer,artifact_prefix=("runtime",),artifact_name="runtime",json_path="runtime")
+        slim["state_summary"]={"event_log_artifact":event_ref,"event_count":len(events)}
+        summary["runtime"]=slim
+
     performance_details = _dict_at(summary, ("performance", "details"))
     runtime = performance_details.get("runtime")
     if isinstance(runtime, dict):

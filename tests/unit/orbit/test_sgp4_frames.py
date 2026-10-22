@@ -52,7 +52,33 @@ def _propagation(epoch="2019-12-09T20:42:00.000000Z"):
 
 @unittest.skipUnless(_has_tested_astropy(), "requires the frozen astropy 6.1.3 engine")
 class Sgp4FrameTransformTests(unittest.TestCase):
-    @unittest.skipUnless(_has_tested_sgp4(), "requires the frozen python-sgp4 2.27 engine")
+    def test_batched_frame_transform_matches_independent_scalar_transforms(self):
+        from dataclasses import replace
+
+        source = _propagation()
+        samples = tuple(
+            replace(
+                source.samples[0],
+                satellite_id=f"sat-{i}",
+                position_teme_km=tuple(
+                    v * (1 + i * 0.01) for v in source.samples[0].position_teme_km
+                ),
+            )
+            for i in range(4)
+        )
+        batched = transform_sgp4_teme_to_itrs(replace(source, samples=samples))
+        for actual, sample in zip(batched.samples, samples):
+            expected = transform_sgp4_teme_to_itrs(
+                replace(source, samples=(sample,))
+            ).samples[0]
+            for a, b in zip(actual.position_itrs_km, expected.position_itrs_km):
+                self.assertAlmostEqual(a, b, delta=1e-10)
+            for a, b in zip(actual.velocity_itrs_km_s, expected.velocity_itrs_km_s):
+                self.assertAlmostEqual(a, b, delta=1e-12)
+
+    @unittest.skipUnless(
+        _has_tested_sgp4(), "requires the frozen python-sgp4 2.27 engine"
+    )
     def test_public_sgp4_to_itrs_pipeline_composes_deterministically(self):
         propagation = propagate_sgp4_teme(
             _iss_bundle(),
@@ -65,7 +91,11 @@ class Sgp4FrameTransformTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual([sample.time_s for sample in first.samples], [0.0, 60.0])
         self.assertTrue(
-            all(math.isfinite(value) for sample in first.samples for value in sample.position_itrs_km)
+            all(
+                math.isfinite(value)
+                for sample in first.samples
+                for value in sample.position_itrs_km
+            )
         )
 
     def test_teme_to_itrs_matches_frozen_reference_and_records_data(self):
@@ -117,7 +147,9 @@ class Sgp4FrameTransformTests(unittest.TestCase):
         self.assertNotIn(str(first_iers), serialized)
         self.assertNotIn(str(second_iers), serialized)
 
-    @unittest.skipUnless(_has_tested_sgp4(), "requires the frozen python-sgp4 2.27 engine")
+    @unittest.skipUnless(
+        _has_tested_sgp4(), "requires the frozen python-sgp4 2.27 engine"
+    )
     def test_default_pinned_data_covers_full_project_2026_pipeline(self):
         propagation = propagate_sgp4_teme(
             _bundle(),
@@ -128,7 +160,9 @@ class Sgp4FrameTransformTests(unittest.TestCase):
         self.assertEqual(result.iers_data_release, PINNED_IERS_DATA_RELEASE)
         self.assertEqual(result.earth_orientation_quality, "predictive")
         self.assertEqual(len(result.samples), 4)
-        self.assertEqual([sample.time_s for sample in result.samples], [0.0, 0.0, 60.0, 60.0])
+        self.assertEqual(
+            [sample.time_s for sample in result.samples], [0.0, 0.0, 60.0, 60.0]
+        )
 
     def test_default_data_hash_mismatch_fails_before_parsing(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -136,7 +170,9 @@ class Sgp4FrameTransformTests(unittest.TestCase):
             shutil.copyfile(frame_module._PINNED_IERS_A_PATH, tampered)
             tampered.write_bytes(tampered.read_bytes() + b" ")
             with patch.object(frame_module, "_PINNED_IERS_A_PATH", tampered):
-                with self.assertRaisesRegex(Sgp4FrameTransformError, "SHA-256 mismatch"):
+                with self.assertRaisesRegex(
+                    Sgp4FrameTransformError, "SHA-256 mismatch"
+                ):
                     transform_sgp4_teme_to_itrs(_propagation())
 
     def test_far_future_sample_fails_closed_with_time(self):

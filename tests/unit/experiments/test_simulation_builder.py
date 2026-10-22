@@ -40,20 +40,12 @@ class SimulationBuilderTests(unittest.TestCase):
         self.assertIsNone(scenario.environment_state)
         self.assertNotIn("orbit_trace_bundle", scenario.__dataclass_fields__)
 
-    def test_builder_extracts_communication_ingress_without_putting_it_in_strategy(self):
-        scenario = build_simulation_spec(
-            simulation_config={
-                "communication_satellite": {
-                    "altitude_km": 550.0,
-                    "uplink_bandwidth_bps": 1e9,
-                    "downlink_bandwidth_bps": 2e9,
-                }
-            }
-        )
-
-        self.assertTrue(scenario.communication_ingress.configured)
-        self.assertEqual(scenario.communication_ingress.altitude_km, 550.0)
-        self.assertNotIn("altitude_km", scenario.strategy.to_dict())
+    def test_builder_preserves_physical_network(self):
+        from orbitserve.runtime import NetworkSpec, NetworkNodeSpec
+        network = NetworkSpec((NetworkNodeSpec("sat-a","compute"),), {}, communication_topology="explicit")
+        scenario = build_simulation_spec(simulation_config={"network":network.to_dict()})
+        self.assertEqual(scenario.network, network)
+        self.assertNotIn("communication_ingress", scenario.__dataclass_fields__)
 
 
 if __name__ == "__main__":

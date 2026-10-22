@@ -139,8 +139,11 @@ class ServingSpec:
     context_length_grid: tuple[int, ...] = DEFAULT_CONTEXT_LENGTH_GRID
     max_concurrency: int = 1
     hardware: SatelliteHardwareProfile | None = None
+    external_profile: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
+        if self.external_profile is not None and not isinstance(self.external_profile,dict):
+            raise ValueError('serving.external_profile must be a measurement mapping')
         for name in ("prefill_compute_efficiency", "decode_memory_efficiency"):
             value = getattr(self, name)
             if not math.isfinite(value) or not 0.0 < value <= 1.0:
@@ -168,6 +171,7 @@ class ServingSpec:
             context_length_grid=tuple(int(item) for item in data.get("context_length_grid", DEFAULT_CONTEXT_LENGTH_GRID)),
             max_concurrency=data.get("max_concurrency", 1),
             hardware=SatelliteHardwareProfile.from_dict(hardware) if isinstance(hardware, dict) else hardware,
+            external_profile=data.get('external_profile'),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -181,6 +185,7 @@ class ServingSpec:
             "context_length_grid": self.context_length_grid,
             "max_concurrency": self.max_concurrency,
             "hardware": self.hardware.to_dict() if self.hardware else None,
+            "external_profile": self.external_profile,
         }
 
 
@@ -297,7 +302,7 @@ def estimate_serving_throughput(
         maximum=model.max_context_tokens,
         max_concurrency=serving.max_concurrency,
     )
-    return ServingPerformanceProfile(
+    profile = ServingPerformanceProfile(
         evaluated=True,
         feasible=feasible,
         model_name=model.name,
@@ -335,6 +340,10 @@ def estimate_serving_throughput(
             "model_approximation_notes": model.approximation_notes,
         },
     )
+    if serving.external_profile is not None:
+        from .external import from_astermind_measurements
+        return from_astermind_measurements(profile, serving.external_profile)
+    return profile
 
 
 def prefill_flops(model_name: str, prompt_length: int) -> float:

@@ -1,7 +1,5 @@
-import sys
 import unittest
 from dataclasses import replace
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -9,9 +7,9 @@ from unittest.mock import patch
 from orbitserve.baselines.ground.costing import estimate_terrestrial_ground_cost
 from orbitserve.dse.search import DSERuntimeMatrixSpec
 from orbitserve.dse.runtime_matrix import DSEDesignContext, evaluate_runtime_matrix
-from orbitserve.runtime import RuntimeScenario, RuntimeStrategySpec
+from orbitserve.baselines.ground.contracts import GroundScenario as RuntimeScenario, GroundStrategySpec as RuntimeStrategySpec
 from orbitserve.experiments.runtime_dispatch import evaluate_runtime_performance
-from orbitserve.runtime.metrics.runtime_records import RuntimeRequestRecord
+from orbitserve.baselines.ground.contracts import GroundRequestRecord as RuntimeRequestRecord
 
 
 def _record(

@@ -1,206 +1,102 @@
-import json
-import sys
 import tempfile
 import unittest
+from copy import deepcopy
 from dataclasses import replace
-from pathlib import Path
+from orbitserve.dse import physical_design_candidates
+from orbitserve.experiments import run_experiment
+from tests.system_case import physical_case
 
 
-from orbitserve.dse.search import DSESpec, run_dse
-from orbitserve.dse.search import _simulation_config_for_dse_design
-from orbitserve.experiments.design_evaluation import (
-    _simulation_config_with_default_trace_dir,
-    evaluate_materialized_design,
-    safe_trace_path_component,
-)
-from orbitserve.experiments import load_experiment_spec, run_experiment
-from orbitserve.experiments.runner import _runtime_result_summary
-
-
-ROOT = Path(__file__).resolve().parents[3]
-MANIFEST = ROOT / "tests/fixtures/manifests/smoke_circular_geometry_runtime_matrix.json"
-
-
-def _skeleton_spec(*, dse: DSESpec):
-    base = load_experiment_spec(MANIFEST)
-    return replace(
-        base,
-        simulation=replace(
-            base.simulation,
-            trace_model="skeleton",
-            trace_output_dir=None,
-        ),
-        dse=dse,
-    )
-
-
-
-def _without_warnings(value):
-    if isinstance(value, dict):
-        return {
-            key: _without_warnings(item)
-            for key, item in value.items()
-            if key != "warnings"
-        }
-    if isinstance(value, list):
-        return [_without_warnings(item) for item in value]
-    return value
-
-
-class FixedDesignAndDSEIsolationTests(unittest.TestCase):
-
-    def test_empty_sweep_baseline_matches_fixed_design_core_evaluation(self):
-        fixed_spec = _skeleton_spec(dse=DSESpec(enabled=False))
-        fixed = run_experiment(fixed_spec).to_dict()
-
-        study = run_dse(_skeleton_spec(dse=DSESpec(enabled=True, sweep={}))).to_dict()
-        self.assertEqual(fixed["result_kind"], "fixed_design_simulation")
-        self.assertEqual(study["result_kind"], "dse_study")
-        self.assertEqual(study["design_count"], 1)
-
-        baseline = study["rows"][0]
-        self.assertEqual(baseline["result_kind"], "dse_candidate")
-        self.assertEqual(baseline["assignments"], {})
-        self.assertEqual(baseline["base_design_id"], fixed_spec.constellation.name)
-        self.assertEqual(baseline["design_id"], fixed_spec.constellation.name)
-        self.assertEqual(len(baseline["digest"]), 64)
-
-        # Architecture and cost are complete common-evaluator outputs, so every
-        # field must agree rather than only the historical 600-Gbps total.
-        self.assertEqual(baseline["constellation_architecture"], fixed["constellation_architecture"])
-        self.assertEqual(baseline["cost"], fixed["cost"])
-
-        # DSE adds a static-SLO projection, while both paths use the same
-        # fixed RuntimeStrategySpec for the shared Runtime evaluation.
-        for field in (
-            "prefill_tokens_per_s",
-            "decode_tokens_per_s",
-            "request_throughput_per_s",
-            "token_throughput_per_s",
-        ):
-            self.assertEqual(baseline["performance"][field], fixed["performance"][field])
-        baseline_runtime = json.loads(
-            json.dumps(_runtime_result_summary(baseline["performance"]["details"]["runtime"]))
-        )
-        fixed_runtime = json.loads(json.dumps(_runtime_result_summary(fixed["performance"]["details"]["runtime"])))
-        self.assertEqual(_without_warnings(baseline_runtime), _without_warnings(fixed_runtime))
-
-
-    def test_duplicate_candidate_names_get_unique_rows_traces_and_runtime_matrix_ids(self):
-        base = load_experiment_spec(MANIFEST)
-        first_payload = base.constellation.to_dict()
-        first_payload["name"] = "same_candidate_name"
-        second_payload = json.loads(json.dumps(first_payload))
-        second_payload["orbital_sets"][0]["altitude_km"] = 600
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            spec = replace(
-                base,
-                simulation=replace(base.simulation, trace_output_dir=tmpdir),
-                dse=DSESpec(
-                    enabled=True,
-                    design_candidates=(
-                        {"candidate_id": "candidate_a", "constellation": first_payload},
-                        {"candidate_id": "candidate_b", "constellation": second_payload},
-                    ),
-                    sweep={},
-                    runtime_matrix=base.dse.runtime_matrix,
-                ),
+class PhysicalDesignIsolationTests(unittest.TestCase):
+    def test_fixed_design_and_empty_dse_use_same_evaluator(self):
+        spec = physical_case()
+        before = deepcopy(spec.to_dict())
+        with tempfile.TemporaryDirectory() as folder:
+            result = run_experiment(
+                replace(spec, dse={"enabled": True}), output_dir=folder, _workers=1
             )
-            study = run_dse(spec).to_dict()
-            materialized_trace_dirs = {
-                path.name
-                for path in Path(tmpdir).iterdir()
-                if path.is_dir() and (path / "link_trace.json").exists()
-            }
+            candidate = result.dse["rows"][0]["runtime"]
+            self.assertEqual(
+                candidate["request_summary"], result.runtime.request_summary
+            )
+            self.assertEqual(
+                candidate["inference_metrics"], result.runtime.inference_metrics
+            )
+            self.assertEqual(spec.to_dict(), before)
 
-        design_ids = [row["design_id"] for row in study["rows"]]
-        self.assertEqual(len(design_ids), 2)
-        self.assertEqual(len(set(design_ids)), 2)
-        self.assertEqual(len({row["digest"] for row in study["rows"]}), 2)
-        self.assertEqual(
+    def test_duplicate_candidate_ids_are_rejected_and_physical_paths_are_safe(self):
+        spec = physical_case()
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            physical_design_candidates(
+                spec.physical_network,
+                {"design_candidates": [{"candidate_id": "x"}, {"candidate_id": "x"}]},
+            )
+        rows = physical_design_candidates(
+            spec.physical_network,
             {
-                row["design"]["dse_candidate"]["candidate_id"]
-                for row in study["rows"]
+                "design_candidates": [
+                    {"candidate_id": "../../one"},
+                    {"candidate_id": "../../two"},
+                ]
             },
-            {"candidate_a", "candidate_b"},
         )
-        self.assertEqual(materialized_trace_dirs, set(design_ids))
-        matrix_design_ids = {
-            row["design_id"] for row in study["runtime_matrix"]["matrix_rows"]
-        }
-        self.assertEqual(matrix_design_ids, set(design_ids))
-        for design_id in design_ids:
-            self.assertTrue(
-                any(
-                    row["design_id"] == design_id
-                    for row in study["runtime_matrix"]["matrix_rows"]
-                )
-            )
-
-    def test_profile_catalog_identifier_is_not_a_searchable_physical_parameter(self):
-        spec = _skeleton_spec(
-            dse=DSESpec(
-                enabled=True,
-                sweep={"same_plane_profile_id": ("old_catalog_entry",)},
+        self.assertTrue(
+            all(
+                "/" not in row["design_id"] and "\\" not in row["design_id"]
+                for row in rows
             )
         )
-        with self.assertRaisesRegex(ValueError, r"unsupported DSE sweep keys.*same_plane_profile_id"):
-            run_dse(spec)
+        self.assertNotEqual(rows[0]["design_id"], rows[1]["design_id"])
 
-    def test_unscoped_sweeps_reject_multi_orbital_set_designs(self):
-        spec = _skeleton_spec(dse=DSESpec(enabled=False))
-        first = spec.constellation.orbital_sets[0]
-        multi_set_design = replace(
-            spec.constellation,
-            orbital_sets=(first, replace(first, name=f"{first.name}_second")),
-        )
-        sweeps = {
-            "altitude_km": (600,),
-            "satellites_per_cluster": (4,),
-        }
-        for key, values in sweeps.items():
-            with self.subTest(key=key):
-                ambiguous = replace(
-                    spec,
-                    constellation=multi_set_design,
-                    dse=DSESpec(enabled=True, sweep={key: values}),
+    def test_hardware_is_not_an_orbit_sweep_and_unknown_fields_fail(self):
+        for sweep in [{"accelerator": ["h200_sxm"]}, {"altitude_km": [750]}]:
+            with self.subTest(sweep=sweep), self.assertRaises((ValueError, KeyError)):
+                physical_design_candidates(
+                    physical_case().physical_network, {"sweep": sweep}
                 )
-                with self.assertRaisesRegex(
-                    ValueError,
-                    rf"2 orbital sets.*unscoped orbital/cluster sweep keys.*{key}",
-                ):
-                    run_dse(ambiguous)
 
-    def test_default_and_dse_trace_directories_are_safe_and_isolated(self):
-        base = load_experiment_spec(MANIFEST)
-        simulation = replace(base.simulation, trace_output_dir=None)
-        dangerous_experiment_id = "../unsafe/study"
-        dangerous_design_id = "../../candidate\\escape"
+    def test_current_route_matrix_and_diagnostics_are_executed(self):
+        spec = physical_case()
+        dse = {
+            "enabled": True,
+            "runtime_matrix": {
+                "enabled": True,
+                "include_current_policy": False,
+                "policies": ["min_hops", "earliest_arrival"],
+                "static_screening": {"enabled": True},
+            },
+            "communication_window_budget": {
+                "enabled": True,
+                "candidate_satellite_budgets": [1, 2],
+            },
+        }
+        with tempfile.TemporaryDirectory() as folder:
+            result = run_experiment(
+                replace(spec, dse=dse), output_dir=folder, _workers=1
+            )
+            self.assertEqual(result.dse["row_count"], 2)
+            self.assertEqual(
+                {r["strategy"]["routing_policy"] for r in result.dse["rows"]},
+                {"min_hops", "earliest_arrival"},
+            )
+            for row in result.dse["rows"]:
+                self.assertTrue(row["diagnostics"]["geometry_screening"]["evaluated"])
+                self.assertTrue(
+                    row["diagnostics"]["communication_window_budget"]["evaluated"]
+                )
 
-        fixed = _simulation_config_with_default_trace_dir(
-            simulation,
-            evaluation_id=dangerous_experiment_id,
+    def test_legacy_controller_configuration_is_not_silently_ignored(self):
+        from orbitserve.dse import run_dse
+
+        spec = replace(
+            physical_case(),
+            dse={
+                "enabled": True,
+                "runtime_matrix": {"enabled": True, "closed_loop": {"enabled": True}},
+            },
         )
-        dse = _simulation_config_for_dse_design(
-            simulation,
-            design_id=dangerous_design_id,
-            experiment_id=dangerous_experiment_id,
-        )
-        fixed_path = Path(fixed.trace_output_dir)
-        dse_path = Path(dse.trace_output_dir)
-
-        self.assertNotEqual(fixed_path, dse_path)
-        self.assertEqual(dse_path.parent.name, "dse")
-        self.assertNotIn("..", fixed_path.parts)
-        self.assertNotIn("..", dse_path.parts)
-        self.assertNotIn("/", dse_path.name)
-        self.assertNotIn("\\", dse_path.name)
-        self.assertIn("hash-", fixed_path.name)
-        self.assertIn("hash-", dse_path.name)
-        multibyte_component = safe_trace_path_component("候选" * 100)
-        self.assertLessEqual(len(multibyte_component.encode("utf-8")), 120)
-
-
-if __name__ == "__main__":
-    unittest.main()
+        with (
+            tempfile.TemporaryDirectory() as folder,
+            self.assertRaisesRegex(ValueError, "closed_loop"),
+        ):
+            run_dse(spec, output_dir=folder, _workers=1)

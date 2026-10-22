@@ -298,9 +298,6 @@ def _candidate_from_row(
     runtime_evaluated = bool(row.get("runtime_evaluated", False))
     valid_for_paper = bool(row.get("valid_for_paper_main_results", False))
     row_provenance = _mapping_from_value(row.get("provenance"))
-    runtime_details = _mapping_from_value(
-        _mapping_from_value(row.get("runtime_result")).get("details")
-    )
     cost_feasible = _first_present(row.get("cost_feasible"), row_provenance.get("cost_feasible"))
     excluded_reason = None
     if not runtime_evaluated:

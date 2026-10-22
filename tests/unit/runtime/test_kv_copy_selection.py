@@ -34,7 +34,16 @@ class KVCopySelectionTests(unittest.TestCase):
         )
 
     def preview(self, environment_state, *, local_hit_tokens=0):
+        from .test_dynamic_network import network
+        windows=environment_state.isl_windows
+        ids={n for w in windows for n in (w["endpoint_a"],w["endpoint_b"])}
+        positions={n:((7000.,0.,0.),(7000.,0.,0.)) for n in ids}
+        for w in windows:
+            positions[w["endpoint_a"]]=((7000.+w["propagation_delay_s"]*299792.458,0.,0.),)*2
+        physical=network(tuple((w["endpoint_a"],w["endpoint_b"],0.,20.) for w in windows),
+                         bandwidth=1e9,positions=positions)
         return _preview_kv_copy(
+            network=physical,
             state=self.state,
             session_id="session-0",
             target_satellite_id="sat-target",

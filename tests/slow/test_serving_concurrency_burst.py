@@ -1,6 +1,6 @@
 import unittest
 
-from orbitserve.runtime import RuntimeSimulationSpec, RuntimeStrategySpec, run_simulation
+from orbitserve.runtime import RuntimeSimulationSpec, RuntimeStrategySpec, run_simulation, NetworkSpec, NetworkNodeSpec, LinkProfile
 from tests.integration.fixed_design.test_serving_runtime_concurrency import _trace
 
 
@@ -17,7 +17,7 @@ class ServingConcurrencyBurstSlowTests(unittest.TestCase):
             for length in lengths for concurrency in range(1, max_concurrency + 1)
         ]
         requests = tuple({
-            "request_id": f"request-{index:04d}",
+            "request_id": f"request-{index:04d}", "ingress_id":"ground",
             "arrival_time_s": 0.0,
             "prompt_tokens": 100,
             "output_tokens": 10,
@@ -40,11 +40,10 @@ class ServingConcurrencyBurstSlowTests(unittest.TestCase):
                 "kv_cache_bytes_per_token": 2.0,
                 "kv_cache_capacity_tokens": 1_000_000,
             },
-            communication_ingress={
-                "altitude_km": 550.0,
-                "uplink_bandwidth_bps": 1e9,
-                "downlink_bandwidth_bps": 1e9,
-            },
+            network=NetworkSpec((NetworkNodeSpec("sat-a","compute",sgl_terminals=1),
+                NetworkNodeSpec("ground","ground",sgl_terminals=1)),
+                {"sgl":LinkProfile(1e9,0.)},communication_topology="explicit",ground_roles=("compute",)),
+            gateways=({"ingress_id":"ground","lat_deg":0.,"lon_deg":0.},),
             energy_profile={
                 "battery_capacity_j": 1e12, "charge_rate_w": 1000.0,
                 "idle_power_w": 0.0, "compute_energy_j_per_token": 0.0,

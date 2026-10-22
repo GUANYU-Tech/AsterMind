@@ -2,135 +2,32 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
 from .contracts import RuntimeEngineResult
-from .decision import SchedulerCandidate, build_candidate_selector
-from .eligibility import build_compute_eligibility_set
-from .routing import (
-    AccessCandidate,
-    RoutePlan,
-    RouteUnavailable,
-    build_isl_transfer_legs,
-    build_route_plan,
-    communication_access_candidate,
-    compute_access_candidates,
-    execute_route,
-)
+from .decision import SchedulerCandidate
+from .routing import AccessCandidate, RoutePlan, RouteUnavailable
+from ..state.network import NetworkState
 from ..metrics.records import RuntimeRequestRecord
-from ..setup.kv_capacity import derive_kv_cache_capacity_tokens
 from ..setup.serving_time import decode_time_s, prefill_suffix_time_s
 from ..state.energy import (
-    EnergyWindowError,
     advance_satellite_energy,
     apply_request_energy,
     energy_window_at,
 )
 from ..state.kv_cache import (
-    commit_session_kv,
     kv_locations_for_session,
     local_kv_reuse_tokens,
-    touch_kv_entry,
 )
 from ..state.runtime_state import RuntimeState
 
 
 def run_runtime_engine(simulation_spec: Any) -> RuntimeEngineResult:
-    environment_state = simulation_spec.environment_state
-    if environment_state is None:
-        return _all_uncompleted(simulation_spec, "environment_state_missing")
-    serving = simulation_spec.serving_profile
-    if serving is None or not serving.has_compute_capacity:
-        return _all_uncompleted(simulation_spec, "serving_capacity_unavailable")
-    try:
-        kv_cache_capacity_tokens = derive_kv_cache_capacity_tokens(
-            simulation_spec.constellation,
-            serving,
-        )
-        energy_trace, initial_soc = _build_energy_trace(environment_state, simulation_spec.energy_profile)
-        sgl_bandwidth_bps = _architecture_bandwidth(
-            simulation_spec.constellation,
-            (
-                "sgl_bandwidth_bps",
-                "sgl_total_bandwidth_bps",
-                "sgl_bandwidth_gbps",
-                "ground_link_bandwidth_gbps",
-            ),
-            required=simulation_spec.strategy.ingress_selection != "communication_satellite",
-        )
-        isl_bandwidth_bps = _architecture_bandwidth(
-            simulation_spec.constellation,
-            (
-                "isl_bandwidth_bps",
-                "isl_total_bandwidth_bps",
-                "isl_bandwidth_gbps",
-                "inter_satellite_bandwidth_gbps",
-            ),
-            required=False,
-        )
-    except ValueError as exc:
-        return _all_uncompleted(simulation_spec, str(exc))
+    from .events import run_event_engine
 
-    state = RuntimeState()
-    compute_node_catalog = getattr(environment_state, "compute_node_catalog", None)
-    if compute_node_catalog is None:
-        compute_node_catalog = tuple(
-            {**row, "compute_node_id": str(row["satellite_id"])}
-            for row in environment_state.satellite_catalog
-        )
-    for row in compute_node_catalog:
-        state.compute_node_for(
-            str(row["compute_node_id"]),
-            initial_soc=initial_soc,
-            max_concurrency=serving.max_concurrency,
-        )
-    eligibility = build_compute_eligibility_set(
-        satellite_catalog=tuple(environment_state.satellite_catalog)
-    )
-    if eligibility.empty:
-        return _all_uncompleted(simulation_spec, "eligible_compute_set_empty")
-    for satellite_id in eligibility.eligible_compute_satellite_ids:
-        state.kv_cache_for(
-            satellite_id,
-            capacity_tokens=kv_cache_capacity_tokens,
-        )
-
-    records: list[RuntimeRequestRecord] = []
-    decisions: list[dict[str, Any]] = []
-    for raw in sorted(
-        simulation_spec.requests,
-        key=lambda row: (float(row.get("arrival_time_s", 0.0)), str(row.get("request_id", ""))),
-    ):
-        request = normalize_runtime_request(raw)
-        record, decision = _run_request(
-            state=state,
-            request=request,
-            simulation_spec=simulation_spec,
-            environment_state=environment_state,
-            energy_trace=energy_trace,
-            eligible_satellite_ids=eligibility.eligible_compute_satellite_ids,
-            sgl_bandwidth_bps=sgl_bandwidth_bps,
-            isl_bandwidth_bps=isl_bandwidth_bps,
-        )
-        records.append(record)
-        decisions.append(decision)
-    return RuntimeEngineResult(
-        records=tuple(records),
-        decision_traces=tuple(decisions),
-        state_summary=state.to_dict(),
-        provenance={
-            "runtime_engine": "deterministic_event_runtime",
-            "communication_queue_model": "not_modeled",
-            "compute_queue_model": "per_compute_node_concurrency_slots",
-            "serving_rate_model": "arrival_snapshot_fixed_rate",
-            "rate_update_during_execution": False,
-            "kv_capacity_model": "architecture_storage_bytes_per_model_token",
-            "kv_cache_capacity_tokens": kv_cache_capacity_tokens,
-        },
-    )
+    return run_event_engine(simulation_spec)
 
 
 def normalize_runtime_request(raw_request: dict[str, Any]) -> dict[str, Any]:
@@ -142,7 +39,9 @@ def normalize_runtime_request(raw_request: dict[str, Any]) -> dict[str, Any]:
     prompt_tokens = int(raw_request["prompt_tokens"])
     output_tokens = int(raw_request["output_tokens"])
     if prompt_tokens < 0 or output_tokens <= 0:
-        raise ValueError("prompt_tokens must be non-negative and output_tokens must be positive")
+        raise ValueError(
+            "prompt_tokens must be non-negative and output_tokens must be positive"
+        )
     return {
         **dict(raw_request),
         "request_id": request_id,
@@ -157,79 +56,6 @@ def normalize_runtime_request(raw_request: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _run_request(
-    *,
-    state: RuntimeState,
-    request: dict[str, Any],
-    simulation_spec: Any,
-    environment_state: Any,
-    energy_trace: Any,
-    eligible_satellite_ids: tuple[str, ...],
-    sgl_bandwidth_bps: float,
-    isl_bandwidth_bps: float,
-) -> tuple[RuntimeRequestRecord, dict[str, Any]]:
-    arrival_s = float(request["arrival_time_s"])
-    horizon_s = float(environment_state.time["end_s"])
-    if arrival_s < float(environment_state.time["start_s"]) or arrival_s >= horizon_s:
-        return _uncompleted(request, "request_time_outside_trace_horizon"), _decision(request, None, ())
-    try:
-        access = _select_access(
-            state=state,
-            request=request,
-            simulation_spec=simulation_spec,
-            environment_state=environment_state,
-            energy_trace=energy_trace,
-            eligible_satellite_ids=eligible_satellite_ids,
-            sgl_bandwidth_bps=sgl_bandwidth_bps,
-            horizon_s=horizon_s,
-        )
-    except (RouteUnavailable, EnergyWindowError) as exc:
-        return _uncompleted(request, str(exc)), _decision(request, None, ())
-
-    candidates: list[SchedulerCandidate] = []
-    candidate_payloads: dict[str, dict[str, Any]] = {}
-    for satellite_id in eligible_satellite_ids:
-        try:
-            payload = _preview_candidate(
-                state=state,
-                request=request,
-                strategy=simulation_spec.strategy,
-                environment_state=environment_state,
-                energy_trace=energy_trace,
-                serving=simulation_spec.serving_profile,
-                access=access,
-                compute_satellite_id=satellite_id,
-                isl_bandwidth_bps=isl_bandwidth_bps,
-            )
-        except (RouteUnavailable, EnergyWindowError, ValueError):
-            continue
-        candidate = payload["candidate"]
-        candidates.append(candidate)
-        candidate_payloads[candidate.candidate_id] = payload
-    selector = build_candidate_selector(simulation_spec.strategy)
-    selected = selector.select_action(
-        {"candidates": tuple(candidate.to_dict() for candidate in candidates)},
-        request,
-    )
-    if not selected.evaluated or selected.selected_candidate_id not in candidate_payloads:
-        return _uncompleted(request, "no_feasible_compute_candidate"), _decision(request, None, candidates)
-    payload = candidate_payloads[selected.selected_candidate_id]
-    try:
-        record = _commit_candidate(
-            state=state,
-            request=request,
-            strategy=simulation_spec.strategy,
-            environment_state=environment_state,
-            energy_trace=energy_trace,
-            serving=simulation_spec.serving_profile,
-            payload=payload,
-            selection=selected,
-        )
-    except (RouteUnavailable, EnergyWindowError, ValueError) as exc:
-        return _uncompleted(request, str(exc)), _decision(request, selected, candidates)
-    return record, _decision(request, selected, candidates)
-
-
 def _select_access(
     *,
     state: RuntimeState,
@@ -242,38 +68,54 @@ def _select_access(
     horizon_s: float,
 ) -> AccessCandidate:
     mode = simulation_spec.strategy.ingress_selection
-    if mode == "communication_satellite":
-        return communication_access_candidate(
-            simulation_spec.communication_ingress, request, horizon_s
-        )
     ingress_id = str(request.get("ingress_id") or "")
-    if not ingress_id:
-        raise RouteUnavailable("request_ingress_id_missing")
-    rows = tuple(
-        candidate
-        for candidate in compute_access_candidates(
-            environment_state,
-            ingress_id=ingress_id,
-            time_s=float(request["arrival_time_s"]),
-            uplink_bandwidth_bps=sgl_bandwidth_bps,
-            downlink_bandwidth_bps=sgl_bandwidth_bps,
+    network = environment_state.network
+    time_s = float(request["arrival_time_s"])
+    rows = []
+    for edge in network.edges:
+        if edge["kind"] != "sgl" or ingress_id not in (
+            edge["endpoint_a"],
+            edge["endpoint_b"],
+        ):
+            continue
+        node = (
+            edge["endpoint_b"]
+            if edge["endpoint_a"] == ingress_id
+            else edge["endpoint_a"]
         )
-        if candidate.satellite_id in set(eligible_satellite_ids)
-    )
+        if mode != "nearest_satellite" and network.nodes[node].role != "compute":
+            continue
+        leg = network._edge_transfer(
+            edge["link_id"], ingress_id, node, time_s, 0.0, True
+        )
+        if leg is not None:
+            rows.append(
+                AccessCandidate(
+                    network.nodes[node].role,
+                    ingress_id,
+                    node,
+                    leg["start_s"],
+                    leg["geometry_end_s"],
+                    leg["propagation_delay_s"],
+                )
+            )
     if not rows:
-        raise RouteUnavailable("no_visible_compute_ingress")
-    if mode == "nearest_compute_satellite":
-        return min(rows, key=lambda item: (item.propagation_delay_s, item.satellite_id or ""))
+        raise RouteUnavailable("no_physical_ingress")
     if mode == "longest_visible_compute_satellite":
-        return min(rows, key=lambda item: (-item.end_s, item.satellite_id or ""))
+        return min(rows, key=lambda item: (-item.end_s, item.satellite_id))
     if mode == "highest_energy_compute_satellite":
-        scored: list[tuple[float, str, AccessCandidate]] = []
-        for candidate in rows:
-            satellite = state.satellite_for(str(candidate.satellite_id))
-            advance_satellite_energy(satellite, energy_trace, float(request["arrival_time_s"]))
-            scored.append((-satellite.soc, str(candidate.satellite_id), candidate))
-        return min(scored)[2]
-    raise RouteUnavailable("unsupported_ingress_selection")
+
+        def energy(item):
+            satellite = state.satellite_for(item.satellite_id)
+            preview = replace(satellite)
+            advance_satellite_energy(preview, energy_trace, time_s)
+            return (-preview.soc, item.satellite_id)
+
+        return min(rows, key=energy)
+    return min(
+        rows,
+        key=lambda item: (item.start_s + item.propagation_delay_s, item.satellite_id),
+    )
 
 
 def _preview_candidate(
@@ -288,18 +130,34 @@ def _preview_candidate(
     compute_satellite_id: str,
     isl_bandwidth_bps: float,
 ) -> dict[str, Any]:
-    route = build_route_plan(
-        environment_state,
-        access=access,
-        compute_satellite_id=compute_satellite_id,
-        time_s=float(request["arrival_time_s"]),
-        input_bytes=float(request["input_bytes"]),
-        output_bytes=float(request["output_bytes"]),
-        isl_bandwidth_bps=isl_bandwidth_bps,
+    network = environment_state.network.fork()
+    access_done, access_path = network.transfer(
+        access.ingress_id,
+        access.satellite_id,
+        float(request["arrival_time_s"]),
+        float(request["input_bytes"]),
+        strategy.routing_policy,
+        commit=True,
+        kinds={"sgl"},
     )
-    if route is None:
-        raise RouteUnavailable("no_route_to_compute_satellite")
-    inbound_done_s, inbound_path = execute_route(route.inbound_legs, float(request["arrival_time_s"]))
+    inbound_done_s, relay_path = network.transfer(
+        access.satellite_id,
+        compute_satellite_id,
+        access_done,
+        float(request["input_bytes"]),
+        strategy.routing_policy,
+        commit=True,
+        kinds={
+            "communication_isl",
+            "cross_layer",
+            "cell_isl",
+            "inter_cell",
+        },
+    )
+    inbound_path = (*access_path, *relay_path)
+    route = RoutePlan(
+        access.access_type, access.satellite_id, compute_satellite_id, inbound_path
+    )
     session_id = request.get("session_id")
     prompt_length = int(request["prompt_tokens"])
     reusable_context = min(
@@ -330,6 +188,8 @@ def _preview_candidate(
         isl_bandwidth_bps=isl_bandwidth_bps,
         prefill_rate_table=serving.prefill_rate_table,
         concurrency=comparison_concurrency,
+        network=network,
+        routing_policy=strategy.routing_policy,
     )
     copy_path = copy_plan["path"]
     copied_from = copy_plan["source_satellite_id"]
@@ -353,18 +213,24 @@ def _preview_candidate(
             if strategy.shadow_dvfs_enabled and not bool(raw_window.get("sunlit", True))
             else 1.0
         )
-        prefill_s = prefill_suffix_time_s(
-            serving.prefill_rate_table,
-            prompt_length=prompt_length,
-            cached_prefix_tokens=effective_reuse_tokens,
-            concurrency=concurrency,
-        ) / dvfs
-        decode_s = decode_time_s(
-            serving.decode_rate_table,
-            context_length=prompt_length,
-            output_tokens=request["output_tokens"],
-            concurrency=concurrency,
-        ) / dvfs
+        prefill_s = (
+            prefill_suffix_time_s(
+                serving.prefill_rate_table,
+                prompt_length=prompt_length,
+                cached_prefix_tokens=effective_reuse_tokens,
+                concurrency=concurrency,
+            )
+            / dvfs
+        )
+        decode_s = (
+            decode_time_s(
+                serving.decode_rate_table,
+                context_length=prompt_length,
+                output_tokens=request["output_tokens"],
+                concurrency=concurrency,
+            )
+            / dvfs
+        )
         return {
             "dvfs_scale": dvfs,
             "energy_window": raw_window,
@@ -391,69 +257,72 @@ def _preview_candidate(
     decode_start_s = prefill_done_s
     decode_done_s = reservation.finish_s
     decode_wait_s = 0.0
-    first_token_service_s = decode_time_s(
-        serving.decode_rate_table,
-        context_length=prompt_length,
-        output_tokens=1,
-        concurrency=concurrency,
-    ) / dvfs_scale
+    first_token_service_s = (
+        decode_time_s(
+            serving.decode_rate_table,
+            context_length=prompt_length,
+            output_tokens=1,
+            concurrency=concurrency,
+        )
+        / dvfs_scale
+    )
     first_token_bytes = _first_token_bytes(request)
-    first_token_legs = tuple(replace(leg, payload_bytes=first_token_bytes) for leg in route.outbound_legs)
-    first_done_s, first_path = execute_route(first_token_legs, decode_start_s + first_token_service_s)
-    remaining_output_bytes = max(0.0, float(request["output_bytes"]) - first_token_bytes)
-    remaining_legs = tuple(replace(leg, payload_bytes=remaining_output_bytes) for leg in route.outbound_legs)
-    remaining_done_s, output_path = execute_route(remaining_legs, decode_done_s)
+    first_done_s, first_path = network.transfer(
+        compute_satellite_id,
+        access.ingress_id,
+        decode_start_s + first_token_service_s,
+        first_token_bytes,
+        strategy.routing_policy,
+        commit=True,
+    )
+    remaining_output_bytes = max(
+        0.0, float(request["output_bytes"]) - first_token_bytes
+    )
+    remaining_done_s, output_path = (first_done_s, ())
+    if remaining_output_bytes:
+        remaining_done_s, output_path = network.transfer(
+            compute_satellite_id,
+            access.ingress_id,
+            decode_done_s,
+            remaining_output_bytes,
+            strategy.routing_policy,
+            commit=True,
+        )
+    route = replace(route, outbound_legs=(*first_path, *output_path))
     output_done_s = max(first_done_s, remaining_done_s)
 
-    preview = replace(
-        satellite,
-        compute_queue=replace(
-            satellite.compute_queue,
-            reservations=list(satellite.compute_queue.reservations),
-        ),
-    )
-    advance_satellite_energy(preview, energy_trace, prefill_start_s)
     energy_window = service["energy_window"]
     physical_paths = (inbound_path, first_path, output_path, copy_path)
     link_bytes_by_satellite = _link_bytes_by_satellite(
         physical_paths,
-        {
-            str(row["satellite_id"])
-            for row in environment_state.satellite_catalog
-        },
+        {str(row["satellite_id"]) for row in environment_state.satellite_catalog},
     )
-    compute_link_bytes = link_bytes_by_satellite.get(compute_satellite_id, 0.0)
-    link_update = apply_request_energy(
-        preview,
-        prompt_tokens=0,
-        output_tokens=0,
-        link_bytes=compute_link_bytes,
-        energy_window=energy_window,
-        event_time_s=prefill_start_s,
-        metadata={"request_id": request["request_id"], "preview": True, "energy_stage": "communication"},
-    )
-    compute_update = apply_request_energy(
-        preview,
+    projected_soc_after, energy_violation = _preview_candidate_energy(
+        state=state,
+        network=network,
+        energy_trace=energy_trace,
+        physical_paths=physical_paths,
+        compute_satellite_id=compute_satellite_id,
+        compute_start_s=prefill_start_s,
+        compute_end_s=decode_done_s,
         prompt_tokens=recompute_tokens,
         output_tokens=request["output_tokens"],
-        link_bytes=0.0,
-        energy_window=energy_window,
-        event_time_s=prefill_start_s,
-        metadata={"request_id": request["request_id"], "preview": True, "energy_stage": "compute"},
     )
-    advance_satellite_energy(preview, energy_trace, decode_done_s)
-    energy_score = max(0.0, min(1.0, float(preview.soc)))
+    energy_score = max(0.0, min(1.0, projected_soc_after))
     service_time_s = prefill_service_s + decode_service_s
     queue_wait_s = prefill_wait_s + decode_wait_s
     compute_load_score = 1.0 / (1.0 + queue_wait_s / max(service_time_s, 1e-12))
-    kv_score = effective_reuse_tokens / reusable_context if reusable_context > 0 else 0.0
-    latency_score = 1.0 - max(0.0, min(math.pi, route.arc_distance_rad)) / math.pi
-    candidate_id = f"{access.access_type}:{compute_satellite_id}:{route.path_id}"
-    violations = (
-        ("energy_unavailable",)
-        if link_update["energy_violation"] or compute_update["energy_violation"]
-        else ()
+    kv_score = (
+        effective_reuse_tokens / reusable_context if reusable_context > 0 else 0.0
     )
+    predicted_network_s = sum(
+        float(leg["arrival_s"]) - float(leg["start_s"]) + float(leg["queue_wait_s"])
+        for path in physical_paths
+        for leg in path
+    )
+    latency_score = 1.0 / (1.0 + predicted_network_s)
+    candidate_id = f"{access.access_type}:{compute_satellite_id}:{route.path_id}"
+    violations = ("energy_unavailable",) if energy_violation else ()
     candidate = SchedulerCandidate(
         candidate_id=candidate_id,
         compute_satellite_id=compute_satellite_id,
@@ -463,11 +332,12 @@ def _preview_candidate(
         kv_reuse_score=kv_score,
         energy_score=energy_score,
         compute_load_score=compute_load_score,
-        arc_distance_rad=route.arc_distance_rad,
+        predicted_network_s=predicted_network_s,
         compute_queue_wait_s=queue_wait_s,
         hard_gate_violations=violations,
     )
     return {
+        "network": network,
         "candidate": candidate,
         "route": route,
         "inbound_path": inbound_path,
@@ -490,7 +360,7 @@ def _preview_candidate(
         "prefill_wait_s": prefill_wait_s,
         "decode_wait_s": decode_wait_s,
         "dvfs_scale": dvfs_scale,
-        "projected_soc_after": preview.soc,
+        "projected_soc_after": projected_soc_after,
         "local_hit_tokens": local_hit_tokens,
         "effective_reuse_tokens": effective_reuse_tokens,
         "recompute_tokens": recompute_tokens,
@@ -499,144 +369,79 @@ def _preview_candidate(
     }
 
 
-def _commit_candidate(
+def _compute_members(network: NetworkState, node_id: str) -> list[str]:
+    cell = network.nodes[node_id].cell_id
+    if cell:
+        return sorted(
+            node.node_id
+            for node in network.nodes.values()
+            if node.role == "compute" and node.cell_id == cell
+        )
+    return [node_id]
+
+
+def _preview_candidate_energy(
     *,
     state: RuntimeState,
-    request: dict[str, Any],
-    strategy: Any,
-    environment_state: Any,
+    network: NetworkState,
     energy_trace: Any,
-    serving: Any,
-    payload: dict[str, Any],
-    selection: Any,
-) -> RuntimeRequestRecord:
-    route: RoutePlan = payload["route"]
-    satellite = state.satellite_for(route.compute_satellite_id)
-    affected_ids = set(payload["link_bytes_by_satellite"])
-    affected_ids.add(route.compute_satellite_id)
-    ledger_starts = {
-        satellite_id: len(state.satellite_for(satellite_id).energy_ledger)
-        for satellite_id in affected_ids
-    }
-    reservation = satellite.compute_queue.reserve(payload["reservation"])
-    prefill_start_s = reservation.start_s
-    prefill_done_s = prefill_start_s + payload["prefill_service_s"]
-    prefill_wait_s = max(0.0, prefill_start_s - payload["copy_done_s"])
-    decode_start_s = prefill_done_s
-    decode_done_s = reservation.finish_s
-    decode_wait_s = 0.0
-    if not math.isclose(prefill_start_s, payload["prefill_start_s"], abs_tol=1e-9):
-        raise ValueError("candidate_preview_state_changed")
-    link_violation = False
-    for satellite_id, link_bytes in sorted(payload["link_bytes_by_satellite"].items()):
-        endpoint = state.satellite_for(satellite_id)
-        advance_satellite_energy(endpoint, energy_trace, prefill_start_s)
-        endpoint_window = energy_window_at(energy_trace, satellite_id, prefill_start_s)
-        update = apply_request_energy(
-            endpoint,
-            prompt_tokens=0,
-            output_tokens=0,
-            link_bytes=link_bytes,
-            energy_window=endpoint_window,
-            event_time_s=prefill_start_s,
-            metadata={"request_id": request["request_id"], "energy_stage": "communication"},
+    physical_paths,
+    compute_satellite_id: str,
+    compute_start_s: float,
+    compute_end_s: float,
+    prompt_tokens: int,
+    output_tokens: int,
+) -> tuple[float, bool]:
+    """Check every physical participant at its predicted debit time, in isolation.
+
+    Match execution: charge each hop's endpoints when serialization starts and
+    share compute work across all cell members. A healthy compute target cannot
+    make an energy-starved relay or cell member into a feasible candidate.
+    """
+    events = []
+    for path in physical_paths:
+        for leg in path:
+            size = float(leg["payload_bytes"])
+            if leg.get("link_kind", leg["kind"]) != "sgl":
+                size /= 2
+            for endpoint in (leg["source_node_id"], leg["target_node_id"]):
+                if network.nodes[endpoint].role != "ground":
+                    events.append((float(leg["start_s"]), endpoint, 0.0, 0.0, size))
+    members = _compute_members(network, compute_satellite_id)
+    for member in members:
+        events.append(
+            (
+                compute_start_s,
+                member,
+                prompt_tokens / len(members),
+                output_tokens / len(members),
+                0.0,
+            )
         )
-        link_violation = link_violation or bool(update["energy_violation"])
-    advance_satellite_energy(satellite, energy_trace, prefill_start_s)
-    compute_update = apply_request_energy(
-        satellite,
-        prompt_tokens=payload["recompute_tokens"],
-        output_tokens=request["output_tokens"],
-        link_bytes=0.0,
-        energy_window=payload["energy_window"],
-        event_time_s=prefill_start_s,
-        metadata={"request_id": request["request_id"], "preview": False},
+    previews = {}
+    violation = False
+    for time_s, node_id, prompt, output, size in sorted(events, key=lambda row: row[0]):
+        if node_id not in previews:
+            # Energy histories are immutable tuples; all new events and snapshots
+            # belong to this copy, including rejected/unselected candidates.
+            previews[node_id] = replace(state.compute_nodes[node_id])
+        preview = previews[node_id]
+        advance_satellite_energy(preview, energy_trace, time_s)
+        update = apply_request_energy(
+            preview,
+            prompt_tokens=prompt,
+            output_tokens=output,
+            link_bytes=size,
+            energy_window=energy_window_at(energy_trace, node_id, time_s),
+            event_time_s=time_s,
+            metadata={"preview": True},
+        )
+        violation |= update["energy_violation"]
+    preview = previews[compute_satellite_id]
+    advance_satellite_energy(
+        preview, energy_trace, max(compute_end_s, preview.last_energy_update_s)
     )
-    advance_satellite_energy(satellite, energy_trace, decode_done_s)
-    touch_kv_entry(
-        state,
-        satellite_id=payload["copied_from"],
-        session_id=str(request.get("session_id")) if request.get("session_id") else None,
-        now_s=payload["copy_done_s"],
-    )
-    context_tokens = int(request["prompt_tokens"]) + int(request["output_tokens"])
-    kv_event = commit_session_kv(
-        state,
-        session_id=str(request.get("session_id")) if request.get("session_id") else None,
-        satellite_id=route.compute_satellite_id,
-        context_tokens=context_tokens,
-        now_s=decode_done_s,
-        copied_from=payload["copied_from"],
-    )
-    selected_path = tuple(
-        (*payload["inbound_path"], *payload["copy_path"], *payload["output_path"])
-    )
-    ttft_s = payload["first_done_s"] - float(request["arrival_time_s"])
-    e2e_s = payload["output_done_s"] - float(request["arrival_time_s"])
-    energy_ledger = tuple(
-        row
-        for satellite_id in sorted(affected_ids)
-        for row in state.satellite_for(satellite_id).energy_ledger[ledger_starts[satellite_id]:]
-    )
-    return RuntimeRequestRecord(
-        request_id=request["request_id"],
-        arrival_time_s=request["arrival_time_s"],
-        prompt_tokens=request["prompt_tokens"],
-        output_tokens=request["output_tokens"],
-        session_id=request.get("session_id"),
-        region_id=request.get("region_id"),
-        action_type="compute",
-        access_type=route.access_type,
-        access_satellite_id=route.access_satellite_id,
-        access_compute_node_id=route.access_satellite_id,
-        serving_compute_node_id=route.compute_satellite_id,
-        serving_satellite_id=route.compute_satellite_id,
-        compute_owner_compute_node_id=route.compute_satellite_id,
-        compute_owner_compute_node_ids=(route.compute_satellite_id,),
-        compute_owner_satellite_id=route.compute_satellite_id,
-        compute_owner_satellite_ids=(route.compute_satellite_id,),
-        dvfs_scale=payload["dvfs_scale"],
-        completed=True,
-        prefill_queue_wait_s=prefill_wait_s,
-        decode_queue_wait_s=decode_wait_s,
-        prefill_service_s=payload["prefill_service_s"],
-        decode_service_s=payload["decode_service_s"],
-        link_transmission_s=sum(float(leg.get("transmission_s", 0.0)) for leg in selected_path),
-        ttft_s=ttft_s,
-        e2e_s=e2e_s,
-        selected_path=selected_path,
-        soc_before=compute_update["soc_before"],
-        soc_after=satellite.soc,
-        energy_violation=link_violation or compute_update["energy_violation"],
-        energy_ledger=energy_ledger,
-        compute_sunlit=bool(payload["energy_window"].get("sunlit", True)),
-        kv_capacity_admission=kv_event.get("admission"),
-        kv_serve_action=kv_event.get("action"),
-        kv_hit_tokens=payload["effective_reuse_tokens"],
-        kv_copied_tokens=payload["copied_tokens"],
-        kv_miss_tokens=payload["recompute_tokens"],
-        context_recompute_tokens=payload["recompute_tokens"],
-        kv_evicted_tokens=int(kv_event.get("evicted_tokens", 0) or 0),
-        kv_evicted_bytes=(
-            float(kv_event.get("evicted_tokens", 0) or 0)
-            * float(serving.kv_cache_bytes_per_token or 0.0)
-        ),
-        kv_evicted_entry_count=len(tuple(kv_event.get("evicted_session_ids", ()) or ())),
-        kv_capacity_tokens=kv_event.get("capacity_tokens"),
-        kv_occupancy_tokens_before=kv_event.get("occupancy_tokens_before"),
-        kv_occupancy_tokens_after=kv_event.get("occupancy_tokens_after"),
-        kv_copy_source_satellite_id=payload["copied_from"],
-        kv_copy_source_compute_node_id=payload["copied_from"],
-        bottleneck_reason="compute_queue" if prefill_wait_s + decode_wait_s > 0.0 else "none",
-        provenance={
-            "score": selection.score,
-            "score_terms": selection.score_terms,
-            "communication_queue_model": "not_modeled",
-            "trace_id": environment_state.trace_id,
-            "serving_concurrency_at_admission": payload["concurrency_at_admission"],
-            "serving_rate_model": "arrival_snapshot_fixed_rate",
-        },
-    )
+    return float(preview.soc), violation
 
 
 def _preview_kv_copy(
@@ -654,6 +459,8 @@ def _preview_kv_copy(
     isl_bandwidth_bps: float,
     prefill_rate_table: tuple[dict[str, Any], ...],
     concurrency: int,
+    network: NetworkState,
+    routing_policy: str = "earliest_arrival",
 ) -> dict[str, Any]:
     """Choose a same-session source only when copy beats local recompute."""
 
@@ -691,18 +498,25 @@ def _preview_kv_copy(
         )
         if copied_tokens <= 0:
             continue
-        legs = build_isl_transfer_legs(
-            environment_state,
-            source_satellite_id=source_satellite_id,
-            target_satellite_id=target_satellite_id,
-            time_s=start_s,
-            payload_bytes=copied_tokens * kv_bytes_per_token,
-            bandwidth_bps=isl_bandwidth_bps,
-        )
-        if legs is None:
-            continue
+        trial = network.fork()
         try:
-            done_s, path = execute_route(legs, start_s)
+            done_s, path = trial.transfer(
+                source_satellite_id,
+                target_satellite_id,
+                start_s,
+                copied_tokens * kv_bytes_per_token,
+                routing_policy,
+                commit=True,
+                kinds={
+                    "communication_isl",
+                    "cross_layer",
+                    "cell_isl",
+                    "inter_cell",
+                },
+            )
+            path = tuple(
+                {**leg, "link_kind": leg["kind"], "kind": "kv_copy"} for leg in path
+            )
         except RouteUnavailable:
             continue
         migration_time_s = done_s - start_s
@@ -715,15 +529,18 @@ def _preview_kv_copy(
         total_time_s = migration_time_s + copied_prefill_time_s
         if total_time_s >= local_prefill_time_s:
             continue
-        options.append({
-            "source_satellite_id": source_satellite_id,
-            "source_reusable_tokens": source_reusable_tokens,
-            "copied_tokens": copied_tokens,
-            "done_s": done_s,
-            "migration_time_s": migration_time_s,
-            "total_time_s": total_time_s,
-            "path": path,
-        })
+        options.append(
+            {
+                "network": trial,
+                "source_satellite_id": source_satellite_id,
+                "source_reusable_tokens": source_reusable_tokens,
+                "copied_tokens": copied_tokens,
+                "done_s": done_s,
+                "migration_time_s": migration_time_s,
+                "total_time_s": total_time_s,
+                "path": path,
+            }
+        )
     if not options:
         return empty
     selected = min(
@@ -734,6 +551,7 @@ def _preview_kv_copy(
             option["source_satellite_id"],
         ),
     )
+    network.calendars = selected["network"].calendars
     return {
         "source_satellite_id": selected["source_satellite_id"],
         "copied_tokens": selected["copied_tokens"],
@@ -742,7 +560,9 @@ def _preview_kv_copy(
     }
 
 
-def _build_energy_trace(environment_state: Any, profile: dict[str, Any]) -> tuple[Any, float]:
+def _build_energy_trace(
+    environment_state: Any, profile: dict[str, Any]
+) -> tuple[Any, float]:
     required = (
         "battery_capacity_j",
         "charge_rate_w",
@@ -761,51 +581,39 @@ def _build_energy_trace(environment_state: Any, profile: dict[str, Any]) -> tupl
         "compute_energy_j_per_token": float(profile["compute_energy_j_per_token"]),
         "link_energy_j_per_byte": float(profile["link_energy_j_per_byte"]),
         "soc_min": float(profile["soc_min"]),
-        "battery_charge_efficiency": float(profile.get("battery_charge_efficiency", 1.0)),
-        "battery_discharge_efficiency": float(profile.get("battery_discharge_efficiency", 1.0)),
-        "energy_accounting_mode": str(profile.get("energy_accounting_mode", "event_incremental_v1")),
+        "battery_charge_efficiency": float(
+            profile.get("battery_charge_efficiency", 1.0)
+        ),
+        "battery_discharge_efficiency": float(
+            profile.get("battery_discharge_efficiency", 1.0)
+        ),
+        "energy_accounting_mode": str(
+            profile.get("energy_accounting_mode", "event_incremental_v1")
+        ),
     }
     windows = tuple(
         {
             **dict(window),
             **static,
-            "charge_rate_w": float(profile["charge_rate_w"]) if bool(window.get("sunlit", not window.get("eclipsed", False))) else 0.0,
+            **{
+                k: v
+                for k, v in profile.get("node_profiles", {})
+                .get(str(window["satellite_id"]), {})
+                .items()
+                if k != "provenance"
+            },
+            "charge_rate_w": float(
+                profile.get("node_profiles", {}).get(
+                    str(window["satellite_id"]), profile
+                )["charge_rate_w"]
+            )
+            if bool(window.get("sunlit", not window.get("eclipsed", False)))
+            else 0.0,
             "sunlit": bool(window.get("sunlit", not window.get("eclipsed", False))),
         }
         for window in environment_state.sunlight_windows
     )
     return SimpleNamespace(energy_windows=windows), float(profile["initial_soc"])
-
-
-def _architecture_bandwidth(
-    constellation: dict[str, Any],
-    keys: tuple[str, ...],
-    *,
-    required: bool,
-) -> float:
-    architecture = dict(constellation.get("architecture") or {})
-    value = _recursive_first(architecture, keys)
-    if value is None:
-        if required:
-            raise ValueError(f"runtime_bandwidth_missing:{keys[0]}")
-        return 0.0
-    numeric = float(value)
-    if numeric <= 0.0:
-        raise ValueError(f"runtime_bandwidth_invalid:{keys[0]}")
-    return numeric
-
-
-def _recursive_first(value: Any, keys: tuple[str, ...]) -> Any:
-    if isinstance(value, dict):
-        for key in keys:
-            if value.get(key) is not None:
-                numeric = value[key]
-                return float(numeric) * 1e9 if key.endswith("_gbps") else numeric
-        for nested in value.values():
-            found = _recursive_first(nested, keys)
-            if found is not None:
-                return found
-    return None
 
 
 def _link_bytes_by_satellite(
@@ -817,11 +625,18 @@ def _link_bytes_by_satellite(
         for leg in path:
             kind = str(leg.get("kind") or "")
             payload_bytes = float(leg.get("payload_bytes", 0.0) or 0.0)
-            endpoints = (str(leg.get("source_node_id") or ""), str(leg.get("target_node_id") or ""))
+            endpoints = (
+                str(leg.get("source_node_id") or ""),
+                str(leg.get("target_node_id") or ""),
+            )
             for endpoint in endpoints:
                 if endpoint not in satellite_ids:
                     continue
-                share = payload_bytes / 2.0 if kind in {"isl", "kv_copy"} else payload_bytes
+                share = (
+                    payload_bytes / 2.0
+                    if str(leg.get("link_kind", kind)) != "sgl"
+                    else payload_bytes
+                )
                 result[endpoint] = result.get(endpoint, 0.0) + share
     return result
 
@@ -844,7 +659,9 @@ def _uncompleted(request: dict[str, Any], reason: str) -> RuntimeRequestRecord:
     )
 
 
-def _decision(request: dict[str, Any], selection: Any, candidates: Any) -> dict[str, Any]:
+def _decision(
+    request: dict[str, Any], selection: Any, candidates: Any
+) -> dict[str, Any]:
     return {
         "request_id": request.get("request_id"),
         "selected_candidate_id": getattr(selection, "selected_candidate_id", None),
@@ -855,10 +672,15 @@ def _decision(request: dict[str, Any], selection: Any, candidates: Any) -> dict[
 
 
 def _all_uncompleted(simulation_spec: Any, reason: str) -> RuntimeEngineResult:
-    records = tuple(_uncompleted(normalize_runtime_request(row), reason) for row in simulation_spec.requests)
+    records = tuple(
+        _uncompleted(normalize_runtime_request(row), reason)
+        for row in simulation_spec.requests
+    )
     return RuntimeEngineResult(
         records=records,
-        decision_traces=tuple(_decision(row, None, ()) for row in simulation_spec.requests),
+        decision_traces=tuple(
+            _decision(row, None, ()) for row in simulation_spec.requests
+        ),
         state_summary=RuntimeState().to_dict(),
         warnings=(reason,),
         provenance={"runtime_engine": "deterministic_event_runtime"},

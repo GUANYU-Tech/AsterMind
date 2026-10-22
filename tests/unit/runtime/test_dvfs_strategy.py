@@ -7,7 +7,7 @@ from orbitserve.runtime.engine.decision import SchedulerCandidate, build_candida
 class RuntimeStrategyTests(unittest.TestCase):
     def test_contract_contains_only_resolved_strategy_parameters(self):
         strategy = RuntimeStrategySpec(
-            ingress_selection="communication_satellite",
+            ingress_selection="nearest_satellite",
             latency_weight=0.4,
             kv_reuse_weight=0.3,
             energy_weight=0.2,

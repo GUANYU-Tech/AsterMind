@@ -1,69 +1,71 @@
 {
+  "schema_version": "orbitserve.experiment.v1",
   "experiment_id": "smoke_tp_pp_ep_parallel",
-  "description": "MoE serving throughput smoke test with cross-satellite TP, PP, and EP over laser ISL.",
-  "constellation": {
-    "name": "smoke_walker_550km_tp_pp_ep",
-    "shells": [
-      {
-        "name": "walker_550_53_tp_pp_ep",
-        "orbit_family": "walker",
-        "altitude_km": 550,
-        "inclination_deg": 53,
-        "plane_count": 2,
-        "sats_per_plane": 4,
-        "min_elevation_deg": 25,
-        "phase_factor": 1
-      }
-    ]
+  "physical_network": "../network/coupled_small.json",
+  "hardware": {
+    "accelerator": "h200_sxm",
+    "compute_payload": {
+      "accelerator_count": 16,
+      "purchase_cost_per_unit_usd": 50000
+    },
+    "communication": {
+      "isl_terminal_count": 6,
+      "isl_terminal_bandwidth_gbps": 100,
+      "ground_link_bandwidth_gbps": 1
+    },
+    "power": {
+      "battery_capacity_wh": 10000,
+      "solar_array_power_w": 10000
+    }
   },
-  "costing": {
-    "scale_by": "satellite_count"
-  },
-  "workload": {
-    "bundle_dir": "tests/fixtures/workloads/smoke_flat_single_turn_direct"
+  "communication_hardware": {
+    "compute_payload": {
+      "accelerator_count": 0
+    },
+    "communication": {
+      "isl_terminal_count": 6,
+      "isl_terminal_bandwidth_gbps": 100,
+      "ground_link_bandwidth_gbps": 1
+    }
   },
   "serving": {
-    "model": {
-      "preset": "deepseek-moe-671b",
-      "precision": "bf16"
+    "max_concurrency": 2,
+    "prompt_length_grid": [
+      1,
+      32,
+      68,
+      128,
+      256
+    ],
+    "context_length_grid": [
+      1,
+      32,
+      68,
+      128,
+      256
+    ],
+    "formation": {
+      "member_count": 4,
+      "topology": "ring",
+      "link_bandwidth_gbps": 100,
+      "link_propagation_delay_s": 5e-06
     },
     "parallelism": {
-      "strategy": "tensor_pipeline_expert_parallel",
-      "tensor_parallel_degree": 2,
-      "pipeline_parallel_degree": 2,
-      "expert_parallel_degree": 4,
-      "microbatch_count": 4,
-      "max_satellites": 8,
-      "expert_parallel_imbalance_factor": 1.0,
-      "expert_parallel_startup_us": 0
+      "tp": 2,
+      "pp": 2,
+      "ep": 2
     },
-    "prefill": {
-      "batching_window_ms": 20,
-      "batch_size": 1
-    },
-    "decode": {
-      "batching_window_ms": 20,
-      "batch_size": 4
-    },
-    "kv_cache_capacity_gb": null,
-    "effective_utilization": 0.5
+    "model": {
+      "name": "deepseek-v3"
+    }
   },
-  "simulation": {
-    "duration_s": 21600,
-    "step_s": 60,
-    "epoch": "2026-06-16T00:00:00Z",
-    "use_stk_calibrated_surrogate": false
+  "workload": {
+    "bundle_dir": "../workloads/coupled_deepseek"
   },
-  "scheduler": {
-    "policy": "orbitserve",
-    "lookahead_orbits": 1
-  },
-  "dse": {
-    "enabled": false,
-    "sweep": {}
-  },
-  "hardware": {
-    "mode": "from_cost_case",
-    "source_case_path": "examples/single_satellite/h200_gpu_derived.json"
+  "runtime_strategy": {
+    "latency_weight": 1,
+    "kv_reuse_weight": 0,
+    "energy_weight": 0,
+    "compute_load_weight": 0
   }
 }

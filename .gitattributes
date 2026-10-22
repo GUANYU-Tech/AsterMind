@@ -4,3 +4,7 @@
 src/workloads/**/*.json   text eol=lf
 src/workloads/**/*.jsonl  text eol=lf
 src/workloads/**/*.csv    text eol=lf
+
+# Pinned Orbit reference data hashes require canonical LF bytes on every host.
+src/orbitserve/orbit/data/iers/** text eol=lf
+src/orbitserve/orbit/data/stk_validation/*.json text eol=lf

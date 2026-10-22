@@ -17,7 +17,7 @@ CORE = ROOT / "src" / "orbitserve"
 class CoreModuleBoundaryTests(unittest.TestCase):
     def test_public_contracts_are_exported(self):
         for module, names in {
-            architecture: ("HardwareSpec", "ResolvedHardware", "SatelliteHardwareProfile", "resolve_experiment_hardware"),
+            architecture: ("HardwareSpec", "ResolvedArchitecture", "SatelliteHardwareProfile", "resolve_architecture"),
             orbit: ("OrbitTraceManifest", "OrbitTraceBundle", "generate_orbit_trace", "load_orbit_trace"),
             workload: ("WorkloadBundleRef", "WorkloadGenerationResult", "materialize_workload_bundle"),
             serving: ("ServingSpec", "ServingThroughputEstimate", "estimate_serving_throughput"),

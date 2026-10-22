@@ -36,8 +36,8 @@ from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
 from orbitserve.workload import (
-    BUNDLE_FILES, CAUSAL_BUNDLE_SCHEMA, CANONICALIZATION,
-    SESSION_REQUEST_KEYS, REGION_KEYS, GATEWAY_KEYS, TIMEBIN_FIELDS,
+    CAUSAL_BUNDLE_SCHEMA, CANONICALIZATION,
+    TIMEBIN_FIELDS,
     bundle_hash, canonical_json_bytes, load_workload_bundle,
 )
 _HERE = Path(__file__).resolve().parent
@@ -387,7 +387,8 @@ def build(args: argparse.Namespace) -> Path:
     workload_id = f"main_composite_chat_{args.profile_pattern}"
     epoch = datetime.fromisoformat(args.epoch.replace("Z", "+00:00")).astimezone(timezone.utc)
     source = Path(args.input)
-    source_hash = sha256_file(source) if getattr(args, "compute_source_sha256", False) else None
+    if getattr(args, "compute_source_sha256", False):
+        sha256_file(source)
     conversations = read_sharechat(source, max_sessions=args.max_sessions, require_timestamps=args.require_turn_timestamps)
     countries = load_countries(Path(args.countries))
     country_names, country_weights = [row["country"] for row in countries], [row["weight"] for row in countries]

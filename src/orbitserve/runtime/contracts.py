@@ -31,7 +31,7 @@ RUNTIME_RESULT_FIELDS = frozenset(
 
 INGRESS_SELECTIONS = frozenset(
     {
-        "communication_satellite",
+        "nearest_satellite",
         "nearest_compute_satellite",
         "longest_visible_compute_satellite",
         "highest_energy_compute_satellite",
@@ -43,7 +43,8 @@ INGRESS_SELECTIONS = frozenset(
 class RuntimeStrategySpec:
     """Complete scheduling rule fixed for one Runtime simulation."""
 
-    ingress_selection: str = "communication_satellite"
+    ingress_selection: str = "nearest_satellite"
+    routing_policy: str = "earliest_arrival"
     latency_weight: float = 0.25
     kv_reuse_weight: float = 0.25
     energy_weight: float = 0.25
@@ -53,6 +54,8 @@ class RuntimeStrategySpec:
     kv_cache_copy_enabled: bool = False
 
     def __post_init__(self) -> None:
+        if self.routing_policy not in {"min_hops", "min_propagation", "earliest_arrival"}:
+            raise ValueError("unsupported routing_policy")
         if self.ingress_selection not in INGRESS_SELECTIONS:
             known = ", ".join(sorted(INGRESS_SELECTIONS))
             raise ValueError(f"ingress_selection must be one of: {known}")
@@ -130,7 +133,7 @@ class ServingCapacityProfile:
             kv_cache_capacity_tokens=_optional_int(throughput.get("kv_cache_capacity_tokens")),
             max_context_tokens=_optional_int(throughput.get("max_context_tokens")),
             internal_comm_summary=_dict(throughput.get("internal_comm_summary")),
-            internal_comm_accounting=str(throughput.get("internal_comm_accounting", "embedded")),
+            internal_comm_accounting=str(throughput.get("internal_communication_accounting",throughput.get("internal_comm_accounting", "embedded"))),
             warnings=_warnings_from_payload(throughput),
         )
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 from .loader import load_experiment_spec
@@ -12,8 +13,12 @@ from .runner import run_experiment
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Run an OrbitServe experiment manifest.")
-    parser.add_argument("manifest", type=Path, help="Path to an experiment JSON manifest.")
+    parser = argparse.ArgumentParser(
+        description="Run an OrbitServe experiment manifest."
+    )
+    parser.add_argument(
+        "manifest", type=Path, help="Path to an experiment JSON manifest."
+    )
     parser.add_argument("--out", type=Path, help="Optional output JSON path.")
     parser.add_argument("--indent", type=int, default=2, help="JSON indentation.")
     parser.add_argument(
@@ -35,7 +40,16 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     spec = load_experiment_spec(args.manifest)
-    result = run_experiment(spec)
+    execution_root = (
+        args.artifact_dir
+        or default_artifact_dir_for_output(args.out)
+        or Path("results/experiments") / spec.experiment_id
+    )
+    result = run_experiment(
+        spec,
+        output_dir=execution_root,
+        progress=lambda stage: print(stage, file=sys.stderr, flush=True),
+    )
     output_mode = "full" if args.full else args.output_mode
     artifact_dir = (
         None

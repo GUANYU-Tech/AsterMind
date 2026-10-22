@@ -1,4 +1,3 @@
-import sys
 import unittest
 from collections import OrderedDict
 from pathlib import Path
@@ -17,12 +16,11 @@ from orbitserve.baselines.ground.runtime import (
     run_ground_runtime,
 )
 from orbitserve.experiments import load_experiment_spec, run_experiment
-from orbitserve.runtime import RuntimeScenario, RuntimeStrategySpec
+from orbitserve.baselines.ground.contracts import GroundScenario as RuntimeScenario, GroundStrategySpec as RuntimeStrategySpec
 from orbitserve.experiments.runtime_dispatch import evaluate_runtime_performance
-from orbitserve.runtime.engine.trace_backed import run_trace_backed_runtime
-from orbitserve.runtime.metrics.runtime_metrics import aggregate_runtime_records
-from orbitserve.runtime.metrics.runtime_records import RuntimeRequestRecord
-from orbitserve.runtime import RuntimeStrategySpec, get_scheduler
+from orbitserve.baselines.ground.evaluation import aggregate_ground_records as aggregate_runtime_records
+from orbitserve.baselines.ground.contracts import GroundRequestRecord as RuntimeRequestRecord
+from orbitserve.baselines.ground.contracts import get_ground_scheduler as get_scheduler
 
 
 class TraceBundleWithoutSatelliteCatalog:
@@ -188,6 +186,7 @@ class GroundBaselineRuntimeTests(unittest.TestCase):
             }
         )
 
+        scheduler_spec=get_scheduler(runtime_strategy)
         self.assertEqual(scheduler_spec.ground_config, ground_config)
         self.assertEqual(scheduler_spec.to_dict()["ground_config"], ground_config)
         self.assertEqual(runtime_strategy.ground_config, ground_config)
@@ -1198,60 +1197,17 @@ class GroundBaselineRuntimeTests(unittest.TestCase):
         )
 
     def test_reproduction_manifest_promotes_ground_scope_and_tail_metrics(self):
-        root = Path(__file__).resolve().parents[3]
-        spec = load_experiment_spec(
-            root / "examples/experiments/skywalker_ground_reproduction.json"
-        )
-        result = run_experiment(spec)
-        payload = result.to_dict()
-        runtime = payload["performance"]["details"]["runtime"]
-
-        self.assertEqual(
-            payload["module_status"]["simulation"],
-            "not_required_terrestrial_baseline",
-        )
-        self.assertEqual(
-            payload["module_status"]["serving_throughput"],
-            "ground_service_model_evaluated",
-        )
-        self.assertIsNotNone(payload["performance"]["ttft_p99_s"])
-        self.assertIsNotNone(payload["performance"]["e2e_p99_s"])
-        self.assertEqual(
-            payload["performance"]["link_delay_p95_s"],
-            runtime["runtime_metrics"]["ground_network_delay_p95_s"],
-        )
-        self.assertEqual(
-            runtime["runtime_metrics"]["ground_output_reservation_exceeded_count"],
-            0,
-        )
-        self.assertGreater(
-            runtime["runtime_metrics"]["completed_request_throughput_per_s"],
-            runtime["runtime_metrics"]["useful_request_throughput_per_s"],
-        )
-        self.assertGreater(
-            runtime["runtime_metrics"]["completed_token_throughput_per_s"],
-            runtime["runtime_metrics"]["useful_token_throughput_per_s"],
-        )
-        self.assertGreater(
-            runtime["runtime_metrics"]["completed_output_token_throughput_per_s"],
-            0.0,
-        )
-        self.assertEqual(
-            runtime["runtime_metrics"]["completed_throughput_token_accounting"],
-            "prompt_plus_output_and_output_only_both_reported",
-        )
-        self.assertTrue(
-            any(
-                "SkyWalker terrestrial reproduction surrogate" in warning
-                for warning in payload["performance"]["warnings"]
-            )
-        )
-        self.assertFalse(
-            any(
-                "idealized compute-only" in warning
-                for warning in payload["performance"]["warnings"]
-            )
-        )
+        root=Path(__file__).resolve().parents[3]
+        spec=load_experiment_spec(root/"examples/experiments/skywalker_ground_reproduction.json")
+        result=run_experiment(spec)
+        runtime=result.runtime
+        self.assertTrue(runtime.evaluated)
+        self.assertEqual(runtime.scope,"skywalker_ground_reproduction_surrogate")
+        self.assertEqual(result.module_status["orbit"],"not_required_terrestrial_baseline")
+        self.assertEqual(len(runtime.request_records),3)
+        self.assertFalse(runtime.valid_for_paper_main_results)
+        self.assertGreater(runtime.runtime_metrics["useful_request_throughput_per_s"],0)
+        self.assertIsNotNone(runtime.runtime_metrics["ground_network_delay_p95_s"])
 
     def test_client_harness_serializes_programs_but_not_requests_inside_a_program(self):
         payload = _ground_strategy(

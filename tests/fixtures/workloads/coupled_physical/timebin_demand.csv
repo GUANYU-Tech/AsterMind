@@ -1,0 +1,2 @@
+time_bin_start_s,time_bin_end_s,region_id,request_count,prompt_tokens_total,new_user_tokens_total,output_tokens_total
+0,60,r0,3,132,96,12

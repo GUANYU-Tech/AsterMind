@@ -16,7 +16,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from ...common import to_jsonable
-from ...runtime import RuntimeRequestRecord
+from .contracts import GroundRequestRecord as RuntimeRequestRecord
 
 
 TERRESTRIAL_NETWORK_TRACE = "terrestrial_network_surrogate"

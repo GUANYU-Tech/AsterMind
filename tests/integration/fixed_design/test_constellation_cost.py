@@ -1,60 +1,39 @@
-from __future__ import annotations
-
 import json
 import unittest
-from dataclasses import replace
-from pathlib import Path
-
-from orbitserve.architecture.hardware import resolve_experiment_hardware
-from orbitserve.experiments import load_experiment_spec
+from orbitserve.architecture import resolve_architecture
 from orbitserve.experiments.constellation_cost import estimate_constellation_cost
-
-
-ROOT = Path(__file__).resolve().parents[3]
-MANIFEST = ROOT / "tests/fixtures/manifests/smoke_clustered_constellation.json"
+from tests.system_case import physical_case
 
 
 class ConstellationCostTests(unittest.TestCase):
-    def _estimate(self, spec):
-        hardware = resolve_experiment_hardware(spec.hardware, base_dir=ROOT)
-        return estimate_constellation_cost(
-            spec.constellation,
+    def test_cost_scales_architecture_per_member_profile(self):
+        spec = physical_case()
+        hardware = resolve_architecture(spec.hardware)
+        result = estimate_constellation_cost(
+            {"compute_node_count": 2},
             spec.costing,
-            cost_limits=hardware.cost_limits,
-            cost_config=hardware.cost_config,
-            single_satellite_case_path=hardware.single_satellite_case_path,
+            resolved_architecture=hardware,
+            formation_member_count=4,
         )
-
-    def test_constellation_cost_scales_immutable_single_satellite_cost(self) -> None:
-        spec = load_experiment_spec(MANIFEST)
-        result = self._estimate(spec)
-        self.assertTrue(result.evaluated)
-        self.assertEqual(result.satellite_count, spec.constellation.satellite_count)
+        self.assertEqual(result.physical_satellite_count, 8)
         self.assertAlmostEqual(
-            result.total_cost_usd,
-            result.single_satellite["C_sat_usd"] * spec.constellation.satellite_count,
+            result.total_cost_usd, 8 * hardware.cost_profile.total_cost_usd
         )
-
-    def test_cost_result_is_json_serializable(self) -> None:
-        result = self._estimate(load_experiment_spec(MANIFEST))
         json.dumps(result.to_dict())
 
-    def test_orbit_geometry_does_not_rewrite_single_satellite_hardware(self) -> None:
-        spec = load_experiment_spec(MANIFEST)
-        first = self._estimate(spec)
-        changed_design = replace(
-            spec.constellation,
-            name="same_count_different_orbit",
-        )
-        hardware = resolve_experiment_hardware(spec.hardware, base_dir=ROOT)
-        second = estimate_constellation_cost(
-            changed_design,
+    def test_orbit_metadata_does_not_rewrite_immutable_hardware(self):
+        spec = physical_case()
+        hardware = resolve_architecture(spec.hardware)
+        a = estimate_constellation_cost(
+            {"compute_node_count": 2, "altitude_km": 500},
             spec.costing,
-            cost_limits=hardware.cost_limits,
-            cost_config=hardware.cost_config,
+            resolved_architecture=hardware,
+            formation_member_count=4,
         )
-        self.assertEqual(first.single_satellite, second.single_satellite)
-
-
-if __name__ == "__main__":
-    unittest.main()
+        b = estimate_constellation_cost(
+            {"compute_node_count": 2, "altitude_km": 900},
+            spec.costing,
+            resolved_architecture=hardware,
+            formation_member_count=4,
+        )
+        self.assertEqual(a.single_satellite, b.single_satellite)

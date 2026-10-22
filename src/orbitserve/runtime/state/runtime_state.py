@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from ...common import to_jsonable
 from .resources import ComputeConcurrencyState, ComputeNodeState
 
 if TYPE_CHECKING:

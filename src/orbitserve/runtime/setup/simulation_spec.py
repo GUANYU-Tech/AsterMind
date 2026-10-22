@@ -4,46 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
+import math
 
 from ...common import to_jsonable
 from ..contracts import RuntimeStrategySpec, ServingCapacityProfile
-
-
-@dataclass(frozen=True)
-class CommunicationIngressProfile:
-    """Normalized Runtime view of an abstract satellite-internet ingress."""
-
-    altitude_km: float | None = None
-    uplink_bandwidth_bps: float | None = None
-    downlink_bandwidth_bps: float | None = None
-
-    @property
-    def configured(self) -> bool:
-        return bool(
-            self.altitude_km is not None
-            and self.altitude_km > 0.0
-            and self.uplink_bandwidth_bps is not None
-            and self.uplink_bandwidth_bps > 0.0
-            and self.downlink_bandwidth_bps is not None
-            and self.downlink_bandwidth_bps > 0.0
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        return to_jsonable(self)
-
-    @classmethod
-    def from_value(cls, value: Any) -> "CommunicationIngressProfile":
-        if isinstance(value, cls):
-            return value
-        if value is None:
-            return cls()
-        if not isinstance(value, dict):
-            raise TypeError("communication_ingress must be a mapping")
-        return cls(
-            altitude_km=_optional_float(value.get("altitude_km")),
-            uplink_bandwidth_bps=_optional_float(value.get("uplink_bandwidth_bps")),
-            downlink_bandwidth_bps=_optional_float(value.get("downlink_bandwidth_bps")),
-        )
+from .network_spec import NetworkSpec
 
 
 @dataclass(frozen=True)
@@ -64,17 +29,26 @@ class RuntimeSimulationSpec:
     constellation: dict[str, Any] = field(default_factory=dict)
     serving_profile: ServingCapacityProfile | None = None
     energy_profile: dict[str, Any] = field(default_factory=dict)
-    communication_ingress: CommunicationIngressProfile = field(
-        default_factory=CommunicationIngressProfile
-    )
+    network: NetworkSpec | None = None
     provenance: dict[str, Any] = field(default_factory=dict)
     warnings: tuple[str, ...] = ()
     schema_version: str = "orbitserve.runtime_simulation_spec.v1"
     time_mode: str = "event_driven"
     time_step_s: float | None = None
+    physical_state_ref: str | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "strategy", RuntimeStrategySpec.from_value(self.strategy))
+        if self.time_mode != "event_driven":
+            raise ValueError(
+                "Runtime time_mode must be event_driven; topology spacing belongs to Orbit"
+            )
+        if self.time_horizon_s is not None and (
+            not math.isfinite(self.time_horizon_s) or self.time_horizon_s <= 0
+        ):
+            raise ValueError("Runtime time_horizon_s must be finite and positive")
+        object.__setattr__(
+            self, "strategy", RuntimeStrategySpec.from_value(self.strategy)
+        )
         object.__setattr__(
             self,
             "serving_profile",
@@ -82,16 +56,12 @@ class RuntimeSimulationSpec:
         )
         object.__setattr__(
             self,
-            "communication_ingress",
-            CommunicationIngressProfile.from_value(self.communication_ingress),
+            "network",
+            NetworkSpec.from_value(self.network),
         )
 
     def to_dict(self) -> dict[str, Any]:
         return to_jsonable(self)
 
 
-__all__ = ["CommunicationIngressProfile", "RuntimeSimulationSpec"]
-
-
-def _optional_float(value: Any) -> float | None:
-    return None if value is None else float(value)
+__all__ = ["RuntimeSimulationSpec"]

@@ -1,6 +1,4 @@
-import sys
 import unittest
-from pathlib import Path
 
 
 from orbitserve.baselines.ground.global_runtime import (
@@ -8,8 +6,8 @@ from orbitserve.baselines.ground.global_runtime import (
     is_centralized_ground_policy,
     run_centralized_ground_runtime,
 )
-from orbitserve.runtime.contracts import RuntimeStrategySpec
-from orbitserve.runtime import RuntimeScenario
+from orbitserve.baselines.ground.contracts import GroundStrategySpec as RuntimeStrategySpec
+from orbitserve.baselines.ground.contracts import GroundScenario as RuntimeScenario
 from orbitserve.experiments.runtime_dispatch import evaluate_runtime_performance
 
 

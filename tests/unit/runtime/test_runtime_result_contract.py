@@ -17,6 +17,11 @@ class RuntimeResultContractTests(unittest.TestCase):
                 "RuntimeSimulationSpec",
                 "RuntimeStrategySpec",
                 "run_simulation",
+                "check_network_backend",
+                "export_cell_network",
+                "LinkProfile", "NetworkNodeSpec", "NetworkSpec", "NetworkState",
+                "NetworkUnavailable", "candidate_links",
+                "STARLINK_RADIO_PROFILES",
             },
         )
         self.assertEqual(tuple(inspect.signature(runtime.run_simulation).parameters), ("simulation_spec",))

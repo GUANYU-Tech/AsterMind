@@ -19,7 +19,7 @@ class SchedulerCandidate:
     kv_reuse_score: float
     energy_score: float
     compute_load_score: float
-    arc_distance_rad: float
+    predicted_network_s: float
     compute_queue_wait_s: float
     hard_gate_violations: tuple[str, ...] = ()
     provenance: dict[str, Any] = field(default_factory=dict)
@@ -42,7 +42,7 @@ class SchedulerCandidate:
             kv_reuse_score=_score(payload.get("kv_reuse_score")),
             energy_score=_score(payload.get("energy_score")),
             compute_load_score=_score(payload.get("compute_load_score")),
-            arc_distance_rad=max(0.0, float(payload.get("arc_distance_rad", 0.0))),
+            predicted_network_s=max(0.0, float(payload.get("predicted_network_s", 0.0))),
             compute_queue_wait_s=max(0.0, float(payload.get("compute_queue_wait_s", 0.0))),
             hard_gate_violations=tuple(str(item) for item in payload.get("hard_gate_violations", ())),
             provenance=dict(payload.get("provenance") or {}),

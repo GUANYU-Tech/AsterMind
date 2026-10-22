@@ -31,7 +31,10 @@ class CliExampleTests(unittest.TestCase):
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
             data = json.loads(out_path.read_text(encoding="utf-8"))
-            for key in ("C_sat_usd", "M_sat_kg", "P_peak_w", "feasible", "provenance"):
+            self.assertIn("hardware_profile",data)
+            self.assertIn("energy_profile",data)
+            data=data["cost_profile"]
+            for key in ("total_cost_usd", "total_mass_kg", "peak_power_w", "feasible", "provenance"):
                 self.assertIn(key, data)
 
 

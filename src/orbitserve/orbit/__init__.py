@@ -133,3 +133,6 @@ __all__ = [
     "write_orbit_trace",
     "write_sgp4_orbit_trace",
 ]
+
+from .sgp4.initialization import walker_delta_elements, tle_elements, dawn_dusk_elements
+__all__ += ["walker_delta_elements", "tle_elements", "dawn_dusk_elements"]

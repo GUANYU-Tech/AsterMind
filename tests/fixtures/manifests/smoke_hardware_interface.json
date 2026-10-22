@@ -1,107 +1,66 @@
 {
-  "constellation": {
-    "name": "smoke_hardware_interface_walker",
-    "shells": [
-      {
-        "altitude_km": 550,
-        "inclination_deg": 53,
-        "min_elevation_deg": 25,
-        "name": "walker_550_53",
-        "orbit_family": "walker",
-        "phase_factor": 1,
-        "plane_count": 2,
-        "sats_per_plane": 3
-      }
-    ]
-  },
-  "costing": {
-    "scale_by": "satellite_count"
-  },
-  "description": "Smoke experiment using the top-level hardware interface to drive cost and performance.",
-  "dse": {
-    "enabled": false,
-    "sweep": {}
-  },
+  "schema_version": "orbitserve.experiment.v1",
   "experiment_id": "smoke_hardware_interface",
+  "physical_network": "../network/coupled_small.json",
   "hardware": {
     "accelerator": "h200_sxm",
-    "communication": {
-      "clink_allocated_usd": 5000,
-      "ground_link_bandwidth_gbps": 100,
-      "ground_link_mass_kg": 28,
-      "ground_link_power_w": 100,
-      "isl_terminal_bandwidth_gbps": 100,
-      "isl_terminal_count": 4,
-      "isl_terminal_mass_kg": 10,
-      "isl_terminal_power_w": 100
-    },
     "compute_payload": {
-      "accelerator_count": 3,
-      "alpha_mass_overhead": 0.2,
-      "alpha_pkg": 0.1,
-      "alpha_power_overhead": 0.1,
-      "purchase_cost_per_unit_usd": 50000,
-      "space_adaptation_cost_usd": 0
+      "accelerator_count": 4,
+      "purchase_cost_per_unit_usd": 50000
     },
-    "cost": {
-      "build_cost_per_kg_usd": 500,
-      "capital_recovery_factor": 0.1,
-      "launch_cost_per_kg_usd": 3360,
-      "mass_margin_fraction": 0.2
-    },
-    "intra_interconnect": {
-      "alpha_intra": 0.1,
-      "switch_bw_gbs": 900,
-      "switch_cost_usd": 0,
-      "switch_mass_kg": 0,
-      "switch_power_w": 0
-    },
-    "mode": "fixed",
-    "name": "three_h200_node",
-    "platform": {
-      "mass_kg": 150,
-      "power_w": 100
+    "communication": {
+      "isl_terminal_count": 6,
+      "isl_terminal_bandwidth_gbps": 100,
+      "ground_link_bandwidth_gbps": 1
     },
     "power": {
-      "battery_eol_fraction": 0.8,
-      "battery_specific_energy_wh_per_kg": 200,
-      "dod_max": 0.3,
-      "eta_pmad": 0.92,
-      "power_margin_fraction": 0.2,
-      "pv_eol_fraction": 0.85,
-      "solar_specific_power_w_per_kg": 100
-    },
-    "storage": {
-      "profile": "nvme_8tb"
-    },
-    "thermal": {
-      "emissivity": 0.9,
-      "environment_heat_flux_w_m2": 150,
-      "radiator_areal_density_kg_m2": 5,
-      "radiator_temperature_k": 350,
-      "view_factor": 0.85
+      "battery_capacity_wh": 10000,
+      "solar_array_power_w": 10000
     }
   },
-  "scheduler": {
-    "lookahead_orbits": 1,
-    "policy": "orbitserve"
+  "communication_hardware": {
+    "compute_payload": {
+      "accelerator_count": 0
+    },
+    "communication": {
+      "isl_terminal_count": 6,
+      "isl_terminal_bandwidth_gbps": 100,
+      "ground_link_bandwidth_gbps": 1
+    }
   },
   "serving": {
-    "memory_reserve_fraction": 0.1,
-    "model": {
-      "max_context_tokens": 8192,
-      "name": "llama-like-34b",
-      "parameter_count_b": 34,
-      "precision": "bf16"
+    "max_concurrency": 2,
+    "prompt_length_grid": [
+      1,
+      32,
+      68,
+      128,
+      256
+    ],
+    "context_length_grid": [
+      1,
+      32,
+      68,
+      128,
+      256
+    ],
+    "formation": {
+      "member_count": 4,
+      "topology": "ring",
+      "link_bandwidth_gbps": 100,
+      "link_propagation_delay_s": 5e-06
+    },
+    "parallelism": {
+      "tp": 4
     }
   },
-  "simulation": {
-    "duration_s": 21600,
-    "epoch": "2026-06-16T00:00:00Z",
-    "step_s": 60,
-    "use_stk_calibrated_surrogate": false
-  },
   "workload": {
-    "bundle_dir": "tests/fixtures/workloads/smoke_flat_single_turn_direct"
+    "bundle_dir": "../workloads/coupled_physical"
+  },
+  "runtime_strategy": {
+    "latency_weight": 1,
+    "kv_reuse_weight": 0,
+    "energy_weight": 0,
+    "compute_load_weight": 0
   }
 }

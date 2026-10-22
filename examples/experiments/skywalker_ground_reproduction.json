@@ -1,94 +1,37 @@
 {
-  "experiment_id": "skywalker_ground_reproduction",
-  "description": "Runnable paper-method reproduction of the SkyWalker-like terrestrial baseline on a 200x time-compressed canonical global-diurnal workload to expose queue/offload behavior. Ground runtime ignores LEO trace, links, energy, and capital cost; all unpublished network and token-service values below are explicit surrogates.",
-  "constellation": {
-    "name": "ground_baseline_schema_placeholder",
-    "shells": [
-      {
-        "name": "placeholder_walker_550_53",
-        "orbit_family": "walker",
-        "altitude_km": 550,
-        "inclination_deg": 53,
-        "plane_count": 2,
-        "sats_per_plane": 3,
-        "min_elevation_deg": 25,
-        "phase_factor": 1
-      }
-    ]
-  },
-  "costing": {},
-  "workload": {
-    "bundle_dir": "../workloads/trace_examples/global_diurnal_gateway_balanced"
-  },
-  "serving": {},
-  "simulation": {
-    "duration_s": 3600,
-    "step_s": 60,
-    "epoch": "2026-06-16T00:00:00Z",
-    "use_stk_calibrated_surrogate": false
-  },
-  "scheduler": {
+  "schema_version": "orbitserve.experiment.v1",
+  "experiment_id": "skywalker-ground-smoke",
+  "description": "Synthetic canonical-workload smoke test of the terrestrial baseline; not paper data reproduction.",
+  "ground_baseline": {
     "policy": "skywalker_like_ground",
-    "path_policy": "skywalker_two_layer_prefix_snapshot",
-    "queue_policy": "skywalker_pending_selective_fcfs",
-    "max_hop_count": 1,
-    "trace_level": "full",
-    "runtime_optimization_enabled": false,
     "ground_config": {
-      "arrival_time_scale": 0.005,
+      "regions": [
+        {
+          "region_id": "r0",
+          "replica_count": 2,
+          "local_rtt_s": 0.02,
+          "lat_deg": -0.07881998146938736,
+          "lon_deg": 62.149944043909464
+        }
+      ],
+      "wan_rtt_s": {
+        "r0": {}
+      },
       "probe_interval_s": 0.1,
       "remote_queue_buffer_requests": 1,
       "routing_policy": "prefix_tree",
       "selective_pushing": "pending_requests",
-      "batch_contention_alpha": 1.0,
-      "admission_output_reservation_tokens": 4096,
-      "hash_virtual_nodes_per_target": 128,
-      "hash_seed": "skywalker-ground-v1",
-      "regions": [
-        {
-          "region_id": "us_east",
-          "replica_count": 4,
-          "local_rtt_s": 0.01
-        },
-        {
-          "region_id": "europe_west",
-          "replica_count": 4,
-          "local_rtt_s": 0.01
-        },
-        {
-          "region_id": "asia_east",
-          "replica_count": 4,
-          "local_rtt_s": 0.01
-        }
-      ],
-      "wan_rtt_s": {
-        "us_east": {
-          "europe_west": 0.12,
-          "asia_east": 0.18
-        },
-        "europe_west": {
-          "us_east": 0.12,
-          "asia_east": 0.16
-        },
-        "asia_east": {
-          "us_east": 0.18,
-          "europe_west": 0.16
-        }
-      },
       "replica_token_service": {
-        "prefill_tokens_per_s": 6000.0,
-        "decode_tokens_per_s": 1000.0,
-        "continuous_batch_capacity_tokens": 32768,
-        "kv_cache_capacity_tokens": 131072
+        "prefill_tokens_per_s": 2048.0,
+        "decode_tokens_per_s": 256.0,
+        "continuous_batch_capacity_tokens": 4096,
+        "kv_cache_capacity_tokens": 65536
       },
       "max_batch_size": 4,
-      "max_replica_queue_requests": 16,
-      "max_lb_queue_wait_s": 60.0,
-      "prefix_tree_max_records": 100000
+      "admission_output_reservation_tokens": 256
     }
   },
-  "dse": {
-    "enabled": false,
-    "sweep": {}
+  "workload": {
+    "bundle_dir": "../../tests/fixtures/workloads/coupled_physical"
   }
 }

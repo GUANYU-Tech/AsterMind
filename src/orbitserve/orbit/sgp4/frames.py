@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from threading import RLock
+from itertools import groupby
 from typing import Any
 
 from .propagation import (
@@ -28,15 +29,18 @@ ASTROPY_ENGINE_NAME = "astropy"
 ASTROPY_ENGINE_VERSION = "6.1.3"
 SGP4_EARTH_FIXED_REFERENCE_FRAME = "ITRS"
 PINNED_IERS_DATA_RELEASE = "astropy-iers-data-0.2026.5.11.1.8.52"
-PINNED_IERS_A_SHA256 = "eeb76193cd43c065b763d78923f8a8ce2f8a62df5d3e1519a3217fac433bdaa6"
-PINNED_IERS_README_SHA256 = "7c6182cc0fd0cbece39711f648d15e48b49168925602e360a5709c5ccc8d5a12"
-PINNED_LEAP_SECONDS_SHA256 = "6f7bc6a25841bc394f82bdfd5d7bb22ffcd4548ee28e9822f2927a909e4f912f"
+PINNED_IERS_A_SHA256 = (
+    "eeb76193cd43c065b763d78923f8a8ce2f8a62df5d3e1519a3217fac433bdaa6"
+)
+PINNED_IERS_README_SHA256 = (
+    "7c6182cc0fd0cbece39711f648d15e48b49168925602e360a5709c5ccc8d5a12"
+)
+PINNED_LEAP_SECONDS_SHA256 = (
+    "6f7bc6a25841bc394f82bdfd5d7bb22ffcd4548ee28e9822f2927a909e4f912f"
+)
 
 _PINNED_IERS_ROOT = (
-    Path(__file__).resolve().parent.parent
-    / "data"
-    / "iers"
-    / "0.2026.5.11.1.8.52"
+    Path(__file__).resolve().parent.parent / "data" / "iers" / "0.2026.5.11.1.8.52"
 )
 _PINNED_IERS_A_PATH = _PINNED_IERS_ROOT / "finals2000A.all"
 _PINNED_IERS_README_PATH = _PINNED_IERS_ROOT / "ReadMe.finals2000A"
@@ -249,7 +253,8 @@ def transform_sgp4_teme_to_itrs(
     start_jd, start_fr = _utc_to_julian(propagation.simulation_epoch_utc)
     unique_times = sorted({sample.time_s for sample in propagation.samples})
     astropy_times = {
-        time_s: _astropy_time(api, start_jd, start_fr, time_s) for time_s in unique_times
+        time_s: _astropy_time(api, start_jd, start_fr, time_s)
+        for time_s in unique_times
     }
     quality = _validate_data_coverage(api, iers_table, leap_table, astropy_times)
 
@@ -268,10 +273,14 @@ def transform_sgp4_teme_to_itrs(
             ):
                 warnings.simplefilter("error")
                 warnings.filterwarnings("ignore", category=api.iers.IERSStaleWarning)
-                for sample in propagation.samples:
+                for time_s, group in groupby(
+                    propagation.samples, key=lambda sample: sample.time_s
+                ):
+                    batch = tuple(group)
+                    sample = batch[0]
                     try:
-                        transformed = _transform_sample(
-                            api, sample, astropy_times[sample.time_s]
+                        transformed = _transform_sample_batch(
+                            api, batch, astropy_times[time_s]
                         )
                     except Warning as exc:
                         raise Sgp4FrameTransformError(
@@ -285,13 +294,17 @@ def transform_sgp4_teme_to_itrs(
                             time_s=sample.time_s,
                             satellite_id=sample.satellite_id,
                         ) from exc
-                    samples.append(transformed)
+                    samples.extend(transformed)
         except Sgp4FrameTransformError:
             raise
         except Warning as exc:
-            raise Sgp4FrameTransformError(f"Astropy transformation warning: {exc}") from exc
+            raise Sgp4FrameTransformError(
+                f"Astropy transformation warning: {exc}"
+            ) from exc
         except Exception as exc:
-            raise Sgp4FrameTransformError(f"Astropy transformation failed: {exc}") from exc
+            raise Sgp4FrameTransformError(
+                f"Astropy transformation failed: {exc}"
+            ) from exc
         finally:
             api.erfa.leap_seconds.set(saved_leap_seconds)
             api.time_core._LEAP_SECONDS_CHECK = saved_leap_check
@@ -360,7 +373,8 @@ def compute_sgp4_sun_positions_itrs(
     start_jd, start_fr = _utc_to_julian(earth_fixed.simulation_epoch_utc)
     unique_times = sorted({sample.time_s for sample in earth_fixed.samples})
     astropy_times = {
-        time_s: _astropy_time(api, start_jd, start_fr, time_s) for time_s in unique_times
+        time_s: _astropy_time(api, start_jd, start_fr, time_s)
+        for time_s in unique_times
     }
     quality = _validate_data_coverage(api, iers_table, leap_table, astropy_times)
     if quality != earth_fixed.earth_orientation_quality:
@@ -478,7 +492,9 @@ def _validate_propagation_result(propagation: Any) -> None:
         raise ValueError("propagation.samples must be non-empty")
     keys = [(sample.time_s, sample.satellite_id) for sample in propagation.samples]
     if keys != sorted(keys) or len(keys) != len(set(keys)):
-        raise ValueError("propagation.samples must be unique and ordered by (time_s, satellite_id)")
+        raise ValueError(
+            "propagation.samples must be unique and ordered by (time_s, satellite_id)"
+        )
     for sample in propagation.samples:
         if not isinstance(sample, Sgp4TemeSample):
             raise TypeError("propagation.samples must contain Sgp4TemeSample values")
@@ -569,7 +585,40 @@ def _validate_data_coverage(
     return "predictive" if predictive else "definitive"
 
 
-def _transform_sample(api: _AstropyApi, sample: Sgp4TemeSample, obstime: Any) -> Sgp4ItrsSample:
+def _transform_sample_batch(api, samples, obstime):
+    if len(samples) == 1:
+        return (_transform_sample(api, samples[0], obstime),)
+    import numpy as np
+
+    units = api.units
+    positions = np.asarray(
+        [sample.position_teme_km for sample in samples], dtype=float
+    ).T
+    velocities = np.asarray(
+        [sample.velocity_teme_km_s for sample in samples], dtype=float
+    ).T
+    representation = api.CartesianRepresentation(
+        positions * units.km
+    ).with_differentials(api.CartesianDifferential(velocities * units.km / units.s))
+    itrs = api.TEME(representation, obstime=obstime).transform_to(
+        api.ITRS(obstime=obstime)
+    )
+    positions = itrs.cartesian.xyz.to_value(units.km).T
+    velocities = itrs.cartesian.differentials["s"].d_xyz.to_value(units.km / units.s).T
+    return tuple(
+        Sgp4ItrsSample(
+            sample.time_s,
+            sample.satellite_id,
+            _validated_vector(position, "position_itrs_km"),
+            _validated_vector(velocity, "velocity_itrs_km_s"),
+        )
+        for sample, position, velocity in zip(samples, positions, velocities)
+    )
+
+
+def _transform_sample(
+    api: _AstropyApi, sample: Sgp4TemeSample, obstime: Any
+) -> Sgp4ItrsSample:
     units = api.units
     position = api.CartesianRepresentation(sample.position_teme_km * units.km)
     velocity = api.CartesianDifferential(sample.velocity_teme_km_s * units.km / units.s)

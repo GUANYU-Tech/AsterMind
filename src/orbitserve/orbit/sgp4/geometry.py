@@ -313,13 +313,17 @@ def evaluate_sgp4_geometry(
     isl_clearance_km: int | float = 0.0,
     shadow_atmosphere_margin_km: int | float = 0.0,
     sun_positions: Sgp4SunPositionResult | None = None,
+    sample_hold: bool = False,
 ) -> Sgp4GeometryResult:
     """Evaluate SGL, ISL, and sunlight geometry on a complete sample grid.
 
     Geometry is evaluated only on ``[first_sample_time, last_sample_time)``.
-    Boolean transitions are refined by deterministic linear interpolation of
-    their signed boundary functions. Candidate ISL pairs are explicit inputs;
-    this function does not choose a network topology.
+    With ``sample_hold=True``, a visibility transition takes effect at the first
+    sample observing the new state; no between-sample crossing is inferred.
+    The default benchmark mode estimates crossings by linear interpolation of
+    signed boundary functions. Production network trace generation explicitly
+    selects sample-hold mode. Candidate ISL pairs are explicit inputs; this
+    function does not choose a network topology.
     """
 
     times, satellite_ids, by_time = _validate_earth_fixed_grid(earth_fixed)
@@ -417,19 +421,19 @@ def evaluate_sgp4_geometry(
     sgl_windows = tuple(
         Sgp4SglWindow(key[0], key[1], start, end)
         for key in sorted(sgl_scores)
-        for start, end, flag in _state_windows(sgl_scores[key])
+        for start, end, flag in _state_windows(sgl_scores[key], sample_hold=sample_hold)
         if flag
     )
     isl_windows = tuple(
         Sgp4IslWindow(key[0], key[1], start, end)
         for key in sorted(isl_scores)
-        for start, end, flag in _state_windows(isl_scores[key])
+        for start, end, flag in _state_windows(isl_scores[key], sample_hold=sample_hold)
         if flag
     )
     sunlight_windows = tuple(
         Sgp4SunlightWindow(satellite_id, start, end, flag)
         for satellite_id in sorted(sunlight_scores)
-        for start, end, flag in _state_windows(sunlight_scores[satellite_id])
+        for start, end, flag in _state_windows(sunlight_scores[satellite_id], sample_hold=sample_hold)
     )
     return Sgp4GeometryResult(
         element_set_id=earth_fixed.element_set_id,
@@ -661,6 +665,7 @@ def _sunlight_shadow_margin(
 
 def _state_windows(
     samples: Sequence[tuple[float, bool, float]],
+    *, sample_hold: bool = False,
 ) -> tuple[tuple[float, float, bool], ...]:
     if len(samples) < 2:
         return ()
@@ -670,7 +675,7 @@ def _state_windows(
     previous = samples[0]
     for current in samples[1:]:
         if current[1] != current_flag:
-            boundary = _linear_boundary(previous, current)
+            boundary = current[0] if sample_hold else _linear_boundary(previous, current)
             if boundary > current_start:
                 windows.append((_q(current_start), _q(boundary), current_flag))
             current_start = boundary

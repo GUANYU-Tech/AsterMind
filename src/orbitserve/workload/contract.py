@@ -500,7 +500,6 @@ def coerce_session_request_row(
     reject_runtime_fields(row, context=f"request {row.get('request_id', '<unknown>')}")
     token_cfg = require_mapping(desc.get("tokens")) if desc else {}
     session_cfg = require_mapping(desc.get("sessions")) if desc else {}
-    regions = region_lookup(desc) if desc else {}
     gateway_cfg = require_mapping(desc.get("gateways")) if desc else {}
     data = dict(row)
 
@@ -508,7 +507,6 @@ def coerce_session_request_row(
     input_bytes_missing = "input_bytes" not in data
     output_bytes_missing = "output_bytes" not in data
 
-    region = regions.get(str(data.get("user_region_id")))
     if "new_user_tokens" not in data and "prompt_tokens" in data:
         data["new_user_tokens"] = data["prompt_tokens"]
     data.setdefault("context_tokens_before_turn", 0)

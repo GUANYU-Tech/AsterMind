@@ -10,6 +10,7 @@ from typing import Any, Mapping
 from ..common import to_jsonable
 from ..common import DSEMetrics
 from ..runtime import RuntimeStrategySpec
+from ..baselines.ground.contracts import GroundStrategySpec
 from ..experiments.runtime_dispatch import evaluate_runtime_performance
 from .runtime_optimization import RuntimeOptimizationObjective, score_runtime_evaluator_result
 
@@ -195,9 +196,9 @@ def evaluate_runtime_matrix(
     for source_context, candidate in terrestrial_references.values():
         scheduler_payload = dict(candidate)
         base_strategy_id = str(scheduler_payload.pop("strategy_id"))
-        strategy = RuntimeStrategySpec.from_dict(scheduler_payload)
+        strategy = _matrix_strategy(scheduler_payload)
         reference_context = _terrestrial_reference_context(
-            source_context, policy=strategy.policy
+            source_context, policy=getattr(strategy,'policy','compute')
         )
         runtime_result = _runtime_result_with_cost_efficiency(
             _compact_runtime_result(
@@ -234,7 +235,7 @@ def evaluate_runtime_matrix(
         for scheduler in candidates:
             scheduler_payload = dict(scheduler)
             strategy_id = str(scheduler_payload.pop("strategy_id"))
-            strategy = RuntimeStrategySpec.from_dict(scheduler_payload)
+            strategy = _matrix_strategy(scheduler_payload)
             full_runtime_result = evaluate_runtime_performance(context.runtime_scenario, strategy)
             runtime_result = _runtime_result_with_cost_efficiency(
                 _compact_runtime_result(full_runtime_result),
@@ -588,13 +589,13 @@ def _static_frontier_ids(infos: tuple[Mapping[str, Any], ...]) -> set[str]:
 
 def _static_dominates(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
     comparisons: list[tuple[float, float, str]] = []
-    for field, direction in (
+    for metric_field, direction in (
         ("annualized_cost_usd_per_year", "lower"),
         ("served_ratio", "higher"),
         ("e2e_p95_s", "lower"),
     ):
-        left_value = _optional_float(left.get(field))
-        right_value = _optional_float(right.get(field))
+        left_value = _optional_float(left.get(metric_field))
+        right_value = _optional_float(right.get(metric_field))
         if left_value is not None and right_value is not None:
             comparisons.append((left_value, right_value, direction))
     if not comparisons:
@@ -772,7 +773,7 @@ def _objective_from_spec(
 def _candidate_schedulers(context: DSEDesignContext, spec: Any) -> tuple[dict[str, Any], ...]:
     base_candidates: list[dict[str, Any]] = []
     if bool(getattr(spec, "include_current_policy", True)):
-        current = RuntimeStrategySpec.from_dict(context.current_scheduler).to_dict()
+        current = _matrix_strategy(context.current_scheduler).to_dict()
         _append_candidate(base_candidates, current, strategy_id=f"current_{current['policy']}")
     for policy in _string_tuple(getattr(spec, "policies", ())):
         policy_payload: dict[str, Any] = {"policy": policy}
@@ -786,10 +787,10 @@ def _candidate_schedulers(context: DSEDesignContext, spec: Any) -> tuple[dict[st
                 )
             if ground_config:
                 policy_payload["ground_config"] = ground_config
-        scheduler = RuntimeStrategySpec.from_dict(policy_payload).to_dict()
+        scheduler = _matrix_strategy(policy_payload).to_dict()
         _append_candidate(base_candidates, scheduler, strategy_id=str(scheduler["policy"]))
     for index, raw_scheduler in enumerate(getattr(spec, "candidate_schedulers", ()) or ()):
-        scheduler = RuntimeStrategySpec.from_dict(_mapping_from_value(raw_scheduler)).to_dict()
+        scheduler = _matrix_strategy(_mapping_from_value(raw_scheduler)).to_dict()
         strategy_id = str(_mapping_from_value(raw_scheduler).get("strategy_id") or scheduler["policy"])
         _append_candidate(base_candidates, scheduler, strategy_id=strategy_id, fallback_suffix=index)
     kv_candidates = _kv_policy_candidates(spec)
@@ -1747,3 +1748,11 @@ __all__ = [
     "evaluate_runtime_matrix",
     "unevaluated_runtime_matrix",
 ]
+
+
+def _matrix_strategy(payload):
+    payload=dict(payload)
+    if payload.get("policy","").startswith("ground_") or payload.get("policy")=="skywalker_like_ground":
+        return GroundStrategySpec.from_dict(payload)
+    payload.pop("policy",None)
+    return RuntimeStrategySpec.from_dict(payload)

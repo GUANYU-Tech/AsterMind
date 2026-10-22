@@ -1,72 +1,66 @@
 {
+  "schema_version": "orbitserve.experiment.v1",
   "experiment_id": "smoke_clustered_constellation",
-  "description": "Runnable smoke experiment for a clustered 4x4 tiled_2x2_clique orbital-set constellation. Write CLI output to results/experiments/smoke_clustered_constellation.json.",
-  "constellation": {
-    "name": "smoke_clustered_4x4_tiled_2x2",
-    "application_profile": "ChatLLM inference",
-    "orbital_sets": [
-      {
-        "name": "walker_550_53_clustered_4x4",
-        "altitude_km": 550,
-        "inclination_deg": 53,
-        "orbit_type": "circular",
-        "orbital_set_type": "walker_delta",
-        "walker_type": "delta",
-        "planes": 2,
-        "clusters_per_plane": 2,
-        "walker_phase": 1,
-        "epoch": "2026-06-16T00:00:00Z",
-        "min_elevation_deg": 25,
-        "cluster": {
-          "grid_shape": "4x4",
-          "satellites_per_cluster": 16,
-          "formation_frame": "lvlh",
-          "formation_pitch_m": 1000,
-          "d_keepout_m": 100,
-          "sigma_navigation_m": 5,
-          "sigma_control_m": 5
-        },
-        "provenance": {
-          "source": "docs/research/parameters/constellation_architecture_model.md",
-          "role": "conservative_mainline_smoke"
-        }
-      }
-    ],
-    "gateway_profile": {
-      "mode": "smoke_gateway_stub"
+  "physical_network": "../network/coupled_small.json",
+  "hardware": {
+    "accelerator": "h200_sxm",
+    "compute_payload": {
+      "accelerator_count": 4,
+      "purchase_cost_per_unit_usd": 50000
+    },
+    "communication": {
+      "isl_terminal_count": 6,
+      "isl_terminal_bandwidth_gbps": 100,
+      "ground_link_bandwidth_gbps": 1
+    },
+    "power": {
+      "battery_capacity_wh": 10000,
+      "solar_array_power_w": 10000
     }
   },
-  "costing": {
-    "scale_by": "satellite_count"
-  },
-  "workload": {
-    "bundle_dir": "tests/fixtures/workloads/smoke_flat_single_turn_direct"
+  "communication_hardware": {
+    "compute_payload": {
+      "accelerator_count": 0
+    },
+    "communication": {
+      "isl_terminal_count": 6,
+      "isl_terminal_bandwidth_gbps": 100,
+      "ground_link_bandwidth_gbps": 1
+    }
   },
   "serving": {
-    "model": {
-      "name": "llama-like-34b",
-      "parameter_count_b": 34,
-      "precision": "bf16",
-      "max_context_tokens": 8192
+    "max_concurrency": 2,
+    "prompt_length_grid": [
+      1,
+      32,
+      68,
+      128,
+      256
+    ],
+    "context_length_grid": [
+      1,
+      32,
+      68,
+      128,
+      256
+    ],
+    "formation": {
+      "member_count": 4,
+      "topology": "ring",
+      "link_bandwidth_gbps": 100,
+      "link_propagation_delay_s": 5e-06
     },
-    "effective_utilization": 0.5
+    "parallelism": {
+      "tp": 4
+    }
   },
-  "simulation": {
-    "duration_s": 21600,
-    "step_s": 60,
-    "epoch": "2026-06-16T00:00:00Z",
-    "use_stk_calibrated_surrogate": false
+  "workload": {
+    "bundle_dir": "../workloads/coupled_physical"
   },
-  "scheduler": {
-    "policy": "orbitserve",
-    "lookahead_orbits": 1
-  },
-  "dse": {
-    "enabled": false,
-    "sweep": {}
-  },
-  "hardware": {
-    "mode": "from_cost_case",
-    "source_case_path": "examples/single_satellite/h200_gpu_derived.json"
+  "runtime_strategy": {
+    "latency_weight": 1,
+    "kv_reuse_weight": 0,
+    "energy_weight": 0,
+    "compute_load_weight": 0
   }
 }

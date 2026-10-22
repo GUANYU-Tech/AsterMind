@@ -1,12 +1,82 @@
 # Changelog
 
+- Prefilled versioned Starlink single-carrier RF and optical budgets with separate
+  user/feeder uplink/downlink profiles, clearly labelled inference and assumptions,
+  and separate V3 160-Gbps specification / >200-Gbps report editions. Added tests
+  that check actual equal-byte transfer times and satellite capacity sharing.
+
 All notable changes to OrbitServe are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserve explicit hardware compute exclusions when combining Orbit catalog
+  metadata with network roles.
+- Check predicted energy for every physical hop endpoint and all compute-cell
+  members before dispatch, without mutating live candidate state.
+- Remove accidentally tracked Python caches and local research documents from
+  distributed files; retain local copies outside the tracked tree.
+
+### Tests
+
+- Preserve KV copy/recompute, session isolation, bounded context reuse and causal
+  KV visibility across queue, fluid, SimGrid and ns-3 in the regular suite.
+- Add physical candidate qualification, relay/cell energy and Runtime LRU
+  regressions, a legacy migration coverage map, and full native-backend CI.
+
+### Changed
+
+- Split physical preparation from Runtime with reusable, versioned and hashed
+  datasets containing complete position/link data and compressed directional
+  budgets. Runtime loads saved physics across transport backends; the local
+  console requires completed physical data before entering execution.
+
+- Enforced generation-specific optical port counts and explicit endpoint rate
+  ceilings; distinguished RF antennas, beams and scenario peer concurrency.
+- Corrected path audit distances to their serialization-completion sample and
+  added independent per-sample physics and real-backend update regressions.
+
+- Released faulted terminals causally and reacquired replacement links at the next
+  Orbit sample; preserved unaffected contacts and discarded only observed bytes.
+- Included observed competition in fluid/ns-3 routing forecasts, with native ns-3
+  packet overhead and logical payload preservation under wire padding.
+- Added versioned Starlink V2 Mini/V3 radio editions, directional RF link budgets
+  and satellite aggregate capacity pools across queue/fluid/SimGrid/ns-3.
+- Added a canonical-Workload three-route/four-backend networking acceptance matrix
+  and cross-GSL aggregate/full-duplex conservation regressions.
+
+- Moved terrestrial baseline metric and cost evaluation into the ground baseline
+  package; experiment runtime dispatch now only selects the appropriate evaluator.
+
 ### Added
+
+- Added explicit compute-only, communication-only and mixed network scenes,
+  dawn-dusk initial orbit designs and observed per-member TLE cell membership.
+- Added sparse Grid/Honeycomb baseline and Ronchetti-style intra-orbit hole
+  patching, retaining physical visibility, atmosphere and terminal constraints.
+- Added per-service ground association quotas, two-sided preference matching,
+  and single/multi/free compute-cell egress policies.
+
+- Added auditable optical aperture/photon link budgets, RF aperture gains and
+  per-direction capacity diagnostics; exported exact cell link snapshots plus
+  labeled static Serving/AsterMind parameter fragments.
+- Added unexpected link/relay outages, in-flight message discard and bounded
+  next-sample recovery over alternate routes or ground access links.
+- Added optional native SimGrid 4.1 transport alongside the default directed
+  queue model, with causal completion callbacks, dynamic shared capacities,
+  byte-progress audit intervals, zero-capacity suspension and contact-loss cleanup.
+- Added analytical native-backend and end-to-end model-comparison regressions.
+
+- Added physical multi-shell communication experiments with Walker/TLE inputs,
+  independent grid/honeycomb shells, separate compute formations, dynamic acquisition,
+  terminal limits, RF link budgets, Sun exclusion and switchable routing.
+- Added automatic parallel orbit/geometry precomputation and complete compressed
+  per-boundary network audit artifacts with a small result index.
+- Added network unit, integration and experiment-CLI tests, including serial/parallel
+  determinism and complete node/link export checks.
 
 - Added a first-order L2 Serving formation model with member count, ring/switch/
   fully-connected topology, link bandwidth, and one-hop propagation delay.
@@ -29,6 +99,41 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Added per-satellite capacity-driven LRU management for KV cache state.
 
 ### Changed
+
+- Isolated personal launchers, templates, browser replay exports and their tests
+  under ignored local directories; shared experiment commands remain portable.
+- Removed cross-communication-shell connectivity and reject explicit bypasses.
+- Kept six-file Workload loading unchanged; corrected the older README description.
+- Documented directed link reservations separately from SimGrid bandwidth sharing.
+
+- Personal large communication scenarios use 600 seconds with 1-second physical
+  sampling. Production positions, Sun directions and visibility windows use
+  sample-and-hold semantics; network simulation no longer interpolates positions.
+- Streamed large frame exports, retained sparse link-state timelines and batched
+  Orbit precomputation to bound memory at finer sampling intervals.
+- Added vectorized, same-epoch satellite coordinate transforms with parity tests
+  against the scalar transformation.
+- Exported actual serialization-completion events for scientific audit; personal
+  paginated Runtime replay is derived separately by the ignored local tools.
+
+
+- Integrated physical networking into the shared Architecture/Serving/Workload/
+  Runtime/cost evaluator and physical DSE; migrated executable experiment examples.
+- Replaced future request-order state publication with chronological request,
+  per-hop transmission, compute admission/completion and client delivery events.
+  Session KV becomes visible at actual compute completion.
+- Enforced physical cell connectivity for Serving admission, per-member compute
+  energy and cancellation on internal link disconnection or zero capacity.
+- Kept terrestrial baseline contracts and execution separate from satellite
+  Runtime DTOs, restoring baseline integration coverage.
+- Added complete-system, event-causality, dense/MoE coupling and import regressions.
+  Rejected mismatched hardware, physical cells and Workload models.
+
+
+- Removed fixed-shell Arc communication and its configuration; Runtime now
+  consumes physical dynamic network state and directed transmission calendars.
+- Enforced LF for pinned reference data so checkout line endings preserve
+  provenance hashes, and excluded personal inputs, results and viewer files.
 
 - Replaced the per-node Prefill/Decode FIFOs with colocated request-concurrency
   reservations and fixed admission-rate lookup.

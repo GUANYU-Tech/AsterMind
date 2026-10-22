@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import math
+import multiprocessing
+import os
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import replace
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -42,23 +46,145 @@ def generate_orbit_trace(
     isl_pairs: Sequence[Sequence[str]] = (),
     valid_for_paper_main_results: bool = False,
     warnings: Sequence[str] = (),
+    workers: int = 1,
+    progress=None,
 ) -> OrbitTraceManifest:
     """Generate one canonical Orbit Trace from structured SGP4 inputs."""
 
+    report = progress or (lambda stage: None)
+    report("SGP4 state precompute")
     bundle = load_sgp4_element_bundle(elements)
-    propagation = propagate_sgp4_teme(
-        bundle,
-        simulation_epoch_utc=simulation_epoch_utc,
-        sample_times_s=sample_times_s,
+    if type(workers) is not int or workers < 1:
+        raise ValueError("workers must be a positive integer")
+    times = tuple(float(t) for t in sample_times_s)
+    # Bound geometry/multiprocessing payload size independently of run length.
+    per_time = len(bundle.satellites) * max(1, len(ground_ingresses)) + len(isl_pairs)
+    batch_samples = max(
+        2,
+        min(
+            121,
+            100_000 // max(1, len(bundle.satellites)),
+            1_000_000 // max(1, per_time),
+        ),
     )
-    earth_fixed = transform_sgp4_teme_to_itrs(propagation)
+    if len(times) > batch_samples:
+        return _generate_chunked_trace(
+            output_dir,
+            bundle,
+            simulation_epoch_utc,
+            times,
+            ground_ingresses,
+            isl_pairs,
+            valid_for_paper_main_results,
+            warnings,
+            workers,
+            report,
+            batch_samples,
+        )
+
+    if workers == 1 or len(bundle.satellites) == 1:
+        propagation, earth_fixed = _state_partition(
+            (bundle, simulation_epoch_utc, sample_times_s)
+        )
+    else:
+        count = min(workers, len(bundle.satellites))
+        chunks = [
+            replace(bundle, satellites=bundle.satellites[i::count])
+            for i in range(count)
+        ]
+        with ProcessPoolExecutor(
+            max_workers=count,
+            mp_context=multiprocessing.get_context("spawn"),
+            initializer=_limit_worker,
+        ) as pool:
+            parts = list(
+                pool.map(
+                    _state_partition,
+                    ((chunk, simulation_epoch_utc, sample_times_s) for chunk in chunks),
+                )
+            )
+        propagation = replace(
+            parts[0][0],
+            element_set_id=bundle.element_set_id,
+            samples=tuple(
+                sorted(
+                    (s for p, _ in parts for s in p.samples),
+                    key=lambda s: (s.time_s, s.satellite_id),
+                )
+            ),
+        )
+        earth_fixed = replace(
+            parts[0][1],
+            element_set_id=bundle.element_set_id,
+            samples=tuple(
+                sorted(
+                    (s for _, e in parts for s in e.samples),
+                    key=lambda s: (s.time_s, s.satellite_id),
+                )
+            ),
+        )
+    report("Visibility, sunlight and candidate geometry")
     sun_positions = compute_sgp4_sun_positions_itrs(earth_fixed)
-    geometry = evaluate_sgp4_geometry(
-        earth_fixed,
-        ground_ingresses=ground_ingresses,
-        isl_pairs=isl_pairs,
-        sun_positions=sun_positions,
-    )
+    if workers == 1:
+        geometry = evaluate_sgp4_geometry(
+            earth_fixed,
+            ground_ingresses=ground_ingresses,
+            isl_pairs=isl_pairs,
+            sun_positions=sun_positions,
+            sample_hold=True,
+        )
+    else:
+        count = min(workers, max(1, len(isl_pairs) + len(ground_ingresses)))
+        jobs = [
+            (
+                earth_fixed,
+                ground_ingresses[i::count],
+                isl_pairs[i::count],
+                sun_positions,
+            )
+            for i in range(count)
+        ]
+        with ProcessPoolExecutor(
+            max_workers=count,
+            mp_context=multiprocessing.get_context("spawn"),
+            initializer=_limit_worker,
+        ) as pool:
+            pieces = list(pool.map(_geometry_partition, jobs))
+        geometry = replace(
+            pieces[0],
+            ground_ingresses=tuple(
+                sorted(
+                    (x for p in pieces for x in p.ground_ingresses),
+                    key=lambda x: x.ingress_id,
+                )
+            ),
+            isl_pairs=tuple(sorted(x for p in pieces for x in p.isl_pairs)),
+            sgl_samples=tuple(
+                sorted(
+                    (x for p in pieces for x in p.sgl_samples),
+                    key=lambda x: (x.time_s, x.ingress_id, x.satellite_id),
+                )
+            ),
+            isl_samples=tuple(
+                sorted(
+                    (x for p in pieces for x in p.isl_samples),
+                    key=lambda x: (x.time_s, x.endpoint_a, x.endpoint_b),
+                )
+            ),
+            sgl_windows=tuple(
+                sorted(
+                    (x for p in pieces for x in p.sgl_windows),
+                    key=lambda x: (x.ingress_id, x.satellite_id, x.start_s),
+                )
+            ),
+            isl_windows=tuple(
+                sorted(
+                    (x for p in pieces for x in p.isl_windows),
+                    key=lambda x: (x.endpoint_a, x.endpoint_b, x.start_s),
+                )
+            ),
+        )
+    report("Canonical orbit trace export")
     return write_sgp4_orbit_trace(
         output_dir,
         elements=bundle,
@@ -67,6 +193,141 @@ def generate_orbit_trace(
         geometry=geometry,
         valid_for_paper_main_results=valid_for_paper_main_results,
         warnings=warnings,
+        sample_hold=True,
+    )
+
+
+def _generate_chunked_trace(
+    output_dir,
+    bundle,
+    epoch,
+    times,
+    ground,
+    pairs,
+    paper,
+    warnings,
+    workers,
+    report,
+    batch_samples,
+):
+    from tempfile import TemporaryDirectory
+    from ..trace import load_orbit_trace
+
+    target = Path(output_dir)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    ephemeris = []
+    windows = {"sgl_windows": [], "isl_windows": [], "sunlight_windows": []}
+    first = None
+    offsets = list(range(0, len(times) - 1, batch_samples - 1))
+    with TemporaryDirectory(prefix="orbit-precompute-", dir=target.parent) as folder:
+        for index, offset in enumerate(offsets):
+            part_times = times[offset : offset + batch_samples]
+            report(
+                f"Orbit batch {index + 1}/{len(offsets)}: {part_times[0]:g}–{part_times[-1]:g} s"
+            )
+            part = Path(folder) / f"part-{index:05d}"
+            generate_orbit_trace(
+                part,
+                elements=bundle,
+                simulation_epoch_utc=epoch,
+                sample_times_s=part_times,
+                ground_ingresses=ground,
+                isl_pairs=pairs,
+                valid_for_paper_main_results=paper,
+                warnings=warnings,
+                workers=workers,
+                progress=report,
+            )
+            loaded = load_orbit_trace(part / "trace_manifest.json")
+            if first is None:
+                first = loaded.trace_manifest
+                catalog = loaded.satellite_catalog
+            ephemeris.extend(
+                row
+                for row in loaded.ephemeris_samples
+                if not index or row["time_s"] > part_times[0]
+            )
+            for key in windows:
+                windows[key].extend(getattr(loaded, key))
+        provenance = {
+            k: v
+            for k, v in first.provenance.items()
+            if k not in {"writer", "algorithm_version"}
+        }
+        provenance["geometry"]["temporal_model"] = "sample_hold"
+        provenance["precompute"] = {
+            "time_batches": len(offsets),
+            "max_batch_samples": batch_samples,
+        }
+        return write_orbit_trace(
+            target,
+            time={
+                **first.time,
+                "start_s": times[0],
+                "end_s": times[-1],
+                "duration_s": times[-1] - times[0],
+                "step_s": _uniform_step(times),
+            },
+            satellite_catalog=catalog,
+            ephemeris_samples=ephemeris,
+            **{key: _merge_sample_windows(rows, key) for key, rows in windows.items()},
+            trace_model=SGP4_ORBIT_TRACE_MODEL,
+            valid_for_paper_main_results=paper,
+            provenance=provenance,
+            warnings=first.warnings,
+        )
+
+
+def _merge_sample_windows(rows, kind):
+    fields = {
+        "sgl_windows": ("ingress_id", "satellite_id"),
+        "isl_windows": ("endpoint_a", "endpoint_b"),
+        "sunlight_windows": ("satellite_id", "sunlit"),
+    }[kind]
+    groups = {}
+    for row in rows:
+        groups.setdefault(tuple(row[k] for k in fields), []).append(row)
+    result = []
+    for group in groups.values():
+        last = None
+        for row in sorted(group, key=lambda r: r["start_s"]):
+            if last is not None and last["end_s"] == row["start_s"]:
+                last["end_s"] = row["end_s"]
+                for key, value in row.items():
+                    if "_min_" in key or key.endswith("_min"):
+                        last[key] = min(last.get(key, value), value)
+                    elif "_max_" in key or key.endswith("_max"):
+                        last[key] = max(last.get(key, value), value)
+                last["duration_s"] = last["end_s"] - last["start_s"]
+            else:
+                last = dict(row)
+                result.append(last)
+    return result
+
+
+def _state_partition(args):
+    bundle, epoch, times = args
+    propagation = propagate_sgp4_teme(
+        bundle, simulation_epoch_utc=epoch, sample_times_s=times
+    )
+    return propagation, transform_sgp4_teme_to_itrs(propagation)
+
+
+def _limit_worker():
+    if hasattr(os, "sched_getaffinity"):
+        cpus = sorted(os.sched_getaffinity(0))
+        if len(cpus) > 1:
+            os.sched_setaffinity(0, cpus[:-1])
+
+
+def _geometry_partition(args):
+    earth_fixed, ground, pairs, sun = args
+    return evaluate_sgp4_geometry(
+        earth_fixed,
+        ground_ingresses=ground,
+        isl_pairs=pairs,
+        sun_positions=sun,
+        sample_hold=True,
     )
 
 
@@ -79,6 +340,7 @@ def write_sgp4_orbit_trace(
     geometry: Sgp4GeometryResult,
     valid_for_paper_main_results: bool = False,
     warnings: Sequence[str] = (),
+    sample_hold: bool = False,
 ) -> OrbitTraceManifest:
     """Write aligned SGP4 states and geometry through the Orbit Trace writer."""
 
@@ -91,9 +353,7 @@ def write_sgp4_orbit_trace(
     )
     step_s = _uniform_step(times)
 
-    automatic_warnings = [
-        "SGP4 Orbit Trace generation is not yet consumed by Runtime or DSE"
-    ]
+    automatic_warnings = []
     if not bundle.provenance.observationally_fitted:
         automatic_warnings.append(
             "SGP4 mean elements are synthetic and are not observationally fitted"
@@ -101,6 +361,10 @@ def write_sgp4_orbit_trace(
     if earth_fixed.earth_orientation_quality == "predictive":
         automatic_warnings.append("Earth orientation uses predictive IERS-A values")
 
+    provenance = _trace_provenance(bundle, propagation, earth_fixed, geometry)
+    if sample_hold:
+        provenance["geometry"]["temporal_model"] = "sample_hold"
+        provenance["sgp4_trace_adapter"]["sampling"] = "sample_hold"
     return write_orbit_trace(
         output_dir,
         time={
@@ -118,7 +382,7 @@ def write_sgp4_orbit_trace(
         sunlight_windows=_sunlight_window_rows(geometry),
         trace_model=SGP4_ORBIT_TRACE_MODEL,
         valid_for_paper_main_results=valid_for_paper_main_results,
-        provenance=_trace_provenance(bundle, propagation, earth_fixed, geometry),
+        provenance=provenance,
         warnings=tuple((*canonical_warnings, *automatic_warnings)),
     )
 
@@ -168,7 +432,9 @@ def _validate_aligned_inputs(
             "earth_fixed.source_algorithm_version does not match propagation"
         )
     if earth_fixed.source_reference_frame != propagation.reference_frame:
-        raise ValueError("earth_fixed.source_reference_frame does not match propagation")
+        raise ValueError(
+            "earth_fixed.source_reference_frame does not match propagation"
+        )
     if earth_fixed.reference_frame != "ITRS":
         raise ValueError("earth_fixed.reference_frame must be ITRS")
     if earth_fixed.position_unit != "km" or earth_fixed.velocity_unit != "km/s":
@@ -280,8 +546,12 @@ def _validate_geometry_sample_grid(
     satellite_ids: tuple[str, ...],
 ) -> None:
     ingress_ids = tuple(ingress.ingress_id for ingress in geometry.ground_ingresses)
-    if ingress_ids != tuple(sorted(ingress_ids)) or len(ingress_ids) != len(set(ingress_ids)):
-        raise ValueError("geometry.ground_ingresses must be unique and canonically ordered")
+    if ingress_ids != tuple(sorted(ingress_ids)) or len(ingress_ids) != len(
+        set(ingress_ids)
+    ):
+        raise ValueError(
+            "geometry.ground_ingresses must be unique and canonically ordered"
+        )
     if geometry.isl_pairs != tuple(sorted(geometry.isl_pairs)) or len(
         geometry.isl_pairs
     ) != len(set(geometry.isl_pairs)):
@@ -317,7 +587,9 @@ def _validate_geometry_sample_grid(
         (sample.time_s, sample.satellite_id) for sample in geometry.sunlight_samples
     )
     if actual_sunlight != expected_sunlight:
-        raise ValueError("geometry.sunlight_samples do not match the complete state grid")
+        raise ValueError(
+            "geometry.sunlight_samples do not match the complete state grid"
+        )
 
 
 def _uniform_step(times: tuple[float, ...]) -> float:
@@ -354,14 +626,17 @@ def _ephemeris_rows(
 
 def _sgl_window_rows(geometry: Sgp4GeometryResult) -> tuple[dict[str, Any], ...]:
     rows: list[dict[str, Any]] = []
+    index = {}
+    for sample in geometry.sgl_samples:
+        if sample.visible:
+            index.setdefault((sample.ingress_id, sample.satellite_id), []).append(
+                sample
+            )
     for window in geometry.sgl_windows:
         samples = [
             sample
-            for sample in geometry.sgl_samples
-            if sample.ingress_id == window.ingress_id
-            and sample.satellite_id == window.satellite_id
-            and sample.visible
-            and window.start_s <= sample.time_s <= window.end_s
+            for sample in index.get((window.ingress_id, window.satellite_id), ())
+            if window.start_s <= sample.time_s <= window.end_s
         ]
         row = {
             **window.to_dict(),
@@ -386,14 +661,15 @@ def _sgl_window_rows(geometry: Sgp4GeometryResult) -> tuple[dict[str, Any], ...]
 
 def _isl_window_rows(geometry: Sgp4GeometryResult) -> tuple[dict[str, Any], ...]:
     rows: list[dict[str, Any]] = []
+    index = {}
+    for sample in geometry.isl_samples:
+        if sample.visible:
+            index.setdefault((sample.endpoint_a, sample.endpoint_b), []).append(sample)
     for window in geometry.isl_windows:
         samples = [
             sample
-            for sample in geometry.isl_samples
-            if sample.endpoint_a == window.endpoint_a
-            and sample.endpoint_b == window.endpoint_b
-            and sample.visible
-            and window.start_s <= sample.time_s <= window.end_s
+            for sample in index.get((window.endpoint_a, window.endpoint_b), ())
+            if window.start_s <= sample.time_s <= window.end_s
         ]
         row = {
             **window.to_dict(),
@@ -420,13 +696,15 @@ def _isl_window_rows(geometry: Sgp4GeometryResult) -> tuple[dict[str, Any], ...]
 
 def _sunlight_window_rows(geometry: Sgp4GeometryResult) -> tuple[dict[str, Any], ...]:
     rows: list[dict[str, Any]] = []
+    index = {}
+    for sample in geometry.sunlight_samples:
+        if True:
+            index.setdefault((sample.satellite_id, sample.sunlit), []).append(sample)
     for window in geometry.sunlight_windows:
         samples = [
             sample
-            for sample in geometry.sunlight_samples
-            if sample.satellite_id == window.satellite_id
-            and sample.sunlit == window.sunlit
-            and window.start_s <= sample.time_s <= window.end_s
+            for sample in index.get((window.satellite_id, window.sunlit), ())
+            if window.start_s <= sample.time_s <= window.end_s
         ]
         row = {
             **window.to_dict(),

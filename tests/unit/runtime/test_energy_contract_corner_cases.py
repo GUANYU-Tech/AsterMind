@@ -1,6 +1,4 @@
-import sys
 import unittest
-from pathlib import Path
 
 
 from orbitserve.runtime.state.energy import EnergyWindowError, advance_satellite_energy, apply_request_energy, energy_window_at

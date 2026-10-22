@@ -67,8 +67,7 @@ def _pipeline_inputs(times=(0.0, 60.0)):
         element_set_id=elements.element_set_id,
         simulation_epoch_utc=propagation.simulation_epoch_utc,
         samples=tuple(
-            Sgp4SunPositionSample(time_s, (149_600_000.0, 0.0, 0.0))
-            for time_s in times
+            Sgp4SunPositionSample(time_s, (149_600_000.0, 0.0, 0.0)) for time_s in times
         ),
         iers_a_sha256=earth_fixed.iers_a_sha256,
         iers_readme_sha256=earth_fixed.iers_readme_sha256,
@@ -178,7 +177,7 @@ class Sgp4OrbitTraceTests(unittest.TestCase):
         self.assertEqual(first_files, second_files)
         self.assertEqual(
             hashlib.sha256(first_files["trace_manifest.json"]).hexdigest(),
-            "cc65be31de4a323efe1b857402144b3008c612d4b5ca6878c2b4a55ae6338ced",
+            "8518bc2af62efb317a3fd5656ef45b689e1b09b9b817db4083207338bb47733f",
         )
 
     def test_synthetic_and_predictive_status_are_explicit_warnings(self):
@@ -196,7 +195,7 @@ class Sgp4OrbitTraceTests(unittest.TestCase):
         self.assertTrue(manifest.valid_for_paper_main_results)
         self.assertIn("synthetic", warning_text)
         self.assertIn("predictive", warning_text)
-        self.assertIn("not yet consumed", warning_text)
+        self.assertNotIn("not yet consumed", warning_text)
 
     def test_alignment_and_uniform_grid_fail_before_writing(self):
         elements, propagation, earth_fixed, geometry = _pipeline_inputs()
@@ -304,3 +303,72 @@ class Sgp4OrbitTraceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SampleHoldWindowsTests(unittest.TestCase):
+    def test_sampled_window_transition_uses_observed_boundary_without_interpolation(
+        self,
+    ):
+        from orbitserve.orbit.sgp4.geometry import _state_windows
+
+        samples = (
+            (0.0, False, -1.0),
+            (1.0, True, 3.0),
+            (2.0, True, 1.0),
+            (3.0, False, -1.0),
+        )
+        self.assertEqual(
+            _state_windows(samples, sample_hold=True),
+            ((0.0, 1.0, False), (1.0, 3.0, True)),
+        )
+
+
+class BatchedTraceTests(unittest.TestCase):
+    def test_time_batches_preserve_states_and_merge_windows_without_boundary_duplicates(
+        self,
+    ):
+        from orbitserve.orbit.sgp4.trace import _state_partition
+        from orbitserve.orbit.sgp4.elements import load_sgp4_element_bundle
+
+        bundle = load_sgp4_element_bundle(_bundle())
+        times = tuple(float(t) for t in range(122))
+        epoch = "2026-07-20T00:00:00.000000Z"
+        with tempfile.TemporaryDirectory() as folder:
+            chunked = generate_orbit_trace(
+                Path(folder) / "chunked",
+                elements=bundle,
+                simulation_epoch_utc=epoch,
+                sample_times_s=times,
+                ground_ingresses=(),
+                isl_pairs=(
+                    (
+                        bundle.satellites[0].satellite_id,
+                        bundle.satellites[1].satellite_id,
+                    ),
+                ),
+                workers=1,
+            )
+            propagation, fixed = _state_partition((bundle, epoch, times))
+            from orbitserve.orbit import evaluate_sgp4_geometry
+
+            geometry = evaluate_sgp4_geometry(
+                fixed,
+                ground_ingresses=(),
+                isl_pairs=(
+                    (
+                        bundle.satellites[0].satellite_id,
+                        bundle.satellites[1].satellite_id,
+                    ),
+                ),
+                sample_hold=True,
+            )
+            whole = write_sgp4_orbit_trace(
+                Path(folder) / "whole",
+                elements=bundle,
+                propagation=propagation,
+                earth_fixed=fixed,
+                geometry=geometry,
+                sample_hold=True,
+            )
+            self.assertEqual(chunked.trace_id, whole.trace_id)
+            self.assertEqual(chunked.provenance["precompute"]["time_batches"], 2)

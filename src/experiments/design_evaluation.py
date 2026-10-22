@@ -1,179 +1,219 @@
-"""Shared evaluation pipeline for one fully materialized constellation design.
-
-The evaluator deliberately knows nothing about DSE ranges.  Callers must pass
-one complete :class:`ConstellationDesign`; fixed experiments and DSE candidates
-therefore exercise the same architecture, hardware, cost, simulation, serving,
-and current-runtime path.
-"""
+"""Shared current-contract evaluator used by fixed designs and DSE."""
 
 from __future__ import annotations
 
 import hashlib
+import json
+import math
 from dataclasses import dataclass, replace
-from pathlib import Path
 from typing import Any
+from pathlib import Path
 
-from .constellation_cost import estimate_constellation_cost
-from ..architecture import resolve_architecture
-from ..runtime import RuntimeStrategySpec, run_simulation as execute_runtime_simulation
+from orbitserve.architecture import resolve_architecture
+from orbitserve.orbit import load_orbit_trace
+from orbitserve.runtime import NetworkSpec, candidate_links, run_simulation
+from orbitserve.serving import estimate_serving_throughput
+from .network import run_network_experiment, TERMINAL_ALLOCATION_MODEL
+from .network_inputs import materialize_network_input
 from .simulation_builder import build_simulation_spec
-from ..serving import estimate_serving_throughput
-from ..orbit import run_simulation as run_orbit_simulation
-
-
-ARCHITECTURE_SURROGATE_WARNING = (
-    "constellation architecture analysis is a lightweight surrogate; STK-calibrated visibility, "
-    "shadow, routing, and queueing are not evaluated"
-)
-
-_FILE_BACKED_TRACE_MODELS = {"surrogate_orbit_trace", "circular_geometry_trace"}
+from .constellation_cost import estimate_constellation_cost
 
 
 @dataclass(frozen=True)
 class MaterializedDesignEvaluation:
-    """Outputs produced by the common single-design evaluation path."""
-
-    design: Any
-    constellation_architecture: dict[str, Any]
-    resolved_hardware: Any
-    cost: Any
-    simulation_config: Any
-    simulation: Any
-    serving_spec: Any
-    serving_throughput: Any
-    runtime_simulation_spec: Any
-    runtime_performance: Any
-    warnings: tuple[str, ...]
+    physical_input: dict
+    architecture: dict
+    serving: object
+    network: dict
+    runtime: object
+    cost: dict
+    runtime_spec: object
 
 
 def evaluate_materialized_design(
-    experiment_spec: Any,
+    spec,
     *,
-    design: Any,
-    workload_generation: Any,
-    serving_workload: Any,
-    evaluation_id: str,
-    simulation_config: Any | None = None,
-    input_warnings: tuple[str, ...] = (),
-) -> MaterializedDesignEvaluation:
-    """Evaluate exactly one complete design without consulting DSE ranges."""
-
-    base_dir = Path(experiment_spec.base_dir) if getattr(experiment_spec, "base_dir", None) else None
-    input_simulation_config = (
-        simulation_config
-        if simulation_config is not None
-        else getattr(experiment_spec, "simulation", None)
+    physical_network,
+    workload_generation,
+    output_dir,
+    strategy=None,
+    progress=None,
+    _workers=None,
+):
+    root = Path(output_dir)
+    if spec.physical_dataset:
+        from .physical_dataset import dataset_physical_input
+        concrete = dataset_physical_input(spec.physical_dataset, physical_network, spec.base_dir or '.')
+    else:
+        concrete = materialize_network_input(physical_network, spec.base_dir or ".")
+    compute = resolve_architecture(spec.hardware)
+    # A distinct role profile is explicit; otherwise identical hardware is shared.
+    communication = (
+        resolve_architecture(spec.communication_hardware)
+        if spec.communication_hardware
+        else compute
     )
-    if input_simulation_config is None:
-        raise ValueError("a materialized design evaluation requires simulation configuration")
-    input_simulation_config = _simulation_config_with_default_trace_dir(
-        input_simulation_config,
-        evaluation_id=evaluation_id,
-    )
-
-    # Keep this order explicit: it is the shared fixed-design/DSE contract.
-    constellation_architecture = design.architecture_analysis()
-    runtime_strategy = RuntimeStrategySpec.from_value(experiment_spec.runtime_strategy)
-    hardware = getattr(experiment_spec, "hardware", None)
-    resolved_hardware = resolve_architecture(hardware) if hardware is not None else None
-    cost = estimate_constellation_cost(
-        design,
-        experiment_spec.costing,
-        resolved_architecture=resolved_hardware,
-        formation_member_count=experiment_spec.serving.formation.member_count,
-    )
-    resolved_simulation_config = _simulation_config_with_link_hardware(
-        input_simulation_config,
-        resolved_hardware=resolved_hardware,
-    )
-    simulation = run_orbit_simulation(
-        resolved_simulation_config,
-        constellation=design,
-        workload_generation=workload_generation,
-        base_dir=base_dir,
-        experiment_id=evaluation_id,
-    )
-    serving_spec, serving_warnings = _serving_spec_for_resolved_hardware(
-        experiment_spec,
-        resolved_hardware=resolved_hardware,
-    )
-    serving_throughput = estimate_serving_throughput(
-        serving_spec,
-        hardware=resolved_hardware.hardware_profile if resolved_hardware else experiment_spec.serving.hardware,
-    )
-
-    pre_runtime_warnings = _dedupe(
-        (
-            *input_warnings,
-            *serving_warnings,
-            *cost.warnings,
-            *simulation.warnings,
-            *serving_throughput.warnings,
-            ARCHITECTURE_SURROGATE_WARNING,
-            *tuple(constellation_architecture.get("warnings", ())),
+    role_profiles = {"compute": compute, "communication": communication}
+    network_spec = NetworkSpec.from_value(concrete["network"])
+    for node in network_spec.nodes:
+        if node.role == "ground":
+            continue
+        profile = role_profiles[node.role].hardware_profile
+        if node.isl_terminals > profile.laser_terminal_count:
+            raise ValueError(
+                f"{node.node_id}: network ISL terminals exceed Architecture laser_terminal_count"
+            )
+    node_catalog = {n.node_id: n for n in network_spec.nodes}
+    for edge in candidate_links(network_spec):
+        profile = network_spec.link_profiles[edge.get("profile_id", edge["kind"])]
+        for endpoint in (edge["endpoint_a"], edge["endpoint_b"]):
+            node = node_catalog[endpoint]
+            if node.role == "ground":
+                continue
+            hardware = role_profiles[node.role].hardware_profile
+            cap = (
+                hardware.ground_link_bandwidth_gbps
+                if edge["kind"] == "sgl"
+                else hardware.laser_terminal_bandwidth_gbps
+            ) * 1e9
+            directional = [network_spec.link_profiles[name] for name in
+                           (profile.uplink_profile, profile.downlink_profile) if name]
+            if any(p.bandwidth_bps > cap + 1e-6 for p in (profile, *directional)):
+                raise ValueError(
+                    f"{edge['link_id']}: network rate exceeds Architecture terminal bandwidth"
+                )
+    cells = {}
+    for node in network_spec.nodes:
+        if node.role == "compute":
+            cells.setdefault(node.cell_id or node.node_id, []).append(node)
+    sizes = {len(members) for members in cells.values()}
+    if sizes != {spec.serving.formation.member_count}:
+        raise ValueError(
+            "Serving formation.member_count must match every physical compute cell"
         )
+    serving = estimate_serving_throughput(
+        replace(spec.serving, hardware=None), hardware=compute.hardware_profile
     )
-    runtime_simulation_spec = build_simulation_spec(
-        scenario_id=evaluation_id,
-        design_id=str(design.name),
-        workload_generation=workload_generation,
-        workload_spec=getattr(experiment_spec, "workload", None),
-        constellation=design,
-        constellation_architecture=(
-            resolved_hardware.hardware_profile
-            if resolved_hardware
-            else experiment_spec.serving.hardware
-        ),
-        serving_profile=serving_throughput,
-        simulation_result=simulation,
-        simulation_config=resolved_simulation_config,
-        energy_profile=resolved_hardware.energy_profile if resolved_hardware else None,
-        strategy=runtime_strategy,
-        warnings=pre_runtime_warnings,
+    if not serving.evaluated or not serving.feasible:
+        raise ValueError(
+            "Serving model is not feasible on the configured Architecture/formation"
+        )
+    requests = workload_generation.get(
+        "session_requests", workload_generation.get("requests", ())
     )
-    runtime_performance = execute_runtime_simulation(runtime_simulation_spec)
-    warnings = _dedupe((*pre_runtime_warnings, *runtime_performance.warnings))
+    for request in requests:
+        if request.get("model_family") != spec.serving.model.name:
+            raise ValueError("Workload model_family must match Serving model.name")
+    # Cached geometry must exactly match the resolved input, not just the file name.
+    network_dir = root / "network"
+    if spec.physical_dataset:
+        from .physical_dataset import reuse_dataset
+        if progress:
+            progress("Loading complete physical dataset (no physical recomputation)")
+        network = reuse_dataset(spec.physical_dataset, network_dir, concrete, base_dir=spec.base_dir or '.')
+    elif (network_dir / "network_result.json").exists():
+        stored = json.loads((network_dir / "materialized_input.json").read_text(encoding='utf-8'))
+        if stored != json.loads(json.dumps(concrete)):
+            raise ValueError("cached network input differs from current experiment")
+        network = json.loads((network_dir / "network_result.json").read_text())
+        if network.get("provenance", {}).get("between_samples") != "sample_hold":
+            raise ValueError(
+                "cached network uses obsolete interpolation semantics; choose a new output directory"
+            )
+        if network.get('provenance', {}).get('terminal_allocation_model') != TERMINAL_ALLOCATION_MODEL:
+            raise ValueError('cached network uses obsolete terminal/capacity semantics; choose a new output directory')
+    else:
+        network = run_network_experiment(
+            physical_network,
+            network_dir,
+            base_dir=spec.base_dir or ".",
+            progress=progress,
+            _workers=_workers,
+        )
+    if progress:
+        progress("Loading sampled Orbit trace")
+    trace = load_orbit_trace(network_dir / "orbit_trace/trace_manifest.json")
+    energy = compute.energy_profile.to_dict()
+    energy["node_profiles"] = {
+        n.node_id: role_profiles[n.role].energy_profile.to_dict()
+        for n in network_spec.nodes
+        if n.role != "ground"
+    }
+    # Ground coordinates in the Orbit input are authoritative; workload IDs must match.
+    ground = {g["ingress_id"]: g for g in concrete["ground_ingresses"]}
+    for station in workload_generation.get("gateways", ()):
+        station_id = station.get("gateway_id")
+        if station_id in ground:
+            for coordinate in ("lat_deg", "lon_deg"):
+                if not math.isclose(
+                    float(station[coordinate]),
+                    float(ground[station_id][coordinate]),
+                    abs_tol=1e-5,
+                ):
+                    raise ValueError(
+                        f"Workload and physical network disagree on {station_id} {coordinate}"
+                    )
+    requests = workload_generation.get(
+        "session_requests", workload_generation.get("requests", ())
+    )
+    for request in requests:
+        if request["ingress_id"] not in ground:
+            raise ValueError(
+                f"workload ingress is absent from physical network: {request['ingress_id']}"
+            )
+    runtime_spec = build_simulation_spec(
+        scenario_id=spec.experiment_id,
+        design_id=spec.experiment_id,
+        workload_generation={**workload_generation, "gateways": tuple(ground.values())},
+        constellation_architecture=compute.hardware_profile,
+        serving_profile=serving,
+        simulation_result=trace,
+        simulation_config={
+            "network": network_spec.to_dict(),
+            "step_s": concrete["time"]["step_s"],
+        },
+        energy_profile=energy,
+        physical_state_ref=str(network_dir / 'physical_state.sqlite')
+        if (network_dir / 'physical_state.sqlite').is_file() else None,
+        strategy=strategy or spec.runtime_strategy,
+    )
+    if progress:
+        progress("Chronological Runtime request execution")
+    runtime = run_simulation(runtime_spec)
+    if progress:
+        summary = runtime.request_summary
+        progress(
+            "Runtime completed: "
+            + str(summary["completed_request_count"])
+            + "/"
+            + str(summary["total_request_count"])
+        )
+    compute_cost = estimate_constellation_cost(
+        {"compute_node_count": len(cells)},
+        spec.costing,
+        resolved_architecture=compute,
+        formation_member_count=spec.serving.formation.member_count,
+    )
+    communication_count = sum(n.role == "communication" for n in network_spec.nodes)
+    comm_cost = communication.cost_profile
+    cost = {
+        "compute": compute_cost.to_dict(),
+        "communication_satellite_count": communication_count,
+        "communication_single_satellite": comm_cost.to_dict(),
+        "total_cost_usd": compute_cost.total_cost_usd
+        + communication_count * comm_cost.total_cost_usd,
+        "annualized_cost_usd_per_year": compute_cost.annualized_cost_usd_per_year
+        + communication_count * comm_cost.annualized_cost_usd_per_year,
+    }
     return MaterializedDesignEvaluation(
-        design=design,
-        constellation_architecture=constellation_architecture,
-        resolved_hardware=resolved_hardware,
-        cost=cost,
-        simulation_config=resolved_simulation_config,
-        simulation=simulation,
-        serving_spec=serving_spec,
-        serving_throughput=serving_throughput,
-        runtime_simulation_spec=runtime_simulation_spec,
-        runtime_performance=runtime_performance,
-        warnings=warnings,
+        concrete,
+        {role: value.to_dict() for role, value in role_profiles.items()},
+        serving,
+        network,
+        runtime,
+        cost,
+        runtime_spec,
     )
-
-
-def _serving_spec_for_resolved_hardware(
-    experiment_spec: Any,
-    *,
-    resolved_hardware: Any,
-) -> tuple[Any, tuple[str, ...]]:
-    """Use resolver output as the single-design hardware authority."""
-
-    serving = experiment_spec.serving
-    if resolved_hardware is None:
-        return serving, ()
-    return replace(serving, hardware=None), ()
-
-
-def _dedupe(values: tuple[Any, ...]) -> tuple[str, ...]:
-    return tuple(dict.fromkeys(str(value) for value in values if value is not None))
-
-
-def _mapping(value: Any) -> dict[str, Any]:
-    if value is None:
-        return {}
-    if isinstance(value, dict):
-        return dict(value)
-    if hasattr(value, "to_dict") and callable(value.to_dict):
-        converted = value.to_dict()
-        return dict(converted) if isinstance(converted, dict) else {}
-    return {}
 
 
 def safe_trace_path_component(value: Any) -> str:
@@ -215,43 +255,3 @@ def _truncate_utf8(value: str, max_bytes: int) -> str:
         characters.append(character)
         byte_count += encoded_size
     return "".join(characters)
-
-
-def _simulation_config_with_default_trace_dir(
-    simulation_config: Any,
-    *,
-    evaluation_id: str,
-) -> Any:
-    """Materialize a safe default trace directory for fixed evaluations."""
-
-    trace_model = str(getattr(simulation_config, "trace_model", "skeleton"))
-    if trace_model not in _FILE_BACKED_TRACE_MODELS:
-        return simulation_config
-    if getattr(simulation_config, "trace_output_dir", None):
-        return simulation_config
-    try:
-        return replace(
-            simulation_config,
-            trace_output_dir=str(
-                Path("results")
-                / "simulation_traces"
-                / safe_trace_path_component(evaluation_id)
-            ),
-        )
-    except TypeError:
-        return simulation_config
-
-
-def _simulation_config_with_link_hardware(simulation_config: Any, *, resolved_hardware: Any) -> Any:
-    """Inject the immutable single-satellite terminal capability into trace inputs."""
-
-    profile = getattr(resolved_hardware, "hardware_profile", None)
-    if profile is None:
-        return simulation_config
-    options = dict(getattr(simulation_config, "trace_options", {}) or {})
-    options["satellite_link_hardware"] = {
-        "terminal_count_per_satellite": int(getattr(profile, "laser_terminal_count", 0)),
-        "terminal_bandwidth_gbps": float(getattr(profile, "resolved_laser_terminal_bandwidth_gbps", 0.0)),
-        "total_bandwidth_gbps": float(getattr(profile, "inter_satellite_bandwidth_gbps", 0.0)),
-    }
-    return replace(simulation_config, trace_options=options)

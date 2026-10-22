@@ -6,7 +6,7 @@ import math
 from pathlib import Path
 from typing import Any
 
-from ..orbit import RuntimeTraceBundle, RuntimeTraceManifest, load_surrogate_trace_bundle
+from ..orbit import OrbitTraceBundle as RuntimeTraceBundle, OrbitTraceManifest as RuntimeTraceManifest, load_orbit_trace as load_surrogate_trace_bundle
 
 
 def analyze_communication_window_satellite_budget(
@@ -65,7 +65,7 @@ def analyze_communication_window_satellite_budget_from_bundle(
 ) -> dict[str, Any]:
     analysis_config = dict(config or {})
     warnings_out = list(warnings)
-    visible_counts = _visible_counts(trace_bundle.visible_count_samples)
+    visible_counts = _visible_counts(_visible_count_samples(trace_bundle))
     visible_satellite_ids = _visible_satellite_ids(trace_bundle)
     request_observations = _request_visible_counts(trace_bundle, workload_generation)
     if not visible_counts and not request_observations:
@@ -94,7 +94,7 @@ def analyze_communication_window_satellite_budget_from_bundle(
             budget,
             counts_for_candidates=counts_for_candidates,
             constellation_count=_constellation_count(trace_bundle, visible_satellite_ids),
-            access_windows=trace_bundle.access_windows,
+            access_windows=trace_bundle.sgl_windows,
         )
         for budget in candidate_budgets
     )
@@ -103,7 +103,7 @@ def analyze_communication_window_satellite_budget_from_bundle(
     summary = _visible_count_summary(
         visible_counts=visible_counts,
         request_counts=request_observations,
-        access_windows=trace_bundle.access_windows,
+        access_windows=trace_bundle.sgl_windows,
     )
     max_ids = int(analysis_config.get("max_visible_satellite_ids", 64))
     return {
@@ -261,7 +261,7 @@ def _visible_counts(samples: tuple[dict[str, Any], ...]) -> list[int]:
 
 def _visible_satellite_ids(trace_bundle: RuntimeTraceBundle) -> tuple[str, ...]:
     ids: set[str] = set()
-    for window in trace_bundle.access_windows:
+    for window in trace_bundle.sgl_windows:
         satellite_id = window.get("satellite_id")
         if satellite_id is not None:
             ids.add(str(satellite_id))
@@ -282,7 +282,7 @@ def _request_visible_counts(trace_bundle: RuntimeTraceBundle, workload_generatio
         ingress_id = _request_ingress_id(row)
         satellites = {
             str(window.get("satellite_id"))
-            for window in trace_bundle.access_windows
+            for window in trace_bundle.sgl_windows
             if window.get("satellite_id") is not None
             and _window_active(window, time_s)
             and (ingress_id is None or str(window.get("ingress_id")) == ingress_id)
@@ -290,7 +290,7 @@ def _request_visible_counts(trace_bundle: RuntimeTraceBundle, workload_generatio
         if not satellites and ingress_id is not None:
             satellites = {
                 str(window.get("satellite_id"))
-                for window in trace_bundle.access_windows
+                for window in trace_bundle.sgl_windows
                 if window.get("satellite_id") is not None and _window_active(window, time_s)
             }
         observations.append(len(satellites))
@@ -400,3 +400,12 @@ def _first_present(*values: Any) -> Any:
         if value is not None:
             return value
     return None
+
+
+def _visible_count_samples(bundle):
+    windows=tuple(bundle.sgl_windows)
+    times=sorted({float(row["time_s"]) for row in bundle.ephemeris_samples})
+    ingresses=sorted({str(row["ingress_id"]) for row in windows})
+    return tuple({"time_s":t,"ingress_id":ingress,"geometry_visible_count":sum(
+        str(w["ingress_id"])==ingress and float(w["start_s"])<=t<float(w["end_s"]) for w in windows)}
+        for ingress in ingresses for t in times if t<float(bundle.time["end_s"]))

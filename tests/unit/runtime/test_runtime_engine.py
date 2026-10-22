@@ -3,7 +3,8 @@ import unittest
 from orbitserve.orbit import ORBIT_TRACE_SCHEMA, OrbitTraceBundle, OrbitTraceManifest
 from orbitserve.experiments.simulation_builder import build_simulation_spec
 from orbitserve.runtime import RuntimeStrategySpec, run_simulation
-from orbitserve.runtime.engine.routing import C_KM_PER_S, COMMUNICATION_SHELL_ALTITUDE_KM, EARTH_RADIUS_KM
+from orbitserve.runtime.state.network import C_KM_PER_S
+from orbitserve.runtime import NetworkSpec, NetworkNodeSpec, LinkProfile
 
 
 def _trace():
@@ -26,11 +27,15 @@ def _trace():
             {"satellite_id": "sat-a", "compute_capable": True},
             {"satellite_id": "sat-b", "compute_capable": True},
         ),
-        ephemeris_samples=(
+        ephemeris_samples=tuple(
+            {**row, "time_s": t} for t in (0., 100.) for row in (
             {"time_s": 0.0, "satellite_id": "sat-a", "position_itrs_km": [7000.0, 0.0, 0.0]},
             {"time_s": 0.0, "satellite_id": "sat-b", "position_itrs_km": [0.0, 7000.0, 0.0]},
+                )),
+        sgl_windows=(
+            {"ingress_id":"gateway-0","satellite_id":"sat-a","start_s":0.,"end_s":100.},
+            {"ingress_id":"gateway-1","satellite_id":"sat-b","start_s":0.,"end_s":100.},
         ),
-        sgl_windows=(),
         isl_windows=(
             {
                 "link_id": "isl:sat-a:sat-b",
@@ -61,7 +66,7 @@ def _request(
         "arrival_time_s": arrival_time_s,
         "lat_deg": 0.0,
         "lon_deg": lon_deg,
-        "ingress_id": "gateway-0",
+        "ingress_id": "gateway-1" if lon_deg == 90.0 else "gateway-0",
         "prompt_tokens": 10,
         "output_tokens": 2,
         "input_bytes": 1000.0,
@@ -72,10 +77,22 @@ def _request(
     }
 
 
+def _network():
+    return NetworkSpec(
+        (NetworkNodeSpec("sat-a", "compute", 2, 1), NetworkNodeSpec("sat-b", "compute", 2, 1),
+         NetworkNodeSpec("gateway-0", "ground", sgl_terminals=1),
+         NetworkNodeSpec("gateway-1", "ground", sgl_terminals=1)),
+        {"communication_isl": LinkProfile(1e9, 0.), "sgl": LinkProfile(1e9, 0.)},
+        communication_topology="explicit", ground_roles=(),
+        explicit_pairs=(("sat-a","sat-b"),("gateway-0","sat-a"),("gateway-1","sat-b")))
+
+
 def _scenario(strategy, requests=None, trace=None):
     return build_simulation_spec(
         workload_generation={
-            "requests": requests or [_request()]
+            "requests": requests or [_request()],
+            "gateways": [{"ingress_id":"gateway-0","lat_deg":0.,"lon_deg":0.},
+                         {"ingress_id":"gateway-1","lat_deg":0.,"lon_deg":90.}]
         },
         constellation_architecture={
             "storage_capacity_tb": 2e-10,
@@ -85,13 +102,7 @@ def _scenario(strategy, requests=None, trace=None):
             }
         },
         simulation_result=trace or _trace(),
-        simulation_config={
-            "communication_satellite": {
-                "altitude_km": 550.0,
-                "uplink_bandwidth_bps": 1e9,
-                "downlink_bandwidth_bps": 1e9,
-            }
-        },
+        simulation_config={"network": _network().to_dict()},
         serving_profile={
             "evaluated": True,
             "feasible": True,
@@ -128,7 +139,7 @@ def _scenario(strategy, requests=None, trace=None):
 
 
 class RuntimeEngineTests(unittest.TestCase):
-    def test_energy_score_observes_solar_input_and_no_link_queue_exists(self):
+    def test_energy_score_observes_solar_input_with_physical_network(self):
         strategy = RuntimeStrategySpec(
             latency_weight=0.0,
             kv_reuse_weight=0.0,
@@ -140,7 +151,7 @@ class RuntimeEngineTests(unittest.TestCase):
         record = result.request_records[0]
         self.assertEqual(record["decision"]["serving_satellite_id"], "sat-b")
         self.assertNotIn("links", result.state_summary)
-        self.assertNotIn("link_queue_wait_s", record["timing"])
+        self.assertIn("link_queue_wait_s", record["timing"])
         self.assertNotIn("slo_metrics", result.to_dict())
         self.assertEqual(
             set(result.inference_metrics),
@@ -161,10 +172,7 @@ class RuntimeEngineTests(unittest.TestCase):
         result = run_simulation(_scenario(strategy))
         record = result.request_records[0]
         first_leg = record["routing"]["selected_path"][0]
-        expected_propagation_s = (
-            COMMUNICATION_SHELL_ALTITUDE_KM
-            + abs((7000.0 - EARTH_RADIUS_KM) - COMMUNICATION_SHELL_ALTITUDE_KM)
-        ) / C_KM_PER_S
+        expected_propagation_s = (7000.0 - 6378.137) / C_KM_PER_S
         self.assertAlmostEqual(first_leg["propagation_delay_s"], expected_propagation_s)
         self.assertAlmostEqual(first_leg["transmission_s"], 1000.0 * 8.0 / 1e9)
         self.assertAlmostEqual(

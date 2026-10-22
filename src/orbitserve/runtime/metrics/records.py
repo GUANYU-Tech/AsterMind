@@ -10,53 +10,90 @@ from ...common import to_jsonable
 
 _SECTION_DEFAULTS: dict[str, dict[str, Any]] = {
     "request": {
-        "request_id": None, "arrival_time_s": 0.0, "prompt_tokens": 0,
-        "output_tokens": 0, "session_id": None, "region_id": None,
+        "request_id": None,
+        "arrival_time_s": 0.0,
+        "prompt_tokens": 0,
+        "output_tokens": 0,
+        "session_id": None,
+        "region_id": None,
     },
     "decision": {
-        "strategy": None, "action_type": "reject_drop", "action_components": (),
+        "strategy": None,
+        "action_type": "reject_drop",
+        "action_components": (),
         "access_type": None,
         "access_satellite_id": None,
         "access_compute_node_id": None,
         "serving_compute_node_id": None,
-        "serving_satellite_id": None, "dvfs_scale": None,
-        "fallback_used": False, "deferred": False, "defer_until_s": None,
-        "session_action": None, "shadow_strategy": None, "shadow_strategies": (),
-        "access_action_type": None, "prefill_action_type": None,
+        "serving_satellite_id": None,
+        "dvfs_scale": None,
+        "fallback_used": False,
+        "deferred": False,
+        "defer_until_s": None,
+        "session_action": None,
+        "shadow_strategy": None,
+        "shadow_strategies": (),
+        "access_action_type": None,
+        "prefill_action_type": None,
         "decode_action_type": None,
     },
     "placement": {
-        "compute_owner_compute_node_id": None, "compute_owner_compute_node_ids": (),
-        "compute_owner_satellite_id": None, "compute_owner_satellite_ids": (),
+        "compute_owner_compute_node_id": None,
+        "compute_owner_compute_node_ids": (),
+        "compute_owner_satellite_id": None,
+        "compute_owner_satellite_ids": (),
     },
     "timing": {
         "access_wait_s": None,
-        "link_transmission_s": None, "propagation_s": None,
-        "prefill_queue_wait_s": None, "prefill_service_s": None,
-        "decode_queue_wait_s": None, "decode_service_s": None,
-        "uplink_s": None, "kv_transfer_s": None, "first_token_decode_s": None,
-        "return_path_s": None, "first_token_return_s": None,
-        "ttft_breakdown_s": {}, "ttft_s": None, "tpot_s": None,
+        "link_queue_wait_s": None,
+        "link_transmission_s": None,
+        "propagation_s": None,
+        "prefill_queue_wait_s": None,
+        "prefill_service_s": None,
+        "decode_queue_wait_s": None,
+        "decode_service_s": None,
+        "uplink_s": None,
+        "kv_transfer_s": None,
+        "first_token_decode_s": None,
+        "return_path_s": None,
+        "first_token_return_s": None,
+        "ttft_breakdown_s": {},
+        "ttft_s": None,
+        "tpot_s": None,
         "e2e_s": None,
         "response_streaming_model": None,
     },
     "routing": {
-        "ingress": None, "input_route_nodes": (), "output_route_nodes": (),
-        "route_node_ids": (), "route_links": (), "hop_count": 0,
+        "ingress": None,
+        "input_route_nodes": (),
+        "output_route_nodes": (),
+        "route_node_ids": (),
+        "route_links": (),
+        "hop_count": 0,
         "selected_path": (),
     },
     "energy": {
-        "soc_before": None, "soc_after": None, "compute_energy_j": None,
-        "communication_energy_j": None, "energy_violation": None,
-        "compute_sunlit": None, "access_sunlit": None, "energy_ledger": (),
+        "soc_before": None,
+        "soc_after": None,
+        "compute_energy_j": None,
+        "communication_energy_j": None,
+        "energy_violation": None,
+        "compute_sunlit": None,
+        "access_sunlit": None,
+        "energy_ledger": (),
     },
     "kv": {
-        "kv_capacity_admission": None, "kv_serve_action": None,
-        "kv_hit_tokens": None, "kv_copied_tokens": None,
+        "kv_capacity_admission": None,
+        "kv_serve_action": None,
+        "kv_hit_tokens": None,
+        "kv_copied_tokens": None,
         "kv_miss_tokens": None,
-        "context_recompute_tokens": None, "kv_reused_bytes": None,
-        "kv_generated_bytes": None, "kv_evicted_bytes": None,
-        "kv_evicted_tokens": None, "kv_evicted_entry_count": None,
+        "context_recompute_tokens": None,
+        "kv_reused_bytes": None,
+        "kv_generated_bytes": None,
+        "kv_evicted_bytes": None,
+        "kv_evicted_tokens": None,
+        "kv_evicted_entry_count": None,
         "kv_capacity_tokens": None,
         "kv_occupancy_tokens_before": None,
         "kv_occupancy_tokens_after": None,
@@ -64,19 +101,20 @@ _SECTION_DEFAULTS: dict[str, dict[str, Any]] = {
         "kv_copy_source_compute_node_id": None,
     },
     "outcome": {
-        "completed": False, "uncompleted_stage": None,
-        "uncompleted_reason": None, "bottleneck_reason": None,
+        "completed": False,
+        "uncompleted_stage": None,
+        "uncompleted_reason": None,
+        "bottleneck_reason": None,
     },
     "provenance": {
-        "scope": "trace_backed_runtime_surrogate", "trace_model": "surrogate_orbit_trace",
+        "scope": "runtime_request",
+        "trace_model": None,
         "valid_for_paper_main_results": False,
     },
 }
 
 _FIELD_SECTION = {
-    key: section
-    for section, defaults in _SECTION_DEFAULTS.items()
-    for key in defaults
+    key: section for section, defaults in _SECTION_DEFAULTS.items() for key in defaults
 }
 
 
@@ -117,18 +155,26 @@ class RuntimeRequestRecord:
         path = tuple(sections["routing"].get("selected_path") or ())
         if path:
             sections["routing"]["route_links"] = tuple(
-                str(leg["link_id"]) for leg in path
+                str(leg["link_id"])
+                for leg in path
                 if isinstance(leg, dict) and leg.get("link_id") is not None
             )
             sections["routing"]["hop_count"] = sum(
-                1 for leg in path
-                if isinstance(leg, dict) and str(leg.get("kind", "")).lower() == "isl"
+                1
+                for leg in path
+                if isinstance(leg, dict) and str(leg.get("kind", "")).lower() != "sgl"
             )
-            sections["timing"]["propagation_s"] = _sum_path_value(path, "propagation_delay_s")
+            sections["timing"]["propagation_s"] = _sum_path_value(
+                path, "propagation_delay_s"
+            )
         ledger = tuple(sections["energy"].get("energy_ledger") or ())
         if ledger:
-            sections["energy"]["compute_energy_j"] = _sum_ledger_value(ledger, "compute_bus_j")
-            sections["energy"]["communication_energy_j"] = _sum_ledger_value(ledger, "link_bus_j")
+            sections["energy"]["compute_energy_j"] = _sum_ledger_value(
+                ledger, "compute_bus_j"
+            )
+            sections["energy"]["communication_energy_j"] = _sum_ledger_value(
+                ledger, "link_bus_j"
+            )
         if sections["decision"].get("strategy") is None:
             sections["decision"]["strategy"] = sections["provenance"].get("policy")
         if sections["request"].get("request_id") is None:
@@ -168,13 +214,19 @@ class RuntimeRequestRecord:
         return RuntimeRequestRecord(**payload)
 
     def to_dict(self) -> dict[str, Any]:
-        return to_jsonable({
-            "request": self.request, "decision": self.decision,
-            "placement": self.placement, "timing": self.timing,
-            "routing": self.routing, "energy": self.energy, "kv": self.kv,
-            "outcome": self.outcome,
-            "provenance": self.provenance,
-        })
+        return to_jsonable(
+            {
+                "request": self.request,
+                "decision": self.decision,
+                "placement": self.placement,
+                "timing": self.timing,
+                "routing": self.routing,
+                "energy": self.energy,
+                "kv": self.kv,
+                "outcome": self.outcome,
+                "provenance": self.provenance,
+            }
+        )
 
 
 def _copy_defaults(defaults: dict[str, Any]) -> dict[str, Any]:
@@ -189,7 +241,9 @@ def _sum_path_value(path: tuple[Any, ...], key: str) -> float:
 
 
 def _sum_ledger_value(ledger: tuple[Any, ...], key: str) -> float:
-    return sum(float(row.get(key, 0.0) or 0.0) for row in ledger if isinstance(row, dict))
+    return sum(
+        float(row.get(key, 0.0) or 0.0) for row in ledger if isinstance(row, dict)
+    )
 
 
 def _tpot_s(*, ttft_s: Any, e2e_s: Any, output_tokens: int) -> float | None:
@@ -201,7 +255,9 @@ def _tpot_s(*, ttft_s: Any, e2e_s: Any, output_tokens: int) -> float | None:
     return streaming_s / (output_tokens - 1)
 
 
-def records_to_jsonable(records: tuple[RuntimeRequestRecord, ...]) -> tuple[dict[str, Any], ...]:
+def records_to_jsonable(
+    records: tuple[RuntimeRequestRecord, ...],
+) -> tuple[dict[str, Any], ...]:
     return tuple(record.to_dict() for record in records)
 
 

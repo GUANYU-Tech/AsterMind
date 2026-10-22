@@ -24,7 +24,6 @@ from .runtime import (
     TERRESTRIAL_GROUND_SCOPE,
     TERRESTRIAL_NETWORK_TRACE,
     GroundRuntimeSimulationResult,
-    _CacheEntry,
     _ReplicaJob,
     _ReplicaState,
     _compact_cache_as_of,
@@ -37,7 +36,6 @@ from .runtime import (
     _percentile,
     _prefix_hit,
     _prefix_routing_sort_key,
-    _ready_cache_entries,
     _region_metrics,
     _replica_imbalance_metrics,
     _replica_metrics,
@@ -51,7 +49,7 @@ from .runtime import (
     _wan_latency,
     _resolve_ground_ingress,
 )
-from ...runtime import RuntimeRequestRecord
+from .contracts import GroundRequestRecord as RuntimeRequestRecord
 
 
 CENTRALIZED_GROUND_POLICIES = frozenset(
