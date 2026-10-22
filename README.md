@@ -169,9 +169,22 @@ OrbitServe still performs hop selection, propagation and fault recovery; this
 adapter does not simulate TCP or IP routing. Selecting a missing native backend
 fails explicitly. The default queue and fluid backends require neither library.
 
-Install the optional native backend with `python3 -m pip install ".[simgrid]"`.
-SimGrid may require a C++ compiler, CMake, Boost and matching Python development
-headers. Its supported operating systems are determined by SimGrid, not a Conda
+SimGrid 4.1 may build from source. On Ubuntu or Ubuntu under WSL, install its
+system build dependencies before installing the optional backend:
+
+```bash
+sudo apt-get update
+sudo apt-get install --yes --no-install-recommends \
+  build-essential cmake libboost-dev pybind11-dev python3-dev
+python3 -m pip install --upgrade 'pip==26.2.2'
+python3 -m pip install --build-constraint constraints/native-build.txt ".[simgrid]"
+```
+
+Run these commands from the repository root. The build constraint selects
+pybind11 2.13.6 for SimGrid 4.1's isolated build; newer pybind11 property checks
+are incompatible with this SimGrid release. It does not disable build isolation.
+
+SimGrid's supported operating systems are determined by SimGrid, not a Conda
 environment name. Queue mode does not import or require SimGrid. Explicitly
 selecting an unavailable SimGrid backend raises an error; there is no fallback.
 

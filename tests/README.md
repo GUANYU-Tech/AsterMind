@@ -9,8 +9,10 @@ python -m unittest discover -s tests -t . -v
 
 Install `.[simgrid,ns3]` on a supported platform for the native backend checks.
 Skipped native cases do not validate those backends. The GitHub Actions workflow
-installs both native dependencies, runs the full suite on Python 3.12, and fails
-if any case is skipped.
+installs the C++ compiler, CMake, Boost and Python/pybind11 development headers
+before installing both native backends. It uses pip 26.2.2 and
+`constraints/native-build.txt` to select pybind11 2.13.6 in the isolated SimGrid
+build. It runs on Ubuntu 24.04 with Python 3.12 and fails if any case is skipped.
 
 ## Preserved behavior during the physical-network migration
 

@@ -1,0 +1,3 @@
+# SimGrid 4.1's Python bindings are incompatible with newer property call_guard checks.
+# Keep this in the isolated build environment; do not disable pip build isolation.
+pybind11==2.13.6
