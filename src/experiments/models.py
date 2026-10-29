@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
-import json
 from typing import Any
 
 from orbitserve.architecture import HardwareSpec
@@ -13,6 +13,7 @@ from orbitserve.common import to_jsonable
 from orbitserve.runtime import RuntimeStrategySpec
 from orbitserve.serving import ServingSpec
 from orbitserve.workload import WorkloadBundleRef
+
 from .constellation_cost import CostingSpec
 
 
@@ -45,7 +46,7 @@ class ExperimentSpec:
         network = deepcopy(data.get("physical_network"))
         if network is None and data.get('physical_dataset'):
             from .physical_dataset import load_dataset
-            folder, _, _ = load_dataset(Path(base_dir or '.') / data['physical_dataset'])
+            folder, _, _ = load_dataset(Path(base_dir or '.') / data['physical_dataset'], verify_exports=False)
             network = json.loads((folder / 'materialized_input.json').read_text(encoding='utf-8'))
         if data.get("ground_baseline") is None and (
             network is None or data.get("hardware") is None
@@ -68,8 +69,9 @@ class ExperimentSpec:
         from .network_inputs import snapshot_network_input
         network = snapshot_network_input(network, network_base)
         if network:
-            from .network_inputs import materialize_network_input
             from orbitserve.runtime import NetworkSpec, candidate_links
+
+            from .network_inputs import materialize_network_input
 
             if data.get('physical_dataset'):
                 from .physical_dataset import dataset_physical_input

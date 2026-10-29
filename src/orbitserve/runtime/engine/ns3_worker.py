@@ -131,6 +131,8 @@ def main():
         for pool in row.get('pools', ()):
             engine.attachPool(row['key'], pool)
     active = set()
+    if initial.get('start_s', 0) > 0:
+        engine.advance(initial['start_s'])
 
     def emit(value):
         print(json.dumps({'time_s': engine.now(), **value}, allow_nan=False), flush=True)
@@ -144,7 +146,13 @@ def main():
                 ns.Simulator.Destroy()
                 emit({'closed': True})
                 return
-            if op == 'configure':
+            if op == 'register':
+                for row in command['links']:
+                    engine.link(row['key'])
+                    for pool in row.get('pools', ()):
+                        engine.attachPool(row['key'], pool)
+                emit({'registered': True})
+            elif op == 'configure':
                 for key, rate in command['capacities'].items():
                     engine.configure(key, rate)
                 emit({'configured': True})

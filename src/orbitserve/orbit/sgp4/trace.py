@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
+import itertools
 import math
-import multiprocessing
 import os
-from concurrent.futures import ProcessPoolExecutor
-from dataclasses import replace
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -16,7 +14,6 @@ from .elements import Sgp4ElementBundle, load_sgp4_element_bundle
 from .frames import (
     Sgp4EarthFixedResult,
     Sgp4ItrsSample,
-    compute_sgp4_sun_positions_itrs,
     transform_sgp4_teme_to_itrs,
 )
 from .geometry import (
@@ -30,7 +27,6 @@ from .propagation import (
     Sgp4TemeSample,
     propagate_sgp4_teme,
 )
-
 
 SGP4_ORBIT_TRACE_ADAPTER_ALGORITHM_VERSION = "sgp4-orbit-trace-adapter"
 SGP4_ORBIT_TRACE_MODEL = "sgp4-wgs72-teme-astropy-itrs-wgs84"
@@ -48,234 +44,22 @@ def generate_orbit_trace(
     warnings: Sequence[str] = (),
     workers: int = 1,
     progress=None,
+    _timings=None,
+    _bundle_sink=None,
+    _compact=False,
+    _file_hashes=None,
 ) -> OrbitTraceManifest:
-    """Generate one canonical Orbit Trace from structured SGP4 inputs."""
+    """Compute bounded batches without writing intermediate trace files."""
+    from .precompute import generate
 
-    report = progress or (lambda stage: None)
-    report("SGP4 state precompute")
-    bundle = load_sgp4_element_bundle(elements)
     if type(workers) is not int or workers < 1:
         raise ValueError("workers must be a positive integer")
-    times = tuple(float(t) for t in sample_times_s)
-    # Bound geometry/multiprocessing payload size independently of run length.
-    per_time = len(bundle.satellites) * max(1, len(ground_ingresses)) + len(isl_pairs)
-    batch_samples = max(
-        2,
-        min(
-            121,
-            100_000 // max(1, len(bundle.satellites)),
-            1_000_000 // max(1, per_time),
-        ),
-    )
-    if len(times) > batch_samples:
-        return _generate_chunked_trace(
-            output_dir,
-            bundle,
-            simulation_epoch_utc,
-            times,
-            ground_ingresses,
-            isl_pairs,
-            valid_for_paper_main_results,
-            warnings,
-            workers,
-            report,
-            batch_samples,
-        )
-
-    if workers == 1 or len(bundle.satellites) == 1:
-        propagation, earth_fixed = _state_partition(
-            (bundle, simulation_epoch_utc, sample_times_s)
-        )
-    else:
-        count = min(workers, len(bundle.satellites))
-        chunks = [
-            replace(bundle, satellites=bundle.satellites[i::count])
-            for i in range(count)
-        ]
-        with ProcessPoolExecutor(
-            max_workers=count,
-            mp_context=multiprocessing.get_context("spawn"),
-            initializer=_limit_worker,
-        ) as pool:
-            parts = list(
-                pool.map(
-                    _state_partition,
-                    ((chunk, simulation_epoch_utc, sample_times_s) for chunk in chunks),
-                )
-            )
-        propagation = replace(
-            parts[0][0],
-            element_set_id=bundle.element_set_id,
-            samples=tuple(
-                sorted(
-                    (s for p, _ in parts for s in p.samples),
-                    key=lambda s: (s.time_s, s.satellite_id),
-                )
-            ),
-        )
-        earth_fixed = replace(
-            parts[0][1],
-            element_set_id=bundle.element_set_id,
-            samples=tuple(
-                sorted(
-                    (s for _, e in parts for s in e.samples),
-                    key=lambda s: (s.time_s, s.satellite_id),
-                )
-            ),
-        )
-    report("Visibility, sunlight and candidate geometry")
-    sun_positions = compute_sgp4_sun_positions_itrs(earth_fixed)
-    if workers == 1:
-        geometry = evaluate_sgp4_geometry(
-            earth_fixed,
-            ground_ingresses=ground_ingresses,
-            isl_pairs=isl_pairs,
-            sun_positions=sun_positions,
-            sample_hold=True,
-        )
-    else:
-        count = min(workers, max(1, len(isl_pairs) + len(ground_ingresses)))
-        jobs = [
-            (
-                earth_fixed,
-                ground_ingresses[i::count],
-                isl_pairs[i::count],
-                sun_positions,
-            )
-            for i in range(count)
-        ]
-        with ProcessPoolExecutor(
-            max_workers=count,
-            mp_context=multiprocessing.get_context("spawn"),
-            initializer=_limit_worker,
-        ) as pool:
-            pieces = list(pool.map(_geometry_partition, jobs))
-        geometry = replace(
-            pieces[0],
-            ground_ingresses=tuple(
-                sorted(
-                    (x for p in pieces for x in p.ground_ingresses),
-                    key=lambda x: x.ingress_id,
-                )
-            ),
-            isl_pairs=tuple(sorted(x for p in pieces for x in p.isl_pairs)),
-            sgl_samples=tuple(
-                sorted(
-                    (x for p in pieces for x in p.sgl_samples),
-                    key=lambda x: (x.time_s, x.ingress_id, x.satellite_id),
-                )
-            ),
-            isl_samples=tuple(
-                sorted(
-                    (x for p in pieces for x in p.isl_samples),
-                    key=lambda x: (x.time_s, x.endpoint_a, x.endpoint_b),
-                )
-            ),
-            sgl_windows=tuple(
-                sorted(
-                    (x for p in pieces for x in p.sgl_windows),
-                    key=lambda x: (x.ingress_id, x.satellite_id, x.start_s),
-                )
-            ),
-            isl_windows=tuple(
-                sorted(
-                    (x for p in pieces for x in p.isl_windows),
-                    key=lambda x: (x.endpoint_a, x.endpoint_b, x.start_s),
-                )
-            ),
-        )
-    report("Canonical orbit trace export")
-    return write_sgp4_orbit_trace(
-        output_dir,
-        elements=bundle,
-        propagation=propagation,
-        earth_fixed=earth_fixed,
-        geometry=geometry,
-        valid_for_paper_main_results=valid_for_paper_main_results,
-        warnings=warnings,
-        sample_hold=True,
-    )
-
-
-def _generate_chunked_trace(
-    output_dir,
-    bundle,
-    epoch,
-    times,
-    ground,
-    pairs,
-    paper,
-    warnings,
-    workers,
-    report,
-    batch_samples,
-):
-    from tempfile import TemporaryDirectory
-    from ..trace import load_orbit_trace
-
-    target = Path(output_dir)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    ephemeris = []
-    windows = {"sgl_windows": [], "isl_windows": [], "sunlight_windows": []}
-    first = None
-    offsets = list(range(0, len(times) - 1, batch_samples - 1))
-    with TemporaryDirectory(prefix="orbit-precompute-", dir=target.parent) as folder:
-        for index, offset in enumerate(offsets):
-            part_times = times[offset : offset + batch_samples]
-            report(
-                f"Orbit batch {index + 1}/{len(offsets)}: {part_times[0]:g}–{part_times[-1]:g} s"
-            )
-            part = Path(folder) / f"part-{index:05d}"
-            generate_orbit_trace(
-                part,
-                elements=bundle,
-                simulation_epoch_utc=epoch,
-                sample_times_s=part_times,
-                ground_ingresses=ground,
-                isl_pairs=pairs,
-                valid_for_paper_main_results=paper,
-                warnings=warnings,
-                workers=workers,
-                progress=report,
-            )
-            loaded = load_orbit_trace(part / "trace_manifest.json")
-            if first is None:
-                first = loaded.trace_manifest
-                catalog = loaded.satellite_catalog
-            ephemeris.extend(
-                row
-                for row in loaded.ephemeris_samples
-                if not index or row["time_s"] > part_times[0]
-            )
-            for key in windows:
-                windows[key].extend(getattr(loaded, key))
-        provenance = {
-            k: v
-            for k, v in first.provenance.items()
-            if k not in {"writer", "algorithm_version"}
-        }
-        provenance["geometry"]["temporal_model"] = "sample_hold"
-        provenance["precompute"] = {
-            "time_batches": len(offsets),
-            "max_batch_samples": batch_samples,
-        }
-        return write_orbit_trace(
-            target,
-            time={
-                **first.time,
-                "start_s": times[0],
-                "end_s": times[-1],
-                "duration_s": times[-1] - times[0],
-                "step_s": _uniform_step(times),
-            },
-            satellite_catalog=catalog,
-            ephemeris_samples=ephemeris,
-            **{key: _merge_sample_windows(rows, key) for key, rows in windows.items()},
-            trace_model=SGP4_ORBIT_TRACE_MODEL,
-            valid_for_paper_main_results=paper,
-            provenance=provenance,
-            warnings=first.warnings,
-        )
+    return generate(output_dir, load_sgp4_element_bundle(elements),
+                    simulation_epoch_utc, tuple(float(t) for t in sample_times_s),
+                    ground_ingresses, isl_pairs, valid_for_paper_main_results,
+                    warnings, workers, progress or (lambda stage: None),
+                    _timings if _timings is not None else {}, _bundle_sink,
+                    _compact, _file_hashes)
 
 
 def _merge_sample_windows(rows, kind):
@@ -321,13 +105,14 @@ def _limit_worker():
 
 
 def _geometry_partition(args):
-    earth_fixed, ground, pairs, sun = args
+    earth_fixed, ground, pairs, sun, include_sunlight = args
     return evaluate_sgp4_geometry(
         earth_fixed,
         ground_ingresses=ground,
         isl_pairs=pairs,
         sun_positions=sun,
         sample_hold=True,
+        _include_sunlight=include_sunlight,
     )
 
 
@@ -344,6 +129,13 @@ def write_sgp4_orbit_trace(
 ) -> OrbitTraceManifest:
     """Write aligned SGP4 states and geometry through the Orbit Trace writer."""
 
+    return write_orbit_trace(output_dir, **_sgp4_trace_payload(
+        load_sgp4_element_bundle(elements), propagation, earth_fixed, geometry,
+        valid_for_paper_main_results, warnings, sample_hold))
+
+
+def _sgp4_trace_payload(elements, propagation, earth_fixed, geometry,
+                        valid_for_paper_main_results, warnings, sample_hold):
     bundle = load_sgp4_element_bundle(elements)
     if not isinstance(valid_for_paper_main_results, bool):
         raise TypeError("valid_for_paper_main_results must be boolean")
@@ -365,9 +157,8 @@ def write_sgp4_orbit_trace(
     if sample_hold:
         provenance["geometry"]["temporal_model"] = "sample_hold"
         provenance["sgp4_trace_adapter"]["sampling"] = "sample_hold"
-    return write_orbit_trace(
-        output_dir,
-        time={
+    return {
+        "time": {
             "epoch": propagation.simulation_epoch_utc,
             "start_s": times[0],
             "end_s": times[-1],
@@ -375,16 +166,16 @@ def write_sgp4_orbit_trace(
             "step_s": step_s,
             "time_scale": "utc",
         },
-        satellite_catalog=_satellite_catalog(bundle),
-        ephemeris_samples=_ephemeris_rows(paired_samples),
-        sgl_windows=_sgl_window_rows(geometry),
-        isl_windows=_isl_window_rows(geometry),
-        sunlight_windows=_sunlight_window_rows(geometry),
-        trace_model=SGP4_ORBIT_TRACE_MODEL,
-        valid_for_paper_main_results=valid_for_paper_main_results,
-        provenance=provenance,
-        warnings=tuple((*canonical_warnings, *automatic_warnings)),
-    )
+        "satellite_catalog": _satellite_catalog(bundle),
+        "ephemeris_samples": _ephemeris_rows(paired_samples),
+        "sgl_windows": _sgl_window_rows(geometry),
+        "isl_windows": _isl_window_rows(geometry),
+        "sunlight_windows": _sunlight_window_rows(geometry),
+        "trace_model": SGP4_ORBIT_TRACE_MODEL,
+        "valid_for_paper_main_results": valid_for_paper_main_results,
+        "provenance": provenance,
+        "warnings": (*canonical_warnings, *automatic_warnings),
+    }
 
 
 def _validate_aligned_inputs(
@@ -596,7 +387,7 @@ def _uniform_step(times: tuple[float, ...]) -> float:
     step_s = round(times[1] - times[0], 9)
     if step_s <= 0.0:
         raise ValueError("SGP4 sample times must be strictly increasing")
-    for previous, current in zip(times, times[1:]):
+    for previous, current in itertools.pairwise(times):
         if round(current - previous, 9) != step_s:
             raise ValueError("Orbit Trace requires a uniform SGP4 sample grid")
     return step_s

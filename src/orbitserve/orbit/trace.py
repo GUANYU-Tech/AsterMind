@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-
 ORBIT_TRACE_SCHEMA = "orbitserve.orbit_trace"
 ORBIT_TRACE_ALGORITHM = "canonical-json-geometry"
 ORBIT_TRACE_SCOPE = "orbit_geometry_only"
@@ -112,8 +111,8 @@ class OrbitTraceManifest:
 
     @classmethod
     def from_value(
-        cls, value: Mapping[str, Any] | "OrbitTraceManifest"
-    ) -> "OrbitTraceManifest":
+        cls, value: Mapping[str, Any] | OrbitTraceManifest
+    ) -> OrbitTraceManifest:
         if isinstance(value, cls):
             return value
         if not isinstance(value, Mapping):
@@ -229,6 +228,9 @@ def write_orbit_trace(
     valid_for_paper_main_results: bool = False,
     provenance: Mapping[str, Any] | None = None,
     warnings: Sequence[str] = (),
+    _bundle_sink: list | None = None,
+    _compact: bool = False,
+    _file_hashes: dict | None = None,
 ) -> OrbitTraceManifest:
     """Write one canonical Orbit Trace directory and return its manifest."""
 
@@ -256,7 +258,10 @@ def write_orbit_trace(
         "time": canonical_time,
         "trace_model": trace_model,
     }
-    trace_id = f"orbit-{hashlib.sha256(_canonical_json_bytes(identity)).hexdigest()}"
+    from . import ephemeris_columns
+    compact = _compact and ephemeris_columns.supported(ephemeris)
+    trace_id = "orbit-" + (ephemeris_columns.identity(identity) if compact else
+                          hashlib.sha256(_canonical_json_bytes(identity)).hexdigest())
 
     target = Path(output_dir)
     if target.exists() and any(target.iterdir()):
@@ -270,6 +275,8 @@ def write_orbit_trace(
         "isl_windows_path": isl,
         "sunlight_windows_path": sunlight,
     }
+    from orbitserve.common import atomic_output
+    written_hashes = {}
     sha256: dict[str, str] = {}
     for path_key, records in datasets.items():
         payload = {
@@ -278,9 +285,14 @@ def write_orbit_trace(
             "schema_version": ORBIT_TRACE_SCHEMA,
             "trace_id": trace_id,
         }
+        if compact and path_key == "ephemeris_trace_path":
+            payload.pop("records")
+            payload.update(ephemeris_columns.write_shards(target, records, trace_id, written_hashes))
         path = target / _FILE_PATHS[path_key]
-        path.write_bytes(_canonical_json_bytes(payload))
-        sha256[_FILE_HASH_KEYS[path_key]] = _file_sha256(path)
+        with atomic_output(path) as output:
+            output.write(ephemeris_columns.prepared_bytes(payload) if compact else _canonical_json_bytes(payload))
+        sha256[_FILE_HASH_KEYS[path_key]] = output.sha256
+        written_hashes[path.name] = output.sha256
 
     manifest: dict[str, Any] = {
         "evaluated": True,
@@ -304,8 +316,16 @@ def write_orbit_trace(
         **sha256,
         "trace_manifest_content_sha256": content_hash,
     }
-    (target / _MANIFEST_NAME).write_bytes(_canonical_json_bytes(manifest))
-    return OrbitTraceManifest.from_value(manifest)
+    with atomic_output(target / _MANIFEST_NAME) as output:
+        output.write(_canonical_json_bytes(manifest))
+    written_hashes[_MANIFEST_NAME] = output.sha256
+    if _file_hashes is not None:
+        _file_hashes.update({str((target / name).resolve()): sha for name, sha in written_hashes.items()})
+    parsed = OrbitTraceManifest.from_value(manifest)
+    if _bundle_sink is not None:
+        _bundle_sink.append(OrbitTraceBundle(parsed, tuple(catalog), tuple(ephemeris),
+                                            tuple(sgl), tuple(isl), tuple(sunlight)))
+    return parsed
 
 
 def load_orbit_trace(
@@ -352,6 +372,9 @@ def load_orbit_trace(
         if payload.get("kind") != _FILE_KINDS[path_key]:
             raise ValueError(f"Orbit Trace kind mismatch in {relative}")
         records = payload.get("records")
+        if path_key == "ephemeris_trace_path" and payload.get("storage"):
+            from .ephemeris_columns import read_shards
+            records = read_shards(root, payload)
         if not isinstance(records, list) or not all(isinstance(item, dict) for item in records):
             raise ValueError(f"Orbit Trace records must be JSON objects in {relative}")
         loaded[path_key] = [dict(item) for item in records]
@@ -763,7 +786,7 @@ def _read_json_mapping(path: Path) -> dict[str, Any]:
 
 def _require_mapping(value: Any, label: str) -> dict[str, Any]:
     if not isinstance(value, Mapping):
-        raise ValueError(f"{label} must be a mapping")
+        raise ValueError(f"{label} must be a mapping")  # noqa: TRY004 -- public validation contract
     return {str(key): item for key, item in value.items()}
 
 

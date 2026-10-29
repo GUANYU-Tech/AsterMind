@@ -12,8 +12,8 @@ class Ns3Transport(SimGridTransport):
     worker_module = 'orbitserve.runtime.engine.ns3_worker'
     check_available = staticmethod(require_ns3)
 
-    def __init__(self, nodes, edges, profiles):
-        super().__init__(nodes, edges, profiles)
+    def __init__(self, nodes, edges, profiles, *, start_s=0.0):
+        super().__init__(nodes, edges, profiles, start_s=start_s)
         self.provenance = {
             'backend': 'ns3', 'ns3_version': self.provenance['simgrid_version'],
             'completion_source': 'native_ns3_point_to_point_phy_tx_end',
@@ -28,3 +28,14 @@ class Ns3Transport(SimGridTransport):
             'time_resolution_s': 1e-12,
             'propagation_accounting': 'orbitserve_after_serialization',
         }
+
+    def register_edge(self, edge):
+        from ..setup.radio_capacity import hop_pools
+        rows = []
+        for direction, (a, b) in enumerate(((edge['endpoint_a'], edge['endpoint_b']), (edge['endpoint_b'], edge['endpoint_a']))):
+            key = f'link-{len(self.edges)}-{direction}'
+            rows.append(dict(key=key, pools=list(hop_pools(self.nodes, a, b))))
+        self._request({'op': 'register', 'links': rows})
+        for row, (a, b) in zip(rows, ((edge['endpoint_a'], edge['endpoint_b']), (edge['endpoint_b'], edge['endpoint_a']))):
+            self.resources[edge['link_id'], a, b] = row['key']
+        self.edges = (*self.edges, edge)

@@ -57,6 +57,7 @@ def manifest():
 class DynamicNetworkExperimentTests(unittest.TestCase):
     def test_fault_audit_reacquisition_and_online_probe_knowledge_are_consistent(self):
         value = manifest()
+        value['network']['fault_timing'] = 'continuous'
         value["network"]["faults"] = [
             dict(
                 target_type="link",
@@ -76,12 +77,12 @@ class DynamicNetworkExperimentTests(unittest.TestCase):
                 for link in result["snapshots"][1]["links"]
                 if link["kind"] == "cross_layer"
             )
-            self.assertEqual(restored["state"], "SETTING_UP")
-            self.assertEqual(restored["setup_start_s"], 60.0)
-            self.assertEqual(restored["ready_s"], 62.0)
+            self.assertEqual(restored["state"], "UP")
+            self.assertEqual(restored["setup_start_s"], 30.5)
+            self.assertEqual(restored["ready_s"], 32.5)
             self.assertTrue(
                 any(
-                    e["time_s"] == 62.0 and e["state"] == "UP" for e in result["events"]
+                    e["time_s"] == 32.5 and e["state"] == "UP" for e in result["events"]
                 )
             )
 

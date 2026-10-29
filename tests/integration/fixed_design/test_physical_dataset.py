@@ -109,6 +109,7 @@ class PhysicalDatasetTests(unittest.TestCase):
         )
 
         physical = manifest()
+        physical['network']['fault_timing'] = 'continuous'
         physical["network"]["faults"] = [
             {
                 "target_type": "link",
@@ -152,6 +153,39 @@ class PhysicalDatasetTests(unittest.TestCase):
             str(self.root / "combined/network"), self.spec.physical_network
         )
         self.assertEqual(first.network["trace_id"], index["trace_id"])
+
+    def test_runtime_random_fault_choices_reuse_identical_physical_dataset(self):
+        physical=deepcopy(self.spec.physical_network)
+        physical['network'].update(fault_timing='boundary', random_faults=dict(
+            enabled=True, model='fixed_ratio', target_type='link', ratio=.5,
+            seed=51, start_step=2, end_step=3))
+        with patch.object(LinkProfile, 'attributes', side_effect=AssertionError('physics recomputed')):
+            result=run_experiment(replace(self.spec,physical_network=physical,physical_dataset=str(self.dataset)),
+                                  output_dir=self.root/'runtime-random',_workers=1)
+        self.assertTrue(result.network['physical_dataset']['reused'])
+        self.assertTrue(any(e['kind']=='fault_injected' and e['source']=='random'
+                            for e in result.runtime.state_summary['event_log']))
+
+    def test_grouped_models_reuse_physics_and_do_not_invent_censored_repairs(self):
+        physical=deepcopy(self.spec.physical_network)
+        last=round(physical['time']['duration_s']/physical['time']['step_s'])
+        common=dict(enabled=True,seed=42,start_step=0,end_step=2)
+        physical['network'].update(fault_timing='boundary',random_faults=dict(
+            nodes=dict(common,model='weibull',up_scale_steps=.01,up_shape=2,
+                       duration=dict(distribution='fixed',steps=1)),
+            links=dict(common,model='per_step',failure_probability=1.,
+                       duration=dict(distribution='exponential',mean_steps=3))))
+        with patch.object(LinkProfile,'attributes',side_effect=AssertionError('physics recomputed')), \
+             patch('orbitserve.runtime.setup.faults.random.Random.expovariate',return_value=last+2.25):
+            result=run_experiment(replace(self.spec,physical_network=physical,physical_dataset=str(self.dataset)),
+                                  output_dir=self.root/'runtime-grouped',_workers=1)
+        self.assertTrue(result.network['physical_dataset']['reused'])
+        events=result.runtime.state_summary['event_log']
+        onsets=[e for e in events if e['kind']=='fault_injected' and e['source']=='random']
+        self.assertEqual({e['target_type'] for e in onsets},{'node','link'})
+        self.assertTrue(all(e['right_censored'] for e in onsets if e['target_type']=='link'))
+        self.assertFalse(any(e['kind']=='fault_restored' and e['source']=='random' and e['target_type']=='link'
+                             for e in events))
 
     def test_missing_corrupt_or_changed_input_is_rejected(self):
         changed = deepcopy(self.concrete)

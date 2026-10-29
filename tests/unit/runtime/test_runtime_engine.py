@@ -83,7 +83,7 @@ def _network():
          NetworkNodeSpec("gateway-0", "ground", sgl_terminals=1),
          NetworkNodeSpec("gateway-1", "ground", sgl_terminals=1)),
         {"communication_isl": LinkProfile(1e9, 0.), "sgl": LinkProfile(1e9, 0.)},
-        communication_topology="explicit", ground_roles=(),
+        communication_topology="explicit", ground_roles=(), fault_timing="continuous",
         explicit_pairs=(("sat-a","sat-b"),("gateway-0","sat-a"),("gateway-1","sat-b")))
 
 

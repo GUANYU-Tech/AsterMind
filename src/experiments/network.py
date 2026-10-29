@@ -2,21 +2,24 @@
 
 from __future__ import annotations
 
-import json
 import gzip
+import json
 import math
 import os
 from pathlib import Path
+from time import perf_counter
 
-from orbitserve.orbit import generate_orbit_trace, load_orbit_trace
+from orbitserve.orbit import generate_orbit_trace
 from orbitserve.runtime import (
     NetworkSpec,
     NetworkState,
     NetworkUnavailable,
     candidate_links,
+    SUN_GEOMETRY_VERSION,
+    sun_positions_from_trace,
 )
 
-TERMINAL_ALLOCATION_MODEL = 'causal_fault_release_service_quotas_v3'
+TERMINAL_ALLOCATION_MODEL = 'causal_configurable_handover_service_quotas_v4'
 
 
 def run_network_experiment(
@@ -26,7 +29,19 @@ def run_network_experiment(
     base_dir: str | Path = ".",
     _workers: int | None = None,
     progress=None,
+    export_mode: str = 'full',
+    export_workers: int | None = None,
+    compression_level: int = 1,
+    chunk_samples: int = 32,
 ) -> dict:
+    if export_mode not in {'core', 'full'}:
+        raise ValueError('export_mode must be core or full')
+    if type(compression_level) is not int or not 0 <= compression_level <= 9:
+        raise ValueError('compression_level must be an integer from 0 to 9')
+    if type(chunk_samples) is not int or chunk_samples < 1:
+        raise ValueError('chunk_samples must be a positive integer')
+    if export_workers is not None and (type(export_workers) is not int or export_workers < 1):
+        raise ValueError('export_workers must be a positive integer')
     if (Path(output_dir) / "network_result.json").exists():
         raise FileExistsError(
             "completed experiment output already exists; choose a new output directory"
@@ -68,6 +83,11 @@ def run_network_experiment(
         json.dumps(manifest, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
         encoding="utf-8",
     )
+    report('Compute formation clearance preflight')
+    from .formation_validation import validate_formation_input
+    start = perf_counter()
+    formation_checks = validate_formation_input(manifest, times)
+    formation_check_s = perf_counter() - start
     trace_dir = Path(output_dir) / "orbit_trace"
     available = (
         len(os.sched_getaffinity(0))
@@ -82,6 +102,9 @@ def run_network_experiment(
         raise ValueError("invalid internal worker count")
     for key in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
         os.environ[key] = "1"
+    timings = {'formation_preflight_s': formation_check_s}
+    file_hashes = {}
+    trace_bundle = []
     generate_orbit_trace(
         trace_dir,
         elements=elements,
@@ -95,30 +118,40 @@ def run_network_experiment(
         ],
         workers=workers,
         progress=report,
+        _timings=timings,
+        _bundle_sink=trace_bundle,
+        _compact=True,
+        _file_hashes=file_hashes,
     )
-    trace = load_orbit_trace(trace_dir / "trace_manifest.json")
-    report("Dynamic link acquisition and terminal allocation")
-    network = NetworkState(trace, spec, gateways)
+    trace = trace_bundle.pop()
+    start = perf_counter()
+    network = NetworkState(trace, spec, gateways, _defer_compile=True)
+    if not network.sun_positions:
+        # Sun geometry is physical scene metadata even when no link profile
+        # enables exclusion. It is inexpensive compared with per-link budgets.
+        network.sun_positions = [(float(row['time_s']), tuple(row['position_itrs_km']))
+                                 for row in sun_positions_from_trace(trace)]
+        network.sun_times = tuple(t for t, _ in network.sun_positions)
+    timings['network_setup_s'] = perf_counter() - start
     report("Persisting complete backend-independent physical attributes")
-    network.save_physical_state(output_root / 'physical_state.sqlite')
+    report(f"Visibility screening: {len(edges)} structural pairs -> {len(network.edges)} horizon candidates")
+    network.save_physical_state(output_root / 'physical_state.sqlite', workers=workers, progress=report)
+    timings.update(network.precompute_timings)
     online_origin = network
     network = network.audit_timeline()
-    snapshots = (
-        [network.snapshot(t, include_inactive=False) for t in times[:-1]]
-        if count <= 32
-        else None
-    )
     keepouts = {
         row["name"]: row.get("keepout_m", 0.0)
         for row in manifest.get("initialization_provenance", [])
     }
-    checks = validate_network(
-        network,
-        snapshots
-        if snapshots is not None
-        else (network.snapshot(t, include_inactive=False) for t in times[:-1]),
-        keepouts,
-    )
+    report("Core physical validation and snapshot store")
+    start = perf_counter()
+    checks = validate_network(network, _validation_snapshots(network, times), keepouts)
+    checks['formation_preflight'] = formation_checks
+    timings['validation_s'] = perf_counter() - start
+    from .snapshot_store import write_store
+    start = perf_counter()
+    file_hashes.update(write_store(network, output_root, times, chunk_samples=chunk_samples))
+    timings['snapshot_store_s'] = perf_counter() - start
     report("Route probes")
     routes = []
     for probe in manifest.get("route_probes", ()):
@@ -149,7 +182,7 @@ def run_network_experiment(
         "trace_id": trace.trace_id,
         "time": trace.time,
         "network": spec.to_dict(),
-        "snapshots": snapshots,
+        "snapshots": [],
         "boundary_sample_times_s": times,
         "events": network.events,
         "routes": routes,
@@ -157,9 +190,12 @@ def run_network_experiment(
             {"time_s": t, "position_itrs_km": p} for t, p in network.sun_positions
         ],
         "checks": checks,
+        "timing_s": timings,
+        "physical_counts": network.physical_counts,
         "warnings": trace.warnings,
         "candidate_links": network.edges,
         "provenance": {
+            "sun_geometry_version": SUN_GEOMETRY_VERSION,
             "requested_transport_model": spec.transport_model,
             "transport_execution": "not_run_geometry_and_independent_route_probes_only",
             "initialization": manifest.get("initialization_provenance", []),
@@ -186,119 +222,62 @@ def run_network_experiment(
             'fault_knowledge': 'audit_replays_observations_probes_only_observe_past_faults',
         },
     }
-    report("Compressed network artifact export")
-    output = Path(output_dir)
-    output.mkdir(parents=True, exist_ok=True)
-
-    def compressed_rows(name, rows):
-        with (
-            (output / name).open("wb") as raw,
-            gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as stream,
-        ):
-            for row in rows:
-                stream.write(
-                    (
-                        json.dumps(
-                            row,
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                            allow_nan=False,
-                        )
-                        + "\n"
-                    ).encode("utf-8")
-                )
-
-    frame_dir = output / "frames"
-    from orbitserve.runtime import export_cell_network
-    exchange_times = sorted({*times, *(t for f in spec.faults for t in (f['start_s'], f['end_s']) if 0 <= t <= duration)})
-    compressed_rows('astermind_network.jsonl.gz',
-                    (export_cell_network(network.snapshot(t)) for t in exchange_times))
-    frame_dir.mkdir(exist_ok=True)
-    frame_index = []
-    for i, t in enumerate(times):
-        # Stream one complete frame at a time: all configured candidate links,
-        # including blocked/unallocated links with their modeled attributes.
-        frame = network.snapshot(t)
-        next_time = times[min(i + 1, len(times) - 1)]
-        frame["events_until_next_boundary"] = [
-            event for event in network.events if t < event["time_s"] <= next_time
-        ]
-        name = f"frames/frame-{i:06d}.json.gz"
-        payload = json.dumps(
-            frame, ensure_ascii=False, separators=(",", ":"), allow_nan=False
-        ).encode("utf-8")
-        temporary = output / (name + ".tmp")
-        with (
-            temporary.open("wb") as raw,
-            gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as stream,
-        ):
-            stream.write(payload)
-        temporary.replace(output / name)
-        frame_index.append(
-            {
-                "time_s": t,
-                "artifact": name,
-                "node_count": len(frame["nodes"]),
-                "link_count": len(frame["links"]),
-            }
-        )
-    compressed_rows("link_events.jsonl.gz", network.events)
-    compressed_rows(
-        "node_positions.jsonl.gz",
-        (
-            {
-                "time_s": t,
-                "node_id": n.node_id,
-                "role": n.role,
-                "position_itrs_km": network.position(n.node_id, t),
-            }
-            for t in times
-            for n in sorted(network.nodes.values(), key=lambda n: n.node_id)
-        ),
-    )
-    compressed_rows(
-        "link_attributes.jsonl.gz",
-        (
-            row
-            for link_id in sorted(network.link_frames)
-            for row in network.link_frames[link_id]
-        ),
-    )
-    result["artifacts"] = {
-        "astermind_network": "astermind_network.jsonl.gz",
-        "orbit_trace": "orbit_trace/trace_manifest.json",
-        "physical_input": "materialized_input.json",
-        "node_positions": "node_positions.jsonl.gz",
-        "link_attributes": "link_attributes.jsonl.gz",
-        "link_events": "link_events.jsonl.gz",
-        "frames": frame_index,
-        "frame_semantics": "complete_candidate_links_at_each_boundary_including_horizon_end",
+    result['artifacts'] = {
+        'orbit_trace': 'orbit_trace/trace_manifest.json',
+        'physical_input': 'materialized_input.json',
+        'snapshot_store': 'state/index.json',
+        'frames': [],
+        'optional_exports': 'physical_exports.json',
+        'frame_semantics': 'complete_candidate_links_at_each_boundary_including_horizon_end',
     }
-    # Keep the result index small; complete audit snapshots live in compressed files.
-    persisted = {
-        **result,
-        "snapshots": frame_index[:-1],
-        "events": [],
-        "candidate_links": [],
-    }
-    temporary_index = output / "network_result.json.tmp"
-    temporary_index.write_text(
-        json.dumps(
-            persisted,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    temporary_index.replace(output / "network_result.json")
+    from orbitserve.common import write_json
+
     from .physical_dataset import publish_dataset
-    publish_dataset(output, manifest, source_input=source_input)
-    if snapshots is None:
-        result["snapshots"] = frame_index[:-1]
+    started = perf_counter()
+    persisted = {**result, 'events': [], 'candidate_links': []}
+    index = output_root / 'core_result.json'
+    file_hashes[str(index.resolve())] = write_json(index, persisted)
+    write_json(output_root / 'network_result.json', persisted)
+    publish_dataset(output_root, manifest, source_input=source_input, file_hashes=file_hashes)
+    timings['core_publish_s'] = perf_counter() - started
+    report('Physical core dataset ready')
+    if export_mode == 'full':
+        from .network_exports import export_network_artifacts
+        report('Parallel snapshot artifact export')
+        exports = export_network_artifacts(
+            output_root, workers=min(workers, export_workers or 8),
+            compression_level=compression_level, chunk_samples=chunk_samples,
+            _core_result=result)
+        result['artifacts'].update(exports['artifacts'])
+        timings.update(exports['timing_s'])
+        frame_index = result['artifacts']['frames']
+        if count <= 32:
+            snapshots = []
+            for row in frame_index[:-1]:
+                with gzip.open(output_root / row['artifact'], 'rt', encoding='utf-8') as stream:
+                    frame = json.load(stream)
+                frame.pop('events_until_next_boundary', None)
+                frame['links'] = [edge for edge in frame['links'] if edge['state'] != 'DOWN']
+                snapshots.append(frame)
+            result['snapshots'] = snapshots
+        else:
+            result['snapshots'] = frame_index[:-1]
     return result
+
+
+def _validation_snapshots(network, times):
+    """Validate all samples without expanding RF diagnostics or inactive edges."""
+    access = [edge for edge in network.edges if edge['kind'] == 'sgl']
+    import bisect
+    for t in times[:-1]:
+        links = []
+        for edge in access:
+            rows = network.link_frames[edge['link_id']]
+            index = bisect.bisect_right(network.link_times[edge['link_id']], t) - 1
+            if index >= 0 and rows[index]['state'] != 'DOWN':
+                links.append(rows[index])
+        yield {'nodes': [{'node_id': n.node_id, 'position_itrs_km': network.position(n.node_id, t)}
+                         for n in network.spec.nodes], 'links': links}
 
 
 def validate_network(

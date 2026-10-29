@@ -11,8 +11,46 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+
+- Default new satellite-link JSON profiles and new optical hardware presets to
+  the external, unmodified ISLSim model; retain explicit legacy model selection.
+- Preserve native configuration, source hashes, SNR, modulation and feasibility
+  in physical inputs and snapshots. Infeasible links become unavailable to routing.
+- Add model selection to the local physical editor and require regenerated
+  physical datasets when switching models. Use the existing local ISLSim checkout.
+- Layer scenario ISLSim parameters over generation and native JSON defaults;
+  pass Starlink optical scenario ceilings into the native terminal configuration.
+  Offer automatic, fixed and custom modulation pools in the local editor.
+
+- Independent node/link random fault settings with exponential UP/DOWN and
+  Weibull healthy-period models, selectable outage duration distributions and
+  explicit right-censoring of repairs beyond the simulation horizon.
+- Boundary-only fault inputs with same-boundary recovery, reproducible fixed-ratio
+  and per-step random fault models, and Runtime fault controls independent of
+  reusable physical dataset identity. Explicit continuous mode preserves legacy
+  experiment timing.
+- An opt-in boundary controller and authoritative topology commands for persistent
+  disconnections, layered manual faults and physically validated new satellite
+  links. Native transport extension preserves active transfer progress.
+- Regression coverage for boundary timing, multi-cause outages, atomic connection
+  rejection, dataset reuse and in-flight byte conservation across four backends.
+
 ### Fixed
 
+- Prevented cross-track rows of synthetic compute formations from converging
+  at orbit-plane intersections by aligning relative eccentricity/inclination
+  vectors. Added an early sampled SGP4 clearance check before link budgets,
+  with cell, member pair and closest-approach time in failure diagnostics.
+- Replaced per-step random repair draws with explicit outage duration in time
+  steps. Random injection windows and fixed-ratio outage intervals accept step
+  indices, with complete repair-window validation and duration audit fields.
+- Avoid repeated SQLite opens and block decoding during Runtime route forecasts
+  by caching bounded compressed data and normalizing reads to physical boundaries.
+- Screen impossible adaptive access pairs across the complete horizon and skip
+  blocked physical budgets. Compute and compress attribute chunks in bounded
+  worker processes with deterministic, atomic SQLite publication and progress.
+  Regenerate datasets made with the previous physics version.
 - Preserve explicit hardware compute exclusions when combining Orbit catalog
   metadata with network roles.
 - Check predicted energy for every physical hop endpoint and all compute-cell
@@ -29,6 +67,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Changed
 
+- Add physical `handover_policy` choices for retaining valid dynamic contacts or
+  reranking them by quality, with explicit cross-layer ranking and setup delays.
 - Split physical preparation from Runtime with reusable, versioned and hashed
   datasets containing complete position/link data and compressed directional
   budgets. Runtime loads saved physics across transport backends; the local

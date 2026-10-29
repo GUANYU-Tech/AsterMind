@@ -7,6 +7,27 @@ import math
 from orbitserve.orbit import walker_delta_elements, tle_elements, dawn_dusk_elements
 
 
+def _wrap_degrees(value):
+    # Tiny negative offsets can round to exactly 360 after modulo.
+    result = value % 360
+    return 0. if result == 360 else result
+
+
+def _hardware_profiles(defaults, overrides):
+    """Layer scenario fields over the selected generation's hardware inputs."""
+    result = deepcopy(defaults)
+    for kind, profile in overrides.items():
+        inherited = result.get(kind, {})
+        merged = {**inherited, **deepcopy(profile)}
+        if profile.get('islsim_config'):
+            native = deepcopy(inherited.get('islsim_config', {}))
+            for section, fields in profile['islsim_config'].items():
+                native[section] = {**native.get(section, {}), **fields}
+            merged['islsim_config'] = native
+        result[kind] = merged
+    return result
+
+
 def snapshot_network_input(manifest, base_dir="."):
     """Resolve source files without running constellation or orbit calculations."""
     result = deepcopy(manifest)
@@ -18,6 +39,18 @@ def snapshot_network_input(manifest, base_dir="."):
             source = shell['source']
             if source.get('type') == 'tle' and 'tle_file' in source:
                 source['tle_text'] = (Path(base_dir) / source.pop('tle_file')).read_text(encoding='utf-8')
+    from orbitserve.runtime import freeze_network_profiles
+    if 'network' in result:
+        result['network'] = freeze_network_profiles(result['network'])
+    # Include generated hardware defaults in the source identity as well, so a
+    # different ISLSim source/config cannot reuse a dataset through source_sha256.
+    from orbitserve.runtime import STARLINK_RADIO_PROFILES
+    for shell in result.get('constellations', {}).get('communication_shells', ()):
+        defaults = STARLINK_RADIO_PROFILES.get(shell.get('radio_profile'), {}).get('simulation_defaults', {})
+        profiles = _hardware_profiles(defaults.get('hardware_link_profiles', {}),
+                                      shell.get('hardware_link_profiles', {}))
+        if profiles:
+            shell['hardware_link_profiles'] = freeze_network_profiles({'link_profiles': profiles})['link_profiles']
     return result
 
 
@@ -119,7 +152,7 @@ def materialize_network_input(manifest, base_dir="."):
             shell['capacity_assumptions'] = [*defaults['capacity_assumptions'], *shell.get('capacity_assumptions', ())]
             for key in ('optical_terminal_bandwidth_bps', 'terminal_assumptions'):
                 shell.setdefault(key, deepcopy(defaults[key]))
-        physical_profiles = {**deepcopy(defaults.get('hardware_link_profiles', {})), **shell.get('hardware_link_profiles', {})}
+        physical_profiles = _hardware_profiles(defaults.get('hardware_link_profiles', {}), shell.get('hardware_link_profiles', {}))
         directional_ids = {}
         for kind, profile in physical_profiles.items():
             if kind not in {'communication_isl', 'user_uplink', 'user_downlink', 'feeder_uplink', 'feeder_downlink'}:
@@ -272,13 +305,25 @@ def materialize_network_input(manifest, base_dir="."):
                     if across
                     else 0.0
                 )
-                du = along / radius - math.cos(inclination) * draan
+                # Parallel relative eccentricity/inclination vectors keep
+                # radial separation when the cross-track separation vanishes.
+                # Compensate the eccentricity-induced along-track offset so
+                # the requested initial along/cross grid is preserved.
+                du = (along - 2 * across) / radius - math.cos(inclination) * draan
                 row["satellite_id"] = f"{cell}-m{member:03d}"
-                row["raan_deg"] = (hub["raan_deg"] + math.degrees(draan)) % 360
+                row["raan_deg"] = _wrap_degrees(hub["raan_deg"] + math.degrees(draan))
                 row["inclination_deg"] = hub["inclination_deg"] + math.degrees(di)
-                row["mean_anomaly_deg"] = (
-                    hub["mean_anomaly_deg"] + math.degrees(du)
-                ) % 360
+                omega = math.radians(hub['argument_of_perigee_deg'])
+                if across:
+                    ex = hub['eccentricity'] * math.cos(omega) + di
+                    ey = hub['eccentricity'] * math.sin(omega) + math.sin(inclination) * draan
+                    row['eccentricity'] = math.hypot(ex, ey)
+                    omega = math.atan2(ey, ex)
+                    row['argument_of_perigee_deg'] = _wrap_degrees(math.degrees(omega))
+                row["mean_anomaly_deg"] = _wrap_degrees(hub['mean_anomaly_deg'] + hub['argument_of_perigee_deg']
+                                                       + math.degrees(du - omega))
+                if not 0 <= row['eccentricity'] < 1:
+                    raise ValueError('formation offsets exceed eccentricity limits')
                 if not 0 <= row["inclination_deg"] <= 180:
                     raise ValueError("formation offsets exceed inclination limits")
                 elements.append(row)
@@ -315,7 +360,9 @@ def materialize_network_input(manifest, base_dir="."):
             )
         uncertainty = math.hypot(*sigmas)
         sources[-1].update(
-            formation_motion="free_sgp4_mean_element_offsets",
+            formation_motion="free_sgp4_ei_separated_mean_element_offsets_v2",
+            separation_design="parallel_relative_eccentricity_and_inclination_vectors",
+            separation_reference="https://doi.org/10.2514/1.23015",
             initial_target_pitch_m=pitch,
             keepout_m=keepout + 3 * uncertainty,
             uncertainty_model="three_sigma_clearance_margin_no_stochastic_displacement",
@@ -378,4 +425,6 @@ def materialize_network_input(manifest, base_dir="."):
     network['cell_egress_policies'] = cell_egress_policies
     network["communication_topology"] = "explicit"
     result["initialization_provenance"] = sources
+    from orbitserve.runtime import freeze_network_profiles
+    result['network'] = freeze_network_profiles(result['network'])
     return result

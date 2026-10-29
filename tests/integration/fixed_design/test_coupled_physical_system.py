@@ -7,8 +7,9 @@ from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 
-from orbitserve.architecture import HardwareSpec
 from orbitserve.experiments import load_experiment_spec, run_experiment
+
+from orbitserve.architecture import HardwareSpec
 from orbitserve.serving import ServingSpec
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -19,10 +20,18 @@ class CoupledPhysicalSystemTests(unittest.TestCase):
     def test_directional_rf_budget_cannot_bypass_hardware_terminal_limit(self):
         spec = load_experiment_spec(MANIFEST)
         physical = deepcopy(spec.physical_network)
-        physical['network']['link_profiles']['sgl']['uplink_profile'] = 'uplink'
-        physical['network']['link_profiles']['uplink'] = {'bandwidth_bps': 2e9, 'setup_time_s': 0.}
-        with tempfile.TemporaryDirectory() as folder, self.assertRaisesRegex(ValueError, 'rate exceeds Architecture'):
-            run_experiment(replace(spec, physical_network=physical), output_dir=folder, _workers=1)
+        physical["network"]["link_profiles"]["sgl"]["uplink_profile"] = "uplink"
+        physical["network"]["link_profiles"]["uplink"] = {
+            "bandwidth_bps": 2e9,
+            "setup_time_s": 0.0,
+        }
+        with (
+            tempfile.TemporaryDirectory() as folder,
+            self.assertRaisesRegex(ValueError, "rate exceeds Architecture"),
+        ):
+            run_experiment(
+                replace(spec, physical_network=physical), output_dir=folder, _workers=1
+            )
 
     def test_workload_architecture_serving_network_runtime_end_to_end(self):
         spec = load_experiment_spec(MANIFEST)
@@ -77,8 +86,20 @@ class CoupledPhysicalSystemTests(unittest.TestCase):
             self.assertFalse((Path(folder) / "runtime_viewer.json").exists())
             self.assertEqual(result.network["checks"]["snapshot_count"], 120)
 
-            self.assertTrue(
-                (Path(folder) / "network/frames/frame-000002.json.gz").exists()
+            # Combined simulation consumes the reusable core without expanding
+            # optional JSON graphs. The same graph remains queryable on demand.
+            from orbitserve.experiments.physical_dataset import load_dataset
+            from orbitserve.experiments.snapshot_store import SnapshotSource
+
+            physical = Path(folder) / "network"
+            load_dataset(physical, verify_exports=False)
+            self.assertFalse((physical / "frames").exists())
+            frame = SnapshotSource(physical).snapshot(2.0)
+            self.assertEqual(frame["time_s"], 2.0)
+            self.assertEqual(
+                len(frame["nodes"]),
+                result.network["checks"]["physical_satellites"]
+                + result.network["checks"]["ground_nodes"],
             )
             saved = json.loads((Path(folder) / "experiment_result.json").read_text())
             self.assertEqual(
@@ -136,6 +157,7 @@ class CoupledPhysicalSystemTests(unittest.TestCase):
 
     def test_moe_serving_profiles_execute_on_the_same_physical_network(self):
         import shutil
+
         from orbitserve.workload import WorkloadBundleRef
         from orbitserve.workload.contract import bundle_hash
 

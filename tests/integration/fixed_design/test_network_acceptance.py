@@ -6,17 +6,17 @@ this is a correctness case, not a vendor-throughput or orbit-accuracy benchmark.
 """
 
 import importlib.util
-import unittest
 import tempfile
+import unittest
 from dataclasses import replace
 from functools import lru_cache
 from pathlib import Path
 
 from orbitserve.orbit import generate_orbit_trace, load_orbit_trace
 from orbitserve.runtime import (
+    LinkProfile,
     NetworkNodeSpec,
     NetworkSpec,
-    LinkProfile,
     NetworkState,
     run_simulation,
 )
@@ -34,7 +34,10 @@ def orbital_trace(ingress_id, lat_deg, lon_deg):
     elements["satellites"] = [
         _satellite(n, i) for i, n in enumerate(("sat-a", "sat-b", "sat-c"), 10001)
     ]
-    elements["satellites"][1]["mean_anomaly_deg"] = 0.01
+    # Keep sat-a unambiguously closer at initial association. With 0.01 degrees
+    # the rounded gateway position made sat-b closer by only 2 cm, so retain_valid
+    # correctly kept sat-b and the later fault on sat-a never hit a transfer.
+    elements["satellites"][1]["mean_anomaly_deg"] = 0.1
     elements["satellites"][2]["mean_motion_rev_per_day"] = 14.3
     with tempfile.TemporaryDirectory() as folder:
         generate_orbit_trace(
@@ -67,12 +70,12 @@ def acceptance_spec():
     }
     ids = ("sat-a", "sat-b", "sat-c")
     trace = orbital_trace(gateway["ingress_id"], gateway["lat_deg"], gateway["lon_deg"])
-    fault = dict(
-        target_type="link",
-        target_id=f"sgl:{gateway['ingress_id']}:sat-a",
-        start_s=10.0,
-        end_s=60.0,
-    )
+    fault = {
+        "target_type": "link",
+        "target_id": f"sgl:{gateway['ingress_id']}:sat-a",
+        "start_s": 10.0,
+        "end_s": 60.0,
+    }
     nodes = tuple(
         NetworkNodeSpec(
             n,
@@ -134,6 +137,20 @@ def run_acceptance(mode, policy):
 
 
 class NetworkAcceptanceTests(unittest.TestCase):
+    def test_fault_target_is_the_initially_selected_contact(self):
+        base = acceptance_spec()
+        state = NetworkState(base.environment_state, base.network, base.gateways)
+        target = base.network.faults[0]["target_id"]
+        backup = "sgl:ground-00:sat-b"
+        for time_s in (0.5, 7.0, 9.0):
+            with self.subTest(time_s=time_s):
+                self.assertEqual(state.link_at(target, time_s)["state"], "UP")
+                self.assertEqual(state.link_at(backup, time_s)["state"], "DOWN")
+        self.assertLess(
+            state.distance(state.edge_by_id[target], 0.0),
+            state.distance(state.edge_by_id[backup], 0.0) - 0.01,
+        )
+
     def verify_matrix_row(self, mode, policy):
         result = run_acceptance(mode, policy)
         self.assertEqual(
@@ -150,7 +167,7 @@ class NetworkAcceptanceTests(unittest.TestCase):
         ]
         self.assertTrue(losses)
         self.assertTrue(
-            any(e["kind"] == "route_recovery" and e["time_s"] == 11.0 for e in events)
+            any(e["kind"] == "route_recovery" and e["time_s"] == 10.0 for e in events)
         )
         paths = [
             leg for r in result.request_records for leg in r["routing"]["selected_path"]
@@ -161,10 +178,10 @@ class NetworkAcceptanceTests(unittest.TestCase):
             if leg["source_node_id"] == "ground-00" and leg["target_node_id"] == "sat-b"
         ]
         self.assertTrue(backup)
-        self.assertAlmostEqual(min(leg["start_s"] for leg in backup), 11.5)
+        self.assertAlmostEqual(min(leg["start_s"] for leg in backup), 10.5)
         self.assertTrue(
             any(
-                leg["contact_ready_s"] == 11.5 and leg["acquisition_wait_s"] == 0.5
+                leg["contact_ready_s"] == 10.5 and leg["acquisition_wait_s"] == 0.5
                 for leg in backup
             )
         )

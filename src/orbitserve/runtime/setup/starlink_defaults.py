@@ -53,7 +53,8 @@ def simulation_defaults(generation, *, report_2025=False):
                             '网关→星：代表性 E-band 载波；1.85 m 地面天线参照 FCC 2024 部分站点许可，不代表所有网关；2 GHz 为场景分配。'),
         'feeder_downlink': rf(73.5e9, .5e9, 10., .3, 1.85, uplink,
                               '星→网关：1.85 m 地面天线参照 FCC 2024 部分站点；500 MHz 为场景分配；不能根据用户下载/上传比断言回传硬件比例。'),
-        'communication_isl': dict(capacity_model='optical_photon_budget', bandwidth_bps=optical,
+        'communication_isl': dict(capacity_model='islsim', bandwidth_bps=optical,
+            islsim_config={'rx': {'terminal_cap_gbps': optical / 1e9}},
             setup_time_s=3., max_distance_km=6000., wavelength_m=1550e-9,
             transmit_power_w=.2, transmit_aperture_m=.05, receive_aperture_m=.05,
             transmit_aperture_efficiency=.6, receive_aperture_efficiency=.6,
@@ -61,7 +62,9 @@ def simulation_defaults(generation, *, report_2025=False):
             implementation_efficiency=.8, parameter_sources=[REPORT24 if v2 else V3_SPEC],
             assumptions=[
                 '公开光口标称 200 / 400 Gbps 的单双向口径未明确，默认按双向合计保守解释，每方向 100 / 200 Gbps；可在场景中修改。',
-                '1550 nm、0.2 W、5 cm 孔径、光子/bit、效率和损耗、3 s 建链与 6000 km 限距均为工程假设；距离变化仍通过光学预算计算实际速率。'])
+                '每方向光口工程上限同时传入 ISLSim terminal_cap_gbps；功率、口径、波特率、调制池等未公开项继承选定的 ISLSim 配置，可在本场景覆盖，不代表 Starlink 实测参数。',
+                '默认使用外部 ISLSim 的 tx/rx/channel 配置计算速率；3 s 建链与 6000 km 限距为 OrbitServe 场景假设。',
+                '光子预算参数仅供显式选择 optical_photon_budget 时使用；ISLSim 使用 islsim_config。'])
     }
     for kind in ('feeder_uplink', 'feeder_downlink'):
         profiles[kind]['parameter_sources'].append(FCC_E)

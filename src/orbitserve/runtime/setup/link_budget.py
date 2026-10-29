@@ -20,6 +20,9 @@ def calculate_budget(profile, distance_km):
     if not math.isfinite(distance_km) or distance_km < 0:
         raise ValueError("distance_km must be finite and nonnegative")
     p = profile
+    if p.capacity_model == 'islsim':
+        from .islsim import calculate
+        return calculate(p, distance_km)
     result = dict(capacity_model=p.capacity_model, snr_db=None, path_loss_db=None,
                   terminal_limit_bps=p.bandwidth_bps, rate_scope="per_direction",
                   parameter_sources=p.parameter_sources, assumptions=p.assumptions)

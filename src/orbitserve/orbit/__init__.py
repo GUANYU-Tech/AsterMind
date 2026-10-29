@@ -1,5 +1,7 @@
 """Orbit geometry, visibility, sunlight, and trace contracts."""
 
+from .sgp4.geometry import satellite_line_of_sight
+
 from .trace import (
     ORBIT_TRACE_ALGORITHM,
     ORBIT_TRACE_SCHEMA,
@@ -69,6 +71,7 @@ from .sgp4 import (
 )
 
 __all__ = [
+    "satellite_line_of_sight",
     "C_LIGHT_KM_PER_S",
     "ASTROPY_ENGINE_NAME",
     "ASTROPY_ENGINE_VERSION",

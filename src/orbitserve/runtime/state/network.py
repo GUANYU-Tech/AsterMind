@@ -4,14 +4,20 @@ from __future__ import annotations
 
 import bisect
 import heapq
+import itertools
 import math
-from copy import copy
+from copy import copy, deepcopy
 from typing import Any
 
-from ..engine.topology import candidate_links
 from ..engine.association import select_ground_links
+from ..engine.topology import candidate_links
 from ..setup.network_spec import NetworkSpec
-from ..setup.radio_capacity import capacity_pools, hop_pools, directional_profile, radio_parameters
+from ..setup.radio_capacity import (
+    capacity_pools,
+    directional_profile,
+    hop_pools,
+    radio_parameters,
+)
 
 C_KM_PER_S = 299792.458
 
@@ -27,16 +33,21 @@ class NetworkState:
     retain exact event times; this class never interpolates physical positions.
     """
 
-    def __init__(self, trace: Any, spec: NetworkSpec, gateways=(), sun_positions=(), *, physical_state=None):
+    def __init__(self, trace: Any, spec: NetworkSpec, gateways=(), sun_positions=(), *, physical_state=None, _defer_compile=False):
         self.physical_attributes = None
         prepared = None
         if physical_state is not None:
             from .physical_dataset import PhysicalAttributes, physical_spec
+            from ..setup.sun_geometry import SUN_GEOMETRY_VERSION
             self.physical_attributes = PhysicalAttributes(physical_state)
             prepared = self.physical_attributes.metadata
-            if prepared['trace_id'] != trace.trace_id or prepared['network'] != physical_spec(spec):
+            from ..setup.faults import physical_network_settings
+            if prepared['trace_id'] != trace.trace_id or physical_network_settings(prepared['network']) != physical_spec(spec):
                 raise ValueError('physical dataset does not match trace/network configuration')
-            sun_positions = [dict(time_s=t, position_itrs_km=p) for t, p in prepared['sun_positions']]
+            if (any(p.sun_exclusion_angle_deg is not None for p in spec.link_profiles.values())
+                    and prepared.get('sun_geometry_version') != SUN_GEOMETRY_VERSION):
+                raise ValueError('physical dataset uses obsolete Sun visibility; regenerate physical data in step one')
+            sun_positions = [{'time_s': t, 'position_itrs_km': p} for t, p in prepared['sun_positions']]
         self.trace, self.spec = trace, spec
         self.nodes = {n.node_id: n for n in spec.nodes}
         self.pool_capacities = capacity_pools(self.nodes)
@@ -113,6 +124,13 @@ class NetworkState:
         for row in trace.sgl_windows:
             key = tuple(sorted((str(row["ingress_id"]), str(row["satellite_id"]))))
             self.windows.setdefault(key, []).append(row)
+        # Adaptive access pairs without any contact in this horizon cannot be
+        # selected. Keep fixed ISLs as topology, even when physically blocked.
+        self.candidate_edge_ids = {edge['link_id'] for edge in self.edges}
+        self.edges = tuple(edge for edge in self.edges if edge['kind'] not in {'sgl', 'cross_layer'} or
+                           any(float(w['start_s']) < self.end_s and float(w['end_s']) > self.start_s
+                               for w in self.windows.get((edge['endpoint_a'], edge['endpoint_b']), ())))
+        self._set_attribute_boundaries()
         self.frames: list[dict] = []
         self.events: list[dict] = []
         self.calendars: dict[tuple[str, str, str], list[tuple[float, float]]] = {}
@@ -122,7 +140,15 @@ class NetworkState:
         self.observed_faults = {}
         self.fault_boundaries = set()
         self.revision = 0
-        if prepared is None:
+        self.manual_disabled_links = set()
+        self.added_edge_ids = set()
+        from ..setup.faults import validate_fault_boundaries
+        validate_fault_boundaries(spec, self.environment_times)
+        self._compile_pending = _defer_compile and prepared is None
+        if self._compile_pending:
+            self.link_frames, self.link_times = {}, {}
+            self.allocation_checks = {'passed': True, 'max_pool_usage': {}}
+        elif prepared is None:
             self._compile()
         else:
             if prepared['ground_positions'] != {k: list(v) for k, v in self.ground_positions.items()}:
@@ -131,16 +157,33 @@ class NetworkState:
                 setattr(self, name, prepared[name])
             self.edge_by_id = {edge['link_id']: edge for edge in self.edges}
             self.link_times = {key: [row['time_s'] for row in rows] for key, rows in self.link_frames.items()}
-        if any(f['target_type'] == 'link' and f['target_id'] not in self.edge_by_id for f in spec.faults):
+        if any(f['target_type'] == 'link' and f['target_id'] not in self.candidate_edge_ids for f in spec.faults):
             raise ValueError("unknown fault link")
         self.frame_times = [f["time_s"] for f in self.frames]
 
-    def save_physical_state(self, path):
+    def _set_attribute_boundaries(self):
+        self.attribute_boundaries = {}
+        if self.physical_attributes is not None:
+            for edge in self.edges:
+                profiles = (self.spec.link_profiles[edge.get('profile_id',edge['kind'])],
+                            *(directional_profile(self.nodes,self.spec.link_profiles,edge,source)
+                              for source in (edge['endpoint_a'],edge['endpoint_b'])))
+                boundaries = {t for profile in profiles for t,_ in profile.capacity_schedule}
+                boundaries.update(float(w[k]) for w in self.windows.get((edge['endpoint_a'],edge['endpoint_b']),())
+                                  for k in ('start_s','end_s'))
+                self.attribute_boundaries[edge['link_id']] = tuple(sorted(boundaries))
+    def save_physical_state(self, path, *, workers=1, progress=None):
         """Persist initial acquisition state and backend-independent budgets."""
         from .physical_dataset import write_physical_state
         if self.observed_faults or self.calendars or self.shared_load or self.shared_pool_load:
             raise ValueError('physical preparation requires a fresh network without runtime observations/traffic')
-        write_physical_state(self, path)
+        write_physical_state(self, path, workers=workers, progress=progress)
+
+    @staticmethod
+    def open_physical_attributes(path):
+        """Open immutable attributes for offline snapshots without a full trace."""
+        from .physical_dataset import PhysicalAttributes
+        return PhysicalAttributes(path)
 
     def position(self, node_id: str, time_s: float) -> tuple[float, ...]:
         if not self.start_s <= time_s <= self.end_s:
@@ -158,15 +201,36 @@ class NetworkState:
             max(0, bisect.bisect_right(self.environment_times, time_s) - 1)
         ]
 
+    def _saved_attributes(self, edge, time_s):
+        return self.physical_attributes.at(edge['link_id'], self._attribute_time(edge, time_s))
+
+    def _attribute_time(self, edge, time_s):
+        # Fractional arrivals in the same physical interval share one cache
+        # key. Exact capacity/contact boundaries are still kept separately.
+        boundaries = self.attribute_boundaries.get(edge['link_id'], ())
+        index = bisect.bisect_right(boundaries,time_s)-1
+        canonical = max(self.sample_time(time_s), boundaries[index] if index>=0 else self.start_s)
+        return canonical
+
     def distance(self, edge: dict, time_s: float) -> float:
-        if self.physical_attributes is not None:
-            return self.physical_attributes.at(edge['link_id'], time_s)['geometry']['distance_km']
+        if self.physical_attributes is not None and edge['link_id'] not in self.added_edge_ids:
+            return self._saved_attributes(edge,time_s)['geometry']['distance_km']
         return math.dist(
             self.position(edge["endpoint_a"], time_s),
             self.position(edge["endpoint_b"], time_s),
         )
 
-    def sun_separation(self, edge: dict, time_s: float) -> float | None:
+    def sun_separation(self, edge: dict, time_s: float, *, receiver_id=None) -> float | None:
+        """Use direct solar incidence at each receiver, never through Earth.
+
+        The shared bidirectional link retains its conservative exclusion policy:
+        if either receiver can see the Sun inside the exclusion cone, the pair
+        is unavailable. A caller may inspect one receiving direction explicitly.
+        """
+        from ..setup.sun_geometry import receiver_sun_separation
+
+        if receiver_id is not None and receiver_id not in (edge['endpoint_a'], edge['endpoint_b']):
+            raise ValueError('solar receiver must be a link endpoint')
         if not self.sun_positions:
             return None
         index = max(
@@ -178,23 +242,12 @@ class NetworkState:
             self.position(edge["endpoint_a"], time_s),
             self.position(edge["endpoint_b"], time_s),
         )
-        for observer, target in ((a, b), (b, a)):
-            sight = tuple(x - y for x, y in zip(target, observer))
-            light = tuple(x - y for x, y in zip(sun, observer))
-            norm = math.sqrt(sum(x * x for x in sight) * sum(x * x for x in light))
-            if norm:
-                angles.append(
-                    math.degrees(
-                        math.acos(
-                            max(
-                                -1.0,
-                                min(
-                                    1.0, sum(x * y for x, y in zip(sight, light)) / norm
-                                ),
-                            )
-                        )
-                    )
-                )
+        for identity, observer, transmitter in ((edge['endpoint_a'], a, b), (edge['endpoint_b'], b, a)):
+            if receiver_id is not None and identity != receiver_id:
+                continue
+            angle = receiver_sun_separation(observer, transmitter, sun)
+            if angle is not None:
+                angles.append(angle)
         return min(angles) if angles else 180.0
 
     def fork(self) -> NetworkState:
@@ -205,21 +258,33 @@ class NetworkState:
         result.active_faults = dict(self.active_faults)
         result.observed_faults = {k: dict(v) for k, v in self.observed_faults.items()}
         result.fault_boundaries = set(self.fault_boundaries)
+        result.manual_disabled_links = set(self.manual_disabled_links)
+        result.added_edge_ids = set(self.added_edge_ids)
+        result.windows = dict(self.windows)
         return result
 
     def observe_fault(self, index, fault, time_s, *, restored=False):
         """Reallocate from observed outages, never from their future repair time.
 
-        Release is immediate. New acquisition starts at the next geometry sample;
+        Release is immediate. Boundary-mode acquisition starts at this boundary;
         unaffected contacts keep their original acquisition clock. Replaying only
         observed boundaries makes both forecasts and forks causal.
         """
-        if restored:
-            self.active_faults.pop(index, None)
-            self.observed_faults[index]['end_s'] = time_s
-        else:
-            self.active_faults[index] = fault
-            self.observed_faults[index] = {**fault, 'end_s': self.end_s}
+        self.observe_faults(((index, fault, restored),), time_s)
+
+    def observe_faults(self, observations, time_s):
+        """Apply one boundary's complete outage batch before reallocating once."""
+        if self.spec.fault_timing == 'boundary' and not any(math.isclose(time_s, t, rel_tol=0, abs_tol=1e-8) for t in self.environment_times):
+            raise ValueError('故障与恢复只能在时间片边界生效')
+        for index, fault, restored in observations:
+            if restored:
+                self.active_faults.pop(index, None)
+                self.observed_faults[index]['end_s'] = time_s
+            else:
+                self.active_faults[index] = fault
+                # The simulation horizon is not an observed repair. Keep the
+                # outage active even at its exact end until a repair is seen.
+                self.observed_faults[index] = {**fault, 'end_s': math.inf}
         self.fault_boundaries.add(time_s)
         self.revision += 1
         self._compile(from_s=time_s)
@@ -227,7 +292,7 @@ class NetworkState:
 
     def faulted(self, edge, time_s=None):
         faults = (self.active_faults.values() if time_s is None else
-                  (f for f in self.spec.faults if f['start_s'] <= time_s < f['end_s']))
+                  (f for f in (*self.spec.faults, *self.observed_faults.values()) if f['start_s'] <= time_s < f['end_s']))
         return any((f['target_type'] == 'link' and f['target_id'] == edge['link_id']) or
                    (f['target_type'] == 'node' and f['target_id'] in
                     (edge['endpoint_a'], edge['endpoint_b'])) for f in faults)
@@ -345,12 +410,14 @@ class NetworkState:
                 if link_id not in eligible:
                     states.pop(link_id)
                     changed.add(link_id)
-            retained_sgl = {
-                k: states.pop(k) for k in list(states)
-                if latest[k]["kind"] == "sgl"
-            }
+            previous_dynamic = {}
+            if self.spec.handover_policy == 'quality_first' and t not in self.fault_boundaries:
+                previous_dynamic = {k:states.pop(k) for k in list(states)
+                                    if latest[k]['kind'] in {'sgl','cross_layer'}}
+            retained_sgl = [latest[k] for k in states if latest[k]['kind'] == 'sgl']
             selected_sgl = select_ground_links(
-                self, [e for e in eligible.values() if e['kind'] == 'sgl'], t)
+                self, [e for k,e in eligible.items() if e['kind'] == 'sgl' and k not in states],
+                t, retained=retained_sgl)
             used = {}
             for link_id in states:
                 edge = latest[link_id]
@@ -358,25 +425,23 @@ class NetworkState:
                 for node in (edge["endpoint_a"], edge["endpoint_b"]):
                     used[node, pool] = used.get((node, pool), 0) + 1
 
-            def priority(edge):
-                if (
-                    edge["kind"] == "sgl"
-                    and self.spec.ground_access_policy == "longest_available"
-                ):
-                    return (
-                        -(edge["available_until_s"] - t),
-                        edge["distance_km"],
-                        edge["link_id"],
-                    )
-                return (1.0 if edge.get('topology_patch') else 0.0, edge["distance_km"], edge["link_id"])
+            def priority(edge, t=t):
+                score = edge['distance_km']
+                policy = (self.spec.cross_layer_access_policy if edge['kind']=='cross_layer'
+                          else self.spec.ground_access_policy if edge['kind']=='sgl' else 'nearest_distance')
+                if policy == 'longest_available':
+                    score = -(edge['available_until_s']-t)
+                elif edge['kind']=='cross_layer' and policy=='highest_capacity':
+                    a,b=edge['endpoint_a'],edge['endpoint_b']
+                    score=-min(self.directional_attributes(edge,a,b,t)['bandwidth_bps'],
+                               self.directional_attributes(edge,b,a,t)['bandwidth_bps'])
+                return (1.0 if edge.get('topology_patch') else 0.0,score,edge['distance_km'],edge['link_id'])
 
             for edge in sorted(eligible.values(), key=priority):
                 link_id = edge["link_id"]
                 if link_id in states:
                     continue
                 if edge['kind'] == 'sgl' and link_id not in selected_sgl:
-                    if link_id in retained_sgl:
-                        changed.add(link_id)
                     continue
                 pool = "sgl" if edge["kind"] == "sgl" else "isl"
                 endpoints = edge["endpoint_a"], edge["endpoint_b"]
@@ -385,20 +450,13 @@ class NetworkState:
                     >= getattr(self.nodes[n], pool + "_terminals")
                     for n in endpoints
                 ):
-                    if link_id in retained_sgl:
-                        changed.add(link_id)
                     if (
                         not self.link_frames[link_id]
                         or self.link_frames[link_id][-1]["state"] != "DOWN"
                     ):
                         changed.add(link_id)
                     continue
-                old = retained_sgl.get(link_id)
-                if old is None and t in self.fault_boundaries:
-                    # Fault processing releases terminals before the next sample
-                    # is allowed to choose a new peer (even for zero setup time).
-                    changed.add(link_id)
-                    continue
+                old = previous_dynamic.get(link_id)
                 profile = self.spec.link_profiles[edge.get("profile_id", edge["kind"])]
                 states[link_id] = old or {
                     "setup_start_s": t,
@@ -407,9 +465,7 @@ class NetworkState:
                 if old is None:
                     changed.add(link_id)
                     if t < states[link_id]["ready_s"] < self.end_s:
-                        heapq.heappush(
-                            queue, (states[link_id]["ready_s"], 1, link_id, None)
-                        )
+                        heapq.heappush(queue, (states[link_id]['ready_s'], 1, link_id, None))
                 for n in endpoints:
                     key = n, pool
                     used[key] = used.get(key, 0) + 1
@@ -419,7 +475,7 @@ class NetworkState:
                     self.allocation_checks["max_pool_usage"][name] = max(
                         used[key], self.allocation_checks["max_pool_usage"].get(name, 0)
                     )
-            changed.update(k for k in retained_sgl if k not in states)
+            changed.update(k for k in previous_dynamic if k not in states)
             for link_id in changed:
                 attr = {
                     **latest[link_id],
@@ -483,16 +539,18 @@ class NetworkState:
             for key, history in self.link_frames.items()
         }
         ordered = sorted(all_times)
-        self.frames = [{"time_s": a, "end_s": b} for a, b in zip(ordered, ordered[1:])]
+        self.frames = [{"time_s": a, "end_s": b} for a, b in itertools.pairwise(ordered)]
 
     def _geometry_attributes(self, edge, time_s):
-        if self.physical_attributes is not None:
-            result = dict(self.physical_attributes.at(edge['link_id'], time_s)['geometry'])
+        if self.physical_attributes is not None and edge['link_id'] not in self.added_edge_ids:
+            result = self.physical_attributes.geometry_at(edge['link_id'], self._attribute_time(edge, time_s))
             if any(f['start_s'] <= time_s < f['end_s'] and
                    ((f['target_type'] == 'link' and f['target_id'] == edge['link_id']) or
                     (f['target_type'] == 'node' and f['target_id'] in (edge['endpoint_a'], edge['endpoint_b'])))
                    for f in self.observed_faults.values()):
                 result['reason'] = 'injected_fault'
+            if edge['link_id'] in self.manual_disabled_links:
+                result['reason'] = 'manual_disconnected'
             return result
         profile = self.spec.link_profiles[edge.get("profile_id", edge["kind"])]
         windows = self.windows.get((edge["endpoint_a"], edge["endpoint_b"]), ())
@@ -521,7 +579,7 @@ class NetworkState:
                 reason = 'patch_atmosphere_blocked'
         angle = (
             self.sun_separation(edge, probe)
-            if profile.sun_exclusion_angle_deg is not None
+            if reason is None and profile.sun_exclusion_angle_deg is not None
             else None
         )
         if (
@@ -530,14 +588,22 @@ class NetworkState:
             and angle < profile.sun_exclusion_angle_deg
         ):
             reason = "sun_exclusion"
+        evaluate_budget = reason is None
         if any(f['start_s'] <= time_s < f['end_s'] and
                ((f['target_type'] == 'link' and f['target_id'] == edge['link_id']) or
                 (f['target_type'] == 'node' and f['target_id'] in
                  (edge['endpoint_a'], edge['endpoint_b'])))
                for f in self.observed_faults.values()):
             reason = 'injected_fault'
-        attrs = profile.attributes(distance, time_s)
+        attrs = (self._budget_attributes(profile, distance, time_s) if evaluate_budget else
+                 {'bandwidth_bps': 0.0, 'budget_bandwidth_bps': 0.0,
+                      'capacity_model': profile.capacity_model, 'rate_scope': 'per_direction',
+                      'budget_evaluated': False})
         attrs['bandwidth_bps'] = min([attrs['bandwidth_bps'], *self.optical_limits(edge)])
+        if reason is None and attrs.get('link_feasible') is False:
+            reason = 'link_budget_infeasible'
+        if edge['link_id'] in self.manual_disabled_links:
+            reason = 'manual_disconnected'
         return {
             **edge,
             "distance_km": distance,
@@ -566,7 +632,7 @@ class NetworkState:
                 {
                     **record,
                     **{k: v for k, v in attributes.items() if k not in {'reason'}},
-                    'directions': self.directions(edge, time_s),
+                    'directions': self.directions(edge, time_s, geometry=attributes),
                     'bandwidth_semantics': 'base_budget_use_directions_for_effective_capacity',
                     **(
                         {"state": "DOWN", "reason": "horizon_end"}
@@ -584,16 +650,29 @@ class NetworkState:
         return {
             "time_s": time_s,
             "valid_until_s": valid_until,
-            "nodes": [
-                {**n.__dict__, 'radio_parameters': radio_parameters(n), "position_itrs_km": self.position(n.node_id, time_s),
-                 "state": "DOWN" if any(f['target_type'] == 'node' and f['target_id'] == n.node_id and f['start_s'] <= time_s < f['end_s'] for f in self.spec.faults) else "UP"}
-                for n in sorted(self.nodes.values(), key=lambda n: n.node_id)
-            ],
+            "nodes": self._snapshot_nodes(time_s),
             "links": links,
             'shared_capacity_pools_bps': dict(self.pool_capacities),
         }
 
-    def directions(self, edge, time_s):
+    def _snapshot_nodes(self, time_s):
+        if not hasattr(self, '_snapshot_catalog'):
+            self._snapshot_catalog = tuple(
+                {**n.__dict__, 'radio_parameters': radio_parameters(n)}
+                for n in sorted(self.nodes.values(), key=lambda n: n.node_id))
+        return [dict(n if getattr(self, '_share_snapshot_metadata', False) else deepcopy(n),
+                     position_itrs_km=self.position(n['node_id'], time_s),
+                     state='DOWN' if any(f['target_type'] == 'node' and f['target_id'] == n['node_id']
+                     and f['start_s'] <= time_s < f['end_s'] for f in (*self.spec.faults, *self.observed_faults.values())) else 'UP')
+                for n in self._snapshot_catalog]
+
+    def directions(self, edge, time_s, *, geometry=None):
+        if geometry is not None and geometry.get('budget_evaluated') is False:
+            return [{'source_node_id': a, 'target_node_id': b, 'bandwidth_bps': 0.0,
+                         'budget_bandwidth_bps': 0.0, 'budget_evaluated': False,
+                         'capacity_model': directional_profile(self.nodes, self.spec.link_profiles, edge, a).capacity_model,
+                         'rate_scope': 'per_direction', 'shared_pools': list(hop_pools(self.nodes,a,b))}
+                    for a,b in ((edge['endpoint_a'],edge['endpoint_b']), (edge['endpoint_b'],edge['endpoint_a']))]
         return [dict(source_node_id=a, target_node_id=b,
                      **self.directional_attributes(edge, a, b, time_s),
                      shared_pools=list(hop_pools(self.nodes, a, b)))
@@ -601,17 +680,30 @@ class NetworkState:
                              (edge['endpoint_b'], edge['endpoint_a']))]
 
     def directional_attributes(self, edge, source, target, time_s):
-        if self.physical_attributes is not None:
-            rows = self.physical_attributes.at(edge['link_id'], time_s)['directions']
-            row = next(r for r in rows if r['source_node_id'] == source and r['target_node_id'] == target)
+        if self.physical_attributes is not None and edge['link_id'] not in self.added_edge_ids:
+            row = self.physical_attributes.direction_at(edge['link_id'], self._attribute_time(edge, time_s), source, target)
             return {k: v for k, v in row.items() if k not in {'source_node_id', 'target_node_id', 'shared_pools'}}
-        result = directional_profile(self.nodes, self.spec.link_profiles, edge, source).attributes(
-            self.distance(edge, time_s), time_s)
+        profile = directional_profile(self.nodes, self.spec.link_profiles, edge, source)
+        # No physical budget exists outside a geometric contact window. These
+        # compact zero-rate records retain blocked-state audit information.
+        if not any(float(w['start_s']) <= time_s < float(w['end_s']) for w in
+                   self.windows.get((edge['endpoint_a'], edge['endpoint_b']), ())):
+            return {'bandwidth_bps': 0.0, 'budget_bandwidth_bps': 0.0,
+                        'capacity_model': profile.capacity_model, 'rate_scope': 'per_direction',
+                        'budget_evaluated': False}
+        result = self._budget_attributes(profile, self.distance(edge, time_s), time_s)
         pools = hop_pools(self.nodes, source, target)
         result['bandwidth_bps'] = min([result['bandwidth_bps']] +
                                      [self.pool_capacities[k] for k in pools] +
                                      self.optical_limits(edge))
         return result
+
+    def _budget_attributes(self, profile, distance, time_s):
+        cached = getattr(self, '_last_budget', None)
+        if cached is None or cached[0] is not profile or cached[1:3] != (distance, time_s):
+            cached = profile, distance, time_s, profile.attributes(distance, time_s)
+            self._last_budget = cached
+        return dict(cached[3])
 
     def optical_limits(self, edge):
         return [self.nodes[n].optical_terminal_bandwidth_bps for n in (edge['endpoint_a'], edge['endpoint_b'])

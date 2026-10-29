@@ -118,7 +118,7 @@ class RecoveryTests(unittest.TestCase):
         recovery = next(e for e in engine.log if e["kind"] == "route_recovery")
         self.assertEqual(recovery["source_node_id"], "a")
         self.assertEqual(recovery["original_source_node_id"], "s")
-        self.assertEqual(recovery["time_s"], 2.0)
+        self.assertEqual(recovery["time_s"], 1.25)  # Continuous faults retry when observed.
         loss = next(e for e in engine.log if e["kind"] == "transfer_cancelled")
         if mode == "ns3":
             self.assertGreater(loss["bytes_discarded"], 0)
@@ -208,10 +208,10 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(loss["time_s"], 10.0)
         self.assertAlmostEqual(loss["bytes_discarded"], 2750, places=5)
         retry = next(e for e in events if e["kind"] == "route_recovery")
-        self.assertEqual(retry["time_s"], 11.0)
+        self.assertEqual(retry["time_s"], 10.0)
         path = result.request_records[0]["routing"]["selected_path"]
         self.assertNotEqual(path[1]["link_id"], initial["link_id"])
-        self.assertEqual(path[1]["start_s"], 11.0)
+        self.assertEqual(path[1]["start_s"], 10.0)
         self.assertEqual(path[1]["payload_bytes"], 7750)
 
     def test_queue_long_transmission_uses_backup_ground_access(self):
@@ -227,7 +227,7 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(len(losses), 1)
         self.assertAlmostEqual(losses[0]["bytes_discarded"], 250, places=5)
         retry = next(e for e in events if e["kind"] == "route_recovery")
-        self.assertEqual(retry["time_s"], 1.0)
+        self.assertEqual(retry["time_s"], 0.25)
         self.assertEqual(retry["retransmit_bytes"], 1000)
         successful = [p for p in job["path"] if not p.get("cancelled_at_s")]
         self.assertEqual([p["target_node_id"] for p in successful], ["d", "c"])

@@ -49,7 +49,11 @@ def run_event_engine(spec):
     serving = spec.serving_profile
     if serving is None or not serving.has_compute_capacity:
         return _all_uncompleted(spec, "serving_capacity_unavailable")
-    network = NetworkState(trace, spec.network, spec.gateways, physical_state=spec.physical_state_ref)
+    from ..setup.faults import realize_runtime_faults
+    from .topology import candidate_links
+    boundaries = sorted({float(row['time_s']) for row in trace.ephemeris_samples})
+    runtime_network = realize_runtime_faults(spec.network, boundaries, candidate_links(spec.network))
+    network = NetworkState(trace, runtime_network, spec.gateways, physical_state=spec.physical_state_ref)
     try:
         energy, initial_soc = _build_energy_trace(trace, spec.energy_profile)
         capacity = derive_kv_cache_capacity_tokens(spec.constellation, serving)
@@ -162,9 +166,18 @@ def run_event_engine(spec):
     boundaries = sorted({float(row["time_s"]) for row in trace.ephemeris_samples})
     for time in boundaries:
         engine.push(time, 0, "topology_sample", None)
+        if engine.controller and time < engine.end:
+            engine.push(time, 5, 'control_boundary', None)
+    fault_batches = defaultdict(list)
     for index, fault in enumerate(network.spec.faults):
-        engine.push(fault['start_s'], -2, "fault_start", None, (index, fault))
-        engine.push(fault['end_s'], -2, "fault_end", None, (index, fault))
+        if network.spec.fault_timing == 'boundary':
+            fault_batches[fault['start_s']].append((index, fault, False))
+            fault_batches[fault['end_s']].append((index, fault, True))
+        else:
+            engine.push(fault['start_s'], -2, "fault_start", None, (index, fault))
+            engine.push(fault['end_s'], -2, "fault_end", None, (index, fault))
+    for time_s, observations in sorted(fault_batches.items()):
+        engine.push(time_s, -2, 'fault_batch', None, observations)
     engine.run()
     ordered = sorted(
         engine.jobs.values(),
@@ -215,7 +228,10 @@ def run_event_engine(spec):
             "compute_queue_model": "ready_order_fifo_concurrency_slots",
             "serving_rate_model": "admission_snapshot_fixed_rate",
             "internal_collectives": "serving_embedded_with_physical_connectivity_gate",
-            "fault_semantics": "unexpected_online_interrupted_hop_discard_buffered_sender_retry_next_sample",
+            "fault_semantics": ('boundary_fault_buffered_sender_retry_same_boundary'
+                                if network.spec.fault_timing == 'boundary' else
+                                "continuous_fault_buffered_sender_retry_on_observed_change"),
+            "realized_faults": list(network.spec.faults),
             "compute_energy_distribution": "equal_work_share_across_physical_cell_members",
             "rate_update_during_execution": False,
             "kv_publication": "compute_completion_event",
@@ -227,6 +243,8 @@ def run_event_engine(spec):
 
 class _EventEngine:
     def __init__(self, spec, environment, energy, state, eligible):
+        from .control import current_controller
+        self.controller = current_controller()
         self.spec, self.env, self.energy, self.state, self.eligible = (
             spec,
             environment,
@@ -249,6 +267,7 @@ class _EventEngine:
         self.shared_messages = {}
         self.shared_capacities = {}
         self.messages = {}
+        self.waiting_retries = {}
         self.transport_provenance = {
             "backend": "queue",
             "sharing_scope": "exclusive_directed_hop",
@@ -316,12 +335,16 @@ class _EventEngine:
     def run(self):
         try:
             self._run()
+            if self.controller:
+                self.controller.finished(self)
         finally:
             if self.transport:
                 self.transport.close()
 
     def _run(self):
         while self.heap:
+            if self.controller and hasattr(self.controller, 'poll'):
+                self.controller.poll(self)
             if self.transport:
                 target = min(self.heap[0][0], self.end)
                 if target > self.transport.now:
@@ -333,7 +356,7 @@ class _EventEngine:
             if time > self.end:
                 break
             self.now = time
-            if kind == 'link_state' and payload.get('revision', 0) != self.net.revision:
+            if kind in {'link_state', 'network_update'} and (payload or {}).get('revision', 0) != self.net.revision:
                 continue
             job = self.jobs.get(request_id)
             if job and job["done"]:
@@ -384,13 +407,14 @@ class _EventEngine:
                     **details,
                     "request_id": request_id,
                     **(
-                        {"link_id": payload["link_id"], "state": payload["state"]}
+                        {"link_id": payload["link_id"], "state": payload["state"], "reason": payload.get('reason')}
                         if kind == "link_state"
                         else {}
                     ),
                 }
             )
             if kind in {"link_state", "topology_sample", "network_update"}:
+                self.wake_retries()
                 if self.transport:
                     self.refresh_shared()
                 else:
@@ -436,6 +460,25 @@ class _EventEngine:
         for job in self.jobs.values():
             if not job["done"]:
                 self.fail(job, "simulation_horizon_exceeded")
+
+    def on_control_boundary(self, unused, payload):
+        self.controller.checkpoint(self)
+
+    def wake_retries(self):
+        """Retry against a newly observed graph, including mid-sample repairs."""
+        pending, self.waiting_retries = self.waiting_retries, {}
+        for message in pending.values():
+            if not self.jobs[message['request_id']]['done']:
+                self.push(self.now, 25, 'retry_transfer', message['request_id'], message)
+
+    def interrupt_unavailable(self, reason):
+        for message in tuple(self.messages.values()):
+            leg = message['leg']
+            if self.net.link_at(leg['link_id'], self.now)['state'] == 'DOWN':
+                self.interrupt_transfer(self.jobs[message['request_id']], message, reason)
+        for job in tuple(self.active_compute.values()):
+            if not self.cell_available(job['node']):
+                self.fail(job, 'compute_cell_disconnected_during_service')
 
     def on_request_arrival(self, job, unused):
         from .simulator import _select_access, _preview_candidate, _decision
@@ -659,7 +702,7 @@ class _EventEngine:
             self.fail(job, 'forwarding_buffer_lost_on_node_failure')
             return
         context = {**message['context'], 'attempt': attempt}
-        self.push(self.next_sample(), 25, 'retry_transfer', message['request_id'],
+        self.push(self.now, 25, 'retry_transfer', message['request_id'],
                   {**message, 'context': context, 'attempt': attempt, 'resume_node':resume_node})
 
     def on_retry_transfer(self, job, message):
@@ -684,40 +727,57 @@ class _EventEngine:
             self.send(job, message['resume_node'], message['target'], message['size'], message['kinds'],
                       message['stage'], message['completion'], context=message['context'])
         except NetworkUnavailable:
-            if message['attempt'] >= self.net.spec.max_transfer_retries or self.next_sample() >= self.end:
+            if message['attempt'] >= self.net.spec.max_transfer_retries or self.now >= self.end:
                 self.fail(job, 'retry_route_unavailable')
             else:
                 message['attempt'] += 1
                 message['context']['attempt'] = message['attempt']
-                self.push(self.next_sample(), 25, 'retry_transfer', message['request_id'], message)
+                self.waiting_retries[message['leg']['transfer_id']] = message
 
     def on_fault_start(self, unused, payload):
         index, fault = payload
-        self.net.observe_fault(index, fault, self.now)
-        self.schedule_reallocation()
-        self.log.append(dict(time_s=self.now, kind='fault_injected', **fault))
-        for message in tuple(self.messages.values()):
-            if self.net.faulted(message['leg']):
-                self.interrupt_transfer(self.jobs[message['request_id']], message, 'injected_' + fault['target_type'] + '_failure')
-        if fault['target_type'] == 'node':
-            for job in tuple(self.active_compute.values()):
-                if fault['target_id'] in self.members(job['node']):
-                    self.fail(job, 'compute_member_failed_no_checkpoint')
+        self.on_fault_batch(unused, ((index, fault, False),))
 
     def on_fault_end(self, unused, payload):
         index, fault = payload
-        self.net.observe_fault(index, fault, self.now, restored=True)
+        self.on_fault_batch(unused, ((index, fault, True),))
+
+    def on_fault_batch(self, unused, observations):
+        from ..setup.faults import fault_step_details
+        self.net.observe_faults(observations, self.now)
         self.schedule_reallocation()
-        self.log.append(dict(time_s=self.now, kind='fault_restored', **fault))
+        failed_nodes = set()
+        for index, fault, restored in observations:
+            self.log.append(dict(time_s=self.now, kind='fault_restored' if restored else 'fault_injected',
+                                 **fault, **fault_step_details(fault, self.net.environment_times)))
+            if not restored and fault['target_type'] == 'node':
+                failed_nodes.add(fault['target_id'])
+        for message in tuple(self.messages.values()):
+            if self.net.faulted(message['leg']):
+                kind = 'node' if failed_nodes.intersection((message['leg']['source_node_id'],message['leg']['target_node_id'])) else 'link'
+                self.interrupt_transfer(self.jobs[message['request_id']], message, 'injected_' + kind + '_failure')
+        for job in tuple(self.active_compute.values()):
+            if failed_nodes.intersection(self.members(job['node'])):
+                self.fail(job, 'compute_member_failed_no_checkpoint')
+        for identity, message in tuple(self.waiting_retries.items()):
+            if message['resume_node'] in failed_nodes:
+                self.waiting_retries.pop(identity, None)
+                self.fail(self.jobs[message['request_id']], 'forwarding_buffer_lost_on_node_failure')
+        self.wake_retries()
 
     def schedule_reallocation(self):
+        # Replaced graph versions must not accumulate future events or wake
+        # route waiters after they have become obsolete.
+        self.heap[:] = [e for e in self.heap if e[3] not in {'link_state', 'network_update'}
+                        or (e[5] or {}).get('revision', 0) == self.net.revision]
+        heapq.heapify(self.heap)
         for event in self.net.events:
             if event['time_s'] >= self.now:
                 self.push(event['time_s'], 0, 'link_state', None,
                           {**event, 'revision': self.net.revision})
         for frame in self.net.frames:
             if frame['time_s'] > self.now:
-                self.push(frame['time_s'], 0, 'network_update', None)
+                self.push(frame['time_s'], 0, 'network_update', None, {'revision': self.net.revision})
 
     def advance_shared(self, target):
         response = self.transport.advance_until(target)
@@ -880,8 +940,9 @@ class _EventEngine:
                 raise
             self.log.append(dict(time_s=self.now, kind='route_wait', request_id=message['request_id'],
                                  source_node_id=node, target_node_id=message['target']))
-            self.push(self.next_sample(), 25, 'retry_transfer', message['request_id'],
-                      {**message, 'resume_node':node, 'attempt': 1, 'context': {**message['context'], 'attempt': 1}})
+            self.waiting_retries[message['leg']['transfer_id']] = {
+                **message, 'resume_node': node, 'attempt': 1,
+                'context': {**message['context'], 'attempt': 1}}
 
     def on_access_done(self, job, unused):
         self.send(
@@ -965,6 +1026,8 @@ class _EventEngine:
 
     def cell_available(self, node_id):
         members = set(self.members(node_id))
+        if any(f['target_type'] == 'node' and f['target_id'] in members for f in self.net.active_faults.values()):
+            return False
         if len(members) < 2:
             return True
         adjacency = {node: [] for node in members}

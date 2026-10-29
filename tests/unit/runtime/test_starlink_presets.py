@@ -49,8 +49,35 @@ class StarlinkPresetTests(unittest.TestCase):
                 self.assertEqual(spec.link_profiles[node.sgl_profiles['user_downlink']].frequency_hz,12e9)
                 shell = next(s for s in spec.communication_shells if s['shell_id']=='comm-low')
                 optical = spec.link_profiles[shell['isl_profile']]
-                self.assertEqual(optical.capacity_model,'optical_photon_budget')
+                self.assertEqual(optical.capacity_model,'islsim')
+                self.assertEqual(set(optical.islsim_config), {'tx', 'rx', 'channel'})
+                self.assertTrue(optical.islsim_source_sha256)
                 self.assertEqual(optical.bandwidth_bps,node.optical_terminal_bandwidth_bps)
+                self.assertEqual(optical.islsim_config['rx']['terminal_cap_gbps'], optical.bandwidth_bps / 1e9)
+                self.assertEqual(optical.attributes(1000, 0)['islsim_total_bw_gbps'], optical.bandwidth_bps / 1e9)
+
+    def test_generation_native_overrides_change_calculation_and_input_identity(self):
+        from orbitserve.experiments.network_inputs import snapshot_network_input
+        from orbitserve.experiments.physical_dataset import input_fingerprint
+        original = json.loads((ROOT/'tests/fixtures/network/multi_shell.json').read_text())
+        shell = original['constellations']['communication_shells'][0]
+        shell.update(radio_profile='starlink_v2_mini_2024', isl_terminals=3)
+        original_snapshot = snapshot_network_input(original)
+        baseline = materialize_network_input(original)
+        shell['hardware_link_profiles'] = {'communication_isl': {
+            'islsim_config': {'tx': {'tx_power_w': .05, 'modulation_pool': [[4, 'DP-QPSK']]},
+                              'rx': {'terminal_cap_gbps': 80}}}}
+        changed_snapshot = snapshot_network_input(original)
+        changed = materialize_network_input(original)
+        name = 'comm-low__hardware__communication_isl'
+        a, b = (NetworkSpec.from_value(value['network']).link_profiles[name] for value in (baseline, changed))
+        self.assertEqual(b.islsim_config['tx']['tx_power_w'], .05)
+        self.assertEqual(b.islsim_config['rx']['terminal_cap_gbps'], 80)
+        self.assertEqual(b.bandwidth_bps, 100e9)
+        self.assertNotIn('rx_aperture_m', shell['hardware_link_profiles']['communication_isl']['islsim_config']['rx'])
+        self.assertTrue(a.attributes(1000, 0)['link_feasible'])
+        self.assertFalse(b.attributes(1000, 0)['link_feasible'])
+        self.assertNotEqual(input_fingerprint(original_snapshot), input_fingerprint(changed_snapshot))
 
     def test_direction_depends_on_both_ground_service_and_physical_transmitter(self):
         for identity in STARLINK_RADIO_PROFILES:

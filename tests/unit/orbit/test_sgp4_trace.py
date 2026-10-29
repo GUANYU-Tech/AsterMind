@@ -4,6 +4,7 @@ import unittest
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from orbitserve.orbit import (
     ASTROPY_ENGINE_VERSION,
@@ -284,21 +285,23 @@ class Sgp4OrbitTraceTests(unittest.TestCase):
         self.assertEqual(loaded.trace_model, SGP4_ORBIT_TRACE_MODEL)
 
     def test_generate_orbit_trace_rejects_invalid_gateway_contract(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with self.assertRaisesRegex(ValueError, "missing required fields"):
-                generate_orbit_trace(
-                    Path(tmpdir) / "trace",
-                    elements=_bundle(),
-                    simulation_epoch_utc="2026-07-20T00:00:00.000000Z",
-                    sample_times_s=(0.0, 60.0),
-                    ground_ingresses=(
-                        {
-                            "ingress_id": "equator",
-                            "lat_deg": 0.0,
-                        },
-                    ),
-                    isl_pairs=(),
-                )
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            self.assertRaisesRegex(ValueError, "missing required fields"),
+        ):
+            generate_orbit_trace(
+                Path(tmpdir) / "trace",
+                elements=_bundle(),
+                simulation_epoch_utc="2026-07-20T00:00:00.000000Z",
+                sample_times_s=(0.0, 60.0),
+                ground_ingresses=(
+                    {
+                        "ingress_id": "equator",
+                        "lat_deg": 0.0,
+                    },
+                ),
+                isl_pairs=(),
+            )
 
 
 if __name__ == "__main__":
@@ -324,11 +327,35 @@ class SampleHoldWindowsTests(unittest.TestCase):
 
 
 class BatchedTraceTests(unittest.TestCase):
+    def test_parallel_memory_handoff_matches_verified_files_without_batch_reads(self):
+        times = tuple(float(t) for t in range(122))
+        with tempfile.TemporaryDirectory() as folder:
+            handoff, timings = [], {}
+            with patch('orbitserve.orbit.trace.load_orbit_trace', side_effect=AssertionError('intermediate trace read')):
+                generate_orbit_trace(Path(folder)/'parallel', elements=_bundle(),
+                    simulation_epoch_utc='2026-07-20T00:00:00.000000Z',
+                    sample_times_s=times, ground_ingresses=(),
+                    isl_pairs=(('sat-00001', 'sat-00002'),), workers=2,
+                    _bundle_sink=handoff, _timings=timings)
+            loaded = load_orbit_trace(Path(folder)/'parallel/trace_manifest.json')
+            self.assertEqual(handoff, [loaded])
+            self.assertGreater(timings['position_s'], 0.)
+            self.assertGreater(timings['candidate_geometry_s'], 0.)
+            generate_orbit_trace(Path(folder)/'serial', elements=_bundle(),
+                simulation_epoch_utc='2026-07-20T00:00:00.000000Z',
+                sample_times_s=times, ground_ingresses=(),
+                isl_pairs=(('sat-00001', 'sat-00002'),), workers=1)
+            serial = load_orbit_trace(Path(folder)/'serial/trace_manifest.json')
+            self.assertEqual(loaded.trace_id, serial.trace_id)
+            self.assertEqual(loaded.ephemeris_samples, serial.ephemeris_samples)
+            self.assertEqual(loaded.isl_windows, serial.isl_windows)
+            self.assertEqual(loaded.sunlight_windows, serial.sunlight_windows)
+
     def test_time_batches_preserve_states_and_merge_windows_without_boundary_duplicates(
         self,
     ):
-        from orbitserve.orbit.sgp4.trace import _state_partition
         from orbitserve.orbit.sgp4.elements import load_sgp4_element_bundle
+        from orbitserve.orbit.sgp4.trace import _state_partition
 
         bundle = load_sgp4_element_bundle(_bundle())
         times = tuple(float(t) for t in range(122))

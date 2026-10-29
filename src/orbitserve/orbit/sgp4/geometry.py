@@ -17,7 +17,6 @@ from .frames import (
     compute_sgp4_sun_positions_itrs,
 )
 
-
 SGP4_GEOMETRY_SCHEMA = "orbitserve.sgp4_geometry.v1"
 SGP4_GEOMETRY_ALGORITHM_VERSION = "sgp4-wgs84-geometry-v1"
 SGP4_SGL_GEOMETRY_MODEL = "wgs84-geodetic-elevation-v1"
@@ -78,7 +77,7 @@ class Sgp4GroundIngress:
         )
 
     @classmethod
-    def from_value(cls, value: Mapping[str, Any] | "Sgp4GroundIngress") -> "Sgp4GroundIngress":
+    def from_value(cls, value: Mapping[str, Any] | Sgp4GroundIngress) -> Sgp4GroundIngress:
         if isinstance(value, cls):
             return value
         if not isinstance(value, Mapping):
@@ -310,10 +309,11 @@ def evaluate_sgp4_geometry(
     *,
     ground_ingresses: Sequence[Mapping[str, Any] | Sgp4GroundIngress] = (),
     isl_pairs: Sequence[Sequence[str]] = (),
-    isl_clearance_km: int | float = 0.0,
-    shadow_atmosphere_margin_km: int | float = 0.0,
+    isl_clearance_km: float = 0.0,
+    shadow_atmosphere_margin_km: float = 0.0,
     sun_positions: Sgp4SunPositionResult | None = None,
     sample_hold: bool = False,
+    _include_sunlight: bool = True,
 ) -> Sgp4GeometryResult:
     """Evaluate SGL, ISL, and sunlight geometry on a complete sample grid.
 
@@ -399,7 +399,7 @@ def evaluate_sgp4_geometry(
 
         sun_position = sun_by_time[time_s]
         sun_distance = _norm(sun_position)
-        for satellite_id in satellite_ids:
+        for satellite_id in satellite_ids if _include_sunlight else ():
             score = _sunlight_shadow_margin(
                 states[satellite_id].position_itrs_km,
                 sun_position,
@@ -612,6 +612,11 @@ def _elevation_and_range(
         return -90.0, 0.0
     sine = _dot(line, ground_up) / distance
     return math.degrees(math.asin(max(-1.0, min(1.0, sine)))), distance
+
+
+def satellite_line_of_sight(first, second, margin_km=0.0):
+    """Check a satellite pair against the same WGS84 model as Orbit traces."""
+    return _ellipsoid_segment_clearance(first, second, margin_km)[0] > 0.0
 
 
 def _ellipsoid_segment_clearance(

@@ -33,8 +33,19 @@ def association_key(state, edge, policy, time_s):
     return score, edge['distance_km'], edge['link_id']
 
 
-def select_ground_links(state, edges, time_s):
+def select_ground_links(state, edges, time_s, retained=()):
     nodes, spec = state.nodes, state.spec
+    reserved_ground, reserved_satellite, reserved_service = {}, {}, {}
+    for edge in retained:
+        ground, satellite = ground_endpoints(nodes, edge)
+        service = nodes[ground].ground_kind
+        reserved_ground[ground] = reserved_ground.get(ground, 0) + 1
+        reserved_satellite[satellite] = reserved_satellite.get(satellite, 0) + 1
+        key = satellite, service
+        reserved_service[key] = reserved_service.get(key, 0) + 1
+
+    def ground_capacity(ground):
+        return nodes[ground].sgl_terminals - reserved_ground.get(ground, 0)
 
     def choose(satellite, proposals, policy):
         node = nodes[satellite]
@@ -43,7 +54,8 @@ def select_ground_links(state, edges, time_s):
             ground, _ = ground_endpoints(nodes, edge)
             service = nodes[ground].ground_kind
             quota = getattr(node, 'max_' + service + '_links')
-            if len(accepted) < node.sgl_terminals and (quota is None or counts[service] < quota):
+            if (len(accepted) < node.sgl_terminals - reserved_satellite.get(satellite, 0)
+                and (quota is None or counts[service] + reserved_service.get((satellite,service), 0) < quota)):
                 accepted.append(edge)
                 counts[service] += 1
         return accepted
@@ -52,7 +64,7 @@ def select_ground_links(state, edges, time_s):
         accepted, ground_counts, satellite_edges = [], {}, {}
         for edge in sorted(edges, key=lambda e: association_key(state, e, spec.ground_access_policy, time_s)):
             ground, satellite = ground_endpoints(nodes, edge)
-            if ground_counts.get(ground, 0) >= nodes[ground].sgl_terminals:
+            if ground_counts.get(ground, 0) >= ground_capacity(ground):
                 continue
             previous = satellite_edges.get(satellite, [])
             chosen = choose(satellite, [*previous, edge], spec.ground_access_policy)
@@ -74,7 +86,7 @@ def select_ground_links(state, edges, time_s):
     held = {}
     while pending:
         ground = pending.popleft()
-        while counts[ground] < nodes[ground].sgl_terminals and next_choice[ground] < len(preferences[ground]):
+        while counts[ground] < ground_capacity(ground) and next_choice[ground] < len(preferences[ground]):
             edge = preferences[ground][next_choice[ground]]
             next_choice[ground] += 1
             _, satellite = ground_endpoints(nodes, edge)

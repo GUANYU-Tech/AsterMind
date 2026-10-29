@@ -83,7 +83,14 @@ def radio_parameters(node):
 
 def capacity_pools(nodes):
     return {f'radio:{n.node_id}:{name}': rate for n in nodes.values()
-            for name, rate in radio_parameters(n)['capacities_bps'].items()}
+            for name, rate in _capacity_values(n).items()}
+
+
+def _capacity_values(node):
+    # Hot routing/budget paths need numeric limits, not copied source documents.
+    values = dict(STARLINK_RADIO_PROFILES[node.radio_profile]['capacities_bps']) if node.radio_profile else {}
+    values.update(node.radio_capacity_bps)
+    return values
 
 
 def hop_pools(nodes, source, target):
@@ -91,7 +98,7 @@ def hop_pools(nodes, source, target):
     if (a.role == 'ground') == (b.role == 'ground'):
         return ()
     ground, satellite = (a, b) if a.role == 'ground' else (b, a)
-    params = radio_parameters(satellite)['capacities_bps']
+    params = _capacity_values(satellite)
     if not params and not satellite.radio_profile:
         return ()  # Existing unversioned engineering scenarios retain their inputs.
     service = 'user' if ground.ground_kind == 'user' else 'feeder'

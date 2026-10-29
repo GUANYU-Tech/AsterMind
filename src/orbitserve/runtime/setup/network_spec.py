@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -117,6 +118,9 @@ class LinkProfile:
     # Optional directional RF budget profiles; geometry/setup remain on this profile.
     uplink_profile: str | None = None
     downlink_profile: str | None = None
+    # Exact upstream TX/RX/channel parameters and source identity, frozen for reuse.
+    islsim_config: dict[str, Any] = field(default_factory=dict)
+    islsim_source_sha256: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         for key in ("bandwidth_bps", "setup_time_s"):
@@ -143,7 +147,7 @@ class LinkProfile:
         if any(a[0] >= b[0] for a, b in zip(schedule, schedule[1:])):
             raise ValueError("capacity_schedule must have strictly increasing times")
         object.__setattr__(self, "capacity_schedule", schedule)
-        if self.capacity_model not in {"fixed", "free_space_shannon", "optical_photon_budget"}:
+        if self.capacity_model not in {"fixed", "free_space_shannon", "optical_photon_budget", "islsim"}:
             raise ValueError("unsupported capacity_model")
         for key in ("transmit_gain_db", "receive_gain_db", "system_loss_db"):
             if not math.isfinite(getattr(self, key)):
@@ -188,6 +192,12 @@ class LinkProfile:
             if isinstance(values, str) or any(not isinstance(v, str) for v in values):
                 raise ValueError(f"{key} must be a sequence of strings")
             object.__setattr__(self, key, tuple(values))
+        if self.capacity_model == 'islsim':
+            from .islsim import checkout, resolve_config
+            parameters, identity = resolve_config(self.islsim_config, self.islsim_source_sha256)
+            object.__setattr__(self, 'islsim_config', parameters)
+            object.__setattr__(self, 'islsim_source_sha256', identity)
+            object.__setattr__(self, '_islsim_checkout', str(checkout()))
 
     def bandwidth_at(self, time_s: float) -> float:
         multiplier = 1.0
@@ -231,8 +241,21 @@ class NetworkSpec:
     cell_egress_policies: dict[str, str] = field(default_factory=dict)
     communication_grid_shape: tuple[int, int] | None = None
     topology_repair: str = 'none'
+    handover_policy: str = 'retain_valid'
+    cross_layer_access_policy: str = 'nearest_distance'
+    fault_timing: str = 'continuous'
+    random_faults: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        from .faults import validate_random_faults
+        if self.fault_timing not in {'boundary', 'continuous'}:
+            raise ValueError('fault_timing must be boundary or continuous')
+        validate_random_faults(self.random_faults)
+        object.__setattr__(self, 'random_faults', deepcopy(self.random_faults))
+        if self.handover_policy not in {'retain_valid','quality_first'}:
+            raise ValueError('unsupported handover_policy')
+        if self.cross_layer_access_policy not in {'nearest_distance','highest_capacity','longest_available'}:
+            raise ValueError('unsupported cross_layer_access_policy')
         if self.topology_repair not in {'none', 'ronchetti_intra_orbit'}:
             raise ValueError('unsupported topology_repair')
         if self.communication_grid_shape is not None:
@@ -261,9 +284,11 @@ class NetworkSpec:
         nodes = tuple(replace(n, cell_ingress=True)
                       if n.cell_id and self.cell_egress_policies.get(n.cell_id) == 'free' else n
                       for n in nodes)
+        from .islsim import freeze_profiles
+        profile_values = freeze_profiles({'nodes': self.nodes, 'link_profiles': self.link_profiles})['link_profiles']
         profiles = {
             k: v if isinstance(v, LinkProfile) else LinkProfile(**v)
-            for k, v in self.link_profiles.items()
+            for k, v in profile_values.items()
         }
         object.__setattr__(self, "nodes", nodes)
         object.__setattr__(self, "link_profiles", profiles)
@@ -283,7 +308,9 @@ class NetworkSpec:
         if len({n.node_id for n in nodes}) != len(nodes):
             raise ValueError("duplicate network node ID")
         for fault in self.faults:
-            if (set(fault) != {"target_type", "target_id", "start_s", "end_s"}
+            if (not {"target_type", "target_id", "start_s", "end_s"} <= set(fault)
+                or not set(fault) <= {"target_type", "target_id", "start_s", "end_s", "source"}
+                or fault.get('source', 'scheduled') not in {'scheduled', 'random', 'manual'}
                 or fault["target_type"] not in {"node", "link"}
                 or not isinstance(fault["target_id"], str)
                 or not all(math.isfinite(fault[k]) for k in ("start_s", "end_s"))

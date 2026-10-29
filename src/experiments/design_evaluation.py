@@ -6,17 +6,18 @@ import hashlib
 import json
 import math
 from dataclasses import dataclass, replace
-from typing import Any
 from pathlib import Path
+from typing import Any
 
 from orbitserve.architecture import resolve_architecture
 from orbitserve.orbit import load_orbit_trace
 from orbitserve.runtime import NetworkSpec, candidate_links, run_simulation
 from orbitserve.serving import estimate_serving_throughput
-from .network import run_network_experiment, TERMINAL_ALLOCATION_MODEL
+
+from .constellation_cost import estimate_constellation_cost
+from .network import TERMINAL_ALLOCATION_MODEL, run_network_experiment
 from .network_inputs import materialize_network_input
 from .simulation_builder import build_simulation_spec
-from .constellation_cost import estimate_constellation_cost
 
 
 @dataclass(frozen=True)
@@ -110,12 +111,13 @@ def evaluate_materialized_design(
         from .physical_dataset import reuse_dataset
         if progress:
             progress("Loading complete physical dataset (no physical recomputation)")
-        network = reuse_dataset(spec.physical_dataset, network_dir, concrete, base_dir=spec.base_dir or '.')
+        network = reuse_dataset(spec.physical_dataset, network_dir, concrete, base_dir=spec.base_dir or '.', include_exports=False)
     elif (network_dir / "network_result.json").exists():
+        from .physical_dataset import load_dataset
+        _, _, network = load_dataset(network_dir, verify_exports=False)
         stored = json.loads((network_dir / "materialized_input.json").read_text(encoding='utf-8'))
         if stored != json.loads(json.dumps(concrete)):
             raise ValueError("cached network input differs from current experiment")
-        network = json.loads((network_dir / "network_result.json").read_text())
         if network.get("provenance", {}).get("between_samples") != "sample_hold":
             raise ValueError(
                 "cached network uses obsolete interpolation semantics; choose a new output directory"
@@ -129,6 +131,7 @@ def evaluate_materialized_design(
             base_dir=spec.base_dir or ".",
             progress=progress,
             _workers=_workers,
+            export_mode='core',
         )
     if progress:
         progress("Loading sampled Orbit trace")

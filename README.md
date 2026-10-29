@@ -108,9 +108,15 @@ Communication shells have independent Walker/TLE inputs and fixed same-shell
 grid/honeycomb neighbors. Communication shells do not connect to one another.
 Compute cells have explicit physical members and fixed internal neighbors.
 Ground access and compute-to-communication access are allocated from currently
-eligible candidates under terminal limits and acquisition delays. Existing
-non-ground connections are retained while eligible; ground access can select the
-nearest or longest-available candidate. Fixed neighbors do not guarantee physical
+eligible candidates under terminal limits and acquisition delays.
+`network.handover_policy` selects `retain_valid` (default: keep eligible contacts
+and fill free ports) or `quality_first` (rerank dynamic contacts at each boundary).
+A retained winner keeps its original acquisition clock; a new target always pays
+its configured setup delay. Fixed ISL neighbors do not change with this policy.
+Ground matching uses its configured ground/satellite preferences;
+`cross_layer_access_policy` selects `nearest_distance` (default),
+`highest_capacity` (the effective two-direction bottleneck) or `longest_available`.
+These are physical rankings, without Runtime traffic-load prediction. Fixed neighbors do not guarantee physical
 availability: visibility, range and Sun constraints still apply.
 
 The production network trace holds positions and environment-derived link
@@ -131,6 +137,19 @@ the self-contained materialized input, Orbit/environment trace, every sampled
 node position and candidate link, directional budgets, link events and the
 initial causal acquisition timeline. `physical_state.sqlite` stores compressed,
 indexed attribute blocks; Runtime reads them through bounded caches.
+Small datasets (up to 64 MiB of compressed attribute payloads) are read once
+into memory. Fractional route-arrival times reuse the same physical-boundary
+cache entry, while exact capacity-schedule and contact boundaries stay distinct.
+
+After geometric screening, adaptive ground/cross-layer pairs without any contact
+in the full horizon are excluded. Future contacts remain eligible when their
+window opens. Outside geometric availability, audit records carry zero bandwidth
+and `budget_evaluated: false`; they do not fabricate a physical budget. Fixed
+ISLs retain their configured topology. Physical attributes, JSON encoding and
+compression run in bounded process chunks using the same worker budget as Orbit,
+with one SQLite writer and per-chunk progress. An incomplete database is kept
+under a temporary name and is never published as a finished dataset.
+Datasets from the previous physics version must be regenerated.
 
 Set the experiment manifest's top-level `physical_dataset` to that directory or
 its `physical_dataset.json`, relative to the experiment manifest. Runtime verifies
@@ -149,10 +168,85 @@ dataset reference still prepare physics before Runtime.
 
 The local console's first step generates this full dataset before entering the
 second step. The second step can also open directly and select a previously
-completed dataset. Configuration drafts alone cannot start Runtime. Random fault
-targets are realized in the first step; Runtime observes faults causally and may
-reallocate terminals using saved physical attributes, without recomputing orbital
-motion or link budgets or learning future faults from exported audit frames.
+completed dataset. Configuration drafts alone cannot start Runtime. Fault inputs,
+random seeds and recovery policy are Runtime choices, excluded from physical
+identity. Changing them reuses the same dataset. Runtime observes faults causally
+and reallocates terminals using saved physical attributes; it never learns future
+faults from exported audit frames. Interactive creation of an unprepared satellite
+pair evaluates that pair from saved positions without modifying the base dataset.
+
+### ISLSim link calculation
+
+New JSON network inputs default satellite-to-satellite profiles to
+`capacity_model: "islsim"`. This includes communication ISLs, compute-cell ISLs
+and cross-layer optical links. Ground/RF profiles keep their existing model.
+Explicit `"fixed"`, `"optical_photon_budget"` or `"free_space_shannon"` profiles
+opt out. Low-level callers constructing `LinkProfile` objects select the model
+explicitly; their existing fixed-capacity constructor remains supported.
+
+OrbitServe imports the external ISLSim `compute_link()` implementation without
+modifying its formulas. Set `ORBITSERVE_ISLSIM_ROOT` to its checkout directory;
+the personal console also reads `local/config/communication-modules.json`.
+`ORBITSERVE_ISLSIM_CONFIG` optionally selects a native JSON configuration.
+Otherwise ISLSim's `configs/google_constellation.json` supplies the defaults.
+A missing or mismatched external model raises an error; it never silently falls
+back to another model. Integration uses the locally available checkout; it does
+not clone, pull, push or modify the ISLSim repository.
+
+```json
+{
+  "communication_isl": {
+    "capacity_model": "islsim",
+    "bandwidth_bps": 200000000000,
+    "setup_time_s": 3
+  }
+}
+```
+
+The profile's optional `islsim_config` contains ISLSim's native `tx`, `rx` and
+`channel` objects. Partial sections override the selected native JSON defaults;
+the frozen physical input always contains the complete resolved configuration.
+The Python API receives an `FSOConfig` object plus `distance_km`, so creating or
+editing a file in the external ISLSim repository is unnecessary. Native inputs
+are separate from the legacy photon-budget fields.
+
+| Section | OrbitServe supplies to ISLSim |
+| --- | --- |
+| `tx` | `tx_power_w`, `tx_aperture_m`, `wavelength_m`, `baud_rate_ghz`, `wdm_channels`, `fec_overhead`, `dual_polarization`, `wdm_power_mode`, `modulation_pool` |
+| `rx` | `rx_aperture_m`, `preamp_gain_db`, `preamp_nf_db`, `ber_threshold`, `terminal_cap_gbps` |
+| `channel` | `link_margin_db`, `optical_efficiency` |
+| Per sample | Current endpoint separation in km |
+
+The Starlink generation presets explicitly pass their per-direction optical
+scenario ceiling to ISLSim's `rx.terminal_cap_gbps` (100 Gbps for V2 Mini and
+200 Gbps for the current V3 presets). Unpublished power, aperture and waveform
+values inherit the selected native configuration and remain editable engineering
+assumptions shared across generations, not inferred vendor measurements. Scenario
+overrides layer over generation defaults. Changing only a TX field retains the
+generation's RX settings. Optical port count and aggregate RF capacities stay in
+OrbitServe's topology/resource allocation; they are not single-link ISLSim inputs.
+
+The console offers automatic modulation from the configured candidate pool,
+fixed QPSK/8QAM/16QAM/64QAM, and a custom ordered pool. Fixed mode supplies one
+candidate; it still fails the link when the native BER condition is unmet.
+The current external implementation validates `preamp_gain_db` but does not use
+it in its high-gain SNR approximation. Wavelength affects received power, while
+the current noise approximation uses a fixed 1550 nm photon energy. These upstream
+behaviors are preserved and must not be interpreted as independent calibration.
+
+OrbitServe freezes these parameters and the external source SHA-256 identities
+in the materialized physical input. Actual capacity uses ISLSim's terminal-capped
+`total_bw_gbps`, converted to bit/s and limited by the configured per-direction
+link and endpoint ceilings. ISLSim's BER feasibility result makes an infeasible
+link DOWN; reacquisition still pays OrbitServe's configured setup delay.
+Snapshots retain native SNR, modulation, bandwidth, limiting reason and latency.
+Propagation is charged once. OrbitServe continues to own SGP4 geometry,
+visibility, acquisition, scheduling, routing and fault recovery.
+
+The physical dataset version changes with this integration. Rebuild older
+datasets before running with ISLSim; selecting another link model also requires
+matching physical data. This adapter verifies consistency with upstream results,
+not independent calibration of ISLSim's physical assumptions or formulas.
 
 Network transport is selected by `physical_network.network.transport_model`:
 
@@ -316,6 +410,18 @@ recovery. Compute TLE sources instead require `source.cell_members`, mapping
 each cell name to ordered catalog numbers; every imported satellite must appear
 exactly once. Observed per-member elements are preserved without formation offsets.
 
+Synthetic multi-row compute cells use aligned relative eccentricity/inclination
+vectors, so radial separation accompanies cross-track orbit-plane crossings.
+The requested grid is an initial layout; each member then propagates independently
+with SGP4, without a rigid offset or station-keeping controller. Initialization
+provenance identifies this as `free_sgp4_ei_separated_mean_element_offsets_v2`.
+Before link-budget preparation, a compute-only TEME pass checks pairwise clearance
+on the configured physical time grid, including the final boundary. Unsafe inputs
+fail with the cell, closest member pair, time and required separation. Full ITRS
+validation remains in place. These sampled checks do not guarantee continuous-time
+collision avoidance between boundaries. The separation design follows the
+[relative e/i-vector approach](https://www.dlr.de/en/rb/research-operation/research-projects/flight-dynamics-navigation-and-orbital-sustainability/gnss-technology-and-navigation/tandem-x-autonomous-formation-flying-experiment-taff).
+
 Each communication shell selects `topology_repair: "none"` (baseline) or
 `"ronchetti_intra_orbit"` (method1). Baseline retains Grid/Honeycomb holes.
 Method1 adds candidate links across consecutive same-orbit holes, including
@@ -375,11 +481,16 @@ Current AsterMind's uniform static network schema cannot express the full dynami
 graph; consuming exact dynamic snapshots requires an adapter on that side.
 
 Optional `network.faults` entries contain `target_type` (`link` or `node`),
-`target_id`, `start_s` and `end_s`. Runtime learns outages at their onset;
+`target_id`, `start_s` and `end_s`, with optional `source` for audit attribution.
+The default `network.fault_timing: "boundary"` requires onset and repair at
+physical sample boundaries. Runtime learns outages at their onset;
 `failure_policy: "retry_next_sample"` discards the incomplete transmission on
 the interrupted hop. Completed upstream hops remain delivered, and the sending
-node retains its buffered message. It reroutes from that current node at the next
-Orbit sample boundary, up to `max_transfer_retries`. Link and relay failures can
+node retains its buffered message. In boundary mode it immediately reroutes at
+that same boundary, up to `max_transfer_retries`; unavailable routes wait for a
+later boundary. The explicitly selected legacy `fault_timing: "continuous"`
+retains arbitrary fault times and next-sample recovery for old experiments.
+Link and relay failures can
 use alternate paths; computation-node failures terminate affected work because
 there is no model checkpoint recovery. The default policy remains `fail`.
 Cancellation logs report discarded in-flight bytes and the retained buffer owner;
@@ -387,6 +498,52 @@ recovery logs identify the current node and the bytes sent on the replacement
 route. Completed upstream hops are not retransmitted. The model uses whole-message
 store-and-forward at each hop, without TCP packet acknowledgements. If the node
 holding the only forwarding buffer fails, recovery reports that buffer loss.
+
+`network.random_faults.nodes` and `.links` independently configure `enabled`,
+integer `seed`, zero-based `start_step`, `end_step`, and `model`. Each group has
+its own random stream; changing link parameters does not alter sampled node
+failures. Legacy flat settings with `target_type` remain readable.
+
+| Model | Healthy period / onset | Outage duration |
+| --- | --- | --- |
+| `per_step` | Bernoulli `failure_probability` per healthy target per boundary | Configurable `duration` distribution |
+| `exponential` | Exponential with `mean_up_steps` | Exponential with `mean_down_steps` |
+| `weibull` | Weibull `up_scale_steps` and `up_shape`; fresh healthy age after repair | Configurable `duration` distribution |
+| `fixed_ratio` | Sample `ceil(target_count * ratio)` targets once | Prescribed `[start_step, end_step)` interval |
+
+For stochastic onset, `[start_step, end_step)` is the eligible injection window.
+Duration accepts `{"distribution":"fixed","steps":4}`,
+`{"distribution":"uniform","min_steps":2,"max_steps":6}`,
+`{"distribution":"exponential","mean_steps":4}`, or
+`{"distribution":"lognormal","mean_steps":4,"sigma":0.6}`. Lognormal
+`mean_steps` is the arithmetic mean before discretization; `sigma` is the
+standard deviation in log space. Legacy `duration_steps` means fixed duration.
+Continuous samples are rounded up to at least one step, so configured means
+refer to the distributions before rounding. A target cannot fail again on its
+repair boundary. Exponential/Weibull healthy periods start at the window's first
+boundary and restart after each repair; independent components are assumed.
+Weibull shape below/at/above 1 means decreasing/constant/increasing healthy-age
+hazard, rather than an assumption of cumulative unrepaired hardware aging.
+
+Explicit intervals and bounded-duration configurations must fit within the
+horizon. Unbounded repair samples may exceed it: the sampled recovery time is
+preserved and actual onset logs mark `right_censored: true`; no repair is
+invented at simulation end and no sample is shortened or redrawn. For example,
+onset at step 3 with duration 4 repairs at step 7 and lasts `4 * step_s` seconds.
+Probabilities are per step, not per second; use `p = 1 - exp(-rate_per_second *
+step_s)` when converting a constant hazard. These are component UP/DOWN models;
+packet error probabilities and Sun-exclusion geometry are separate mechanisms.
+Random targets are realized by Runtime and remain hidden from route forecasting
+until observation. Actual outcomes are retained in provenance and execution logs;
+actual fault events include start/end step, duration in steps and seconds.
+
+The optional `runtime_control(controller)` context binds an in-process controller
+to one experiment thread. It pauses at boundaries after scheduled faults and
+physical changes, before business events. Commands execute on the engine thread.
+Manual faults and administrative disconnections persist independently; restoring
+a manual fault does not clear a simultaneous random or scheduled outage. The
+local console uses this hook for its event-timeline workspace. It performs
+authoritative physical/terminal checks before publishing connection changes.
 When the failed hop is the initial ground upload, recovery reselects an available
 access satellite while retaining the chosen compute destination. A ready backup
 requires a separate allocated ground/space terminal; acquisition delays still
@@ -415,6 +572,15 @@ python3 -m orbitserve.architecture.single_satellite_cost.cli \
   examples/single_satellite/h200_gpu_derived.json \
   --out results/single_satellite/h200_gpu_derived.json
 ```
+
+## Physical data preparation
+
+Physical preparation can publish a compact, reusable core independently of full
+JSON snapshots and exchange exports. Combined experiments use the core directly;
+standalone callers retain the full-export default. Parallel exports support
+bounded time chunks and selectable compression levels. See
+[physical data and optional exports](src/experiments/PHYSICAL_DATA.md) for commands, layout,
+integrity checks and compatibility with existing data.
 
 ## Tests
 

@@ -35,7 +35,7 @@ class SimGridTransport:
     worker_module = 'orbitserve.runtime.engine.simgrid_worker'
     check_available = staticmethod(require_simgrid)
 
-    def __init__(self, nodes, edges, profiles):
+    def __init__(self, nodes, edges, profiles, *, start_s=0.0):
         self.check_available()
         if not isinstance(nodes, dict):
             from ..setup.network_spec import NetworkNodeSpec
@@ -45,6 +45,8 @@ class SimGridTransport:
             hop_pools(nodes, edge['endpoint_a'], edge['endpoint_b'])
             hop_pools(nodes, edge['endpoint_b'], edge['endpoint_a'])
         self.now = 0.0
+        self.nodes, self.edges, self.profiles = nodes, tuple(edges), profiles
+        self.configured_capacities = {}
         self.active = {}
         self.resources = {}
         self.closed = False
@@ -102,7 +104,7 @@ class SimGridTransport:
                 )
                 links[-1]['bandwidth_bps'] = directional_profile(nodes, profiles, edge, source).bandwidth_bps
         try:
-            ready = self._request({"nodes": sorted(nodes), "links": links, 'pools': capacity_pools(nodes)})
+            ready = self._request({"nodes": sorted(nodes), "links": links, 'pools': capacity_pools(nodes), 'start_s': start_s})
             if not ready.get("ready"):
                 raise SimGridUnavailable("SimGrid worker did not initialize")
             self.provenance = {
@@ -151,6 +153,24 @@ class SimGridTransport:
             raise ValueError("SimGrid capacities must be finite nonnegative bits/s")
         if capacities:
             self._request({"op": "configure", "capacities": capacities})
+            self.configured_capacities.update(capacities)
+
+    def register_edge(self, edge):
+        """SimGrid seals platforms: rebuild at this causal boundary, retaining work."""
+        remaining = self._request({'op': 'remaining'})['remaining']
+        replacement = type(self)(self.nodes, (*self.edges, edge), self.profiles, start_s=self.now)
+        try:
+            replacement.configure(self.configured_capacities)
+            for identity, row in self.active.items():
+                replacement.start(identity, row['leg'], remaining[identity])
+            # Zero capacity is represented by suspended activities, so apply it
+            # again after restoring activities at exactly the same native time.
+            replacement.configure(self.configured_capacities)
+        except BaseException:
+            replacement.close(force=True)
+            raise
+        self.close()
+        self.__dict__.update(replacement.__dict__)
 
     def start(self, identity, leg, payload_bytes):
         if not math.isfinite(payload_bytes) or payload_bytes <= 0:

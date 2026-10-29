@@ -17,7 +17,7 @@ def access_network(**kwargs):
     spec = NetworkSpec((NetworkNodeSpec('a', 'communication', sgl_terminals=1),
                         NetworkNodeSpec('b', 'communication', sgl_terminals=1),
                         NetworkNodeSpec('g', 'ground', sgl_terminals=1)),
-                       {'sgl': LinkProfile(8000, .4)}, communication_topology='explicit', **kwargs)
+                       {'sgl': LinkProfile(8000, .4)}, communication_topology='explicit', fault_timing='continuous', **kwargs)
     return NetworkState(trace, spec, ({'ingress_id': 'g', 'lat_deg': 0., 'lon_deg': 0.},))
 
 
@@ -37,19 +37,18 @@ class FaultAllocationTests(unittest.TestCase):
         self.assertEqual(audited.link_at('sgl:a:g', 1.)['state'], 'UP')
         self.assertEqual(audited.link_at('sgl:b:g', 3.)['state'], 'UP')
 
-    def test_single_terminal_is_released_and_backup_reacquires_at_next_sample(self):
-        state = access_network()
+    def test_single_terminal_is_released_and_backup_reacquires_when_observed(self):
+        state = access_network(handover_policy='quality_first')
         fault = dict(target_type='link', target_id='sgl:a:g', start_s=1.25, end_s=5.4)
         state.observe_fault(0, fault, 1.25)
         self.assertEqual(state.link_at('sgl:a:g', 1.25)['state'], 'DOWN')
-        self.assertEqual(state.link_at('sgl:b:g', 1.25)['state'], 'DOWN')
-        setup = state.link_at('sgl:b:g', 2.)
+        setup = state.link_at('sgl:b:g', 1.25)
         self.assertEqual(setup['state'], 'SETTING_UP')
-        self.assertEqual(setup['setup_start_s'], 2.)
-        self.assertEqual(setup['ready_s'], 2.4)
+        self.assertEqual(setup['setup_start_s'], 1.25)
+        self.assertEqual(setup['ready_s'], 1.65)
         arrival, path = state.transfer('g', 'b', 2., 1000)
-        self.assertAlmostEqual(path[0]['start_s'], 2.4)
-        self.assertGreater(arrival, 3.4)
+        self.assertAlmostEqual(path[0]['start_s'], 2.)
+        self.assertGreater(arrival, 3.)
         # Repair has not been observed; its configured end must not help forecasts.
         with self.assertRaises(NetworkUnavailable):
             state.transfer('g', 'a', 5.5, 10)
@@ -57,6 +56,16 @@ class FaultAllocationTests(unittest.TestCase):
         renewed = state.link_at('sgl:a:g', 6.)
         self.assertEqual(renewed['setup_start_s'], 6.)
         self.assertEqual(renewed['ready_s'], 6.4)
+
+    def test_repair_keeps_backup_until_policy_allows_a_new_selection(self):
+        for policy in ('retain_valid','quality_first'):
+            state=access_network(handover_policy=policy)
+            fault=dict(target_type='link',target_id='sgl:a:g',start_s=1.25,end_s=5.4)
+            state.observe_fault(0,fault,1.25)
+            state.observe_fault(0,fault,5.4,restored=True)
+            self.assertEqual(state.link_at('sgl:b:g',5.5)['state'],'UP')
+            selected=state.link_at('sgl:b:g' if policy=='retain_valid' else 'sgl:a:g',6.)
+            self.assertEqual(selected['setup_start_s'],1.25 if policy=='retain_valid' else 6.)
 
     def test_overlap_node_failure_and_prediction_fork_do_not_release_live_state(self):
         state = access_network()
@@ -68,7 +77,7 @@ class FaultAllocationTests(unittest.TestCase):
         self.assertEqual(state.link_at('sgl:b:g', 3.)['state'], 'UP')
         self.assertEqual(prediction.link_at('sgl:b:g', 3.)['state'], 'DOWN')
         prediction.observe_fault(1, second, 4.25, restored=True)
-        self.assertEqual(prediction.link_at('sgl:b:g', 5.)['setup_start_s'], 5.)
+        self.assertEqual(prediction.link_at('sgl:b:g', 5.)['setup_start_s'], 4.25)
 
 
 class RadioCapacityTests(unittest.TestCase):

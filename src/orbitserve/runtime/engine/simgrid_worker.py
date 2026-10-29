@@ -59,6 +59,8 @@ def main():
         )
 
     def controller():
+        if initial.get('start_s', 0) > 0:
+            sg.this_actor.sleep_until(initial['start_s'])
         emit({"ready": True, "version": version("simgrid"), "model": "CM02"})
         while line := sys.stdin.readline():
             command = json.loads(line)
@@ -70,7 +72,9 @@ def main():
                     active.clear()
                     emit({"closed": True})
                     return
-                if op == "start":
+                if op == 'remaining':
+                    emit({'remaining': {identity: row['comm'].remaining / BYTE_SCALE for identity, row in active.items()}})
+                elif op == "start":
                     comm = sg.Comm.sendto_async(
                         hosts[command["source"]],
                         hosts[command["target"]],

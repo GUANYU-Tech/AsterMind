@@ -43,6 +43,7 @@ def network(
         tuple(NetworkNodeSpec(n, "compute", terminals) for n in ids),
         {"communication_isl": LinkProfile(bandwidth, setup, limit, schedule)},
         communication_topology="explicit",
+        fault_timing="continuous",  # Legacy continuous-time regression fixture.
         explicit_pairs=tuple(sorted({tuple(sorted((a, b))) for a, b, _, _ in edges})),
     )
     rows = []
