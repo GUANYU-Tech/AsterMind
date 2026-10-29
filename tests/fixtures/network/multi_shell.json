@@ -52,6 +52,7 @@
   "network": {
     "link_profiles": {
       "communication_isl": {
+        "capacity_model": "fixed",
         "bandwidth_bps": 10000000000.0,
         "setup_time_s": 3.0,
         "max_distance_km": 6000.0,
@@ -67,11 +68,13 @@
         ]
       },
       "cell_isl": {
+        "capacity_model": "fixed",
         "bandwidth_bps": 100000000000.0,
         "setup_time_s": 1.0,
         "max_distance_km": 10.0
       },
       "cross_layer": {
+        "capacity_model": "fixed",
         "bandwidth_bps": 10000000000.0,
         "setup_time_s": 5.0,
         "max_distance_km": 4000.0

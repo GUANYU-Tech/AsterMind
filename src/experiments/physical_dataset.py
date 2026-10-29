@@ -20,8 +20,8 @@ def input_fingerprint(concrete, *, legacy=False):
         value.get('network', {}).pop('transport_model', None)
     else:
         from orbitserve.runtime import physical_network_settings, freeze_network_profiles
-        # Raw inputs omitting the default model and already-frozen inputs must
-        # identify the same physics, including upstream parameters/source hashes.
+        # Configuration fingerprinting remains portable. Actual local preparation
+        # includes the external implementation hashes in its frozen input.
         value['network'] = physical_network_settings(freeze_network_profiles(value.get('network', {})))
     value.pop("route_probes", None)
     return hashlib.sha256(
@@ -183,7 +183,7 @@ def reuse_dataset(reference, destination, concrete, *, base_dir=".", include_exp
 
 def validate_dataset_input(reference, physical, base_dir="."):
     root, manifest, result = load_dataset(Path(base_dir) / reference, verify_exports=False)
-    requested = input_fingerprint(snapshot_network_input(physical, base_dir))
+    requested = input_fingerprint(snapshot_network_input(physical, base_dir, bind_islsim=True))
     if requested not in {manifest.get("source_sha256"), manifest["input_sha256"]}:
         stored = json.loads((root / 'materialized_input.json').read_text(encoding='utf-8'))
         if requested != input_fingerprint(stored):

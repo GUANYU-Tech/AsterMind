@@ -175,7 +175,7 @@ and reallocates terminals using saved physical attributes; it never learns futur
 faults from exported audit frames. Interactive creation of an unprepared satellite
 pair evaluates that pair from saved positions without modifying the base dataset.
 
-### ISLSim link calculation
+### ISLSim configuration and local link calculation
 
 New JSON network inputs default satellite-to-satellite profiles to
 `capacity_model: "islsim"`. This includes communication ISLs, compute-cell ISLs
@@ -184,11 +184,28 @@ Explicit `"fixed"`, `"optical_photon_budget"` or `"free_space_shannon"` profiles
 opt out. Low-level callers constructing `LinkProfile` objects select the model
 explicitly; their existing fixed-capacity constructor remains supported.
 
-OrbitServe imports the external ISLSim `compute_link()` implementation without
+Configuration generation does not import or invoke ISLSim and does not read a
+personal checkout or `local/` settings. Export a complete native JSON input with
+OrbitServe's explicit scenario defaults and optional partial parameters:
+
+```bash
+python3 -m orbitserve.experiments.islsim_cli --out results/islsim.json
+python3 -m orbitserve.experiments.islsim_cli --input profile.json --out results/islsim.json
+```
+
+`profile.json` may contain native `tx`/`rx`/`channel` sections or a link profile's
+`islsim_config`. `prepare_islsim_config()` provides the same portable validation
+and export contract. Repository CI tests this contract without an ISLSim checkout
+or cross-repository credentials. The bundled examples explicitly select fixed
+link capacities so they run independently of the external optical model.
+
+Local physical calculations import the external ISLSim `compute_link()` without
 modifying its formulas. Set `ORBITSERVE_ISLSIM_ROOT` to its checkout directory;
 the personal console also reads `local/config/communication-modules.json`.
 `ORBITSERVE_ISLSIM_CONFIG` optionally selects a native JSON configuration.
-Otherwise ISLSim's `configs/google_constellation.json` supplies the defaults.
+The local `resolve_islsim_config()` helper can read the selected native JSON
+(otherwise `configs/google_constellation.json`) and return parameters to place
+in a profile before generating its portable input.
 A missing or mismatched external model raises an error; it never silently falls
 back to another model. Integration uses the locally available checkout; it does
 not clone, pull, push or modify the ISLSim repository.
@@ -204,7 +221,7 @@ not clone, pull, push or modify the ISLSim repository.
 ```
 
 The profile's optional `islsim_config` contains ISLSim's native `tx`, `rx` and
-`channel` objects. Partial sections override the selected native JSON defaults;
+`channel` objects. Partial sections override OrbitServe's portable input defaults;
 the frozen physical input always contains the complete resolved configuration.
 The Python API receives an `FSOConfig` object plus `distance_km`, so creating or
 editing a file in the external ISLSim repository is unnecessary. Native inputs
@@ -220,7 +237,7 @@ are separate from the legacy photon-budget fields.
 The Starlink generation presets explicitly pass their per-direction optical
 scenario ceiling to ISLSim's `rx.terminal_cap_gbps` (100 Gbps for V2 Mini and
 200 Gbps for the current V3 presets). Unpublished power, aperture and waveform
-values inherit the selected native configuration and remain editable engineering
+values use explicit base parameters or OrbitServe's portable defaults and remain editable engineering
 assumptions shared across generations, not inferred vendor measurements. Scenario
 overrides layer over generation defaults. Changing only a TX field retains the
 generation's RX settings. Optical port count and aggregate RF capacities stay in
@@ -258,7 +275,10 @@ Network transport is selected by `physical_network.network.transport_model`:
 | `ns3` | Real ns-3 point-to-point serialization with 1400-byte payload packets, 2-byte PPP overhead and packet round-robin admission. |
 
 Install ns-3 separately with `python3 -m pip install ".[ns3]"` on a supported
-platform. It uses a 1 ps native clock and lazy directed
+platform, with a C++20 compiler available (`sudo apt-get install build-essential`
+on Ubuntu, or set `CXX`). Each worker compiles a small temporary adapter against
+the installed ns-3 headers and libraries, avoiding cppyy JIT initialization traps.
+It uses a 1 ps native clock and lazy directed
 point-to-point resources. Capacity changes apply at the next packet boundary.
 Logical payloads retain microbyte precision; the native wire packet pads its last
 payload to an integer byte and adds the 2-byte PPP header. Padding is not counted
@@ -603,6 +623,17 @@ python3 -m unittest tests.unit.runtime.test_radio_capacity \
 ```
 
 `tests/slow/` contains physical-network Runtime, prefill/decode concurrency and strategy-matrix tests. Full validation must include this suite; routine development may run the first three suites separately.
+
+Real ISLSim invocation is an additional local integration suite, separate from
+the four CI suites. With a local checkout and the native backends installed, run:
+
+```bash
+ORBITSERVE_ISLSIM_ROOT=/path/to/ISLSim python3 -m unittest discover -s tests/external/islsim -v
+```
+
+The local suite verifies that generated inputs are accepted by the actual model
+and checks its results, source identity and Runtime integration. A missing model
+fails this explicit local command; there is no substitute calculation.
 
 The network acceptance case loads one canonical workload bundle and reuses one
 real SGP4 trace from a small synthetic constellation across three routing policies and four

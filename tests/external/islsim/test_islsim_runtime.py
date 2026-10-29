@@ -47,19 +47,22 @@ class ISLSimRuntimeTests(unittest.TestCase):
 
     def test_default_experiment_freezes_native_input_and_rejects_other_model_dataset(self):
         original = manifest()
+        original['network']['link_profiles']['cross_layer'].pop('capacity_model')
         frozen = snapshot_network_input(original)
         p = frozen['network']['link_profiles']['cross_layer']
         self.assertEqual(p['capacity_model'], 'islsim')
         self.assertEqual(set(p['islsim_config']), {'tx', 'rx', 'channel'})
-        self.assertEqual(set(p['islsim_source_sha256']), {'config.py', 'link_model.py', 'validator.py'})
+        self.assertEqual(p['islsim_source_sha256'], {})
         self.assertNotIn('capacity_model', original['network']['link_profiles']['cross_layer'])
         with tempfile.TemporaryDirectory() as folder:
             result = run_network_experiment(original, folder, _workers=1, export_mode='core')
             self.assertTrue(result['checks']['passed'])
             saved = json.loads((Path(folder) / 'materialized_input.json').read_text())
             self.assertEqual(saved['network']['link_profiles']['cross_layer']['islsim_config'], p['islsim_config'])
+            self.assertEqual(set(saved['network']['link_profiles']['cross_layer']['islsim_source_sha256']),
+                             {'config.py', 'link_model.py', 'validator.py'})
             load_dataset(folder, saved)
-            changed = snapshot_network_input(original)
+            changed = snapshot_network_input(original, bind_islsim=True)
             changed['network']['link_profiles']['cross_layer']['capacity_model'] = 'fixed'
             self.assertNotEqual(input_fingerprint(changed), input_fingerprint(frozen))
             with self.assertRaises(ValueError):

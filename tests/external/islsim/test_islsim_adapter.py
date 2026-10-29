@@ -25,10 +25,16 @@ class ISLSimAdapterTests(unittest.TestCase):
             for path, value in zip(files, (first, second)):
                 path.write_text(json.dumps(value))
             with patch.dict('os.environ', ORBITSERVE_ISLSIM_CONFIG=str(files[0])):
-                a = LinkProfile(1e12, 0, capacity_model='islsim')
+                parameters, identity = islsim.resolve_config()
+                a = LinkProfile(1e12, 0, capacity_model='islsim', islsim_config=parameters,
+                                islsim_source_sha256=identity)
             with patch.dict('os.environ', ORBITSERVE_ISLSIM_CONFIG=str(files[1])):
-                b = LinkProfile(1e12, 0, capacity_model='islsim')
-                explicit = replace(b, islsim_config={'tx': {'tx_power_w': first['tx']['tx_power_w']}})
+                parameters, identity = islsim.resolve_config()
+                b = LinkProfile(1e12, 0, capacity_model='islsim', islsim_config=parameters,
+                                islsim_source_sha256=identity)
+                explicit_parameters = deepcopy(parameters)
+                explicit_parameters['tx']['tx_power_w'] = first['tx']['tx_power_w']
+                explicit = replace(b, islsim_config=explicit_parameters)
             aa, bb = a.attributes(1000, 0), b.attributes(1000, 0)
             self.assertGreater(aa['received_power_w'], bb['received_power_w'])
             self.assertGreater(aa['snr_db'], bb['snr_db'])
@@ -37,7 +43,7 @@ class ISLSimAdapterTests(unittest.TestCase):
             # A frozen input must not depend on a later default-file selection.
             with patch.dict('os.environ', ORBITSERVE_ISLSIM_CONFIG=str(Path(directory) / 'missing.json')):
                 self.assertEqual(replace(a).attributes(1000, 0), aa)
-            self.assertEqual(a.islsim_source_sha256, identity)
+            self.assertEqual(aa['islsim_source_sha256'], identity)
             self.assertEqual(json.loads(files[1].read_text()), second)
 
     def test_fixed_and_automatic_modulation_use_allowed_native_candidates(self):
@@ -87,13 +93,14 @@ class ISLSimAdapterTests(unittest.TestCase):
     def test_missing_or_different_upstream_fails_without_fallback(self):
         with patch.dict('os.environ', ORBITSERVE_ISLSIM_ROOT='/nonexistent/orbitserve-islsim'):
             with self.assertRaises(islsim.ISLSimUnavailable):
-                LinkProfile(1e12, 0, capacity_model='islsim')
+                LinkProfile(1e12, 0, capacity_model='islsim').attributes(1000, 0)
             self.assertEqual(LinkProfile(8000, 0).attributes(1000, 0)['bandwidth_bps'], 8000)
         p = LinkProfile(1e12, 0, capacity_model='islsim')
+        p.attributes(1000, 0)
         with patch.dict('os.environ', ORBITSERVE_ISLSIM_ROOT='/nonexistent/changed-after-binding'):
             self.assertEqual(p.attributes(1000, 0)['capacity_model'], 'islsim')
         with self.assertRaises(islsim.ISLSimUnavailable):
-            replace(p, islsim_source_sha256={'config.py': 'incorrect'})
+            replace(p, islsim_source_sha256={'config.py': 'incorrect'}).attributes(1000, 0)
 
     def test_native_parameters_roundtrip_and_capacity_schedule(self):
         p = LinkProfile(250e9, 0, capacity_model='islsim', capacity_schedule=((1.25, .5),))

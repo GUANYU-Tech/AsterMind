@@ -40,7 +40,7 @@ def manifest():
             ],
             "communication_topology": "explicit",
             "link_profiles": {
-                "cross_layer": {"bandwidth_bps": 1e9, "setup_time_s": 2.0},
+                "cross_layer": {"capacity_model": "fixed", "bandwidth_bps": 1e9, "setup_time_s": 2.0},
                 "sgl": {
                     "bandwidth_bps": 1e9,
                     "setup_time_s": 2.0,

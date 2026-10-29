@@ -50,7 +50,7 @@ def run_network_experiment(
     report("Materializing physical nodes")
     from .network_inputs import materialize_network_input, snapshot_network_input
 
-    source_input = snapshot_network_input(manifest, base_dir)
+    source_input = snapshot_network_input(manifest, base_dir, bind_islsim=True)
     manifest = materialize_network_input(source_input, base_dir)
     unknown = set(manifest) - {
         "schema_version",

@@ -28,7 +28,7 @@ def _hardware_profiles(defaults, overrides):
     return result
 
 
-def snapshot_network_input(manifest, base_dir="."):
+def snapshot_network_input(manifest, base_dir=".", *, bind_islsim=False):
     """Resolve source files without running constellation or orbit calculations."""
     result = deepcopy(manifest)
     if isinstance(result.get('elements'), str):
@@ -41,16 +41,17 @@ def snapshot_network_input(manifest, base_dir="."):
                 source['tle_text'] = (Path(base_dir) / source.pop('tle_file')).read_text(encoding='utf-8')
     from orbitserve.runtime import freeze_network_profiles
     if 'network' in result:
-        result['network'] = freeze_network_profiles(result['network'])
-    # Include generated hardware defaults in the source identity as well, so a
-    # different ISLSim source/config cannot reuse a dataset through source_sha256.
+        result['network'] = freeze_network_profiles(result['network'], bind_islsim=bind_islsim)
+    # Include generated hardware parameters in the input identity. Only local
+    # physical preparation requests bind_islsim and attaches implementation hashes.
     from orbitserve.runtime import STARLINK_RADIO_PROFILES
     for shell in result.get('constellations', {}).get('communication_shells', ()):
         defaults = STARLINK_RADIO_PROFILES.get(shell.get('radio_profile'), {}).get('simulation_defaults', {})
         profiles = _hardware_profiles(defaults.get('hardware_link_profiles', {}),
                                       shell.get('hardware_link_profiles', {}))
         if profiles:
-            shell['hardware_link_profiles'] = freeze_network_profiles({'link_profiles': profiles})['link_profiles']
+            shell['hardware_link_profiles'] = freeze_network_profiles(
+                {'link_profiles': profiles}, bind_islsim=bind_islsim)['link_profiles']
     return result
 
 

@@ -118,7 +118,7 @@ class LinkProfile:
     # Optional directional RF budget profiles; geometry/setup remain on this profile.
     uplink_profile: str | None = None
     downlink_profile: str | None = None
-    # Exact upstream TX/RX/channel parameters and source identity, frozen for reuse.
+    # Portable TX/RX/channel input; local physical preparation binds source hashes.
     islsim_config: dict[str, Any] = field(default_factory=dict)
     islsim_source_sha256: dict[str, str] = field(default_factory=dict)
 
@@ -193,11 +193,10 @@ class LinkProfile:
                 raise ValueError(f"{key} must be a sequence of strings")
             object.__setattr__(self, key, tuple(values))
         if self.capacity_model == 'islsim':
-            from .islsim import checkout, resolve_config
-            parameters, identity = resolve_config(self.islsim_config, self.islsim_source_sha256)
-            object.__setattr__(self, 'islsim_config', parameters)
-            object.__setattr__(self, 'islsim_source_sha256', identity)
-            object.__setattr__(self, '_islsim_checkout', str(checkout()))
+            from .islsim_config import prepare_config
+            object.__setattr__(self, 'islsim_config', prepare_config(self.islsim_config))
+            object.__setattr__(self, 'islsim_source_sha256', dict(self.islsim_source_sha256))
+            object.__setattr__(self, '_islsim_binding', None)
 
     def bandwidth_at(self, time_s: float) -> float:
         multiplier = 1.0

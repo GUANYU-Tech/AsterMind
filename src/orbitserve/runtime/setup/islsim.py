@@ -154,10 +154,13 @@ def _configuration(location, identity, serialized):
 def calculate(profile, distance_km):
     if not math.isfinite(distance_km) or distance_km <= 0:
         raise ValueError('ISLSim requires a finite positive link distance')
-    # Source identity is verified when the immutable LinkProfile is constructed.
-    # Hot per-sample calls reuse that binding instead of rereading source files.
-    root = Path(profile._islsim_checkout)
-    identity = profile.islsim_source_sha256
+    # Configuration construction is portable. Only an actual local calculation
+    # binds the external implementation, then reuses that immutable binding.
+    with _LOCK:
+        if profile._islsim_binding is None:
+            root, identity, _ = _api(profile.islsim_source_sha256)
+            object.__setattr__(profile, '_islsim_binding', (root, identity))
+        root, identity = profile._islsim_binding
     _, model, _ = _modules(str(root), tuple(sorted(identity.items())))
     cfg = _configuration(str(root), tuple(sorted(identity.items())),
                          json.dumps(profile.islsim_config, sort_keys=True, allow_nan=False))
@@ -181,7 +184,7 @@ def calculate(profile, distance_km):
                 receiver_model='external_islsim_unmodified')
 
 
-def freeze_profiles(network):
+def freeze_profiles(network, *, bind_islsim=False):
     """Default user-facing ISLs to ISLSim; preserve explicitly selected models."""
     value = deepcopy(network)
     profiles = value.get('link_profiles', {})
@@ -197,6 +200,10 @@ def freeze_profiles(network):
             continue  # Explicit low-level LinkProfile objects retain their selected model.
         profile.setdefault('capacity_model', 'fixed' if name in gsl else 'islsim')
         if profile['capacity_model'] == 'islsim':
-            profile['islsim_config'], profile['islsim_source_sha256'] = resolve_config(
-                profile.get('islsim_config'), profile.get('islsim_source_sha256'))
+            from .islsim_config import prepare_config
+            profile['islsim_config'] = prepare_config(profile.get('islsim_config'))
+            profile.setdefault('islsim_source_sha256', {})
+            if bind_islsim:
+                profile['islsim_config'], profile['islsim_source_sha256'] = resolve_config(
+                    profile['islsim_config'], profile.get('islsim_source_sha256'))
     return value

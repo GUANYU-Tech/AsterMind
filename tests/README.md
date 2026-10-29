@@ -20,6 +20,16 @@ The causal workload contract checks use `unittest.TestCase` so they are collecte
 by the same full-suite command and do not depend on pytest.
 CI runs `.github/scripts/run_native_tests.py`, whose guarded file entry point
 supports the orbit pipeline's `spawn` workers and rejects skipped tests.
+The ns-3 worker compiles its adapter with C++20 against the wheel's libraries;
+local runs require a compiler on `PATH` or selected through `CXX`.
+
+ISLSim is a separate local integration boundary. The CI suites generate and
+validate native JSON parameters without importing ISLSim, and their simulation
+fixtures explicitly choose self-contained capacity models. CI does not clone the
+ISLSim private repository or need its credentials. `tests/external/islsim/` keeps
+the real-model integration checks outside default discovery; run them locally
+with `ORBITSERVE_ISLSIM_ROOT=/path/to/ISLSim python -m unittest discover -s tests/external/islsim -v`.
+Those tests exercise the real model, including native SimGrid/ns3 Runtime paths.
 
 ## Preserved behavior during the physical-network migration
 

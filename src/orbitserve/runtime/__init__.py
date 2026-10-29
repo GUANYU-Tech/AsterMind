@@ -11,12 +11,14 @@ from .setup.radio_capacity import STARLINK_RADIO_PROFILES
 from .setup.simulation_spec import RuntimeSimulationSpec
 from .setup.faults import RUNTIME_NETWORK_FIELDS, physical_network_settings
 from .setup.islsim import freeze_profiles as freeze_network_profiles, resolve_config as resolve_islsim_config
+from .setup.islsim_config import prepare_config as prepare_islsim_config
 from .setup.sun_geometry import SUN_GEOMETRY_VERSION
 from .setup.network_geometry import sun_positions_from_trace
 from .state.network import NetworkState, NetworkUnavailable
 
 __all__ = [
     "freeze_network_profiles",
+    "prepare_islsim_config",
     "resolve_islsim_config",
     "SUN_GEOMETRY_VERSION",
     "sun_positions_from_trace",

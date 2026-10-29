@@ -1,7 +1,9 @@
 import importlib.util
+import os
 import unittest
 from types import SimpleNamespace
-from orbitserve.runtime.engine.ns3_transport import Ns3Transport
+from unittest.mock import patch
+from orbitserve.runtime.engine.ns3_transport import Ns3Transport, Ns3Unavailable
 
 
 @unittest.skipUnless(importlib.util.find_spec('ns'), 'Install OrbitServe[ns3] for native ns-3 checks')
@@ -53,3 +55,18 @@ class NativeNs3Tests(unittest.TestCase):
         self.assertEqual(done['completed'], ['fraction'])
         self.assertAlmostEqual(done['bytes_sent']['fraction'], 10.25)
         self.assertAlmostEqual(done['time_s'], 13e-6, places=10)  # ceil(10.25) + 2 PPP
+
+    def test_native_exception_preserves_worker_and_unicode_flow_identity(self):
+        with self.assertRaisesRegex(Ns3Unavailable, 'map::at'):
+            self.engine._request({'op': 'cancel', 'ids': ['missing']})
+        with self.assertRaisesRegex(Ns3Unavailable, 'must not contain NUL'):
+            self.engine.start('invalid\0identity', self.leg, 10.25)
+        self.engine.start('数据流', self.leg, 10.25)
+        done = self.engine.advance_until(.01)
+        self.assertEqual(done['completed'], ['数据流'])
+        self.assertAlmostEqual(done['bytes_sent']['数据流'], 10.25)
+
+    def test_missing_compiler_reports_required_dependency(self):
+        with patch.dict(os.environ, {'CXX': '/nonexistent/orbitserve-cxx'}):
+            with self.assertRaisesRegex(Ns3Unavailable, 'requires a C\\+\\+ compiler'):
+                Ns3Transport(('a', 'b'), [], {})

@@ -3,9 +3,16 @@
 OrbitServe chooses hops and accounts for propagation. This adapter deliberately
 models packet arbitration, not TCP congestion control or IP route discovery.
 """
+import ctypes
 import json
+import os
+import shlex
+import shutil
+import subprocess
 import sys
+import tempfile
 from importlib.metadata import distribution, version
+from pathlib import Path
 
 NATIVE = r'''
 #include "ns3/core-module.h"
@@ -116,36 +123,146 @@ class Engine {
 }
 '''
 
+BRIDGE = r'''
+namespace {
+thread_local std::string lastError;
+template<class F> int checked(F action) {
+    try { action(); lastError.clear(); return 0; }
+    catch(const std::exception& error) { lastError=error.what(); return -1; }
+    catch(...) { lastError="Unknown native ns-3 error"; return -1; }
+}
+using Engine=orbitserve_ns3::Engine;
+}
+extern "C" {
+const char* os_error() {return lastError.c_str();}
+void* os_create() {
+    Engine* engine=nullptr;
+    checked([&](){engine=new Engine();});
+    return engine;
+}
+int os_close(Engine* e) {return checked([&](){ns3::Simulator::Destroy();delete e;});}
+int os_now(Engine* e,double* value) {return checked([&](){*value=e->now();});}
+int os_link(Engine* e,const char* key) {return checked([&](){e->link(key);});}
+int os_configure(Engine* e,const char* key,double rate) {return checked([&](){e->configure(key,rate);});}
+int os_addPool(Engine* e,const char* key,double rate) {return checked([&](){e->addPool(key,rate);});}
+int os_attachPool(Engine* e,const char* key,const char* pool) {return checked([&](){e->attachPool(key,pool);});}
+int os_start(Engine* e,const char* id,const char* key,double bytes) {return checked([&](){e->start(id,key,bytes);});}
+int os_cancel(Engine* e,const char* id) {return checked([&](){e->cancel(id);});}
+int os_advance(Engine* e,double target) {return checked([&](){e->advance(target);});}
+int os_progress(Engine* e,const char* id,double* value) {return checked([&](){*value=e->progress(id);});}
+size_t os_completedCount(Engine* e) {return e->completed.size();}
+const char* os_completedAt(Engine* e,size_t i) {return e->completed.at(i).c_str();}
+int os_clearCompleted(Engine* e) {e->completed.clear();return 0;}
+}
+'''
+
+
+class NativeEngine:
+    """Use the wheel's native libraries through a small compiled C ABI.
+
+    Compiling against the installed headers avoids cppyy/Cling static initializer
+    and JIT traps that differ between workstation and CI compiler environments.
+    The temporary build belongs to this worker and is removed on close.
+    """
+
+    def __init__(self):
+        package = distribution('ns3')
+        files = list(package.files or ())
+        header = next(path for path in files if path.name == 'core-module.h')
+        include = package.locate_file(header).parent.parent
+        libraries = []
+        for module in ('point-to-point', 'network', 'core'):
+            matches = [package.locate_file(path) for path in files
+                       if path.name.startswith('libns3') and f'-{module}.' in path.name
+                       and path.name.endswith(('.so', '.dylib'))]
+            if len(matches) != 1:
+                raise RuntimeError(f'Expected one installed ns3 {module} library')
+            libraries.extend(matches)
+        compiler = shlex.split(os.environ.get('CXX', 'c++'))
+        if not compiler or not shutil.which(compiler[0]):
+            raise RuntimeError('Native ns-3 requires a C++ compiler; install build-essential or set CXX')
+        self.build = tempfile.TemporaryDirectory(prefix='orbitserve-ns3-')
+        root = Path(self.build.name)
+        source, target = root / 'adapter.cc', root / 'adapter.so'
+        source.write_text(NATIVE + BRIDGE, encoding='utf-8')
+        try:
+            subprocess.run([
+                *compiler, '-std=c++20', '-O2', '-shared', '-fPIC', f'-I{include}',
+                str(source), '-o', str(target), *(str(path) for path in libraries),
+                *(f'-Wl,-rpath,{path}' for path in sorted({p.parent for p in libraries})),
+            ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=45)
+            self.lib = ctypes.CDLL(str(target))
+        except subprocess.CalledProcessError as error:
+            self.build.cleanup()
+            raise RuntimeError(f'Native ns-3 adapter compilation failed:\n{error.stderr}') from error
+        except BaseException:
+            self.build.cleanup()
+            raise
+        pointer, string, number = ctypes.c_void_p, ctypes.c_char_p, ctypes.c_double
+        output = ctypes.POINTER(number)
+        signatures = {
+            'close': [], 'now': [output], 'link': [string], 'configure': [string, number],
+            'addPool': [string, number], 'attachPool': [string, string],
+            'start': [string, string, number], 'cancel': [string], 'advance': [number],
+            'progress': [string, output], 'clearCompleted': [],
+        }
+        for name, arguments in signatures.items():
+            function = getattr(self.lib, f'os_{name}')
+            function.argtypes = [pointer, *arguments]
+            function.restype = ctypes.c_int
+        self.lib.os_error.argtypes, self.lib.os_error.restype = [], string
+        self.lib.os_create.argtypes, self.lib.os_create.restype = [], pointer
+        self.lib.os_completedCount.argtypes, self.lib.os_completedCount.restype = [pointer], ctypes.c_size_t
+        self.lib.os_completedAt.argtypes, self.lib.os_completedAt.restype = [pointer, ctypes.c_size_t], string
+        self.handle = self.lib.os_create()
+        if not self.handle:
+            self.build.cleanup()
+            raise RuntimeError(self.lib.os_error().decode('utf-8'))
+
+    def call(self, name, *arguments):
+        if any(isinstance(value, str) and '\0' in value for value in arguments):
+            raise ValueError('Native ns-3 identifiers must not contain NUL')
+        values = [value.encode('utf-8') if isinstance(value, str) else value for value in arguments]
+        if getattr(self.lib, f'os_{name}')(self.handle, *values):
+            raise RuntimeError(self.lib.os_error().decode('utf-8'))
+
+    def value(self, name, *arguments):
+        result = ctypes.c_double()
+        self.call(name, *arguments, ctypes.byref(result))
+        return result.value
+
+    def completed(self):
+        return [self.lib.os_completedAt(self.handle, i).decode('utf-8')
+                for i in range(self.lib.os_completedCount(self.handle))]
+
+    def close(self):
+        try:
+            self.call('close')
+        finally:
+            self.build.cleanup()
+
 
 def main():
-    import cppyy
-    # ns3 3.44 parses headers before loading its libraries. nstime.h creates
-    # g_timeInitHelper, whose constructor needs Time::StaticInit from core.
-    # Resolve that library before the bindings can trigger its initializer.
-    package = distribution('ns3')
-    libraries = [path for path in package.files or ()
-                 if path.name.startswith('libns3') and '-core.' in path.name
-                 and path.name.endswith(('.so', '.dylib'))]
-    if len(libraries) != 1:
-        raise RuntimeError('Expected one installed ns3 core library before loading bindings')
-    cppyy.load_library(str(package.locate_file(libraries[0])))
-    from ns import ns
-    # Resolve module libraries before compiling the small adapter.
-    ns.PointToPointHelper
-    cppyy.cppdef(NATIVE)
-    engine = cppyy.gbl.orbitserve_ns3.Engine()
+    engine = NativeEngine()
+    try:
+        serve(engine)
+    finally:
+        engine.close()
+
+
+def serve(engine):
     initial = json.loads(sys.stdin.readline())
     for key, rate in initial.get('pools', {}).items():
-        engine.addPool(key, rate)
+        engine.call('addPool', key, rate)
     for row in initial['links']:
         for pool in row.get('pools', ()):
-            engine.attachPool(row['key'], pool)
+            engine.call('attachPool', row['key'], pool)
     active = set()
     if initial.get('start_s', 0) > 0:
-        engine.advance(initial['start_s'])
+        engine.call('advance', initial['start_s'])
 
     def emit(value):
-        print(json.dumps({'time_s': engine.now(), **value}, allow_nan=False), flush=True)
+        print(json.dumps({'time_s': engine.value('now'), **value}, allow_nan=False), flush=True)
 
     emit({'ready': True, 'version': version('ns3')})
     for line in sys.stdin:
@@ -153,35 +270,34 @@ def main():
             command = json.loads(line)
             op = command['op']
             if op == 'close':
-                ns.Simulator.Destroy()
                 emit({'closed': True})
                 return
             if op == 'register':
                 for row in command['links']:
-                    engine.link(row['key'])
+                    engine.call('link', row['key'])
                     for pool in row.get('pools', ()):
-                        engine.attachPool(row['key'], pool)
+                        engine.call('attachPool', row['key'], pool)
                 emit({'registered': True})
             elif op == 'configure':
                 for key, rate in command['capacities'].items():
-                    engine.configure(key, rate)
+                    engine.call('configure', key, rate)
                 emit({'configured': True})
             elif op == 'start':
-                engine.start(command['id'], command['key'], command['bytes'] / 1_000_000)
+                engine.call('start', command['id'], command['key'], command['bytes'] / 1_000_000)
                 active.add(command['id'])
                 emit({'started': command['id']})
             elif op == 'cancel':
                 for identity in command['ids']:
-                    engine.cancel(identity)
+                    engine.call('cancel', identity)
                     active.discard(identity)
                 emit({'cancelled': command['ids']})
             elif op == 'advance':
-                start = engine.now()
-                before = {i: engine.progress(i) for i in active}
-                engine.advance(float(command['until_s']))
-                done = [str(i) for i in engine.completed if str(i) in active]
-                engine.completed.clear()
-                progress = {i: max(0.0, engine.progress(i) - before[i]) for i in active}
+                start = engine.value('now')
+                before = {i: engine.value('progress', i) for i in active}
+                engine.call('advance', float(command['until_s']))
+                done = [i for i in engine.completed() if i in active]
+                engine.call('clearCompleted')
+                progress = {i: max(0.0, engine.value('progress', i) - before[i]) for i in active}
                 active.difference_update(done)
                 emit({'completed': sorted(done), 'bytes_sent': progress, 'interval_start_s': start})
             else:

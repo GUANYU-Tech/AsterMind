@@ -51,12 +51,11 @@ class StarlinkPresetTests(unittest.TestCase):
                 optical = spec.link_profiles[shell['isl_profile']]
                 self.assertEqual(optical.capacity_model,'islsim')
                 self.assertEqual(set(optical.islsim_config), {'tx', 'rx', 'channel'})
-                self.assertTrue(optical.islsim_source_sha256)
+                self.assertEqual(optical.islsim_source_sha256, {})
                 self.assertEqual(optical.bandwidth_bps,node.optical_terminal_bandwidth_bps)
                 self.assertEqual(optical.islsim_config['rx']['terminal_cap_gbps'], optical.bandwidth_bps / 1e9)
-                self.assertEqual(optical.attributes(1000, 0)['islsim_total_bw_gbps'], optical.bandwidth_bps / 1e9)
 
-    def test_generation_native_overrides_change_calculation_and_input_identity(self):
+    def test_generation_native_overrides_change_export_and_input_identity(self):
         from orbitserve.experiments.network_inputs import snapshot_network_input
         from orbitserve.experiments.physical_dataset import input_fingerprint
         original = json.loads((ROOT/'tests/fixtures/network/multi_shell.json').read_text())
@@ -75,8 +74,7 @@ class StarlinkPresetTests(unittest.TestCase):
         self.assertEqual(b.islsim_config['rx']['terminal_cap_gbps'], 80)
         self.assertEqual(b.bandwidth_bps, 100e9)
         self.assertNotIn('rx_aperture_m', shell['hardware_link_profiles']['communication_isl']['islsim_config']['rx'])
-        self.assertTrue(a.attributes(1000, 0)['link_feasible'])
-        self.assertFalse(b.attributes(1000, 0)['link_feasible'])
+        self.assertNotEqual(a.islsim_config, b.islsim_config)
         self.assertNotEqual(input_fingerprint(original_snapshot), input_fingerprint(changed_snapshot))
 
     def test_direction_depends_on_both_ground_service_and_physical_transmitter(self):

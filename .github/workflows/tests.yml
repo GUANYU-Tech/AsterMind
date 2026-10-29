@@ -19,6 +19,8 @@ jobs:
     env:
       PYTHONDONTWRITEBYTECODE: "1"
       CMAKE_BUILD_PARALLEL_LEVEL: "2"
+      # This workflow validates exported inputs, never the private ISLSim model.
+      ORBITSERVE_ISLSIM_ROOT: /nonexistent/orbitserve-islsim-ci
     steps:
       - uses: actions/checkout@v4
         with:

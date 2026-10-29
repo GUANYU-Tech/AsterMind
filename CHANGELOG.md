@@ -38,6 +38,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- Generate and validate portable ISLSim JSON inputs without loading its external
+  implementation. Bind source hashes only for actual local physical calculation;
+  keep real-model integration in an explicit local test suite.
+- Compile the ns3 adapter against the installed native libraries with a C++20
+  compiler to avoid cppyy initialization and JIT traps on clean runners.
+  Preserve native worker diagnostic heads,
+  tails, exit status and backend-specific exception names.
 - Prevented cross-track rows of synthetic compute formations from converging
   at orbit-plane intersections by aligning relative eccentricity/inclination
   vectors. Added an early sampled SGP4 clearance check before link budgets,

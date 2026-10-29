@@ -23,7 +23,7 @@ class RuntimeResultContractTests(unittest.TestCase):
                 "NetworkUnavailable", "candidate_links",
                 "STARLINK_RADIO_PROFILES",
                 "runtime_control", "physical_network_settings", "RUNTIME_NETWORK_FIELDS",
-                "freeze_network_profiles", "resolve_islsim_config",
+                "freeze_network_profiles", "resolve_islsim_config", "prepare_islsim_config",
                 "SUN_GEOMETRY_VERSION", "sun_positions_from_trace",
             },
         )
