@@ -5,7 +5,7 @@ models packet arbitration, not TCP congestion control or IP route discovery.
 """
 import json
 import sys
-from importlib.metadata import version
+from importlib.metadata import distribution, version
 
 NATIVE = r'''
 #include "ns3/core-module.h"
@@ -118,8 +118,18 @@ class Engine {
 
 
 def main():
-    from ns import ns
     import cppyy
+    # ns3 3.44 parses headers before loading its libraries. nstime.h creates
+    # g_timeInitHelper, whose constructor needs Time::StaticInit from core.
+    # Resolve that library before the bindings can trigger its initializer.
+    package = distribution('ns3')
+    libraries = [path for path in package.files or ()
+                 if path.name.startswith('libns3') and '-core.' in path.name
+                 and path.name.endswith(('.so', '.dylib'))]
+    if len(libraries) != 1:
+        raise RuntimeError('Expected one installed ns3 core library before loading bindings')
+    cppyy.load_library(str(package.locate_file(libraries[0])))
+    from ns import ns
     # Resolve module libraries before compiling the small adapter.
     ns.PointToPointHelper
     cppyy.cppdef(NATIVE)
