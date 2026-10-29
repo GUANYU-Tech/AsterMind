@@ -52,5 +52,7 @@ jobs:
           PY
       - name: Lint
         run: python -m ruff check src tests .github/scripts
+      - name: Verify native ns-3 packet transport
+        run: python -m unittest tests.unit.runtime.test_ns3_transport -v
       - name: Full suite including slow and native backend regressions
         run: python .github/scripts/run_native_tests.py

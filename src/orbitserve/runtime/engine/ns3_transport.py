@@ -1,15 +1,21 @@
 """Optional native ns-3 packet transport; no silent analytical fallback."""
 import importlib.util
-from .simgrid_transport import SimGridTransport
+from .simgrid_transport import SimGridTransport, SimGridUnavailable
+
+
+class Ns3Unavailable(SimGridUnavailable):
+    """The explicitly selected native ns-3 worker could not run."""
 
 
 def require_ns3():
     if importlib.util.find_spec('ns') is None:
-        raise RuntimeError('ns-3 mode requires the optional ns3 package; install OrbitServe[ns3] on a supported platform')
+        raise Ns3Unavailable('ns-3 mode requires the optional ns3 package; install OrbitServe[ns3] on a supported platform')
 
 
 class Ns3Transport(SimGridTransport):
     worker_module = 'orbitserve.runtime.engine.ns3_worker'
+    worker_name = 'ns-3'
+    error_type = Ns3Unavailable
     check_available = staticmethod(require_ns3)
 
     def __init__(self, nodes, edges, profiles, *, start_s=0.0):

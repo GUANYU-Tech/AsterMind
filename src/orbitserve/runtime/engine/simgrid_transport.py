@@ -33,6 +33,8 @@ class SimGridTransport:
     """One native engine with independently shared forward/reverse resources."""
 
     worker_module = 'orbitserve.runtime.engine.simgrid_worker'
+    worker_name = 'SimGrid'
+    error_type = SimGridUnavailable
     check_available = staticmethod(require_simgrid)
 
     def __init__(self, nodes, edges, profiles, *, start_s=0.0):
@@ -106,7 +108,7 @@ class SimGridTransport:
         try:
             ready = self._request({"nodes": sorted(nodes), "links": links, 'pools': capacity_pools(nodes), 'start_s': start_s})
             if not ready.get("ready"):
-                raise SimGridUnavailable("SimGrid worker did not initialize")
+                raise self.error_type(f"{self.worker_name} worker did not initialize")
             self.provenance = {
                 "backend": "simgrid",
                 "simgrid_version": ready["version"],
@@ -130,17 +132,20 @@ class SimGridTransport:
             line = self.responses.get(timeout=60)
             if line is None:
                 self.errors.seek(0)
-                raise SimGridUnavailable(
-                    "SimGrid worker exited: " + self.errors.read()[-2500:]
+                diagnostic = self.errors.read()
+                if len(diagnostic) > 12000:
+                    diagnostic = diagnostic[:6000] + '\n... stderr truncated ...\n' + diagnostic[-6000:]
+                raise self.error_type(
+                    f"{self.worker_name} worker exited (returncode {self.process.poll()}):\n{diagnostic}"
                 )
             result = json.loads(line)
             if "error" in result:
-                raise SimGridUnavailable(result["error"])
+                raise self.error_type(result["error"])
             self.now = float(result["time_s"])
             return result
         except (BrokenPipeError, queue.Empty, json.JSONDecodeError) as error:
-            raise SimGridUnavailable(
-                f"SimGrid worker protocol failed: {error}"
+            raise self.error_type(
+                f"{self.worker_name} worker protocol failed: {error}"
             ) from error
 
     def resource(self, leg):
