@@ -202,7 +202,9 @@ class NetworkState:
         ]
 
     def _saved_attributes(self, edge, time_s):
-        return self.physical_attributes.at(edge['link_id'], self._attribute_time(edge, time_s))
+        # Internal read-only access keeps distance lookups cheap. External readers
+        # receive independent values through PhysicalAttributes.at().
+        return self.physical_attributes._cached_at(edge['link_id'], self._attribute_time(edge, time_s))
 
     def _attribute_time(self, edge, time_s):
         # Fractional arrivals in the same physical interval share one cache

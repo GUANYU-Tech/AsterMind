@@ -4,6 +4,7 @@ import hashlib
 import json
 from contextlib import contextmanager
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 
 class HashingWriter:
@@ -31,17 +32,24 @@ class HashingWriter:
 
 @contextmanager
 def atomic_output(path):
+    """Publish complete bytes on success; each writer owns its temporary file.
+
+    Writers targeting the same destination may finish in either order. The last
+    successful replace wins, without mixing bytes or deleting a peer's output.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
+    temporary = None
     try:
-        with temporary.open("wb") as stream:
+        with NamedTemporaryFile(mode="wb", dir=path.parent, prefix=f".{path.name[:80]}.",
+                                suffix=".tmp", delete=False) as stream:
+            temporary = Path(stream.name)
             output = HashingWriter(stream)
             yield output
         temporary.replace(path)
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def write_json(path, value):

@@ -19,6 +19,11 @@ def _pick(data: dict[str, Any], key: str, default: Any) -> Any:
     return data[key] if key in data else default
 
 
+def _require_count(value, name):
+    if type(value) is not int:
+        raise ValueError(f'{name} must be an integer')
+
+
 @dataclass(frozen=True)
 class AcceleratorSpec:
     profile: str | dict[str, Any] = "h200_sxm"
@@ -53,12 +58,15 @@ class ComputePayloadSpec:
     power_overhead_fraction: float = 0.10
     mass_overhead_fraction: float = 0.20
 
+    def __post_init__(self):
+        _require_count(self.accelerator_count, 'hardware.compute_payload.accelerator_count')
+
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "ComputePayloadSpec":
         data = data or {}
         _reject_unknown(data, cls, "hardware.compute_payload")
         return cls(
-            accelerator_count=int(_pick(data, "accelerator_count", 1)),
+            accelerator_count=_pick(data, "accelerator_count", 1),
             purchase_cost_per_unit_usd=_optional_float(data.get("purchase_cost_per_unit_usd")),
             space_adaptation_cost_usd=float(_pick(data, "space_adaptation_cost_usd", 0.0)),
             packaging_cost_fraction=float(_pick(data, "packaging_cost_fraction", 0.10)),
@@ -75,13 +83,16 @@ class StorageSpec:
     profile: str | dict[str, Any] = "nvme_8tb"
     device_count: int = 1
 
+    def __post_init__(self):
+        _require_count(self.device_count, 'hardware.storage.device_count')
+
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "StorageSpec":
         data = data or {}
         _reject_unknown(data, cls, "hardware.storage")
         return cls(
             profile=_pick(data, "profile", "nvme_8tb"),
-            device_count=int(_pick(data, "device_count", 1)),
+            device_count=_pick(data, "device_count", 1),
         )
 
     def resolve(self) -> StorageDevice:
@@ -104,13 +115,16 @@ class IntraInterconnectSpec:
     power_per_gbs_w: float = 0.0
     mass_per_gbs_kg: float = 0.0
 
+    def __post_init__(self):
+        _require_count(self.switch_count, 'hardware.intra_interconnect.switch_count')
+
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "IntraInterconnectSpec":
         data = data or {}
         _reject_unknown(data, cls, "hardware.intra_interconnect")
         return cls(
             cost_fraction=float(_pick(data, "cost_fraction", 0.10)),
-            switch_count=int(_pick(data, "switch_count", 1)),
+            switch_count=_pick(data, "switch_count", 1),
             switch_bandwidth_gbs=float(_pick(data, "switch_bandwidth_gbs", 900.0)),
             switch_cost_usd=float(_pick(data, "switch_cost_usd", 0.0)),
             switch_power_w=float(_pick(data, "switch_power_w", 0.0)),
@@ -136,6 +150,9 @@ class CommunicationSpec:
     ground_cost_per_gbps_usd: float | None = None
     isl_cost_per_gbps_usd: float | None = None
 
+    def __post_init__(self):
+        _require_count(self.isl_terminal_count, 'hardware.communication.isl_terminal_count')
+
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "CommunicationSpec":
         data = data or {}
@@ -144,7 +161,7 @@ class CommunicationSpec:
             ground_link_bandwidth_gbps=float(_pick(data, "ground_link_bandwidth_gbps", 1.0)),
             ground_link_mass_kg=float(_pick(data, "ground_link_mass_kg", 5.0)),
             ground_link_power_w=float(_pick(data, "ground_link_power_w", 20.0)),
-            isl_terminal_count=int(_pick(data, "isl_terminal_count", 0)),
+            isl_terminal_count=_pick(data, "isl_terminal_count", 0),
             isl_terminal_bandwidth_gbps=float(_pick(data, "isl_terminal_bandwidth_gbps", 10.0)),
             isl_terminal_mass_kg=float(_pick(data, "isl_terminal_mass_kg", 10.0)),
             isl_terminal_power_w=float(_pick(data, "isl_terminal_power_w", 100.0)),

@@ -1,6 +1,7 @@
 """Compact numeric columns for decoded, immutable physical attribute blocks."""
 
 import sys
+import math
 from array import array
 
 
@@ -34,8 +35,8 @@ class _Fields:
 
     def at(self, index):
         return {
-            **self.constants,
-            **{key: values[index] for key, values in self.columns.items()},
+            **_canonical(self.constants),
+            **{key: _canonical(values[index]) for key, values in self.columns.items()},
         }
 
     def value(self, key, index):
@@ -49,6 +50,9 @@ class AttributeBlock:
 
     def __init__(self, rows):
         self.times = array("d", (row[0] for row in rows))
+        if (not 0 < len(self.times) <= 256 or any(not math.isfinite(t) or t < 0 for t in self.times)
+                or any(b <= a for a, b in zip(self.times, self.times[1:]))):
+            raise ValueError('physical block times must be finite, nonnegative and strictly increasing')
         self.group_ids = array("H", [0] * len(rows))
         self.row_ids = array("H", [0] * len(rows))
         groups = {}

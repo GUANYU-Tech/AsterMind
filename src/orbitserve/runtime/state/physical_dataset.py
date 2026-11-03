@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import bisect
 import json
+import math
 import multiprocessing
 import sqlite3
 import zlib
 from collections import OrderedDict
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import closing
+from copy import deepcopy
 from functools import lru_cache
 from itertools import islice
 from pathlib import Path
 from time import perf_counter
+from threading import RLock
 from types import SimpleNamespace
 
 from . import attribute_workers
@@ -25,6 +28,25 @@ LEGACY_SCHEMA = "orbitserve.physical_state.v1"
 COMPRESSED_READ_CACHE_BYTES = 64 * 1024 * 1024
 DECODED_READ_CACHE_BYTES = 512 * 1024 * 1024
 MMAP_READ_BYTES = 256 * 1024 * 1024
+MAX_BLOCK_BYTES = 64 * 1024 * 1024
+
+
+def _decode_block(value):
+    """Bound decompression before parsing externally supplied physical state."""
+    from .attribute_codec import MAGIC, decode
+    decoder = zlib.decompressobj()
+    try:
+        raw = decoder.decompress(value, MAX_BLOCK_BYTES + 1)
+    except zlib.error as error:
+        raise ValueError('invalid compressed physical block') from error
+    if len(raw) > MAX_BLOCK_BYTES:
+        raise ValueError('physical block exceeds decompression size limit')
+    if not decoder.eof or decoder.unused_data:
+        raise ValueError('truncated or trailing compressed physical block')
+    try:
+        return decode(raw) if raw.startswith(MAGIC) else AttributeBlock(json.loads(raw))
+    except (KeyError, IndexError, TypeError, OverflowError) as error:
+        raise ValueError('invalid physical block structure') from error
 
 
 def physical_spec(spec):
@@ -93,7 +115,10 @@ def _chunks(network):
 def _encode_block(block):
     from .attribute_codec import encode
     compact = block if isinstance(block, AttributeBlock) else AttributeBlock(block)
-    return zlib.compress(encode(compact), level=1)
+    raw = encode(compact)
+    if len(raw) > MAX_BLOCK_BYTES:
+        raise ValueError('physical block exceeds decompression size limit')
+    return zlib.compress(raw, level=1)
 
 
 def _encode_chunk(rows):
@@ -242,10 +267,18 @@ class PhysicalAttributes:
         if self.metadata.get("schema_version") not in {SCHEMA, LEGACY_SCHEMA}:
             raise ValueError("unsupported physical state; regenerate in step one")
         self._blocks = OrderedDict()
+        self._cache_lock = RLock()
         self.decoded_bytes = self.peak_decoded_bytes = 0
         self.read_decode_s = 0.
         self.block_loads = 0
-        self.at = lru_cache(maxsize=4096)(self._at)
+        self._cached_at = lru_cache(maxsize=4096)(self._at)
+
+        def read(link, time_s):
+            return deepcopy(self._cached_at(link, time_s))
+
+        read.cache_info = self._cached_at.cache_info
+        read.cache_clear = self._cached_at.cache_clear
+        self.at = read
 
     def connect(self, *, immutable=False):
         options = '?mode=ro&immutable=1' if immutable else '?mode=ro'
@@ -275,12 +308,17 @@ class PhysicalAttributes:
             self._read_connection = None
 
     def _locate(self, link, time_s):
+        if not math.isfinite(time_s) or time_s < 0:
+            raise ValueError('physical query time must be finite and nonnegative')
         starts = self.block_times.get(link, ())
         index = bisect.bisect_right(starts, time_s) - 1
         if index < 0:
             raise ValueError('physical dataset does not cover link/time')
         block = self._block(link, starts[index])
-        return block, bisect.bisect_right(block.times, time_s) - 1
+        row = bisect.bisect_right(block.times, time_s) - 1
+        if row < 0:
+            raise ValueError('physical block does not cover query time')
+        return block, row
 
     def _at(self, link, time_s):
         block, index = self._locate(link, time_s)
@@ -295,6 +333,12 @@ class PhysicalAttributes:
         return block.direction(index, source, target)
 
     def _block(self, link, start_s):
+        # Forked network previews share this immutable reader across threads.
+        # Keep eviction, cache population and byte accounting one transaction.
+        with self._cache_lock:
+            return self._cached_block(link, start_s)
+
+    def _cached_block(self, link, start_s):
         key = link, start_s
         if key in self._blocks:
             self._blocks.move_to_end(key)
@@ -322,6 +366,4 @@ class PhysicalAttributes:
         else:
             with closing(self.connect()) as db:
                 value = db.execute('SELECT value FROM attributes WHERE link=? AND time=?', (link, start_s)).fetchone()[0]
-        from .attribute_codec import MAGIC, decode
-        raw = zlib.decompress(value)
-        return decode(raw) if raw.startswith(MAGIC) else AttributeBlock(json.loads(raw))
+        return _decode_block(value)

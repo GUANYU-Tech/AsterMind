@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from .contracts import RuntimeEngineResult
+from .request_input import normalize_runtime_request
 from .decision import SchedulerCandidate
 from .routing import AccessCandidate, RoutePlan, RouteUnavailable
 from ..state.network import NetworkState
@@ -28,32 +29,6 @@ def run_runtime_engine(simulation_spec: Any) -> RuntimeEngineResult:
     from .events import run_event_engine
 
     return run_event_engine(simulation_spec)
-
-
-def normalize_runtime_request(raw_request: dict[str, Any]) -> dict[str, Any]:
-    if "prompt_tokens" not in raw_request or "output_tokens" not in raw_request:
-        raise ValueError("canonical request requires prompt_tokens and output_tokens")
-    request_id = str(raw_request.get("request_id") or "")
-    if not request_id:
-        raise ValueError("canonical request requires request_id")
-    prompt_tokens = int(raw_request["prompt_tokens"])
-    output_tokens = int(raw_request["output_tokens"])
-    if prompt_tokens < 0 or output_tokens <= 0:
-        raise ValueError(
-            "prompt_tokens must be non-negative and output_tokens must be positive"
-        )
-    return {
-        **dict(raw_request),
-        "request_id": request_id,
-        "arrival_time_s": float(raw_request.get("arrival_time_s", 0.0)),
-        "prompt_tokens": prompt_tokens,
-        "output_tokens": output_tokens,
-        "input_bytes": max(0.0, float(raw_request.get("input_bytes", 0.0))),
-        "output_bytes": max(0.0, float(raw_request.get("output_bytes", 0.0))),
-        "context_tokens_before_turn": max(
-            0, int(raw_request.get("context_tokens_before_turn", 0) or 0)
-        ),
-    }
 
 
 def _select_access(

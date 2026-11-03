@@ -61,14 +61,14 @@ class ServingParallelism:
             "tensor_parallel_degree", "pipeline_parallel_degree",
             "expert_parallel_degree",
         ):
-            if getattr(self, name) < 1:
-                raise ValueError(f"serving.parallelism.{name} must be at least 1")
-        if self.tensor_parallel_collectives_per_layer < 0:
-            raise ValueError("tensor_parallel_collectives_per_layer must be non-negative")
-        if self.expert_parallel_imbalance_factor < 1.0:
-            raise ValueError("expert_parallel_imbalance_factor must be at least 1")
-        if self.expert_parallel_startup_us < 0.0:
-            raise ValueError("expert_parallel_startup_us must be non-negative")
+            if type(getattr(self, name)) is not int or getattr(self, name) < 1:
+                raise ValueError(f"serving.parallelism.{name} must be a positive integer")
+        if type(self.tensor_parallel_collectives_per_layer) is not int or self.tensor_parallel_collectives_per_layer < 0:
+            raise ValueError("tensor_parallel_collectives_per_layer must be a non-negative integer")
+        for name, minimum in (('expert_parallel_imbalance_factor', 1.), ('expert_parallel_startup_us', 0.)):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < minimum:
+                raise ValueError(f'serving.parallelism.{name} must be finite and >= {minimum}')
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "ServingParallelism":
@@ -100,8 +100,8 @@ class L2FormationSpec:
     link_propagation_delay_s: float = 0.0
 
     def __post_init__(self) -> None:
-        if self.member_count < 1:
-            raise ValueError("serving.formation.member_count must be at least 1")
+        if type(self.member_count) is not int or self.member_count < 1:
+            raise ValueError("serving.formation.member_count must be a positive integer")
         if self.topology not in {"ring", "switch", "fully_connected"}:
             raise ValueError("serving.formation.topology must be ring, switch, or fully_connected")
         if not math.isfinite(self.link_bandwidth_gbps) or self.link_bandwidth_gbps < 0.0:
@@ -118,7 +118,7 @@ class L2FormationSpec:
         if unknown:
             raise ValueError("Unsupported serving.formation fields: " + ", ".join(unknown))
         return cls(
-            member_count=int(data.get("member_count", 1)),
+            member_count=data.get("member_count", 1),
             topology=str(data.get("topology", "ring")).lower(),
             link_bandwidth_gbps=float(data.get("link_bandwidth_gbps", 0.0)),
             link_propagation_delay_s=float(data.get("link_propagation_delay_s", 0.0)),
@@ -167,8 +167,8 @@ class ServingSpec:
             formation=L2FormationSpec.from_dict(data.get("formation")),
             prefill_compute_efficiency=float(data.get("prefill_compute_efficiency", 0.5)),
             decode_memory_efficiency=float(data.get("decode_memory_efficiency", 0.7)),
-            prompt_length_grid=tuple(int(item) for item in data.get("prompt_length_grid", DEFAULT_PROMPT_LENGTH_GRID)),
-            context_length_grid=tuple(int(item) for item in data.get("context_length_grid", DEFAULT_CONTEXT_LENGTH_GRID)),
+            prompt_length_grid=tuple(data.get("prompt_length_grid", DEFAULT_PROMPT_LENGTH_GRID)),
+            context_length_grid=tuple(data.get("context_length_grid", DEFAULT_CONTEXT_LENGTH_GRID)),
             max_concurrency=data.get("max_concurrency", 1),
             hardware=SatelliteHardwareProfile.from_dict(hardware) if isinstance(hardware, dict) else hardware,
             external_profile=data.get('external_profile'),

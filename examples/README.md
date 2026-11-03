@@ -13,3 +13,5 @@ This directory contains readable, reusable, version-controlled input examples. I
 `fixed_design_geometry.json` demonstrates a complete Orbit-geometry-to-Runtime path. `orbit_geometry_dse.json` enumerates orbital geometry candidates through the same evaluation path. Both use the same workload and per-satellite hardware input.
 
 See the repository root `README.md` for commands. Write outputs to `results/`, never back into `examples/`.
+
+中文命令行操作、配置迁移和实验结果说明见 [OrbitServe 使用说明](使用说明.md)。

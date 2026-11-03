@@ -1,6 +1,7 @@
 """Portable numeric-column encoding; legacy JSON blocks remain readable."""
 
 import json
+import math
 import struct
 import sys
 from array import array
@@ -53,6 +54,8 @@ def decode(data):
         raise ValueError("invalid physical column block")
     length = struct.unpack_from("<I", data, len(MAGIC))[0]
     offset = len(MAGIC) + 4
+    if not 0 < length <= len(data) - offset:
+        raise ValueError('truncated physical block metadata')
     header = json.loads(data[offset : offset + length])
     offset += length
     arrays = []
@@ -75,20 +78,25 @@ def decode(data):
     if offset != len(data):
         raise ValueError("trailing physical column bytes")
 
+    def column(index):
+        if type(index) is not int or not 0 <= index < len(arrays):
+            raise ValueError('invalid physical column reference')
+        return arrays[index]
+
     def fields(value):
         result = _Fields.__new__(_Fields)
         result.constants = value["constants"]
         result.columns = {
-            key: arrays[column["array"]]
-            if "array" in column
-            else tuple(column["values"])
-            for key, column in value["columns"].items()
+            key: column(description['array'])
+            if 'array' in description
+            else tuple(description['values'])
+            for key, description in value["columns"].items()
         }
         return result
 
     block = AttributeBlock.__new__(AttributeBlock)
     block.times, block.group_ids, block.row_ids = (
-        arrays[header[name]] for name in ("times", "group_ids", "row_ids")
+        column(header[name]) for name in ("times", "group_ids", "row_ids")
     )
     block.groups = [(fields(g), [fields(d) for d in ds]) for g, ds in header["groups"]]
     if (
@@ -99,6 +107,9 @@ def decode(data):
         or len(block.times) != len(block.row_ids)
     ):
         raise ValueError("invalid physical row index")
+    if (any(not math.isfinite(t) or t < 0 for t in block.times)
+            or any(b <= a for a, b in zip(block.times, block.times[1:]))):
+        raise ValueError('invalid physical block times')
     max_rows = [-1] * len(block.groups)
     for i, group in enumerate(block.group_ids):
         if group >= len(block.groups):

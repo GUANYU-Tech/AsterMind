@@ -63,11 +63,8 @@ def publish_dataset(root, concrete, *, source_input=None, file_hashes=None):
                   for p in sorted(files) if not p.name.endswith('.tmp')},
         "optional_exports": "physical_exports.json",
     }
-    temporary = root / "physical_dataset.json.tmp"
-    temporary.write_text(
-        json.dumps(value, sort_keys=True, indent=2) + "\n", encoding="utf-8"
-    )
-    temporary.replace(root / "physical_dataset.json")
+    from orbitserve.common import write_json
+    write_json(root / "physical_dataset.json", value)
     return value
 
 

@@ -39,9 +39,12 @@ class SimGridTransport:
 
     def __init__(self, nodes, edges, profiles, *, start_s=0.0):
         self.check_available()
+        if isinstance(start_s, bool) or not isinstance(start_s, (int, float)) or not math.isfinite(start_s) or start_s < 0:
+            raise ValueError('native transport start_s must be finite and nonnegative')
         if not isinstance(nodes, dict):
             from ..setup.network_spec import NetworkNodeSpec
             nodes = {n: NetworkNodeSpec(n, 'compute') for n in nodes}
+        edges = tuple(edges)
         # Validate unpublished capacities before launching a worker subprocess.
         for edge in edges:
             hop_pools(nodes, edge['endpoint_a'], edge['endpoint_b'])
@@ -52,8 +55,21 @@ class SimGridTransport:
         self.active = {}
         self.resources = {}
         self.closed = False
+        # Resolve/validate all input-derived values before owning a subprocess.
+        links = []
+        for i, edge in enumerate(edges):
+            for direction, (source, target) in enumerate(
+                ((edge['endpoint_a'], edge['endpoint_b']), (edge['endpoint_b'], edge['endpoint_a']))
+            ):
+                key = f'link-{i}-{direction}'
+                self.resources[edge['link_id'], source, target] = key
+                links.append({
+                    'key': key, 'source': source, 'target': target,
+                    'bandwidth_bps': directional_profile(nodes, profiles, edge, source).bandwidth_bps,
+                    'pools': list(hop_pools(nodes, source, target)),
+                })
+        pools = capacity_pools(nodes)
         self.responses = queue.Queue()
-        self.errors = tempfile.TemporaryFile(mode="w+t", encoding="utf-8")
         environment = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
         # Official bindings may ship libsimgrid next to their extension module.
         # Configure only this child loader, without importing native global state
@@ -65,48 +81,31 @@ class SimGridTransport:
         environment[loader_variable] = os.pathsep.join(
             value for value in (location, environment.get(loader_variable, "")) if value
         )
-        self.process = subprocess.Popen(
-            [sys.executable, "-B", "-m", self.worker_module],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=self.errors,
-            text=True,
-            encoding="utf-8",
-            bufsize=1,
-            env=environment,
-        )
+        self.errors = tempfile.TemporaryFile(mode="w+t", encoding="utf-8")
+        try:
+            self.process = subprocess.Popen(
+                [sys.executable, "-B", "-m", self.worker_module],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.errors,
+                text=True, encoding="utf-8", bufsize=1, env=environment,
+            )
+        except BaseException:
+            self.errors.close()
+            raise
 
         def read_responses():
-            for line in self.process.stdout:
-                self.responses.put(line)
-            self.responses.put(None)
+            try:
+                for line in self.process.stdout:
+                    self.responses.put(line)
+            except (OSError, UnicodeError) as error:
+                self.reader_error = str(error)
+            finally:
+                self.responses.put(None)
 
+        self.reader_error = None
         self.reader = threading.Thread(target=read_responses, daemon=True)
-        self.reader.start()
-        links = []
-        for i, edge in enumerate(edges):
-            for direction, (source, target) in enumerate(
-                (
-                    (edge["endpoint_a"], edge["endpoint_b"]),
-                    (edge["endpoint_b"], edge["endpoint_a"]),
-                )
-            ):
-                key = f"link-{i}-{direction}"
-                self.resources[edge["link_id"], source, target] = key
-                links.append(
-                    {
-                        "key": key,
-                        "source": source,
-                        "target": target,
-                        "bandwidth_bps": profiles[
-                            edge.get("profile_id", edge["kind"])
-                        ].bandwidth_bps,
-                        'pools': list(hop_pools(nodes, source, target)),
-                    }
-                )
-                links[-1]['bandwidth_bps'] = directional_profile(nodes, profiles, edge, source).bandwidth_bps
         try:
-            ready = self._request({"nodes": sorted(nodes), "links": links, 'pools': capacity_pools(nodes), 'start_s': start_s})
+            self.reader.start()
+            ready = self._request({"nodes": sorted(nodes), "links": links, 'pools': pools, 'start_s': start_s})
             if not ready.get("ready"):
                 raise self.error_type(f"{self.worker_name} worker did not initialize")
             self.provenance = {
@@ -126,24 +125,39 @@ class SimGridTransport:
             raise
 
     def _request(self, payload):
+        if self.closed and payload.get('op') != 'close':
+            raise self.error_type(f'{self.worker_name} transport is closed')
+        encoded = json.dumps(payload, allow_nan=False) + '\n'
         try:
-            self.process.stdin.write(json.dumps(payload, allow_nan=False) + "\n")
+            self.process.stdin.write(encoded)
             self.process.stdin.flush()
             line = self.responses.get(timeout=60)
             if line is None:
                 self.errors.seek(0)
                 diagnostic = self.errors.read()
+                if self.reader_error:
+                    diagnostic += f'\nWorker output could not be decoded: {self.reader_error}'
                 if len(diagnostic) > 12000:
                     diagnostic = diagnostic[:6000] + '\n... stderr truncated ...\n' + diagnostic[-6000:]
+                returncode = self.process.poll()
+                self.close(force=True)
                 raise self.error_type(
-                    f"{self.worker_name} worker exited (returncode {self.process.poll()}):\n{diagnostic}"
+                    f"{self.worker_name} worker exited (returncode {returncode}):\n{diagnostic}"
                 )
             result = json.loads(line)
+            if not isinstance(result, dict):
+                raise ValueError('worker response must be an object')
             if "error" in result:
                 raise self.error_type(result["error"])
-            self.now = float(result["time_s"])
+            time_s = result['time_s']
+            if isinstance(time_s, bool) or not isinstance(time_s, (int, float)) or not math.isfinite(time_s) or time_s < self.now:
+                raise ValueError('worker time must be finite and monotonic')
+            self.now = float(time_s)
             return result
-        except (BrokenPipeError, queue.Empty, json.JSONDecodeError) as error:
+        except (OSError, queue.Empty, ValueError, TypeError, KeyError) as error:
+            # A timeout/malformed reply loses request-response alignment. Reusing
+            # that worker can assign a late response to an unrelated operation.
+            self.close(force=True)
             raise self.error_type(
                 f"{self.worker_name} worker protocol failed: {error}"
             ) from error
@@ -178,8 +192,12 @@ class SimGridTransport:
         self.__dict__.update(replacement.__dict__)
 
     def start(self, identity, leg, payload_bytes):
-        if not math.isfinite(payload_bytes) or payload_bytes <= 0:
+        if identity in self.active:
+            raise ValueError('native transport requires a unique active transfer id')
+        if isinstance(payload_bytes, bool) or not math.isfinite(payload_bytes) or payload_bytes <= 0:
             raise ValueError("SimGrid payload_bytes must be finite and positive")
+        if payload_bytes >= 2**64 / BYTE_SCALE:
+            raise ValueError("SimGrid payload exceeds its native scaled size limit")
         amount = max(1, round(payload_bytes * BYTE_SCALE))
         if amount >= 2**64:
             raise ValueError("SimGrid payload exceeds its native scaled size limit")
@@ -197,6 +215,8 @@ class SimGridTransport:
         self.active[identity] = {"key": key, "leg": leg}
 
     def advance_until(self, time_s):
+        if isinstance(time_s, bool) or not math.isfinite(time_s) or time_s < self.now:
+            raise ValueError('native transport time must be finite and monotonic')
         response = self._request({"op": "advance", "until_s": time_s})
         for identity in response["completed"]:
             self.active.pop(identity, None)
@@ -224,6 +244,7 @@ class SimGridTransport:
                 self.process.kill()
                 self.process.wait(timeout=10)
             self.process.stdin.close()
-            self.reader.join(timeout=2)
+            if self.reader.ident is not None:
+                self.reader.join(timeout=2)
             self.process.stdout.close()
             self.errors.close()

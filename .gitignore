@@ -1,5 +1,11 @@
-# Research documents are maintained locally and are not uploaded.
-/docs/
+# Preserve develop's versioned research notes; keep other research material local.
+/docs/**
+!/docs/research/
+!/docs/research/parameters/
+!/docs/research/parameters/runtime_inference_metrics.md
+!/docs/research/parameters/serving_model_profiles.md
+!/docs/research/positioning/
+!/docs/research/positioning/l2_compute_node_iteration.md
 # Generated experiment output.
 /results/
 # Downloaded third-party workload traces and locally materialized BurstGPT bundles.

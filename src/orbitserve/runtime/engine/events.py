@@ -9,6 +9,7 @@ from collections import defaultdict, deque
 from types import SimpleNamespace
 
 from .contracts import RuntimeEngineResult
+from .request_input import prepare_runtime_requests
 from .decision import build_candidate_selector
 from .eligibility import build_compute_eligibility_set
 from ..metrics.records import RuntimeRequestRecord
@@ -36,7 +37,6 @@ ISL_KINDS = {
 def run_event_engine(spec):
     # Kept local to avoid a module cycle with the prediction helpers.
     from .simulator import (
-        normalize_runtime_request,
         _build_energy_trace,
         _all_uncompleted,
     )
@@ -49,6 +49,7 @@ def run_event_engine(spec):
     serving = spec.serving_profile
     if serving is None or not serving.has_compute_capacity:
         return _all_uncompleted(spec, "serving_capacity_unavailable")
+    requests = prepare_runtime_requests(spec.requests)
     from ..setup.faults import realize_runtime_faults
     from .topology import candidate_links
     boundaries = sorted({float(row['time_s']) for row in trace.ephemeris_samples})
@@ -101,32 +102,14 @@ def run_event_engine(spec):
     for node in eligible:
         state.kv_cache_for(node, capacity_tokens=capacity)
     engine = _EventEngine(spec, environment, energy, state, eligible)
-    requests = [normalize_runtime_request(row) for row in spec.requests]
-    if len({r["request_id"] for r in requests}) != len(requests):
-        raise ValueError("duplicate request_id")
-    by_id = {request["request_id"]: request for request in requests}
+    try:
+        return _execute_requests(engine, requests, trace, capacity)
+    finally:
+        engine.close()
 
-    def validate_dependency(rid, visiting, visited):
-        if rid in visiting:
-            raise ValueError("request dependency cycle")
-        if rid in visited:
-            return
-        visiting.add(rid)
-        request = by_id[rid]
-        if (
-            request.get("arrival_time_mode", "absolute")
-            == "after_dependency_completion"
-        ):
-            predecessor = request.get("depends_on_request_id")
-            if predecessor not in by_id:
-                raise ValueError("unknown request predecessor")
-            validate_dependency(predecessor, visiting, visited)
-        visiting.remove(rid)
-        visited.add(rid)
 
-    visited = set()
-    for rid in by_id:
-        validate_dependency(rid, set(), visited)
+def _execute_requests(engine, requests, trace, capacity):
+    network, state = engine.net, engine.state
     for request in sorted(
         requests, key=lambda r: (r["arrival_time_s"], r["request_id"])
     ):
@@ -296,6 +279,16 @@ class _EventEngine:
         )
 
     def fail(self, job, reason):
+        pending = [(job, reason)]
+        while pending:
+            current, current_reason = pending.pop()
+            if current['done']:
+                continue
+            self._fail_one(current, current_reason)
+            pending.extend((self.jobs[rid], 'dependency_uncompleted')
+                           for rid in reversed(self.followers.get(current['request']['request_id'], ())))
+
+    def _fail_one(self, job, reason):
         if job["done"]:
             return
         from .simulator import _uncompleted
@@ -329,17 +322,15 @@ class _EventEngine:
                 "reason": reason,
             }
         )
-        for rid in self.followers.get(job["request"]["request_id"], ()):
-            self.fail(self.jobs[rid], "dependency_uncompleted")
-
     def run(self):
-        try:
-            self._run()
-            if self.controller:
-                self.controller.finished(self)
-        finally:
-            if self.transport:
-                self.transport.close()
+        # The orchestration boundary owns cleanup, including pre-run failures.
+        self._run()
+        if self.controller:
+            self.controller.finished(self)
+
+    def close(self):
+        if self.transport:
+            self.transport.close()
 
     def _run(self):
         while self.heap:

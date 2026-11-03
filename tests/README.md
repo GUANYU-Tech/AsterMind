@@ -3,29 +3,47 @@
 Run all four suites before integration, including `tests/slow/`:
 
 ```bash
-python -m ruff check src tests .github/scripts
+python -m ruff check src tests
 python -m unittest discover -s tests -t . -v
 ```
 
 Install `.[simgrid,ns3]` on a supported platform for the native backend checks.
-Skipped native cases do not validate those backends. The GitHub Actions workflow
-installs the C++ compiler, CMake, Boost and Python/pybind11 development headers
-before installing both native backends. It uses pip 26.2.2 and
-`constraints/native-build.txt` to select pybind11 2.13.6 in the isolated SimGrid
-build. It runs on Ubuntu 24.04 with Python 3.12 and fails if any case is skipped.
+Skipped native cases do not validate those backends. On Ubuntu 24.04 with Python
+3.12, install the C++ compiler, CMake, Boost and Python/pybind11 development headers
+before installing both native backends. Use pip 26.2.2 and
+`tests/requirements/native-build.txt` to select pybind11 2.13.6 in the isolated
+SimGrid build; see the root README for the installation commands.
 The package pins NumPy 2.2.6 with Astropy 6.1.3. Before lint and regression tests,
-CI checks dependency consistency, imports Astropy's coordinate and unit modules,
-and prints the installed core/native dependency versions.
+check dependency consistency with `python -m pip check` and import Astropy's
+coordinate and unit modules.
 The causal workload contract checks use `unittest.TestCase` so they are collected
 by the same full-suite command and do not depend on pytest.
-CI runs `.github/scripts/run_native_tests.py`, whose guarded file entry point
-supports the orbit pipeline's `spawn` workers and rejects skipped tests.
+Run `python tests/scripts/run_native_tests.py` for full native validation. Its
+guarded file entry point supports the orbit pipeline's `spawn` workers and
+rejects skipped tests.
 The ns-3 worker compiles its adapter with C++20 against the wheel's libraries;
 local runs require a compiler on `PATH` or selected through `CXX`.
 
-ISLSim is a separate local integration boundary. The CI suites generate and
+Run `python tests/scripts/check_distribution.py` with `build==1.6.1`: it builds
+from current Git inputs in a temporary directory, then builds the wheel from the
+sdist. It installs into a separate target, imports every packaged module and
+checks reference hashes and the portable configuration CLI with ISLSim absent.
+Build isolation requires setuptools 84.1.0 or newer; native build constraints
+retain pybind11 2.13.6. The caller's Python environment is not overwritten.
+
+Reliability regressions cover overlapping artifact writers, 5000-node dependency
+graphs, 1500-request failure propagation, native protocol retirement and startup
+cleanup, invalid model counts, tiny zero-capacity transfers, bounded compressed
+blocks and isolation of cached physical metadata.
+
+The feature branch follows develop's directory layout and does not provide a
+GitHub Actions workflow. These commands remain available for local validation
+and for the repository's configured CI; local results do not replace required
+remote checks or maintainer review.
+
+ISLSim is a separate local integration boundary. The default suites generate and
 validate native JSON parameters without importing ISLSim, and their simulation
-fixtures explicitly choose self-contained capacity models. CI does not clone the
+fixtures explicitly choose self-contained capacity models. The suites do not clone the
 ISLSim private repository or need its credentials. `tests/external/islsim/` keeps
 the real-model integration checks outside default discovery; run them locally
 with `ORBITSERVE_ISLSIM_ROOT=/path/to/ISLSim python -m unittest discover -s tests/external/islsim -v`.

@@ -1,11 +1,12 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=84.1.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "OrbitServe"
 version = "0.0.1"
-description = "Private research artifact for OrbitServe LEO AI serving cost-SLO co-design."
+description = "LEO AI serving simulation and cost-SLO co-design."
+readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "numpy==2.2.6",
@@ -19,6 +20,7 @@ simgrid = ["simgrid==4.1"]
 ns3 = ["ns3==3.44.post0"]
 
 [tool.setuptools]
+include-package-data = false
 packages = [
   "orbitserve",
   "orbitserve.architecture",

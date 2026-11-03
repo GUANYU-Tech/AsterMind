@@ -38,6 +38,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- Restore develop's three research notes under `docs/research/`; place native
+  build requirements and validation scripts under `tests/` and remove the
+  feature branch's root `.github/` and `constraints/` directories.
+- Isolate overlapping artifact writers and preserve the published file on a
+  producer failure. Use the same publication primitive for dataset manifests.
+- Validate Runtime requests before allocating backends; use iterative dependency
+  checks and failure propagation for long causal chains. Reject fractional model
+  counts and nonfinite Serving coefficients instead of silently changing inputs.
+- Preserve tiny fluid transfers until actual service completes them. Reject
+  duplicate native transfers, invalid clock changes and oversized payloads;
+  retire workers after malformed RPC/timeout and clean up startup failures.
+- Bound physical-block decompression, validate binary indices and times, isolate
+  returned metadata and serialize concurrent cache population/eviction.
+- Remove the obsolete ground evaluator and unused sequential implementation;
+  check every source module and installed distribution module for import errors.
+- Require a patched setuptools build backend and verify sdist-to-wheel packaging,
+  reference hashes and the portable CLI outside the source checkout.
+
 - Generate and validate portable ISLSim JSON inputs without loading its external
   implementation. Bind source hashes only for actual local physical calculation;
   keep real-model integration in an explicit local test suite.

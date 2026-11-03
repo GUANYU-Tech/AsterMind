@@ -28,12 +28,12 @@ class FluidTransport:
         self.capacities.update(capacities)
 
     def start(self, identity, leg, payload_bytes):
-        if identity in self.active or not math.isfinite(payload_bytes) or payload_bytes <= 0:
+        if identity in self.active or isinstance(payload_bytes, bool) or not math.isfinite(payload_bytes) or payload_bytes <= 0:
             raise ValueError('fluid requires a unique transfer and positive finite bytes')
         self.active[identity] = {'key': self.resource(leg), 'leg': leg, 'remaining': float(payload_bytes)}
 
     def advance_until(self, time_s):
-        if not math.isfinite(time_s) or time_s < self.now:
+        if isinstance(time_s, bool) or not math.isfinite(time_s) or time_s < self.now:
             raise ValueError('fluid time must be finite and monotonic')
         requirements = {i: (r['key'], *hop_pools(self.nodes, r['leg']['source_node_id'], r['leg']['target_node_id']))
                         if self.nodes else (r['key'],) for i, r in self.active.items()}
@@ -44,8 +44,12 @@ class FluidTransport:
         sent = {i: min(r['remaining'], dt * rates[i]) for i, r in self.active.items()}
         done = []
         for i, r in self.active.items():
+            # Round only the residual of actual service, relative to that flow.
+            # An absolute epsilon completes tiny zero-capacity transfers for free.
+            if rates[i] > 0 and math.isclose(sent[i], r['remaining'], rel_tol=1e-12, abs_tol=0.):
+                sent[i] = r['remaining']
             r['remaining'] -= sent[i]
-            if r['remaining'] <= 1e-7:
+            if r['remaining'] <= 0.:
                 done.append(i)
         for i in done:
             del self.active[i]

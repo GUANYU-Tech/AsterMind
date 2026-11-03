@@ -15,12 +15,17 @@ src/orbitserve/              Core simulation engine
 src/experiments/             Manifests, cross-module orchestration, fixed-design evaluation, and output
 src/dse/                     Physical design enumeration, runtime strategies, geometry screening, and frontier analysis
 src/baselines/ground/        Terrestrial serving baselines
-src/workloads/wildchat/      WildChat conversion tools with optional dependencies
+src/workloads/main_composite_chat/  Synthetic workload adapter and source profiles
 examples/                    Versioned, user-facing input examples
 tests/                       Unit, integration, smoke, and slow regression suites
+docs/research/               Research notes retained from develop
 ```
 
 See `CHANGELOG.md` for release history.
+
+Development changes are reviewed through a pull request to `develop`. Keep
+validation results, affected interfaces and a rollback procedure in the PR;
+merging requires the repository's CI and maintainer review.
 
 ## Execution Path
 
@@ -295,7 +300,7 @@ sudo apt-get update
 sudo apt-get install --yes --no-install-recommends \
   build-essential cmake libboost-dev pybind11-dev python3-dev
 python3 -m pip install --upgrade 'pip==26.2.2'
-python3 -m pip install --build-constraint constraints/native-build.txt ".[simgrid]"
+python3 -m pip install --build-constraint tests/requirements/native-build.txt ".[simgrid]"
 ```
 
 Run these commands from the repository root. The build constraint selects
@@ -657,3 +662,33 @@ within samples, while configured capacity schedules retain exact event times.
 - `local/` contains personal tools, inputs, results, tests and internal documents; it is ignored. Do not force-add it.
 - `scripts/` is reserved for paper experiment orchestration after the methodology is frozen.
 - `examples/` contains user-facing inputs, not test-generated artifacts.
+
+## Input Reliability and Distribution Checks
+
+Canonical request token counts, hardware counts, parallel degrees and Serving
+length grids use integers. Request times and byte counts must be finite and
+nonnegative. Fractional counts, booleans and NaN/Infinity are rejected before
+allocating a native backend. Causal requests may arrive in any input order;
+duplicate IDs, missing predecessors and cycles are rejected explicitly.
+
+Physical attribute readers bound decompression to 64 MiB per block, validate
+time and column indices, and return independent metadata values. Atomic artifact
+writes use a separate temporary file per producer; overlapping writers publish
+complete files, with the last successful publication taking effect.
+
+The distribution check builds a source distribution and a wheel from it, installs that wheel
+outside the source tree, imports all modules and verifies the pinned reference
+data and ISLSim configuration CLI. To run this check from a Git checkout with
+the core dependencies installed:
+
+```bash
+python -m pip install 'build==1.6.1'
+python tests/scripts/check_distribution.py
+```
+
+The project license is pending maintainer selection. Before public release,
+review dependency and bundled-data redistribution terms and the Git history
+that will become visible. The optional ns-3 backend is
+[GPL-2.0-only](https://pypi.org/project/ns3/3.44.post0/); the bundled IERS data
+retains its own license and provenance. Passing software tests does not replace
+validation of model assumptions and scientific reference results.
