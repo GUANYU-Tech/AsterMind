@@ -274,10 +274,88 @@ Network transport is selected by `physical_network.network.transport_model`:
 
 | Value | Execution and contention |
 | --- | --- |
-| `queue` (default) | Whole-message store-and-forward; one transmission occupies a link direction and later messages queue. |
+| `queue` | Whole-message store-and-forward; one transmission occupies a link direction and later messages queue. |
 | `fluid` | OrbitServe equal-share fluid service; arrivals, completions and capacity changes update the shares of active flows. |
+| `flowsim` (default) | AsterMind FlowSim provides max-min sharing of directed hops and aggregate RF pools; OrbitServe drives network state and the event clock. |
 | `simgrid` | Real SimGrid 4.1 CM02 activities share each directed physical hop; native activity completion drives the Runtime event queue. |
 | `ns3` | Real ns-3 point-to-point serialization with 1400-byte payload packets, 2-byte PPP overhead and packet round-robin admission. |
+
+The default FlowSim backend requires the shared-runtime `_flowsim` extension
+from a separately prepared AsterMind checkout. Install that checkout into the
+same Python environment (`python -m pip install -e /path/to/astermind`) for
+the extension, standalone CLI and joint serving bridge. On the configured
+workstation, `third_party/astermind` holds the modified local checkout; it and
+the root workstation-only build adapter are ignored by Git and are not supplied
+by an OrbitServe checkout. Joint examples require that local dependency to be
+prepared first. An older `_flowsim` fails explicitly.
+OrbitServe supplies candidate links and updates capacity at runtime; FlowSim
+retains in-flight bytes during capacity changes and shares each directed hop
+and applicable RF pools across all flows. OrbitServe handles per-hop routing,
+propagation, network visibility, and link recovery. New candidate edges added
+after the simulation begins are not yet supported by this backend. A lost
+contact follows OrbitServe's existing interrupted-hop policy: partial bytes on
+that hop are discarded on retry, while completed hops are retained.
+
+An experimental joint run can pass `compute_runtime=AsterMindRuntime(cells)`
+to `run_simulation`, with `AsterMindRuntime` and `AsterMindCell` imported from
+`orbitserve.runtime.engine.astermind_bridge`. The `cells` mapping associates
+each selectable compute node with `AsterMindCell(config, rank_mapping,
+repository)`, where the rank mapping covers exactly the physical cell members.
+OrbitServe owns the clock and network; each cell runs a Midlayer scheduler and
+submits its collective flows into that same network. FlowSim is the default;
+select `transport_model="ns3"` for the packet-level alternative. The current bridge accepts
+independent requests with at least one output token. Cross-request KV reuse,
+request cancellation and recovery of a failed active cell are not yet supported;
+an active serving failure aborts the run. Compute energy uses OrbitServe's
+per-token admission estimate, not Midlayer kernel-level energy. Collective
+communication is recorded against the cell, not attributed to individual
+requests in their path or energy ledgers. OrbitServe's shadow DVFS policy is
+not supported in this mode. The existing queue and legacy backends remain
+available pending full integration.
+
+`examples/astermind_joint/full_serving.py` runs a 72-plane, 22-satellite-per-plane
+communication shell and two compute replicas on dawn-dusk reference orbits.
+Use `--users single|multi`, `--parallel tp_pp|ep` and `--backend flowsim|ns3`:
+
+```bash
+python examples/astermind_joint/full_serving.py --users multi --parallel tp_pp \
+  --backend flowsim --output local/results/full-serving/multi-tp_pp-flowsim.json
+python examples/astermind_joint/full_serving.py --users multi --parallel tp_pp \
+  --backend ns3 --output local/results/full-serving/multi-tp_pp-ns3.json
+```
+
+The single-user case submits one request; the multi-user case submits eight
+independent requests from four users. Inputs and replies traverse actual eligible
+ground, communication-shell and compute-access hops. Qwen3-4B uses TP2 and PP2
+within each four-satellite replica; Qwen3-30B-A3B uses TP2 and EP2 within each
+two-satellite replica. Replica-level request dispatch is separate from native
+worker-pool DP, which remains one. Midlayer predicts kernel latencies and lowers
+collectives; these runs do not execute model weights or generate text. EP uses
+explicit seeded routing assumptions. Formation offsets are prescribed in LVLH
+around SGP4 reference states, rather than independently propagated formation orbits.
+
+On the configured workstation, the original local console at port 8766 exposes
+`/serving?users=multi&parallel=tp_pp&backend=flowsim` and the corresponding
+`backend=ns3` view. It retains the original 3D Earth and satellite renderer.
+Both views replay executed events; the page can launch a new simulation.
+FlowSim shows continuous flow service with changing allocated bandwidth. The
+ns-3 view shows packet serialization intervals recorded at native `PhyTxEnd`
+events, with exact logical payload, wire size and message offset. Link zoom,
+slow playback and a contention jump expose simultaneous fluid sharing versus
+packet interleaving. The 3D packet marker's position encodes its message byte
+offset, not a packet's propagation trajectory: propagation still follows the
+OrbitServe whole-message per-hop model. Optional packet recording is disabled
+for ordinary runs; this demonstration enables it explicitly.
+
+`examples/astermind_joint/collectives.py` runs four-rank training communication
+graphs (`--mode ring4` for one formation cell, `--mode multi` for four single-satellite
+cells), with FlowSim or ns-3. It uses Midlayer's collective lowering and validates
+all 51 primitive completions and dependency ordering while three background
+requests arrive. SGP4 propagates an initial LTAN-06:00 dawn-dusk design; the formation
+case prescribes a square in the reference satellite's LVLH frame. The workload
+models communication and configured compute barriers, not a full training compute
+or accuracy model. On the configured workstation, the original local 8766 console
+exposes `/collectives` with its existing Earth, satellite, cell and transfer renderer.
 
 Install ns-3 separately with `python3 -m pip install ".[ns3]"` on a supported
 platform, with a C++20 compiler available (`sudo apt-get install build-essential`
@@ -290,7 +368,7 @@ payload to an integer byte and adds the 2-byte PPP header. Padding is not counte
 as delivered application data.
 OrbitServe still performs hop selection, propagation and fault recovery; this
 adapter does not simulate TCP or IP routing. Selecting a missing native backend
-fails explicitly. The default queue and fluid backends require neither library.
+fails explicitly. The queue and fluid backends require neither library.
 
 SimGrid 4.1 may build from source. On Ubuntu or Ubuntu under WSL, install its
 system build dependencies before installing the optional backend:

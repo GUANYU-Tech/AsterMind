@@ -9,7 +9,7 @@ from orbitserve.runtime.engine.ns3_transport import Ns3Transport, Ns3Unavailable
 @unittest.skipUnless(importlib.util.find_spec('ns'), 'Install OrbitServe[ns3] for native ns-3 checks')
 class NativeNs3Tests(unittest.TestCase):
     def setUp(self):
-        self.engine = Ns3Transport(('a','b'), [{'endpoint_a':'a','endpoint_b':'b','link_id':'ab','kind':'isl'}], {'isl':SimpleNamespace(bandwidth_bps=8_000_000)})
+        self.engine = Ns3Transport(('a','b'), [{'endpoint_a':'a','endpoint_b':'b','link_id':'ab','kind':'isl'}], {'isl':SimpleNamespace(bandwidth_bps=8_000_000)}, record_packets=True)
         self.addCleanup(self.engine.close)
         self.leg = {'source_node_id':'a','target_node_id':'b','link_id':'ab'}
         self.key = self.engine.resource(self.leg)
@@ -25,6 +25,13 @@ class NativeNs3Tests(unittest.TestCase):
         second=self.engine.advance_until(.1)
         self.assertAlmostEqual(second['time_s'],.005608,places=9)
         self.assertEqual(second['completed'],['two'])
+        packets=self.engine.packet_trace
+        self.assertEqual([p['transfer_id'] for p in packets],['one','two','one','two'])
+        self.assertEqual([p['offset_bytes'] for p in packets],[0,0,1400,1400])
+        self.assertEqual(sum(p['payload_bytes'] for p in packets),5600)
+        self.assertEqual(sum(p['wire_bytes'] for p in packets),5608)
+        self.assertEqual(self.engine.provenance['native_counters']['packets_started'],4)
+        self.assertTrue(all(p['start_s'] < p['finish_s'] for p in packets))
         self.assertEqual(self.engine.provenance['completion_source'],'native_ns3_point_to_point_phy_tx_end')
 
     def test_partial_progress_cancel_and_independent_reverse_direction(self):
@@ -39,6 +46,15 @@ class NativeNs3Tests(unittest.TestCase):
         done=self.engine.advance_until(.1)
         self.assertEqual(done['completed'],['reverse'])
         self.assertAlmostEqual(done['time_s'],.001402,places=9)
+
+    def test_disabling_packet_trace_retains_native_counters(self):
+        self.engine._request({'op': 'trace', 'enabled': False})
+        self.engine.start('untraced', self.leg, 2800)
+        done = self.engine.advance_until(.1)
+        self.assertEqual(done['completed'], ['untraced'])
+        self.assertEqual(self.engine.packet_trace, [])
+        self.assertEqual(self.engine.provenance['native_counters']['packets_started'], 2)
+        self.assertEqual(self.engine.provenance['native_counters']['wire_bytes_started'], 2804)
 
     def test_fractional_runtime_boundary_advances_without_zero_time_rpc_loop(self):
         boundary=.1234567891234

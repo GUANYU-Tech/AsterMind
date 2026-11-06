@@ -230,7 +230,7 @@ class NetworkSpec:
     ground_access_policy: str = "nearest_distance"
     communication_shells: tuple[dict, ...] = ()
     cell_topologies: dict[str, str] = field(default_factory=dict)
-    transport_model: str = "queue"
+    transport_model: str = "flowsim"
     # Unexpected outages: revealed only at start_s to online Runtime routing.
     faults: tuple[dict, ...] = ()
     failure_policy: str = "fail"
@@ -274,8 +274,8 @@ class NetworkSpec:
             raise ValueError("unsupported failure_policy")
         if type(self.max_transfer_retries) is not int or self.max_transfer_retries < 0:
             raise ValueError("max_transfer_retries must be a nonnegative integer")
-        if self.transport_model not in {"queue", "fluid", "simgrid", "ns3"}:
-            raise ValueError("transport_model must be queue, fluid, simgrid or ns3")
+        if self.transport_model not in {"queue", "fluid", "simgrid", "ns3", "flowsim"}:
+            raise ValueError("transport_model must be queue, fluid, simgrid, ns3 or flowsim")
         nodes = tuple(
             n if isinstance(n, NetworkNodeSpec) else NetworkNodeSpec(**n)
             for n in self.nodes

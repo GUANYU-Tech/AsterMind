@@ -8,6 +8,8 @@
 !/docs/research/positioning/l2_compute_node_iteration.md
 # Generated experiment output.
 /results/
+/log/
+*.log
 # Downloaded third-party workload traces and locally materialized BurstGPT bundles.
 /src/workloads/BurstGPT/data/
 /src/workloads/BurstGPT/bundles/
@@ -31,6 +33,19 @@ __pycache__/
 .ruff_cache/
 # Personal network console and visual diagnostics (not distributed).
 /local/
+
+# Local third-party checkouts and their workstation-only build adapter.
+# Keep these on disk, but do not commit or force-add them.
+/third_party/
+/third-party/
+/setup.py
+/MANIFEST.in
+# Superseded schematic demo; the original 8766 console stays under /local/.
+/examples/astermind_joint/index.html
+/examples/astermind_joint/replay.html
+/examples/astermind_joint/replay.js
+/examples/astermind_joint/run.py
+/examples/astermind_joint/server.py
 
 # Personal agent instructions and packaging intermediates.
 /AGENTS.md

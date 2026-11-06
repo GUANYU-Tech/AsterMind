@@ -17,7 +17,7 @@ def run_experiment(spec, *, output_dir=None, progress=None, _workers=None):
         from orbitserve.runtime import check_network_backend
 
         check_network_backend(
-            spec.physical_network["network"].get("transport_model", "queue")
+            spec.physical_network["network"].get("transport_model", "flowsim")
         )
     root = Path(
         output_dir

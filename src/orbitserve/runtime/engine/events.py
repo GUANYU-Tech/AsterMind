@@ -142,6 +142,8 @@ def _execute_requests(engine, requests, trace, capacity):
                 "request_arrival",
                 request["request_id"],
             )
+    if engine.compute_runtime:
+        engine.compute_runtime.initialize(engine, requests)
     for frame in network.frames:
         engine.push(frame["time_s"], 0, "network_update", None)
     for event in network.events:
@@ -200,6 +202,7 @@ def _execute_requests(engine, requests, trace, capacity):
                 'simgrid': 'simgrid_cm02_shared_directed_hops',
                 'fluid': 'orbitserve_equal_share_fluid_directed_hops',
                 'ns3': 'ns3_point_to_point_packet_round_robin',
+                'flowsim': 'flowsim_shared_directed_hops',
             }.get(engine.net.spec.transport_model)
             if engine.transport
             else "directed_full_duplex_reservation_calendar",
@@ -209,8 +212,8 @@ def _execute_requests(engine, requests, trace, capacity):
             if engine.transport
             else "directed_reservation_calendar",
             "compute_queue_model": "ready_order_fifo_concurrency_slots",
-            "serving_rate_model": "admission_snapshot_fixed_rate",
-            "internal_collectives": "serving_embedded_with_physical_connectivity_gate",
+            "serving_rate_model": getattr(engine.compute_runtime, "serving_rate_model", "astermind_midlayer") if engine.compute_runtime else "admission_snapshot_fixed_rate",
+            "internal_collectives": f"{engine.net.spec.transport_model}_shared_network" if engine.compute_runtime else "serving_embedded_with_physical_connectivity_gate",
             "fault_semantics": ('boundary_fault_buffered_sender_retry_same_boundary'
                                 if network.spec.fault_timing == 'boundary' else
                                 "continuous_fault_buffered_sender_retry_on_observed_change"),
@@ -226,8 +229,9 @@ def _execute_requests(engine, requests, trace, capacity):
 
 class _EventEngine:
     def __init__(self, spec, environment, energy, state, eligible):
-        from .control import current_controller
+        from .control import current_controller, current_compute_runtime
         self.controller = current_controller()
+        self.compute_runtime = current_compute_runtime()
         self.spec, self.env, self.energy, self.state, self.eligible = (
             spec,
             environment,
@@ -241,6 +245,7 @@ class _EventEngine:
             float(spec.time_horizon_s) if spec.time_horizon_s is not None else math.inf,
         )
         self.jobs, self.heap, self.log = {}, [], []
+        self.service_jobs = {}
         self.followers = defaultdict(list)
         self.active_compute = {}
         self.waiting = defaultdict(deque)
@@ -262,12 +267,15 @@ class _EventEngine:
                 self.net.nodes, self.net.edges, self.net.spec.link_profiles
             )
             self.transport_provenance = self.transport.provenance
-        elif self.net.spec.transport_model in {'fluid', 'ns3'}:
+        elif self.net.spec.transport_model in {'fluid', 'ns3', 'flowsim'}:
             if self.net.spec.transport_model == 'fluid':
                 from .fluid_transport import FluidTransport as Transport
-            else:
+            elif self.net.spec.transport_model == 'ns3':
                 from .ns3_transport import Ns3Transport as Transport
-            self.transport = Transport(self.net.nodes, self.net.edges, self.net.spec.link_profiles)
+            else:
+                from .flowsim_transport import FlowSimTransport as Transport
+            options = {'record_packets': getattr(self.compute_runtime, 'record_packets', False)} if self.net.spec.transport_model == 'ns3' else {}
+            self.transport = Transport(self.net.nodes, self.net.edges, self.net.spec.link_profiles, **options)
             self.transport_provenance = self.transport.provenance
 
     def push(self, time, priority, kind, request_id=None, payload=None):
@@ -278,7 +286,14 @@ class _EventEngine:
             self.heap, (float(time), priority, self.sequence, kind, request_id, payload)
         )
 
+    def message_owner(self, request_id):
+        return self.jobs.get(request_id) or self.service_jobs[request_id]
+
     def fail(self, job, reason):
+        if job.get('external_service'):
+            raise RuntimeError(f"external compute communication failed: {reason}")
+        if self.compute_runtime and job['request']['request_id'] in self.compute_runtime.jobs:
+            raise RuntimeError(f"in-flight AsterMind request failed: {reason}")
         pending = [(job, reason)]
         while pending:
             current, current_reason = pending.pop()
@@ -329,8 +344,12 @@ class _EventEngine:
             self.controller.finished(self)
 
     def close(self):
-        if self.transport:
-            self.transport.close()
+        try:
+            if self.compute_runtime:
+                self.compute_runtime.close()
+        finally:
+            if self.transport:
+                self.transport.close()
 
     def _run(self):
         while self.heap:
@@ -349,7 +368,7 @@ class _EventEngine:
             self.now = time
             if kind in {'link_state', 'network_update'} and (payload or {}).get('revision', 0) != self.net.revision:
                 continue
-            job = self.jobs.get(request_id)
+            job = self.jobs.get(request_id) or self.service_jobs.get(request_id)
             if job and job["done"]:
                 continue
             if isinstance(payload, dict) and payload.get('cancelled') and kind != 'retry_transfer':
@@ -390,7 +409,7 @@ class _EventEngine:
                 details["compute_node_id"] = job["node"]
             if isinstance(payload, dict):
                 details.update({k: payload[k] for k in ('phase', 'pipeline_stage', 'operation', 'members', 'bytes', 'attempt') if k in payload})
-                details.update({k: v for k, v in payload.get('context', {}).items() if k != 'origin'})
+                details.update({k: v for k, v in payload.get('context', {}).items() if k not in {'origin', 'callback'}})
             self.log.append(
                 {
                     "time_s": time,
@@ -415,7 +434,7 @@ class _EventEngine:
                             continue
                         current = self.net.link_at(leg['link_id'], self.now)
                         if current['state'] != 'UP' or current.get('setup_start_s') != leg.get('setup_start_s'):
-                            self.interrupt_transfer(self.jobs[message['request_id']], message,
+                            self.interrupt_transfer(self.message_owner(message['request_id']), message,
                                                     'network_contact_lost_during_transmission')
                 if kind == "network_update":
                     for active in tuple(self.active_compute.values()):
@@ -455,18 +474,24 @@ class _EventEngine:
     def on_control_boundary(self, unused, payload):
         self.controller.checkpoint(self)
 
+    def on_external_callback(self, unused, callback):
+        callback()
+
+    def on_external_flow_done(self, unused, callback):
+        callback['callback']()
+
     def wake_retries(self):
         """Retry against a newly observed graph, including mid-sample repairs."""
         pending, self.waiting_retries = self.waiting_retries, {}
         for message in pending.values():
-            if not self.jobs[message['request_id']]['done']:
+            if not self.message_owner(message['request_id'])['done']:
                 self.push(self.now, 25, 'retry_transfer', message['request_id'], message)
 
     def interrupt_unavailable(self, reason):
         for message in tuple(self.messages.values()):
             leg = message['leg']
             if self.net.link_at(leg['link_id'], self.now)['state'] == 'DOWN':
-                self.interrupt_transfer(self.jobs[message['request_id']], message, reason)
+                self.interrupt_transfer(self.message_owner(message['request_id']), message, reason)
         for job in tuple(self.active_compute.values()):
             if not self.cell_available(job['node']):
                 self.fail(job, 'compute_cell_disconnected_during_service')
@@ -504,6 +529,8 @@ class _EventEngine:
             except (NetworkUnavailable, EnergyWindowError, ValueError):
                 continue
             candidate = forecast["candidate"]
+            if self.compute_runtime and hasattr(self.compute_runtime, 'candidate_load'):
+                candidate = replace(candidate, compute_load_score=self.compute_runtime.candidate_load(node))
             candidates.append(candidate)
             forecasts[candidate.candidate_id] = forecast
         selected = build_candidate_selector(self.spec.strategy).select_action(
@@ -632,7 +659,7 @@ class _EventEngine:
                 current["state"] != "UP"
                 or current.get("setup_start_s") != leg["contact_setup_start_s"]
             ):
-                self.interrupt_transfer(self.jobs[self.shared_messages[identity]['request_id']], self.shared_messages[identity], "network_contact_lost_during_transmission")
+                self.interrupt_transfer(self.message_owner(self.shared_messages[identity]['request_id']), self.shared_messages[identity], "network_contact_lost_during_transmission")
                 continue
             value = self.net.directional_attributes(current, leg['source_node_id'], leg['target_node_id'], self.now)['bandwidth_bps']
             if self.shared_capacities.get(row["key"]) != value:
@@ -746,14 +773,14 @@ class _EventEngine:
         for message in tuple(self.messages.values()):
             if self.net.faulted(message['leg']):
                 kind = 'node' if failed_nodes.intersection((message['leg']['source_node_id'],message['leg']['target_node_id'])) else 'link'
-                self.interrupt_transfer(self.jobs[message['request_id']], message, 'injected_' + kind + '_failure')
+                self.interrupt_transfer(self.message_owner(message['request_id']), message, 'injected_' + kind + '_failure')
         for job in tuple(self.active_compute.values()):
             if failed_nodes.intersection(self.members(job['node'])):
                 self.fail(job, 'compute_member_failed_no_checkpoint')
         for identity, message in tuple(self.waiting_retries.items()):
             if message['resume_node'] in failed_nodes:
                 self.waiting_retries.pop(identity, None)
-                self.fail(self.jobs[message['request_id']], 'forwarding_buffer_lost_on_node_failure')
+                self.fail(self.message_owner(message['request_id']), 'forwarding_buffer_lost_on_node_failure')
         self.wake_retries()
 
     def schedule_reallocation(self):
@@ -947,6 +974,12 @@ class _EventEngine:
         )
 
     def on_input_done(self, job, unused):
+        if self.compute_runtime:
+            self.compute_runtime.submit(self, job)
+            return
+        self.on_analytical_input_done(job, unused)
+
+    def on_analytical_input_done(self, job, unused):
         from .simulator import _preview_kv_copy
 
         request, node = job["request"], job["node"]
@@ -1301,7 +1334,7 @@ class _EventEngine:
                 "network_transport": self.transport_provenance,
                 "trace_model": self.env.trace_model,
                 "serving_concurrency_at_admission": job["concurrency"],
-                "serving_rate_model": "admission_snapshot_fixed_rate",
+                "serving_rate_model": getattr(self.compute_runtime, "serving_rate_model", "astermind_midlayer") if self.compute_runtime else "admission_snapshot_fixed_rate",
                 "trace_id": self.env.trace_id,
                 "score": job["selection"].score,
                 "compute_ready_s": job["compute_ready_s"],

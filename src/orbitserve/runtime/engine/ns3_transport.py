@@ -18,10 +18,14 @@ class Ns3Transport(SimGridTransport):
     error_type = Ns3Unavailable
     check_available = staticmethod(require_ns3)
 
-    def __init__(self, nodes, edges, profiles, *, start_s=0.0):
+    def __init__(self, nodes, edges, profiles, *, start_s=0.0, record_packets=False):
         super().__init__(nodes, edges, profiles, start_s=start_s)
+        self.packet_trace = []
+        if record_packets:
+            self._request({'op':'trace','enabled':True})
         self.provenance = {
             'backend': 'ns3', 'ns3_version': self.provenance['simgrid_version'],
+            'packet_trace_enabled': record_packets,
             'completion_source': 'native_ns3_point_to_point_phy_tx_end',
             'sharing_scope': 'each_directed_physical_hop',
             'packet_payload_bytes': 1400, 'wire_overhead_bytes': 2,
@@ -45,3 +49,9 @@ class Ns3Transport(SimGridTransport):
         for row, (a, b) in zip(rows, ((edge['endpoint_a'], edge['endpoint_b']), (edge['endpoint_b'], edge['endpoint_a']))):
             self.resources[edge['link_id'], a, b] = row['key']
         self.edges = (*self.edges, edge)
+
+    def advance_until(self, time_s):
+        response = super().advance_until(time_s)
+        self.provenance['native_counters'] = response['native_counters']
+        self.packet_trace.extend(response['packets'])
+        return response

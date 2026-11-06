@@ -35,6 +35,7 @@ struct Link {
     bool busy=false;
     std::vector<std::string> pools;
 };
+struct PacketTrace {std::string flow; double start, finish, logical, wire, offset;};
 class Engine {
  public:
     Engine() {Time::SetResolution(Time::PS);}
@@ -44,6 +45,9 @@ class Engine {
     std::map<std::string,double> poolRates;
     std::map<std::string,bool> poolBusy;
     std::string lastServed;
+    double packetsStarted=0, wireBytesStarted=0;
+    std::vector<PacketTrace> packetTrace;
+    bool recordPackets=false;
     double now() {return Simulator::Now().GetSeconds();}
     Link& link(std::string key) {
         if (!links.count(key)) {
@@ -61,6 +65,8 @@ class Engine {
     }
     static void txEnd(Engine* self,std::string key,Ptr<const Packet> packet) {
         auto& row=self->link(key); auto& flow=self->flows.at(row.current);
+        if(self->recordPackets)self->packetTrace.push_back({flow.id,row.start,self->now(),row.bytes,
+                                    static_cast<double>(packet->GetSize()),flow.done});
         if (!flow.cancelled) {
             flow.done+=row.bytes;
             if (flow.done>=flow.total-1e-7) {flow.done=flow.total;self->completed.push_back(flow.id);Simulator::Stop();}
@@ -97,6 +103,7 @@ class Engine {
             row.duration=rate.CalculateBytesTxTime(payload+2).GetSeconds();
             row.busy=true;
             row.device->Send(Create<Packet>(payload),row.device->GetBroadcast(),0x0800);
+            packetsStarted+=1; wireBytesStarted+=payload+2;
             return;
         }
     }
@@ -142,6 +149,9 @@ void* os_create() {
 }
 int os_close(Engine* e) {return checked([&](){ns3::Simulator::Destroy();delete e;});}
 int os_now(Engine* e,double* value) {return checked([&](){*value=e->now();});}
+int os_packetsStarted(Engine* e,double* value) {return checked([&](){*value=e->packetsStarted;});}
+int os_wireBytesStarted(Engine* e,double* value) {return checked([&](){*value=e->wireBytesStarted;});}
+int os_trace(Engine* e,double value) {e->recordPackets=value!=0;return 0;}
 int os_link(Engine* e,const char* key) {return checked([&](){e->link(key);});}
 int os_configure(Engine* e,const char* key,double rate) {return checked([&](){e->configure(key,rate);});}
 int os_addPool(Engine* e,const char* key,double rate) {return checked([&](){e->addPool(key,rate);});}
@@ -153,6 +163,14 @@ int os_progress(Engine* e,const char* id,double* value) {return checked([&](){*v
 size_t os_completedCount(Engine* e) {return e->completed.size();}
 const char* os_completedAt(Engine* e,size_t i) {return e->completed.at(i).c_str();}
 int os_clearCompleted(Engine* e) {e->completed.clear();return 0;}
+size_t os_packetCount(Engine* e) {return e->packetTrace.size();}
+const char* os_packetFlow(Engine* e,size_t i) {return e->packetTrace.at(i).flow.c_str();}
+double os_packetValue(Engine* e,size_t i,int field) {
+    const auto& p=e->packetTrace.at(i);
+    switch(field){case 0:return p.start;case 1:return p.finish;case 2:return p.logical;
+                  case 3:return p.wire;default:return p.offset;}
+}
+int os_clearPackets(Engine* e) {e->packetTrace.clear();return 0;}
 }
 '''
 
@@ -201,10 +219,10 @@ class NativeEngine:
         pointer, string, number = ctypes.c_void_p, ctypes.c_char_p, ctypes.c_double
         output = ctypes.POINTER(number)
         signatures = {
-            'close': [], 'now': [output], 'link': [string], 'configure': [string, number],
+            'close': [], 'trace': [number], 'now': [output], 'packetsStarted': [output], 'wireBytesStarted': [output], 'link': [string], 'configure': [string, number],
             'addPool': [string, number], 'attachPool': [string, string],
             'start': [string, string, number], 'cancel': [string], 'advance': [number],
-            'progress': [string, output], 'clearCompleted': [],
+            'progress': [string, output], 'clearCompleted': [], 'clearPackets': [],
         }
         for name, arguments in signatures.items():
             function = getattr(self.lib, f'os_{name}')
@@ -214,6 +232,9 @@ class NativeEngine:
         self.lib.os_create.argtypes, self.lib.os_create.restype = [], pointer
         self.lib.os_completedCount.argtypes, self.lib.os_completedCount.restype = [pointer], ctypes.c_size_t
         self.lib.os_completedAt.argtypes, self.lib.os_completedAt.restype = [pointer, ctypes.c_size_t], string
+        self.lib.os_packetCount.argtypes, self.lib.os_packetCount.restype = [pointer], ctypes.c_size_t
+        self.lib.os_packetFlow.argtypes, self.lib.os_packetFlow.restype = [pointer, ctypes.c_size_t], string
+        self.lib.os_packetValue.argtypes, self.lib.os_packetValue.restype = [pointer, ctypes.c_size_t, ctypes.c_int], number
         self.handle = self.lib.os_create()
         if not self.handle:
             self.build.cleanup()
@@ -278,6 +299,9 @@ def serve(engine):
                     for pool in row.get('pools', ()):
                         engine.call('attachPool', row['key'], pool)
                 emit({'registered': True})
+            elif op == 'trace':
+                engine.call('trace', float(bool(command['enabled'])))
+                emit({'tracing': bool(command['enabled'])})
             elif op == 'configure':
                 for key, rate in command['capacities'].items():
                     engine.call('configure', key, rate)
@@ -299,7 +323,16 @@ def serve(engine):
                 engine.call('clearCompleted')
                 progress = {i: max(0.0, engine.value('progress', i) - before[i]) for i in active}
                 active.difference_update(done)
-                emit({'completed': sorted(done), 'bytes_sent': progress, 'interval_start_s': start})
+                packets=[]
+                for i in range(engine.lib.os_packetCount(engine.handle)):
+                    values=[engine.lib.os_packetValue(engine.handle,i,field) for field in range(5)]
+                    packets.append({'transfer_id':engine.lib.os_packetFlow(engine.handle,i).decode('utf8'),
+                                    **dict(zip(('start_s','finish_s','payload_bytes','wire_bytes','offset_bytes'),values))})
+                engine.call('clearPackets')
+                emit({'completed': sorted(done), 'bytes_sent': progress, 'interval_start_s': start,
+                      'packets': packets,
+                      'native_counters': {'packets_started': int(engine.value('packetsStarted')),
+                                          'wire_bytes_started': int(engine.value('wireBytesStarted'))}})
             else:
                 raise ValueError('unknown ns-3 operation')
         except Exception as error:

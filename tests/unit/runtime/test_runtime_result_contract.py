@@ -27,7 +27,9 @@ class RuntimeResultContractTests(unittest.TestCase):
                 "SUN_GEOMETRY_VERSION", "sun_positions_from_trace",
             },
         )
-        self.assertEqual(tuple(inspect.signature(runtime.run_simulation).parameters), ("simulation_spec",))
+        parameters = inspect.signature(runtime.run_simulation).parameters
+        self.assertEqual(tuple(parameters), ("simulation_spec", "compute_runtime"))
+        self.assertEqual(parameters["compute_runtime"].kind, inspect.Parameter.KEYWORD_ONLY)
         self.assertFalse(hasattr(runtime, "RuntimeScenario"))
         self.assertFalse(hasattr(runtime, "run_runtime_engine"))
 
