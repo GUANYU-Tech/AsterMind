@@ -1,10 +1,9 @@
-"""Virtual-time infrastructure shared by independently scheduled serving cells."""
+"""Cell event contracts backed by the platform-wide GlobalTimeline."""
 
 from dataclasses import dataclass
-import heapq
-import itertools
 import math
-from typing import Callable
+
+from ..timeline import GlobalTimeline
 
 
 ARRIVAL = 0
@@ -96,45 +95,11 @@ class CellWaitInterval:
             raise ValueError("invalid Cell wait interval")
 
 
-class CellEventLoop:
-    """Dispatch same-time arrivals before completion, then local planning.
+class CellEventLoop(GlobalTimeline):
+    """Compatibility name for code that already receives the global timeline.
 
-    Priorities reproduce synchronous depth-one Midlayer device-only ordering.
-    Wall-clock computation does not advance this clock. Cells never poll.
+    This class intentionally adds no state and owns no local queue.  New code
+    should depend on :class:`orbitserve.runtime.timeline.GlobalTimeline`.
     """
 
-    def __init__(self):
-        self.now_s = 0.0
-        self._events = []
-        self._ordinal = itertools.count()
-        self.events = []
-
-    def schedule(self, at_s: float, priority: int, label: str, callback: Callable):
-        if not math.isfinite(at_s) or at_s < self.now_s:
-            raise ValueError("cannot schedule a past/nonfinite event")
-        if priority not in (ARRIVAL, STEP_COMPLETE, NOTIFY, DISPATCH):
-            raise ValueError("unknown event priority")
-        if not callable(callback):
-            raise TypeError("event callback must be callable")
-        heapq.heappush(self._events, (at_s, priority, next(self._ordinal), label, callback))
-
-    def run(self, *, until_s: float | None = None, max_events: int = 100000):
-        if until_s is not None and (not math.isfinite(until_s) or until_s < self.now_s):
-            raise ValueError("invalid event horizon")
-        handled = 0
-        while self._events:
-            if until_s is not None and self._events[0][0] > until_s:
-                break
-            if handled >= max_events:
-                raise RuntimeError("event limit reached; simulation did not drain")
-            at_s, priority, _, label, callback = heapq.heappop(self._events)
-            self.now_s = at_s
-            self.events.append({"time_s": at_s, "priority": priority, "event": label})
-            callback()
-            handled += 1
-        if until_s is not None:
-            self.now_s = until_s
-
-    @property
-    def pending_count(self):
-        return len(self._events)
+    pass
