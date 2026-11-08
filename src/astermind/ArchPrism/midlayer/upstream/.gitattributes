@@ -1,0 +1,4 @@
+# Complete in-repository Mid-Layer snapshot.
+# Canonical source/config/data bytes are preserved on every platform.
+# Original LFS payloads are materialized as regular files in this repository.
+* -text -filter

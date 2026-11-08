@@ -1,0 +1,16 @@
+# UniNDP produces decomposed eager-attention/MoE upper-bound observations.
+schema_version: 1
+hardware_id: samsung_hbm_pim
+
+kernel:
+  pipeline:
+    workloads: [gemm, eager_attn, unfused_moe, vector]
+    settings:
+      unindp_arch: hbm-pim
+      unindp_topk: 1
+      unindp_quicksearch: true
+      sim_timeout_s: 30
+      unindp_workspace_subdir: unindp_workspace
+
+serving:
+  suites: {}

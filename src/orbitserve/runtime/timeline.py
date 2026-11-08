@@ -48,6 +48,10 @@ class GlobalTimeline:
     def pending_count(self) -> int:
         return len(self._queue)
 
+    @property
+    def next_event_time_s(self) -> float | None:
+        return self._queue[0][0] if self._queue else None
+
     def schedule(
         self,
         at_s: float,

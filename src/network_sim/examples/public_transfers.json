@@ -1,0 +1,4 @@
+[
+  {"id": "flow0", "source": "gpu0", "target": "gpu2", "size_bytes": 1000000, "origin": "test", "operation": "example_transfer"},
+  {"id": "flow1", "source": "gpu1", "target": "gpu3", "size_bytes": 1000000, "origin": "test", "operation": "example_transfer"}
+]

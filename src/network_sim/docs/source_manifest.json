@@ -1,0 +1,60 @@
+{
+  "source_package": "astermind-feature-flowsim-web-integration",
+  "files": [
+    {
+      "source": "src/astermind/interfaces.py",
+      "local": "physical/_vendor/astermind_interfaces.py",
+      "original_sha256": "b34e5ffeaf9a83b108815cf99421db665bd75621f85bc39f56bbe1369d6bbe82",
+      "local_sha256": "8719f33cc203d2aee402939ed793de593e7809c5d980a98647d811d2148c41bd",
+      "modified": false
+    },
+    {
+      "source": "third_party/flowsim/include/flowsim/flowsim.hh",
+      "local": "comm/_vendor/flowsim/include/flowsim/flowsim.hh",
+      "original_sha256": "fd2f0929f7042af0e345f8cc889e03e7eea58f4112fb84e98283bd0588ea87b3",
+      "local_sha256": "057e44c50c86ba55e9d7ec432cca192d838547ee71aae49644dce824e2b325a9",
+      "modified": true
+    },
+    {
+      "source": "third_party/flowsim/src/topology.cc",
+      "local": "comm/_vendor/flowsim/src/topology.cc",
+      "original_sha256": "e052d6a1e9952a2376ba4679a99a970a4b7d10d3a8612f5cfa069e89983df62e",
+      "local_sha256": "d0d6520c7550185979cfcbbc1fd06173be4c96d7b87641f32aae52c3fd6ff67b",
+      "modified": true
+    },
+    {
+      "source": "third_party/flowsim/src/event_simulator.cc",
+      "local": "comm/_vendor/flowsim/src/event_simulator.cc",
+      "original_sha256": "356526e6aab55ac11ebb82f6345c1ee0ddb5ad323ed3a885bfae0a4adf3e5df4",
+      "local_sha256": "52997526a401f4b854f476c236a5cbf22a14511213dc90c0692c37a4e539b9e2",
+      "modified": true
+    },
+    {
+      "source": "third_party/flowsim/src/simulator.cc",
+      "local": "comm/_vendor/flowsim/src/simulator.cc",
+      "original_sha256": "32e617f10cd05f2c113097a5522b3afe686035efa2e788d0d6085e2ab776ed1d",
+      "local_sha256": "5c771c69b8042c9ee2417c53714d540d1d135c623f75641a0c074b25e3ef5a01",
+      "modified": false
+    },
+    {
+      "source": "third_party/flowsim/tests/test_flowsim.cc",
+      "local": "comm/_vendor/flowsim/tests/test_flowsim.cc",
+      "original_sha256": "62e80d0c7ca88cd196a7d309635aa2debd37d817ed260a86dbd564fe2a1bc678",
+      "local_sha256": "001fba1a8065549918688b9642d24399846fb9456d4014c12d21604b6b0995b3",
+      "modified": false
+    }
+  ],
+  "orbitserve_reference": {
+    "source": "src/orbitserve/runtime/engine/communication.py",
+    "local": "physical/_vendor/orbitserve_link_selection.py",
+    "source_sha256": "7bbd86fd93db14d1ed369ed853d33a1a215519b4c705aa7f5ef2b79dfedd176c",
+    "local_sha256": "f1e4ad2fd26d2dc4c192218b343e6a46ec15f6295009b3260c67d61cb256015b",
+    "functions": [
+      "_edge_sort_key",
+      "_degree_limited_edges",
+      "_select_terminal_edges"
+    ],
+    "verification": "AST identical for all copied selection methods; wrapper only constructs self.topology and self.isl_terminal_count"
+  },
+  "version": "0.2"
+}

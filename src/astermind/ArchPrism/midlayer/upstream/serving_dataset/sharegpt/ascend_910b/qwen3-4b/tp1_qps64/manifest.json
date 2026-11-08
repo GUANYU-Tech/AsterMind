@@ -1,0 +1,324 @@
+{
+  "alignment_steps": {
+    "compressed_sha256": "548afe79dbedc43767bbfc1ce076751232ccaacaf95382fbf5c55283a0f405b5",
+    "compression": "zstd",
+    "path": "alignment_steps.json.zst",
+    "phases": {
+      "decode": {
+        "rank_ids": [
+          0
+        ],
+        "status": "available"
+      },
+      "mixed": {
+        "rank_ids": [
+          0
+        ],
+        "status": "available"
+      },
+      "prefill": {
+        "rank_ids": [
+          0
+        ],
+        "status": "available"
+      }
+    },
+    "sha256": "7411b461a13e4d9a604e00c72e146b63c11fd73d6382b7b43215ae02b2f53298",
+    "status": "available"
+  },
+  "capture": {
+    "metrics_source_archive_id": "accepted-ground-truth-full-depth2-v3",
+    "observer_effect_validation": {
+      "baseline_run_id": "canary_trace_off_r2/ground_truth.json",
+      "instrumented_run_id": "canary_trace_on_r2/ground_truth.json",
+      "metric_delta_percent": {
+        "e2e": 0.8485837593609259,
+        "output_token_throughput": 1.048628929205233,
+        "request_throughput": 1.0486289292052249,
+        "tpot": 0.6670355313309249,
+        "ttft": 2.222282275999771
+      },
+      "passed": true,
+      "status": "inherited_from_representative_case",
+      "threshold_percent": 3.0,
+      "validation_case_id": "ascend_910b/qwen3-8b/tp1_qps4"
+    },
+    "profiler_attached": false,
+    "requests_source_archive_ids": [
+      "accepted-ground-truth-v3"
+    ],
+    "run_id": "tp1_qps64/ground_truth.json",
+    "scheduler_source_archive_id": "accepted-scheduler-trace-full-depth2-v3",
+    "scheduler_trace_enabled": true
+  },
+  "converter": {
+    "implementation_id": "midlayer.scheduler_depth_metadata_migration.v1",
+    "selection_rule": "middle_complete_work_bearing_step_v1",
+    "source_commit": "69ef7b7e7df2e48ccad05a10938bcc4c984dc70d"
+  },
+  "identity": {
+    "case_id": "tp1_qps64",
+    "hardware_id": "ascend_910b",
+    "model_id": "qwen3-4b",
+    "model_revision": null,
+    "raw_model_id": "Qwen3-4B",
+    "source_kind": "sharegpt",
+    "tokenizer_revision": null
+  },
+  "metrics": {
+    "path": "metrics.json",
+    "reason": null,
+    "sha256": "ababaf2814cf291c1cc96a3b86ddffa4eb8cf938e75f03b7a919ddf70356885e",
+    "status": "available"
+  },
+  "provenance": {
+    "gaps": [
+      "identity.model_revision: historical raw does not record an immutable model revision",
+      "identity.tokenizer_revision: historical raw does not record an immutable tokenizer revision",
+      "runtime.deployment: historical raw does not record a versioned deployment identity",
+      "runtime.seed: historical raw does not identify one runtime seed contract",
+      "runtime.scheduler_config_sha256: historical raw has no canonical Scheduler config digest",
+      "runtime.source_commit: historical raw does not record source commit",
+      "raw_sources.case-metadata.tool_version: historical raw does not record the producing tool version",
+      "raw_sources.serving-metrics.tool_version: historical raw does not record the producing tool version",
+      "raw_sources.scheduler.tool_version: historical raw does not record the producing tool version",
+      "raw_sources.trace-provenance.tool_version: historical raw does not record the producing tool version",
+      "raw_sources.operators-rank0.tool_version: historical raw does not record the producing tool version",
+      "raw_sources.device-profiler-rank0.tool_version: historical raw does not record the producing tool version",
+      "raw_sources.profiler-metadata-rank0.tool_version: historical raw does not record the producing tool version"
+    ],
+    "raw_source_set_sha256": "6e226612773dd83a0fc287c44a75c7dabe9cf7d85e42e6263dc103f9194aa056"
+  },
+  "raw_sources": [
+    {
+      "archive_id": "case-metadata",
+      "bytes": 443,
+      "relative_path": "meta.json",
+      "role": "case-metadata",
+      "sha256": "7525c68bb92425f0f1f4e2aaeed1636df3aa2be4b234762eaec105ea054a82c7",
+      "tool": "capture-metadata",
+      "tool_version": null
+    },
+    {
+      "archive_id": "serving-metrics",
+      "bytes": 33414,
+      "relative_path": "serving_metrics.json",
+      "role": "serving-metrics",
+      "sha256": "b3c23502ff90e2ffe232d67970dffc8cded37d390b5e017774d3ab567c3606de",
+      "tool": "serving-runtime",
+      "tool_version": null
+    },
+    {
+      "archive_id": "scheduler",
+      "bytes": 777160,
+      "relative_path": "plugin_trace.json_scheduler.jsonl",
+      "role": "scheduler",
+      "sha256": "a484ac8afdbd18d75131c8a49d9cabf3c5ac14a6b9ed4657a732c1aad801cace",
+      "tool": "vllm-scheduler-trace",
+      "tool_version": null
+    },
+    {
+      "archive_id": "trace-provenance",
+      "bytes": 3261,
+      "relative_path": "plugin_trace.json_provenance.json",
+      "role": "trace-provenance",
+      "sha256": "13a865a3edd7424964dd9d711e6cd9bbf8d66359eb89dea59586976567bcd4fc",
+      "tool": "vllm-operator-trace",
+      "tool_version": null
+    },
+    {
+      "archive_id": "operators-rank0",
+      "bytes": 82069244,
+      "relative_path": "plugin_trace.json_operators.jsonl.rank0",
+      "role": "operators-rank0",
+      "sha256": "6b04ef7b5e4669befe54190700150b222852fdefd41a75dbee4f736a7989d871",
+      "tool": "vllm-operator-trace",
+      "tool_version": null
+    },
+    {
+      "archive_id": "runtime-log",
+      "bytes": 18029,
+      "relative_path": "capture.log",
+      "role": "runtime-log",
+      "sha256": "2ec6cff9c0bd1843e4edba5b87aa308bffd2029c0b0175eff2c70e1b01d1d6aa",
+      "tool": "vllm",
+      "tool_version": "0.18.0"
+    },
+    {
+      "archive_id": "device-profiler-rank0",
+      "bytes": 543916032,
+      "relative_path": "msprof/PROF_000001_20260716145415219_ANBIIJCKFBQQEPCC/msprof_20260716150612.db",
+      "role": "device-profiler-rank0",
+      "sha256": "0050ef12806af94aa7974b0681690284702c49c17739c0f9f071a46e75551e2e",
+      "tool": "msprof",
+      "tool_version": null
+    },
+    {
+      "archive_id": "profiler-metadata-rank0",
+      "bytes": 977,
+      "relative_path": "msprof/PROF_000001_20260716145415219_ANBIIJCKFBQQEPCC/device_0/info.json.0",
+      "role": "profiler-metadata-rank0",
+      "sha256": "fde463d003f83b01c7439b1580ba9a85c827d6954995081553102efe4c878cf7",
+      "tool": "msprof",
+      "tool_version": null
+    },
+    {
+      "archive_id": "production-ground-truth",
+      "bytes": 57289,
+      "relative_path": "ground_truth.json",
+      "role": "production-ground-truth",
+      "sha256": "79aab7d6db363107cad150b852ac4aa7a19bc00a67c9789c94af9cdaecccc20e",
+      "tool": "vllm-serving-runtime",
+      "tool_version": "0.18.0"
+    },
+    {
+      "archive_id": "accepted-ground-truth-v3",
+      "bytes": 76053,
+      "relative_path": "trace_on/ground_truth.json",
+      "role": "accepted-ground-truth",
+      "sha256": "16ca61a1ac20e398f1d7d1cfe06982f352b24a0cb379ab59856939a629cd3639",
+      "tool": "midlayer-sharegpt-ground-truth",
+      "tool_version": "1"
+    },
+    {
+      "archive_id": "accepted-scheduler-trace-v3",
+      "bytes": 2833204,
+      "relative_path": "trace_on/scheduler_steps.jsonl",
+      "role": "accepted-scheduler-trace",
+      "sha256": "0a3063f78fd4dc70e5e1c3daace3e2ae70cebadc2eb7646c6204dbcf23f43a19",
+      "tool": "midlayer-vllm-scheduler-trace",
+      "tool_version": "1"
+    },
+    {
+      "archive_id": "scheduler-observer-effect-v1",
+      "bytes": 1358,
+      "relative_path": "tp1_qps16/observer_effect_3pct.json",
+      "role": "scheduler-observer-effect",
+      "sha256": "7a64ba99401a5a6ac717793f8abeba07078e3bea00dba073ad98642a4266e1c6",
+      "tool": "midlayer-scheduler-trace-ab",
+      "tool_version": "1"
+    },
+    {
+      "archive_id": "accepted-ground-truth-full-depth2-v3",
+      "bytes": 69873,
+      "relative_path": "tp1_qps64/ground_truth.json",
+      "role": "accepted-ground-truth",
+      "sha256": "8f5a8334e229eb96ca5f01cf7126232ca54203410e5f6255ccd6c75db25ef9a3",
+      "tool": "midlayer-sharegpt-ground-truth",
+      "tool_version": "1"
+    },
+    {
+      "archive_id": "accepted-scheduler-trace-full-depth2-v3",
+      "bytes": 3442466,
+      "relative_path": "tp1_qps64/scheduler_steps.raw.jsonl",
+      "role": "accepted-scheduler-trace",
+      "sha256": "bb55e92bac43402ec6e94312219558f115b43ac09c5027e89dead37466324760",
+      "tool": "midlayer-vllm-scheduler-trace",
+      "tool_version": "1"
+    },
+    {
+      "archive_id": "scheduler-observer-effect-full-depth2-v1",
+      "bytes": 1511,
+      "relative_path": "20260901_ascend910b_full_depth2_a435/canary_observer_effect_r2.json",
+      "role": "scheduler-observer-effect",
+      "sha256": "6c8d69ffa7b0e87d99ccb0800d64211f1e4925562d7a58f40bd5371aae27392c",
+      "tool": "midlayer-scheduler-trace-ab",
+      "tool_version": "1"
+    },
+    {
+      "archive_id": "scheduler-pipeline-depth-runtime-v1",
+      "bytes": 69873,
+      "relative_path": "external_scheduler_depth/87951a35c43ea3028dfebedcadaf0df9fd204709de3cce99aaecbbdf0b8619ca/ground_truth.json",
+      "role": "scheduler-executor-capacity",
+      "sha256": "8f5a8334e229eb96ca5f01cf7126232ca54203410e5f6255ccd6c75db25ef9a3",
+      "tool": "vllm",
+      "tool_version": "0.18.0"
+    }
+  ],
+  "requests": {
+    "cached_hit_value_evidence": {
+      "derivation": "full_scheduler_token_conservation",
+      "kind": "scheduler_equivalent_representative",
+      "logical_prefix_hit_observability": "unavailable",
+      "net_prefix_work_reduction_tokens": 0,
+      "raw_source_set_sha256": "9bfcef2c776ad3ccf9b72fe9a130a8dc9304a9c2735e304d8e46d696c9f79f63",
+      "representative_value": 0,
+      "source_archive_ids": [
+        "accepted-ground-truth-v3",
+        "accepted-scheduler-trace-v3"
+      ]
+    },
+    "field_provenance": {
+      "Cached hit [tokens]": {
+        "kind": "scheduler_equivalent_representative",
+        "reason": "logical H unavailable; accepted Scheduler trace proves equivalent zero net prefix-work reduction",
+        "source_archive_id": null
+      },
+      "In Token [tokens]": {
+        "kind": "observed_actual",
+        "reason": null,
+        "source_archive_id": "accepted-ground-truth-v3"
+      },
+      "Out Token [tokens]": {
+        "kind": "observed_actual",
+        "reason": null,
+        "source_archive_id": "accepted-ground-truth-v3"
+      },
+      "Query Time Stamp [ms]": {
+        "kind": "observed_actual",
+        "reason": null,
+        "source_archive_id": "accepted-ground-truth-v3"
+      }
+    },
+    "path": "requests.csv",
+    "row_count": 128,
+    "sha256": "55263c04da46f3d1db8ab4b254684d9f137166d0cfc63816006f7052ba7b029b"
+  },
+  "runtime": {
+    "capture_enable_prefix_caching": true,
+    "deployment": null,
+    "dtype": "bfloat16",
+    "expert_parallel_size": 1,
+    "pipeline_parallel_size": 1,
+    "runtime_version": "0.18.0",
+    "scheduler_config_sha256": null,
+    "scheduler_pipeline_depth": 2,
+    "scheduler_pipeline_depth_evidence": {
+      "executor_class": "vllm.v1.executor.multiproc_executor.MultiprocExecutor",
+      "pipeline_parallel_size": 1,
+      "runtime_version": "0.18.0",
+      "source_field": "max_concurrent_batches",
+      "source_identity": "vllm=0.18.0;core=b8a10b3d...a61439;executor=138fd673...e758d;vllm-ascend=5673759a...cdd3fd",
+      "source_kind": "runtime_executor_property"
+    },
+    "seed": null,
+    "source_commit": "vllm=0.18.0;core=b8a10b3d...a61439;executor=138fd673...e758d;vllm-ascend=5673759a...cdd3fd",
+    "target_qps": 64.0,
+    "tensor_parallel_size": 1
+  },
+  "scheduler_steps": {
+    "compressed_sha256": "ea0df1fad7cd8a731457238849c1ee4762fa7bbd3fee39217c12de3d07cade0a",
+    "compression": "zstd",
+    "path": "scheduler_steps.jsonl.zst",
+    "provenance": {
+      "buffering": "in_memory_append_then_single_write",
+      "capture_run_id": "tp1_qps64/ground_truth.json",
+      "instrumentation_id": "midlayer-vllm-scheduler-trace",
+      "instrumentation_version": 2,
+      "profiler_attached": false,
+      "source_archive_id": "accepted-scheduler-trace-full-depth2-v3",
+      "source_sha256": "bb55e92bac43402ec6e94312219558f115b43ac09c5027e89dead37466324760"
+    },
+    "row_count": 1111,
+    "sha256": "3b29e6c764ca7803e74ac0b83e8e564c180a7cb7b73f2bccc45478bd749ba161",
+    "timing_boundary": {
+      "clock": "time.perf_counter_ns",
+      "origin": "first_scheduler_step_start",
+      "schedule_end": "immediately_after_scheduler_schedule",
+      "step_end": "immediately_after_scheduler_output_update",
+      "step_start": "immediately_before_scheduler_schedule",
+      "update_start": "immediately_before_scheduler_output_update"
+    }
+  },
+  "schema_version": 5
+}
