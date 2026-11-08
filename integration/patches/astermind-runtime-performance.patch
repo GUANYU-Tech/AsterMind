@@ -1,0 +1,276 @@
+--- a/third_party/astermind/third_party/flowsim/src/event_simulator.cc
++++ b/third_party/astermind/third_party/flowsim/src/event_simulator.cc
+@@ -2,6 +2,8 @@
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <chrono>
++#include <cstdlib>
+ #include <limits>
+ #include <queue>
+ #include <sstream>
+@@ -14,6 +16,19 @@
+ 
+ constexpr long double kEventEpsilon = 1e-9L;
+ constexpr long double kByteEpsilon = 1e-6L;
++
++struct PhaseTimer {
++  bool enabled;
++  double &seconds;
++  std::chrono::steady_clock::time_point started;
++  PhaseTimer(bool on, double &value) : enabled(on), seconds(value) {
++    if (enabled) started = std::chrono::steady_clock::now();
++  }
++  ~PhaseTimer() {
++    if (enabled) seconds += std::chrono::duration<double>(
++        std::chrono::steady_clock::now() - started).count();
++  }
++};
+ 
+ std::uint64_t event_ceil_time_ns(const long double value) {
+   if (value <= 0.0L) {
+@@ -48,7 +63,8 @@
+         link_busy_time_(topology_.links().size(), 0.0L),
+         link_capacity_time_(topology_.links().size(), 0.0L),
+         link_peak_flows_(topology_.links().size(), 0),
+-        link_active_flows_(topology_.links().size(), 0) {}
++        link_active_flows_(topology_.links().size(), 0),
++        link_stats_time_(topology_.links().size(), 0.0L) {}
+ 
+   void schedule(const long double delay_ns, Callback callback, int priority = 0) {
+     if (!std::isfinite(delay_ns) || delay_ns < 0.0L) {
+@@ -106,6 +122,8 @@
+ 
+   void set_bandwidth(const std::string &source, const std::string &target,
+                      const double bandwidth_gbps) {
++    const auto route = topology_.direct_route(source, target);
++    for (const auto link : route.link_indices) settle_link_stats(link);
+     topology_.set_bandwidth(source, target, bandwidth_gbps);
+     rates_dirty_ = true;
+   }
+@@ -144,6 +162,7 @@
+   }
+ 
+   void advance_until(const long double target_ns) {
++    ++advance_calls_;
+     if (running_ || !std::isfinite(target_ns) || target_ns < current_time_) {
+       throw std::invalid_argument("advance target must be finite and monotonic");
+     }
+@@ -153,6 +172,8 @@
+     if (!events_.empty()) {
+       next_time = std::min(next_time, events_.top().time);
+     }
++    {
++    PhaseTimer timer(profile_enabled_, completion_search_s_);
+     for (const auto index : active_) {
+       const auto &flow = flows_[index];
+       if (flow.rate_bytes_per_ns > 0.0L) {
+@@ -164,6 +185,7 @@
+         }
+         next_time = std::min(next_time, completion_time);
+       }
++    }
+     }
+     advance_to(next_time);
+     finish_transmissions();
+@@ -249,6 +271,18 @@
+     return !active_.empty() || !events_.empty();
+   }
+ 
++  std::map<std::string, double> performance_stats() const {
++    return {{"timing_enabled", profile_enabled_ ? 1.0 : 0.0},
++            {"advance_calls", static_cast<double>(advance_calls_)},
++            {"rate_recomputations", static_cast<double>(rate_recomputations_)},
++            {"link_stat_settles", static_cast<double>(link_stat_settles_)},
++            {"active_flow_updates", static_cast<double>(active_flow_updates_)},
++            {"rate_allocation_s", rate_allocation_s_},
++            {"advance_bytes_s", advance_bytes_s_},
++            {"completion_search_s", completion_search_s_},
++            {"completion_processing_s", completion_processing_s_}};
++  }
++
+   SimulationReport report() const {
+     for (const auto &flow : flows_) {
+       if (!flow.completed && !flow.cancelled) {
+@@ -282,15 +316,20 @@
+     for (std::size_t index = 0; index < links.size(); ++index) {
+       const auto &link = links[index];
+       double utilization = 0.0;
+-      if (link_capacity_time_[index] > 0) {
++      const auto elapsed = current_time_ - link_stats_time_[index];
++      const auto capacity_time = link_capacity_time_[index] +
++          link.capacity_bytes_per_ns * elapsed;
++      const auto busy_time = link_busy_time_[index] +
++          (link_active_flows_[index] > 0 ? elapsed : 0.0L);
++      if (capacity_time > 0) {
+         utilization = static_cast<double>(
+             static_cast<long double>(link_bytes_[index]) /
+-            link_capacity_time_[index]);
++            capacity_time);
+         utilization = std::min(1.0, std::max(0.0, utilization));
+       }
+       output.links.push_back(
+           {link.source, link.target, link.bandwidth_gbps, link.latency_ns,
+-           link_bytes_[index], event_ceil_time_ns(link_busy_time_[index]),
++           link_bytes_[index], event_ceil_time_ns(busy_time),
+            link_peak_flows_[index], utilization});
+     }
+     return output;
+@@ -330,7 +369,18 @@
+     }
+   };
+ 
++  void settle_link_stats(const std::size_t index) {
++    ++link_stat_settles_;
++    const auto elapsed = current_time_ - link_stats_time_[index];
++    link_capacity_time_[index] +=
++        topology_.links()[index].capacity_bytes_per_ns * elapsed;
++    if (link_active_flows_[index] > 0) link_busy_time_[index] += elapsed;
++    link_stats_time_[index] = current_time_;
++  }
++
+   void advance_to(const long double next_time) {
++    PhaseTimer timer(profile_enabled_, advance_bytes_s_);
++    active_flow_updates_ += active_.size();
+     const auto elapsed = std::max(0.0L, next_time - current_time_);
+     for (const auto flow_index : active_) {
+       auto &flow = flows_[flow_index];
+@@ -339,16 +389,11 @@
+         flow.remaining_bytes = 0.0L;
+       }
+     }
+-    for (std::size_t index = 0; index < link_active_flows_.size(); ++index) {
+-      link_capacity_time_[index] += topology_.links()[index].capacity_bytes_per_ns * elapsed;
+-      if (link_active_flows_[index] > 0) {
+-        link_busy_time_[index] += elapsed;
+-      }
+-    }
+     current_time_ = next_time;
+   }
+ 
+   void finish_transmissions() {
++    PhaseTimer timer(profile_enabled_, completion_processing_s_);
+     bool finished_any = false;
+     for (const auto flow_index : active_) {
+       auto &flow = flows_[flow_index];
+@@ -405,19 +450,44 @@
+       return;
+     }
+     rates_dirty_ = false;
+-    std::fill(link_active_flows_.begin(), link_active_flows_.end(), 0);
++    PhaseTimer timer(profile_enabled_, rate_allocation_s_);
++    ++rate_recomputations_;
++    // Account the old busy intervals before changing their contender counts.
++    for (const auto link : occupied_links_) {
++      settle_link_stats(link);
++      link_active_flows_[link] = 0;
++    }
++    occupied_links_.clear();
+     for (const auto flow_index : active_) {
+       flows_[flow_index].rate_bytes_per_ns = 0.0L;
+       for (const auto link_index : flows_[flow_index].route.link_indices) {
++        if (link_active_flows_[link_index] == 0) {
++          settle_link_stats(link_index);
++          occupied_links_.push_back(link_index);
++        }
+         ++link_active_flows_[link_index];
+       }
+     }
+-    for (std::size_t index = 0; index < link_active_flows_.size(); ++index) {
++    for (const auto index : occupied_links_) {
+       link_peak_flows_[index] =
+           std::max(link_peak_flows_[index], link_active_flows_[index]);
+     }
+ 
+     const auto &links = topology_.links();
++    // Exact max-min solution for independent single-hop resources. Keep the
++    // general progressive-filling solver for shared pools and multi-hop flows.
++    if (topology_.pool_capacities().empty() &&
++        std::all_of(active_.begin(), active_.end(), [&](const auto index) {
++          return flows_[index].route.link_indices.size() == 1;
++        })) {
++      for (const auto index : active_) {
++        auto &flow = flows_[index];
++        const auto link = flow.route.link_indices.front();
++        flow.rate_bytes_per_ns = links[link].capacity_bytes_per_ns /
++                                static_cast<long double>(link_active_flows_[link]);
++      }
++      return;
++    }
+     std::vector<long double> residual_capacity;
+     residual_capacity.reserve(links.size());
+     for (const auto &link : links) {
+@@ -527,6 +597,13 @@
+   std::vector<long double> link_capacity_time_;
+   std::vector<std::size_t> link_peak_flows_;
+   std::vector<std::size_t> link_active_flows_;
++  std::vector<std::size_t> occupied_links_;
++  std::vector<long double> link_stats_time_;
++  bool profile_enabled_ = std::getenv("FLOWSIM_PROFILE") != nullptr;
++  std::uint64_t advance_calls_ = 0, rate_recomputations_ = 0;
++  std::uint64_t link_stat_settles_ = 0, active_flow_updates_ = 0;
++  double rate_allocation_s_ = 0, advance_bytes_s_ = 0;
++  double completion_search_s_ = 0, completion_processing_s_ = 0;
+   long double current_time_ = 0.0L;
+   std::uint64_t next_event_sequence_ = 0;
+   std::uint64_t progress_revision_ = 0;
+@@ -586,4 +663,8 @@
+ }
+ SimulationReport EventSimulator::report() const { return impl_->report(); }
+ 
++std::map<std::string, double> EventSimulator::performance_stats() const {
++  return impl_->performance_stats();
++}
++
+ } // namespace flowsim
+--- a/third_party/astermind/third_party/flowsim/include/flowsim/flowsim.hh
++++ b/third_party/astermind/third_party/flowsim/include/flowsim/flowsim.hh
+@@ -149,6 +149,7 @@
+   long double now_ns() const;
+   bool has_pending_work() const;
+   SimulationReport report() const;
++  std::map<std::string, double> performance_stats() const;
+ 
+ private:
+   class Impl;
+--- a/third_party/astermind/third_party/flowsim/python/bindings.cc
++++ b/third_party/astermind/third_party/flowsim/python/bindings.cc
+@@ -63,5 +63,6 @@
+       .def("stop", &flowsim::EventSimulator::stop)
+       .def_property_readonly("now_ns", &flowsim::EventSimulator::now_ns)
+       .def("has_pending_work", &flowsim::EventSimulator::has_pending_work)
+-      .def("report", &flowsim::EventSimulator::report);
++      .def("report", &flowsim::EventSimulator::report)
++      .def("performance_stats", &flowsim::EventSimulator::performance_stats);
+ }
+--- a/third_party/astermind/third_party/midlayer/midlayer/runtime.py
++++ b/third_party/astermind/third_party/midlayer/midlayer/runtime.py
+@@ -9,6 +9,7 @@
+ from dataclasses import dataclass, replace
+ 
+ from .kernel.kernel_base import predict
++from .kernel.prediction_cache import PredictionCache
+ from .kernel.kernel_spec import KernelKind
+ from .kernel.predictors.common import graph_replayed_launch
+ from .serving.deployment.emission_scope import validate_workload_emission_parallelism
+@@ -63,7 +64,9 @@
+         timing_mode="device_only",
+         host_launch_profiles=None,
+         kv_lifecycles=None,
++        prediction_cache_entries=2048,
+     ):
++        self.prediction_cache = PredictionCache(prediction_cache_entries)
+         self.model = model
+         self.deployment = deployment
+         self.hardware = hardware
+@@ -480,8 +483,8 @@
+         predictions = {}
+         for call in plan.calls:
+             if call.kernel_spec.kind is not KernelKind.COMMUNICATION:
+-                predictions[call.call_id] = predict(
+-                    call.kernel_spec, self.hardware[call.kernel_spec.hardware_id]
++                predictions[call.call_id] = self.prediction_cache(
++                    predict, call.kernel_spec, self.hardware[call.kernel_spec.hardware_id]
+                 )
+                 # Preserve the native SGLang MLA alt-stream graph boundary;
+                 # unsupported or uncalibrated graph launches must still fail.

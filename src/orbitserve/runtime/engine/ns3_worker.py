@@ -33,6 +33,7 @@ struct Link {
     std::string current;
     double rate=0, start=0, duration=0, bytes=0;
     bool busy=false;
+    bool resourceGate=false;
     std::vector<std::string> pools;
 };
 struct PacketTrace {std::string flow; double start, finish, logical, wire, offset;};
@@ -65,7 +66,7 @@ class Engine {
     }
     static void txEnd(Engine* self,std::string key,Ptr<const Packet> packet) {
         auto& row=self->link(key); auto& flow=self->flows.at(row.current);
-        if(self->recordPackets)self->packetTrace.push_back({flow.id,row.start,self->now(),row.bytes,
+        if(self->recordPackets && !row.resourceGate)self->packetTrace.push_back({flow.id,row.start,self->now(),row.bytes,
                                     static_cast<double>(packet->GetSize()),flow.done});
         if (!flow.cancelled) {
             flow.done+=row.bytes;
@@ -98,6 +99,12 @@ class Engine {
             row.current=id; row.bytes=logical;row.start=now();
             double capacity=row.rate;
             for(auto& pool:row.pools){capacity=std::min(capacity,poolRates[pool]);poolBusy[pool]=true;}
+            if(row.resourceGate) {
+                auto delay=PicoSeconds(static_cast<int64_t>(std::max(1.0,std::ceil(logical*8.0/capacity*1e12))));
+                row.duration=delay.GetSeconds(); row.busy=true;
+                Simulator::Schedule(delay,&Engine::txEnd,this,key,Create<Packet>(0));
+                return;
+            }
             auto rate=DataRate(static_cast<uint64_t>(std::max(1.0,capacity)));
             row.device->SetDataRate(rate);
             row.duration=rate.CalculateBytesTxTime(payload+2).GetSeconds();
@@ -108,6 +115,7 @@ class Engine {
         }
     }
     void configure(std::string key,double rate) {auto& row=link(key);row.rate=rate;pump(key);}
+    void gate(std::string key,double enabled) {link(key).resourceGate=enabled!=0;}
     void start(std::string id,std::string key,double bytes) {
         Flow flow; flow.id=id;flow.key=key;flow.total=bytes;
         flows[id]=flow;link(key).ready.push_back(id);pump(key);
@@ -154,6 +162,7 @@ int os_wireBytesStarted(Engine* e,double* value) {return checked([&](){*value=e-
 int os_trace(Engine* e,double value) {e->recordPackets=value!=0;return 0;}
 int os_link(Engine* e,const char* key) {return checked([&](){e->link(key);});}
 int os_configure(Engine* e,const char* key,double rate) {return checked([&](){e->configure(key,rate);});}
+int os_gate(Engine* e,const char* key,double enabled) {return checked([&](){e->gate(key,enabled);});}
 int os_addPool(Engine* e,const char* key,double rate) {return checked([&](){e->addPool(key,rate);});}
 int os_attachPool(Engine* e,const char* key,const char* pool) {return checked([&](){e->attachPool(key,pool);});}
 int os_start(Engine* e,const char* id,const char* key,double bytes) {return checked([&](){e->start(id,key,bytes);});}
@@ -220,7 +229,7 @@ class NativeEngine:
         output = ctypes.POINTER(number)
         signatures = {
             'close': [], 'trace': [number], 'now': [output], 'packetsStarted': [output], 'wireBytesStarted': [output], 'link': [string], 'configure': [string, number],
-            'addPool': [string, number], 'attachPool': [string, string],
+            'addPool': [string, number], 'attachPool': [string, string], 'gate': [string, number],
             'start': [string, string, number], 'cancel': [string], 'advance': [number],
             'progress': [string, output], 'clearCompleted': [], 'clearPackets': [],
         }
@@ -276,6 +285,8 @@ def serve(engine):
     for key, rate in initial.get('pools', {}).items():
         engine.call('addPool', key, rate)
     for row in initial['links']:
+        if row.get('resource_gate'):
+            engine.call('gate', row['key'], 1.)
         for pool in row.get('pools', ()):
             engine.call('attachPool', row['key'], pool)
     active = set()
@@ -285,7 +296,8 @@ def serve(engine):
     def emit(value):
         print(json.dumps({'time_s': engine.value('now'), **value}, allow_nan=False), flush=True)
 
-    emit({'ready': True, 'version': version('ns3')})
+    emit({'ready': True, 'version': version('ns3'), 'protocol_version': 1,
+          'capabilities': ['packet_trace', 'native_counters', 'dynamic_capacity', 'shared_rf_pools', 'resource_gates']})
     for line in sys.stdin:
         try:
             command = json.loads(line)

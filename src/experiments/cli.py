@@ -21,6 +21,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--out", type=Path, help="Optional output JSON path.")
     parser.add_argument("--indent", type=int, default=2, help="JSON indentation.")
+    parser.add_argument('--midlayer-root', type=Path, help='Explicit external M-L root for native Cell scenarios.')
     parser.add_argument(
         "--output-mode",
         choices=("summary", "full"),
@@ -38,6 +39,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Shortcut for --output-mode full.",
     )
     args = parser.parse_args(argv)
+
+    header = json.loads(args.manifest.read_text(encoding='utf8'))
+    if header.get('schema_version') == 'orbitserve.native_cells.v1':
+        from .native_cells import run_native_cell_manifest
+        return run_native_cell_manifest(args)
+    if args.midlayer_root is not None:
+        parser.error('--midlayer-root requires an orbitserve.native_cells.v1 manifest')
 
     spec = load_experiment_spec(args.manifest)
     execution_root = (

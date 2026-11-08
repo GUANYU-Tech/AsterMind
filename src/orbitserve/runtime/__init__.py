@@ -1,6 +1,15 @@
 """Public API for deterministic OrbitServe Runtime simulation."""
 
 from .api import check_network_backend, run_simulation
+from .communication import (
+    CommunicationExecutor,
+    InterSatelliteFlowBackend,
+    IntraSatelliteSurrogateBackend,
+    Ns3PacketBackend,
+    PhysicalTransfer,
+)
+from .network import NetworkStateFrame
+from .timeline import CellManager, GlobalScheduling, GlobalTimeline
 from .astermind import export_cell_network
 from .contracts import RuntimeStrategySpec
 from .engine.topology import candidate_links
@@ -17,6 +26,9 @@ from .setup.network_geometry import sun_positions_from_trace
 from .state.network import NetworkState, NetworkUnavailable
 
 __all__ = [
+    "CellManager", "CommunicationExecutor", "GlobalScheduling", "GlobalTimeline",
+    "InterSatelliteFlowBackend", "IntraSatelliteSurrogateBackend", "NetworkStateFrame",
+    "Ns3PacketBackend", "PhysicalTransfer",
     "freeze_network_profiles",
     "prepare_islsim_config",
     "resolve_islsim_config",

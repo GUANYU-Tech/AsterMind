@@ -288,6 +288,12 @@ workstation, `third_party/astermind` holds the modified local checkout; it and
 the root workstation-only build adapter are ignored by Git and are not supplied
 by an OrbitServe checkout. Joint examples require that local dependency to be
 prepared first. An older `_flowsim` fails explicitly.
+The native shared `advance_until()` must also guard positive residual-byte
+completion times that round back to the current native clock, using the next
+representable native time as its standalone `run()` loop already does. The
+FlowSim fractional-tail regression checks this requirement. The workstation
+source fix remains in the ignored AsterMind checkout and must be carried with
+that external dependency when preparing another environment.
 OrbitServe supplies candidate links and updates capacity at runtime; FlowSim
 retains in-flight bytes during capacity changes and shares each directed hop
 and applicable RF pools across all flows. OrbitServe handles per-hop routing,
@@ -312,6 +318,34 @@ communication is recorded against the cell, not attributed to individual
 requests in their path or energy ledgers. OrbitServe's shadow DVFS policy is
 not supported in this mode. The existing queue and legacy backends remain
 available pending full integration.
+
+### Native Cells from Merge_ML_Version
+
+The first-party `integration/`, `simulator/` and `network_sim/` adapters now run
+real Mid-Layer Cells and the official vLLM 0.31 Scheduler on the dynamic Runtime.
+Explicit GPU/switch/terminal graphs support multiple GPUs per satellite, cross-
+satellite TP/PP and per-rank KV migration. The existing `_EventEngine` owns all
+physical hops, resource contention, acquisition and fault recovery. Native COMM
+predictions are not charged again alongside physical communication.
+
+```bash
+python -m orbitserve.experiments.cli simulator/examples/dynamic_tp2_pp2.json \
+  --midlayer-root /path/to/midlayer --out results/cells/cross.json
+python -m orbitserve.experiments.cli simulator/examples/dynamic_migration_tp2.json \
+  --midlayer-root /path/to/midlayer --out results/cells/migration.json
+```
+
+See [native setup, examples, resource semantics and validation](simulator/README.md)
+and [the Runtime adapter contract](src/orbitserve/runtime/CELL_INTEGRATION.md).
+Mid-Layer source/calibration and native binaries remain external local dependencies.
+Explicit test KV block counts are not hardware-derived HBM limits; bound memory
+policies are checked separately. Native kernel energy is not evaluated.
+
+`python -m simulator.replay REPORT.json --out local/results/native-cells-viewer`
+exports an offline replay of real Scheduler batches, per-GPU operators, dependency
+edges, physical communication and KV transactions. The local console links it at
+`/native-cells/`. Its checks expose concrete trace violations and keep hardware
+accuracy and native energy explicitly outside the verified scope.
 
 `examples/astermind_joint/full_serving.py` runs a 72-plane, 22-satellite-per-plane
 communication shell and two compute replicas on dawn-dusk reference orbits.

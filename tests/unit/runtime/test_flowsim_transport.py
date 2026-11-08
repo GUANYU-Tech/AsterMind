@@ -9,6 +9,26 @@ from orbitserve.runtime.setup.network_spec import NetworkNodeSpec
 
 @unittest.skipUnless(importlib.util.find_spec("_flowsim"), "requires shared-runtime FlowSim")
 class FlowSimTransportTests(unittest.TestCase):
+    def test_sub_ulp_native_completion_drains_fractional_tail(self):
+        nodes = {name: NetworkNodeSpec(name, "compute") for name in ("a", "b")}
+        engine = FlowSimTransport(nodes, ({"link_id": "ab", "endpoint_a": "a", "endpoint_b": "b"},), {})
+        self.addCleanup(engine.close)
+        leg = {"link_id": "ab", "source_node_id": "a", "target_node_id": "b"}
+        engine.advance_until(7.25)
+        engine.configure({engine.resource(leg): 2.3e9})
+        engine.start("tail", leg, 1_000_000.)
+        sent = 0.
+        for _ in range(4):
+            result = engine.advance_until(8.)
+            sent += result['bytes_sent'].get('tail', 0.)
+            if result['completed']:
+                self.assertEqual(result['completed'], ['tail'])
+                break
+        else:
+            self.fail('native completion failed to drain the sub-ULP tail')
+        self.assertAlmostEqual(sent, 1_000_000., places=6)
+        self.assertAlmostEqual(result['time_s'], 7.25 + 8_000_000 / 2.3e9, places=12)
+
     def test_flowsim_is_default_transport(self):
         from orbitserve.runtime import LinkProfile, NetworkSpec
 

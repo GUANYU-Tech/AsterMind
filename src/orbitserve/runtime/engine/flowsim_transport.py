@@ -26,7 +26,7 @@ def require_flowsim():
 
 
 class FlowSimTransport:
-    def __init__(self, nodes, edges, profiles):
+    def __init__(self, nodes, edges, profiles, *, shared_pools=None, link_pools=None):
         del profiles
         module = require_flowsim()
         self.nodes = nodes
@@ -34,16 +34,19 @@ class FlowSimTransport:
         self.active = {}
         self.now = 0.0
         self.completed = []
+        self._configured_capacities = {}
+        pools = capacity_pools(nodes) if shared_pools is None else dict(shared_pools)
+        link_pools = link_pools or {}
         topology = module.Topology()
         for node in sorted(nodes):
             topology.add_node(node)
-        for pool, capacity in capacity_pools(nodes).items():
+        for pool, capacity in pools.items():
             topology.set_pool_capacity(pool, capacity * BYTE_SCALE / 1e9)
         for edge in self.edges:
             a, b = edge["endpoint_a"], edge["endpoint_b"]
             for source, target in ((a, b), (b, a)):
                 topology.add_link(source, target, 1.0, 0, False)
-                for pool in hop_pools(nodes, source, target):
+                for pool in link_pools.get((edge['link_id'], source, target), hop_pools(nodes, source, target)):
                     topology.attach_pool(source, target, pool)
         self.simulator = module.EventSimulator(topology)
         self.provenance = {
@@ -68,7 +71,10 @@ class FlowSimTransport:
         for (_, source, target), value in capacities.items():
             if not math.isfinite(value) or value < 0:
                 raise ValueError("FlowSim capacities must be finite nonnegative bits/s")
-            self.simulator.set_bandwidth(source, target, value * BYTE_SCALE / 1e9)
+            key = source, target
+            if self._configured_capacities.get(key) != value:
+                self.simulator.set_bandwidth(source, target, value * BYTE_SCALE / 1e9)
+                self._configured_capacities[key] = value
 
     def start(self, identity, leg, payload_bytes):
         if identity in self.active or isinstance(payload_bytes, bool) or not math.isfinite(payload_bytes) or payload_bytes <= 0:

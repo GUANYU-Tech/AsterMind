@@ -42,6 +42,23 @@ assert main(['--out', str(output)]) == 0
 assert set(json.loads(output.read_text())) == {'tx', 'rx', 'channel'}
 from orbitserve.serving import ServingSpec
 assert ServingSpec().parallelism.parallel_node_count == 1
+for name in ('network_sim', 'network_sim.topology', 'simulator.config',
+             'simulator.network', 'simulator.engine', 'integration'):
+    loaded = import_module(name)
+    assert Path(loaded.__file__).is_relative_to(target), loaded.__file__
+from simulator.config import SimulationConfig
+identity = json.loads(files('integration').joinpath('runtime/vllm_0_31_identity.json').read_text())
+assert identity, 'native Scheduler identity must be packaged'
+assert files('integration').joinpath('requirements-scheduler-latest.lock').is_file()
+scene = files('simulator').joinpath('examples/dynamic_tp2_pp2.json')
+config = SimulationConfig.load(scene)
+assert config.cells[0].parallel.workers == 4
+assert len(config.topology().devices) == 11
+assert Path(config.physical_network).is_file()
+for name in ('index.html', 'replay.js', 'replay.css'):
+    assert files('simulator').joinpath('web', name).is_file(), name
+from simulator.replay import audit_checks
+assert callable(audit_checks)
 print(f'Installed wheel: {len(modules)} modules imported; reference hashes and portable CLI verified.')
 '''
 

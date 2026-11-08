@@ -13,6 +13,9 @@ class RuntimeResultContractTests(unittest.TestCase):
         self.assertEqual(
             set(runtime.__all__),
             {
+                "CellManager", "CommunicationExecutor", "GlobalScheduling", "GlobalTimeline",
+                "InterSatelliteFlowBackend", "IntraSatelliteSurrogateBackend", "NetworkStateFrame",
+                "Ns3PacketBackend", "PhysicalTransfer",
                 "RuntimePerformanceResult",
                 "RuntimeSimulationSpec",
                 "RuntimeStrategySpec",

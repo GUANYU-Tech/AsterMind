@@ -1,0 +1,319 @@
+"""Device-level resources must remain real shared hops, not satellite aliases."""
+
+import importlib.util
+import json
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+
+from network_sim import PhysicalTopology, Scenario
+from orbitserve.runtime.engine.cell_bridge import CellTransferExecutor
+from simulator.network import DeviceCommunicationRuntime, DeviceRuntimeHost
+
+
+def topology():
+    devices = [{"id": f"gpu{i}", "satellite": "sat", "kind": "gpu"} for i in range(4)]
+    devices += [
+        {
+            "id": "switch",
+            "satellite": "sat",
+            "kind": "switch",
+            "capacity_gbps": 0.000008,
+        }
+    ]
+    return PhysicalTopology(
+        Scenario.model_validate(
+            {
+                "cells": [{"id": "A", "satellites": ["sat"]}],
+                "satellites": [{"id": "sat"}],
+                "devices": devices,
+                "links": [
+                    {
+                        "id": f"p{i}",
+                        "source": f"gpu{i}",
+                        "target": "switch",
+                        "bandwidth_gbps": 8.0,
+                    }
+                    for i in range(4)
+                ],
+            }
+        )
+    )
+
+
+def run_transfers(backend):
+    graph = topology()
+    config = SimpleNamespace(
+        horizon_ns=4_000_000_000,
+        backend=backend,
+        runtime_network={},
+        physical_link_bindings={},
+    )
+    host = DeviceRuntimeHost(graph, config)
+    network = DeviceCommunicationRuntime(host, graph)
+    executor = CellTransferExecutor(host.timeline, network)
+    completed = []
+    try:
+        for identifier, source, target in [
+            ("a", "gpu0", "gpu1"),
+            ("b", "gpu2", "gpu3"),
+        ]:
+            executor.submit_transport(
+                identifier,
+                source,
+                target,
+                1000,
+                "collective",
+                None,
+                lambda identifier=identifier: completed.append((identifier, host.now)),
+            )
+        host.run()
+        return completed, host.log, dict(host.transport_provenance), network.events
+    finally:
+        network.close()
+        host.close()
+
+
+class DeviceNetworkTests(unittest.TestCase):
+    def test_device_projection_preserves_directional_rf_pool_across_ground_links(self):
+        from orbitserve.runtime import (
+            LinkProfile,
+            NetworkNodeSpec,
+            NetworkSpec,
+            NetworkState,
+        )
+
+        physical_nodes = (
+            NetworkNodeSpec(
+                "sat",
+                "communication",
+                sgl_terminals=2,
+                radio_capacity_bps={
+                    "user_uplink_bps": 8000,
+                    "user_downlink_bps": 16000,
+                },
+                capacity_assumptions=(
+                    "Synthetic rates for device projection conservation checks.",
+                ),
+            ),
+            NetworkNodeSpec("u", "ground", sgl_terminals=1, ground_kind="user"),
+            NetworkNodeSpec("v", "ground", sgl_terminals=1, ground_kind="user"),
+        )
+        trace = SimpleNamespace(
+            time={"start_s": 0.0, "end_s": 4.0},
+            satellite_catalog=({"satellite_id": "sat"},),
+            ephemeris_samples=tuple(
+                {
+                    "satellite_id": "sat",
+                    "time_s": float(t),
+                    "position_itrs_km": (7000.0, 0.0, 0.0),
+                }
+                for t in range(5)
+            ),
+            isl_windows=(),
+            sgl_windows=tuple(
+                {"ingress_id": g, "satellite_id": "sat", "start_s": 0.0, "end_s": 4.0}
+                for g in ("u", "v")
+            ),
+        )
+        spec = NetworkSpec(
+            physical_nodes,
+            {
+                "sgl": LinkProfile(
+                    32000, 0, uplink_profile="up", downlink_profile="down"
+                ),
+                "up": LinkProfile(8000, 0),
+                "down": LinkProfile(16000, 0),
+            },
+            communication_topology="explicit",
+        )
+        physical = NetworkState(
+            trace,
+            spec,
+            tuple(
+                {"ingress_id": g, "lat_deg": 0.0, "lon_deg": 0.0} for g in ("u", "v")
+            ),
+        )
+        raw = topology().scenario.model_dump(mode="json")
+        raw["devices"][-1]["capacity_gbps"] = 8.0
+        raw["cells"] += [{"id": g, "satellites": [g]} for g in ("u", "v")]
+        raw["satellites"] += [{"id": g} for g in ("u", "v")]
+        raw["devices"] += [
+            {
+                "id": "radio",
+                "satellite": "sat",
+                "kind": "terminal",
+                "external_access": True,
+                "max_external_links": 2,
+            }
+        ]
+        raw["links"] += [
+            {
+                "id": "access",
+                "source": "switch",
+                "target": "radio",
+                "bandwidth_gbps": 8.0,
+            }
+        ]
+        for g in ("u", "v"):
+            raw["devices"].append(
+                {"id": g, "satellite": g, "kind": "terminal", "external_access": True}
+            )
+            raw["links"].append(
+                {"id": g, "source": g, "target": "radio", "bandwidth_gbps": 8.0}
+            )
+        graph = PhysicalTopology(Scenario.model_validate(raw))
+        config = SimpleNamespace(
+            horizon_ns=4_000_000_000,
+            backend="fluid",
+            runtime_network={},
+            ground_owners=("u", "v"),
+            physical_link_bindings={},
+        )
+        host = DeviceRuntimeHost(graph, config, physical)
+        network = DeviceCommunicationRuntime(host, graph)
+        executor = CellTransferExecutor(host.timeline, network)
+        completed = {}
+        try:
+            for name, source, target in [
+                ("up-u", "u", "gpu0"),
+                ("up-v", "v", "gpu1"),
+                ("down", "gpu0", "u"),
+            ]:
+                executor.submit_transport(
+                    name,
+                    source,
+                    target,
+                    1000,
+                    "test",
+                    None,
+                    lambda name=name: completed.update({name: host.now}),
+                )
+            host.run()
+            self.assertTrue(2.0 <= completed["up-u"] < 2.01)
+            self.assertTrue(2.0 <= completed["up-v"] < 2.01)
+            self.assertTrue(0.5 <= completed["down"] < 0.51)
+            used = {
+                p
+                for pools in host.net.transport_options()["link_pools"].values()
+                for p in pools
+            }
+            self.assertEqual(
+                used, {"radio:sat:user_uplink_bps", "radio:sat:user_downlink_bps"}
+            )
+        finally:
+            network.close()
+            host.close()
+
+    def test_ground_user_cannot_relay_between_satellites(self):
+        from simulator.config import SimulationConfig
+
+        path = (
+            Path(__file__).resolve().parents[3]
+            / "simulator/examples/session_migration_tp2.json"
+        )
+        value = json.loads(path.read_text())
+        value["physical"]["links"] = [
+            link for link in value["physical"]["links"] if link["id"] != "isl"
+        ]
+        config = SimulationConfig.model_validate(value)
+        graph = config.topology()
+        host = DeviceRuntimeHost(
+            graph, SimpleNamespace(**{**vars(config), "backend": "fluid"})
+        )
+        try:
+            network = DeviceCommunicationRuntime(host, graph)
+            with self.assertRaises(ValueError):
+                network.route("gpu0", "gpu1", 1000)
+            with self.assertRaises(ValueError):
+                network.candidate_path("gpu0", "gpu1")
+            self.assertEqual(network.route("user", "gpu0", 1000)["path"][0], "user")
+        finally:
+            host.close()
+
+    def test_legacy_allocator_is_rejected_instead_of_ignoring_acquisition(self):
+        from simulator.config import SimulationConfig
+
+        path = (
+            Path(__file__).resolve().parents[3]
+            / "simulator/examples/session_migration_tp2.json"
+        )
+        value = json.loads(path.read_text())
+        value["physical"]["link_policy"] = {
+            "mode": "simple_keep",
+            "check_interval_ns": 100,
+            "initial_acquisition_ns": 10,
+            "reacquisition_ns": 10,
+        }
+        with self.assertRaisesRegex(ValueError, "canonical physical_network allocator"):
+            SimulationConfig.model_validate(value)
+
+    def test_two_gpus_on_one_satellite_use_distinct_ports_and_switch_capacity(self):
+        completed, events, _, _ = run_transfers("fluid")
+        self.assertEqual(len(completed), 2)
+        self.assertTrue(all(2.0 <= time < 2.00001 for _, time in completed))
+        segments = [e for e in events if e["kind"] == "bandwidth_update"]
+        gates = [e for e in segments if e.get("link_capacity_bps") == 8000.0]
+        self.assertTrue(any(e["allocated_bandwidth_bps"] == 4000.0 for e in gates))
+        self.assertAlmostEqual(sum(e["bytes_sent"] for e in gates), 2000.0)
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("_flowsim"), "requires shared-runtime FlowSim"
+    )
+    def test_real_flowsim_shares_same_satellite_switch(self):
+        completed, _, _, _ = run_transfers("flowsim")
+        self.assertTrue(all(2.0 <= time < 2.00001 for _, time in completed))
+
+    @unittest.skipUnless(importlib.util.find_spec("ns"), "requires native ns-3")
+    def test_real_ns3_resource_gates_do_not_add_ppp_packets(self):
+        completed, _, provenance, _ = run_transfers("ns3")
+        self.assertEqual(len(completed), 2)
+        self.assertTrue(2.0 <= max(time for _, time in completed) < 2.00001)
+        # Two actual GPU-to-switch and two switch-to-GPU links; the virtual
+        # switch budget gate schedules service but is not another wire packet.
+        self.assertEqual(provenance["native_counters"]["packets_started"], 4)
+        self.assertEqual(provenance["native_counters"]["wire_bytes_started"], 4008)
+
+    def test_gpu_cannot_forward_between_two_switches(self):
+        graph = topology()
+        raw = graph.scenario.model_dump(mode="json")
+        raw["devices"] += [
+            {"id": "second-switch", "satellite": "sat", "kind": "switch"}
+        ]
+        raw["links"] = [
+            link
+            for link in raw["links"]
+            if link["target"] != "switch" or link["source"] == "gpu0"
+        ]
+        raw["links"] += [
+            {
+                "id": "bridge",
+                "source": "gpu0",
+                "target": "second-switch",
+                "bandwidth_gbps": 8.0,
+            },
+            {
+                "id": "target",
+                "source": "gpu1",
+                "target": "second-switch",
+                "bandwidth_gbps": 8.0,
+            },
+        ]
+        split = PhysicalTopology(Scenario.model_validate(raw))
+        config = SimpleNamespace(
+            horizon_ns=1_000_000_000,
+            backend="fluid",
+            runtime_network={},
+            physical_link_bindings={},
+        )
+        host = DeviceRuntimeHost(split, config)
+        try:
+            network = DeviceCommunicationRuntime(host, split)
+            with self.assertRaises(ValueError):
+                network.candidate_path("switch", "gpu1")
+        finally:
+            host.close()
+
+
+if __name__ == "__main__":
+    unittest.main()

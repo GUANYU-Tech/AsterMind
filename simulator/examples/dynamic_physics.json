@@ -1,0 +1,125 @@
+{
+  "schema_version": "orbitserve.network_experiment.v1",
+  "time": {
+    "epoch_utc": "2026-07-20T00:00:00.000000Z",
+    "duration_s": 10.0,
+    "step_s": 0.25
+  },
+  "elements": {
+    "schema_version": "orbitserve.sgp4_element_bundle.v1",
+    "element_semantics": "sgp4_mean_elements",
+    "gravity_model": "wgs72",
+    "ops_mode": "improved",
+    "time_scale": "utc",
+    "satellites": [
+      {
+        "satellite_id": "satA",
+        "satnum": 10002,
+        "classification": "U",
+        "object_id": "2026-001A",
+        "epoch_utc": "2026-07-20T00:00:00.000000Z",
+        "inclination_deg": 53.0,
+        "raan_deg": -0.0,
+        "eccentricity": 0.001,
+        "argument_of_perigee_deg": 0.0,
+        "mean_anomaly_deg": 0.0,
+        "mean_motion_rev_per_day": 15.25,
+        "mean_motion_dot_rev_per_day2": 0.0,
+        "mean_motion_ddot_rev_per_day3": 0.0,
+        "bstar_inv_earth_radii": 1e-05,
+        "ephemeris_type": 0,
+        "element_set_number": 1,
+        "revolution_number_at_epoch": 1
+      },
+      {
+        "satellite_id": "satB",
+        "satnum": 10001,
+        "classification": "U",
+        "object_id": "2026-001A",
+        "epoch_utc": "2026-07-20T00:00:00.000000Z",
+        "inclination_deg": 53.0,
+        "raan_deg": -0.0,
+        "eccentricity": 0.001,
+        "argument_of_perigee_deg": 0.0,
+        "mean_anomaly_deg": 0.05,
+        "mean_motion_rev_per_day": 15.25,
+        "mean_motion_dot_rev_per_day2": 0.0,
+        "mean_motion_ddot_rev_per_day3": 0.0,
+        "bstar_inv_earth_radii": 1e-05,
+        "ephemeris_type": 0,
+        "element_set_number": 1,
+        "revolution_number_at_epoch": 1
+      }
+    ],
+    "provenance": {
+      "source_kind": "synthetic_sgp4_mean_elements",
+      "source_name": "native-cell-functional-example",
+      "source_version": "unit-v1",
+      "observationally_fitted": false
+    }
+  },
+  "ground_ingresses": [
+    {
+      "ingress_id": "ground",
+      "lat_deg": -0.07952463237853821,
+      "lon_deg": 62.14941197120167,
+      "min_elevation_deg": 10.0
+    }
+  ],
+  "network": {
+    "nodes": [
+      {
+        "node_id": "satA",
+        "role": "compute",
+        "isl_terminals": 1,
+        "sgl_terminals": 1
+      },
+      {
+        "node_id": "satB",
+        "role": "compute",
+        "isl_terminals": 1,
+        "sgl_terminals": 1
+      },
+      {
+        "node_id": "ground",
+        "role": "ground",
+        "isl_terminals": 0,
+        "sgl_terminals": 2
+      }
+    ],
+    "communication_topology": "explicit",
+    "ground_roles": [],
+    "explicit_pairs": [
+      [
+        "satA",
+        "satB"
+      ],
+      [
+        "ground",
+        "satA"
+      ],
+      [
+        "ground",
+        "satB"
+      ]
+    ],
+    "link_profiles": {
+      "communication_isl": {
+        "capacity_model": "fixed",
+        "bandwidth_bps": 80000000.0,
+        "setup_time_s": 0.005,
+        "capacity_schedule": [
+          [
+            0.125,
+            0.5
+          ]
+        ]
+      },
+      "sgl": {
+        "capacity_model": "fixed",
+        "bandwidth_bps": 1000000000.0,
+        "setup_time_s": 0.005
+      }
+    }
+  }
+}

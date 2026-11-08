@@ -260,11 +260,12 @@ class _EventEngine:
             "backend": "queue",
             "sharing_scope": "exclusive_directed_hop",
         }
+        transport_options = self.net.transport_options() if hasattr(self.net, 'transport_options') else {}
         if self.net.spec.transport_model == "simgrid":
             from .simgrid_transport import SimGridTransport
 
             self.transport = SimGridTransport(
-                self.net.nodes, self.net.edges, self.net.spec.link_profiles
+                self.net.nodes, self.net.edges, self.net.spec.link_profiles, **transport_options
             )
             self.transport_provenance = self.transport.provenance
         elif self.net.spec.transport_model in {'fluid', 'ns3', 'flowsim'}:
@@ -274,8 +275,8 @@ class _EventEngine:
                 from .ns3_transport import Ns3Transport as Transport
             else:
                 from .flowsim_transport import FlowSimTransport as Transport
-            options = {'record_packets': getattr(self.compute_runtime, 'record_packets', False)} if self.net.spec.transport_model == 'ns3' else {}
-            self.transport = Transport(self.net.nodes, self.net.edges, self.net.spec.link_profiles, **options)
+            options = {'record_packets': getattr(self.compute_runtime, 'record_packets', getattr(self, 'record_packets', False))} if self.net.spec.transport_model == 'ns3' else {}
+            self.transport = Transport(self.net.nodes, self.net.edges, self.net.spec.link_profiles, **options, **transport_options)
             self.transport_provenance = self.transport.provenance
 
     def push(self, time, priority, kind, request_id=None, payload=None):
@@ -289,7 +290,34 @@ class _EventEngine:
     def message_owner(self, request_id):
         return self.jobs.get(request_id) or self.service_jobs[request_id]
 
+    def hop_pools(self, source, target):
+        if hasattr(self.net, 'pools_for_hop'):
+            return self.net.pools_for_hop(source, target)
+        return hop_pools(self.net.nodes, source, target)
+
     def fail(self, job, reason):
+        if job.get('external_failure_callback') is not None:
+            if job['done']:
+                return
+            job['done'] = True
+            if self.transport:
+                self.cancel_shared(job['request']['request_id'], reason)
+            for collection in (self.messages, self.waiting_retries):
+                for identity, message in tuple(collection.items()):
+                    if message['request_id'] == job['request']['request_id']:
+                        message['cancelled'] = True
+                        if not self.transport and collection is self.messages:
+                            leg = message['leg']
+                            interval = leg['start_s'], leg['finish_s']
+                            for key in self.net.reservation_keys(leg):
+                                intervals = self.net.calendars.get(key, [])
+                                if interval in intervals:
+                                    intervals.remove(interval)
+                                    if leg['start_s'] < self.now:
+                                        intervals.append((leg['start_s'], min(leg['finish_s'], self.now)))
+                        collection.pop(identity, None)
+            job['external_failure_callback'](reason)
+            return
         if job.get('external_service'):
             raise RuntimeError(f"external compute communication failed: {reason}")
         if self.compute_runtime and job['request']['request_id'] in self.compute_runtime.jobs:
@@ -337,6 +365,58 @@ class _EventEngine:
                 "reason": reason,
             }
         )
+    def _record_event(self, time, kind, request_id, payload, job):
+        details = {}
+        if kind in {
+            "transfer_queued",
+            "transmit_start",
+            "transmit_complete",
+            "hop_arrival",
+            "bandwidth_update",
+        }:
+            leg = payload["leg"]
+            details = {
+                k: leg.get(k)
+                for k in (
+                    "transfer_id",
+                    "link_id",
+                    "source_node_id",
+                    "target_node_id",
+                    "payload_bytes",
+                    "stage",
+                    "start_s",
+                    "finish_s",
+                    "arrival_s",
+                    "ready_s",
+                    "queue_wait_s",
+                    'contact_ready_s',
+                    'acquisition_wait_s',
+                    "transmission_s",
+                    "propagation_delay_s",
+                    "transport_model",
+                )
+            }
+            if kind == "bandwidth_update":
+                details.update(payload["allocation"])
+        if job and job.get("node"):
+            details["compute_node_id"] = job["node"]
+        if isinstance(payload, dict):
+            details.update({k: payload[k] for k in ('phase', 'pipeline_stage', 'operation', 'members', 'bytes', 'attempt') if k in payload})
+            details.update({k: v for k, v in payload.get('context', {}).items() if k not in {'origin', 'callback'}})
+        self.log.append(
+            {
+                "time_s": time,
+                "kind": kind,
+                **details,
+                "request_id": request_id,
+                **(
+                    {"link_id": payload["link_id"], "state": payload["state"], "reason": payload.get('reason')}
+                    if kind == "link_state"
+                    else {}
+                ),
+            }
+        )
+
     def run(self):
         # The orchestration boundary owns cleanup, including pre-run failures.
         self._run()
@@ -373,56 +453,7 @@ class _EventEngine:
                 continue
             if isinstance(payload, dict) and payload.get('cancelled') and kind != 'retry_transfer':
                 continue
-            details = {}
-            if kind in {
-                "transfer_queued",
-                "transmit_start",
-                "transmit_complete",
-                "hop_arrival",
-                "bandwidth_update",
-            }:
-                leg = payload["leg"]
-                details = {
-                    k: leg.get(k)
-                    for k in (
-                        "transfer_id",
-                        "link_id",
-                        "source_node_id",
-                        "target_node_id",
-                        "payload_bytes",
-                        "stage",
-                        "start_s",
-                        "finish_s",
-                        "arrival_s",
-                        "ready_s",
-                        "queue_wait_s",
-                        'contact_ready_s',
-                        'acquisition_wait_s',
-                        "transmission_s",
-                        "propagation_delay_s",
-                        "transport_model",
-                    )
-                }
-                if kind == "bandwidth_update":
-                    details.update(payload["allocation"])
-            if job and job.get("node"):
-                details["compute_node_id"] = job["node"]
-            if isinstance(payload, dict):
-                details.update({k: payload[k] for k in ('phase', 'pipeline_stage', 'operation', 'members', 'bytes', 'attempt') if k in payload})
-                details.update({k: v for k, v in payload.get('context', {}).items() if k not in {'origin', 'callback'}})
-            self.log.append(
-                {
-                    "time_s": time,
-                    "kind": kind,
-                    **details,
-                    "request_id": request_id,
-                    **(
-                        {"link_id": payload["link_id"], "state": payload["state"], "reason": payload.get('reason')}
-                        if kind == "link_state"
-                        else {}
-                    ),
-                }
-            )
+            self._record_event(time, kind, request_id, payload, job)
             if kind in {"link_state", "topology_sample", "network_update"}:
                 self.wake_retries()
                 if self.transport:
@@ -467,6 +498,9 @@ class _EventEngine:
                     raise
                 self.fail(job, str(error))
         self.now = self.end
+        for job in tuple(self.service_jobs.values()):
+            if not job['done'] and job.get('external_failure_callback') is not None:
+                self.fail(job, 'simulation_horizon_exceeded')
         for job in self.jobs.values():
             if not job["done"]:
                 self.fail(job, "simulation_horizon_exceeded")
@@ -514,6 +548,9 @@ class _EventEngine:
         )
         candidates, forecasts = [], {}
         for node in self.eligible:
+            if (self.compute_runtime and hasattr(self.compute_runtime, 'accepts')
+                    and not self.compute_runtime.accepts(node, request)):
+                continue
             try:
                 forecast = _preview_candidate(
                     state=self.state,
@@ -546,6 +583,8 @@ class _EventEngine:
             ].compute_satellite_id,
             selection=selected,
         )
+        if self.compute_runtime and hasattr(self.compute_runtime, 'selected'):
+            self.compute_runtime.selected(job)
         self.log_route_plan(job, forecasts[selected.selected_candidate_id]['inbound_path'], 'input', 'initial')
         self.send(
             job,
@@ -587,7 +626,7 @@ class _EventEngine:
         else:
             leg.update(finish_s=None, arrival_s=None, transmission_s=None, segments=[])
         leg["transport_model"] = self.net.spec.transport_model
-        leg['shared_pools'] = list(hop_pools(self.net.nodes, source, leg['target_node_id']))
+        leg['shared_pools'] = list(self.hop_pools(source, leg['target_node_id']))
         leg["stage"] = stage
         leg["ready_s"] = self.now
         leg["transfer_id"] = f"{job['request']['request_id']}:{self.sequence}"
@@ -621,7 +660,7 @@ class _EventEngine:
             leg = row["leg"]
             key = leg["link_id"], leg["source_node_id"], leg["target_node_id"]
             self.net.shared_load[key] = self.net.shared_load.get(key, 0) + 1
-            for pool in hop_pools(self.net.nodes, key[1], key[2]):
+            for pool in self.hop_pools(key[1], key[2]):
                 self.net.shared_pool_load[pool] = self.net.shared_pool_load.get(pool, 0) + 1
 
     def cancel_shared(self, request_id, reason):

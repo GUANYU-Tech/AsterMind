@@ -6,12 +6,13 @@ from ..setup.radio_capacity import capacity_pools, hop_pools, max_min_rates
 
 
 class FluidTransport:
-    def __init__(self, nodes, edges, profiles):
+    def __init__(self, nodes, edges, profiles, *, shared_pools=None, link_pools=None):
         self.now = 0.0
         self.active = {}
         self.capacities = {}
         self.nodes = nodes
-        self.pools = capacity_pools(nodes)
+        self.pools = capacity_pools(nodes) if shared_pools is None else dict(shared_pools)
+        self.link_pools = link_pools
         self.provenance = {
             'backend': 'fluid', 'sharing_scope': 'each_directed_physical_hop',
             'completion_source': 'orbitserve_equal_share_fluid',
@@ -35,7 +36,8 @@ class FluidTransport:
     def advance_until(self, time_s):
         if isinstance(time_s, bool) or not math.isfinite(time_s) or time_s < self.now:
             raise ValueError('fluid time must be finite and monotonic')
-        requirements = {i: (r['key'], *hop_pools(self.nodes, r['leg']['source_node_id'], r['leg']['target_node_id']))
+        requirements = {i: (r['key'], *(self.link_pools.get(r['key'], ()) if self.link_pools is not None else
+                                      hop_pools(self.nodes, r['leg']['source_node_id'], r['leg']['target_node_id'])))
                         if self.nodes else (r['key'],) for i, r in self.active.items()}
         rates = {i: v / 8 for i, v in max_min_rates(requirements, {**self.capacities, **self.pools}).items()}
         dt = min([time_s - self.now] + [r['remaining'] / rates[i] for i, r in self.active.items() if rates[i] > 0])

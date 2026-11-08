@@ -65,6 +65,17 @@ Those tests exercise the real model, including native SimGrid/ns3 Runtime paths.
 
 ## Deliberate interface changes
 
+Runtime routing now persists selected paths across transfers. The routing policy
+selects the initial path; traffic changes update timing without reselecting it.
+At physical time-slice, acquisition, or fault boundaries, only reused paths whose
+directed-link attributes changed are invalidated. Unrelated paths remain cached,
+and newly available alternatives do not preempt an unchanged path. A cached path
+that cannot carry a payload falls back to a feasibility search. Cache entries
+are bounded and isolated between preview forks. `NetworkState.transfer(...,
+recompute=True)` performs the original fresh search for comparison;
+`route_cache_info()` reports searches, hits, and invalidations. The regression
+checks are in `unit/runtime/test_persistent_routing.py`.
+
 The physical SGP4 path replaces the fixed-shell Arc and surrogate/circular trace
 runtime inputs. Legacy fixtures using `constellation`, `scheduler`, `simulation`,
 `communication_ingress`, and the old `RuntimeScenario` are not compatibility

@@ -18,8 +18,15 @@ class Ns3Transport(SimGridTransport):
     error_type = Ns3Unavailable
     check_available = staticmethod(require_ns3)
 
-    def __init__(self, nodes, edges, profiles, *, start_s=0.0, record_packets=False):
-        super().__init__(nodes, edges, profiles, start_s=start_s)
+    def validate_ready(self, ready):
+        required = {'packet_trace', 'native_counters', 'dynamic_capacity', 'shared_rf_pools'}
+        if any(edge.get('kind') == 'device_gate' for edge in getattr(self, 'edges', ())):
+            required.add('resource_gates')
+        if ready.get('protocol_version') != 1 or not required <= set(ready.get('capabilities', ())):
+            raise Ns3Unavailable('ns-3 worker protocol is incompatible; retain the dynamic-links worker with packet traces and counters')
+
+    def __init__(self, nodes, edges, profiles, *, start_s=0.0, record_packets=False, shared_pools=None, link_pools=None):
+        super().__init__(nodes, edges, profiles, start_s=start_s, shared_pools=shared_pools, link_pools=link_pools)
         self.packet_trace = []
         if record_packets:
             self._request({'op':'trace','enabled':True})

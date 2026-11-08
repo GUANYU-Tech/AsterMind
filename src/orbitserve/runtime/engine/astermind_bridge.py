@@ -90,6 +90,10 @@ class AsterMindRuntime:
             )
 
     def submit(self, engine, job):
+        self._admit_job(engine, job)
+        self.sessions[job['node']].submit(job['request']['request_id'])
+
+    def _admit_job(self, engine, job):
         node, request = job['node'], job['request']
         if node not in self.sessions:
             raise ValueError(f'no AsterMind deployment for selected node: {node}')
@@ -114,7 +118,6 @@ class AsterMindRuntime:
         job['soc_before'] = updates[node]['soc_before']
         self.jobs[request['request_id']] = job
         engine.active_compute[request['request_id']] = job
-        self.sessions[node].submit(request['request_id'])
 
     def candidate_load(self, node):
         session = self.sessions.get(node)

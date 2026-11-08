@@ -37,7 +37,7 @@ class SimGridTransport:
     error_type = SimGridUnavailable
     check_available = staticmethod(require_simgrid)
 
-    def __init__(self, nodes, edges, profiles, *, start_s=0.0):
+    def __init__(self, nodes, edges, profiles, *, start_s=0.0, shared_pools=None, link_pools=None):
         self.check_available()
         if isinstance(start_s, bool) or not isinstance(start_s, (int, float)) or not math.isfinite(start_s) or start_s < 0:
             raise ValueError('native transport start_s must be finite and nonnegative')
@@ -51,6 +51,7 @@ class SimGridTransport:
             hop_pools(nodes, edge['endpoint_b'], edge['endpoint_a'])
         self.now = 0.0
         self.nodes, self.edges, self.profiles = nodes, tuple(edges), profiles
+        self.pool_overrides, self.link_pool_overrides = shared_pools, link_pools
         self.configured_capacities = {}
         self.active = {}
         self.resources = {}
@@ -66,9 +67,11 @@ class SimGridTransport:
                 links.append({
                     'key': key, 'source': source, 'target': target,
                     'bandwidth_bps': directional_profile(nodes, profiles, edge, source).bandwidth_bps,
-                    'pools': list(hop_pools(nodes, source, target)),
+                    'resource_gate': edge.get('kind') == 'device_gate',
+                    'pools': list(link_pools.get((edge['link_id'], source, target), ())
+                                  if link_pools is not None else hop_pools(nodes, source, target)),
                 })
-        pools = capacity_pools(nodes)
+        pools = capacity_pools(nodes) if shared_pools is None else dict(shared_pools)
         self.responses = queue.Queue()
         environment = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
         # Official bindings may ship libsimgrid next to their extension module.
@@ -108,6 +111,7 @@ class SimGridTransport:
             ready = self._request({"nodes": sorted(nodes), "links": links, 'pools': pools, 'start_s': start_s})
             if not ready.get("ready"):
                 raise self.error_type(f"{self.worker_name} worker did not initialize")
+            self.validate_ready(ready)
             self.provenance = {
                 "backend": "simgrid",
                 "simgrid_version": ready["version"],
@@ -162,6 +166,9 @@ class SimGridTransport:
                 f"{self.worker_name} worker protocol failed: {error}"
             ) from error
 
+    def validate_ready(self, ready):
+        """Backend-specific handshake checks, inside startup cleanup ownership."""
+
     def resource(self, leg):
         return self.resources[
             leg["link_id"], leg["source_node_id"], leg["target_node_id"]
@@ -177,7 +184,8 @@ class SimGridTransport:
     def register_edge(self, edge):
         """SimGrid seals platforms: rebuild at this causal boundary, retaining work."""
         remaining = self._request({'op': 'remaining'})['remaining']
-        replacement = type(self)(self.nodes, (*self.edges, edge), self.profiles, start_s=self.now)
+        replacement = type(self)(self.nodes, (*self.edges, edge), self.profiles, start_s=self.now,
+                                 shared_pools=self.pool_overrides, link_pools=self.link_pool_overrides)
         try:
             replacement.configure(self.configured_capacities)
             for identity, row in self.active.items():

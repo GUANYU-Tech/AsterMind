@@ -54,3 +54,13 @@ __pycache__/
 .coverage
 .coverage.*
 /htmlcov/
+
+# Merge_ML_Version source adapters: retain their generated artifacts locally.
+/simulator/build/
+/simulator/runs/
+/network_sim/build/
+/network_sim/runs/
+/integration/upstream/
+*.so
+*.dll
+*.pdb

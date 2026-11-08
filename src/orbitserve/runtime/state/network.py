@@ -37,8 +37,8 @@ class NetworkState:
         self.physical_attributes = None
         prepared = None
         if physical_state is not None:
-            from .physical_dataset import PhysicalAttributes, physical_spec
             from ..setup.sun_geometry import SUN_GEOMETRY_VERSION
+            from .physical_dataset import PhysicalAttributes, physical_spec
             self.physical_attributes = PhysicalAttributes(physical_state)
             prepared = self.physical_attributes.metadata
             from ..setup.faults import physical_network_settings
@@ -263,6 +263,8 @@ class NetworkState:
         result.manual_disabled_links = set(self.manual_disabled_links)
         result.added_edge_ids = set(self.added_edge_ids)
         result.windows = dict(self.windows)
+        if hasattr(self, '_route_cache'):
+            result._route_cache = self._route_cache.fork()
         return result
 
     def observe_fault(self, index, fault, time_s, *, restored=False):
@@ -713,7 +715,10 @@ class NetworkState:
 
     def reservation_keys(self, leg):
         return ((leg['link_id'], leg['source_node_id'], leg['target_node_id']),
-                *((k, '', '') for k in hop_pools(self.nodes, leg['source_node_id'], leg['target_node_id'])))
+                *((k, '', '') for k in self.pools_for_hop(leg['source_node_id'], leg['target_node_id'])))
+
+    def pools_for_hop(self, source, target):
+        return hop_pools(self.nodes, source, target)
 
     def reserve(self, leg):
         for key in self.reservation_keys(leg):
@@ -747,7 +752,7 @@ class NetworkState:
         if self.faulted(self.edge_by_id[link_id]):
             return None
         times = self.link_times[link_id]
-        pools = hop_pools(self.nodes, source, target)
+        pools = self.pools_for_hop(source, target)
         occupied = sorted(row for key in ((link_id, source, target), *((k, '', '') for k in pools))
                           for row in self.calendars.get(key, ()))
         cursor = time_s
@@ -789,7 +794,7 @@ class NetworkState:
                     bandwidth /= 1 + self.shared_load.get((link_id, source, target), 0)
                     bandwidth = min([bandwidth] + [self.pool_capacities[k] /
                                     (1 + self.shared_pool_load.get(k, 0)) for k in pools])
-                    if self.spec.transport_model == 'ns3' and payload_bytes > 0:
+                    if self.spec.transport_model == 'ns3' and payload_bytes > 0 and edge['kind'] != 'device_gate':
                         # Native P2P uses 1400-byte payload packets plus 2-byte PPP.
                         bandwidth *= payload_bytes / (math.ceil(payload_bytes / 1400) * 2 + math.ceil(payload_bytes))
                 duration = (remaining / bandwidth) if bandwidth > 0 else math.inf
@@ -813,7 +818,11 @@ class NetworkState:
                 remaining -= sent
                 cursor = finish
                 if remaining <= 1e-7:
-                    propagation = self.distance(edge, cursor) / C_KM_PER_S
+                    # Reuse the exact same finish-time geometry lookup for the
+                    # propagation estimate and returned leg; never reuse a
+                    # start-time value across a physical boundary.
+                    finish_distance = self.distance(edge, cursor)
+                    propagation = finish_distance / C_KM_PER_S
                     arrival = cursor + propagation
                     if arrival > self.end_s:
                         return None
@@ -822,7 +831,7 @@ class NetworkState:
                         "source_node_id": source,
                         "target_node_id": target,
                         "payload_bytes": payload_bytes,
-                        'distance_km': self.distance(edge, cursor),
+                        'distance_km': finish_distance,
                         'start_distance_km': self.distance(edge, start),
                         'distance_time_s': cursor,
                         'attributes_time_s': self.sample_time(cursor),
@@ -859,7 +868,15 @@ class NetworkState:
         allow_wait: bool = True,
         kinds: set[str] | None = None,
         avoid_nodes: set[str] | None = None,
+        recompute: bool = False,
     ) -> tuple[float, tuple[dict, ...]]:
+        """Reuse a selected path; recompute current leg timing on every call.
+
+        Policies choose the initial path. Traffic alone does not change it.
+        Physical changes invalidate only cached paths using changed links.
+        ``recompute=True`` bypasses persistence for an explicit fresh search.
+        A path that cannot carry this payload also falls back to a fresh search.
+        """
         if policy not in {"min_hops", "min_propagation", "earliest_arrival"}:
             raise ValueError("unsupported routing policy")
         if not math.isfinite(payload_bytes) or payload_bytes < 0:
@@ -870,13 +887,35 @@ class NetworkState:
             or not self.start_s <= time_s < self.end_s
         ):
             raise NetworkUnavailable("route_endpoint_or_time_unavailable")
-        adjacency: dict[str, list[tuple[str, str]]] = {}
-        for edge in self.edges:
-            if kinds is not None and edge["kind"] not in kinds:
-                continue
-            a, b = edge["endpoint_a"], edge["endpoint_b"]
-            adjacency.setdefault(a, []).append((b, edge["link_id"]))
-            adjacency.setdefault(b, []).append((a, edge["link_id"]))
+        from .route_cache import PersistentRouteCache
+
+        if not hasattr(self, '_route_cache'):
+            self._route_cache = PersistentRouteCache()
+        route_cache = self._route_cache
+        route_key = route_cache.key(source, target, policy, allow_wait, kinds, avoid_nodes)
+        selected = None if recompute else route_cache.get(self, route_key, time_s)
+        if selected is not None:
+            _, hops = selected
+            arrival, replay = time_s, []
+            for link_id, first, second in hops:
+                leg = self._edge_transfer(
+                    link_id, first, second, arrival, payload_bytes, allow_wait
+                )
+                if leg is None:
+                    break
+                replay.append(leg)
+                arrival = leg['arrival_s']
+            else:
+                route_cache.hits += 1
+                if commit:
+                    for leg in replay:
+                        self.reserve(leg)
+                return arrival, tuple(replay)
+            # A long transfer may no longer fit its contact window. Search for
+            # a feasible alternative without caching failed timing predictions.
+            route_cache.replay_failures += 1
+        route_cache.searches += 1
+        adjacency = self._routing_adjacency(kinds)
         queue = [(0.0, time_s, (source,), 0, ())]
         labels: dict[str, list[tuple[float, float]]] = {}
         serial = 0
@@ -884,6 +923,8 @@ class NetworkState:
             cost, arrival, nodes, _, path = heapq.heappop(queue)
             node = nodes[-1]
             if node == target:
+                if not recompute:
+                    route_cache.remember(self, route_key, path, time_s)
                 if commit:
                     for leg in path:
                         self.reserve(leg)
@@ -893,11 +934,11 @@ class NetworkState:
                 continue
             prior[:] = [(c, t) for c, t in prior if not (cost <= c and arrival <= t)]
             prior.append((cost, arrival))
-            for neighbor, link_id in sorted(adjacency.get(node, ())):
+            for neighbor, link_id in adjacency.get(node, ()):
                 if (
                     neighbor in nodes
                     or neighbor in (avoid_nodes or ())
-                    or (self.nodes[neighbor].role == "ground" and neighbor != target)
+                    or not self.route_node_allowed(neighbor, source, target)
                 ):
                     continue
                 leg = self._edge_transfer(
@@ -924,6 +965,40 @@ class NetworkState:
                     ),
                 )
         raise NetworkUnavailable("no_feasible_dynamic_route")
+
+    def _routing_adjacency(self, kinds):
+        """Cache only structural neighbors; every edge cost is evaluated live."""
+        epoch = (id(self.edges), self.revision)
+        if getattr(self, '_adjacency_epoch', None) != epoch:
+            self._adjacency_epoch = epoch
+            self._adjacency_cache = {}
+        key = None if kinds is None else frozenset(kinds)
+        if key not in self._adjacency_cache:
+            adjacency = {}
+            for edge in self.edges:
+                if kinds is not None and edge['kind'] not in kinds:
+                    continue
+                a, b = edge['endpoint_a'], edge['endpoint_b']
+                adjacency.setdefault(a, []).append((b, edge['link_id']))
+                adjacency.setdefault(b, []).append((a, edge['link_id']))
+            # Preserve the original deterministic search order and bound the
+            # number of retained kind filters. Forks may share these read-only
+            # neighbor tuples; costs, loads and calendars are never cached here.
+            if len(self._adjacency_cache) >= 16:
+                self._adjacency_cache = {}
+            self._adjacency_cache[key] = {
+                node: tuple(sorted(rows)) for node, rows in adjacency.items()}
+        return self._adjacency_cache[key]
+
+    def route_cache_info(self):
+        """Report path reuse separately from per-hop transport work."""
+        from .route_cache import PersistentRouteCache
+
+        cache = getattr(self, '_route_cache', None)
+        return (cache if cache is not None else PersistentRouteCache()).info()
+
+    def route_node_allowed(self, node, source, target):
+        return self.nodes[node].role != "ground" or node == target
 
 
 def ground_position_km(row: dict) -> tuple[float, float, float]:
