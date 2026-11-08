@@ -6,14 +6,391 @@ source metadata math and complete useful operator work do not establish a
 native allocator, provider, launch or observed runtime execution.
 """
 
+from dataclasses import dataclass, replace
+
 from src.serving.schedule.schedule_step import schedule_step_sha256
 
 from .runtime_inputs import ExpertRoutingInput, V32PaddedMTPInputs, vllm_0_30_source_model_inputs
-from .traced_forward import ForwardCollectiveGroup, ForwardTrace
-from .traced_models import DeepseekV32Model, DeepseekV32MTPPredictorLayer, _glm_source_weight_dtype, _source_expert_resolutions
+from .traced_forward import ForwardCollectiveGroup, ForwardPipelineGroup, ForwardTrace, ForwardWorkspace
+from .traced_models import (DeepseekV32Model, DeepseekV32MTPPredictorLayer, _glm_source_weight_dtype,
+    _source_expert_resolutions, _run_vllm030_pipeline_stages)
 from .traced_operators import SymbolicGreedy, SymbolicLinear, SymbolicTPLogitsProcessor
 from .traced_sampling import MTPSourceOps, _mtp_retained_last_rows, prepare_padded_drafter, sample_padded_raw_logits
 from .workload_graph import WorkloadKind
+from .model_config import is_glm_mtp_tensor_model_scope, is_glm_mtp_data_parallel_model_scope
+
+
+def glm_fp8_rank_local_expert_source_metadata():
+    """Declared0.30 NoDPEP prepare with deferred Cutlass block128 experts."""
+    from .traced_glm_pcp import glm_fp8_deferred_expert_source_metadata
+    return {**glm_fp8_deferred_expert_source_metadata(),
+        "source_fp8_prepare_implementation": "vllm_0_30_no_dp_ep_modular",
+        "source_fp8_dispatch_scope": "replicated_tp_rows_without_cross_rank_dispatch",
+        "source_fp8_output_reduction": "decoder_late_tp_sum_or_partial_pp_hidden_frontier"}
+
+
+@dataclass(frozen=True)
+class _GLMMTPReplicaContext:
+    """One real DP replica's traces and globally coordinated expert rows."""
+    traces: tuple
+    target_contexts: tuple
+    draft_contexts: tuple
+    target_resolutions: tuple
+    draft_resolutions: tuple
+    expert_parallel_size: int
+
+
+@dataclass(frozen=True)
+class _GLMMTPLegacyState:
+    pool: object
+    model_sha256: str
+    num_drafts: int
+    share_indices: bool
+    skip_topk: tuple
+    step_ids: frozenset
+
+
+def _mtp_dp_rows(step, token_ids, *, block_size, num_drafts, draft_pass):
+    from .traced_glm_pcp import PCPModelRows, PCPQueryChunk
+    chunks, positions, slots = [], [], []
+    base = offset = 0
+    for request in step.requests:
+        first = request.computed_tokens
+        count = request.scheduled_tokens
+        if draft_pass is not None and draft_pass > 0:
+            first += count - 1 + draft_pass
+            count = 1
+        end = first + count
+        chunks.append(PCPQueryChunk(request.request_id, request.phase if draft_pass in (None, 0) else "decode",
+            0, count, offset, offset, first, base, end))
+        positions.extend(range(first, end))
+        slots.extend(range(base + first, base + end))
+        offset += count
+        extent = request.computed_tokens + request.scheduled_tokens + num_drafts - 1
+        base += -(-extent // block_size) * block_size
+    if len(token_ids) != offset:
+        raise ValueError("MTP DP rows require every actual target/draft input ID")
+    return PCPModelRows((tuple(chunks),), (token_ids,), (tuple(positions),), (tuple(slots),),
+        ((False,) * offset,), tuple(range(offset)), offset, base)
+
+
+def _trace_glm_mtp_data_parallel_forward(model, step, pool, expert_routing, *, input_ids, source_profile,
+        source_max_model_len, max_batched_tokens, max_requests, workspace_initial_capacity_bytes,
+        selection_source, prefill_attention_source, source_inputs, indexer_max_logits_mb,
+        legacy_skip_topk_by_data_rank, source_program_cache):
+    """TP/DP experts share routed shards for target and each draft pass."""
+    from src.serving.parallelism.parallel_plan import build_parallel_plan
+    from .traced_glm_pcp import GLMPCPContext
+    from .traced_forward import SourceProgramCache
+    config = pool.parallel_plan.config
+    dp, pp, tp = config.data_parallel_size, config.pipeline_parallel_size, config.tensor_parallel_size
+    ep = config.expert_parallel_size
+    moe_sp = config.enable_expert_parallel and tp > 1
+    model_sp = moe_sp and pp == 1
+    if (pool.hardware_id != "nvidia_h200" or not is_glm_mtp_data_parallel_model_scope(model, config)
+            or model.weight_dtype != _glm_source_weight_dtype(source_profile)
+            or len(pool.ranks) != config.worker_count):
+        raise NotImplementedError("V32 source requires SP/CP/DP1 or explicit BF16 whole-shard TP CP1 MTP DP; FP8 DP binds whole128 expert shards or uniform EP with deferred Cutlass input quantization")
+    if (not isinstance(source_inputs, V32PaddedMTPInputs) or source_inputs.request_ids != tuple(r.request_id for r in step.requests)
+            or not isinstance(expert_routing, ExpertRoutingInput) or step.pool_name != pool.name):
+        raise ValueError("MTP DP requires the complete original schedule and independent typed draft inputs")
+    if (not isinstance(workspace_initial_capacity_bytes, tuple) or len(workspace_initial_capacity_bytes) != len(pool.ranks)
+            or any(type(value) is not int or value < 0 for value in workspace_initial_capacity_bytes)):
+        raise ValueError("MTP DP requires actual per-rank workspace entry history")
+    num_drafts = len(source_inputs.draft_input_token_ids)
+    if (source_program_cache is not None and type(source_program_cache) is not SourceProgramCache
+            or type(indexer_max_logits_mb) is not int or indexer_max_logits_mb <= 0):
+        raise ValueError("GLM MTP requires its typed run history and positive indexer reserve")
+    share = model.index_share_for_mtp_iteration
+    prior = None
+    if source_program_cache is not None and id(pool) in source_program_cache.glm_mtp_legacy_states:
+        prior = source_program_cache.glm_mtp_legacy_states[id(pool)]
+        if (type(prior) is not _GLMMTPLegacyState or prior.pool is not pool or prior.model_sha256 != model.config_sha256
+                or prior.num_drafts != num_drafts or prior.share_indices != share or len(prior.skip_topk) != dp
+                or step.step_id in prior.step_ids):
+            raise ValueError("GLM MTP dummy requires its own unreplayed model/pool/proposer history")
+    previous_skip = prior.skip_topk if prior is not None else ((False,) * dp if source_program_cache is not None or not share else None)
+    if legacy_skip_topk_by_data_rank is not None:
+        if (type(legacy_skip_topk_by_data_rank) is not tuple or len(legacy_skip_topk_by_data_rank) != dp
+                or any(type(value) is not bool for value in legacy_skip_topk_by_data_rank)
+                or previous_skip is not None and previous_skip != legacy_skip_topk_by_data_rank
+                or not share and any(legacy_skip_topk_by_data_rank)):
+            raise ValueError("GLM MTP declared skip-topk history conflicts with actual run-owned state")
+        previous_skip = legacy_skip_topk_by_data_rank
+    packed, packed_ids, packed_order = vllm_0_30_source_model_inputs(step, embedding_token_ids=input_ids,
+        prompt_lengths=None, num_speculative_tokens=num_drafts)
+    if (tuple(len(ids) for ids in source_inputs.draft_input_token_ids)
+            != (step.token_count, *((len(step.requests),) * (num_drafts - 1)))):
+        raise ValueError("MTP DP scenario must retain every physical target row and every recurrent request")
+    row_indices, request_indices = {}, {}
+    offset = 0
+    for index, request in enumerate(packed.requests):
+        row_indices[request.request_id] = tuple(range(offset, offset + request.scheduled_tokens))
+        request_indices[request.request_id] = index
+        offset += request.scheduled_tokens
+    if any(request.data_parallel_rank >= dp for request in step.requests):
+        raise ValueError("MTP DP request owner is outside the physical deployment")
+    local_steps, local_ids, local_inputs, layouts = [], [], [], []
+    for replica in range(dp):
+        requests = tuple(request for request in packed.requests if request.data_parallel_rank == replica)
+        if not requests:
+            local_steps.append(None)
+            local_ids.append(())
+            local_inputs.append(None)
+            layouts.append((None,) * (num_drafts + 1))
+            continue
+        local = replace(step, requests=requests, finished_request_ids=(), preempted_request_ids=())
+        indices = tuple(index for request in requests for index in row_indices[request.request_id])
+        ids = tuple(packed_ids[index] for index in indices)
+        drafts = (tuple(source_inputs.draft_input_token_ids[0][index] for index in indices),
+            *(tuple(values[request_indices[request.request_id]] for request in requests)
+                for values in source_inputs.draft_input_token_ids[1:]))
+        scenario = replace(source_inputs, request_ids=tuple(request.request_id for request in requests),
+            discarded_rows=(False,) * len(requests), draft_input_token_ids=drafts)
+        local_steps.append(local)
+        local_ids.append(ids)
+        local_inputs.append(scenario)
+        layouts.append((_mtp_dp_rows(local, ids, block_size=scenario.block_size_tokens,
+            num_drafts=num_drafts, draft_pass=None), *(_mtp_dp_rows(local, values,
+                block_size=scenario.block_size_tokens, num_drafts=num_drafts, draft_pass=index)
+                for index, values in enumerate(drafts))))
+    request_counts = tuple(tuple(0 if layout[index] is None else layout[index].physical_rows for layout in layouts)
+        for index in range(num_drafts + 1))
+    if any(local is None for local in local_steps) and previous_skip is None:
+        raise NotImplementedError("GLM MTP warm dummy requires explicit retained skip-topk history or its run-owned source cache")
+    dummy_rows = num_drafts + 1
+    counts = tuple(tuple(dummy_rows if count == 0 else count for count in phase) for phase in request_counts)
+    if max(max(phase) for phase in counts) > max_batched_tokens:
+        raise ValueError("GLM MTP source batch capacity must contain the full N+1 legacy dummy batch")
+    traces = tuple(ForwardTrace(rank=rank, namespace=f"{step.step_id}:rank-{rank}") for rank in pool.ranks)
+    tensor = {(replica, stage): ForwardCollectiveGroup(tuple(traces[replica * pp * tp + stage * tp + lane]
+        for lane in range(tp)), namespace=f"{step.step_id}:dp{replica}:stage{stage}:tp")
+        for replica in range(dp) for stage in range(pp)} if tp > 1 else {}
+    data = {(stage, lane): ForwardCollectiveGroup(tuple(traces[replica * pp * tp + stage * tp + lane]
+        for replica in range(dp)), namespace=(f"{step.step_id}:stage{stage}:dp" if tp == 1 else
+            f"{step.step_id}:stage{stage}:lane{lane}:dp")) for stage in range(pp) for lane in range(tp)}
+    expert = {stage: ForwardCollectiveGroup(tuple(traces[replica * pp * tp + stage * tp + lane]
+        for replica in range(dp) for lane in range(tp)), namespace=f"{step.step_id}:stage{stage}:ep")
+        for stage in range(pp)} if config.enable_expert_parallel else {}
+    root = ForwardCollectiveGroup(traces, namespace=f"{step.step_id}:joined", subgroups=(*tensor.values(), *data.values(), *expert.values()))
+    dispatch, combine = (pool.collective_for(operation) for operation in ("all_gatherv", "reduce_scatterv"))
+    reduce = pool.collective_for("all_reduce") if tp > 1 else None
+    gather = pool.collective_for("all_gather") if tp > 1 else None
+    def context(replica, stage, lane, phase):
+        return GLMPCPContext(layouts[replica][phase], 0, None, gather, dispatch=dispatch, combine=combine,
+            tensor_group=tensor[(replica, stage)] if tp > 1 else None, tensor_collective=reduce,
+            data_group=data[(stage, lane)], data_parallel_rank=replica, physical_rows_by_data_rank=counts[phase],
+            expert_group=expert[stage] if config.enable_expert_parallel else None,
+            sequence_parallel=model_sp, moe_sequence_parallel=moe_sp, dummy_run=local_steps[replica] is None,
+            request_rows_by_data_rank=request_counts[phase])
+    invocations = tuple(f"{step.step_id}:layer-{layer}:moe" for layer in range(model.num_hidden_layers))
+    expert_counts = tuple(sum(-(-count // tp) * tp if moe_sp else count for count in phase) for phase in counts)
+    resolutions = _source_expert_resolutions(model, step, pool, expert_routing, invocations, expert_counts[0])
+    drafts = tuple(expert_routing.resolve(step_id=step.step_id, layer_index=None,
+        moe_invocation_id=f"{step.step_id}:mtp-pass-{index}:moe", schedule_step_sha256=schedule_step_sha256(step),
+        tokens=expert_counts[index + 1], num_experts=model.num_experts, topk=model.num_experts_per_tok,
+        model_config_sha256=model.config_sha256, pool_name=pool.name, tensor_parallel_size=tp, expert_parallel_size=ep,
+        expert_rank_group=(pool.physical_ranks_for_pipeline_stage(pp - 1) if config.enable_expert_parallel
+            else (pool.physical_ranks_for_pipeline_stage(pp - 1)[0],)), expert_placement_strategy="linear",
+        moe_layer_ordinal=sum(model.layer_uses_moe(layer) for layer in range(model.num_hidden_layers)),
+        assumption_model_semantics_sha256=(model.expert_routing_assumption_semantics_sha256
+            if expert_routing.source_kind == "explicit_assumption" else None)) for index in range(num_drafts))
+    assignments = pool.parallel_plan.layer_to_pipeline_stage
+    partition = tuple(assignments.count(stage) for stage in range(pp))
+    local_plan = build_parallel_plan(replace(config, data_parallel_size=1, sequence_parallel_size=1,
+        enable_expert_parallel=config.enable_expert_parallel and tp > 1), num_layers=model.num_hidden_layers,
+        num_experts=model.num_experts, pipeline_layer_partition=partition)
+    for replica, local in enumerate(local_steps):
+        target_contexts = tuple(context(replica, stage, lane, 0) for stage in range(pp) for lane in range(tp))
+        draft_contexts = tuple(tuple(context(replica, pp - 1, lane, index + 1) for lane in range(tp)) for index in range(num_drafts))
+        local_traces = traces[replica * pp * tp:(replica + 1) * pp * tp]
+        if local is None:
+            _trace_glm_mtp_legacy_dummy(model, step, pool, local_traces,
+                tuple(tensor[(replica,stage)] for stage in range(pp)) if tp>1 else (),
+                target_contexts, draft_contexts, resolutions, drafts, invocations, partition,
+                source_profile=source_profile, source_max_model_len=source_max_model_len,
+                max_batched_tokens=max_batched_tokens, workspace_initial_capacity_bytes=workspace_initial_capacity_bytes,
+                indexer_max_logits_mb=indexer_max_logits_mb, skip_topk=previous_skip[replica],
+                reduce=reduce, gather=gather)
+            continue
+        view = replace(pool, ranks=tuple(trace.rank for trace in local_traces), parallel_plan=local_plan)
+        trace_glm_dsa_mtp_forward(model, local, view, expert_routing, input_ids=local_ids[replica],
+            source_profile=source_profile, source_max_model_len=source_max_model_len,
+            max_batched_tokens=max_batched_tokens, max_requests=max_requests,
+            workspace_initial_capacity_bytes=workspace_initial_capacity_bytes[replica * pp * tp:(replica + 1) * pp * tp],
+            selection_source=selection_source, prefill_attention_source=prefill_attention_source,
+            source_inputs=local_inputs[replica], indexer_max_logits_mb=indexer_max_logits_mb,
+            _replica_context=_GLMMTPReplicaContext(local_traces,
+                target_contexts, draft_contexts, resolutions, drafts, ep))
+    def metadata(node):
+        logical = pool.logical_rank_for_physical_rank(node.rank)
+        return {"glm_parallel_source": True, "source_projection_only": True,
+            "model_execution_version": "vllm_0_30_0", "model_source_profile": source_profile,
+            "source_pipeline_stage": logical // tp % pp, "pipeline_layer_partition": partition,
+            "source_data_parallel_rank": logical // (pp * tp), "source_glm_model_sequence_parallel": model_sp,
+            "source_glm_moe_sequence_parallel": moe_sp,
+            **({"source_dummy_run":True,"source_actual_request_count":0} if local_steps[logical//(pp*tp)] is None
+                and node.kind not in (WorkloadKind.COLLECTIVE,WorkloadKind.P2P) else {}),
+            **({"source_glm_context_parallel_size": 1, "source_pcp_sequence_parallel": model_sp}
+                if node.kind is not WorkloadKind.P2P else {})}
+    for trace in traces:
+        trace._nodes = {name: node.with_attributes({**node.attributes, **metadata(node)}) for name, node in trace._nodes.items()}
+    for group in (*tensor.values(), *data.values(), *expert.values()):
+        group._contracts = {name: node.with_attributes({**node.attributes, **metadata(node)})
+            for name, node in group._contracts.items()}
+    root.source_scope = {"model_execution_version": "vllm_0_30_0", "source_projection_only": True,
+        "pipeline_layer_partition": partition, "MTP_data_parallel_target_rows": request_counts[0],
+        "MTP_data_parallel_draft_rows": request_counts[1:], "global_model_input_order": packed_order,
+        "MTP_physical_target_rows_including_dummy": counts[0], "MTP_physical_draft_rows_including_dummy": counts[1:],
+        "MTP_legacy_dummy_skip_topk": previous_skip, "indexer_max_logits_mb": indexer_max_logits_mb,
+        "idle_source_scope": "full N+1-row target plus N independent proposer-buffer forwards on last PP; no logits, cache writes or PP transfer",
+        "dummy_draft_PP_provider_equivalence": pp == 1,
+        "legacy_runtime_scope": "eager/noCG/noDBO/compilerSPoff; model/MoE SP padding represented separately",
+        "target_draft_topk_backing": "shared last-stage target TopK; proposer load_model rebinds every draft module",
+        "model_sequence_parallel": model_sp, "moe_sequence_parallel": moe_sp,
+        "normal_capacity_accepted": False, "actual_provider_bound": False}
+    if source_program_cache is not None:
+        root.graph
+        source_program_cache.glm_mtp_legacy_states[id(pool)] = _GLMMTPLegacyState(pool,model.config_sha256,
+            num_drafts,share,tuple(share if local is not None else previous_skip[replica]
+                for replica,local in enumerate(local_steps)),
+            frozenset((step.step_id,)) if prior is None else prior.step_ids | {step.step_id})
+    return root
+
+
+def _trace_glm_mtp_legacy_dummy(model, step, pool, traces, groups, target_contexts, draft_contexts,
+        resolutions, draft_resolutions, invocations, partition, *, source_profile, source_max_model_len,
+        max_batched_tokens, workspace_initial_capacity_bytes, indexer_max_logits_mb, skip_topk, reduce, gather):
+    """Eager idle target and proposer read independent retained runner inputs."""
+    from .traced_operators import SymbolicGather
+    from .workload_graph import WorkloadEdge
+    tp = pool.parallel_plan.config.tensor_parallel_size
+    pp, num_drafts = len(partition), len(draft_resolutions)
+    rows = num_drafts + 1
+    factory = GLMLegacyDummyAttentionFactory(tokens=rows,source_max_model_len=source_max_model_len,
+        max_batched_tokens=max_batched_tokens,indexer_max_logits_mb=indexer_max_logits_mb)
+    def run_stage(trace,stage,incoming):
+        lane = traces.index(trace) % tp
+        group = groups[stage] if groups else None
+        start = sum(partition[:stage])
+        network = DeepseekV32Model(trace,model,pool.name,group,reduce,token_ids=None,
+            q_lens=(rows,),kv_lens=(rows,),request_phases=("decode",),slot_mapping=None,cache_capacity_tokens=None,
+            source_max_model_len=source_max_model_len,max_batched_tokens=max_batched_tokens,resolutions=resolutions,
+            invocation_ids=invocations,workspace_initial_capacity_bytes=workspace_initial_capacity_bytes[pool.ranks.index(trace.rank)],
+            selection_source=None,source_profile=source_profile,prefill_attention_source=None,
+            model_input_order=None,
+            num_speculative_tokens=num_drafts,
+            expert_parallel_size=pool.parallel_plan.config.expert_parallel_size,layer_range=(start,start+partition[stage]),
+            pcp_context=target_contexts[stage*tp+lane],startup_attention_factory=factory)
+        positions = trace.tensor("positions",(rows,),"int64")
+        ids = trace.tensor("input_ids",(rows,),"int32") if stage==0 else None
+        output = network(ids,positions,intermediate_tensors=incoming)
+        if stage != pp-1:
+            return output
+        # The target result remains live through proposer.dummy_run. Its
+        # selected-hidden gather follows all draft calls in the runner.
+        completion = trace._writers[output.view.allocation_id]
+        def order_call(before):
+            added = set(trace._nodes)-before
+            roots = added-{edge.destination for edge in trace._edges if edge.source in added and edge.destination in added}
+            trace._edges.extend(WorkloadEdge(completion,root,"barrier") for root in sorted(roots))
+        draft_ids = trace.tensor("mtp.input_ids",(max_batched_tokens,),"int32",persistent=True).narrow(0,0,rows)
+        draft_positions = trace.tensor("mtp.positions",(max_batched_tokens,),"int64",persistent=True).narrow(0,0,rows)
+        previous = trace.tensor("mtp.hidden_states",(max_batched_tokens,model.hidden_size),"bf16",persistent=True).narrow(0,0,rows)
+        # load_model rebinds every draft module to the target's top-k arena.
+        topk = network.topk_buffer
+        input_norm = None
+        for index in range(num_drafts):
+            draft = DeepseekV32MTPPredictorLayer(trace,model,pool.name,f"mtp-pass-{index}",group=group,
+                collective=reduce,gather=gather,input_token_ids=None,q_lens=(rows,),kv_lens=(rows,),request_phases=("decode",),
+                slots=None,cache_capacity_tokens=None,resolution=draft_resolutions[index],
+                invocation_id=f"{step.step_id}:mtp-pass-{index}:moe",source_profile=source_profile,
+                source_max_model_len=source_max_model_len,max_batched_tokens=max_batched_tokens,workspace=network.workspace,
+                topk_buffer=topk,cache=None,index_cache=None,rotary_cache=network.rotary_cache,
+                index_rotary_cache=network.index_rotary_cache,slot_tensor=None,input_norm=input_norm,
+                indexer_type="shared" if skip_topk else "full",prefill_attention_source=None,selection_source=None,
+                startup_attention_factory=factory,expert_parallel_size=pool.parallel_plan.config.expert_parallel_size,
+                pcp_context=draft_contexts[index][lane])
+            before = set(trace._nodes)
+            result = draft(draft_ids,draft_positions,previous,position_values=None)
+            order_call(before)
+            completion = trace._writers[result[0].view.allocation_id]
+            del result
+            input_norm = draft.input_norm
+        before = set(trace._nodes)
+        SymbolicGather(trace,"dummy:selected-hidden",pool.name)(output,1,indices=(rows-1,))
+        order_call(before)
+        return None
+    if pp==1:
+        for trace in traces:run_stage(trace,0,None)
+    else:
+        pipeline = ForwardPipelineGroup(traces,namespace=f"{step.step_id}:dummy-dp{target_contexts[0].data_parallel_rank}",
+            collective_groups=groups)
+        _run_vllm030_pipeline_stages(pipeline,pool,rows=rows,hidden_size=model.hidden_size,
+            max_batched_tokens=max_batched_tokens,run_stage=run_stage,mark_source_projection=False,
+            dummy_run=True,declare_external_dummy_inputs=True)
+
+
+def _reserve_glm_no_metadata_indexer(trace, model, prefix, workspace, max_model_len, logits_mb):
+    """Pinned sparse_attn_indexer's metadata=None allocation-only branch."""
+    capacity = 40 * max_model_len
+    workspace.get_simultaneous(((capacity, model.index_head_dim), "fp8"),
+        ((capacity, 4), "uint8"), ((1024 * 1024,), "uint8"))
+    dummy_logits = trace.tensor(trace.unique_name(prefix + ":profile-logits"),
+        (logits_mb * 1024 * 1024,), "uint8")
+
+
+class GLMLegacyDummyAttentionFactory:
+    """Actual eager idle work, with full configured constructor capacities."""
+
+    def __init__(self, *, tokens, source_max_model_len, max_batched_tokens, indexer_max_logits_mb):
+        if (any(type(value) is not int or value <= 0 for value in
+                (tokens, source_max_model_len, max_batched_tokens, indexer_max_logits_mb)) or tokens > max_batched_tokens):
+            raise ValueError("GLM dummy requires positive source limits containing every physical row")
+        self.tokens, self.max_model_len = tokens, source_max_model_len
+        self.max_batched_tokens, self.logits_mb = max_batched_tokens, indexer_max_logits_mb
+
+    def validate(self, *, rows, max_batched_tokens, source_max_model_len,
+                 cache_capacity_tokens, slot_mapping, selection_source, prefill_attention_source):
+        if (rows != self.tokens or max_batched_tokens != self.max_batched_tokens or source_max_model_len != self.max_model_len
+                or any(value is not None for value in (cache_capacity_tokens, slot_mapping, selection_source, prefill_attention_source))):
+            raise ValueError("GLM dummy requires its complete source capacities and no request/cache metadata")
+
+    def attention(self, trace, model, pool, prefix, *, layer_index, tp_size,
+                  workspace, rotary_cache, topk_buffer, dummy_index_q, dummy_index_weights,
+                  mtp_indexer_type=None):
+        return _GLMLegacyDummyAttention(trace, model, pool, prefix, layer_index=layer_index, tp_size=tp_size,
+            workspace=workspace, rotary_cache=rotary_cache, topk_buffer=topk_buffer,
+            dummy_index_q=dummy_index_q, dummy_index_weights=dummy_index_weights, factory=self,
+            mtp_indexer_type=mtp_indexer_type)
+
+
+class _GLMLegacyDummyAttention:
+    def __init__(self, trace, model, pool, prefix, *, layer_index, tp_size, workspace,
+                 rotary_cache, topk_buffer, dummy_index_q, dummy_index_weights, factory, mtp_indexer_type):
+        from .traced_models import DeepseekV32AttentionInput, _source_linear
+        self.trace, self.model, self.pool, self.prefix = trace, model, pool, prefix
+        self.workspace, self.factory = workspace, factory
+        self.inputs = DeepseekV32AttentionInput(trace, model, pool, prefix, layer_index=layer_index,
+            tp_size=tp_size, cache=None, index_cache=None, topk_buffer=topk_buffer,
+            rotary_cache=rotary_cache, index_rotary_cache=rotary_cache, slot_mapping=None,
+            dummy_index_q=dummy_index_q, dummy_index_weights=dummy_index_weights, no_metadata=True,
+            mtp_indexer_type=mtp_indexer_type)
+        self.o_proj = _source_linear(trace, model, pool, prefix + ":o-proj",
+            self.inputs.local_heads * model.v_head_dim, model.hidden_size, f"model.layers.{layer_index}.self_attn.o_proj")
+
+    def __call__(self, positions, hidden_states):
+        from .traced_operators import SymbolicFillZero
+        if hidden_states.shape[0] != self.factory.tokens:
+            raise ValueError("GLM dummy hidden rows differ from its actual legacy dummy batch")
+        with self.inputs(positions, hidden_states) as prefix:
+            q_c,q_nope,q_pe,ql_nope,index_q,weights,mqa_q,kv_out,rope_out,output = prefix
+            if self.inputs.has_indexer:
+                _reserve_glm_no_metadata_indexer(self.trace, self.model, self.prefix, self.workspace,
+                    self.factory.max_model_len, self.factory.logits_mb)
+            SymbolicFillZero(self.trace, self.prefix + ":dummy-output-zero", self.pool)(
+                output, controls=(q_c,ql_nope,index_q,weights,mqa_q))
+            return self.o_proj(output)[0]
 
 
 class GLMStartupAttentionFactory:
@@ -85,11 +462,8 @@ class _GLMStartupAttention:
         # No divisor for GLM's uncompressed indexer. UINT8 dummy logits are
         # local to sparse_attn_indexer, while the workspace manager retains
         # its arena after the temporary views have been discarded.
-        capacity = 40 * self.factory.max_model_len
-        self.workspace.get_simultaneous(((capacity, self.model.index_head_dim), "fp8"),
-            ((capacity, 4), "uint8"), ((1024 * 1024,), "uint8"))
-        dummy_logits = self.trace.tensor(self.trace.unique_name(self.prefix + ":profile-logits"),
-            (self.factory.logits_mb * 1024 * 1024,), "uint8")
+        _reserve_glm_no_metadata_indexer(self.trace, self.model, self.prefix, self.workspace,
+            self.factory.max_model_len, self.factory.logits_mb)
 
     def __call__(self, positions, hidden_states):
         trace, model, rows = self.trace, self.model, self.factory.tokens
@@ -232,7 +606,8 @@ def trace_glm_startup_profile(model, pool, expert_routing, *, tokens, max_reques
 def trace_glm_dsa_mtp_forward(model, step, pool, expert_routing, *, input_ids, source_profile,
                             source_max_model_len, max_batched_tokens, max_requests,
                             workspace_initial_capacity_bytes, selection_source,
-                            prefill_attention_source, source_inputs):
+                            prefill_attention_source, source_inputs, _replica_context=None,
+                            indexer_max_logits_mb=512, legacy_skip_topk_by_data_rank=None, source_program_cache=None):
     """Full target → greedy rejection → declared sequential padded drafts.
 
     Both target and drafter retain speculative_config and its decode threshold.
@@ -242,16 +617,34 @@ def trace_glm_dsa_mtp_forward(model, step, pool, expert_routing, *, input_ids, s
     are not consumed. The source still forwards their complete first-pass
     rows, then one row per incoming request on each remaining pass. It does
     not compact the physical drafter batch to the proposal consumers.
+    The target uses its actual PP ranges and tensor transport; rejection and
+    the complete sequential drafter execute only on the last PP stage.
     """
     config = pool.parallel_plan.config
+    if config.data_parallel_size > 1:
+        if _replica_context is not None:
+            raise ValueError("MTP DP cannot nest replica projections")
+        return _trace_glm_mtp_data_parallel_forward(model, step, pool, expert_routing,
+            input_ids=input_ids, source_profile=source_profile, source_max_model_len=source_max_model_len,
+            max_batched_tokens=max_batched_tokens, max_requests=max_requests,
+            workspace_initial_capacity_bytes=workspace_initial_capacity_bytes, selection_source=selection_source,
+            prefill_attention_source=prefill_attention_source, source_inputs=source_inputs,
+            indexer_max_logits_mb=indexer_max_logits_mb, legacy_skip_topk_by_data_rank=legacy_skip_topk_by_data_rank,
+            source_program_cache=source_program_cache)
+    if _replica_context is not None and (type(_replica_context) is not _GLMMTPReplicaContext
+            or (_replica_context.target_contexts[0].expert_group is not None) != (_replica_context.expert_parallel_size > 1)
+            or tuple(trace.rank for trace in _replica_context.traces) != pool.ranks):
+        raise ValueError("MTP replica projection requires its actual whole-shard TP and global expert physical traces")
+    expert_size = config.expert_parallel_size if _replica_context is None else _replica_context.expert_parallel_size
     if (model.model_type != "glm_moe_dsa" or model.mtp_architecture != "glm_moe_dsa_mtp"
             or model.num_hidden_layers != 78 or model.num_mtp_layers != 1
             or model.compute_dtype != "bf16" or model.weight_dtype != _glm_source_weight_dtype(source_profile)
-            or pool.hardware_id != "nvidia_h200" or config.tensor_parallel_size not in (1, 8)
-            or len(pool.ranks) != config.tensor_parallel_size or config.enable_expert_parallel
-            or any(value != 1 for value in (config.pipeline_parallel_size, config.sequence_parallel_size,
+            or pool.hardware_id != "nvidia_h200" or not is_glm_mtp_tensor_model_scope(model, config.tensor_parallel_size,
+                expert_parallel=config.enable_expert_parallel and _replica_context is None)
+            or len(pool.ranks) != config.worker_count or config.pipeline_parallel_size > model.num_hidden_layers
+            or any(value != 1 for value in (config.sequence_parallel_size,
                 config.context_parallel_size, config.data_parallel_size))):
-        raise NotImplementedError("V32 padded source requires its H200 BF16-compute TP1/TP8 PP/SP/CP/DP1 EP-off checkpoint")
+        raise NotImplementedError("V32 padded source requires its H200 BF16-compute whole-shard TP/nonempty PP SP/CP/DP1 checkpoint, with EP-off or BF16 stage-local EP")
     if not isinstance(source_inputs, V32PaddedMTPInputs) or not isinstance(expert_routing, ExpertRoutingInput):
         raise TypeError("V32 padded source requires typed independent draft and routing scenarios")
     if source_inputs.request_ids != tuple(request.request_id for request in step.requests) or step.pool_name != pool.name:
@@ -335,24 +728,58 @@ def trace_glm_dsa_mtp_forward(model, step, pool, expert_routing, *, input_ids, s
     slots = tuple(bases[index] + request.computed_tokens + offset for index, request in enumerate(requests)
         for offset in range(request.scheduled_tokens))
     old_selected_contexts = tuple(positions[index] + 1 for index in retained)
-    traces = tuple(ForwardTrace(rank=rank, namespace=f"{step.step_id}:rank-{rank}") for rank in pool.ranks)
-    group = None if len(traces) == 1 else ForwardCollectiveGroup(traces, namespace=step.step_id)
-    collective = None if group is None else pool.collective_for("all_reduce")
-    gather = None if group is None else pool.collective_for("all_gather")
+    assignments = pool.parallel_plan.layer_to_pipeline_stage
+    pp = config.pipeline_parallel_size
+    if (len(assignments) != model.num_hidden_layers or assignments != tuple(sorted(assignments))
+            or set(assignments) != set(range(pp))):
+        raise ValueError("V32 padded pipeline requires complete ordered nonempty target layer stages")
+    ranges = tuple((assignments.index(stage), assignments.index(stage) + assignments.count(stage)) for stage in range(pp))
+    tp = config.tensor_parallel_size
+    stages = (tuple(_replica_context.traces[stage * tp:(stage + 1) * tp] for stage in range(pp)) if _replica_context is not None else
+        tuple(tuple(ForwardTrace(rank=rank, namespace=f"{step.step_id}:rank-{rank}")
+            for rank in pool.physical_ranks_for_pipeline_stage(stage)) for stage in range(pp)))
+    groups = (tuple(_replica_context.target_contexts[stage * tp].tensor_group for stage in range(pp))
+        if _replica_context is not None else tuple(None if len(traces) == 1 else ForwardCollectiveGroup(traces,
+            namespace=step.step_id if pp == 1 else f"{step.step_id}:stage-{stage}")
+            for stage, traces in enumerate(stages)))
+    collective = None if config.tensor_parallel_size == 1 else pool.collective_for("all_reduce")
+    gather = None if config.tensor_parallel_size == 1 else pool.collective_for("all_gather")
     invocations = tuple(f"{step.step_id}:layer-{layer}:moe" for layer in range(model.num_hidden_layers))
-    resolutions = _source_expert_resolutions(model, step, pool, expert_routing, invocations, rows)
-    draft_resolutions = tuple(expert_routing.resolve(step_id=step.step_id, layer_index=None,
+    resolutions = (_source_expert_resolutions(model, step, pool, expert_routing, invocations, rows)
+        if _replica_context is None else _replica_context.target_resolutions)
+    draft_resolutions = (tuple(expert_routing.resolve(step_id=step.step_id, layer_index=None,
         moe_invocation_id=f"{step.step_id}:mtp-pass-{index}:moe", schedule_step_sha256=schedule_step_sha256(step),
         tokens=count, num_experts=model.num_experts, topk=model.num_experts_per_tok,
-        model_config_sha256=model.config_sha256, pool_name=pool.name, tensor_parallel_size=len(pool.ranks),
-        expert_parallel_size=1, expert_rank_group=(pool.ranks[0],), expert_placement_strategy="linear",
+        model_config_sha256=model.config_sha256, pool_name=pool.name, tensor_parallel_size=config.tensor_parallel_size,
+        expert_parallel_size=config.expert_parallel_size,
+        expert_rank_group=tuple(trace.rank for trace in stages[-1]) if config.enable_expert_parallel else (stages[-1][0].rank,),
+        expert_placement_strategy="linear",
         moe_layer_ordinal=sum(model.layer_uses_moe(layer) for layer in range(model.num_hidden_layers)),
         assumption_model_semantics_sha256=(model.expert_routing_assumption_semantics_sha256
             if expert_routing.source_kind == "explicit_assumption" else None))
         for index, count in enumerate((rows, *((batch,) * (num_drafts - 1)))))
+        if _replica_context is None else _replica_context.draft_resolutions)
 
-    def rank_forward(trace, capacity):
-        ops = MTPSourceOps(trace, "mtp-source", pool.name, model_execution_version="vllm_0_30_0")
+    def target_network(trace, capacity, stage):
+        return DeepseekV32Model(trace, model, pool.name, groups[stage], collective, token_ids=input_ids,
+            q_lens=q_lens, kv_lens=kv_lens, request_phases=phases, slot_mapping=slots,
+            cache_capacity_tokens=arena_size, source_max_model_len=source_max_model_len,
+            max_batched_tokens=max_batched_tokens, resolutions=resolutions, invocation_ids=invocations,
+            workspace_initial_capacity_bytes=capacity, selection_source=selection_source,
+            source_profile=source_profile, prefill_attention_source=prefill_attention_source,
+            model_input_order=ordering, num_speculative_tokens=num_drafts, expert_parallel_size=expert_size,
+            layer_range=None if pp == 1 else ranges[stage],
+            pcp_context=None if _replica_context is None else _replica_context.target_contexts[pool.ranks.index(trace.rank)])
+
+    def rank_forward(trace, capacity, stage, incoming):
+        group = groups[stage]
+        if stage != pp - 1:
+            network = target_network(trace, capacity, stage)
+            ids = trace.tensor("input_ids", (rows,), "int32") if network.first_stage else None
+            pos = trace.tensor("positions", (rows,), "int64")
+            return network(ids, pos, intermediate_tensors=incoming)
+        ops = MTPSourceOps(trace, "mtp-source", pool.name, model_execution_version="vllm_0_30_0",
+            source_geometry_program="vllm_0_30_torch_2_13_cuda_source")
         ids = trace.tensor("input_ids", (rows,), "int32")
         pos = trace.tensor("positions", (rows,), "int64")
         selected_rows, target_values, bonus_values = [], [], []
@@ -374,14 +801,8 @@ def trace_glm_dsa_mtp_forward(model, step, pool, expert_routing, *, input_ids, s
             shifted = ops.unary(target_indices, expression="add", scalar=1)
             previous_draft = ops.gather(selected_ids, shifted,
                 selected_indices=tuple(index + 1 for index in target_values))
-        network = DeepseekV32Model(trace, model, pool.name, group, collective, token_ids=input_ids,
-            q_lens=q_lens, kv_lens=kv_lens, request_phases=phases, slot_mapping=slots,
-            cache_capacity_tokens=arena_size, source_max_model_len=source_max_model_len,
-            max_batched_tokens=max_batched_tokens, resolutions=resolutions, invocation_ids=invocations,
-            workspace_initial_capacity_bytes=capacity, selection_source=selection_source,
-            source_profile=source_profile, prefill_attention_source=prefill_attention_source,
-            model_input_order=ordering, num_speculative_tokens=num_drafts)
-        hidden = network(ids, pos)
+        network = target_network(trace, capacity, stage)
+        hidden = network(ids if network.first_stage else None, pos, intermediate_tensors=incoming)
         selected_hidden = ops.gather(hidden, indices, selected_indices=tuple(selected_rows))
         head = (SymbolicLinear(trace, "lm-head", pool.name, model.hidden_size, model.vocab_size,
             kind=WorkloadKind.LM_HEAD) if group is None else SymbolicTPLogitsProcessor(trace, "lm-head", pool.name,
@@ -414,18 +835,19 @@ def trace_glm_dsa_mtp_forward(model, step, pool, expert_routing, *, input_ids, s
         ops.copy(hidden, first_hidden)
         mtp_cache = trace.tensor("mtp.kv-cache", (arena_size, model.kv_lora_rank + model.qk_rope_head_dim), "bf16", persistent=True)
         mtp_index_cache = trace.tensor("mtp.index-cache", (arena_size, 132), "uint8", persistent=True)
-        topk = trace.tensor("mtp.topk", (max_batched_tokens, model.index_topk), "int32", persistent=True)
+        topk = network.topk_buffer
         arenas = dict(cache_capacity_tokens=arena_size, source_profile=source_profile,
             source_max_model_len=source_max_model_len, max_batched_tokens=max_batched_tokens,
             workspace=network.workspace, topk_buffer=topk, cache=mtp_cache, index_cache=mtp_index_cache,
             rotary_cache=network.rotary_cache, index_rotary_cache=network.index_rotary_cache,
             selection_source=selection_source, num_speculative_tokens=num_drafts,
-            group=group, collective=collective, gather=gather)
+            group=group, collective=collective, gather=gather, expert_parallel_size=expert_size)
         predictor = DeepseekV32MTPPredictorLayer(trace, model, pool.name, "mtp-pass-0",
             input_token_ids=drafts[0], q_lens=q_lens, kv_lens=kv_lens, request_phases=phases,
             slots=slots, slot_tensor=network.slot_mapping, indexer_type="full",
             resolution=draft_resolutions[0], invocation_id=f"{step.step_id}:mtp-pass-0:moe",
-            prefill_attention_source=prefill_attention_source, **arenas)
+            prefill_attention_source=prefill_attention_source,
+            pcp_context=None if _replica_context is None else _replica_context.draft_contexts[0][stages[stage].index(trace)], **arenas)
         post_norm, recycle = predictor(first_ids, first_pos, first_hidden, position_values=positions)
         # llm_base_proposer only toggles skip_topk and compacts the first
         # pass's selection when the draft checkpoint enables index sharing.
@@ -465,13 +887,47 @@ def trace_glm_dsa_mtp_forward(model, step, pool, expert_routing, *, input_ids, s
                 indexer_type="shared" if model.index_share_for_mtp_iteration else "full",
                 resolution=draft_resolutions[draft_index], invocation_id=f"{step.step_id}:mtp-pass-{draft_index}:moe",
                 prefill_attention_source=None, input_norm=predictor.input_norm,
-                reused_selection_kv_lens=old_selected_contexts if model.index_share_for_mtp_iteration else None, **arenas)
+                reused_selection_kv_lens=old_selected_contexts if model.index_share_for_mtp_iteration else None,
+                pcp_context=None if _replica_context is None else _replica_context.draft_contexts[draft_index][stages[stage].index(trace)], **arenas)
             final_hidden, recurrent_hidden = recurrent(draft_ids.narrow(0, 0, batch), out_pos,
                 draft_hidden.narrow(0, 0, batch), position_values=current_positions)
             draft_outputs.append(ops.unary(recurrent.compute_logits(final_hidden), "argmax"))
             selected_positions = out_pos
         output = ops.stack(tuple(draft_outputs))
 
-    for trace, capacity in zip(traces, workspace_initial_capacity_bytes, strict=True):
-        rank_forward(trace, capacity)
-    return traces[0] if group is None else group
+    if pp == 1:
+        for trace, capacity in zip(stages[0], workspace_initial_capacity_bytes, strict=True):
+            rank_forward(trace, capacity, 0, None)
+        source = stages[0][0] if groups[0] is None else groups[0]
+    else:
+        namespace = (step.step_id if _replica_context is None else
+            f"{step.step_id}:dp{_replica_context.target_contexts[0].data_parallel_rank}:pipeline")
+        source = ForwardPipelineGroup(tuple(trace for traces in stages for trace in traces), namespace=namespace,
+            collective_groups=tuple(group for group in groups if group is not None))
+        source.source_scope = {"model_execution_version": "vllm_0_30_0", "source_projection_only": True,
+            "pipeline_layer_partition": tuple(end - first for first, end in ranges),
+            "normal_capacity_accepted": False, "actual_provider_bound": False}
+        _run_vllm030_pipeline_stages(source, pool, rows=rows, hidden_size=model.hidden_size,
+            max_batched_tokens=max_batched_tokens, run_stage=lambda trace, stage, incoming:
+                rank_forward(trace, workspace_initial_capacity_bytes[pool.ranks.index(trace.rank)], stage, incoming))
+    for stage, traces in enumerate(stages):
+        attrs = {"glm_parallel_source": True, "source_projection_only": True,
+            "model_execution_version": "vllm_0_30_0", "model_source_profile": source_profile}
+        if pp > 1:
+            attrs |= {"source_pipeline_stage": stage, "pipeline_layer_partition": tuple(end - first for first, end in ranges)}
+        rank_local_fp8_ep = model.weight_dtype == "fp8" and config.enable_expert_parallel and _replica_context is None
+        if rank_local_fp8_ep:
+            attrs |= {"source_glm_rank_local_fp8_mtp_ep": True}
+        for trace in traces:
+            trace._nodes = {name: node.with_attributes({**node.attributes, **attrs,
+                **(glm_fp8_rank_local_expert_source_metadata() if rank_local_fp8_ep and node.kind is WorkloadKind.FUSED_MOE else {})})
+                for name, node in trace._nodes.items()}
+        if groups[stage] is not None:
+            groups[stage]._contracts = {name: node.with_attributes({**node.attributes, **attrs})
+                for name, node in groups[stage]._contracts.items()}
+    if model.weight_dtype == "fp8" and config.enable_expert_parallel and _replica_context is None:
+        source.source_scope = {"source_projection_only": True, "model_execution_version": "vllm_0_30_0",
+            "model_source_profile": source_profile, "source_glm_rank_local_fp8_mtp_ep": True,
+            "pipeline_layer_partition": tuple(end - first for first, end in ranges),
+            "normal_capacity_accepted": False, "actual_provider_bound": False}
+    return source

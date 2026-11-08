@@ -27,8 +27,9 @@ import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
-UNINDP_ROOT = os.environ.get(
-    "UNINDP_ROOT", "/share_data/yangxinhao/chip_modeling/UniNDP")
+if "UNINDP_ROOT" not in os.environ:
+    raise SystemExit("UNINDP_ROOT must name the external UniNDP checkout")
+UNINDP_ROOT = os.environ["UNINDP_ROOT"]
 TIMINGS = ("tCCDL", "tCCDS", "tRCDWR", "tRCDRD", "tRP", "tWR", "tRTPL",
            "tWTRL", "tRTRS", "RL", "WL", "BL")
 DELTA = 10

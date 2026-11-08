@@ -4,7 +4,7 @@ from typing import Mapping, Optional
 
 from src.kernel.launch_config import LaunchConfig, TilingSpec
 from src.kernel.launch_config.selection_primitives import (
-    ceil_div, require_dtype, require_positive_integer, require_shape,
+    ceil_div, fused_moe_local_expert_count, require_dtype, require_shape,
     require_variant,
     select_gpu_fused_moe_launch)
 from src.kernel.launch_config import hardware_skeleton as _skeleton
@@ -315,11 +315,7 @@ def select_fused_moe_launch(shape: Mapping[str, int], dtype: Optional[str],
     del hardware
     _, experts, _, hidden, _ = require_shape(
         shape, ("tokens", "experts", "topk", "hidden", "intermediate"))
-    expert_parallel_size = require_positive_integer(
-        attributes, "expert_parallel_size")
-    if experts % expert_parallel_size:
-        raise ValueError("A800 FUSED_MOE expert_parallel_size must divide experts")
-    local_experts = experts // expert_parallel_size
+    local_experts = fused_moe_local_expert_count(experts, attributes)
     if (local_experts, hidden) in _A800_BUNDLED_TUNED_BF16_CONFIG_KEYS:
         raise NotImplementedError(
             "A800 FUSED_MOE source selects a bundled tuned config for local "

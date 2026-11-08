@@ -23,9 +23,10 @@ SOURCE = Path(__file__).with_name("fused_moe_e256_cold_weight_replay.cu")
 RUNNER = Path(__file__)
 DATASET = ROOT / "kernel_dataset/nvidia_a800/fused_moe.json.zst"
 OUTPUT_ROOT = ROOT / "profiler_output/microbench/nvidia_a800"
-VLLM_SOURCE = Path(
-    "/share_data/yangxinhao/chip_modeling/vllm_src_3ver/a800/vllm/"
-    "model_executor/layers/fused_moe/fused_moe.py")
+VLLM_SOURCE = (
+    Path(os.environ["MIDLAYER_A800_VLLM_SOURCE"])
+    / "model_executor/layers/fused_moe/fused_moe.py"
+)
 DEVICE_NAME = "NVIDIA A800-SXM4-80GB"
 BLOCK_M = 64
 BLOCK_N = 64

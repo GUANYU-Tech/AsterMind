@@ -3,6 +3,8 @@
 from math import prod
 from types import SimpleNamespace
 
+from src.kernel.memory_access import region_end
+
 from .qwen3_source import _Ledger, _Tensor
 
 
@@ -93,7 +95,10 @@ def compare_v4_terminal_storage(reference, traces, graph):
     locals_by_rank = {}
     for trace in traces:
         owned = {}
+        parameters = trace.parameter_allocation_ids
         for allocation in trace.allocations:
+            if allocation.allocation_id in parameters:
+                continue
             prefix = allocation.allocation_id
             while prefix not in trace._nodes and ":" in prefix:
                 prefix = prefix.rsplit(":", 1)[0]
@@ -124,11 +129,8 @@ def compare_v4_terminal_storage(reference, traces, graph):
                 for field in ("symbolic_tensor_inputs", "symbolic_tensor_outputs"))
             want_inputs = list(row["inputs"])
             want_alias = [list(values) for values in row["output_alias_inputs"]]
-            if row["kind"] in ("lm_head", "norm"):
-                # Read-only parameters live in the weight owner, not the
-                # activation trace. Their typed bytes are checked separately.
-                want_inputs = want_inputs[:-1]
-                want_alias = [values[:-1] for values in want_alias]
+            # Parameters remain public read operands even though the weight
+            # ledger owns their backing; compare their geometry and aliases.
             actual = {"inputs": [(v.shape, v.dtype) for v in incoming],
                 "outputs": [(v.shape, v.dtype) for v in outgoing],
                 "output_alias_inputs": [[out.allocation_id == src.allocation_id for src in incoming] for out in outgoing]}
@@ -144,6 +146,12 @@ def compare_v4_terminal_storage(reference, traces, graph):
             ends = [i for event, i in events.items() if event.endswith("return:" + local_node.node_id)]
             if len(ends) != 1:
                 raise ValueError("terminal source stage needs one actual call boundary")
+            for inp in incoming:
+                allocation = allocations[inp.allocation_id]
+                if (allocation.size_bytes < region_end(inp.region())
+                        or events[allocation.allocated_event] >= ends[0]
+                        or allocation.freed_event is not None and events[allocation.freed_event] <= ends[0]):
+                    differences.append("input_backing_or_lifetime")
             for out in outgoing:
                 allocation = allocations[out.allocation_id]
                 aliases = any(out.allocation_id == inp.allocation_id for inp in incoming)

@@ -10,12 +10,12 @@ discarded.  SM clock is sampled before and after; windows whose samples are
 not 1980 MHz are marked.  Output: <out>/gap_summary.json + raw sqlite/csv.
 Usage: python cuda_graph_node_gap_runner.py --out <dir> --gpu <physical index>
 """
-import argparse, json, os, sqlite3, statistics, subprocess
+import argparse, json, os, shutil, sqlite3, statistics, subprocess
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-NSYS = '/mnt/public/yangxinhao/tools/nsys_2025.6.1/bin/nsys'
-NVCC = '/mnt/public/yangxinhao/tools/cuda-12.9/bin/nvcc'
+NSYS = shutil.which('nsys') or 'nsys'
+NVCC = shutil.which('nvcc') or 'nvcc'
 GRIDS = '1,16,66,132,264,528,1056'
 THREADS = '128,256,384'
 WAITS = '0,1000,2000,5000,10000,20000'

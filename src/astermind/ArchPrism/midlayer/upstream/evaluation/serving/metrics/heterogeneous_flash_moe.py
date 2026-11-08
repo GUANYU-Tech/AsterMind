@@ -32,22 +32,26 @@ LIMITATIONS = (
 )
 
 
-def _hardware_specs(gpu_vector_memory_only, *, gpu_utilization=1.0, fpga_utilization=1.0):
+def _hardware_specs(gpu_vector_memory_only, *, gpu_utilization=1.0, fpga_utilization=1.0,
+        gpu_hardware_config="configs/hardware/hygon_bw1100.yaml"):
     """Load canonical hardware; apply the explicit user-approved scenario only."""
     if type(gpu_vector_memory_only) is not bool:
         raise TypeError("gpu_vector_memory_only must be boolean")
-    with open("configs/hardware/hygon_bw1100.yaml") as source:
+    with open(gpu_hardware_config) as source:
         gpu_config = yaml.safe_load(source)
     if gpu_vector_memory_only:
         gpu_config["features"]["gpu_vector_memory_only"] = True
-    return {"hygon_bw1100": HWSpec(gpu_config).with_roofline_utilization(
-            compute=gpu_utilization, bandwidth=gpu_utilization),
+    gpu = HWSpec(gpu_config).with_roofline_utilization(
+        compute=gpu_utilization, bandwidth=gpu_utilization)
+    if not HWSpec.source_contract_supported("aggregate_gpu_source_roofline", gpu.hardware_id):
+        raise ValueError("heterogeneous GPU requires its declared aggregate source Roofline contract")
+    return {gpu.hardware_id: gpu,
         "intel_agmf039r47": HWSpec("configs/hardware/intel_agmf039r47.yaml").with_roofline_utilization(
             compute=fpga_utilization, bandwidth=fpga_utilization)}
 
 
 GPU_APPROXIMATION_LIMITATIONS = (
-    "Explicit user-approved approximation: BW1100 GPU vector/scalar/SFU work contributes only its logical memory traffic; GPU tensor/matrix work and FPGA compute remain priced.",
+    "Explicit user-approved approximation: scenario GPU vector/scalar/SFU work contributes only its logical memory traffic; GPU tensor/matrix work and FPGA compute remain priced.",
     "Roofline uses rated bandwidth/compute and dependency/resource contention; unspecified GPU launch, software, DMA/controller and network protocol startup are excluded, not measured as zero.",
     "Predictions are analytical scenario results, not hardware/provider or numerical-checkpoint acceptance.",
 )
@@ -119,8 +123,7 @@ def _case(arguments):
 
 def evaluate_heterogeneous_flash_moe(*, seed=0, scope="moe", layer_count=1, kv_length=1,
         concurrencies=(1, 4, 16, 32), microbatches=(1, 2), fpga_cards=(8, 16),
-        output_tokens=3, sdk_python=".venv-vllm030/bin/python",
-        sdk_source="/share_data/yangxinhao/chip_modeling/upstream/vllm/v0.30.0",
+        output_tokens=3, sdk_python, sdk_source, workers=None,
         scheduler_kv_bytes_per_rank=512 * 1024 * 1024, gpu_vector_memory_only=False):
     if scope == "request":
         if (concurrencies != (1,) or microbatches != (1,)
@@ -139,8 +142,8 @@ def evaluate_heterogeneous_flash_moe(*, seed=0, scope="moe", layer_count=1, kv_l
         for case in product(concurrencies, microbatches, fpga_cards))
     if not arguments:
         raise ValueError("heterogeneous sweep requires a nonempty case set")
-    # Independent CPU metadata cases; bounded workers avoid memory oversubscription.
-    with ProcessPoolExecutor(max_workers=4) as executor:
+    # Independent CPU metadata cases; the caller controls worker count.
+    with ProcessPoolExecutor(max_workers=workers) as executor:
         cases = list(executor.map(_case, arguments))
     scope_limitations = (LIMITATIONS[:7] + LIMITATIONS[8:] + GPU_APPROXIMATION_LIMITATIONS
         if gpu_vector_memory_only else LIMITATIONS)

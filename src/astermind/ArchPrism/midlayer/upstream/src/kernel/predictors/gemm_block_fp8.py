@@ -436,4 +436,4 @@ def roofline_block_fp8_gemm(kernel: KernelSpec, hardware) -> KernelPrediction:
 
 
 def is_block_fp8_gemm(kernel: KernelSpec) -> bool:
-    return kernel.launch.algorithm in BLOCK_FP8_GEMM_ALGORITHMS
+    return kernel.launch is not None and kernel.launch.algorithm in BLOCK_FP8_GEMM_ALGORITHMS

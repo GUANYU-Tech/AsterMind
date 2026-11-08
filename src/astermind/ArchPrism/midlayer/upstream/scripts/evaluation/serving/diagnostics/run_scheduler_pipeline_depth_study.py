@@ -32,7 +32,7 @@ def main() -> None:
     parser.add_argument(
         "--jobs",
         type=int,
-        default=min(16, os.cpu_count() or 1),
+        default=os.cpu_count() or 1,
     )
     parser.add_argument(
         "--from-results",

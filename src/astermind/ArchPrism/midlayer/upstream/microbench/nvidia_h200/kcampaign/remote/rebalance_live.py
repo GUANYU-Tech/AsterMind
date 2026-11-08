@@ -29,7 +29,8 @@ import os
 import re
 import subprocess
 
-K = "/mnt/public/yangxinhao/h200_microbench/kcampaign"
+K = os.path.join(
+    os.environ["MIDLAYER_H200_PUBLIC_ROOT"], "h200_microbench/kcampaign")
 ap = argparse.ArgumentParser()
 ap.add_argument("--gpus", required=True)
 ap.add_argument("--order", nargs="+", required=True)

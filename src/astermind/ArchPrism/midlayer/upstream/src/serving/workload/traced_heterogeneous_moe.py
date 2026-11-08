@@ -61,9 +61,13 @@ def _node(trace, name, kind, pool, shape, dtype, variant, attributes=None):
 def _tag(trace):
     for name, node in tuple(trace._nodes.items()):
         operator_component = (node.attributes["source_component"] if "source_component" in node.attributes else None)
-        trace._nodes[name] = replace(node, attributes={**node.attributes,
+        if operator_component == COMPONENT:
+            continue
+        updates = {
             **({"heterogeneous_operator_component": operator_component}
-                if operator_component != COMPONENT else {}), "source_component": COMPONENT})
+                if operator_component != COMPONENT else {}), "source_component": COMPONENT}
+        trace._nodes[name] = (node.with_updates({}, updates, compose=True) if "_module_source_frame" in node.__dict__
+            else node.with_attributes({**node.attributes, **updates}))
 
 
 def _staging(trace, name, x, direction, *, output_resource):
@@ -96,7 +100,7 @@ def _transfer(x, destination, *, name, chip_trace):
                 else "fpga-nic:" + str(t.rank - 8) for t in (source, destination)),
             "source_view": x.view.view_id, "destination_view": received.view.view_id})
     identifier = chip_trace.qualify(node.node_id)
-    chip_trace._nodes[identifier] = replace(node, node_id=identifier)
+    chip_trace._nodes[identifier] = node.with_attributes(node.attributes, node_id=identifier)
     writer = source._writers[x.view.allocation_id]
     if writer is None:
         raise ValueError("heterogeneous transfers require a produced source")
@@ -126,12 +130,37 @@ def _fp8_linear(trace, name, x, scales, n, pool, *, weight_dtype):
     return trace.call(node, (x, scales), shape=(rows, n), dtype="bf16")
 
 
+class _HeterogeneousMLPBody:
+    """The unchanged source body, recorded by the common module-frame owner."""
+
+    def __init__(self, trace, prefix, intermediate, pool, weight_dtype, limit):
+        self.trace, self.prefix, self.intermediate = trace, prefix, intermediate
+        self.pool, self.weight_dtype, self.limit = pool, weight_dtype, limit
+
+    def __call__(self, x):
+        trace, prefix, pool = self.trace, self.prefix, self.pool
+        q, scales = _quant(trace, prefix + ":input-quant", x, pool)
+        up = _fp8_linear(trace, prefix + ":w13", q, scales, 2 * self.intermediate, pool,
+            weight_dtype=self.weight_dtype)
+        activated = SymbolicSiluAndMul(trace, prefix + ":clamped-silu", pool, swiglu_limit=self.limit)(up)
+        q2, scales2 = _quant(trace, prefix + ":activation-quant", activated, pool)
+        return (_fp8_linear(trace, prefix + ":w2", q2, scales2, x.shape[-1], pool,
+            weight_dtype=self.weight_dtype),)
+
+
 def _mlp(trace, prefix, x, intermediate, pool, *, weight_dtype, limit):
-    q, scales = _quant(trace, prefix + ":input-quant", x, pool)
-    up = _fp8_linear(trace, prefix + ":w13", q, scales, 2 * intermediate, pool, weight_dtype=weight_dtype)
-    activated = SymbolicSiluAndMul(trace, prefix + ":clamped-silu", pool, swiglu_limit=limit)(up)
-    q2, scales2 = _quant(trace, prefix + ":activation-quant", activated, pool)
-    return _fp8_linear(trace, prefix + ":w2", q2, scales2, x.shape[-1], pool, weight_dtype=weight_dtype)
+    if "_heterogeneous_mlp_programs" not in trace.__dict__:
+        trace._heterogeneous_mlp_programs = {}
+    key = (intermediate, pool, weight_dtype, limit,
+        _node, _node.__code__, _quant, _quant.__code__, _fp8_linear, _fp8_linear.__code__,
+        SymbolicSiluAndMul, SymbolicSiluAndMul.__init__, SymbolicSiluAndMul.__init__.__code__,
+        SymbolicSiluAndMul.__call__, SymbolicSiluAndMul.__call__.__code__)
+    if key not in trace._heterogeneous_mlp_programs:
+        trace._heterogeneous_mlp_programs[key] = trace._module_program(_HeterogeneousMLPBody)
+    module = _HeterogeneousMLPBody(trace, prefix, intermediate, pool, weight_dtype, limit)
+    output, = trace._call_module_frame(trace._heterogeneous_mlp_programs[key], prefix, module, (x,),
+        readonly_arguments=(0,))
+    return output
 
 
 def _trace_flash_moe(model, traces, inputs, routes, batches, *, prefix, layer_index, root_seed):
@@ -153,7 +182,7 @@ def _trace_flash_moe(model, traces, inputs, routes, batches, *, prefix, layer_in
             model, layer_index=layer_index)(x, logits, ids)
         route_writer = trace._writers[selected.view.allocation_id]
         route_node = trace._nodes[route_writer]
-        trace._nodes[route_writer] = replace(route_node, attributes={**route_node.attributes,
+        trace._nodes[route_writer] = route_node.with_attributes({**route_node.attributes,
             "assumed_topk_ids": tuple(routes[t] for t in local),
             "routing_distribution": "uniform_without_replacement", "routing_seed": root_seed})
         shared_dtype = model.weight_dtype_for_module(
@@ -252,7 +281,8 @@ def _trace_flash_moe(model, traces, inputs, routes, batches, *, prefix, layer_in
     return tuple(outputs)
 
 
-def _flash_heterogeneous_placement(model, concurrency, microbatches, fpga_cards, root_seed, layer_index):
+def _flash_heterogeneous_placement(model, concurrency, microbatches, fpga_cards, root_seed, layer_index,
+        gpu_hardware_id="hygon_bw1100"):
     if (model.model_type != "deepseek_v4" or model.hidden_size != 4096
             or model.num_experts != 256 or model.num_experts_per_tok != 6
             or model.expert_dtype != "fp4" or model.weight_dtype != "fp8"
@@ -264,7 +294,7 @@ def _flash_heterogeneous_placement(model, concurrency, microbatches, fpga_cards,
         raise ValueError("invalid heterogeneous Flash concurrency/microbatch/card/layer configuration")
     chips = 2 * fpga_cards
     deployment = build_deployment_plan(DeploymentConfig("colocated", (
-        WorkerPoolConfig("decode_gpu", "colocated", "hygon_bw1100",
+        WorkerPoolConfig("decode_gpu", "colocated", gpu_hardware_id,
             parallelism=ParallelConfig(data_parallel_size=8), ranks=tuple(range(8))),
         WorkerPoolConfig("experts", "colocated", "intel_agmf039r47",
             parallelism=ParallelConfig(data_parallel_size=chips, enable_expert_parallel=True),
@@ -280,7 +310,7 @@ def _flash_heterogeneous_placement(model, concurrency, microbatches, fpga_cards,
 
 
 def trace_flash_heterogeneous_moe(model, *, concurrency=1, microbatches=1, fpga_cards=8,
-        root_seed=0, layer_index=3):
+        root_seed=0, layer_index=3, gpu_hardware_id="hygon_bw1100"):
     """One decode MoE boundary, DP8 GPU and chip-level FPGA EP16/32.
 
     Routes are uniform distinct top6 draws, *not* evaluated router scores.
@@ -289,7 +319,7 @@ def trace_flash_heterogeneous_moe(model, *, concurrency=1, microbatches=1, fpga_
     this initial graph represents the payload channel, not a full protocol.
     """
     deployment, traces, routes, batches = _flash_heterogeneous_placement(
-        model, concurrency, microbatches, fpga_cards, root_seed, layer_index)
+        model, concurrency, microbatches, fpga_cards, root_seed, layer_index, gpu_hardware_id)
     inputs = []
     for gpu in range(8):
         local = tuple(t for t in range(concurrency) if t % 8 == gpu)
@@ -316,7 +346,7 @@ def _requires_joint_expert_forward(hidden, input_ids):
 
 def trace_flash_heterogeneous_decode_layers(model, *, concurrency=1, microbatches=1, fpga_cards=8,
         root_seed=0, layer_count=1, kv_length=1, include_model_boundary=False, state_observer=None,
-        execution_state=None, execution_states=None, defer_graph=False):
+        execution_state=None, execution_states=None, defer_graph=False, gpu_hardware_id="hygon_bw1100"):
     """Trace each layer across fixed DP batches before coordinating FPGA MoE.
 
     Only routed experts are partitioned by microbatch. Attention, router,
@@ -340,7 +370,7 @@ def trace_flash_heterogeneous_decode_layers(model, *, concurrency=1, microbatche
         raise ValueError("decode requires an explicit positive checkpoint context length")
     # Also validates the unchanged checkpoint, EP geometry and MB domain.
     deployment, traces, _, batches = _flash_heterogeneous_placement(
-        model, concurrency, microbatches, fpga_cards, root_seed, 0)
+        model, concurrency, microbatches, fpga_cards, root_seed, 0, gpu_hardware_id)
     if states is not None:
         if not isinstance(states, tuple) or not states:
             raise ValueError("live decode states must be a nonempty tuple")
@@ -350,6 +380,7 @@ def trace_flash_heterogeneous_decode_layers(model, *, concurrency=1, microbatche
                     or layer_count != model.num_hidden_layers or kv_length != state.kv_length + 1
                     or kv_length > state.max_context_tokens or len(state.traces) != 8 + 2 * fpga_cards
                     or len(state.cache_tensors) != layer_count
+                    or state.deployment.worker_pools["decode_gpu"].hardware_id != gpu_hardware_id
                     or (not isinstance(state.input_graph, WorkloadGraph)
                         and not (defer_graph and state.input_graph is None))):
                 raise ValueError("live heterogeneous decode requires consecutive retained-state steps and all checkpoint layers")

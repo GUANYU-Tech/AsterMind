@@ -25,7 +25,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import clock_gated_capture as gate  # noqa: E402
 
-NVCC = Path("/mnt/public/yangxinhao/tools/cuda-12.9/bin/nvcc")
+NVCC = gate.NVCC
 SOURCES = {
     "dram": Path(__file__).with_name("dram_latency.cu"),
     "l2": Path(__file__).resolve().parents[1] / "l2" / "l2_latency.cu",

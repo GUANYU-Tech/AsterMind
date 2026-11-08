@@ -2974,7 +2974,7 @@ interconnect:
 # ─── Features ────────────────────────────────────────────
 features:
   kernel_memory_model: npu_tile
-  async_output_release: successor
+  async_output_release: self
   analytical_vector_dependency_paths: true
   kernel_dtype: bf16
   l1_cache_enabled: true

@@ -5,6 +5,8 @@ at consumption. Dependencies, not tuple order, define the execution DAG.
 """
 from __future__ import annotations
 
+from src.kernel.prediction_cache import runtime_lru_cache
+
 from dataclasses import dataclass, fields
 from enum import Enum
 from functools import cached_property, lru_cache
@@ -648,7 +650,7 @@ class LogicalPartialSelectionView(LogicalSelectionView):
             raise ValueError('partial logical selection must partition known and unbound parent axes')
 
 
-@lru_cache(maxsize=256)
+@runtime_lru_cache(maxsize=256)
 def _validate_logical_parent_geometry(shape,mapping,parent_shape,unbound_axes):
     """Reuse only arithmetic with every consumed geometry value in the key."""
     bound=tuple(binding.axis for binding in mapping)
@@ -1048,6 +1050,23 @@ def _replace_source_identity(value, **changes):
     return result
 
 
+class _ProgramValueHash:
+    """Cache an immutable value without a descriptor lock inherited by fork.
+
+    A recycled pool worker may fork while another parent thread hashes a
+    program. Python 3.10 cached_property would retain that vanished thread's
+    shared lock. Concurrent first reads may safely repeat this pure hash;
+    subsequent reads use the same instance dictionary entry directly.
+    """
+
+    def __get__(self, program, owner=None):
+        if program is None:
+            return self
+        value = hash(tuple(getattr(program, field.name) for field in fields(program)))
+        program.__dict__["_value_hash"] = value
+        return value
+
+
 @dataclass(frozen=True)
 class MemoryAccessProgram(Typed):
     version: str
@@ -1062,11 +1081,8 @@ class MemoryAccessProgram(Typed):
     accesses: tuple[MemoryAccess, ...]
     tile_programs: tuple[TileProgram, ...] = ()
 
-    @cached_property
-    def _value_hash(self):
-        # Include every declared field. Dataclass replacement constructs a
-        # fresh object, so changing any source/binding cannot inherit this hash.
-        return hash(tuple(getattr(self,field.name) for field in fields(self)))
+    # Include every declared field; dataclass replacement creates a fresh cache.
+    _value_hash = _ProgramValueHash()
 
     def __hash__(self):
         return self._value_hash
@@ -1076,7 +1092,7 @@ class MemoryAccessProgram(Typed):
         _validate_memory_access_program(self)
 
 
-@lru_cache(maxsize=8)
+@runtime_lru_cache(maxsize=8)
 def _validate_memory_access_program(program):
     """Reuse validation of an identical complete immutable program.
 
@@ -1787,7 +1803,7 @@ def _tile_limited_requested_bytes(views,axes,family,template,limits):
     return total//prod(axes[name].count for name in names)*prod(limits[name] for name in names)
 
 
-@lru_cache(maxsize=256)
+@runtime_lru_cache(maxsize=256)
 def _validate_tile_operand_geometry(axis_values,shape,iteration_axes,view_axes,view_divisors,view_padding):
     """Cache only exact immutable loop geometry; bindings remain per call."""
     axes={name:(extent,block) for name,extent,block in axis_values}
@@ -1815,7 +1831,7 @@ def _validate_tile_operand_geometry(axis_values,shape,iteration_axes,view_axes,v
     return divisors
 
 
-@lru_cache(maxsize=32)
+@runtime_lru_cache(maxsize=32)
 def _validate_static_tile_dependency_graph(steps):
     """Prove ordinary completion edges using their complete immutable graph.
 

@@ -1,9 +1,12 @@
 """Source-derived live activation storage, independent of startup observations."""
 
+from src.kernel.prediction_cache import runtime_lru_cache, RuntimeCache
+
 from collections.abc import Mapping
 from collections import OrderedDict
 from dataclasses import replace
-from functools import lru_cache
+import hashlib
+import json
 import threading
 from src.kernel.memory_access import MemoryAllocation
 from src.serving.parallelism.parallel_config import ParallelConfig
@@ -12,8 +15,8 @@ from src.serving.workload.traced_forward import ForwardActivationGroup, ForwardC
 from src.serving.workload.workload_graph import WorkloadGraph, WorkloadKind, WorkloadNode
 
 
-_peak_identity_cache = OrderedDict()
-_capture_identity_cache = OrderedDict()
+_peak_identity_cache = RuntimeCache()
+_capture_identity_cache = RuntimeCache()
 _storage_identity_lock = threading.Lock()
 
 
@@ -61,7 +64,8 @@ def peak_live_activation_bytes(
 
 def source_capture_activation_peak(trace, capture):
     """Reuse this exact capture's strict allocation window, never global peak."""
-    allocations, events = trace.activation_allocations, trace.event_order
+    from src.serving.workload.traced_forward import _source_activation_allocations
+    allocations, events = _source_activation_allocations(trace), trace.event_order
     begin_event, end_event = capture["begin_event"], capture["end_event"]
     cacheable = (type(allocations) is tuple and type(events) is tuple
         and type(begin_event) is str and type(end_event) is str)
@@ -82,7 +86,7 @@ def source_capture_activation_peak(trace, capture):
     return result
 
 
-@lru_cache(maxsize=128)
+@runtime_lru_cache(maxsize=128)
 def _cached_peak_live_activation_bytes(allocations, event_order, start_event, end_event):
     # Frozen canonical allocations contain every geometry and lifetime field;
     # equal IDs alone are insufficient. Eviction simply repeats the same sweep.
@@ -375,7 +379,188 @@ def segment_reference_storage_report(trace, *, split_node_ids, escaped_allocatio
         "normal_capacity_accepted": False}
 
 
+def _native_observer_report(source, graph, source_profile, traces, compute):
+    if source_profile != "cuda_eager_inplace" or type(source) is not ForwardCollectiveGroup or len(traces) != 2:
+        return None
+    from copy import deepcopy
+    from src.serving.kernel_lowering.memory_bindings import _memory_fields
+    from src.serving.workload.traced_forward import (
+        ForwardCollectiveSourceProgram, _NativeSourceFrame, _NativeStorageOverlay)
+
+    frame = graph.__dict__["_native_source_frame"] if "_native_source_frame" in graph.__dict__ else None
+    if type(frame) is not _NativeSourceFrame:
+        return None
+    owner = frame.owner()
+    if type(owner) is not ForwardCollectiveSourceProgram or source._recorded_graph is not graph:
+        return None
+    if any(not rank.geometry_rebind for rank in owner.rank_programs):
+        return None
+    snapshots = tuple(rank.__dict__["_native_storage_template"] if "_native_storage_template" in rank.__dict__ else None
+        for rank in owner.rank_programs)
+    if any(snapshot is None for snapshot in snapshots):
+        return None
+    rank_keys = []
+    for trace, snapshot in zip(traces, snapshots, strict=True):
+        owned = trace.__dict__["_owned_memory_storage"] if "_owned_memory_storage" in trace.__dict__ else None
+        if (type(owned) is not tuple or len(owned) != 6
+                or type(owned[2]) is not _NativeStorageOverlay or type(owned[3]) is not _NativeStorageOverlay
+                or trace._allocations is not owned[0] or trace._views is not owned[1]
+                or trace._persistent_ids is not owned[4] or trace._events is not owned[5]
+                or trace._persistent_ids is not snapshot[2] or trace._events is not snapshot[6]):
+            return None
+        captures = []
+        for capture in trace.source_captures:
+            inputs = tuple((name, port["shape"], port["dtype"], port["bytes"], port["storage_id"])
+                for name, port in capture["inputs"].items())
+            output = capture["output"]
+            captures.append((capture["logical_tokens"], capture["model_input_tokens"],
+                capture["key"], capture["runtime_mode"], capture["source_stage"],
+                capture["begin_event"], capture["end_event"], inputs,
+                (output["shape"], output["dtype"], output["bytes"], output["storage_id"])))
+        rank_keys.append((trace.rank, len(trace._views),
+            tuple(sorted(trace.workspace_capacity_bytes.items())), tuple(captures)))
+    key = id(frame.template), source_profile, tuple(rank_keys)
+    if "_native_observer_reports" not in owner.__dict__:
+        owner.__dict__["_native_observer_reports"] = OrderedDict()
+    cache = owner.__dict__["_native_observer_reports"]
+    if key in cache:
+        cached_snapshots, expected, report = cache[key]
+        if all(current is previous for current, previous in zip(snapshots, cached_snapshots, strict=True)):
+            current = tuple(tuple((type(allocation), _memory_fields(allocation))
+                for allocation in trace.activation_allocations) for trace in traces)
+            if current == expected:
+                cache.move_to_end(key)
+                return deepcopy(report)
+    report = compute()
+    expected = tuple(tuple((type(allocation), _memory_fields(allocation))
+        for allocation in trace.activation_allocations) for trace in traces)
+    cache[key] = snapshots, expected, deepcopy(report)
+    cache.move_to_end(key)
+    if len(cache) > 64:
+        cache.popitem(last=False)
+    return report
+
+
 def symbolic_forward_storage_report(source, graph, *, source_profile):
+    if isinstance(source, ForwardTrace):
+        traces = (source,)
+    elif isinstance(source, (ForwardActivationGroup, ForwardCollectiveGroup, ForwardKVCacheGroup, ForwardPipelineGroup)):
+        traces = source.traces
+    else:
+        raise TypeError("source memory requires the actual symbolic forward trace")
+    if not isinstance(graph, WorkloadGraph) or not isinstance(source_profile, str) or not source_profile:
+        raise TypeError("source memory requires its workload graph and declared source profile")
+    cached = _native_observer_report(source, graph, source_profile, traces,
+        lambda: _compute_symbolic_forward_storage_report(source, graph, source_profile=source_profile))
+    if cached is not None:
+        return cached
+    return _compute_symbolic_forward_storage_report(source, graph, source_profile=source_profile)
+
+
+def kimi_k3_source_cache_storage_report(source, *, native_workers, physical_ranks):
+    """Reconcile logical K3 source pools with validated native page metadata.
+
+    Logical per-layer tensors retain dense coordinates for dependency/traffic
+    analysis. They are projections into the native arena, not extra allocations
+    to add to that arena. This check does not bind GPU tensors or change their
+    source storage identities, allocator policy or acceptance status.
+    """
+    from src.kernel.kernel_spec import DTYPE_BYTES
+
+    if isinstance(source, ForwardTrace):
+        traces = (source,)
+    elif isinstance(source, (ForwardActivationGroup, ForwardCollectiveGroup, ForwardKVCacheGroup, ForwardPipelineGroup)):
+        traces = source.traces
+    else:
+        raise TypeError("K3 cache reconciliation requires the actual symbolic source")
+    if (not isinstance(native_workers, tuple) or not isinstance(physical_ranks, tuple)
+            or len(traces) != len(native_workers) or len(traces) != len(physical_ranks)
+            or len(set(physical_ranks)) != len(physical_ranks)
+            or tuple(trace.rank for trace in traces) != physical_ranks):
+        raise ValueError("K3 cache reconciliation requires matching physical rank order")
+    dtype_names = {"bfloat16": "bf16", "float32": "fp32"}
+    ranks = {}
+    for trace, native in zip(traces, native_workers, strict=True):
+        rows, logical_bytes = [], 0
+        blocks, arena = native["num_blocks"], native["shared_arena_bytes"]
+        if type(blocks) is not int or blocks <= 0 or type(arena) is not int or arena <= 0:
+            raise ValueError("K3 cache reconciliation requires positive native capacities")
+        owners = set()
+        for layer in native["layers"]:
+            owner = layer["owner"]
+            parts = owner.split(".")
+            if (len(parts) != 5 or parts[:3] != ["language_model", "model", "layers"]
+                    or parts[4] != "self_attn" or not parts[3].isdigit() or owner in owners):
+                raise ValueError("K3 cache reconciliation requires unique source attention owners")
+            owners.add(owner)
+            prefix = f"layer-{int(parts[3])}:attention"
+            if layer["spec_type"] == "MambaSpec":
+                if len(layer["states"]) != 2:
+                    raise ValueError("K3 cache reconciliation requires conv and recurrent native states")
+                first_state, second_state = layer["states"]
+                if (first_state["offset_within_page_bytes"] != 0
+                        or second_state["offset_within_page_bytes"] != first_state["state_content_bytes"]
+                        or sum(state["state_content_bytes"] for state in layer["states"]) != layer["state_content_size_bytes"]
+                        or layer["state_content_size_bytes"] > layer["page_size_bytes"]):
+                    raise ValueError("K3 cache reconciliation has inconsistent packed native states")
+                projections = []
+                for suffix, state in zip(("conv-state", "recurrent-state"), layer["states"], strict=True):
+                    shape, dtype = tuple(state["shape"]), dtype_names[state["dtype"]]
+                    element_bytes = DTYPE_BYTES[dtype]
+                    strides, stride = [], element_bytes
+                    for dimension in reversed(shape):
+                        strides.append(stride)
+                        stride *= dimension
+                    strides = tuple(reversed(strides))
+                    transform = "identity"
+                    if suffix == "conv-state":
+                        if len(shape) != 2 or layer["conv_state_layout"] not in ("SD", "DS"):
+                            raise ValueError("K3 cache reconciliation requires source-defined conv state orientation")
+                        if layer["conv_state_layout"] == "SD":
+                            # K3 forward transposes SD storage to the DS
+                            # kernel view before all prefill/decode branches.
+                            shape, strides = tuple(reversed(shape)), tuple(reversed(strides))
+                            transform = "transpose_last_two_view_no_copy"
+                    projections.append((suffix, (blocks, *shape), dtype,
+                        blocks * state["state_content_bytes"], state["offset_within_page_bytes"], strides, transform))
+            elif layer["spec_type"] == "MLAAttentionSpec":
+                if layer["num_kv_heads"] != 1:
+                    raise ValueError("K3 cache reconciliation requires one latent KV head")
+                projections = (("cache", (blocks * layer["block_tokens"], layer["head_size"]),
+                    dtype_names[layer["dtype"]], blocks * layer["page_size_bytes"], 0,
+                    (layer["head_size"] * DTYPE_BYTES[dtype_names[layer["dtype"]]], DTYPE_BYTES[dtype_names[layer["dtype"]]]),
+                    "slot_to_block_and_token_in_page"),)
+            else:
+                raise NotImplementedError("K3 cache reconciliation requires native Mamba/MLA leaves")
+            if (type(layer["block_stride_bytes"]) is not int or layer["block_stride_bytes"] <= 0
+                    or layer["last_page_end_bytes"] != layer["block0_offset_bytes"]
+                        + (blocks - 1) * layer["block_stride_bytes"] + layer["page_size_bytes"]
+                    or not 0 <= layer["block0_offset_bytes"] < layer["last_page_end_bytes"] <= arena):
+                raise ValueError("K3 cache reconciliation native page exceeds arena")
+            for suffix, shape, dtype, size, state_offset, strides, transform in projections:
+                key = trace.qualify(prefix + ":" + suffix)
+                view, allocation = trace._views[key], trace._allocations[key]
+                if (key not in trace._persistent_ids or view.allocation_id != key
+                        or view.shape != shape or view.dtype != dtype or allocation.size_bytes != size):
+                    raise ValueError(f"K3 source logical cache differs from native state geometry: {key}; "
+                        f"source={(view.shape, view.dtype, allocation.size_bytes)}, native={(shape, dtype, size)}")
+                logical_bytes += size
+                rows.append({"allocation_id": key, "owner": owner, "logical_projection_bytes": size,
+                    "group_index": layer["group_index"], "block0_offset_bytes": layer["block0_offset_bytes"] + state_offset,
+                    "block_stride_bytes": layer["block_stride_bytes"],
+                    "native_intra_page_strides_bytes": strides, "logical_to_native_transform": transform})
+        source_pools = {key for key in trace._persistent_ids
+            if key.endswith((":attention:conv-state", ":attention:recurrent-state", ":attention:cache"))}
+        if not rows or {row["allocation_id"] for row in rows} != source_pools:
+            raise ValueError("K3 cache reconciliation requires all stage-local source pools")
+        ranks[str(trace.rank)] = {"native_shared_arena_bytes": arena,
+            "logical_source_projection_bytes": logical_bytes, "additional_cache_charge_bytes": 0,
+            "projections": tuple(rows)}
+    return {"ranks": ranks, "normal_capacity_accepted": False, "gpu_cache_binding_executed": False,
+        "scope": "source_logical_shapes_match_native_pages; physical_capacity_charges_native_arena_once"}
+
+
+def _compute_symbolic_forward_storage_report(source, graph, *, source_profile):
     """Summarize the same virtual forward, without replaying model code.
 
     Canonical allocation lifetimes remain the authority. Only peak witnesses
@@ -395,15 +580,16 @@ def symbolic_forward_storage_report(source, graph, *, source_profile):
     if projection is None:
         ranks = {}
         for trace in traces:
-            peak, live = peak_live_activation_bytes(trace.activation_allocations, trace.event_order)
+            allocations = trace.activation_allocations
+            peak, live = peak_live_activation_bytes(allocations, trace.event_order)
             live_ids = set(live)
             objects = tuple({"allocation_id": a.allocation_id, "size_bytes": a.size_bytes,
                 "allocated_event": a.allocated_event, "freed_event": a.freed_event}
-                for a in trace.activation_allocations if a.allocation_id in live_ids)
+                for a in allocations if a.allocation_id in live_ids)
             if sum(a["size_bytes"] for a in objects) != peak:
                 raise AssertionError("source activation peak disagrees with its unique live storage")
             ranks[str(trace.rank)] = {"known_activation_peak_bytes": peak, "peak_live_storage": objects,
-                "activation_allocation_count": len(trace.activation_allocations), "view_count": len(trace.views),
+                "activation_allocation_count": len(allocations), "view_count": len(trace._views),
                 "source_workspace_capacity_bytes": trace.workspace_capacity_bytes}
         graph_nodes, graph_edges = len(graph.nodes), len(graph.edges)
     else:
@@ -443,6 +629,63 @@ def symbolic_forward_storage_report(source, graph, *, source_profile):
         "ranks": ranks, "complete": False, "normal_capacity_accepted": False,
         "scope": "same_forward_known_source_storage_only_not_complete_worker_peak_or_bound",
         "limitations": limitations}
+
+
+def source_forward_state_summary(source, graph):
+    """Bind every source allocation's identity, location, capacity and lifetime."""
+    if isinstance(source, ForwardTrace):
+        traces = (source,)
+    elif isinstance(source, (ForwardActivationGroup, ForwardCollectiveGroup, ForwardKVCacheGroup, ForwardPipelineGroup)):
+        traces = source.traces
+    else:
+        raise TypeError("source state audit requires the actual symbolic forward trace")
+    if not isinstance(graph, WorkloadGraph):
+        raise TypeError("source state audit requires its actual workload graph")
+    ranks = {}
+    for trace in traces:
+        records = []
+        domains = {}
+        freed_count = freed_bytes = live_count = live_bytes = 0
+        for allocation in trace.allocations:
+            record = {
+                "allocation_id": allocation.allocation_id,
+                "device_id": allocation.device_id,
+                "memory_domain": allocation.memory_domain,
+                "size_bytes": allocation.size_bytes,
+                "address_level": allocation.address_level.value,
+                "base_address_bytes": allocation.base_address_bytes,
+                "mapping_ref": allocation.mapping_ref,
+                "allocated_event": allocation.allocated_event,
+                "freed_event": allocation.freed_event,
+            }
+            records.append(record)
+            domain_key = (allocation.memory_domain
+                if allocation.memory_domain is not None else "not_declared")
+            domain = domains[domain_key] if domain_key in domains else {
+                "allocation_count": 0, "allocation_bytes": 0}
+            domain["allocation_count"] += 1
+            domain["allocation_bytes"] += allocation.size_bytes
+            domains[domain_key] = domain
+            if allocation.freed_event is None:
+                live_count += 1
+                live_bytes += allocation.size_bytes
+            else:
+                freed_count += 1
+                freed_bytes += allocation.size_bytes
+        records.sort(key=lambda record: record["allocation_id"])
+        encoded = json.dumps(records, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        ranks[str(trace.rank)] = {
+            "allocation_count": len(records),
+            "allocation_bytes": sum(record["size_bytes"] for record in records),
+            "freed_allocation_count": freed_count,
+            "freed_allocation_bytes": freed_bytes,
+            "live_allocation_count": live_count,
+            "live_allocation_bytes": live_bytes,
+            "memory_domains": domains,
+            "allocation_state_sha256": hashlib.sha256(encoded).hexdigest(),
+        }
+    return {"ranks": ranks,
+        "scope": "source_forward_allocation_lifecycle_not_complete_runtime_state"}
 
 
 class SourceActivationMemoryAccumulator:
@@ -722,9 +965,9 @@ def symbolic_startup_activation_peak(model: ModelConfig, parallelism: ParallelCo
     if not isinstance(model, ModelConfig):
         raise TypeError("symbolic startup activation requires ModelConfig")
     if (not isinstance(parallelism, ParallelConfig) or not parallelism.is_rank_local
-            or parallelism.tensor_parallel_size not in (1, 2) or parallelism.pipeline_parallel_size != 1
+            or parallelism.pipeline_parallel_size != 1
             or parallelism.enable_expert_parallel):
-        raise NotImplementedError("initial symbolic startup source requires TP1/TP2 PP1 EP-off")
+        raise NotImplementedError("symbolic dense startup source requires ordinary TP, PP1 EP-off")
     trace = trace_qwen3_startup_profile(model, tokens=tokens, max_requests=max_requests,
         source_profile=source_profile, num_compute_units=num_compute_units,
         tensor_parallel_size=parallelism.tensor_parallel_size, collective_configs=collective_configs,

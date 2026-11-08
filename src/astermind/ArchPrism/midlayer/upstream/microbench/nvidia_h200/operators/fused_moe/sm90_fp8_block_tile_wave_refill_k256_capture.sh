@@ -10,15 +10,15 @@
 # prefill W2 launches resolve to bm64_bn128_bk128_w4_s3.
 GPU=$1; RUN=$2; PROBE=$3; PROGRAM=${4:-bm16_bn128_bk128_w4_s3}
 mkdir -p $RUN; cd $RUN
-export HOME=/mnt/public/yangxinhao/h200_microbench/home
-export TRITON_CACHE_DIR=/mnt/public/yangxinhao/cache/dsr1_mtpoff/triton_gpu$GPU
+export HOME=${MIDLAYER_H200_PUBLIC_ROOT:?set MIDLAYER_H200_PUBLIC_ROOT}/h200_microbench/home
+export TRITON_CACHE_DIR=${MIDLAYER_H200_PUBLIC_ROOT:?set MIDLAYER_H200_PUBLIC_ROOT}/cache/dsr1_mtpoff/triton_gpu$GPU
 export PYTHONPATH=$PROBE
 for mode in l2 dram; do
   flag=""; [ $mode = dram ] && flag="--dram"
   for proc in 1 2; do
     for attempt in 1 2 3 4; do
       tag=gpu${GPU}_${PROGRAM}_${mode}_p${proc}_a${attempt}
-      CUDA_VISIBLE_DEVICES=$GPU /mnt/public/yangxinhao/envs/vllm024/bin/python $PROBE/sm90_fp8_block_tile_wave_refill_runner.py --program $PROGRAM --trials 9 --k-values 256 512 1024 $flag --clock-log $tag.clock.csv > $tag.csv 2> $tag.err
+      CUDA_VISIBLE_DEVICES=$GPU ${MIDLAYER_H200_PUBLIC_ROOT:?set MIDLAYER_H200_PUBLIC_ROOT}/envs/vllm024/bin/python $PROBE/sm90_fp8_block_tile_wave_refill_runner.py --program $PROGRAM --trials 9 --k-values 256 512 1024 $flag --clock-log $tag.clock.csv > $tag.csv 2> $tag.err
       if grep -q "^CLOCK,$GPU,.*,1$" $tag.csv; then echo "ACCEPT $tag"; break; else echo "REJECT $tag"; fi
     done
   done

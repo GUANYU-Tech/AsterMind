@@ -5,7 +5,7 @@
 # wait until the GPU has no compute process (3 checks), then hold runs/gpu<N>.proc.lock with a GPU-free
 # `sleep` so none of our jobs start there while it is lent. Serving lanes are NOT stopped (reported instead).
 set -u
-K=/mnt/public/yangxinhao/h200_microbench/kcampaign; cd $K
+K=${MIDLAYER_H200_PUBLIC_ROOT:?set MIDLAYER_H200_PUBLIC_ROOT}/h200_microbench/kcampaign; cd $K
 say() { echo "$(date '+%F %T') $*"; }
 if pgrep -f "^(timeout \S+ )?bash \S*with_gpu_locks\.sh 0,1,2,3,4,5,6,7 " > /dev/null; then  # argv must start with it: a shell whose command line merely mentions the string does not count
   say "a whole-machine job (with_gpu_locks.sh on all 8 GPUs) is running; nothing yielded"; exit 3

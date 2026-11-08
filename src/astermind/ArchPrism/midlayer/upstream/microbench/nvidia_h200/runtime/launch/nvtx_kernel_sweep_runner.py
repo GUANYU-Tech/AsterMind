@@ -34,9 +34,10 @@ import re
 import sqlite3
 import statistics
 import subprocess
+import shutil
 import time
 
-NSYS = '/mnt/public/yangxinhao/tools/nsys_2025.6.1/bin/nsys'
+NSYS = shutil.which('nsys') or 'nsys'
 BOOST_MHZ = 1980
 
 

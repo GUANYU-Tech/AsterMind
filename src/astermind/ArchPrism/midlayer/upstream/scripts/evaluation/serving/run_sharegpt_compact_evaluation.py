@@ -10,7 +10,7 @@ from evaluation.serving.metrics import sharegpt_compact_evaluation as compact  #
 from evaluation.serving.metrics.compact_alignment_suite import run_compact_alignment_suite  # noqa: E402
 from evaluation.serving.simulation import simulation_runner  # noqa: E402
 DEFAULT_CONFIG = Path("configs/evaluation/experiments/sharegpt_phase1.json")
-MAX_JOBS = 64; DEFAULT_JOBS = min(MAX_JOBS, os.cpu_count() or 1)
+DEFAULT_JOBS = os.cpu_count() or 1
 def _run_isolated_case(repository_root: str, config: compact.Phase1Config, cell: compact.Phase1Cell, source_commit: str, alignment_checked: bool | dict[str, object], execution_mode: str, debug_num_kv_blocks: int | None = None, debug_analytical_launch: bool = False, host_launch_profile_paths: dict[str, str] | None = None, scheduler_host_profile_paths: dict[str, str] | None = None) -> dict[str, object]:
     return compact.run_isolated_case(
         repository_root, config, cell, source_commit, alignment_checked, execution_mode,
@@ -35,7 +35,7 @@ def _parse_args(argv=None):
     selection.add_argument("--all-official-metrics", action="store_true", help="run the frozen 45-case official-metrics matrix; --virtual-forward also retains its 15 H2000.30 cases")
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--execution-mode", choices=("accelerated", "reference"), default="accelerated", help="run-local execution strategy")
-    parser.add_argument("--jobs", type=int, choices=range(1, MAX_JOBS + 1), default=DEFAULT_JOBS, metavar="1..64", help="isolated case workers; parent writes ordered output")
+    parser.add_argument("--jobs", type=int, default=DEFAULT_JOBS, metavar="N", help="isolated case workers; parent writes ordered output")
     parser.add_argument("--metrics-only", action="store_true", help="debug-only: skip alignment and mark results non-formal")
     parser.add_argument("--debug-num-kv-blocks", type=int, help="debug-only explicit Scheduler capacity; requires one case and metrics-only")
     parser.add_argument("--debug-analytical-launch", action="store_true", help="debug-only: use analytical rather than injected launch facts")

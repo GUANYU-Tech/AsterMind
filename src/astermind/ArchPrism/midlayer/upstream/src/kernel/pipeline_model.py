@@ -1,8 +1,9 @@
 """Deterministic worker-aware tile pipeline evaluator."""
 
+from src.kernel.prediction_cache import runtime_lru_cache, RuntimeCache
+
 from collections import OrderedDict
 import dataclasses
-from functools import lru_cache
 import math
 import threading
 
@@ -208,7 +209,7 @@ def _evaluate_explicit_pipeline(plan: PipelinePlan) -> PipelineDiagnostics:
 
 _NEGATIVE_INFINITY = float("-inf")
 _ATTENTION_ENVELOPE_CACHE_SIZE = 8
-_attention_envelope_cache = OrderedDict()
+_attention_envelope_cache = RuntimeCache()
 _attention_envelope_cache_lock = threading.Lock()
 
 
@@ -231,7 +232,7 @@ class _AttentionEnvelopeCacheKey:
 
 
 _ATTENTION_PHASE_TRANSITION_CACHE_SIZE = 512
-_attention_phase_transition_cache = OrderedDict()
+_attention_phase_transition_cache = RuntimeCache()
 _attention_phase_transition_cache_lock = threading.Lock()
 _ATTENTION_SOURCE_ORDINAL_RESOURCE = "__source_ordinal__"
 
@@ -264,7 +265,7 @@ def attention_round_robin_signatures(class_counts, lane_count):
     return tuple(grouped)
 
 
-@lru_cache(maxsize=8)
+@runtime_lru_cache(maxsize=8)
 def _attention_round_robin_sparse_signatures(class_counts, lane_count):
     """Return only source classes assigned to each distinct physical lane."""
 
@@ -317,7 +318,7 @@ def _shortest_exact_period(tokens):
     return period if len(tokens) % period == 0 else len(tokens)
 
 
-@lru_cache(maxsize=512)
+@runtime_lru_cache(maxsize=512)
 def _attention_source_blocks(entries, class_period):
     """Partition one immutable lane stream at exact source-period edges."""
 
@@ -402,7 +403,7 @@ def _maxplus_left_sparse_product(left_sparse, right):
     return tuple(product)
 
 
-@lru_cache(maxsize=4096)
+@runtime_lru_cache(maxsize=4096)
 def _maxplus_matrix_array(matrix):
     """Materialize one immutable square transition for vectorized application."""
 
@@ -436,14 +437,14 @@ def _maxplus_apply(matrix, vector):
     return tuple(output)
 
 
-@lru_cache(maxsize=4096)
+@runtime_lru_cache(maxsize=4096)
 def _maxplus_square(matrix):
     """Reuse one exact max-plus square across different repeat counts."""
 
     return _maxplus_product(matrix, matrix)
 
 
-@lru_cache(maxsize=4096)
+@runtime_lru_cache(maxsize=4096)
 def _maxplus_powers(matrix, exponent):
     powers = []
     current = matrix
@@ -562,7 +563,7 @@ def _pipeline_buffer_topology_signature(buffers):
         for buffer in buffers)
 
 
-@lru_cache(maxsize=4096)
+@runtime_lru_cache(maxsize=4096)
 def _compile_pipeline_topology(
         stage_signature, buffer_signature, uses_source_ordinal):
     """Compile a finite source DAG once, independent of duration binding.
@@ -641,7 +642,7 @@ def _compile_pipeline_topology(
     )
 
 
-@lru_cache(maxsize=4096)
+@runtime_lru_cache(maxsize=4096)
 def _compile_pipeline_binding_skeleton(
         topology, resource_layout, buffer_layout, constant_index,
         source_ordinal_index):

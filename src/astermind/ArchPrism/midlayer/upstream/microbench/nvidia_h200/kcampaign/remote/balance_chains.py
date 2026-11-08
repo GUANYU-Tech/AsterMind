@@ -7,7 +7,8 @@ placed first (still one GPU each); the rest by longest-processing-time greedy.
 Prints one `chain.sh` command per GPU (REPO/PY for vLLM 0.30 are set by the caller).
 """
 import argparse, glob, json, os
-K = "/mnt/public/yangxinhao/h200_microbench/kcampaign"
+K = os.path.join(
+    os.environ["MIDLAYER_H200_PUBLIC_ROOT"], "h200_microbench/kcampaign")
 ap = argparse.ArgumentParser()
 ap.add_argument("--gpus", required=True)
 ap.add_argument("--plans", nargs="+", required=True)

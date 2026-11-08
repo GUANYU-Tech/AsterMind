@@ -5,7 +5,8 @@ from typing import Iterable, Iterator, Tuple
 from collections.abc import Mapping
 from types import MappingProxyType
 
-from src.kernel.kernel_spec import KernelSpec
+from src.kernel.kernel_spec import KernelSpec, PhysicalTransferConfig
+from src.kernel.launch_config import LaunchConfig
 from src.kernel.memory_access_builder import (
     CacheUpdateBindings, ElementwiseBindings, FusedMoEBindings, MemoryBindings, SparseAttentionBindings,
 )
@@ -26,8 +27,18 @@ class KernelCall:
     memory_bindings: MemoryBindings | ElementwiseBindings | CacheUpdateBindings | SparseAttentionBindings | FusedMoEBindings | None = None
     memory_source: SourceCallMemory | None = None
     memory_unbound_reason: str | None = None
+    source_launches: Tuple[Tuple[str, LaunchConfig | PhysicalTransferConfig], ...] | None = None
 
     def __post_init__(self) -> None:
+        if self.source_launches is not None:
+            if not isinstance(self.source_launches, tuple) or any(
+                    not isinstance(item, tuple) or len(item) != 2
+                    or type(item[0]) is not str or not item[0]
+                    or not isinstance(item[1], (LaunchConfig, PhysicalTransferConfig)) for item in self.source_launches):
+                raise TypeError("source launches require immutable named launch/transfer descriptors")
+            roles = tuple(role for role, _ in self.source_launches)
+            if len(set(roles)) != len(roles):
+                raise ValueError("source launch stage roles must be unique within a logical call")
         for name in ("call_id", "pool_name", "resource"):
             value = getattr(self, name)
             if not isinstance(value, str) or not value:
@@ -72,12 +83,46 @@ class KernelCall:
                 "kernel call dependencies must contain non-empty strings")
 
 
+    def with_dependencies(self, dependencies):
+        """Bind current resource predecessors to an already validated call."""
+        if type(self) is not KernelCall or type(dependencies) is not tuple:
+            raise TypeError("dependency binding requires a canonical call and immutable tuple")
+        if any(not isinstance(name, str) or not name or name == self.call_id for name in dependencies):
+            raise ValueError("kernel dependencies require preceding call identities")
+        if dependencies == self.dependencies:
+            return self
+        result = object.__new__(KernelCall)
+        result.__dict__.update(self.__dict__)
+        object.__setattr__(result, "dependencies", dependencies)
+        return result
+
+    def bind_source_call(self, call_id, source_node_id, dependencies):
+        """Instantiate a compiled one-node lowering recipe at its actual ports."""
+        if (type(self) is not KernelCall or self.memory_source is not None
+                or self.memory_bindings is not None or self.memory_unbound_reason is not None
+                or len(self.source_node_ids) != 1):
+            raise ValueError("source call recipes require one unbound canonical source node")
+        if (not isinstance(call_id, str) or not call_id or not isinstance(source_node_id, str) or not source_node_id
+                or type(dependencies) is not tuple
+                or any(not isinstance(name, str) or not name or name == call_id for name in dependencies)):
+            raise ValueError("source call binding requires current IDs and predecessor ports")
+        result = object.__new__(KernelCall)
+        result.__dict__.update(self.__dict__)
+        object.__setattr__(result, "call_id", call_id)
+        object.__setattr__(result, "source_node_ids", (source_node_id,))
+        object.__setattr__(result, "dependencies", dependencies)
+        return result
+
     def with_kernel_spec(self, kernel_spec):
         """Bind a validated spec without changing this call's execution lane."""
         if type(self) is not KernelCall or type(kernel_spec) is not KernelSpec:
             raise TypeError("compiled call binding requires canonical KernelCall and KernelSpec")
         if kernel_spec is self.kernel_spec:
             return self
+        if self.source_launches is not None and any(
+                getattr(kernel_spec, name) != getattr(self.kernel_spec, name)
+                for name in ("shape", "dtype", "variant", "attributes")):
+            raise ValueError("changing source-bound call geometry requires reselecting its source launches")
         from src.kernel.kernel_spec import KernelKind
         if kernel_spec.transfer is None:
             resource = "compute"
@@ -346,7 +391,7 @@ class KernelPlan:
                     logical = KernelCall(identity(member.call_id, occurrence), member.kernel_spec,
                         member.pool_name, member.rank, member.resource,
                         tuple(source_maps[repeat.block_id][name][occurrence] for name in member.source_node_ids),
-                        tuple(dependencies))
+                        tuple(dependencies), source_launches=member.source_launches)
                     if self.memory_context is not None:
                         logical = self.memory_context.bind_call(logical)
                     elif member.memory_source is not None or member.memory_bindings is not None:
@@ -382,6 +427,11 @@ class KernelPlan:
         unknown = set(updates) - positions.keys()
         if unknown:
             raise ValueError(f"unknown compiled call bindings: {sorted(unknown)}")
+        if "_schedule_structure_token" not in self.__dict__:
+            canonical = (all(type(call.kernel_spec) is KernelSpec
+                and (call.kernel_spec.transfer is None or type(call.kernel_spec.transfer) is PhysicalTransferConfig)
+                for call in self.calls) and all(type(repeat) is KernelBlockRepeat for repeat in self.block_repeats))
+            object.__setattr__(self, "_schedule_structure_token", object() if canonical else None)
         changed = {}
         for name, spec in updates.items():
             index = positions[name]
@@ -394,9 +444,18 @@ class KernelPlan:
             for index, call in enumerate(self.calls))
         result = object.__new__(KernelPlan)
         result.__dict__.update(self.__dict__)
+        if (self._schedule_structure_token is not None
+                and any(spec.variant != self.calls[positions[name]].kernel_spec.variant for name, spec in updates.items())):
+            # Kind, hardware and transfer topology are checked by
+            # with_kernel_spec(). Variant is also part of schedule structure.
+            object.__setattr__(result, "_schedule_structure_token", object())
         object.__setattr__(result, "calls", calls)
         object.__setattr__(result, "_topological_calls", tuple(calls[index]
             for index in self._binding_topological_indices))
+        previous = _bound_kernel_spec_projection(self)
+        template, inherited = (self, ()) if previous is None else previous
+        object.__setattr__(result, "_bound_spec_projection", _BoundSpecProjection(
+            result, template, tuple(sorted(set(inherited) | changed.keys()))))
         return result
 
     def _compute_topological_order(self) -> Tuple[KernelCall, ...]:
@@ -445,3 +504,45 @@ def require_hardware(hardware_id: str, hardware_by_id):
     if hardware_id not in hardware_by_id:
         raise ValueError(f"no HWSpec supplied for {hardware_id}")
     return hardware_by_id[hardware_id]
+
+
+class _BoundSpecProjection:
+    """Run-local changed slots in the same immutable plan body."""
+    __slots__ = ("owner_id", "calls", "topological_calls", "template", "base_calls", "repeats", "positions")
+
+    def __init__(self, plan, template, positions):
+        for name, value in (("owner_id", id(plan)), ("calls", plan.calls),
+                ("topological_calls", plan._topological_calls),
+                ("template", template), ("base_calls", template.calls),
+                ("repeats", plan.block_repeats), ("positions", positions)):
+            object.__setattr__(self, name, value)
+
+    def __setattr__(self, name, value):
+        raise TypeError("bound spec projections are immutable")
+
+    def __reduce_ex__(self, protocol):
+        # Transport preserves the public plan, not this process's owner proof.
+        return type(None), ()
+
+
+def _bound_kernel_spec_projection(plan):
+    """Return the checked template/changed slots, or use complete consumers."""
+    if (type(plan) is not KernelPlan or type(plan.calls) is not tuple
+            or "__getattribute__" in vars(KernelPlan)
+            or any(getattr(owner, name) is not function or function.__code__ is not code
+                for owner, name, function, code in _SPEC_BINDING_SOURCE)):
+        return None
+    binding = plan.__dict__["_bound_spec_projection"] if "_bound_spec_projection" in plan.__dict__ else None
+    if (type(binding) is not _BoundSpecProjection or binding.owner_id != id(plan)
+            or binding.calls is not plan.calls or binding.topological_calls is not plan._topological_calls
+            or binding.repeats is not plan.block_repeats
+            or type(binding.template) is not KernelPlan
+            or type(binding.template.calls) is not tuple
+            or binding.base_calls is not binding.template.calls
+            or binding.template.block_repeats is not binding.repeats):
+        return None
+    return binding.template, binding.positions
+
+
+_SPEC_BINDING_SOURCE = tuple((owner, name, getattr(owner, name), getattr(owner, name).__code__)
+    for owner, name in ((KernelPlan, "bind_kernel_specs"), (KernelCall, "with_kernel_spec")))

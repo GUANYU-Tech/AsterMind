@@ -26,7 +26,9 @@ import time
 LENGTHS = (16, 128, 512, 1024)
 TRIALS = 60
 WARMUP = 10
-DATASET = "/mnt/disk1/datasets/ShareGPT_V3_unfiltered_cleaned_split.json"
+if "MIDLAYER_SHAREGPT_DATASET" not in os.environ:
+    raise SystemExit("MIDLAYER_SHAREGPT_DATASET must name the ShareGPT JSON input")
+DATASET = os.environ["MIDLAYER_SHAREGPT_DATASET"]
 HELD_OUT_FROM = 60000
 
 

@@ -445,8 +445,8 @@ def _compiled_wrapper_composite(source: torch.Tensor) -> torch.Tensor:
 
     The child calls have already been replaced by immediate synthetic values
     by ``_synthetic_source_environment``.  Returning a preallocated NPU
-    tensor keeps the probe asynchronous and excludes allocation and Device
-    work from this measurement.
+    tensor keeps the probe asynchronous and excludes NPU tensor allocation
+    and Device work. Python control objects remain part of this boundary.
     """
 
     _measure_custom_op_entry()
@@ -486,7 +486,43 @@ class _CompiledWrapperChain(torch.nn.Module):
         return value
 
 
-def _measure_compiled_wrapper_composite() -> dict[str, object]:
+def _compiled_wrapper_backend(name: str):
+    """Select and identify the compiler whose Host control is being measured.
+
+    Ordinary torch.compile defaults to Inductor. Ascend Serving's npugraph_ex
+    path explicitly selects TorchAir reduce-overhead, so an unspecified
+    default cannot establish coverage of that path.
+    """
+    if name == "inductor":
+        from torch._dynamo.backends.registry import lookup_backend
+
+        compiler = lookup_backend("inductor")
+        return "inductor", {
+            "name": name,
+            "compiler_module": compiler.__module__,
+            "compiler_qualname": compiler.__qualname__,
+            "compiler_source": _source_identity(compiler),
+        }
+    if name == "torchair_npugraph_ex":
+        import torchair
+
+        torch.npu.set_compile_mode(jit_compile=False)
+        config = torchair.CompilerConfig()
+        config.mode = "reduce-overhead"
+        config.debug.run_eagerly = True
+        config.debug.aclgraph.disable_reinplace_inplaceable_ops_pass = True
+        return torchair.get_npu_backend(compiler_config=config), {
+            "name": name,
+            "mode": "reduce-overhead",
+            "run_eagerly": True,
+            "disable_reinplace_inplaceable_ops_pass": True,
+            "static_kernel_requested": False,
+            "backend_factory_source": _source_identity(torchair.get_npu_backend),
+        }
+    raise ValueError(f"unsupported compiled wrapper backend: {name}")
+
+
+def _measure_compiled_wrapper_composite(backend_name: str) -> dict[str, object]:
     """Measure the complete ``FX entry → source wrapper`` boundary.
 
     Comparing this slope with the separately measured generic compiled-FX
@@ -495,10 +531,12 @@ def _measure_compiled_wrapper_composite() -> dict[str, object]:
     """
 
     global _COMPILED_OUTPUT_INDEX
+    backend, backend_identity = _compiled_wrapper_backend(backend_name)
     samples = {length: [] for length in COMPILED_CHAIN_LENGTHS}
     for chain_length in COMPILED_CHAIN_LENGTHS:
         compiled = torch.compile(
             _CompiledWrapperChain(chain_length).eval(),
+            backend=backend,
             fullgraph=True,
             dynamic=False,
         )
@@ -527,6 +565,7 @@ def _measure_compiled_wrapper_composite() -> dict[str, object]:
     ])
     holdout = medians[512]
     return {
+        "compiler_backend": backend_identity,
         "measurement_boundary": (
             "compiled opaque FX entry through the complete source-wrapper "
             "control composite with all Device children replaced by "
@@ -608,6 +647,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--baseline-commit", required=True)
     parser.add_argument("--container-name", required=True)
     parser.add_argument("--expected-source-sha256", required=True)
+    parser.add_argument(
+        "--compiled-backend", choices=("inductor", "torchair_npugraph_ex"),
+        default="inductor", help="Compiler used for the opaque FX control chain")
     args = parser.parse_args()
     if len(args.baseline_commit) != 40:
         parser.error("--baseline-commit must be a full Git commit")
@@ -642,6 +684,7 @@ def main() -> None:
         "baseline_commit": args.baseline_commit,
         "container_name": args.container_name,
         "runner": {"path": str(runner_path), "sha256": runner_sha256},
+        "compiled_backend_requested": args.compiled_backend,
         "source_modules": {
             "vllm_default_moe_runner": _source_identity(default_moe_runner),
             "vllm_ascend_fused_moe": _source_identity(ascend_fused_moe),
@@ -655,7 +698,7 @@ def main() -> None:
                 "remain installed through every timed sample; patch setup and "
                 "teardown are outside the measurement boundary"),
             "excluded": (
-                "all NPU kernels, CANN API submits, collectives, allocations "
+                "all NPU kernels, CANN API submits, collectives, NPU tensor allocations "
                 "and Serving/model duration; NPU inputs are allocated once "
                 "before timing only to select the registered dispatch backend"),
             "chain_lengths": list(CHAIN_LENGTHS),
@@ -711,7 +754,8 @@ def main() -> None:
                         "chain_length": length,
                         "wall_ns": elapsed,
                     })
-            compiled_wrapper_composite = _measure_compiled_wrapper_composite()
+            compiled_wrapper_composite = _measure_compiled_wrapper_composite(
+                args.compiled_backend)
         fits = []
         for name in MEASUREMENTS:
             medians = {

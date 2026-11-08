@@ -19,15 +19,19 @@ import hashlib
 import inspect
 import json
 import os
+from pathlib import Path
 import statistics
 import sys
 import time
 
-RUNNER_DIR = os.path.join(os.getcwd(), "microbench/nvidia_a800/runtime/host_request_path")
-sys.path.insert(0, RUNNER_DIR)
+REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
+RUNNER_DIR = REPOSITORY_ROOT / "microbench/nvidia_a800/runtime/host_request_path"
+sys.path.insert(0, str(RUNNER_DIR))
 import vllm_host_request_path_runner as runner  # noqa: E402
 
-TOKENIZER = "/mnt/disk2/models/Qwen3-30B-A3B"
+if "MIDLAYER_C500_TOKENIZER" not in os.environ:
+    raise SystemExit("MIDLAYER_C500_TOKENIZER must name the tokenizer directory")
+TOKENIZER = os.environ["MIDLAYER_C500_TOKENIZER"]
 GAPS_MS = (0, 10, 30, 100, 250)
 _GAP = {"s": 0.0}
 
@@ -85,7 +89,7 @@ def main():
     with open(sys.argv[1], "w") as handle:
         json.dump({
             "schema_version": 1, "hardware_id": "metax_c500", "tokenizer_path": TOKENIZER,
-            "published_runner": {"path": os.path.relpath(published),
+            "published_runner": {"path": os.path.relpath(published, REPOSITORY_ROOT),
                                  "sha256": hashlib.sha256(open(published, "rb").read()).hexdigest()},
             "gap_substitution": "time.sleep(gap) before each timed call; nothing else changed",
             "production_or_evaluation_duration_consumed": False,

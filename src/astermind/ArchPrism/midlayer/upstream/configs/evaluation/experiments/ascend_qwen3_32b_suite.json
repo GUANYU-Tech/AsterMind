@@ -59,7 +59,7 @@
     "compute_dtype": "bf16",
     "prediction_method": "midlayer",
     "tensor_collective_backend": "protobridge",
-    "tensor_all_reduce_profile_sha256": "fd10cbc19e0f328393a465c722cd2f69bd2e1945383743c55ebb10cc0d2c5f6c",
+    "tensor_all_reduce_profile_sha256": "5da6b468a555eb7286ff519c8b2f5ba4dda6266226dce21936430cd53503781d",
     "tensor_all_gather_profile_sha256": "61a3f49106d2242ac8def315fb67da3bdb3105c037681cce710fff785a07de45",
     "launch_policy": "injected_launch",
     "tensor_parallel_size": 2,

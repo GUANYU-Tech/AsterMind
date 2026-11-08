@@ -17,6 +17,13 @@ from src.kernel.launch_config.select_launch_config import select_launch_config
 from src.kernel.launch_config.nvidia_h200.flash_attn_launch import (
     FA3_COMBINE_ALGORITHM,
     FA3_DECODE_ALGORITHM,
+    FA3_GQA_OBSERVED_030_ALGORITHM,
+    FA3_GQA_OBSERVED_SPLIT_030_ALGORITHM,
+    FA3_GQA_COMBINE_030_ALGORITHM,
+    select_v030_gqa_fresh_prefill_launch,
+    select_fa3_prepare_varlen_launch,
+    validate_v030_gqa_observed_launch,
+    v030_gqa_dynamic_splits,
 )
 from src.kernel.predictors.flash_attn import (
     FA3_UNMODELED_OBSERVATION_ALGORITHM,
@@ -1018,19 +1025,134 @@ _H200_FA3_MAIN_SYMBOL = "FlashAttnFwdSm90"
 _H200_FA3_COMBINE_SYMBOL = "FlashAttnFwdCombine"
 
 
+def _normalize_v030_gqa_observed(
+        op_attributes, metrics, shape, attributes, observed, hardware):
+    """Decode only versioned template/launch facts, never profiler duration."""
+
+    name = metrics["kernel_name"]
+    head_dim = shape["head_dim"]
+    splits = _positive_int(op_attributes, "SP", "FLASH_ATTN Attr")
+    if name.startswith("void flash::prepare_varlen_num_blocks_kernel<"):
+        prepare = re.match(r"void flash::prepare_varlen_num_blocks_kernel<"
+                           r"\(int\)(\d+), \(bool\)0>", name)
+        launch = select_fa3_prepare_varlen_launch(shape["batch"])
+        if (prepare is None or int(prepare[1]) * 32 != launch.block_size
+                or observed.grid != launch.grid or observed.block != launch.block
+                or metrics["dynamic_smem_per_block"] != 0):
+            raise ValueError("H200 FA3 prepare launch differs from source")
+        return KernelSpec(
+            kind=KernelKind.VECTOR, hardware_id="nvidia_h200",
+            shape={"batch": shape["batch"]}, dtype="int32",
+            variant="fa3_prepare_varlen", launch=launch)
+    if name.startswith("void at::native::vectorized_elementwise_kernel<(int)4, "
+                       "at::native::FillFunctor<int>, "):
+        fill_shape, fill_attributes = {"element_count": 1}, {
+            "reads": 0, "writes": 1, "operation": "fill"}
+        launch = select_launch_config(
+            "nvidia_h200", KernelKind.VECTOR, fill_shape, "int32",
+            "elementwise", fill_attributes, hardware)
+        if (observed.grid != launch.grid or observed.block != launch.block
+                or metrics["dynamic_smem_per_block"] != 0):
+            raise ValueError("H200 FA3 semaphore Fill differs from source")
+        return KernelSpec(
+            kind=KernelKind.VECTOR, hardware_id="nvidia_h200", shape=fill_shape,
+            dtype="int32", variant="elementwise", launch=launch,
+            attributes=fill_attributes)
+    if "FlashAttnFwdCombine<" in name:
+        combine = re.search(
+            r"FlashAttnFwdCombine<cute::tuple<cute::C<\(int\)(\d+)>, "
+            r"cute::C<\(int\)(\d+)>>, \(int\)(\d+), \(int\)256, "
+            r"\(int\)1, \(bool\)0, \(bool\)1, cutlass::bfloat16_t, "
+            r"float, cutlass::arch::Sm90>", name)
+        if combine is None:
+            return None
+        if op_attributes["FA3_SPLIT_COMBINE"] is not True:
+            raise ValueError("H200 FA3 GQA combine source template differs")
+        rows, columns, log_splits = (int(v) for v in combine.groups())
+        if splits > 2 ** log_splits:
+            raise ValueError("H200 FA3 GQA combine split capacity is too small")
+        launch = dataclasses.replace(
+            observed, algorithm=FA3_GQA_COMBINE_030_ALGORITHM,
+            tiling=TilingSpec(tile_shape={"rows": rows, "value_head": columns},
+                              num_kv_splits=splits),
+            parameters={"unpadded_flops": 1.0, "mma_smem_bytes_per_flop": 0.0,
+                        "split_scratch_dram_bytes_per_element": 4.0 if splits > 1 else 0.0,
+                        "page_table_bytes_per_kv_panel": 0.0},
+            execution_variant="combine")
+        kernel = KernelSpec(
+            kind=KernelKind.FLASH_ATTN, hardware_id="nvidia_h200", shape=shape,
+            dtype=hardware.kernel_dtype, variant="combine", launch=launch,
+            attributes=attributes)
+        validate_v030_gqa_observed_launch(kernel, hardware)
+        return kernel
+    if _H200_FA3_MAIN_SYMBOL not in name:
+        return None
+    scheduler = re.search(
+        r"flash::VarlenDynamicPersistentTileScheduler<"
+        r"\(int\)(\d+), \(int\)(\d+), \(int\)(\d+), \(int\)(\d+), "
+        r"\(bool\)([01]), \(bool\)1, \(bool\)1, \(bool\)([01]), "
+        r"\(bool\)0, \(bool\)1>", name)
+    if scheduler is None:
+        return None
+    block_m, block_n, mma_threads, producer_threads, split, lpt = (
+        int(v) for v in scheduler.groups())
+    causal = attributes["causal"] and shape["q_len"] > 1
+    mainloop = re.search(
+        r"cutlass::arch::Sm90, ((?:\(bool\)[01], ){12})"
+        r"cutlass::bfloat16_t, \(int\)(\d+)>", name)
+    expected_flags = (
+        int(causal), 0, 0, 1,
+        int(attributes["kv_layout"] in ("paged", "paged_varlen", "chunked_prefill")),
+        0, 0, 1, 1, 1, split, 0)
+    if (mainloop is None or tuple(int(value) for value in re.findall(
+            r"\(bool\)([01])", mainloop[1])) != expected_flags):
+        raise ValueError("H200 FA3 GQA mainloop flags differ from source")
+    if (lpt != int(causal) or split != int(op_attributes["FA3_SPLIT_COMBINE"])
+            or observed.block_size != mma_threads + math.ceil(producer_threads / 128) * 128
+            or "CollectiveMainloopFwdSm90<(int)2," not in name
+            or f"cute::C<(int){block_m}>, cute::C<(int){block_n}>, "
+               f"cute::C<(int){head_dim}>>" not in name):
+        raise ValueError("H200 FA3 GQA mainloop and scheduler disagree")
+    ratio = shape["num_query_heads"] // shape["num_kv_heads"]
+    dynamic = v030_gqa_dynamic_splits(
+        attributes["q_lens"], attributes["kv_lens"], ratio=ratio,
+        kv_heads=shape["num_kv_heads"], block_m=block_m, block_n=block_n,
+        split_cap=splits, num_sms=int(hardware.num_compute_units))
+    if dynamic != tuple(op_attributes["SP_PER_REQUEST"]):
+        raise ValueError("H200 FA3 GQA per-request splits differ from source")
+    variant = "decode" if shape["q_len"] == 1 else "prefill"
+    launch = dataclasses.replace(
+        observed, algorithm=(FA3_GQA_OBSERVED_SPLIT_030_ALGORITHM if split
+                             else FA3_GQA_OBSERVED_030_ALGORITHM),
+        tiling=TilingSpec(tile_shape={"q": block_m, "kv": block_n,
+                                     "head_dim": head_dim},
+                          pipeline_depth=2, num_kv_splits=splits),
+        parameters={"unpadded_flops": 0.0, "mma_smem_bytes_per_flop": 0.0,
+                    "split_scratch_dram_bytes_per_element": 4.0 if splits > 1 else 0.0,
+                    "page_table_bytes_per_kv_panel": (
+                        4.0 if splits > 1 and attributes["kv_layout"] in ("paged", "paged_varlen") else 0.0)},
+        execution_variant=variant)
+    kernel = KernelSpec(
+        kind=KernelKind.FLASH_ATTN, hardware_id="nvidia_h200", shape=shape,
+        dtype=hardware.kernel_dtype, variant=variant, launch=launch,
+        attributes=attributes)
+    validate_v030_gqa_observed_launch(kernel, hardware)
+    return kernel
+
+
 def _normalize_h200_flash_attention(
         op_attributes: Mapping, metrics: Mapping, shape: Mapping,
         query_lengths, kv_lengths, causal, kv_layout: str,
         kv_distribution: str, split_policy: str, hardware) -> KernelSpec:
     """Bind one H200 FA3 launch to the source-derived FA3 package.
 
-    Only the absorbed MLA decode (FA3 ``hdim 64 / 512`` with its split
-    combine) has a derived H200 template.  Its launch is re-selected from
+    Absorbed MLA decode and uniform fresh BF16 D128 GQA prefill have derived
+    H200 templates.  Each launch is re-selected from
     the pinned source (the runner calls FA3 with ``num_splits=0``, i.e. the
     heuristic, eager: no full-CUDA-graph split bound) and must agree with the
     observed grid/block, the observed combine launch and the recorded
-    per-request dynamic splits; no duration is read.  Every other FA3 launch
-    is normalized under an explicit unmodeled identity that every pricing
+    per-request dynamic splits; no duration is read.  Other FA3 launches
+    are normalized under an explicit unmodeled identity that every pricing
     method rejects.
     """
 
@@ -1056,6 +1178,63 @@ def _normalize_h200_flash_attention(
             variant = "decode"
         else:
             variant = "prefill"
+        if (variant == "prefill" and split_policy == "serving"
+                and splits == 1 and op_attributes["FA3_SPLIT_COMBINE"] is False
+                and tuple(op_attributes["SP_PER_REQUEST"]) == (1,) * batch
+                and shape["head_dim"] == 128 and causal is True
+                and kv_layout in ("paged", "paged_varlen")
+                and query_lengths == kv_lengths
+                and query_lengths == (shape["q_len"],) * batch):
+            source_attributes = {
+                **common_attributes, "fa_ksteps": None,
+                "fa_eff_mfrac": 1.0}
+            try:
+                selected = select_v030_gqa_fresh_prefill_launch(
+                    shape, hardware.kernel_dtype,
+                    {**source_attributes, "num_kv_splits": 1}, hardware)
+            except NotImplementedError:
+                selected = None
+            if selected is not None:
+                if is_main:
+                    ratio = shape["num_query_heads"] // shape["num_kv_heads"]
+                    if ("CollectiveMainloopFwdSm90<(int)2" not in runtime_name
+                            or "VarlenDynamicPersistentTileScheduler<"
+                            "(int)128, (int)128, (int)256, (int)128" not in runtime_name
+                            or runtime_name.count(f"(int){ratio}>") < 2
+                            or metrics["regs_per_thread"] != 168
+                            or metrics["dynamic_smem_per_block"] != 166912
+                            or observed.grid != selected.grid
+                            or observed.block != selected.block):
+                        raise ValueError("H200 FA3 GQA observed main differs from pinned source")
+                    return KernelSpec(
+                        kind=KernelKind.FLASH_ATTN,
+                        hardware_id="nvidia_h200", shape=shape,
+                        dtype=hardware.kernel_dtype, variant="prefill",
+                        launch=selected, attributes=source_attributes)
+                if runtime_name.startswith(
+                        "void at::native::vectorized_elementwise_kernel<(int)4, "
+                        "at::native::FillFunctor<int>, "):
+                    fill_shape = {"element_count": 1}
+                    fill_attributes = {"reads": 0, "writes": 1, "operation": "fill"}
+                    fill_launch = select_launch_config(
+                        "nvidia_h200", KernelKind.VECTOR, fill_shape, "int32",
+                        "elementwise", fill_attributes, hardware)
+                    if (observed.grid != fill_launch.grid
+                            or observed.block != fill_launch.block
+                            or metrics["regs_per_thread"] != 16
+                            or metrics["dynamic_smem_per_block"] != 0):
+                        raise ValueError("H200 FA3 GQA observed Fill differs from pinned source")
+                    return KernelSpec(
+                        kind=KernelKind.VECTOR,
+                        hardware_id="nvidia_h200", shape=fill_shape,
+                        dtype="int32", variant="elementwise",
+                        launch=fill_launch, attributes=fill_attributes)
+        source_attributes = {
+            **common_attributes, "fa_ksteps": None, "fa_eff_mfrac": 1.0}
+        source_kernel = _normalize_v030_gqa_observed(
+            op_attributes, metrics, shape, source_attributes, observed, hardware)
+        if source_kernel is not None:
+            return source_kernel
         return KernelSpec(
             kind=KernelKind.FLASH_ATTN,
             hardware_id="nvidia_h200",

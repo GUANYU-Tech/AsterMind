@@ -47,8 +47,11 @@ class SchedulerHostProfile:
     fallback_dispatch_plan_s: float | None = None
     fallback_dispatch_update_s: float | None = None
     fallback_dispatch_occurrence_contract: str | None = None
+    shared_cpu_timing_target: str | None = None
 
     def __post_init__(self) -> None:
+        if self.shared_cpu_timing_target not in (None, "0.30.0"):
+            raise ValueError("unsupported shared CPU timing target")
         for name in ("hardware_id", "vllm_version", "source_identity",
                      "profile_path", "profile_sha256"):
             value = getattr(self, name)
@@ -212,6 +215,8 @@ class SchedulerHostProfile:
             "hardware_id": self.hardware_id,
             "vllm_version": self.vllm_version,
             "source_identity": self.source_identity,
+            **({"shared_cpu_timing_target": self.shared_cpu_timing_target}
+               if self.shared_cpu_timing_target is not None else {}),
             "model": {
                 "kind": "scheduled_request_count_affine",
                 "state_dimensions": ["scheduled_request_count"],
@@ -361,11 +366,21 @@ class RuntimePrepareEvent:
     from source-authored boundary work that remains outside the graph even
     when the associated model call is captured.  The latter must survive the
     runtime-Graph filtering step and is still charged before/after replay.
+    ``replaces_eager_enqueue`` marks the unique completion of a group whose
+    measured Host services already include the actual native submissions.
+    That occurrence retains its eager-submit fact, but adds no generic
+    enqueue service; captured occurrences still use ordinary graph replay.
+    ``additional_eager_enqueue_count`` retains source Host submissions whose
+    zero mathematical work has no device call in the lowered plan. They use
+    the existing launch profile, disappear under capture, and create no
+    device work or launch-gap events.
     """
 
     mechanism: str
     count: int = 1
     graph_capturable: bool = True
+    replaces_eager_enqueue: bool = False
+    additional_eager_enqueue_count: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.mechanism, str) or not self.mechanism:
@@ -375,6 +390,16 @@ class RuntimePrepareEvent:
             raise ValueError("runtime prepare event count must be positive")
         if not isinstance(self.graph_capturable, bool):
             raise TypeError("runtime prepare graph_capturable must be boolean")
+        if type(self.replaces_eager_enqueue) is not bool:
+            raise TypeError("runtime prepare replaces_eager_enqueue must be boolean")
+        if self.replaces_eager_enqueue and not self.graph_capturable:
+            raise ValueError("a complete eager submit must be graph capturable")
+        if (type(self.additional_eager_enqueue_count) is not int
+                or self.additional_eager_enqueue_count < 0):
+            raise ValueError("additional eager enqueue count must be a non-negative integer")
+        if self.additional_eager_enqueue_count and (
+                not self.graph_capturable or self.replaces_eager_enqueue):
+            raise ValueError("additional enqueues require a capturable incremental prepare event")
 
 
 @dataclass(frozen=True)
@@ -810,7 +835,7 @@ def load_scheduler_host_profile(path: str | Path) -> SchedulerHostProfile:
         "max_scheduled_request_count", "supported_phases", "service_time_s",
         "measurement",
     }
-    allowed_profile_fields = required_profile_fields | {"fallback_dispatch"}
+    allowed_profile_fields = required_profile_fields | {"fallback_dispatch", "shared_cpu_timing_target"}
     if (not required_profile_fields.issubset(payload)
             or set(payload) - allowed_profile_fields):
         _exact_fields(payload, required_profile_fields, "Scheduler Host profile")
@@ -961,6 +986,8 @@ def load_scheduler_host_profile(path: str | Path) -> SchedulerHostProfile:
         vllm_version=_string(scheduler["vllm_version"], "Scheduler Host vLLM version"),
         source_identity=_string(
             scheduler["source_identity"], "Scheduler Host source identity"),
+        shared_cpu_timing_target=(payload["shared_cpu_timing_target"]
+            if "shared_cpu_timing_target" in payload else None),
         max_scheduled_request_count=maximum,
         supported_phases=supported_phases,
         plan_intercept_s=coefficients[0],
@@ -1217,7 +1244,8 @@ def load_host_launch_profile(path: str | Path) -> HostLaunchProfile:
     artifact_value = _string(measurement["artifact"], "measurement artifact")
     repository_root = next(
         candidate for candidate in source_path.parents
-        if (candidate / "AGENTS.md").is_file())
+        if (candidate / "AGENTS.md").is_file()
+        or (candidate / ".orbitserve_snapshot.json").is_file())
     artifact_path = Path(artifact_value)
     if not artifact_path.is_absolute():
         artifact_path = (repository_root / artifact_path).resolve()
@@ -1369,8 +1397,14 @@ class HostRequestPathProfile:
     tokenizer_encode_per_token_s: float | None = None
     tokenizer_render_region_intercept_s: float | None = None
     tokenizer_render_region_per_token_s: float | None = None
+    shared_cpu_timing_target: str | None = None
+
+    def supports_runtime_version(self, version: str) -> bool:
+        return self.runtime_version == version or self.shared_cpu_timing_target == version
 
     def __post_init__(self) -> None:
+        if self.shared_cpu_timing_target not in (None, "0.30.0"):
+            raise ValueError("unsupported shared CPU timing target")
         for name in ("hardware_id", "runtime_version", "source_identity",
                      "host_cpu", "profile_path", "profile_sha256"):
             value = getattr(self, name)
@@ -1486,6 +1520,8 @@ class HostRequestPathProfile:
             "hardware_id": self.hardware_id,
             "runtime_version": self.runtime_version,
             "source_identity": self.source_identity,
+            **({"shared_cpu_timing_target": self.shared_cpu_timing_target}
+               if self.shared_cpu_timing_target is not None else {}),
             "host_cpu": self.host_cpu,
             "service_time_s": {
                 "api_entry": self.api_entry_s,
@@ -1515,10 +1551,10 @@ def load_host_request_path_profile(path: str | Path) -> HostRequestPathProfile:
     source_path = Path(path).resolve()
     raw = source_path.read_bytes()
     payload = _mapping(json.loads(raw), "Host request path profile")
-    _exact_fields(payload, {
-        "schema_version", "hardware_id", "runtime", "host", "service_time_s",
-        "measurement",
-    }, "Host request path profile")
+    required = {"schema_version", "hardware_id", "runtime", "host",
+                "service_time_s", "measurement"}
+    if not required.issubset(payload) or set(payload) - (required | {"shared_cpu_timing_target"}):
+        _exact_fields(payload, required, "Host request path profile")
     if (type(payload["schema_version"]) is not int
             or payload["schema_version"] != 1):
         raise ValueError("Host request path profile schema_version must equal 1")
@@ -1571,6 +1607,8 @@ def load_host_request_path_profile(path: str | Path) -> HostRequestPathProfile:
     return HostRequestPathProfile(
         hardware_id=_string(payload["hardware_id"], "hardware_id"),
         runtime_version=_string(runtime["version"], "runtime version"),
+        shared_cpu_timing_target=(payload["shared_cpu_timing_target"]
+            if "shared_cpu_timing_target" in payload else None),
         source_identity=_string(
             runtime["source_identity"], "runtime source identity"),
         host_cpu=_string(host["cpu"], "Host CPU"),

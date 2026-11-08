@@ -1,5 +1,7 @@
 """Complete-spec vector, activation, routing, and reduction prediction."""
 
+from src.kernel.prediction_cache import runtime_lru_cache
+
 import dataclasses
 import math
 from bisect import bisect_right
@@ -2526,6 +2528,10 @@ def _attach_cann_kv_scalar_get_value_service(
     )
 
 
+_ROPE_CONTRACT_TYPES = (
+    PipelineStageDemand, ComputeServiceDemand, ComputeExactRequestDemand)
+
+
 def _attach_cann_atb_bf16_rope_pipeline(
         inp: PredictionInput, kernel: KernelSpec, hardware, *,
         analytical_compact: bool = False,
@@ -2599,6 +2605,16 @@ def _attach_cann_atb_bf16_rope_pipeline(
     if worker_count != inp.active_units:
         raise ValueError(
             "ATB BF16 RoPE worker count must equal active AIVs")
+    # Only immutable constructor outputs are shared, with complete typed
+    # arguments, inside this call. Hardware queries and every worker program
+    # still execute normally; custom constructors retain ordinary delegation.
+    _stage, _service, _exact = (
+        PipelineStageDemand, ComputeServiceDemand, ComputeExactRequestDemand)
+    if (worker_count > 1 and type(kernel) is KernelSpec and type(hardware) is HWSpec
+            and (_stage, _service, _exact) == _ROPE_CONTRACT_TYPES):
+        _stage = lru_cache(maxsize=4096, typed=True)(_stage)
+        _service = lru_cache(maxsize=512, typed=True)(_service)
+        _exact = lru_cache(maxsize=512, typed=True)(_exact)
     base_tokens, remainder = divmod(tokens, worker_count)
     read_bytes = float(rotary_work['tensor_read_bytes']+rotary_work['per_token_cache_row_bytes']+rotary_work['per_token_position_bytes'])
     write_bytes = float(rotary_work['tensor_write_bytes'])
@@ -2631,7 +2647,7 @@ def _attach_cann_atb_bf16_rope_pipeline(
             and base_tokens + (1 if worker < remainder else 0) > 1
             else 1)
         for worker in range(worker_count))
-    scalar_fill = ComputeExactRequestDemand(
+    scalar_fill = _exact(
         _CANN_LOCAL_SCALAR_FILL_SV_EXACT_SERVICE,
         request_sizes_by_worker,
     )
@@ -2707,7 +2723,7 @@ def _attach_cann_atb_bf16_rope_pipeline(
                 exact_services[service][
                     "service_time_s_by_request_size"].keys()))
         if service_is_covered:
-            exact_copy_demands.append(ComputeExactRequestDemand(
+            exact_copy_demands.append(_exact(
                 service, schedule))
             exact_copy_service_names.add(service)
         else:
@@ -2738,7 +2754,7 @@ def _attach_cann_atb_bf16_rope_pipeline(
         rounded_elements_per_token = math.fsum(rounded_slices)
         source_slice_count = len(rounded_slices)
         service_demands = (
-                ComputeServiceDemand(
+                _service(
                     "cast_bf16_to_fp32_serialized",
                     float(tokens * (
                         2 * cos_cast_elements
@@ -2746,18 +2762,18 @@ def _attach_cann_atb_bf16_rope_pipeline(
                     serial_invocations=(
                         maximum_tokens_per_worker
                         * (2 + 3 * source_slice_count))),
-                ComputeServiceDemand(
+                _service(
                     "cast_fp32_to_bf16_serialized",
                     float(tokens * rounded_elements_per_token),
                     serial_invocations=(
                         maximum_tokens_per_worker * source_slice_count)),
-                ComputeServiceDemand(
+                _service(
                     "mul_serialized",
                     float(tokens * 3 * rounded_elements_per_token),
                     serial_invocations=(
                         maximum_tokens_per_worker
                         * 3 * source_slice_count)),
-                ComputeServiceDemand(
+                _service(
                     "generic",
                     float(tokens * math.fsum(
                         rounded for rounded in rounded_slices)
@@ -2766,7 +2782,7 @@ def _attach_cann_atb_bf16_rope_pipeline(
             )
     else:
         service_demands = (
-            ComputeServiceDemand(
+            _service(
                 "generic",
                 source_vector_compute + generic_copy_operations),)
     vector_demand = vector_demands[0]
@@ -2786,9 +2802,9 @@ def _attach_cann_atb_bf16_rope_pipeline(
         if not requests:
             return (), ()
         if service in exact_copy_service_names:
-            return (), (ComputeExactRequestDemand(service, (requests,)),)
+            return (), (_exact(service, (requests,)),)
         return (
-            (ComputeServiceDemand("generic", float(math.fsum(requests))),),
+            (_service("generic", float(math.fsum(requests))),),
             (),
         )
 
@@ -2804,11 +2820,11 @@ def _attach_cann_atb_bf16_rope_pipeline(
             mask_copy_services, mask_copy_exact = _copy_stage_demands(
                 _CANN_LOCAL_UB_COPY_CONTIGUOUS_EXACT_SERVICE,
                 mask_copy_requests)
-            stages.append(PipelineStageDemand(
+            stages.append(_stage(
                 "mask_prologue", "compute:compute_vector", None,
                 compute_service_demands=mask_copy_services,
                 compute_exact_request_demands=(
-                    ComputeExactRequestDemand(
+                    _exact(
                         _CANN_LOCAL_SCALAR_FILL_SV_EXACT_SERVICE,
                         (mask_requests,)),
                     *mask_copy_exact,
@@ -2816,17 +2832,17 @@ def _attach_cann_atb_bf16_rope_pipeline(
         cos_copy_services, cos_copy_exact = _copy_stage_demands(
             _CANN_LOCAL_UB_COPY_CONTIGUOUS_EXACT_SERVICE,
             cos_sin_copy_requests_per_token)
-        stages.append(PipelineStageDemand(
+        stages.append(_stage(
             "cos_sin_load", "memory:mte2_read",
             ((head_dim * dtype_bytes + 4) / read_bytes)))
         if cos_sin_copy_requests_per_token:
-            stages.append(PipelineStageDemand(
+            stages.append(_stage(
                 "cos_sin_broadcast", "compute:compute_vector", None,
                 compute_service_demands=cos_copy_services,
                 compute_exact_request_demands=cos_copy_exact))
-        stages.append(PipelineStageDemand(
+        stages.append(_stage(
             "cos_sin_cast", "compute:compute_vector", None,
-            compute_service_demands=(ComputeServiceDemand(
+            compute_service_demands=(_service(
                 ("cast_bf16_to_fp32_serialized"
                  if typed_rope_services else "generic"),
                 float(2 * cos_cast_elements),
@@ -2875,7 +2891,7 @@ def _attach_cann_atb_bf16_rope_pipeline(
                 store_name = f"{prefix}_store_{index}"
                 overlap_prior_store = (
                     tiling_key == 24 and previous_store is not None)
-                stages.append(PipelineStageDemand(
+                stages.append(_stage(
                     load_name, "memory:mte2_read",
                     payload_bytes / read_bytes,
                     memory_exact_request_demands=mte2_completion,
@@ -2891,7 +2907,7 @@ def _attach_cann_atb_bf16_rope_pipeline(
                 rotation_copy_services, rotation_copy_exact = (
                     _copy_stage_demands(
                         half_rotation_service, rotation_requests))
-                stages.append(PipelineStageDemand(
+                stages.append(_stage(
                     rotation_name,
                     "compute:compute_vector", None,
                     compute_service_demands=rotation_copy_services,
@@ -2906,40 +2922,40 @@ def _attach_cann_atb_bf16_rope_pipeline(
                     if previous_store is None:
                         compute_prior_resources = ("memory:mte3_write",)
                 stages.extend((
-                    PipelineStageDemand(
+                    _stage(
                         compute_name,
                         "compute:compute_vector", None,
                         compute_service_demands=(
                             (
-                                ComputeServiceDemand(
+                                _service(
                                     "cast_bf16_to_fp32_serialized",
                                     float(3 * math.ceil(
                                         current_slice / 64) * 64),
                                     serial_invocations=3),
-                                ComputeServiceDemand(
+                                _service(
                                     "cast_fp32_to_bf16_serialized",
                                     float(math.ceil(
                                         current_slice / 64) * 64),
                                     serial_invocations=1),
-                                ComputeServiceDemand(
+                                _service(
                                     "mul_serialized",
                                     float(3 * math.ceil(
                                         current_slice / 64) * 64),
                                     serial_invocations=3),
-                                ComputeServiceDemand(
+                                _service(
                                     "generic",
                                     float(math.ceil(
                                         current_slice / 64) * 64)),
                             )
                             if typed_rope_services
-                            else (ComputeServiceDemand(
+                            else (_service(
                                 "generic",
                                 float(8 * math.ceil(
                                     current_slice / 64) * 64)),)
                         ),
                         predecessors=compute_predecessors,
                         prior_resources=compute_prior_resources),
-                    PipelineStageDemand(
+                    _stage(
                         store_name, "memory:mte3_write",
                         payload_bytes / write_bytes,
                         memory_exact_request_demands=mte3_completion,
@@ -9031,10 +9047,17 @@ def _attach_cann_add_rms_row_group_pipeline(
             return "output_store"
         return f"row{row_index}_{base}"
 
+    group_stage_templates = {}
+
     def _group_task(worker, group_rows, *, include_gamma, suffix):
         if group_rows <= 0 or group_rows > _CANN_NORM_SPLIT_ROW_FACTOR:
             raise ValueError(
                 "CANN AddRmsNorm key-30 group must contain 1..64 rows")
+        key = (group_rows, include_gamma)
+        if key in group_stage_templates:
+            return PipelineTaskDemand(
+                name=f"worker{worker}_{suffix}", worker=worker,
+                stages=group_stage_templates[key])
         stages = []
         if include_gamma:
             stages.extend((
@@ -9215,10 +9238,11 @@ def _attach_cann_add_rms_row_group_pipeline(
                     dram=float(4 * group_rows)),
                 completion_resource_roles=("mte3",),
                 predecessors=(prior_output, "rstd_queue_control")))
+        group_stage_templates[key] = tuple(stages)
         return PipelineTaskDemand(
             name=f"worker{worker}_{suffix}",
             worker=worker,
-            stages=tuple(stages),
+            stages=group_stage_templates[key],
         )
 
     def _worker_program_entries(worker, worker_rows):
@@ -10070,6 +10094,10 @@ def _attach_a800_block256_add_rms_resident_cohort_floor(
     )
 
 
+_NORM_PIPELINE_STAGE_TYPE = PipelineStageDemand
+_NORM_COMPUTE_SERVICE_TYPE = ComputeServiceDemand
+
+
 def _attach_source_bound_gpu_norm_cta_pipeline(
         inp: PredictionInput, kernel: KernelSpec, hardware) -> PredictionInput:
     """Attach the source loop and CTA-residency program for GPU RMSNorm.
@@ -10176,6 +10204,10 @@ def _attach_source_bound_gpu_norm_cta_pipeline(
         variant == "rmsnorm" and typed_rmsnorm_scalar_rounds)
     typed_norm_rounds = (
         typed_add_rms_rounds or typed_rmsnorm_scalar_rounds)
+    reuse_native_contracts = (
+        typed_norm_rounds and type(kernel) is KernelSpec and type(hardware) is HWSpec
+        and PipelineStageDemand is _NORM_PIPELINE_STAGE_TYPE
+        and ComputeServiceDemand is _NORM_COMPUTE_SERVICE_TYPE)
     rmsnorm_phase_chain_excess_service = None
     if (typed_rmsnorm_scalar_rounds
             and inp.active_units
@@ -10655,6 +10687,12 @@ def _attach_source_bound_gpu_norm_cta_pipeline(
                     _round_service(function, regime, threads), width_weight))
         return tuple(demands)
 
+    if reuse_native_contracts and (typed_rmsnorm_scalar_rounds or typed_add_rms_scalar_rounds):
+        # These scalar branches depend only on the fixed local geometry and
+        # source service names. Keep their complete function/regime/index key
+        # local; generic hardware-mechanism round selection remains ordinary.
+        _round_demands = lru_cache(maxsize=512, typed=True)(_round_demands)
+
     if typed_norm_rounds:
         if "compute_vector" not in hardware._role_map:
             raise ValueError(
@@ -10983,6 +11021,13 @@ def _attach_source_bound_gpu_norm_cta_pipeline(
         )
         add_rms_prologue_fraction = 1.0 / rows
 
+    # Worker classes can share an identical prefix of source CTA stages.
+    # Retain only complete immutable constructor arguments in this call;
+    # typed keys keep bool/int/float validation distinct. No stage survives
+    # through a cache after this function returns, and misses validate normally.
+    _stage = PipelineStageDemand
+    if reuse_native_contracts:
+        _stage = lru_cache(maxsize=4096, typed=True)(PipelineStageDemand)
     cta_stages_by_contract = {}
 
     def _cta_task(
@@ -11004,7 +11049,7 @@ def _attach_source_bound_gpu_norm_cta_pipeline(
                 "input_square" if typed_rmsnorm_scalar_rounds
                 else "add_square")
             for round_index in range(loop_rounds):
-                stages.append(PipelineStageDemand(
+                stages.append(_stage(
                     f"{input_function}_{round_index}",
                     "compute:compute_vector", None,
                     compute_service_demands=_round_demands(
@@ -11021,7 +11066,7 @@ def _attach_source_bound_gpu_norm_cta_pipeline(
                 if local_memory_source_completion:
                     local_demands, shared_demands = (
                         _local_read_round_demands("load_reduce", regime))
-                    stages.append(PipelineStageDemand(
+                    stages.append(_stage(
                         f"load_reduce_{round_index}", "memory:global_read",
                         None,
                         memory_node_demands=local_demands,
@@ -11032,7 +11077,7 @@ def _attach_source_bound_gpu_norm_cta_pipeline(
                             "sequence_start"
                             if round_index == 0 else "steady")))
                 else:
-                    stages.append(PipelineStageDemand(
+                    stages.append(_stage(
                         f"load_reduce_{round_index}", "memory:global_read",
                         load_reduce_fraction,
                         # A disabled per-AP L1 leaves every CTA's first source
@@ -11049,15 +11094,15 @@ def _attach_source_bound_gpu_norm_cta_pipeline(
                         predecessors=load_predecessors,
                         start_predecessors=load_start_predecessors))
                 if input_alu_fraction > 0:
-                    stages.append(PipelineStageDemand(
+                    stages.append(_stage(
                         f"input_alu_{round_index}", "compute:compute_alu",
                         input_alu_fraction))
                 if input_fma_fraction > 0:
-                    stages.append(PipelineStageDemand(
+                    stages.append(_stage(
                         f"input_fma_{round_index}", "compute:compute_fma",
                         input_fma_fraction))
                 if variant == "add_rmsnorm":
-                    stages.append(PipelineStageDemand(
+                    stages.append(_stage(
                         f"residual_store_{round_index}",
                         store_service, residual_store_fraction))
         if typed_block_reduction:
@@ -11080,21 +11125,21 @@ def _attach_source_bound_gpu_norm_cta_pipeline(
             else:
                 raise AssertionError(
                     f"unexpected GPU NORM variant: {variant!r}")
-            stages.append(PipelineStageDemand(
+            stages.append(_stage(
                 "block_reduction", "compute:compute_reduction", None,
                 compute_service_demands=reduction_service_demands,
                 predecessors=reduction_predecessors,
                 start_predecessors=reduction_start_predecessors))
         else:
             if reduction_fma_fraction > 0:
-                stages.append(PipelineStageDemand(
+                stages.append(_stage(
                     "block_reduction", "compute:compute_fma",
                     reduction_fma_fraction,
                     predecessors=(f"input_fma_{loop_rounds - 1}",),
                     start_predecessors=(
                         f"residual_store_{loop_rounds - 1}",)))
             if reduction_sfu_fraction > 0:
-                stages.append(PipelineStageDemand(
+                stages.append(_stage(
                     "reciprocal_sqrt", "compute:compute_sfu",
                     reduction_sfu_fraction))
         if typed_norm_rounds:
@@ -11103,7 +11148,7 @@ def _attach_source_bound_gpu_norm_cta_pipeline(
                 "output_scale" if typed_rmsnorm_scalar_rounds
                 else "scale_multiply")
             for round_index in range(loop_rounds):
-                stages.append(PipelineStageDemand(
+                stages.append(_stage(
                     f"{output_function}_{round_index}",
                     "compute:compute_vector", None,
                     compute_service_demands=_round_demands(
@@ -11111,7 +11156,7 @@ def _attach_source_bound_gpu_norm_cta_pipeline(
                     predecessors=(reduction_terminal,)
                     if round_index == 0 else None))
                 if rmsnorm_phase_chain_excess_service is not None:
-                    stages.append(PipelineStageDemand(
+                    stages.append(_stage(
                         f"phase_chain_excess_{round_index}",
                         "compute:compute_vector", None,
                         compute_service_demands=_round_demands(
@@ -11136,7 +11181,7 @@ def _attach_source_bound_gpu_norm_cta_pipeline(
                     local_demands, shared_demands = (
                         _local_read_round_demands("load_output", regime))
                     if local_demands or shared_demands:
-                        stages.append(PipelineStageDemand(
+                        stages.append(_stage(
                             f"load_output_{round_index}",
                             "memory:global_read", None,
                             memory_node_demands=local_demands,
@@ -11147,7 +11192,7 @@ def _attach_source_bound_gpu_norm_cta_pipeline(
                                 "sequence_start"
                                 if round_index == 0 else "steady")))
                 else:
-                    stages.append(PipelineStageDemand(
+                    stages.append(_stage(
                         f"load_output_{round_index}", "memory:global_read",
                         load_output_fraction,
                         # The block reduction separates the two source loops,
@@ -11162,14 +11207,14 @@ def _attach_source_bound_gpu_norm_cta_pipeline(
                         predecessors=predecessor_by_variant[variant],
                         start_predecessors=output_start_predecessors))
                 if output_alu_fraction > 0:
-                    stages.append(PipelineStageDemand(
+                    stages.append(_stage(
                         f"output_alu_{round_index}", "compute:compute_alu",
                         output_alu_fraction))
                 if output_fma_fraction > 0:
-                    stages.append(PipelineStageDemand(
+                    stages.append(_stage(
                         f"output_fma_{round_index}", "compute:compute_fma",
                         output_fma_fraction))
-                stages.append(PipelineStageDemand(
+                stages.append(_stage(
                     f"final_store_{round_index}", "memory:global_write",
                     final_store_fraction))
         task_prefix = (
@@ -11247,12 +11292,12 @@ def _attach_source_bound_gpu_norm_cta_pipeline(
                     # issue floor.  It intentionally has no phase dependency:
                     # dependencies use the source-stage branch below, while
                     # all CTAs contend for one physical issue slot per AP.
-                    stages.append(PipelineStageDemand(
+                    stages.append(_stage(
                         f"cta{cta_index}_program_issue_floor",
                         "compute:warp_issue", 1.0 / rows,
                         predecessors=()))
                     if completion_service is not None:
-                        stages.append(PipelineStageDemand(
+                        stages.append(_stage(
                             f"cta{cta_index}_program_completion",
                             "compute:compute_vector", None,
                             compute_exact_request_demands=(
@@ -11289,7 +11334,7 @@ def _attach_source_bound_gpu_norm_cta_pipeline(
                     early_fraction = 1.0 - active_fraction
                     early_reduction_name = (
                         f"cta{cta_index}_block_reduction_inactive_prefix")
-                    stages.append(PipelineStageDemand(
+                    stages.append(_stage(
                         early_reduction_name,
                         "compute:compute_reduction", None,
                         compute_service_demands=tuple(
@@ -11307,7 +11352,7 @@ def _attach_source_bound_gpu_norm_cta_pipeline(
                 parallel_prologue_name = None
                 if add_rms_prologue_fraction is not None:
                     prologue_name = f"cta{cta_index}_source_prologue"
-                    stages.append(PipelineStageDemand(
+                    stages.append(_stage(
                         prologue_name, "compute:warp_issue",
                         add_rms_prologue_fraction,
                         predecessors=(
@@ -11324,7 +11369,7 @@ def _attach_source_bound_gpu_norm_cta_pipeline(
                             "available only for the first CTA cohort")
                     complete_name = (
                         f"cta{cta_index}_complete_source_phase_chain")
-                    stages.append(PipelineStageDemand(
+                    stages.append(_stage(
                         complete_name, "compute:compute_vector", None,
                         compute_service_demands=(ComputeServiceDemand(
                             c500_complete_phase_chain_service,
@@ -11335,7 +11380,7 @@ def _attach_source_bound_gpu_norm_cta_pipeline(
                     prior_stage = complete_name
                 elif c500_grid64_fixed_input_selected:
                     stage_name = f"cta{cta_index}_fixed_input_loop"
-                    stages.append(PipelineStageDemand(
+                    stages.append(_stage(
                         stage_name, "compute:compute_vector", None,
                         compute_service_demands=(ComputeServiceDemand(
                             c500_grid64_fixed_input_service, 1.0),),
@@ -11348,7 +11393,7 @@ def _attach_source_bound_gpu_norm_cta_pipeline(
                         predecessors = (
                             slot_predecessors if prior_stage is None
                             else (prior_stage,))
-                        stages.append(PipelineStageDemand(
+                        stages.append(_stage(
                             stage_name, "compute:compute_vector", None,
                             compute_service_demands=_round_demands(
                                 input_function, regime, round_index),
@@ -11363,7 +11408,7 @@ def _attach_source_bound_gpu_norm_cta_pipeline(
                     reduction_predecessors += (parallel_prologue_name,)
                 if early_reduction_name is not None:
                     reduction_predecessors += (early_reduction_name,)
-                stages.append(PipelineStageDemand(
+                stages.append(_stage(
                     reduction_name, "compute:compute_reduction", None,
                     compute_service_demands=terminal_reduction_service,
                     predecessors=reduction_predecessors))
@@ -11382,7 +11427,7 @@ def _attach_source_bound_gpu_norm_cta_pipeline(
                 if (rmsnorm_phase_entry_service is not None
                         and regime == "first"):
                     entry_name = f"cta{cta_index}_phase_entry"
-                    stages.append(PipelineStageDemand(
+                    stages.append(_stage(
                         entry_name, "compute:compute_vector", None,
                         compute_service_demands=(ComputeServiceDemand(
                             rmsnorm_phase_entry_service, 1.0),),
@@ -11391,7 +11436,7 @@ def _attach_source_bound_gpu_norm_cta_pipeline(
                 if (add_rmsnorm_phase_chain_excess_service is not None
                         and regime == "first"):
                     excess_name = f"cta{cta_index}_scalar_phase_chain_excess"
-                    stages.append(PipelineStageDemand(
+                    stages.append(_stage(
                         excess_name, "compute:compute_vector", None,
                         compute_service_demands=(ComputeServiceDemand(
                             add_rmsnorm_phase_chain_excess_service,
@@ -11401,7 +11446,7 @@ def _attach_source_bound_gpu_norm_cta_pipeline(
                 for round_index in range(loop_rounds):
                     stage_name = (
                         f"cta{cta_index}_{output_function}_{round_index}")
-                    stages.append(PipelineStageDemand(
+                    stages.append(_stage(
                         stage_name, "compute:compute_vector", None,
                         compute_service_demands=_round_demands(
                             output_function, regime, round_index),
@@ -11411,7 +11456,7 @@ def _attach_source_bound_gpu_norm_cta_pipeline(
                         excess_name = (
                             f"cta{cta_index}_phase_chain_excess_"
                             f"{round_index}")
-                        stages.append(PipelineStageDemand(
+                        stages.append(_stage(
                             excess_name, "compute:compute_vector", None,
                             compute_service_demands=_round_demands(
                                 "phase_chain_excess", regime, round_index),
@@ -13716,6 +13761,9 @@ def _attach_a800_fp16_rmsnorm_single_cta_completion_floor(
 
 def _regular_model(kernel: KernelSpec, hardware) -> Tuple[PredictionInput, float]:
     inp, compulsory = _regular_model_body(kernel, hardware)
+    if kernel.launch.algorithm == "vllm_0_11_sm90_add_rmsnorm_geometry_partial":
+        inp = dataclasses.replace(inp, support_level="partial", limitations=inp.limitations + (
+            "vllm011_fused_norm_host_geometry_bound_compiled_alignment_and_resources_unbound",))
     if (SOURCE_BOUND_MEMORY_DEPENDENCY_TASK_PARAMETER in kernel.launch.parameters
             and hardware.memory_dependency_task_latency_model is None):
         inp = dataclasses.replace(
@@ -13730,6 +13778,40 @@ def _regular_model_body(kernel: KernelSpec, hardware) -> Tuple[PredictionInput, 
     variant = kernel.variant.lower()
     dtype_bytes = _shape(kernel, "dtype_bytes")
     graph_padding = _has_graph_padding(kernel)
+    if variant == "fa3_prepare_varlen":
+        # KernelSpec validates the exact source launch/dtype; the common
+        # predictor boundary validates the supplied execution hardware.
+        batch = kernel.shape["batch"]
+        # The unsorted varlen entry reads cu_seqlens_q/k and materializes
+        # prepared Q length, dynamic split count and L2 head grouping.
+        # Arithmetic is deliberately an aggregate logical-work estimate;
+        # no CUB/FA2/MLA timing is substituted for the source scheduler.
+        if ("source_program" in kernel.attributes
+                and kernel.attributes["source_program"] == "vllm_0_30_fa3_full_aot_prepare"):
+            # AOT consumes B+1 cuQ endpoints and B seqused-K entries.
+            # Source stores only live vector slots, excluding rounded holes;
+            # each prepare CTA separately stores the shared semaphore zero.
+            dynamic = kernel.attributes["use_dynamic_split"]
+            read_bytes = (2 * batch + 1) * 4
+            write_bytes = (2 + int(dynamic)) * batch * 4 + kernel.launch.grid_size * 4
+        else:
+            read_bytes, write_bytes = 2 * (batch + 1) * 4, 3 * batch * 4
+        # Four source-invariant scalar operations per batch: the two
+        # cumulative-length differences, packed-Q scaling, and M*N block
+        # product. Division, selection and warp-reduction dependency service
+        # remain unbound; this is an explicitly partial setup estimate.
+        flops = {"compute_tensor": 0.0, "compute_fma": 0.0,
+                 "compute_reduction": 0.0, "compute_alu": float(batch * 4),
+                 "compute_sfu": 0.0}
+        demand = _vector_demand(
+            hardware, l2_read_bytes=read_bytes, dram_read_bytes=read_bytes,
+            write_bytes=write_bytes, flops=flops)
+        inp = _input(kernel, hardware, demand, write_bytes=write_bytes,
+                     phase_blueprint=None, operator_aux=True)
+        return dataclasses.replace(
+            inp, support_level="partial",
+            limitations=inp.limitations + (
+                "fa3_prepare_integer_division_and_warp_shuffle_service_unbound",)), read_bytes + write_bytes
     if variant == "qkv_rmsnorm_rope":
         marker = SOURCE_VLLM_ASCEND_SPLIT_QKV_RMSNORM_ROPE_PROGRAM_PARAMETER
         if kernel.launch.parameters[marker] != 1.0:
@@ -15736,6 +15818,29 @@ def _regular_model_body(kernel: KernelSpec, hardware) -> Tuple[PredictionInput, 
                 hardware, l2_read_bytes=read, dram_read_bytes=read,
                 write_bytes=write, flops=flops),
             write_bytes=write, phase_blueprint=None), total
+    if (variant == "gemm_reduce"
+            and kernel.launch.algorithm in ("h200_vllm030_torch213_fp16_external_aggregate_reduce",
+                "h200_cublaslt129_bf16_external_aggregate_reduce")):
+        if kernel.dtype == "bf16":
+            kernel.validate_legacy_bf16_external_launch(hardware)
+        else:
+            kernel.validate_observed_gemm_launch(hardware)
+        elements = _shape(kernel, "element_count")
+        splits = kernel.launch.parameters["modeled_split_k"]
+        read = float(splits * elements * kernel.launch.parameters["modeled_partial_bytes_per_element"])
+        write = float(2 * elements)
+        total = read + write
+        demand = build_forward_demand(total, total, True, {
+            "compute_tensor": 0.0, "compute_fma": float((splits - 1) * elements),
+            "compute_reduction": 0.0, "compute_sfu": 0.0, "compute_alu": 0.0})
+        demand["l1_cache"] = demand["smem"] = demand["xbar"] = 0.0
+        inp = build_aggregate_gpu_input(kernel, hardware, demand,
+            write_l2_bytes=write, write_dram_bytes=write, limitations=(
+                "explicit_API_configured_split_k_model_assumption_not_observed_effective_partition",
+                f"aggregate_only_FP32_partial_reads_adds_and_single_final_{kernel.dtype.upper()}_write",
+                "partial_buffer_ABI_CTA_mapping_cast_instruction_and_dynamic_shared_unbound",
+                "no_new_rate_or_production_duration_fit"))
+        return dataclasses.replace(inp, support_level="partial", dram_capacity_multiplier=1.0), total
     if variant in ("gemm_reduce", "gemm_elementwise"):
         elements = _shape(kernel, "element_count")
         if variant == "gemm_reduce":
@@ -16045,7 +16150,7 @@ def _cann_moe_compute_expert_tokens_key1001_compute_service(
     )
 
 
-@lru_cache(maxsize=320)
+@runtime_lru_cache(maxsize=320)
 def _cann_upper_bound_comparison_depths(elements: int) -> Tuple[int, ...]:
     """Return source binary-search depth for every upper-bound position."""
 
@@ -16993,6 +17098,8 @@ def dsv32_target_fusion_logical_work(kernel: KernelSpec):
     has_indexer = kernel.attributes["has_indexer"]
     alu = reduction = sfu = 0
     if kernel.variant == "dsv32_fused_norm_rope":
+        no_metadata = kernel.attributes["cache_slot_scope"] == "no_metadata_no_cache_slots"
+        outputs_only = kernel.attributes["cache_slot_scope"] in ("outputs_only_no_cache_slots", "no_metadata_no_cache_slots")
         q, kv, index = sh["q_hidden"], sh["kv_hidden"], sh["index_dim"]
         width = q + kv
         read = 2 * rows * (width + rope) + 2 * width
@@ -17002,6 +17109,11 @@ def dsv32_target_fusion_logical_work(kernel: KernelSpec):
         alu = rows * (3 * width + 4 + 3 * rope)
         reduction = rows * (width - 2)
         sfu = 2 * rows
+        if outputs_only:
+            # PCP passes None for all cache/slot pointers. The same source
+            # produces materialized normalized/rotated BF16 KV exactly once.
+            read -= 8 * rows
+            write -= 2 * rows * (kv + rope)
         if has_indexer:
             read += 2 * rows * index + 8 * index + rows * (8 + 2 * rope)
             write += rows * (index + 4 + 4 * sh["topk"])
@@ -17010,6 +17122,16 @@ def dsv32_target_fusion_logical_work(kernel: KernelSpec):
             alu += rows * (13 * index + 4 * rope + 6)
             reduction += 3 * rows * (index - 1)
             sfu += 3 * rows  # rsqrt, log2 and exp2; ceil is an ALU op
+            if outputs_only:
+                read -= 8 * rows
+                write += rows * (index - 4)  # BF16 index-K, no FP8 cache/scale
+                if no_metadata:
+                    write -= 2 * rows * index  # null index-K output; active TopK clear remains
+                # Keep LayerNorm, partner normalization and RoPE; remove
+                # only the cache quantizer's abs/scale/clamp and amax.
+                alu -= rows * (3 * index + 3)
+                reduction -= rows * (index - 1)
+                sfu -= 2 * rows
     elif kernel.variant == "dsv32_fused_q":
         heads, index_heads, index = sh["q_heads"], sh["index_heads"], sh["index_dim"]
         query_elements = rows * heads * rope
@@ -17031,8 +17153,12 @@ def dsv32_target_fusion_logical_work(kernel: KernelSpec):
     total = float(read + write)
     limitations = (
         "dsv32_target_fusion_roofline_only",
-        "bf16_mla_no_pcp_dcp_hisparse_source_projection",
-        "all_rows_valid_slots_projection_actual_mapping_unvalidated",
+        ("bf16_mla_pcp_outputs_only_no_cache_slots" if kernel.variant == "dsv32_fused_norm_rope"
+            and kernel.attributes["cache_slot_scope"] == "outputs_only_no_cache_slots" else
+            "bf16_mla_no_pcp_dcp_hisparse_source_projection"),
+        ("pcp_cache_insert_is_a_separate_required_source_operation" if kernel.variant == "dsv32_fused_norm_rope"
+            and kernel.attributes["cache_slot_scope"] == "outputs_only_no_cache_slots" else
+            "all_rows_valid_slots_projection_actual_mapping_unvalidated"),
         "logical_real_element_work_not_compiler_padded_instruction_count",
         "logical_unique_traffic_not_observed_dram_or_cache_hit_proof",
         "dtype_conversions_address_and_mask_control_not_counted",
@@ -17040,6 +17166,12 @@ def dsv32_target_fusion_logical_work(kernel: KernelSpec):
     )
     if kernel.variant == "dsv32_fused_norm_rope":
         limitations += ("local_triton_3_4_default_launch_not_bound_to_vllm_0_30_runtime",)
+        if no_metadata:
+            limitations = tuple(item for item in limitations
+                if item not in ("bf16_mla_no_pcp_dcp_hisparse_source_projection",
+                    "all_rows_valid_slots_projection_actual_mapping_unvalidated")) + (
+                "metadata_None_no_cache_slots_or_index_K_output",
+                "active_topk_prefix_fill_retained_without_unused_capacity_clear",)
     return {"logical_bytes": total, "write_bytes": float(write), "demand": {"compute_vector": 0.0, **flops},
         "limitations": limitations, "complete_native_work_bound": False}
 
@@ -17537,12 +17669,18 @@ def kimi_k3_nope_context_logical_work(kernel: KernelSpec):
     return {"source": source, "stage": stage, "operands": tuple(operands), "source_launch": launch,
             "in_place_roles": (("prefix_partial", "merged_output"), ("prefix_lse", "merged_lse"))
             if stage == "context_partial_merge" else (),
-            "demand": None if stage in ("merge", "context_partial_merge") else {
+            "demand": {
                 "compute_tensor": 0.0, "compute_vector": 0.0, "compute_reduction": 0.0,
-                "compute_fma": 0.0, "compute_sfu": 0.0, "compute_alu": 0.0},
+                "compute_fma": float(5 * rows * heads + 3 * rows * heads * 128
+                    + (rows * heads if stage == "context_partial_merge" else 0))
+                    if stage in ("merge", "context_partial_merge") else 0.0,
+                "compute_sfu": float(2 * rows * heads
+                    + (rows * heads if stage == "context_partial_merge" else 0))
+                    if stage in ("merge", "context_partial_merge") else 0.0,
+                "compute_alu": 0.0},
             "limitations": ("one request with no empty slices, TP/DCP1 and BF16 workspace; complete or continuation chunk source",
                             "no RoPE, scale, token_to_seq or V-copy traffic for this BF16 source specialization",
-                            "merge LSE value branches and repeated per-pack exp/div/compiler services remain unbound",
+                            "merge uses_ideal_LSE_math_repeated_per_pack_exp_div_and_compiler_services_unbound",
                             "logical operand extents are not observed cache/DRAM or actual H200 provider acceptance")}
 
 
@@ -17782,17 +17920,837 @@ def _kimi_k3_kda_chunk_logical_work(kernel: KernelSpec):
             "logical_math_excludes_masked_lanes_compiler_issue_counts_and_physical_cache_effects"),
     }
     if stage == "chunk":
+        intra = 4 * chunks * heads * 64**2 * dim + 32 * chunks * heads * 16**3
+        recompute = 4 * chunks * heads * 64**2 * dim
+        state = 4 * chunks * heads * 64 * dim**2
+        output = 2 * chunks * heads * (64 * dim**2 + 64**2 * dim)
+        matrix_stages = {"intra_qk_kk_and_inverse": intra, "recompute_w_u": recompute,
+                         "delta_h_and_v_new": state, "output": output}
+        public_bytes = sum(item["bytes"] for item in operands)
+        internal_bytes = 2 * sum(item["storage_bytes"] for item in buffers)
+        internal_bytes += sum(item["storage_bytes"] for item in buffers if item["zero_initialized"])
         result.update(
             chunks=chunks, temporary_metadata_storage_bound=False,
             complete_internal_traffic_bound=False,
             source_stages=("Q_K_L2norm", "chunk_indices", "fused_gate_beta_chunk_cumsum_log2",
                            "Akk_zero_initialize", "safe_gate_diagonal", "inter_solve_tril",
                            "recompute_w_u_kg", "chunk_offsets", "delta_h_v_new_final_state", "output_overwrites_V"),
-            partial_tensor_flops_w_u=None if mixed else 2 * chunks * heads * 64**2 * (dim + dim),
+            major_matrix_stages=matrix_stages,
+            partial_tensor_flops_w_u=recompute,
+            demand={"compute_tensor": float(sum(matrix_stages.values())),
+                    "compute_vector": 0.0, "compute_reduction": 0.0,
+                    "compute_fma": float(16 * elements - head_rows),
+                    "compute_sfu": float(3 * elements + 3 * head_rows + heads),
+                    "compute_alu": 0.0},
+            analytical_logical_bytes=public_bytes + internal_bytes,
+            analytical_traffic_assumption="each_declared_internal_buffer_one_write_one_read_plus_Akk_zero_fill",
             query_lengths=lengths, num_sequences=sequences,
-            partial_chunk_masked_dot_work_bound=not mixed,
+            partial_chunk_masked_dot_work_bound=False,
+            analytical_scope="major_source_tile_matrices_L2norm_gate_beta_recompute_pointwise_and_declared_buffer_traffic",
+            remaining_unpriced_source_work="intra_and_state_gate_exp2_tile_reloads_autotune_compiler_and_local_services",
             seconds=None)
     return result
+
+
+def kimi_k3_kda_recompute_source_work(kernel: KernelSpec, *, num_warps, num_stages,
+                                    metadata_dtype):
+    """Complete conditional W/U/kg CUDA source kernel, not an autotune choice.
+
+    The K3 wrapper fixes BT/BK/BV=64, STORE_QG=False, STORE_KG=True and
+    DOT_PRECISION=ieee. Boundary masks only shorten IO; all four dots and
+    pointwise tiles retain the padded64 token extent. Metadata is already
+    cached; this function does not invent the cold CPU/H2D preparation.
+    """
+    owners = {"kimi_k3_kda_prefill": kimi_k3_kda_prefill_logical_work,
+        "kimi_k3_kda_mixed": kimi_k3_kda_mixed_logical_work,
+        "kimi_k3_kda_context_prefill": kimi_k3_kda_context_prefill_logical_work}
+    if (not HWSpec.source_contract_supported("h200_partial_source_programs", kernel.hardware_id) or kernel.dtype != "bf16"
+            or kernel.variant not in owners or kernel.attributes["stage"] != "chunk"
+            or kernel.launch is not None):
+        raise ValueError("KDA recompute requires its unbound H200 BF16 chunk source")
+    logical = owners[kernel.variant](kernel)
+    if (type(num_warps) is not int or num_warps not in (2, 4, 8)
+            or type(num_stages) is not int or num_stages not in (2, 3, 4)
+            or metadata_dtype != "int32"):
+        raise ValueError("KDA recompute requires an explicit source config and existing INT32 metadata ABI")
+    heads, dim = kernel.shape["heads"], kernel.shape["head_dim"]
+    if dim != 128:
+        raise ValueError("KDA recompute source requires K=V=128")
+    live = tuple(min(64, length - begin) for length in logical["query_lengths"]
+        for begin in range(0, length, 64))
+    families = {}
+    for rows in dict.fromkeys(live):
+        stages = [("metadata", "memory:global_read", 16),
+            ("beta", "memory:global_read", 4 * rows),
+            ("A", "memory:global_read", 2 * rows * 64)]
+        for tile in range(2):
+            prefix = f"v{tile}"
+            stages.extend(((prefix + "_read", "memory:global_read", 2 * rows * 64),
+                (prefix + "_beta", "compute:compute_fma", 64 * 64),
+                (prefix + "_dot", "compute:compute_tensor", 2 * 64**3),
+                (prefix + "_u", "memory:global_write", 2 * rows * 64)))
+        for tile in range(2):
+            prefix = f"k{tile}"
+            stages.extend(((prefix + "_read", "memory:global_read", 2 * rows * 64),
+                (prefix + "_beta", "compute:compute_fma", 64 * 64),
+                (prefix + "_gate", "memory:global_read", 4 * rows * 64),
+                (prefix + "_gate_exp2", "compute:compute_sfu", 64 * 64),
+                (prefix + "_gate_multiply", "compute:compute_fma", 64 * 64),
+                (prefix + "_last_gate", "memory:global_read", 4 * 64),
+                (prefix + "_gate_subtract", "compute:compute_fma", 64 * 64),
+                (prefix + "_difference_exp2", "compute:compute_sfu", 64 * 64),
+                (prefix + "_kg_multiply", "compute:compute_fma", 64 * 64),
+                (prefix + "_kg", "memory:global_write", 2 * rows * 64),
+                (prefix + "_dot", "compute:compute_tensor", 2 * 64**3),
+                (prefix + "_w", "memory:global_write", 2 * rows * 64)))
+        families[rows] = tuple(stages)
+    counts = {rows: heads * live.count(rows) for rows in families}
+    services = ("memory:global_read", "memory:global_write", "compute:compute_tensor",
+        "compute:compute_fma", "compute:compute_sfu")
+    totals = {service: sum(counts[rows] * sum(amount for _, role, amount in stages if role == service)
+        for rows, stages in families.items()) for service in services}
+    return {"source": "vllm/models/kimi_k3/nvidia/ops/third_party/kda/chunk.py:recompute_w_u_fwd_kernel",
+        "source_wrapper": "recompute_w_u_fwd: qg=None, kg=empty_like(k), DOT_PRECISION=ieee",
+        "launch_grid": (len(live), heads, 1), "launch_block": (32 * num_warps, 1, 1),
+        "num_stages": num_stages, "chunks_live_rows": live, "families": families,
+        "family_ctas": counts, "ctas": heads * len(live), "service_work": totals,
+        "read_bytes": totals["memory:global_read"], "write_bytes": totals["memory:global_write"],
+        "output_roles": ("u", "kg", "w"), "input_beta_dtype": "fp32", "input_A_dtype": "bf16",
+        "padded_pointwise_values": heads * len(live) * 64 * dim,
+        "source_selected_configuration_bound": False, "complete_source_service": False,
+        "compiler_resources_bound": False, "default_Forward_price_changed": False}
+
+
+def kimi_k3_kda_recompute_source_input(kernel: KernelSpec, hardware, *, num_warps,
+                                     num_stages, metadata_dtype):
+    """Price the explicit complete recompute submission with existing rates.
+
+    This separate conditional input never replaces the whole chunk program,
+    its other submissions or the public source selector.
+    """
+    if not HWSpec.source_contract_supported("h200_partial_source_programs", hardware.hardware_id) or hardware.kernel_memory_model != "gpu_mshr":
+        raise NotImplementedError("KDA recompute requires H200 GPU services")
+    work = kimi_k3_kda_recompute_source_work(kernel, num_warps=num_warps,
+        num_stages=num_stages, metadata_dtype=metadata_dtype)
+    total = work["service_work"]
+    read, write = float(work["read_bytes"]), float(work["write_bytes"])
+    demand = build_forward_demand(read + write, read + write, False, {
+        "compute_tensor": total["compute:compute_tensor"], "compute_fma": total["compute:compute_fma"],
+        "compute_sfu": total["compute:compute_sfu"], "compute_alu": 0.0})
+    demand["l1_cache"] = demand["xbar"] = 0.0
+    workers = min(work["ctas"], hardware.num_compute_units)
+    inp = PredictionInput(demand_per_resource=demand, eta=1.0, wave_efficiency=1.0,
+        active_units=workers, sm_freq_hz=hardware.nominal_sm_freq_hz,
+        dram_freq_hz=hardware.nominal_dram_freq_hz, grid_size=work["ctas"],
+        block_size=32 * num_warps, launch_grid=work["launch_grid"], launch_block=work["launch_block"],
+        variant="kda_recompute_w_u_kg", mem_model="gpu_mshr", compute_demands=(),
+        memory_paths=(), pipeline_plan=None, support_level="partial",
+        limitations=gpu_partial_limitations(hardware,
+            "complete_KDA_recompute_source_submission_only_not_the_whole_chunk_operator",
+            "explicit_autotune_candidate_not_actual_selected_compiler_or_runtime_provider",
+            "cached_INT32_chunk_indices_and_query_starts_no_cold_host_or_H2D_price",
+            "BF16_A_k_v_and_FP32_beta_gate_all_source_loads_and_u_kg_w_stores",
+            "masked_IO_with_full64_token_pointwise_and_tensor_tiles_even_for_short_mixed_tail",
+            "source_exp2_as_SFU_math_not_compiler_instruction_or_conversion_service",
+            "cold_global_role_values_not_DRAM_transactions_or_cache_residency",
+            "serial_source_CTA_stages_SM_stride_not_native_overlap_or_occupancy",
+            "typed_address_conversion_shared_register_division_and_normal_accuracy_unbound",
+            "no_new_rate_default_dispatch_change_or_production_duration_fit"))
+    producers, requests = gpu_memory_source(hardware)
+    inp = attach_structured_contract(inp, hardware, transaction_bytes=None, path_name="global_memory",
+        source_producers_per_unit=producers, independent_requests_per_producer=requests)
+    inp = split_global_memory_paths(inp, read_l2_bytes=read, read_dram_bytes=read,
+        write_l2_bytes=write, write_dram_bytes=write)
+    layouts = {rows: tuple(bind_pipeline_stage_template(name, service, amount / total[service],
+        service.startswith("memory:")) for name, service, amount in stages)
+        for rows, stages in work["families"].items()}
+    tasks = tuple(PipelineTaskDemand(name=f"kda_recompute_cta{cta}", worker=cta % workers,
+        stages=layouts[rows]) for cta, rows in enumerate(work["chunks_live_rows"] * kernel.shape["heads"]))
+    return attach_pipeline_work_plan(inp, hardware,
+        PipelineWorkPlan(worker_count=workers, tasks=tasks, buffers=())), read + write
+
+
+def kimi_k3_kda_state_source_work(kernel: KernelSpec, *, block_v, num_warps, num_stages,
+                                metadata_dtype, chunk_offsets_dtype):
+    """Conditional complete KDA delta-state submission with per-CTA recurrence.
+
+    K3 supplies BF16 kg/W/u, FP32 dense h0 (including fresh zero rows),
+    FP32 cumulative gk, g=None, save_new_value=True, final_state=True,
+    use_exp2=True. Each value CTA retains two FP32[BV,64] register blocks
+    across all its sequence chunks. Chunk snapshots are BF16; final state
+    is FP32. Cached offsets use torch.cumsum's promoted INT64 result.
+    """
+    owners = {"kimi_k3_kda_prefill": kimi_k3_kda_prefill_logical_work,
+        "kimi_k3_kda_mixed": kimi_k3_kda_mixed_logical_work,
+        "kimi_k3_kda_context_prefill": kimi_k3_kda_context_prefill_logical_work}
+    if (not HWSpec.source_contract_supported("h200_partial_source_programs", kernel.hardware_id) or kernel.dtype != "bf16"
+            or kernel.variant not in owners or kernel.attributes["stage"] != "chunk"
+            or kernel.launch is not None):
+        raise ValueError("KDA state requires its unbound H200 BF16 chunk source")
+    logical = owners[kernel.variant](kernel)
+    if (type(block_v) is not int or block_v not in (32, 64)
+            or type(num_warps) is not int or num_warps not in (2, 4)
+            or type(num_stages) is not int or num_stages not in (2, 3, 4)
+            or metadata_dtype != "int32" or chunk_offsets_dtype != "int64"):
+        raise ValueError("KDA state requires explicit source config, INT32 query starts and INT64 cumsum offsets")
+    heads, dim = kernel.shape["heads"], kernel.shape["head_dim"]
+    if dim != 128:
+        raise ValueError("KDA state source requires K=V=128")
+    families = []
+    for length in logical["query_lengths"]:
+        stages = [("metadata", "memory:global_read", 16),
+            ("initial_state", "memory:global_read", 4 * block_v * dim),
+            ("initial_state_add", "compute:compute_fma", block_v * dim)]
+        live = tuple(min(64, length - begin) for begin in range(0, length, 64))
+        for chunk, rows in enumerate(live):
+            prefix = f"chunk{chunk}"
+            stages.append((prefix + "_snapshot", "memory:global_write", 2 * block_v * dim))
+            for tile in range(2):
+                stages.extend(((f"{prefix}_w{tile}", "memory:global_read", 2 * rows * 64),
+                    (f"{prefix}_w_dot{tile}", "compute:compute_tensor", 2 * 64 * 64 * block_v)))
+            stages.extend(((prefix + "_w_dot_add", "compute:compute_fma", 64 * block_v),
+                (prefix + "_u", "memory:global_read", 2 * rows * block_v),
+                (prefix + "_delta", "compute:compute_fma", 64 * block_v),
+                (prefix + "_v_new", "memory:global_write", 2 * rows * block_v)))
+            for tile in range(2):
+                stages.extend(((f"{prefix}_last_gate{tile}", "memory:global_read", 4 * 64),
+                    (f"{prefix}_gate_exp2_{tile}", "compute:compute_sfu", 64),
+                    (f"{prefix}_decay{tile}", "compute:compute_fma", block_v * 64)))
+            for tile in range(2):
+                stages.extend(((f"{prefix}_kg{tile}", "memory:global_read", 2 * rows * 64),
+                    (f"{prefix}_update_dot{tile}", "compute:compute_tensor", 2 * 64 * 64 * block_v),
+                    (f"{prefix}_update_add{tile}", "compute:compute_fma", block_v * 64)))
+        stages.append(("final_state", "memory:global_write", 4 * block_v * dim))
+        families.append({"length": length, "chunks_live_rows": live, "stages": tuple(stages)})
+    value_tiles = dim // block_v
+    services = ("memory:global_read", "memory:global_write", "compute:compute_tensor",
+        "compute:compute_fma", "compute:compute_sfu")
+    totals = {service: heads * value_tiles * sum(amount for family in families
+        for _, role, amount in family["stages"] if role == service) for service in services}
+    sequences = len(families)
+    return {"source": "vllm/third_party/flash_linear_attention/ops/chunk_delta_h.py:chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "source_wrapper": "K3 chunk: k=kg, w=w, u=u, g=None, gk=g, dense_initial_state, output_final_state, use_exp2=True",
+        "launch_grid": (value_tiles, sequences * heads, 1), "launch_block": (num_warps * 32, 1, 1),
+        "num_stages": num_stages, "block_v": block_v, "ctas": value_tiles * sequences * heads,
+        "sequence_families": tuple(families), "service_work": totals,
+        "read_bytes": totals["memory:global_read"], "write_bytes": totals["memory:global_write"],
+        "initial_state_read_bytes": 4 * sequences * heads * dim**2,
+        "final_state_write_bytes": 4 * sequences * heads * dim**2,
+        "chunk_snapshot_write_bytes": 2 * logical["chunks"] * heads * dim**2,
+        "v_new_write_bytes": 2 * kernel.shape["rows"] * heads * dim,
+        "query_start_loc_dtype": "int32", "chunk_offsets_dtype": "int64",
+        "register_recurrent_state_dtype": "fp32", "chunk_snapshot_dtype": "bf16",
+        "source_selected_configuration_bound": False, "complete_source_service": False,
+        "compiler_resources_bound": False, "default_Forward_price_changed": False}
+
+
+def kimi_k3_kda_state_source_input(kernel: KernelSpec, hardware, *, block_v, num_warps,
+                                 num_stages, metadata_dtype, chunk_offsets_dtype):
+    """Existing-rate state CTA streams; all chunks of a sequence stay ordered."""
+    if not HWSpec.source_contract_supported("h200_partial_source_programs", hardware.hardware_id) or hardware.kernel_memory_model != "gpu_mshr":
+        raise NotImplementedError("KDA state requires H200 GPU services")
+    work = kimi_k3_kda_state_source_work(kernel, block_v=block_v, num_warps=num_warps,
+        num_stages=num_stages, metadata_dtype=metadata_dtype, chunk_offsets_dtype=chunk_offsets_dtype)
+    total = work["service_work"]
+    read, write = float(work["read_bytes"]), float(work["write_bytes"])
+    demand = build_forward_demand(read + write, read + write, False, {
+        "compute_tensor": total["compute:compute_tensor"], "compute_fma": total["compute:compute_fma"],
+        "compute_sfu": total["compute:compute_sfu"], "compute_alu": 0.0})
+    demand["l1_cache"] = demand["xbar"] = 0.0
+    workers = min(work["ctas"], hardware.num_compute_units)
+    inp = PredictionInput(demand_per_resource=demand, eta=1.0, wave_efficiency=1.0,
+        active_units=workers, sm_freq_hz=hardware.nominal_sm_freq_hz,
+        dram_freq_hz=hardware.nominal_dram_freq_hz, grid_size=work["ctas"],
+        block_size=32 * num_warps, launch_grid=work["launch_grid"], launch_block=work["launch_block"],
+        variant="kda_chunk_delta_state", mem_model="gpu_mshr", compute_demands=(), memory_paths=(),
+        pipeline_plan=None, support_level="partial", limitations=gpu_partial_limitations(hardware,
+            "complete_KDA_state_submission_only_not_whole_chunk_or_model_latency",
+            "explicit_BV_warps_stages_candidate_not_selected_compiler_or_runtime_provider",
+            "one_CTA_per_sequence_head_value_tile_with_serial_chunk_register_recurrence",
+            "fresh_dense_FP32_zero_initial_state_still_loaded_and_added_not_skipped",
+            "BF16_chunk_snapshots_and_v_new_FP32_final_state_actual_source_payloads",
+            "INT32_query_starts_and_promoted_INT64_cached_cumsum_offsets",
+            "W_kg_and_last_gate_rereads_per_value_CTA_not_unique_operand_only",
+            "masked_IO_keeps_full64_token_dot_delta_and_state_update_tiles",
+            "source_FP32_adds_retained_no_assumed_accumulator_fusion_or_zero_add_folding",
+            "source_exp2_as_SFU_math_not_compiler_instruction_service",
+            "cold_role_payload_serial_CTA_streams_not_native_cache_overlap_or_occupancy",
+            "typed_cast_address_metadata_shared_register_and_actual_memory_ABI_unbound",
+            "no_new_rate_default_dispatch_change_or_production_duration_fit"))
+    producers, requests = gpu_memory_source(hardware)
+    inp = attach_structured_contract(inp, hardware, transaction_bytes=None, path_name="global_memory",
+        source_producers_per_unit=producers, independent_requests_per_producer=requests)
+    inp = split_global_memory_paths(inp, read_l2_bytes=read, read_dram_bytes=read,
+        write_l2_bytes=write, write_dram_bytes=write)
+    tasks = []
+    value_tiles = work["launch_grid"][0]
+    for sequence, family in enumerate(work["sequence_families"]):
+        stages = tuple(bind_pipeline_stage_template(name, service, amount / total[service],
+            service.startswith("memory:")) for name, service, amount in family["stages"])
+        for head in range(kernel.shape["heads"]):
+            for value in range(value_tiles):
+                cta = (sequence * kernel.shape["heads"] + head) * value_tiles + value
+                tasks.append(PipelineTaskDemand(name=f"kda_state_cta{cta}", worker=cta % workers, stages=stages))
+    return attach_pipeline_work_plan(inp, hardware,
+        PipelineWorkPlan(worker_count=workers, tasks=tuple(tasks), buffers=())), read + write
+
+
+def kimi_k3_kda_output_source_work(kernel: KernelSpec, *, block_k, block_v,
+                                 num_warps, num_stages, metadata_dtype):
+    """Complete conditional KDA output submission, including causal A dot.
+
+    The source consumes normalized q, FP32 cumulative gate, BF16 chunk h
+    and v_new, then overwrites the caller's original V with BF16 output.
+    Triangular masking of A does not shrink its loads or the dense dot.
+    """
+    owners = {"kimi_k3_kda_prefill": kimi_k3_kda_prefill_logical_work,
+        "kimi_k3_kda_mixed": kimi_k3_kda_mixed_logical_work,
+        "kimi_k3_kda_context_prefill": kimi_k3_kda_context_prefill_logical_work}
+    if (not HWSpec.source_contract_supported("h200_partial_source_programs", kernel.hardware_id) or kernel.dtype != "bf16"
+            or kernel.variant not in owners or kernel.attributes["stage"] != "chunk"
+            or kernel.launch is not None):
+        raise ValueError("KDA output requires its unbound H200 BF16 chunk source")
+    logical = owners[kernel.variant](kernel)
+    if (type(block_k) is not int or block_k not in (32, 64)
+            or type(block_v) is not int or block_v not in (64, 128)
+            or type(num_warps) is not int or num_warps not in (2, 4, 8)
+            or type(num_stages) is not int or num_stages not in (2, 3, 4)
+            or metadata_dtype != "int32"):
+        raise ValueError("KDA output requires an explicit source config and INT32 metadata ABI")
+    heads, dim = kernel.shape["heads"], kernel.shape["head_dim"]
+    if dim != 128:
+        raise ValueError("KDA output source requires K=V=128")
+    live = tuple(min(64, length - begin) for length in logical["query_lengths"]
+        for begin in range(0, length, 64))
+    if len(live) > 65535:
+        raise NotImplementedError("KDA output chunk grid exceeds CUDA Y-axis capacity")
+    families = {}
+    for rows in dict.fromkeys(live):
+        stages = [("metadata", "memory:global_read", 16)]
+        for tile in range(dim // block_k):
+            prefix = f"k{tile}"
+            stages.extend(((prefix + "_q", "memory:global_read", 2 * rows * block_k),
+                (prefix + "_scale", "compute:compute_fma", 64 * block_k),
+                (prefix + "_gate", "memory:global_read", 4 * rows * block_k),
+                (prefix + "_exp2", "compute:compute_sfu", 64 * block_k),
+                (prefix + "_qg", "compute:compute_fma", 64 * block_k),
+                (prefix + "_h", "memory:global_read", 2 * block_v * block_k),
+                (prefix + "_dot", "compute:compute_tensor", 2 * 64 * block_k * block_v),
+                (prefix + "_accumulate", "compute:compute_fma", 64 * block_v)))
+        stages.extend((("v_new", "memory:global_read", 2 * rows * block_v),
+            ("causal_A", "memory:global_read", 2 * rows * 64),
+            ("causal_A_dot_v", "compute:compute_tensor", 2 * 64**2 * block_v),
+            ("causal_A_accumulate", "compute:compute_fma", 64 * block_v),
+            ("output", "memory:global_write", 2 * rows * block_v)))
+        families[rows] = tuple(stages)
+    value_tiles = dim // block_v
+    counts = {rows: heads * value_tiles * live.count(rows) for rows in families}
+    services = ("memory:global_read", "memory:global_write", "compute:compute_tensor",
+        "compute:compute_fma", "compute:compute_sfu")
+    totals = {service: sum(counts[rows] * sum(amount for _, role, amount in stages if role == service)
+        for rows, stages in families.items()) for service in services}
+    return {"source": "vllm/models/kimi_k3/nvidia/ops/third_party/kda/chunk.py:chunk_gla_fwd_kernel_o",
+        "source_wrapper": "chunk_gla_fwd_o_gk: q=q, v=v_new, g=g, A=Aqk, h=h, o=original_V",
+        "launch_grid": (value_tiles, len(live), heads), "launch_block": (num_warps * 32, 1, 1),
+        "num_stages": num_stages, "block_k": block_k, "block_v": block_v,
+        "chunks_live_rows": live, "families": families, "family_ctas": counts,
+        "ctas": heads * value_tiles * len(live), "service_work": totals,
+        "read_bytes": totals["memory:global_read"], "write_bytes": totals["memory:global_write"],
+        "input_roles": ("normalized_q", "cumulative_gate", "chunk_h", "v_new", "Aqk"),
+        "output_alias_role": "post_conv_v", "input_chunk_state_dtype": "bf16",
+        "unpriced_causal_compare_values": 64**2 * heads * value_tiles * len(live),
+        "source_selected_configuration_bound": False, "complete_source_service": False,
+        "compiler_resources_bound": False, "default_Forward_price_changed": False}
+
+
+def kimi_k3_kda_output_source_input(kernel: KernelSpec, hardware, *, block_k, block_v,
+                                  num_warps, num_stages, metadata_dtype):
+    """Source-ordered output CTAs using existing H200 resource services."""
+    if not HWSpec.source_contract_supported("h200_partial_source_programs", hardware.hardware_id) or hardware.kernel_memory_model != "gpu_mshr":
+        raise NotImplementedError("KDA output requires H200 GPU services")
+    work = kimi_k3_kda_output_source_work(kernel, block_k=block_k, block_v=block_v,
+        num_warps=num_warps, num_stages=num_stages, metadata_dtype=metadata_dtype)
+    total = work["service_work"]
+    read, write = float(work["read_bytes"]), float(work["write_bytes"])
+    demand = build_forward_demand(read + write, read + write, False, {
+        "compute_tensor": total["compute:compute_tensor"], "compute_fma": total["compute:compute_fma"],
+        "compute_sfu": total["compute:compute_sfu"], "compute_alu": 0.0})
+    demand["l1_cache"] = demand["xbar"] = 0.0
+    workers = min(work["ctas"], hardware.num_compute_units)
+    inp = PredictionInput(demand_per_resource=demand, eta=1.0, wave_efficiency=1.0,
+        active_units=workers, sm_freq_hz=hardware.nominal_sm_freq_hz,
+        dram_freq_hz=hardware.nominal_dram_freq_hz, grid_size=work["ctas"],
+        block_size=32 * num_warps, launch_grid=work["launch_grid"], launch_block=work["launch_block"],
+        variant="kda_chunk_output", mem_model="gpu_mshr", compute_demands=(), memory_paths=(),
+        pipeline_plan=None, support_level="partial", limitations=gpu_partial_limitations(hardware,
+            "complete_KDA_output_submission_only_not_whole_chunk_or_model_latency",
+            "explicit_BK_BV_warps_stages_candidate_not_selected_compiler_or_runtime_provider",
+            "BF16_chunk_h_v_new_Aqk_and_FP32_gate_read_in_source_order",
+            "Q_gate_and_full_Aqk_rows_reload_per_value_CTA_output_columns_partition_exactly",
+            "causal_mask_does_not_shrink_Aqk_payload_or_dense_tensor_dot",
+            "masked_IO_keeps_full64_token_scale_exp2_dot_and_accumulator_math",
+            "source_zero_seeded_FP32_accumulations_retained_not_assumed_fused_or_folded",
+            "output_overwrites_original_V_but_reads_distinct_v_new_no_original_V_read",
+            "cold_role_payload_serial_CTA_streams_not_native_cache_overlap_or_occupancy",
+            "typed_compare_select_cast_address_shared_register_and_native_memory_ABI_unbound",
+            "no_new_rate_default_dispatch_change_or_production_duration_fit"))
+    producers, requests = gpu_memory_source(hardware)
+    inp = attach_structured_contract(inp, hardware, transaction_bytes=None, path_name="global_memory",
+        source_producers_per_unit=producers, independent_requests_per_producer=requests)
+    inp = split_global_memory_paths(inp, read_l2_bytes=read, read_dram_bytes=read,
+        write_l2_bytes=write, write_dram_bytes=write)
+    layouts = {rows: tuple(bind_pipeline_stage_template(name, service, amount / total[service],
+        service.startswith("memory:")) for name, service, amount in stages)
+        for rows, stages in work["families"].items()}
+    per_head = tuple(rows for rows in work["chunks_live_rows"] for _ in range(work["launch_grid"][0]))
+    tasks = tuple(PipelineTaskDemand(name=f"kda_output_cta{cta}", worker=cta % workers, stages=layouts[rows])
+        for cta, rows in enumerate(per_head * kernel.shape["heads"]))
+    return attach_pipeline_work_plan(inp, hardware,
+        PipelineWorkPlan(worker_count=workers, tasks=tasks, buffers=())), read + write
+
+
+def kimi_k3_kda_intra_solve_source_work(kernel: KernelSpec, *, intra_num_warps,
+        intra_num_stages, inter_block_k, inter_num_warps, inter_num_stages,
+        use_gather, metadata_dtype):
+    """Both complete safe-gate intra/solve submissions, with typed FP32 dots.
+
+    Source counts cannot supply an H200 BF16 tensor demand: gate-scaled
+    operands are FP32, and the SM90 merged inverse explicitly uses TF32.
+    The default precision of the other dots remains a compiler input.
+    """
+    owners = {"kimi_k3_kda_prefill": kimi_k3_kda_prefill_logical_work,
+        "kimi_k3_kda_mixed": kimi_k3_kda_mixed_logical_work,
+        "kimi_k3_kda_context_prefill": kimi_k3_kda_context_prefill_logical_work}
+    if (not HWSpec.source_contract_supported("h200_partial_source_programs", kernel.hardware_id) or kernel.dtype != "bf16"
+            or kernel.variant not in owners or kernel.attributes["stage"] != "chunk"
+            or kernel.launch is not None or kernel.attributes["gate_lower_bound"] != -5):
+        raise ValueError("KDA intra/solve requires its unbound H200 BF16 safe-gate chunk source")
+    logical = owners[kernel.variant](kernel)
+    if (type(intra_num_warps) is not int or intra_num_warps not in (1, 2, 4, 8)
+            or type(intra_num_stages) is not int or intra_num_stages not in (2, 3, 4)
+            or type(inter_block_k) is not int or inter_block_k not in (32, 64)
+            or type(inter_num_warps) is not int or inter_num_warps not in (1, 2, 4)
+            or type(inter_num_stages) is not int or inter_num_stages != 3
+            or type(use_gather) is not bool or metadata_dtype != "int32"):
+        raise ValueError("KDA intra/solve requires explicit safe source configurations and INT32 metadata")
+    heads, dim, bc = kernel.shape["heads"], kernel.shape["head_dim"], 16
+    if dim != 128:
+        raise ValueError("KDA intra/solve source requires K=128")
+    live = tuple(min(64, length - begin) for length in logical["query_lengths"]
+        for begin in range(0, length, 64))
+    if heads > 65535:
+        raise NotImplementedError("KDA intra source exceeds CUDA Z-axis capacity")
+    intra_families, inter_families = {}, {}
+    for rows in dict.fromkeys(live):
+        sub_rows = tuple(max(0, min(bc, rows - group * bc)) for group in range(4))
+        sub_programs = []
+        for sub, count in enumerate(sub_rows):
+            stages = [("metadata", "memory:global_read", 16)]
+            if count == 0:
+                sub_programs.append({"sub_chunk": sub, "live_rows": 0,
+                    "early_return": True, "stages": tuple(stages), "unpriced_actions": ()})
+                continue
+            stages.extend((("q_k_gate", "memory:global_read", 8 * count * dim),
+                ("beta", "memory:global_read", 4 * count)))
+            if not use_gather:
+                stages.append(("gate_reference", "memory:global_read", 4 * dim))
+            stages.extend((("gate_subtract", "compute:compute_fma", bc * dim),
+                ("gate_exp2", "compute:compute_sfu", 2 * bc * dim),
+                ("gate_products", "compute:compute_fma", 3 * bc * dim),
+                ("qk_kk", "dot:fp32_default_unbound", 4 * bc**2 * dim),
+                ("scale_and_beta", "compute:compute_fma", 2 * bc**2),
+                ("Aqk_diagonal", "memory:global_write", 2 * count * bc),
+                ("Akkd_raw", "memory:global_write", 4 * count * bc)))
+            iterations = max(count - 2, 0)
+            for iteration in range(iterations):
+                stages.extend(((f"solve{iteration}_row", "memory:global_read", 4 * bc),
+                    (f"solve{iteration}_multiply", "compute:compute_fma", bc**2),
+                    (f"solve{iteration}_sum_add", "compute:compute_fma", bc**2)))
+            stages.extend((("identity_add", "compute:compute_fma", bc**2),
+                ("Akkd_inverse", "memory:global_write", 4 * count * bc)))
+            sub_programs.append({"sub_chunk": sub, "live_rows": count, "early_return": False,
+                "forward_substitution_iterations": iterations, "stages": tuple(stages),
+                "unpriced_actions": ("gate sign, row sign, masks/selects/casts",
+                    "gather of gate reference" if use_gather else "gate reference address",
+                    "debug barrier after raw Akkd store", "FP32 default-precision dot compiler service")})
+        intra_families[rows] = tuple(sub_programs)
+        stages = [("metadata", "memory:global_read", 16)]
+        active = sum(count > 0 for count in sub_rows)
+        for tile in range(dim // inter_block_k):
+            prefix = f"k{tile}"
+            stages.append((prefix + "_base_k_gate", "memory:global_read", 6 * sub_rows[0] * inter_block_k))
+            for target in range(1, active):
+                stages.extend(((f"{prefix}_target{target}", "memory:global_read",
+                    (8 * sub_rows[target] + 4) * inter_block_k),
+                    (f"{prefix}_gate_diff{target}", "compute:compute_fma", bc * inter_block_k),
+                    (f"{prefix}_gate_exp{target}", "compute:compute_sfu", bc * inter_block_k),
+                    (f"{prefix}_qk_products{target}", "compute:compute_fma", 2 * bc * inter_block_k)))
+                for previous in range(target):
+                    name = f"{prefix}_pair{target}_{previous}"
+                    stages.extend(((name + "_gate_diff", "compute:compute_fma", bc * inter_block_k),
+                        (name + "_gate_exp", "compute:compute_sfu", bc * inter_block_k),
+                        (name + "_k_product", "compute:compute_fma", bc * inter_block_k),
+                        (name + "_qk_kk", "dot:fp32_default_unbound", 4 * bc**2 * inter_block_k),
+                        (name + "_accumulate", "compute:compute_fma", 2 * bc**2)))
+        for target in range(1, active):
+            for previous in range(target):
+                name = f"pair{target}_{previous}"
+                stages.extend(((name + "_scale", "compute:compute_fma", bc**2),
+                    (name + "_Aqk", "memory:global_write", 2 * sub_rows[target] * bc)))
+            stages.append((f"beta{target}", "memory:global_read", 4 * sub_rows[target]))
+            for previous in range(target):
+                stages.append((f"pair{target}_{previous}_beta", "compute:compute_fma", bc**2))
+        stages.append(("Akkd_diagonals", "memory:global_read", 4 * rows * bc))
+        # These six inverse blocks run unconditionally, even when trailing
+        # token subchunks were masked. 16 nested16x16x16 FP32 TF32 dots.
+        inverse = (("10", 2, 0), ("21", 2, 0), ("32", 2, 0),
+            ("20", 3, 1), ("31", 3, 1), ("30", 4, 2))
+        for block, dots, adds in inverse:
+            stages.append(("inverse" + block, "dot:fp32_tf32", dots * 2 * bc**3))
+            if adds:
+                stages.append(("inverse" + block + "_add", "compute:compute_fma", adds * bc**2))
+        stages.append(("Akk_inverse", "memory:global_write",
+            2 * bc * sum((group + 1) * count for group, count in enumerate(sub_rows))))
+        inter_families[rows] = tuple(stages)
+    services = ("memory:global_read", "memory:global_write", "compute:compute_fma", "compute:compute_sfu",
+        "dot:fp32_default_unbound", "dot:fp32_tf32")
+    intra_totals = {service: heads * sum(amount for rows in live for program in intra_families[rows]
+        for _, role, amount in program["stages"] if role == service) for service in services}
+    inter_totals = {service: heads * sum(amount for rows in live
+        for _, role, amount in inter_families[rows] if role == service) for service in services}
+    totals = {service: intra_totals[service] + inter_totals[service] for service in services}
+    return {"source": "vllm/models/kimi_k3/nvidia/ops/third_party/kda/chunk_intra.py",
+        "intra_launch_grid": (len(live), 4, heads), "intra_launch_block": (32 * intra_num_warps, 1, 1),
+        "inter_launch_grid": (len(live), heads, 1), "inter_launch_block": (32 * inter_num_warps, 1, 1),
+        "intra_num_stages": intra_num_stages, "inter_num_stages": inter_num_stages,
+        "inter_block_k": inter_block_k, "use_gather": use_gather, "chunks_live_rows": live,
+        "intra_families": intra_families, "inter_families": inter_families, "typed_service_work": totals,
+        "intra_service_work": intra_totals, "inter_service_work": inter_totals,
+        "intra_ctas": 4 * len(live) * heads, "inter_ctas": len(live) * heads,
+        "intra_early_return_ctas": heads * sum(program["early_return"] for rows in live
+            for program in intra_families[rows]),
+        "read_bytes": totals["memory:global_read"], "write_bytes": totals["memory:global_write"],
+        "matrix_input_dtype": "fp32", "inverse_dot_precision": "tf32",
+        "other_dot_precision": None, "Aqk_dtype": "bf16", "Akkd_dtype": "fp32", "Akk_dtype": "bf16",
+        "Aqk_upper_blocks": "unwritten_and_masked_by_output_not_assumed_initialized",
+        "Akk_upper_blocks": "prior_zero_fill_required_not_repeated_inside_these_submissions",
+        "unpriced_source_actions": ("FP32 default-precision and TF32 dot compiler/services",
+            "typed negation, masks, selection, casts and addresses", "gather and debug barrier",
+            "compiler shared/register staging, issue, occupancy and actual memory ABI"),
+        "demand": None, "seconds": None, "typed_service_available": False,
+        "source_selected_configuration_bound": False, "complete_source_service": False,
+        "compiler_resources_bound": False, "default_Forward_price_changed": False}
+
+
+def _kda_frontend_parent_work(kernel):
+    owners = {"kimi_k3_kda_prefill": kimi_k3_kda_prefill_logical_work,
+        "kimi_k3_kda_mixed": kimi_k3_kda_mixed_logical_work,
+        "kimi_k3_kda_context_prefill": kimi_k3_kda_context_prefill_logical_work}
+    if (not HWSpec.source_contract_supported("h200_partial_source_programs", kernel.hardware_id) or kernel.dtype != "bf16"
+            or kernel.variant not in owners or kernel.attributes["stage"] != "chunk"
+            or kernel.launch is not None or kernel.shape["head_dim"] != 128):
+        raise ValueError("KDA frontend requires its existing unbound H200 BF16 chunk")
+    return owners[kernel.variant](kernel)
+
+
+def _kda_frontend_work(source, grid, block, families, cta_families, limitations):
+    services = ("memory:global_read", "memory:global_write", "compute:compute_tensor",
+        "compute:compute_fma", "compute:compute_sfu")
+    counts = {family: cta_families.count(family) for family in families}
+    totals = {service: sum(counts[family] * sum(amount for _, role, amount in stages if role == service)
+        for family, stages in families.items()) for service in services}
+    return {"source": source, "launch_grid": grid, "launch_block": block,
+        "ctas": len(cta_families), "families": families, "cta_families": cta_families,
+        "service_work": totals, "read_bytes": totals["memory:global_read"],
+        "write_bytes": totals["memory:global_write"], "limitations": limitations,
+        "source_selected_configuration_bound": False, "compiler_resources_bound": False,
+        "complete_source_service": False, "default_Forward_price_changed": False}
+
+
+def kimi_k3_kda_l2norm_source_work(kernel: KernelSpec, *, source_norm_backend, num_warps, num_stages):
+    """One Q or K norm: kernel2's32x128 source math and masked BF16 IO."""
+    _kda_frontend_parent_work(kernel)
+    if (source_norm_backend != "l2norm_fwd_kernel2" or type(num_warps) is not int or num_warps != 4
+            or type(num_stages) is not int or num_stages != 3):
+        raise ValueError("KDA L2norm requires explicit kernel2 and source default4warps/3stages")
+    head_rows = kernel.shape["rows"] * kernel.shape["heads"]
+    ctas = (head_rows + 31) // 32
+    live = (32,) * (head_rows // 32) + ((head_rows % 32,) if head_rows % 32 else ())
+    families = {rows: (("input", "memory:global_read", 2 * rows * 128),
+        ("square", "compute:compute_fma", 32 * 128),
+        ("reduce", "compute:compute_fma", 32 * 127),
+        ("epsilon", "compute:compute_fma", 32), ("rsqrt", "compute:compute_sfu", 32),
+        ("normalize", "compute:compute_fma", 32 * 128),
+        ("output", "memory:global_write", 2 * rows * 128)) for rows in dict.fromkeys(live)}
+    return _kda_frontend_work("vllm/third_party/flash_linear_attention/ops/l2norm.py:l2norm_fwd_kernel2",
+        (ctas, 1, 1), (128, 1, 1), families, live, (
+            "one_Q_or_K_norm_submission_not_both_or_whole_chunk",
+            "source_kernel2_MBLOCK32_BD128_eps1e6_no_global_rstd_output",
+            "masked_payload_keeps_full32_head_rows_square_reduce_rsqrt_and_normalize_math",
+            "FP32_reduction_add_minimum_not_compiled_shuffle_or_conversion_service"))
+
+
+def kimi_k3_kda_gate_source_work(kernel: KernelSpec, *, block_s, num_warps, num_stages, metadata_dtype):
+    """Safe-gate/beta source math with explicitly ideal prefix-scan additions.
+
+    Sigmoid is an exp/add/reciprocal mathematical projection. The63-add
+    prefix per column is an arithmetic minimum, not a compiler scan tree.
+    Both limitations remain explicit when this auxiliary is priced.
+    """
+    logical = _kda_frontend_parent_work(kernel)
+    if (kernel.attributes["gate_lower_bound"] != -5 or type(block_s) is not int or block_s not in (32, 64)
+            or type(num_warps) is not int or num_warps not in (2, 4, 8)
+            or type(num_stages) is not int or num_stages != 3 or metadata_dtype != "int32"):
+        raise ValueError("KDA gate requires explicit safe-gate source config and INT32 metadata")
+    live = tuple(min(64, length - begin) for length in logical["query_lengths"]
+        for begin in range(0, length, 64))
+    heads, tiles = kernel.shape["heads"], 128 // block_s
+    if len(live) > 65535 or heads > 65535:
+        raise NotImplementedError("KDA gate chunk/head grid exceeds CUDA axis capacity")
+    families = {}
+    for rows in dict.fromkeys(live):
+        families[("beta", rows)] = (("metadata", "memory:global_read", 16),
+            ("raw_beta", "memory:global_read", 2 * rows),
+            ("sigmoid_exp_reciprocal", "compute:compute_sfu", 2 * 64),
+            ("sigmoid_add", "compute:compute_fma", 64),
+            ("beta", "memory:global_write", 4 * rows))
+        families[("gate", rows)] = (("metadata", "memory:global_read", 16),
+            ("raw_gate", "memory:global_read", 2 * rows * block_s),
+            ("bias", "memory:global_read", 4 * block_s),
+            ("bias_add", "compute:compute_fma", 64 * block_s),
+            ("A_log", "memory:global_read", 4), ("A_exp", "compute:compute_sfu", 1),
+            ("A_multiply", "compute:compute_fma", 64 * block_s),
+            ("sigmoid_exp_reciprocal", "compute:compute_sfu", 2 * 64 * block_s),
+            ("sigmoid_add", "compute:compute_fma", 64 * block_s),
+            ("lower_bound", "compute:compute_fma", 64 * block_s),
+            ("prefix_minimum", "compute:compute_fma", 63 * block_s),
+            ("log2_scale", "compute:compute_fma", 64 * block_s),
+            ("gate", "memory:global_write", 4 * rows * block_s))
+    per_head = tuple(family for rows in live for family in (("beta", rows),) + (("gate", rows),) * tiles)
+    work = _kda_frontend_work("vllm/models/kimi_k3/nvidia/ops/third_party/kda/chunk.py:kda_gate_chunk_cumsum_vector_kernel",
+        (tiles + 1, len(live), heads), (num_warps * 32, 1, 1), families, per_head * heads, (
+            "complete_safe_gate_beta_submission_only_not_whole_chunk",
+            "one_beta_CTA_and_remaining_gate_dimension_CTAs_per_chunk_head",
+            "FP32_bias_and_A_log_reread_per_gate_CTA_not_once_per_model",
+            "sigmoid_exp_add_reciprocal_math_not_actual_compiler_lowering",
+            "prefix_scan63_adds_per_column_is_arithmetic_minimum_not_compiled_scan_service",
+            "padded64_token_gate_math_retained_after_bias_even_when_stores_are_masked",
+            "typed_negation_scan_shuffle_cast_address_and_actual_cache_services_unbound"))
+    work["prefix_scan_is_compiled_program"] = False
+    return work
+
+
+def kimi_k3_kda_zero_Akk_source_work(kernel: KernelSpec, *, tensor_iterator_source, source_input_layout):
+    """One official Torch2.13 contiguous BF16 zero Fill, with no input read."""
+    _kda_frontend_parent_work(kernel)
+    if tensor_iterator_source != "pytorch_2_13_sm90" or source_input_layout != "contiguous":
+        raise ValueError("KDA Akk zero requires explicit Torch2.13 contiguous BF16 Fill")
+    elements = kernel.shape["rows"] * kernel.shape["heads"] * 64
+    if elements >= 2**31 or 2 * (elements - 1) >= 2**31 - 1:
+        raise NotImplementedError("KDA Akk zero requires every split TensorIterator sublaunch")
+    ctas = (elements + 1023) // 1024
+    live = (1024,) * (elements // 1024) + ((elements % 1024,) if elements % 1024 else ())
+    families = {count: (("fill", "memory:global_write", 2 * count),) for count in dict.fromkeys(live)}
+    return _kda_frontend_work("Torch2.13 Fill.cpp/FillKernel.cu/CUDALoops.cuh:FillFunctor(0)",
+        (ctas, 1, 1), (128, 1, 1), families, live, (
+            "one_full_Akk_BF16_zero_fill_not_Aqk_or_FP32_Akkd_initialization",
+            "official_Torch213_128_threads_8_values_per_thread_contiguous_source_geometry",
+            "alignment_may_select_vectorized_or_unrolled_entry_with_same_grid",
+            "no_tensor_input_or_arithmetic_demand_no_guessed_compiler_resource"))
+
+
+def kimi_k3_kda_frontend_source_input(kernel: KernelSpec, hardware, *, stage, source_attributes):
+    """One declared frontend submission, validated from the parent contract."""
+    if not HWSpec.source_contract_supported("h200_partial_source_programs", hardware.hardware_id) or hardware.kernel_memory_model != "gpu_mshr":
+        raise NotImplementedError("KDA frontend requires H200 GPU services")
+    owners = {
+        "q_l2norm": (kimi_k3_kda_l2norm_source_work, {"source_norm_backend", "num_warps", "num_stages"}),
+        "k_l2norm": (kimi_k3_kda_l2norm_source_work, {"source_norm_backend", "num_warps", "num_stages"}),
+        "gate_cumsum_beta": (kimi_k3_kda_gate_source_work, {"block_s", "num_warps", "num_stages", "metadata_dtype"}),
+        "zero_Akk": (kimi_k3_kda_zero_Akk_source_work, {"tensor_iterator_source", "source_input_layout"})}
+    if type(stage) is not str or stage not in owners or type(source_attributes) is not dict:
+        raise ValueError("KDA frontend requires one exact source stage and explicit caller facts")
+    owner, fields = owners[stage]
+    if set(source_attributes) != fields:
+        raise ValueError("KDA frontend source facts must exactly cover the stage contract")
+    work = owner(kernel, **source_attributes)
+    return _kda_frontend_source_resource_input(work, hardware)
+
+
+def _kda_frontend_source_resource_input(work, hardware):
+    """Existing rates for the three closed frontend source-work producers."""
+    if not HWSpec.source_contract_supported("h200_partial_source_programs", hardware.hardware_id) or hardware.kernel_memory_model != "gpu_mshr":
+        raise NotImplementedError("KDA frontend requires H200 GPU services")
+    source = work["source"]
+    allowed = ("vllm/third_party/flash_linear_attention/ops/l2norm.py:l2norm_fwd_kernel2",
+        "vllm/models/kimi_k3/nvidia/ops/third_party/kda/chunk.py:kda_gate_chunk_cumsum_vector_kernel",
+        "Torch2.13 Fill.cpp/FillKernel.cu/CUDALoops.cuh:FillFunctor(0)")
+    if source not in allowed:
+        raise ValueError("KDA frontend input requires a closed source-work producer")
+    total = work["service_work"]
+    read, write = float(work["read_bytes"]), float(work["write_bytes"])
+    demand = build_forward_demand(read + write, read + write, False, {
+        "compute_tensor": total["compute:compute_tensor"], "compute_fma": total["compute:compute_fma"],
+        "compute_sfu": total["compute:compute_sfu"], "compute_alu": 0.0})
+    demand["l1_cache"] = demand["xbar"] = 0.0
+    workers = min(work["ctas"], hardware.num_compute_units)
+    inp = PredictionInput(demand_per_resource=demand, eta=1.0, wave_efficiency=1.0,
+        active_units=workers, sm_freq_hz=hardware.nominal_sm_freq_hz,
+        dram_freq_hz=hardware.nominal_dram_freq_hz, grid_size=work["ctas"],
+        block_size=math.prod(work["launch_block"]), launch_grid=work["launch_grid"], launch_block=work["launch_block"],
+        variant="kda_chunk_frontend", mem_model="gpu_mshr", compute_demands=(), memory_paths=(),
+        pipeline_plan=None, support_level="partial", limitations=gpu_partial_limitations(hardware,
+            *work["limitations"], "source_or_math_projection_not_selected_compiler_or_native_provider",
+            "cold_global_role_payload_not_physical_DRAM_transactions_or_native_cache_residency",
+            "serial_CTA_stages_SM_stride_not_compiler_overlap_or_actual_occupancy",
+            "typed_services_compiler_memory_ABI_normal_capacity_and_accuracy_unbound",
+            "no_new_rate_default_dispatch_change_or_production_duration_fit"))
+    producers, requests = gpu_memory_source(hardware)
+    inp = attach_structured_contract(inp, hardware, transaction_bytes=None, path_name="global_memory",
+        source_producers_per_unit=producers, independent_requests_per_producer=requests)
+    inp = split_global_memory_paths(inp, read_l2_bytes=read, read_dram_bytes=read,
+        write_l2_bytes=write, write_dram_bytes=write)
+    layouts = {family: tuple(bind_pipeline_stage_template(name, service, amount / total[service],
+        service.startswith("memory:")) for name, service, amount in stages)
+        for family, stages in work["families"].items()}
+    tasks = tuple(PipelineTaskDemand(name=f"kda_frontend_cta{cta}", worker=cta % workers, stages=layouts[family])
+        for cta, family in enumerate(work["cta_families"]))
+    return attach_pipeline_work_plan(inp, hardware,
+        PipelineWorkPlan(worker_count=workers, tasks=tasks, buffers=())), read + write
+
+
+def kimi_k3_kda_chunk_stage_source_input(kernel: KernelSpec, hardware):
+    """One explicitly bound chunk child under the exact public source contract.
+
+    The header retains the parent's BF16 activation geometry. Stage owners
+    describe mixed FP32 gate/state and metadata roles; this never casts their
+    work to BF16. Reconstructing the launchless parent uses the public contract
+    and does not erase facts from the child whose exact launch Core validates.
+    """
+    if (kernel.kind is not KernelKind.VECTOR or not HWSpec.source_contract_supported("h200_partial_source_programs", kernel.hardware_id)
+            or kernel.dtype != "bf16" or kernel.variant not in (
+                "kimi_k3_kda_prefill", "kimi_k3_kda_mixed", "kimi_k3_kda_context_prefill")
+            or kernel.execution_support != "unsupported"
+            or kernel.unsupported_reason != "typed_service_unavailable" or kernel.launch is None
+            or kernel.attributes["source_component"] != "vllm_0_30_kimi_k3_triton_chunk"):
+        raise ValueError("KDA child requires its exact partial H200 source contract")
+    parent_fields = ("stage", "state_indices", "state_pool_slots", "query_start_loc",
+        "has_initial_state", "gate_lower_bound")
+    parent = dataclasses.replace(kernel, launch=None, unsupported_reason="launch_selector_unavailable",
+        attributes={name: kernel.attributes[name] for name in parent_fields})
+    attrs = kernel.attributes
+    configs = attrs["source_selected_configs"]
+    stage = attrs["source_stage"]
+    if stage in ("intra_sub_chunk", "inter_solve"):
+        raise NotImplementedError("KDA intra/solve FP32/TF32 typed dot services remain unpriced")
+    if stage in ("q_l2norm", "k_l2norm"):
+        result = kimi_k3_kda_frontend_source_input(parent, hardware, stage=stage,
+            source_attributes={"source_norm_backend": attrs["source_norm_backend"],
+                "num_warps": 4, "num_stages": 3})
+    elif stage == "gate_cumsum_beta":
+        config = configs["gate"]
+        result = kimi_k3_kda_frontend_source_input(parent, hardware, stage=stage,
+            source_attributes={"block_s": config["BS"], "num_warps": config["num_warps"],
+                "num_stages": config["num_stages"], "metadata_dtype": attrs["metadata_dtype"]})
+    elif stage == "zero_Akk":
+        result = kimi_k3_kda_frontend_source_input(parent, hardware, stage=stage,
+            source_attributes={"tensor_iterator_source": attrs["tensor_iterator_source"],
+                "source_input_layout": "contiguous"})
+    elif stage == "recompute_w_u":
+        config = configs["recompute"]
+        result = kimi_k3_kda_recompute_source_input(parent, hardware,
+            num_warps=config["num_warps"], num_stages=config["num_stages"], metadata_dtype=attrs["metadata_dtype"])
+    elif stage == "state":
+        config = configs["state"]
+        result = kimi_k3_kda_state_source_input(parent, hardware, block_v=config["BV"],
+            num_warps=config["num_warps"], num_stages=config["num_stages"],
+            metadata_dtype=attrs["metadata_dtype"], chunk_offsets_dtype=attrs["chunk_offsets_dtype"])
+    elif stage == "output":
+        config = configs["output"]
+        result = kimi_k3_kda_output_source_input(parent, hardware, block_k=config["BK"], block_v=config["BV"],
+            num_warps=config["num_warps"], num_stages=config["num_stages"], metadata_dtype=attrs["metadata_dtype"])
+    else:
+        raise ValueError("KDA child requires one of the exact nine source stages")
+    inp, traffic = result
+    if inp.launch_grid != kernel.launch.grid or inp.launch_block != kernel.launch.block:
+        raise ValueError("KDA source resource geometry disagrees with the bound child launch")
+    return inp, traffic
+
+
+def kimi_k3_kda_chunk_source_inputs(kernel: KernelSpec, hardware, *, source_attributes):
+    """All nine conditional submissions; unpriced typed dots remain explicit.
+
+    This source input composition is not default public child admission.
+    No whole-chunk prediction can be formed from the priced subset alone.
+    """
+    _kda_frontend_parent_work(kernel)
+    if not HWSpec.source_contract_supported("h200_partial_source_programs", hardware.hardware_id) or hardware.kernel_memory_model != "gpu_mshr":
+        raise NotImplementedError("KDA chunk source composition requires H200 GPU services")
+    expected = {"source_compiler": "triton_3_7_1_cuda_sm90", "source_norm_backend": "l2norm_fwd_kernel2",
+        "source_metadata_state": "cached_actual_cu_seqlens_identity", "tensor_iterator_source": "pytorch_2_13_sm90",
+        "metadata_dtype": "int32", "chunk_offsets_dtype": "int64"}
+    if (type(source_attributes) is not dict
+            or set(source_attributes) != set(expected) | {"source_selected_configs", "source_use_gather"}
+            or any(source_attributes[name] != value for name, value in expected.items())
+            or type(source_attributes["source_use_gather"]) is not bool):
+        raise ValueError("KDA composition requires complete explicit prepared compiler/source facts")
+    configs = source_attributes["source_selected_configs"]
+    fields = {"gate": {"BS", "num_warps", "num_stages"}, "intra": {"num_warps", "num_stages"},
+        "inter_solve": {"BK", "num_warps", "num_stages"}, "recompute": {"num_warps", "num_stages"},
+        "state": {"BV", "num_warps", "num_stages"}, "output": {"BK", "BV", "num_warps", "num_stages"}}
+    if (type(configs) is not dict or set(configs) != set(fields)
+            or any(type(configs[name]) is not dict or set(configs[name]) != keys for name, keys in fields.items())):
+        raise ValueError("KDA composition requires all six complete source configurations")
+    norm = kimi_k3_kda_l2norm_source_work(kernel, source_norm_backend=source_attributes["source_norm_backend"],
+        num_warps=4, num_stages=3)
+    gate = kimi_k3_kda_gate_source_work(kernel, block_s=configs["gate"]["BS"],
+        num_warps=configs["gate"]["num_warps"], num_stages=configs["gate"]["num_stages"], metadata_dtype=source_attributes["metadata_dtype"])
+    zero = kimi_k3_kda_zero_Akk_source_work(kernel,
+        tensor_iterator_source=source_attributes["tensor_iterator_source"], source_input_layout="contiguous")
+    combined = kimi_k3_kda_intra_solve_source_work(kernel,
+        intra_num_warps=configs["intra"]["num_warps"], intra_num_stages=configs["intra"]["num_stages"],
+        inter_block_k=configs["inter_solve"]["BK"], inter_num_warps=configs["inter_solve"]["num_warps"],
+        inter_num_stages=configs["inter_solve"]["num_stages"], use_gather=source_attributes["source_use_gather"],
+        metadata_dtype=source_attributes["metadata_dtype"])
+    recompute_args = dict(num_warps=configs["recompute"]["num_warps"],
+        num_stages=configs["recompute"]["num_stages"], metadata_dtype=source_attributes["metadata_dtype"])
+    state_args = dict(block_v=configs["state"]["BV"], num_warps=configs["state"]["num_warps"],
+        num_stages=configs["state"]["num_stages"], metadata_dtype=source_attributes["metadata_dtype"],
+        chunk_offsets_dtype=source_attributes["chunk_offsets_dtype"])
+    output_args = dict(block_k=configs["output"]["BK"], block_v=configs["output"]["BV"],
+        num_warps=configs["output"]["num_warps"], num_stages=configs["output"]["num_stages"],
+        metadata_dtype=source_attributes["metadata_dtype"])
+    works = {"q_l2norm": norm, "k_l2norm": norm, "gate_cumsum_beta": gate, "zero_Akk": zero}
+    for role, prefix in (("intra_sub_chunk", "intra"), ("inter_solve", "inter")):
+        total = combined[prefix + "_service_work"]
+        works[role] = {"source": combined["source"], "service_work": total,
+            "launch_grid": combined[prefix + "_launch_grid"], "launch_block": combined[prefix + "_launch_block"],
+            "read_bytes": total["memory:global_read"], "write_bytes": total["memory:global_write"],
+            "ctas": combined[prefix + "_ctas"], "typed_service_available": False}
+    works["recompute_w_u"] = kimi_k3_kda_recompute_source_work(kernel, **recompute_args)
+    works["state"] = kimi_k3_kda_state_source_work(kernel, **state_args)
+    works["output"] = kimi_k3_kda_output_source_work(kernel, **output_args)
+    inputs = {role: _kda_frontend_source_resource_input(works[role], hardware)[0] for role in
+        ("q_l2norm", "k_l2norm", "gate_cumsum_beta", "zero_Akk")}
+    inputs["recompute_w_u"] = kimi_k3_kda_recompute_source_input(kernel, hardware, **recompute_args)[0]
+    inputs["state"] = kimi_k3_kda_state_source_input(kernel, hardware, **state_args)[0]
+    inputs["output"] = kimi_k3_kda_output_source_input(kernel, hardware, **output_args)[0]
+    calls = []
+    previous = ()
+    for role, work in works.items():
+        available = role in inputs
+        calls.append({"role": role, "source_work": work, "resource_input": inputs[role] if available else None,
+            "predecessors": previous, "unpriced_reason": None if available else "FP32/TF32 typed dot services unbound"})
+        previous = (role,)
+    services = tuple(dict.fromkeys(service for work in works.values() for service in work["service_work"]))
+    totals = {service: sum(work["service_work"][service] for work in works.values()
+        if service in work["service_work"]) for service in services}
+    return {"calls": tuple(calls), "resource_projection_total_work": totals,
+        "submission_count": len(calls), "resource_input_count": len(inputs),
+        "unpriced_submissions": ("intra_sub_chunk", "inter_solve"), "whole_chunk_latency_s": None,
+        "all_calls_priced": False, "actual_metadata_cache_history_bound": False,
+        "source_selected_configuration_bound": False, "compiler_resources_bound": False,
+        "default_public_child_admission": False, "native_normal_or_accuracy_accepted": False}
 
 
 def kimi_k3_kda_decode_logical_work(kernel: KernelSpec):
@@ -17915,13 +18873,16 @@ def kimi_k3_situ_logical_work(kernel: KernelSpec):
             {"role": "gate_up", "dtype": "bf16", "elements": 2 * elements, "bytes": 4 * elements, "access": "read"},
             {"role": "output", "dtype": "bf16", "elements": elements, "bytes": 2 * elements, "access": "write"}),
         "source_launch": {"grid": (rows, 1, 1), "block": (min(intermediate, 1024), 1, 1)},
+        "demand": {"compute_tensor": 0.0, "compute_vector": 0.0, "compute_reduction": 0.0,
+                   "compute_fma": float(8 * elements), "compute_sfu": float(3 * elements),
+                   "compute_alu": 0.0},
         "unbound_service_inputs": ("tanh_argument_magnitude_activity",
                                    "actual_toolchain_and_compiler_math_mode",
                                    "conversion_address_and_per_thread_coefficient_issue_counts"),
         "limitations": (
             "ordinary_unquantized_cuda_situ_not_masked_or_routed_mxfp4_activation_fusion",
             "scalar_coefficients_and_reciprocals_are_source_invariants_not_assigned_issue_counts",
-            "tanhf_compiler_paths_and_dynamic_operand_magnitudes_unbound_no_sfu_rate_assigned",
+            "tanhf_calls_use_ideal_mathematical_SFU_group_not_native_instruction_or_rate_binding",
             "typed_logical_bytes_not_observed_physical_dram_or_compiler_local_traffic",
             "source_launch_is_not_actual_provider_or_runtime_acceptance"),
     }
@@ -18058,6 +19019,16 @@ def silu_source_arithmetic(elements, dtype, *, has_clamp):
 
 
 def dense_fp16_source_logical_work(kernel: KernelSpec):
+    """Existing FP16 mathematical program, preserving FP16 operand identities."""
+    return _dense_16bit_source_logical_work(kernel, "fp16", "dense_fp16_source_flops_bytes_v1")
+
+
+def dense_bf16_source_logical_work(kernel: KernelSpec):
+    """The same source arithmetic with real BF16 operands, without a native claim."""
+    return _dense_16bit_source_logical_work(kernel, "bf16", "dense_bf16_source_flops_bytes_v1")
+
+
+def _dense_16bit_source_logical_work(kernel: KernelSpec, source_dtype, program):
     """Useful dense source math and typed payloads, independent of a launch.
 
     Ordinary floating arithmetic counts one operation per add/multiply/divide;
@@ -18065,14 +19036,15 @@ def dense_fp16_source_logical_work(kernel: KernelSpec):
     These operands describe logical traffic, not DRAM transactions or cache
     residency, and the result cannot supply a native execution envelope.
     """
-    if (kernel.dtype != "fp16" or kernel.launch is not None
+    if (kernel.dtype != source_dtype or kernel.launch is not None
             or kernel.execution_support != "unsupported"
             or "mathematical_program" not in kernel.attributes
-            or kernel.attributes["mathematical_program"] != "dense_fp16_source_flops_bytes_v1"
+            or kernel.attributes["mathematical_program"] != program
             or not ((kernel.kind is KernelKind.VECTOR and kernel.variant in (
                 "gather", "rmsnorm", "add_rmsnorm", "silu", "rotary"))
+                or (source_dtype == "bf16" and kernel.kind is KernelKind.VECTOR and kernel.variant == "elementwise")
                 or (kernel.kind is KernelKind.KV_CACHE and kernel.variant == "paged_kv_cache"))):
-        raise ValueError("dense FP16 source work requires its unbound mathematical contract")
+        raise ValueError(f"dense {source_dtype.upper()} source work requires its unbound mathematical contract")
     elements = (kernel.shape["rows"] * kernel.shape["hidden"]
         if kernel.variant in ("rmsnorm", "add_rmsnorm") else kernel.shape["element_count"])
     operands = []
@@ -18085,24 +19057,35 @@ def dense_fp16_source_logical_work(kernel: KernelSpec):
         operands.append({"role": role, "dtype": dtype, "elements": count,
             "bytes": count * byte_width, "access": access})
 
-    if kernel.variant == "gather":
+    if kernel.variant == "elementwise":
+        operation = kernel.attributes["operation"]
+        if operation not in ("add", "mul", "unary", "copy", "fill", "read", "cast_bf16_float32"):
+            raise ValueError("BF16 source elementwise arithmetic is not bound for this operation")
+        operand("input", source_dtype, elements * kernel.attributes["reads"], "read")
+        operand("output", "fp32" if operation == "cast_bf16_float32" else source_dtype,
+            elements * kernel.attributes["writes"], "write")
+        # Same mathematical operation count as the established elementwise
+        # owner; no conversion, compiler issue or launch cost is inferred.
+        demand["compute_fma"] = elements if operation in ("add", "mul", "unary") else 0
+        primitives = {operation: demand["compute_fma"]}
+    elif kernel.variant == "gather":
         if kernel.attributes["gather_factor"] != 1 or not kernel.attributes["materialized_output"]:
-            raise ValueError("dense FP16 gather requires one materialized source copy")
+            raise ValueError(f"dense {source_dtype.upper()} gather requires one materialized source copy")
         index_count, index_bytes = (kernel.attributes[name] for name in ("index_count", "index_bytes"))
         if index_count and index_bytes != 8:
-            raise ValueError("dense FP16 indexed gather requires INT64 indices")
-        operand("input", "fp16", elements, "read")
+            raise ValueError(f"dense {source_dtype.upper()} indexed gather requires INT64 indices")
+        operand("input", source_dtype, elements, "read")
         if index_count:
             operand("indices", "int64", index_count, "read")
-        operand("output", "fp16", elements, "write")
+        operand("output", source_dtype, elements, "write")
     elif kernel.variant in ("rmsnorm", "add_rmsnorm"):
         rows, hidden = kernel.shape["rows"], kernel.shape["hidden"]
-        operand("input", "fp16", elements, "read")
-        operand("gamma", "fp16", hidden, "read")
+        operand("input", source_dtype, elements, "read")
+        operand("gamma", source_dtype, hidden, "read")
         if kernel.variant == "add_rmsnorm":
-            operand("residual_input", "fp16", elements, "read")
-            operand("residual_output", "fp16", elements, "write")
-        operand("output", "fp16", elements, "write")
+            operand("residual_input", source_dtype, elements, "read")
+            operand("residual_output", source_dtype, elements, "write")
+        operand("output", source_dtype, elements, "write")
         primitives = {"square": elements, "sum_add": rows * (hidden - 1),
             "mean_multiply": rows, "epsilon_add": rows,
             "output_multiply": 2 * elements, "rsqrt": rows,
@@ -18113,10 +19096,10 @@ def dense_fp16_source_logical_work(kernel: KernelSpec):
         demand["compute_sfu"] = rows
     elif kernel.variant == "silu":
         if kernel.attributes["swiglu_limit"] is not None:
-            raise ValueError("dense FP16 SiLU mathematical program excludes clamp")
-        operand("gate_up_input", "fp16", 2 * elements, "read")
-        operand("output", "fp16", elements, "write")
-        arithmetic = silu_source_arithmetic(elements, "fp16", has_clamp=False)
+            raise ValueError(f"dense {source_dtype.upper()} SiLU mathematical program excludes clamp")
+        operand("gate_up_input", source_dtype, 2 * elements, "read")
+        operand("output", source_dtype, elements, "write")
+        arithmetic = silu_source_arithmetic(elements, source_dtype, has_clamp=False)
         primitives = arithmetic["mathematical_primitives"]
         demand.update(arithmetic["baseline_demand"])
     elif kernel.variant == "rotary":
@@ -18124,13 +19107,13 @@ def dense_fp16_source_logical_work(kernel: KernelSpec):
             "seq_len", "head_dim", "num_query_heads", "num_kv_heads"))
         query_elements, key_elements = tokens * query_heads * head_dim, tokens * key_heads * head_dim
         if head_dim % 2 or elements != query_elements + key_elements:
-            raise ValueError("dense FP16 rotary requires complete full-head Q/K pairs")
-        operand("query_input", "fp16", query_elements, "read")
-        operand("key_input", "fp16", key_elements, "read")
+            raise ValueError(f"dense {source_dtype.upper()} rotary requires complete full-head Q/K pairs")
+        operand("query_input", source_dtype, query_elements, "read")
+        operand("key_input", source_dtype, key_elements, "read")
         operand("positions", "int64", tokens, "read")
-        operand("selected_cos_sin", "fp16", tokens * head_dim, "read")
-        operand("query_output", "fp16", query_elements, "write")
-        operand("key_output", "fp16", key_elements, "write")
+        operand("selected_cos_sin", source_dtype, tokens * head_dim, "read")
+        operand("query_output", source_dtype, query_elements, "write")
+        operand("key_output", source_dtype, key_elements, "write")
         primitives = {"multiply": 2 * elements, "add_subtract": elements}
         demand["compute_fma"] = 3 * elements
     else:
@@ -18140,12 +19123,12 @@ def dense_fp16_source_logical_work(kernel: KernelSpec):
                 or kernel.attributes["kv_cache_dtype"] != "auto"
                 or not kernel.attributes["cache_storage_matches_input"]
                 or not kernel.attributes["slot_mapping_all_valid"]):
-            raise ValueError("dense FP16 paged cache requires matching auto storage and valid slots")
-        operand("key", "fp16", elements, "read")
-        operand("value", "fp16", elements, "read")
+            raise ValueError(f"dense {source_dtype.upper()} paged cache requires matching auto storage and valid slots")
+        operand("key", source_dtype, elements, "read")
+        operand("value", source_dtype, elements, "read")
         operand("slot_mapping", "int64", tokens, "read")
-        operand("key_cache", "fp16", elements, "write")
-        operand("value_cache", "fp16", elements, "write")
+        operand("key_cache", source_dtype, elements, "write")
+        operand("value_cache", source_dtype, elements, "write")
     return {"mathematical_program": kernel.attributes["mathematical_program"],
         "operands": tuple(operands), "mathematical_primitives": primitives, "demand": demand,
         "logical_bytes": sum(item["bytes"] for item in operands),
@@ -18449,6 +19432,8 @@ def vllm_plain_greedy_sampling_logical_work(kernel: KernelSpec):
     }
 
 
+
+
 def vllm_mtp_eager_roofline_work(kernel: KernelSpec):
     """Logical typed payload of version-bound draft/control materializations.
 
@@ -18467,6 +19452,173 @@ def vllm_mtp_eager_roofline_work(kernel: KernelSpec):
     operation = kernel.attributes["operation"]
     demand = {role: 0.0 for role in (
         "compute_tensor", "compute_vector", "compute_reduction", "compute_fma", "compute_sfu", "compute_alu")}
+    if operation == "dspark_roundtrip_prepare":
+        # Source metadata projection with explicit logical slot candidates.
+        # Both counters must be actual inputs from the preceding verifier.
+        valid = kernel.attributes["accepted_drafts"] + 1
+        operands = (
+            {"role": "target_positions", "dtype": "int64", "parent_shape": (6,), "read_elements": valid, "bytes": 8 * valid, "access": "read"},
+            {"role": "context_slot_candidates", "dtype": "int64", "parent_shape": (6,), "read_elements": valid, "bytes": 8 * valid, "access": "read"},
+            {"role": "query_slot_candidates", "dtype": "int64", "parent_shape": (5,), "read_elements": 5, "bytes": 40, "access": "read"},
+            {"role": "num_sampled", "dtype": "int32", "parent_shape": (1,), "read_elements": 1, "bytes": 4, "access": "read"},
+            {"role": "num_rejected", "dtype": "int32", "parent_shape": (1,), "read_elements": 1, "bytes": 4, "access": "read"},
+            {"role": "context_positions", "dtype": "int64", "shape": (6,), "bytes": 48, "access": "write"},
+            {"role": "context_slots", "dtype": "int64", "shape": (6,), "bytes": 48, "access": "write"},
+            {"role": "query_positions", "dtype": "int64", "shape": (5,), "bytes": 40, "access": "write"},
+            {"role": "query_slots", "dtype": "int64", "shape": (5,), "bytes": 40, "access": "write"},
+            {"role": "seq_lens", "dtype": "int32", "shape": (1,), "bytes": 4, "access": "write"})
+        return {"operation": operation,
+            "source": "vllm/v1/worker/gpu/spec_decode/dflash/speculator.py:prepare_dflash_inputs kernel context/query metadata; input_batch.py:InputBuffers INT32 seq_lens",
+            "projection": "typed_counter_consuming_roundtrip_metadata_with_logical_slot_candidates",
+            "read_bytes": 16 * valid + 48, "write_bytes": 180, "logical_bytes": 16 * valid + 228,
+            "input_parent_bytes": 144, "operands": operands, "demand": demand,
+            "mathematical_primitives": {}, "arithmetic_flops": 0,
+            "typed_mathematical_work": {"int64_position_values_read": valid,
+                "int64_context_slot_values_read": valid, "int64_query_slot_values_read": 5,
+                "int32_counter_values_read": 2, "int64_metadata_values_written": 22,
+                "int32_seq_len_values_written": 1, "issue_resource_mapping_complete": False},
+            "output_shapes": {"context_positions": (6,), "context_slots": (6,),
+                "query_positions": (5,), "query_slots": (5,), "seq_lens": (1,)},
+            "output_dtypes": {"context_positions": "int64", "context_slots": "int64",
+                "query_positions": "int64", "query_slots": "int64", "seq_lens": "int32"},
+            "all_outputs_fresh_and_independent": True, "all_output_elements_written": True,
+            "valid_context_prefix": (0, valid), "context_initialized_tail": (valid, 6),
+            "context_tail_values": {"positions": 0, "slots": -1},
+            "counter_scenario_expected": {"num_sampled": valid, "num_rejected": 6 - valid},
+            "source_value_program": {"valid_count": "6-num_rejected; equals num_sampled in nonchunked greedy scenario",
+                "query_positions": "target_positions[valid_count-1]+1+offset, offset0..4",
+                "seq_lens": "target_positions[valid_count-1]+1+5; equals target_positions[0]+valid_count+5 for consecutive target positions"},
+            "complete_native_work_bound": False, "physical_slot_values_bound": False,
+            "limitations": ("typed_public_metadata_projection_not_full_source_prepare_kernel_launch_or_price",
+                "slot_candidates_are_declared_caller_logical_arena_facts_not_block_table_translation_or_null_block_eviction",
+                "actual_num_sampled_and_num_rejected_verifier_writers_must_be_bound_as_inputs",
+                "unclamped_eager_nonchunked_B1_N6_K5_source_domain_requires_caller_validation",
+                "input_ID_anchor_noise_sample_index_sampling_state_graph_padding_and_CP_services_excluded",
+                "last_sampled_not_read_because_this_projection_does_not_produce_query_input_IDs",
+                "public_role_reads_not_lane_replicated_source_rereads_DRAM_or_native_integer_issue",
+                "integer_address_predicate_counter_and_translation_services_not_floating_FMA_or_new_rate")}
+    if operation == "dspark_greedy_verify":
+        # Minimal typed mathematical prefix projection AFTER independently
+        # priced target ID selection. Not the full native0.30 rejection chain.
+        accepted = kernel.attributes["accepted_drafts"]
+        valid = accepted + 1
+        checked = min(valid, 5)
+        operands = (
+            {"role": "draft_token_ids", "dtype": "int32", "shape": (5,), "bytes": 20, "access": "read"},
+            {"role": "target_selected_ids", "dtype": "int64", "shape": (valid,), "bytes": 8 * valid, "access": "read"},
+            {"role": "sampled_active_prefix", "dtype": "int64", "shape": (1, valid), "bytes": 8 * valid, "access": "write"},
+            {"role": "num_sampled", "dtype": "int32", "shape": (1,), "bytes": 4, "access": "write"},
+            {"role": "num_rejected", "dtype": "int32", "shape": (1,), "bytes": 4, "access": "write"})
+        return {"operation": operation,
+            "source": "vllm0.30 rejection_sampler_utils.py:_rejection_kernel/_insert_resampled_kernel; input_batch.py:_get_num_sampled_and_rejected_kernel",
+            "projection": "typed_greedy_prefix_from_independently_selected_target_ids",
+            "read_bytes": 20 + 8 * valid, "write_bytes": 8 * valid + 8,
+            "logical_bytes": 28 + 16 * valid, "operands": operands, "demand": demand,
+            "mathematical_primitives": {}, "arithmetic_flops": 0,
+            "typed_mathematical_work": {"int32_draft_values_read": 5,
+                "int64_target_values_read": valid, "int64_token_equality_checks": checked,
+                "int64_active_sampled_values_written": valid, "int32_counter_values_written": 2,
+                "issue_resource_mapping_complete": False},
+            "output_shapes": {"sampled": (1, 6), "num_sampled": (1,), "num_rejected": (1,)},
+            "output_dtypes": {"sampled": "int64", "num_sampled": "int32", "num_rejected": "int32"},
+            "sampled_parent_bytes": 48, "sampled_active_prefix": (0, valid),
+            "sampled_unwritten_tail": (valid, 6), "sampled_tail_initialized": False,
+            "counter_scenario": {"num_sampled": valid, "num_rejected": 5 - accepted},
+            "accepted_drafts_scenario": accepted,
+            "scenario_provenance": "explicit_independent_schedule_not_executed_token_match",
+            "complete_native_work_bound": False, "acceptance_values_observed": False,
+            "limitations": ("typed_mathematical_public_role_projection_not_complete_vllm030_stats_resample_launch_or_price",
+                "target_ID_selection_argmax_and_bonus_argmax_independently_priced_not_recounted",
+                "partial_stats_resample_scratch_RNG_metadata_temporaries_and_source_rereads_excluded",
+                "sampled_INT64_parent_tail_uninitialized_not_zero_minus_one_or_valid_tokens",
+                "valid_prefix_only_no_read_or_materialization_of_unwritten_tail",
+                "nonchunked_greedy_B1_K5_all_real_drafts_no_graph_padding_probabilistic_or_synthetic_acceptance",
+                "integer_ID_equality_control_conversion_and_counter_services_not_floating_FMA_or_new_rate",
+                "actual_source_writer_alias_readiness_and_lifetime_must_be_bound_by_caller")}
+    if operation == "dspark_zero_query":
+        # _insert_context_kv creates initialized zeros, never an uninitialized
+        # alias. The fused insert consumes this real BF16 dummy query.
+        write = elements * size
+        return {"operation": operation,
+            "source": "vllm/models/deepseek_v4/nvidia/dspark.py:_insert_context_kv dummy_q=torch.zeros",
+            "read_bytes": 0, "write_bytes": write, "logical_bytes": write, "demand": demand,
+            "operands": ({"role": "dummy_q", "dtype": "bf16", "bytes": write, "access": "write"},),
+            "input_shapes": (), "output_shape": (rows, width // 512, 512),
+            "mathematical_primitives": {}, "arithmetic_flops": 0,
+            "typed_mathematical_work": {"bf16_initialized_zero_values": elements},
+            "complete_native_work_bound": False, "zero_initialized_source_semantics": True,
+            "limitations": ("explicit_BF16_dummy_query_zeros_not_uninitialized_storage_or_alias",
+                "public_output_payload_not_observed_DRAM_or_allocator_temporaries",
+                "fused_KV_insert_consumption_and_parent_lifetime_are_separate_caller_contracts",
+                "actual_zero_fill_provider_compiler_launch_and_scratch_unbound")}
+    if operation == "dspark_swa_indices":
+        # Source kernel expression payload for explicitly all-valid block5.
+        # Each query reads one validity, req ID, two cuQ bounds and seq_len;
+        # only active index offsets load the physical block table.
+        pairs = 5 * sum(5 + min(kv - 5, 128) for kv in kernel.attributes["kv_lens"])
+        operands = (
+            {"role": "is_valid_token", "dtype": "bool", "bytes": rows, "access": "read"},
+            {"role": "token_to_req_indices", "dtype": "int32", "bytes": 4 * rows, "access": "read"},
+            {"role": "query_start_loc_bounds", "dtype": "int32", "bytes": 8 * rows, "access": "read"},
+            {"role": "seq_lens", "dtype": "int32", "bytes": 4 * rows, "access": "read"},
+            {"role": "block_table_active_slot_loads", "dtype": "int32", "bytes": 4 * pairs, "access": "read"},
+            {"role": "swa_indices", "dtype": "int32", "bytes": 4 * rows * width, "access": "write"},
+            {"role": "swa_lens", "dtype": "int32", "bytes": 4 * rows, "access": "write"})
+        read, write = 17 * rows + 4 * pairs, 4 * rows * (width + 1)
+        return {"operation": operation,
+            "source": "vllm/v1/attention/backends/mla/sparse_swa.py:ComputeDSparkNoncausalSWAIndicesKernel.kernel",
+            "read_bytes": read, "write_bytes": write, "logical_bytes": read + write, "operands": operands,
+            "demand": demand, "mathematical_primitives": {}, "arithmetic_flops": 0,
+            "active_slot_loads": pairs, "index_capacity_values": rows * width,
+            "output_shapes": {"swa_indices": (rows, 1, width), "swa_lens": (rows,)},
+            "typed_mathematical_work": {"bool_validity_reads": rows, "int32_request_ID_reads": rows,
+                "int32_query_bound_reads": 2 * rows, "int32_seq_len_reads": rows,
+                "int32_block_table_reads": pairs, "int32_index_writes": rows * width,
+                "int32_length_writes": rows, "issue_resource_mapping_complete": False},
+            "complete_native_work_bound": False, "physical_indices_values_bound": False,
+            "limitations": ("all_valid_block5_only_not_padded_invalid_or_graph_rows",
+                "source_expression_load_bytes_not_unique_addresses_DRAM_transactions_or_cache_residency",
+                "physical_index_values_require_actual_block_table_parent_alias_and_readiness",
+                "slot_mapping_validity_comparison_is_a_separate_caller_producer",
+                "integer_address_divide_remainder_compare_and_predicate_services_not_floating_arithmetic",
+                "full_width_indices_include_minus_one_tail_writes_not_extra_valid_KV_tokens",
+                "actual_native_provider_compiler_launch_scratch_and_lifetime_unbound")}
+    if operation in ("dspark_aux_mean", "dspark_repeat_hc", "dspark_sigmoid"):
+        # Public mathematical operands, not compiler loads, instruction
+        # issue, temporary buffers, native reduction or copy launch claims.
+        if operation == "dspark_aux_mean":
+            read, write = 4 * elements * size, elements * size
+            primitives = {"add": 3 * elements, "divide": elements}
+            demand["compute_fma"] = float(4 * elements)
+            input_shape, output_shape = (rows, 4, width), (rows, width)
+            source = "vllm/models/deepseek_v4/nvidia/model.py:DeepseekV4Model.forward aux_recon.mean(dim=1)"
+            typed = {"bf16_input_values": 4 * elements, "bf16_output_values": elements}
+        elif operation == "dspark_repeat_hc":
+            read, write = kernel.shape["source_rows"] * width * size, elements * size
+            primitives = {}
+            input_shape, output_shape = (kernel.shape["source_rows"], width), (kernel.shape["source_rows"], 4, width)
+            source = "vllm/models/deepseek_v4/nvidia/dspark.py:DSparkDeepseekV4Model.forward inputs_embeds.unsqueeze(-2).repeat(1,hc_mult,1)"
+            typed = {"bf16_materialized_output_values": elements}
+        else:
+            read, write = elements * size, elements * size
+            primitives = {"exp": elements, "add": elements, "divide": elements}
+            demand["compute_fma"], demand["compute_sfu"] = float(2 * elements), float(elements)
+            input_shape = output_shape = (rows, width)
+            source = "vllm/models/deepseek_v4/nvidia/dspark.py:DSparkDeepseekV4ForCausalLM.compute_confidence torch.sigmoid"
+            typed = {"fp32_sign_negation": elements}
+        return {"operation": operation, "source": source, "read_bytes": read, "write_bytes": write,
+            "logical_bytes": read + write, "demand": demand, "input_shape": input_shape, "output_shape": output_shape,
+            "mathematical_primitives": primitives, "typed_mathematical_work": typed,
+            "arithmetic_flops": sum(count for name, count in primitives.items() if name != "exp"),
+            "complete_native_work_bound": False, "numerical_equivalence_asserted": False,
+            "limitations": ("public_operand_bytes_not_observed_DRAM_or_issued_loads_or_library_temporaries",
+                "hc4_mean_is_target_aux_mean_not_draft_hc_head",
+                "repeat_materializes_all_four_copies_not_an_alias_only_expand",
+                "mathematical_divide_is_one_FLOP_not_a_reciprocal_instruction_service",
+                "sigmoid_sign_negation_is_typed_not_an_additional_arithmetic_FLOP",
+                "FP32_accumulation_rounding_and_BF16_output_conversion_services_not_bound_by_real_arithmetic",
+                "confidence_sigmoid_only_if_explicitly_enabled_by_caller_checkpoint_fact",
+                "provider_compiler_native_launch_scratch_and_lifetime_unbound")}
     if operation in ("copy", "concat"):
         read, write = elements * size, elements * size
     elif operation == "gather":
@@ -19066,7 +20218,10 @@ def vllm_logits_row_selection_roofline_bytes(kernel: KernelSpec) -> int:
 
 
 def dsv32_draft_sampling_logical_work(kernel: KernelSpec):
-    """Legacy full-logits greedy source math and materialized feedback roles.
+    """Explicit full-logits greedy source math and materialized feedback roles.
+
+    DSpark's exact BF16 full-vocab argmax reuses the typed reduction ledger,
+    while retaining its own source identity and excluding legacy MTP claims.
 
     llm_base_proposer._greedy_sample calls compute_logits().argmax(-1),
     returning INT64 IDs. Its next uniform iteration calls .int() before
@@ -19217,6 +20372,21 @@ def dsv32_draft_sampling_logical_work(kernel: KernelSpec):
             {"role": "draft_ids", "dtype": "int64", "elements": rows,
              "bytes": 8 * rows, "access": "write"})
         comparisons = rows * (kernel.shape["vocab"] - 1)
+        if kernel.attributes["sampling_source"] == "vllm_0_30_dspark_full_vocab_greedy_bf16":
+            return {
+                "sampling_source": kernel.attributes["sampling_source"],
+                "source_program": "vllm_0_30_dspark_markov_full_vocab_greedy",
+                "mathematical_comparison_lower_bound": comparisons,
+                "integer_conversions": 0,
+                "operands": operands,
+                "limitations": (
+                    "explicit_dspark_full_vocab_greedy_bf16_source",
+                    "one_bf16_logit_scan_and_one_int64_id_per_row_memory_approximation",
+                    "argmax_tie_nan_tree_padding_and_compiler_services_unbound",
+                    "logical_role_bytes_not_observed_dram_or_cache_hits",
+                    "no_native_provider_numerical_or_accuracy_acceptance",
+                    "no_library_launch_new_rate_or_duration_fit"),
+            }
     elif kernel.variant == "dsv32_draft_id_cast":
         operands = (
             {"role": "draft_ids", "dtype": "int64", "elements": rows,
@@ -19529,6 +20699,24 @@ def kimi_k3_moe_route_logical_work(kernel: KernelSpec):
             "single_group_does_not_prove_compiler_elides_group_topk_masks_or_temporary_copies",
             "correction_bias_role_rereads_not_observed_DRAM_or_distinct_parameter_objects"),
     }
+
+
+def kimi_k3_moe_route_roofline_work(kernel: KernelSpec):
+    source = kimi_k3_moe_route_logical_work(kernel)
+    rows, experts, topk = (kernel.shape[key] for key in ("rows", "experts", "topk"))
+    values, selected = rows * experts, rows * topk
+    primitives = {"exp": values, "denominator_add": values, "sigmoid_divide": values,
+        "selection_bias_add": values, "selected_sum_add": rows * (topk - 1),
+        "selected_weight_divide": selected, "selected_weight_scale": selected}
+    flops = sum(count for name, count in primitives.items() if name != "exp")
+    return {"mathematical_primitives": primitives, "logical_bytes": sum(
+            operand["bytes"] for operand in source["operands"]),
+        "demand": {"compute_tensor": 0.0, "compute_vector": 0.0, "compute_reduction": 0.0,
+            "compute_fma": float(flops), "compute_sfu": float(values), "compute_alu": 0.0},
+        "typed_actions": {"score_negate": values, "biased_top16_ID_selection": selected},
+        "source": source["source"], "complete_native_work_bound": False,
+        "limitations": source["limitations"] + (
+            "mathematical_sigmoid_exp_and_divide_do_not_bind_CUDA_or_torch_instruction_services",)}
 
 
 def kimi_moe_route_logical_work(kernel: KernelSpec):
@@ -20484,7 +21672,7 @@ def _model(kernel: KernelSpec, hardware):
         "qkv_rmsnorm_rope",
         "activation", "silu",
         "reduce", "gather", "softmax",
-        "gemm_reduce", "gemm_elementwise", "flash_mla_metadata",
+        "gemm_reduce", "gemm_elementwise", "flash_mla_metadata", "fa3_prepare_varlen",
         "fp8_group_quant",
     }:
         return _regular_model(kernel, hardware)
@@ -20496,7 +21684,7 @@ def paged_kv_cache_resource_input(kernel: KernelSpec, hardware):
     """Reuse the established paged-cache physical model under its own kind."""
 
     if ("mathematical_program" in kernel.attributes
-            and kernel.attributes["mathematical_program"] == "dense_fp16_source_flops_bytes_v1"):
+            and kernel.attributes["mathematical_program"] in ("dense_fp16_source_flops_bytes_v1", "dense_bf16_source_flops_bytes_v1")):
         raise NotImplementedError("dense FP16 mathematical work has no native launch")
     if (kernel.kind is not KernelKind.KV_CACHE
             or kernel.variant != "paged_kv_cache"):
@@ -20516,7 +21704,7 @@ def forward_analytical_resource_input(kernel: KernelSpec, hardware):
     """
 
     if ("mathematical_program" in kernel.attributes
-            and kernel.attributes["mathematical_program"] == "dense_fp16_source_flops_bytes_v1"):
+            and kernel.attributes["mathematical_program"] in ("dense_fp16_source_flops_bytes_v1", "dense_bf16_source_flops_bytes_v1")):
         raise NotImplementedError("dense FP16 mathematical work has no native launch")
     token = _FORWARD_CANN_ANALYTICAL_ENVELOPE.set(True)
     try:
@@ -20538,6 +21726,7 @@ def bw1100_vector_memory_only_bytes(kernel: KernelSpec):
     if kernel.kind is not KernelKind.VECTOR or not HWSpec.source_contract_supported("aggregate_gpu_source_roofline", kernel.hardware_id):
         raise ValueError("BW1100 vector memory approximation requires its VECTOR contract")
     variant = kernel.variant
+    packed_weights = "packed_weight_storage" in kernel.attributes
     operand_ledgers = {
         "silu": clamped_silu_logical_work,
         "rmsnorm": rmsnorm_logical_work,
@@ -20554,7 +21743,11 @@ def bw1100_vector_memory_only_bytes(kernel: KernelSpec):
         work = vocab_parallel_embedding_logical_work(kernel)
         if work["owned_token_rows"] is None:
             raise NotImplementedError("BW1100 embedding ownership remains unbound")
-        return sum(value["bytes"] for value in work["operands"])
+        total = sum(value["bytes"] for value in work["operands"])
+        if packed_weights:
+            weight = next(value for value in work["operands"] if value["role"] == "owned_weight_rows")
+            total += weight["elements"] // 2 + weight["elements"] // 32 - weight["bytes"]
+        return total
     if variant == "vllm_logits_row_select":
         return vllm_logits_row_selection_roofline_bytes(kernel)
     if variant in ("dsv4_q_kv_rmsnorm", "dsv4_inv_rope_fp8_quant"):
@@ -20571,6 +21764,9 @@ def bw1100_vector_memory_only_bytes(kernel: KernelSpec):
         # BF16 RMSNorm gamma[H]. Broadcast pre uses fn_broadcast[mixes,H].
         projection_width = h if variant == "mhc_pre" else c * h
         parameter_bytes = 4 * mixes * projection_width + 4 * (3 + mixes) + 2 * h
+        if packed_weights:
+            weights = mixes * projection_width
+            parameter_bytes += weights // 2 + weights // 32 - 4 * weights
         input_bytes = 2 * rows * h
         if variant == "mhc_post_pre":
             input_bytes += 2 * rows * c * h + 4 * rows * (c + c * c)
@@ -20579,10 +21775,18 @@ def bw1100_vector_memory_only_bytes(kernel: KernelSpec):
     if variant in ("mhc_post", "hc_head", "mhc_prenorm", "mhc_prenorm_broadcast",
             "mhc_post_prenorm", "mhc_pre_norm", "mhc_pre_norm_broadcast"):
         work = mhc_stage_logical_work(kernel)
-        return work["read_bytes"] + work["write_bytes"]
+        total = work["read_bytes"] + work["write_bytes"]
+        if packed_weights:
+            weight = next(value for value in work["operands"] if value["role"] == "projection_weight")
+            weights = math.prod(weight["shape"])
+            total += weights // 2 + weights // 32 - weight["bytes"]
+        return total
     elements, width = kernel.shape["element_count"], kernel.shape["dtype_bytes"]
     if variant == "gather":
         read_bytes = elements * width * kernel.attributes["gather_factor"]
+        if packed_weights:
+            weights = elements * kernel.attributes["gather_factor"]
+            read_bytes = weights // 2 + weights // 32
         read_bytes += kernel.attributes["index_count"] * kernel.attributes["index_bytes"]
         return read_bytes + (elements * width if kernel.attributes["materialized_output"] else 0)
     if variant == "fp8_group_quant":
@@ -20597,6 +21801,10 @@ def bw1100_vector_memory_only_bytes(kernel: KernelSpec):
         if operation not in ("add", "mul", "copy"):
             raise NotImplementedError(f"BW1100 memory approximation has no {operation} operand ledger")
         return elements * width * (2 if operation == "copy" else 3)
+    if variant == "reduce":
+        # Explicit source projection: all input contributions are read,
+        # one same-width output is written for each logical output element.
+        return elements * width * (kernel.attributes["reduction_factor"] + 1)
     if variant == "moe_sum":
         rows, hidden, topk = (kernel.shape[key] for key in ("tokens", "hidden", "topk"))
         total = rows * hidden * (topk + 1) * width
@@ -20628,6 +21836,15 @@ class VectorPredictor(KernelPredictor):
 
     def analytical_without_launch(self, kernel: KernelSpec, hardware):
         """Performance-only models do not execute or inspect tensor values."""
+        if ("source_component" in kernel.attributes
+                and kernel.attributes["source_component"] == "vllm_0_30_kimi_k3_triton_chunk"):
+            inp, _ = kimi_k3_kda_chunk_stage_source_input(kernel, hardware)
+            prediction = PerformanceFormula(hardware).predict_kernel(inp)
+            return dataclasses.replace(prediction, bottleneck_group="analytical_kda_chunk_source_pipeline")
+
+        if (kernel.variant == "elementwise" and "mathematical_program" in kernel.attributes
+                and kernel.attributes["mathematical_program"] == "vllm_0_30_fa3_aot_tail_clear"):
+            return self.roofline_without_launch(kernel, hardware)
         if kernel.variant == "dsv32_draft_argmax":
             work = dsv32_draft_sampling_logical_work(kernel)
             logical_bytes = sum(operand["bytes"] for operand in work["operands"])
@@ -20670,11 +21887,18 @@ class VectorPredictor(KernelPredictor):
         return dataclasses.replace(prediction, bottleneck_group="analytical_logical_work")
 
     def resource_input(self, kernel: KernelSpec, hardware):
+        if ("source_component" in kernel.attributes
+                and kernel.attributes["source_component"] == "vllm_0_30_kimi_k3_triton_chunk"):
+            return kimi_k3_kda_chunk_stage_source_input(kernel, hardware)
+
         if HWSpec.source_contract_supported("programmed_mxfp4_fp8_expert_service", hardware.hardware_id):
             raise NotImplementedError("FPGA vector element service has no native resource-input program")
         if ("mathematical_program" in kernel.attributes
-                and kernel.attributes["mathematical_program"] == "dense_fp16_source_flops_bytes_v1"):
+                and kernel.attributes["mathematical_program"] in ("dense_fp16_source_flops_bytes_v1", "dense_bf16_source_flops_bytes_v1")):
             raise NotImplementedError("dense FP16 mathematical work has no native launch")
+        if (kernel.variant == "dsv32_fused_norm_rope"
+                and kernel.attributes["cache_slot_scope"] == "no_metadata_no_cache_slots"):
+            raise NotImplementedError("metadata=None fusion has no native source-memory/launch program")
         if kernel.variant == "vllm_mtp_eager":
             raise NotImplementedError("MTP eager source compiler/library services are unbound")
         if kernel.variant == "vllm_mtp_position_mask":
@@ -20695,6 +21919,56 @@ class VectorPredictor(KernelPredictor):
         return _model(kernel, hardware)
 
     def roofline_without_launch(self, kernel: KernelSpec, hardware):
+        if ("mathematical_program" in kernel.attributes
+                and kernel.attributes["mathematical_program"] == "vllm_0_30_dspark_typed_role_bytes_v1"):
+            if (kernel.hardware_id != hardware.hardware_id
+                    or not hardware.supports_source_contract("vllm_0_30_symbolic_mhc")
+                    or kernel.variant != "elementwise" or kernel.launch is not None
+                    or kernel.execution_support != "unsupported"
+                    or kernel.attributes["operation"] not in ("read", "fill")):
+                raise ValueError("DSpark typed payload requires its exact unbound source contract")
+            # Current source typed role bytes only. A write projection does
+            # not set state values; comparisons/addressing/issue remain partial.
+            logical_bytes = (kernel.shape["element_count"] * kernel.shape["dtype_bytes"]
+                * (kernel.attributes["reads"] + kernel.attributes["writes"]))
+            return prediction_from_ns(logical_bytes / hardware.resource_by_role("dram").capacity * 1e9,
+                "analytical_dspark_typed_payload")
+        if ("source_component" in kernel.attributes
+                and kernel.attributes["source_component"] == "vllm_0_30_kimi_k3_triton_chunk"):
+            raise NotImplementedError("KDA chunk child has no whole-parent roofline fallback")
+
+        if ("mathematical_program" in kernel.attributes
+                and kernel.attributes["mathematical_program"] == "vllm_0_30_fa3_aot_tail_clear"):
+            if (kernel.hardware_id != hardware.hardware_id
+                    or not hardware.supports_source_contract("vllm_0_30_fa3_gqa_fresh_prefill")
+                    or kernel.variant != "elementwise" or kernel.dtype != "int32"
+                    or kernel.execution_support != "unsupported" or kernel.launch is not None
+                    or kernel.attributes["operation"] != "fill"
+                    or kernel.attributes["reads"] != 0 or kernel.attributes["writes"] != 1):
+                raise ValueError("FA3 AOT tail clear requires its unbound H200 INT32 source contract")
+            # Actual output payload only. Native compiler/launch/startup are
+            # unbound; no synthetic grid or new per-program rate is supplied.
+            output_bytes = kernel.shape["element_count"] * kernel.shape["dtype_bytes"]
+            write_capacity = hardware.dram_capacity_for_access("write",
+                active_units=hardware.num_compute_units,
+                sm_freq_hz=hardware.nominal_sm_freq_hz,
+                dram_freq_hz=hardware.nominal_dram_freq_hz)
+            return prediction_from_ns(output_bytes / write_capacity * 1e9,
+                "analytical_fa3_metadata_clear")
+        if (kernel.variant == "silu" and kernel.attributes["swiglu_limit"] is not None
+                and hardware.supports_source_contract("unbound_clamped_silu_source_math")):
+            work = clamped_silu_logical_work(kernel)
+            demand = {role: 0 for role in ("compute_tensor", "compute_vector", "compute_reduction", "compute_fma", "compute_sfu", "compute_alu")}
+            demand.update(work["baseline_demand"])
+            logical_bytes = sum(operand["bytes"] for operand in work["operands"])
+            from src.kernel.memory_access_builder import has_mathematical_memory_source, mathematical_prediction_memory_bytes
+            if has_mathematical_memory_source(kernel):
+                logical_bytes = mathematical_prediction_memory_bytes(kernel, hardware)
+            return prediction_from_ns(roofline_ns(demand, hardware, logical_bytes), "roofline")
+        if (kernel.variant == "gather" and "index_select_source" not in kernel.attributes
+                and "mathematical_program" not in kernel.attributes
+                and hardware.supports_source_contract("unbound_materialized_gather_source_math")):
+            return self.analytical_without_launch(kernel, hardware)
         if HWSpec.source_contract_supported("aten_advanced_indexing_long_math", hardware.hardware_id) and (
                 (HWSpec.source_contract_supported("vllm_0_11_embedding_index_select_math", hardware.hardware_id) and kernel.variant == "gather" and "index_select_source" in kernel.attributes
                     and kernel.attributes["index_select_source"] == "vllm_0_11_embedding")
@@ -20767,8 +22041,8 @@ class VectorPredictor(KernelPredictor):
             seconds += execution["hbm_latency_ns"] / 1e9
             return prediction_from_ns(seconds * 1e9, "fpga_vector")
         if ("mathematical_program" in kernel.attributes
-                and kernel.attributes["mathematical_program"] == "dense_fp16_source_flops_bytes_v1"):
-            work = dense_fp16_source_logical_work(kernel)
+                and kernel.attributes["mathematical_program"] in ("dense_fp16_source_flops_bytes_v1", "dense_bf16_source_flops_bytes_v1")):
+            work = {"fp16": dense_fp16_source_logical_work, "bf16": dense_bf16_source_logical_work}[kernel.dtype](kernel)
             from src.kernel.memory_access_builder import has_mathematical_memory_source, mathematical_prediction_memory_bytes
             if has_mathematical_memory_source(kernel):
                 work = {**work, "logical_bytes": mathematical_prediction_memory_bytes(kernel, hardware)}
@@ -20891,15 +22165,16 @@ class VectorPredictor(KernelPredictor):
             work = {"kimi_k3_kda_prefill": kimi_k3_kda_prefill_logical_work,
                     "kimi_k3_kda_mixed": kimi_k3_kda_mixed_logical_work,
                     "kimi_k3_kda_context_prefill": kimi_k3_kda_context_prefill_logical_work}[kernel.variant](kernel)
-            if kernel.attributes["stage"] == "chunk":
-                raise NotImplementedError("K3 KDA chunk internal math/traffic, autotune and compiler services remain unbound")
-            logical_bytes = sum(operand["bytes"] for operand in work["operands"])
+            logical_bytes = (work["analytical_logical_bytes"] if kernel.attributes["stage"] == "chunk"
+                             else sum(operand["bytes"] for operand in work["operands"]))
             return prediction_from_ns(roofline_ns(work["demand"], hardware, logical_bytes), "roofline")
         if kernel.variant == "kimi_k3_moe_route":
-            kimi_k3_moe_route_logical_work(kernel)
-            raise NotImplementedError("K3 grouped top16 selection/compiler and temporary services remain unbound")
+            work = kimi_k3_moe_route_roofline_work(kernel)
+            return prediction_from_ns(roofline_ns(work["demand"], hardware, work["logical_bytes"]), "roofline")
         if kernel.variant == "kimi_k3_situ":
-            raise NotImplementedError("K3 SiTU tanhf compiler/local services remain unbound")
+            work = kimi_k3_situ_logical_work(kernel)
+            logical_bytes = sum(operand["bytes"] for operand in work["operands"])
+            return prediction_from_ns(roofline_ns(work["demand"], hardware, logical_bytes), "roofline")
         if kernel.variant in ("kimi_k3_nope_prefill", "kimi_k3_nope_decode", "kimi_k3_nope_mixed", "kimi_k3_nope_context"):
             work = {
                 "kimi_k3_nope_prefill": kimi_k3_nope_prefill_logical_work,
@@ -20907,8 +22182,6 @@ class VectorPredictor(KernelPredictor):
                 "kimi_k3_nope_mixed": kimi_k3_nope_mixed_logical_work,
                 "kimi_k3_nope_context": kimi_k3_nope_context_logical_work,
             }[kernel.variant](kernel)
-            if kernel.attributes["stage"] == "output_gate":
-                raise NotImplementedError("K3 output gate compiled BF16 intermediate materialization remains unbound")
             if work["demand"] is None:
                 raise NotImplementedError("K3 context merge LSE value branches and per-pack compiler services remain unbound")
             logical_bytes = sum(operand["bytes"] for operand in work["operands"])
@@ -20940,6 +22213,10 @@ class VectorPredictor(KernelPredictor):
         return self._forward_resource_input(kernel, hardware)
 
     def _forward_resource_input(self, kernel: KernelSpec, hardware):
+        if ("source_component" in kernel.attributes
+                and kernel.attributes["source_component"] == "vllm_0_30_kimi_k3_triton_chunk"):
+            return self.resource_input(kernel, hardware)
+
         from src.kernel.memory_cann_moe_routing import has_cann_moe_range_source,cann_moe_range_source_demands
         if has_cann_moe_range_source(kernel,hardware):
             from src.kernel.memory_access_builder import cann_moe_range_memory_access_program
@@ -20992,7 +22269,7 @@ class VectorPredictor(KernelPredictor):
 
     def oracle_resource_input(self, kernel: KernelSpec, hardware):
         if ("mathematical_program" in kernel.attributes
-                and kernel.attributes["mathematical_program"] == "dense_fp16_source_flops_bytes_v1"):
+                and kernel.attributes["mathematical_program"] in ("dense_fp16_source_flops_bytes_v1", "dense_bf16_source_flops_bytes_v1")):
             raise NotImplementedError("dense FP16 mathematical work has no native launch")
         # Keep resource_input's expanded source program for contract callers.
         # Oracle only consumes its normalized resource/dependency envelope, so
@@ -21009,17 +22286,8 @@ class VectorPredictor(KernelPredictor):
 
     def midlayer(self, kernel: KernelSpec, hardware):
         if ("mathematical_program" in kernel.attributes
-                and kernel.attributes["mathematical_program"] == "dense_fp16_source_flops_bytes_v1"):
+                and kernel.attributes["mathematical_program"] in ("dense_fp16_source_flops_bytes_v1", "dense_bf16_source_flops_bytes_v1")):
             raise NotImplementedError("dense FP16 mathematical work has no native launch")
-        if kernel.variant == "dsv4_moe_route":
-            raise NotImplementedError("V4 source routing supports Roofline only")
-        if kernel.variant == "dsv4_inv_rope_fp8_quant":
-            raise NotImplementedError("V4 inverse RoPE quantization supports Roofline only")
-        if kernel.variant == "silu" and kernel.attributes["swiglu_limit"] is not None:
-            raise NotImplementedError("clamped SiLU supports Roofline only")
-        if kernel.variant in ("dsv4_short_context_topk", "dsv32_fused_norm_rope", "dsv32_fused_q", "dsv4_q_kv_rmsnorm", "dsv32_eh_norm", "dsv32_embed_eh_norm", "dsv32_embed_norm") or kernel.variant.startswith("mhc_") or kernel.variant == "hc_head":
-            raise NotImplementedError(
-                "DSV4/V32 fused norms and mHC support Roofline only")
         # The vLLM-Ascend QKNormRope fusion pass rewrites this pattern at
         # torchair compile time, and capture-limit fallback (NONE) steps
         # still execute the codegen'd fused fx graph: msprof serving traces

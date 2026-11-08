@@ -11,7 +11,7 @@
 # Usage: VLLM_MOE_ROUTING_SIMULATION_STRATEGY=uniform_random MODEL=.. TP=.. MTP=.. PORT=.. \
 #            nvidia_h200_deepseek_r1_nsys_decode_capture.sh <out dir> <C>...
 set -euo pipefail
-B=/mnt/public/yangxinhao; D=$B/h200_microbench/dsr1_mtpoff
+B=${MIDLAYER_H200_PUBLIC_ROOT:?set MIDLAYER_H200_PUBLIC_ROOT}; D=$B/h200_microbench/dsr1_mtpoff
 OUT=$1; shift; mkdir -p $OUT
 export PATH=$B/tools/nsys_2025.6.1/bin:$PATH
 echo "MODEL=$MODEL TP=$TP MTP=$MTP PORT=$PORT CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-all} routing=${VLLM_MOE_ROUTING_SIMULATION_STRATEGY:-model}" > $OUT/config.txt

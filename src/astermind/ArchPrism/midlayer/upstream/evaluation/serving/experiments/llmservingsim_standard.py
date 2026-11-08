@@ -182,8 +182,8 @@ def _execute_case(cell: dict, payload: dict, accepted: Path, runtime: Path,
 def run_standard_suite(runtime: Path, python: Path, accepted: Path, results: Path,
                        output: Path, jobs: int, load_case) -> dict:
     accepted, output, runtime = accepted.resolve(), output.resolve(), runtime.resolve()
-    if jobs < 1 or jobs > 12:
-        raise ValueError('standard baseline CPU jobs must be in 1..12')
+    if jobs < 1:
+        raise ValueError('standard baseline CPU jobs must be positive')
     source = read_json(SOURCE)
     if git_revision(runtime) != source['commit']:
         raise ValueError('baseline source differs from pinned version')

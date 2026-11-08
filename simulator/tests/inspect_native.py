@@ -5,15 +5,13 @@ from simulator.bootstrap import activate
 
 def main():
     root = activate()
-    from midlayer_cell import MidlayerCellConfig, create_midlayer_runtime
+    from astermind.ArchPrism.midlayer.runtime import MidlayerCellConfig, create_midlayer_runtime
     from src.serving.schedule.schedule_step import ScheduleStep, ScheduledRequest
-    from src.serving.workload.build_workload import build_workload
-    _, execution = create_midlayer_runtime(MidlayerCellConfig(root), with_scheduler=False)
-    graph = build_workload(ScheduleStep("audit", "main", (
+    _, execution, _ = create_midlayer_runtime(MidlayerCellConfig(root), with_scheduler=False)
+    graph = execution.execute_step(ScheduleStep("audit", "main", (
         ScheduledRequest("p", "prefill", 4, 0, computed_tokens=8),
         ScheduledRequest("d", "decode", 0, 1, computed_tokens=32))),
-        execution.model, execution.deployment, launch_policy=execution.launch_policy,
-        runtime_inputs=execution.runtime_inputs)
+        embedding_token_ids=(42,) * 5).workload
     nodes = []
     for node in graph.nodes[:45]:
         nodes.append(dict(id=node.node_id, kind=node.kind.value, shape=dict(node.shape),

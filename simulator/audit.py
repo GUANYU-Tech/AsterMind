@@ -17,6 +17,20 @@ def audit(result):
         assert request["cell_ready_ns"] >= request["arrival_ns"]
         if request["first_token_received_ns"] is not None:
             assert request["first_token_received_ns"] >= request["cell_ready_ns"]
+    if "request_state_events" in result:
+        events = {item["sequence"]: item for item in result["event_log"]}
+        expected_tokens = {item["id"]: item["output_tokens"]
+                           for item in result["configuration"]["requests"]}
+        status = {request_id: "pending" for request_id in result["requests"]}
+        for change in result["request_state_events"]:
+            request_id = change["request_id"]
+            event = events[change["event_sequence"]]
+            assert change["time_ns"] == round(event["time_s"] * 1e9)
+            assert change["previous"] == status[request_id]
+            status[request_id] = change["status"]
+        for request_id, state in result["requests"].items():
+            assert status[request_id] == state["status"] == "completed"
+            assert state["received_tokens"] == expected_tokens[request_id]
     for batch in result["batches"]:
         assert batch["native_communication_duration_charged_s"] == 0
         calls = {(call["call_id"], call["occurrence"]): call for call in batch["calls"]}
@@ -51,6 +65,17 @@ def audit(result):
         if "bytes_per_rank" in migration:
             assert sum(event["size_bytes"] for event in events) == migration["bytes"]
             assert all(event["size_bytes"] == migration["bytes_per_rank"] for event in events)
+    for cell in result.get("cells", {}).values():
+        for request_id, handoff in cell.get("pd_handoffs", {}).items():
+            assert handoff["partitions"] and not handoff["failures"]
+            terminal = [transfers[part["id"]] for part in handoff["partitions"]]
+            assert all(event["kind"] == "completed" for event in terminal)
+            assert max(event["completion_time_ns"] for event in terminal) == handoff["end_time_ns"]
+            assert all(event["size_bytes"] == part["bytes"]
+                       for event, part in zip(terminal, handoff["partitions"], strict=True))
+            decode = [step for step in cell["steps"] if step["step"]["schedule"]["pool_name"] == "decode"
+                      and any(row["request_id"] == request_id for row in step["step"]["schedule"]["requests"])]
+            assert decode and round(decode[0]["start_time_s"] * 1e9) >= handoff["end_time_ns"]
     batches = {(b["cell_id"], b["step_id"]): b for b in result["batches"]}
     for distribution in result.get("input_distributions", []):
         batch = batches[distribution["cell_id"], distribution["step_id"]]

@@ -32,6 +32,7 @@ from src.serving.kernel_lowering.execution_timeline import (
 )
 from src.serving.kernel_lowering.kernel_plan import KernelBlockRepeat, KernelCall, KernelPlan
 from src.serving.kernel_lowering.kernel_predict import freeze_contract_value
+from evaluation.serving.simulation.state_audit import ServingStateAuditAccumulator
 from src.serving.kernel_lowering.kv_offload_completion import (
     build_kv_cache_transfer_completion,
 )
@@ -579,6 +580,46 @@ def _native_routing_regions_digest(regions):
     return digest.digest()
 
 
+def _native_workload_contract_bytes(contract):
+    """Encode an already validated native projection with exact v6 repr bytes."""
+    from src.serving.kernel_lowering import kernel_predict as freezing
+    for name, original, code, defaults, kwdefaults in _NATIVE_WORKLOAD_FREEZER_SOURCE:
+        current = vars(freezing)[name] if name in vars(freezing) else None
+        if (current is not original or original.__code__ is not code
+                or original.__defaults__ is not defaults or original.__kwdefaults__ is not kwdefaults):
+            return None
+    if (freeze_contract_value is not freezing.freeze_contract_value
+            or type(freezing._NONE_CONTRACT) is not tuple or len(freezing._NONE_CONTRACT) != 1
+            or type(freezing._NONE_CONTRACT[0]) is not str or freezing._NONE_CONTRACT[0] != "none"):
+        return None
+    for kind, function in ((str, freezing._freeze_str), (int, freezing._freeze_int),
+            (type(None), freezing._freeze_none), (tuple, freezing._freeze_tuple),
+            (WorkloadEdge, freezing._freeze_dataclass)):
+        if kind in freezing._CONTRACT_FREEZERS and freezing._CONTRACT_FREEZERS[kind] is not function:
+            return None
+    if (WorkloadEdge in freezing._CONTRACT_DATACLASS_FIELD_NAMES
+            and freezing._CONTRACT_DATACLASS_FIELD_NAMES[WorkloadEdge] != ("source", "destination", "kind")):
+        return None
+    scalars = {}
+
+    def scalar(value):
+        if value not in scalars:
+            frozen = (("none",) if value is None else
+                ("str", value) if type(value) is str else ("int", value))
+            scalars[value] = repr(frozen)
+        return scalars[value]
+
+    def sequence(parts):
+        parts = tuple(parts)
+        return "('tuple', (" + ", ".join(parts) + ("," if len(parts) == 1 else "") + "))"
+
+    nodes = sequence(sequence(scalar(value) for value in row) for row in contract[0])
+    header = "('dataclass', " + repr(WorkloadEdge.__module__) + ", " + repr(WorkloadEdge.__qualname__) + ", ("
+    edges = sequence(header + "('source', " + scalar(edge.source) + "), ('destination', "
+        + scalar(edge.destination) + "), ('kind', " + scalar(edge.kind) + ")))" for edge in contract[1])
+    return sequence((nodes, edges, "('tuple', ())", scalar(contract[3]), scalar(contract[4]))).encode("utf-8")
+
+
 class StreamingExecutionArtifactAccumulator:
     """Consume full step IR once and retain only an auditable hash chain."""
 
@@ -597,7 +638,12 @@ class StreamingExecutionArtifactAccumulator:
         self._compiled_workload_projection_digests = {}
         self._repeat_contract_digests = {}
         self._header_bytes_by_fields = {}
+        self._header_bytes_by_identity = {}
+        self._plan_bytes_by_identity = {}
+        self._prediction_bytes_by_plan = {}
+        self._timeline_count_bytes = {}
         self._consume_wall_time_s = 0.0
+        self._state_audit = ServingStateAuditAccumulator()
 
     @staticmethod
     def _transfer_trace_digest(transfers: tuple[object, ...]) -> str:
@@ -779,9 +825,14 @@ class StreamingExecutionArtifactAccumulator:
                     struct.pack("!dd", start_time_s, end_time_s)
                     for start_time_s, end_time_s in activity.intervals
                 ))
-        for call_id, count in timeline.call_occurrence_counts:
-            update_text(call_id)
-            update_int(count)
+        counts = timeline.call_occurrence_counts
+        native_counts = self._timeline_occurrence_bytes(counts) if self._header_encoder_unchanged() else None
+        if native_counts is None:
+            for call_id, count in counts:
+                update_text(call_id)
+                update_int(count)
+        else:
+            digest.update(native_counts)
         for category, duration_s in timeline.critical_path_contributions:
             update_text(category)
             update_float(duration_s)
@@ -817,10 +868,15 @@ class StreamingExecutionArtifactAccumulator:
         return digest.digest()
 
     def _header_encoder_unchanged(self):
-        if (type(self) is not StreamingExecutionArtifactAccumulator
-                or "_update_text_hash" in vars(self)
-                or "_update_string_sequence_hash" in vars(self)
-                or "__getattribute__" in vars(StreamingExecutionArtifactAccumulator)):
+        # Recorders inherit these exact encoders. Prove the resolved methods,
+        # rather than excluding the default report's accumulator subclasses.
+        classes = type(self).__mro__
+        if any("__getattribute__" in vars(cls) for cls in classes if cls is not object):
+            return False
+        name, function, code = _HEADER_NATIVE_SOURCE
+        if (name in vars(self)
+                or next(vars(cls)[name] for cls in classes if name in vars(cls)) is not function
+                or function.__code__ is not code):
             return False
         namespace = vars(KernelCall)
         if (KernelCall.__bases__ is not _HEADER_CALL_BASES
@@ -830,7 +886,9 @@ class StreamingExecutionArtifactAccumulator:
                     in zip(namespace.items(), _HEADER_CALL_NAMESPACE, strict=True))):
             return False
         for name, descriptor, function, code, defaults, kwdefaults in _HEADER_ENCODER_SOURCE:
-            current = vars(StreamingExecutionArtifactAccumulator)[name]
+            if name in vars(self):
+                return False
+            current = next(vars(cls)[name] for cls in classes if name in vars(cls))
             if (current is not descriptor or function.__code__ is not code
                     or function.__defaults__ is not defaults
                     or function.__kwdefaults__ is not kwdefaults):
@@ -840,6 +898,12 @@ class StreamingExecutionArtifactAccumulator:
     def _native_header_bytes(self, call):
         if type(call) is not KernelCall:
             return None
+        identity = id(call)
+        if identity in self._header_bytes_by_identity:
+            retained, encoded = self._header_bytes_by_identity[identity]
+            if retained is not call:
+                raise RuntimeError("streaming artifact call identity collision")
+            return encoded
         key = (call.call_id, call.pool_name, call.rank, call.resource,
             call.source_node_ids, call.dependencies)
         if (any(type(value) is not str for value in (key[0], key[1], key[3]))
@@ -847,7 +911,9 @@ class StreamingExecutionArtifactAccumulator:
                 or not _native_string_tuple(key[4]) or not _native_string_tuple(key[5])):
             return None
         if key in self._header_bytes_by_fields:
-            return self._header_bytes_by_fields[key]
+            value = self._header_bytes_by_fields[key]
+            self._retain_header(call, value)
+            return value
         def text(value):
             data = value.encode("utf-8")
             return len(data).to_bytes(8, "big") + data
@@ -859,7 +925,16 @@ class StreamingExecutionArtifactAccumulator:
             self._header_bytes_by_fields.clear()
         value = header, call_id
         self._header_bytes_by_fields[key] = value
+        self._retain_header(call, value)
         return value
+
+    def _retain_header(self, call, value):
+        # Only native immutable header fields reach this bounded identity
+        # cache. Retain the call to prevent id reuse; dynamic calls must not
+        # accumulate over a complete request stream.
+        if len(self._header_bytes_by_identity) >= 4096:
+            self._header_bytes_by_identity.clear()
+        self._header_bytes_by_identity[id(call)] = call, value
 
     def execution_contract_digest(
         self,
@@ -902,52 +977,146 @@ class StreamingExecutionArtifactAccumulator:
         else:
             workload_contract, routing_regions = projection
             update("workload_graph", self._compiled_workload_contract_digest(workload_contract))
-        plan_digest = hashlib.sha256()
         native_headers = self._header_encoder_unchanged()
-        headers = []
-        for call in step.kernel_plan.calls:
-            header = self._native_header_bytes(call) if native_headers else None
-            headers.append(header)
-            if header is not None:
-                plan_digest.update(header[0])
-            else:
-                self._update_text_hash(plan_digest, call.call_id)
-                self._update_text_hash(plan_digest, call.pool_name)
-                self._update_text_hash(plan_digest, str(call.rank))
-                self._update_text_hash(plan_digest, call.resource)
-                self._update_string_sequence_hash(
-                    plan_digest, call.source_node_ids)
-                self._update_string_sequence_hash(
-                    plan_digest, call.dependencies)
-            plan_digest.update(
-                self._cached_contract_digest(call.kernel_spec))
-        plan_digest.update(
-            self._repeat_contract_digest(step.kernel_plan.block_repeats))
-        update("kernel_plan", plan_digest.digest())
+        bound = self._bound_plan_digest(step.kernel_plan) if native_headers else None
+        if bound is None:
+            plan_digest = hashlib.sha256()
+            headers = []
+            for call in step.kernel_plan.calls:
+                header = self._native_header_bytes(call) if native_headers else None
+                headers.append(header)
+                if header is not None:
+                    plan_digest.update(header[0])
+                else:
+                    self._update_text_hash(plan_digest, call.call_id)
+                    self._update_text_hash(plan_digest, call.pool_name)
+                    self._update_text_hash(plan_digest, str(call.rank))
+                    self._update_text_hash(plan_digest, call.resource)
+                    self._update_string_sequence_hash(plan_digest, call.source_node_ids)
+                    self._update_string_sequence_hash(plan_digest, call.dependencies)
+                plan_digest.update(self._cached_contract_digest(call.kernel_spec))
+            plan_digest.update(self._repeat_contract_digest(step.kernel_plan.block_repeats))
+            plan_bytes = plan_digest.digest()
+            call_ids = tuple(call.call_id for call in step.kernel_plan.calls)
+        else:
+            plan_bytes, headers, call_ids, plan_identity = bound
+        update("kernel_plan", plan_bytes)
         # Preserve actual per-layer identities alongside the compact physical
         # program. These are read from the untouched complete source graph.
         update("routing_regions", self._routing_regions_contract_digest(routing_regions))
 
 
-        prediction_digest = hashlib.sha256()
-        call_ids = tuple(
-            call.call_id for call in step.kernel_plan.calls)
         if set(step.predictions) != set(call_ids):
             raise ValueError(
                 "streaming artifact predictions must cover KernelPlan exactly")
-        for call_id, header in zip(call_ids, headers, strict=True):
-            if header is None:
-                self._update_text_hash(prediction_digest, call_id)
-            else:
-                prediction_digest.update(header[1])
-            prediction_digest.update(
-                self._cached_contract_digest(step.predictions[call_id]))
-        update("predictions", prediction_digest.digest())
+        prediction_bytes = (self._bound_prediction_digest(step.predictions, headers, call_ids, plan_identity)
+            if bound is not None else None)
+        if prediction_bytes is None:
+            prediction_digest = hashlib.sha256()
+            for call_id, header in zip(call_ids, headers, strict=True):
+                if header is None:
+                    self._update_text_hash(prediction_digest, call_id)
+                else:
+                    prediction_digest.update(header[1])
+                prediction_digest.update(self._cached_contract_digest(step.predictions[call_id]))
+            prediction_bytes = prediction_digest.digest()
+        update("predictions", prediction_bytes)
         update(
             "execution_timeline",
             self._timeline_contract_digest(step.execution_timeline),
         )
         return digest.digest()
+
+    def _bound_plan_digest(self, plan):
+        from src.serving.kernel_lowering.kernel_plan import _bound_kernel_spec_projection
+        projection = _bound_kernel_spec_projection(plan)
+        if projection is None or type(plan.block_repeats) is not tuple or plan.block_repeats:
+            return None
+        classes = type(self).__mro__
+        for name, descriptor, function, code in _PLAN_DIGEST_ENCODERS:
+            if (name in vars(self) or next(vars(cls)[name] for cls in classes if name in vars(cls)) is not descriptor
+                    or function.__code__ is not code):
+                return None
+        template, positions = projection
+        identity = id(template)
+        if identity in self._plan_bytes_by_identity:
+            retained, retained_calls, body, offsets, headers, call_ids = self._plan_bytes_by_identity[identity]
+            if retained is not template:
+                raise RuntimeError("streaming artifact plan identity collision")
+            if retained_calls is not template.calls:
+                del self._plan_bytes_by_identity[identity]
+                return None
+        else:
+            body, offsets, headers, call_ids = bytearray(), [], [], []
+            for call in template.calls:
+                header = self._native_header_bytes(call)
+                if header is None:
+                    return None
+                encoded = self._cached_contract_digest(call.kernel_spec)
+                if id(call.kernel_spec) not in self._contract_digest_by_identity:
+                    return None
+                body.extend(header[0])
+                offsets.append(len(body))
+                body.extend(encoded)
+                headers.append(header)
+                call_ids.append(call.call_id)
+            body.extend(self._repeat_contract_digest(()))
+            body, offsets, headers, call_ids = bytes(body), tuple(offsets), tuple(headers), tuple(call_ids)
+            if len(self._plan_bytes_by_identity) >= 64:
+                self._plan_bytes_by_identity.clear()
+            self._plan_bytes_by_identity[identity] = template, template.calls, body, offsets, headers, call_ids
+        current = bytearray(body)
+        for index in positions:
+            current[offsets[index]:offsets[index] + 32] = self._cached_contract_digest(plan.calls[index].kernel_spec)
+        return hashlib.sha256(current).digest(), headers, call_ids, identity
+
+    def _bound_prediction_digest(self, predictions, headers, call_ids, identity):
+        if identity in self._prediction_bytes_by_plan:
+            retained_plan, retained_ids, base, body, offsets = self._prediction_bytes_by_plan[identity]
+            if (identity not in self._plan_bytes_by_identity
+                    or self._plan_bytes_by_identity[identity][0] is not retained_plan
+                    or retained_ids is not call_ids):
+                del self._prediction_bytes_by_plan[identity]
+                return None
+            current = bytearray(body)
+            for index, call_id in enumerate(call_ids):
+                value = predictions[call_id]
+                if value is not base[index]:
+                    current[offsets[index]:offsets[index] + 32] = self._cached_contract_digest(value)
+            return hashlib.sha256(current).digest()
+        base, body, offsets = [], bytearray(), []
+        for call_id, header in zip(call_ids, headers, strict=True):
+            value = predictions[call_id]
+            encoded = self._cached_contract_digest(value)
+            if id(value) not in self._contract_digest_by_identity:
+                return None
+            body.extend(header[1])
+            offsets.append(len(body))
+            body.extend(encoded)
+            base.append(value)
+        if len(self._prediction_bytes_by_plan) >= 64:
+            self._prediction_bytes_by_plan.clear()
+        self._prediction_bytes_by_plan[identity] = (
+            self._plan_bytes_by_identity[identity][0], call_ids, tuple(base), bytes(body), tuple(offsets))
+        return hashlib.sha256(body).digest()
+
+    def _timeline_occurrence_bytes(self, counts):
+        if (type(counts) is not tuple or any(type(row) is not tuple or len(row) != 2
+                or type(row[0]) is not str or type(row[1]) is not int for row in counts)):
+            return None
+        if counts in self._timeline_count_bytes:
+            return self._timeline_count_bytes[counts]
+        body = bytearray()
+        for call_id, count in counts:
+            for text in (call_id, str(count)):
+                encoded = text.encode("utf-8")
+                body.extend(len(encoded).to_bytes(8, "big"))
+                body.extend(encoded)
+        if len(self._timeline_count_bytes) >= 64:
+            self._timeline_count_bytes.clear()
+        body = bytes(body)
+        self._timeline_count_bytes[counts] = body
+        return body
 
     def _compiled_workload_contract_digest(self, contract):
         """Hash the unchanged v6 structure supplied by its source owner.
@@ -975,7 +1144,9 @@ class StreamingExecutionArtifactAccumulator:
             and tuple(field.name for field in fields(WorkloadEdge)) == ("source", "destination", "kind")
             and all(type(edge) is WorkloadEdge and type(edge.source) is str
                 and type(edge.destination) is str and type(edge.kind) is str for edge in contract[1]))
-        digest = self._contract_digest(contract)
+        encoded = _native_workload_contract_bytes(contract) if native else None
+        digest = (self._contract_digest(contract) if encoded is None
+            else hashlib.sha256(encoded).digest())
         if native:
             if len(self._compiled_workload_projection_digests) >= 64:
                 self._compiled_workload_projection_digests.clear()
@@ -1153,6 +1324,8 @@ class StreamingExecutionArtifactAccumulator:
                 f"streaming artifact timeline duration disagrees for "
                 f"{step_id!r}")
         started = time.perf_counter()
+        if step.source_state_summary is not None:
+            self._state_audit.consume(step)
         step_digest = self._step_contract_digest(step, entry)
         self._record_prehashed(
             step_id,
@@ -1169,6 +1342,7 @@ class StreamingExecutionArtifactAccumulator:
         execution_contract_digest: bytes,
         logical_kernel_call_count: int,
         compact: bool,
+        state_audit_snapshot=None,
     ) -> None:
         if not isinstance(entry, ScheduleTraceEntry):
             raise TypeError(
@@ -1178,6 +1352,8 @@ class StreamingExecutionArtifactAccumulator:
         if not isinstance(execution_contract_digest, bytes):
             raise TypeError(
                 "streaming execution contract digest must be bytes")
+        if state_audit_snapshot is not None:
+            self._state_audit.consume_snapshot(state_audit_snapshot)
         step_id = backend_step.schedule.step_id
         if step_id in self._seen_step_ids:
             raise ValueError(
@@ -1234,6 +1410,11 @@ class StreamingExecutionArtifactAccumulator:
             and compact
         )
 
+    def state_audit_manifest(self, result):
+        if result.num_steps != self._state_audit.step_count:
+            raise ValueError("state audit step count differs from simulation")
+        return self._state_audit.manifest(result)
+
     def manifest(
         self,
         result: StreamingSimulationResult,
@@ -1257,8 +1438,49 @@ class StreamingExecutionArtifactAccumulator:
             representation = "full_step_ir_consumed_without_retention"
         else:
             representation = "compact_step_ir_consumed_without_retention"
+        offload = result.kv_offload
+        if offload is None:
+            modeled_transfer_count = 0
+            offload_summary = None
+        else:
+            modeled_transfer_count = len(offload.transfers)
+            serialized_records = json.dumps(_json_value(
+                tuple(asdict(record) for record in offload.transfers),
+                "streaming KV offload completions"),
+                sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+            offload_summary = {
+                "mode": offload.mode,
+                "validation_status": offload.validation_status,
+                "transfer_count": modeled_transfer_count,
+                "h2d_bytes_per_rank": sum(record.event.bytes
+                    for record in offload.transfers
+                    if record.event.action is KVCacheAction.LOAD),
+                "d2h_bytes_per_rank": sum(record.event.bytes
+                    for record in offload.transfers
+                    if record.event.action in (
+                        KVCacheAction.EVICT, KVCacheAction.STORE)),
+                "completion_records_sha256": hashlib.sha256(serialized_records).hexdigest(),
+                "final_tier_state": _json_value(offload.final_tier_state,
+                    "streaming KV final tier state"),
+            }
+        streaming_aggregate = {
+            "retention": "step_ir_consumed_then_released",
+            "representation": representation,
+            "ordered_step_execution_contract_chain_sha256": (
+                self._chain.hexdigest()),
+            "request_level_artifact": "not_retained",
+            "transfer_summary": {
+                "retention": "trace_manifest_digest_and_counts",
+                "trace_transfer_count": trace_transfer_count,
+                "simulation_transfer_count": result.num_simulation_transfers,
+                "trace_transfer_manifest_sha256": (
+                    self._transfer_trace_digest(result.schedule_trace.transfers)),
+            },
+        }
+        if offload_summary is not None:
+            streaming_aggregate["modeled_kv_offload"] = offload_summary
         body = {
-            "schema_version": 14,
+            "schema_version": 16 if offload is not None else 14,
             "hash_method": _STREAMING_HASH_METHOD,
             "performance_timing_status": performance_timing_status,
             "counts": {
@@ -1266,25 +1488,10 @@ class StreamingExecutionArtifactAccumulator:
                 "simulation_steps": result.num_steps,
                 "simulation_transfers": result.num_simulation_transfers,
                 "trace_transfers": trace_transfer_count,
-                "modeled_kv_offload_transfers": 0,
+                "modeled_kv_offload_transfers": modeled_transfer_count,
                 "kernel_calls": result.num_kernel_calls,
             },
-            "streaming_aggregate": {
-                "retention": "step_ir_consumed_then_released",
-                "representation": representation,
-                "ordered_step_execution_contract_chain_sha256": (
-                    self._chain.hexdigest()),
-                "request_level_artifact": "not_retained",
-                "transfer_summary": {
-                    "retention": "trace_manifest_digest_and_counts",
-                    "trace_transfer_count": trace_transfer_count,
-                    "simulation_transfer_count": (
-                        result.num_simulation_transfers),
-                    "trace_transfer_manifest_sha256": (
-                        self._transfer_trace_digest(
-                            result.schedule_trace.transfers)),
-                },
-            },
+            "streaming_aggregate": streaming_aggregate,
         }
         serialized = json.dumps(
             body,
@@ -1368,7 +1575,8 @@ def _modeled_kv_offload_manifest(
         step_id = step.backend_step.schedule.step_id
         for event in step.backend_step.kv_cache_events:
             if event.action not in (
-                    KVCacheAction.LOAD, KVCacheAction.EVICT):
+                    KVCacheAction.LOAD, KVCacheAction.EVICT,
+                    KVCacheAction.STORE):
                 continue
             key = (step_id, event.ready_event)
             if key in transfer_events_by_key:
@@ -1406,10 +1614,12 @@ def _modeled_kv_offload_manifest(
         len(record.completion.physical_transfers)
         for record in records_by_key.values()
     }
-    if not physical_counts or any(count < 1 for count in physical_counts):
+    if (any(count < 1 for count in physical_counts)
+            or (not physical_counts
+                and result.kv_offload.mode != "fixed_prefix_tier_replay")):
         raise ValueError(
             "execution artifact KV offload requires physical completions")
-    multi_rank = physical_counts != {1}
+    multi_rank = bool(physical_counts and physical_counts != {1})
     if multi_rank and physical_counts != {2}:
         raise NotImplementedError(
             "execution artifact v7 currently supports exactly two physical "
@@ -1538,7 +1748,15 @@ def _modeled_kv_offload_manifest(
             raise ValueError(
                 "execution artifact KV offload final state retains "
                 "reserved capacity")
-    if result.kv_offload.lifecycle_replay is None:
+    if result.kv_offload.mode == "fixed_prefix_tier_replay":
+        if result.kv_offload.lifecycle_replay is not None:
+            raise ValueError("fixed prefix tier scenario cannot use lifecycle replay")
+        intent_source = {
+            "kind": "fixed_prefix_tier_scenario",
+            "hbm_percent": final_tier_state["fixed_prefix_hbm_percent"],
+            "replay": None,
+        }
+    elif result.kv_offload.lifecycle_replay is None:
         intent_source = {
             "kind": "backend_emitted",
             "replay": None,
@@ -2939,9 +3157,20 @@ _NATIVE_ROUTING_FREEZER_SOURCE = tuple((name, getattr(_routing_freezing_owner, n
 # Only the two actual header encoders and canonical call layout qualify reuse.
 _HEADER_CALL_BASES = KernelCall.__bases__
 _HEADER_CALL_NAMESPACE = tuple(vars(KernelCall).items())
+_HEADER_NATIVE_SOURCE = ("_native_header_bytes", StreamingExecutionArtifactAccumulator._native_header_bytes,
+    StreamingExecutionArtifactAccumulator._native_header_bytes.__code__)
+_PLAN_DIGEST_ENCODERS = tuple((name, vars(StreamingExecutionArtifactAccumulator)[name],
+    function, function.__code__) for name, function in (
+        ("_cached_contract_digest", StreamingExecutionArtifactAccumulator._cached_contract_digest),
+        ("_contract_digest", StreamingExecutionArtifactAccumulator._contract_digest)))
 _HEADER_ENCODER_SOURCE = tuple((name, vars(StreamingExecutionArtifactAccumulator)[name],
     vars(StreamingExecutionArtifactAccumulator)[name].__func__,
     vars(StreamingExecutionArtifactAccumulator)[name].__func__.__code__,
     vars(StreamingExecutionArtifactAccumulator)[name].__func__.__defaults__,
     vars(StreamingExecutionArtifactAccumulator)[name].__func__.__kwdefaults__)
     for name in ("_update_text_hash", "_update_string_sequence_hash"))
+
+_NATIVE_WORKLOAD_FREEZER_SOURCE = _NATIVE_ROUTING_FREEZER_SOURCE + tuple((name,
+    getattr(_routing_freezing_owner, name), getattr(_routing_freezing_owner, name).__code__,
+    getattr(_routing_freezing_owner, name).__defaults__, getattr(_routing_freezing_owner, name).__kwdefaults__)
+    for name in ("_freeze_dataclass",))

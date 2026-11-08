@@ -500,17 +500,16 @@ def main():
         "--nvcc", type=Path, default=Path("/usr/local/cuda-12.2/bin/nvcc"))
     parser.add_argument(
         "--cuobjdump", type=Path,
-        default=Path(
-            "/share_data/yangxinhao/miniconda_yxh/envs/r2r_qwen3_next/"
-            "lib/python3.10/site-packages/triton/backends/nvidia/bin/cuobjdump"))
+        default=Path(shutil.which("cuobjdump") or "cuobjdump"))
     parser.add_argument(
         "--nvidia-smi", type=Path, default=Path("/usr/bin/nvidia-smi"))
     parser.add_argument(
         "--production-binary", type=Path,
-        default=Path(
-            "/share_data/yangxinhao/miniconda_yxh/envs/r2r_qwen3_next/"
-            "lib/python3.10/site-packages/vllm/_C.abi3.so"))
+        default=(Path(os.environ["MIDLAYER_A800_VLLM_BINARY"])
+                 if "MIDLAYER_A800_VLLM_BINARY" in os.environ else None))
     args = parser.parse_args()
+    if args.production_binary is None:
+        parser.error("--production-binary or MIDLAYER_A800_VLLM_BINARY is required")
     if args.device < 0:
         parser.error("--device must be non-negative")
     if args.rotation not in range(REQUIRED_INDEPENDENT_RUNS):

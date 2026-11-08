@@ -79,11 +79,21 @@ def build_fused_moe_physical_specs(
     # public .to(int64) is an alias. Keep W1/activation/W2 shared, while
     # exposing dispatch/finalization as unbound mathematical source ports.
     recipe = (("moe_init_routing", "w1", "moe_swiglu", "w2", "moe_abs", "moe_token_unpermute")
-        if ascend018 else select_fused_moe_recipe(hardware_id, selection_shape, hardware))
+        if ascend018 else select_fused_moe_recipe(
+            hardware_id, selection_shape, hardware, selection_attributes))
+    if hardware_id == "nvidia_h200" and "source_router_state" in selection_attributes:
+        router_state = selection_attributes["source_router_state"]
+        if router_state == "prepared_topk_weights_and_ids":
+            # The model's external router already owns casts and normalization.
+            # Keep expert-map conversion, which belongs to aligned assignment.
+            router_roles = {"logits_cast", "moe_topk", "normalize_sum", "normalize_div"}
+            recipe = tuple(stage for stage in recipe if stage not in router_roles)
+        elif router_state != "softmax_logits_ready":
+            raise NotImplementedError("H200 MoE requires explicit router producer ownership")
     reduce_work_fractions = select_fused_moe_reduce_work_fractions(
-        hardware_id, selection_shape, hardware)
+        hardware_id, selection_shape, hardware, selection_attributes)
     cast_roles = (() if ascend018 else select_fused_moe_cast_roles(
-        hardware_id, selection_shape, hardware))
+        hardware_id, selection_shape, hardware, selection_attributes))
     reduce_invocations = recipe.count("moe_reduce")
     sum_invocations = recipe.count("moe_sum")
     silu_invocations = recipe.count("moe_silu")
@@ -94,7 +104,10 @@ def build_fused_moe_physical_specs(
         raise ValueError(
             "fused-MoE recipe and source-derived moe_reduce work fractions "
             "disagree")
-    if fill_invocations not in (0, len(MOE_FILL_ROLES)):
+    source_naive_fill = (hardware_id == "nvidia_h200"
+        and selection_attributes["model_execution_version"] == "vllm_0_30_0"
+        and fill_invocations == 1)
+    if fill_invocations not in (0, len(MOE_FILL_ROLES)) and not source_naive_fill:
         raise ValueError(
             "fused-MoE recipe must contain either zero or exactly three "
             "typed moe_fill invocations")
@@ -139,6 +152,10 @@ def build_fused_moe_physical_specs(
     reduce_ordinal = 0
     specs = []
     for variant in recipe:
+        physical_shape = shape
+        launch_shape = selection_shape
+        stage_dtype = dtype
+        stage_selection_attributes = {}
         if variant in ("w1", "w2"):
             if skip_empty_npu_projection:
                 continue
@@ -172,7 +189,8 @@ def build_fused_moe_physical_specs(
             attributes = {"work_fraction": 1.0 / invocation_count}
         elif variant == "moe_fill":
             kind = KernelKind.VECTOR
-            attributes = {"fill_role": MOE_FILL_ROLES[fill_ordinal]}
+            attributes = {"fill_role": ("num_tokens_post_padded" if source_naive_fill
+                else MOE_FILL_ROLES[fill_ordinal])}
             fill_ordinal += 1
         elif variant == "moe_cast":
             kind = KernelKind.VECTOR
@@ -190,13 +208,74 @@ def build_fused_moe_physical_specs(
                 "tokens_per_expert": prediction_attributes[
                     "tokens_per_expert"],
             }
+        elif variant in ("logits_cast", "normalize_sum", "normalize_div",
+                         "expert_ids_long", "expert_map_lookup"):
+            # These are real0.11 Torch submissions with their own tensor ABI,
+            # not generic MoE vector work on [T,E,K,H,I].
+            role = variant
+            kind = KernelKind.VECTOR
+            tokens, experts, topk = (selection_shape[name]
+                for name in ("tokens", "experts", "topk"))
+            stage_dtype = "fp32"
+            if role == "logits_cast":
+                elements = tokens * experts
+                variant = "elementwise"
+                attributes = {"operation": "cast_bf16_float32", "reads": 1, "writes": 1}
+            elif role == "normalize_sum":
+                elements = tokens
+                variant = "reduce"
+                attributes = {"reduction_factor": topk}
+            elif role == "normalize_div":
+                elements = tokens * topk
+                variant = "elementwise"
+                attributes = {"operation": "div", "reads": 2, "writes": 1}
+            else:
+                from src.kernel.launch_config.nvidia_h200.moe_legacy_launch import legacy_expert_map_elements
+                elements = legacy_expert_map_elements(selection_shape, selection_attributes)
+                stage_dtype = "int32"
+                if role == "expert_ids_long":
+                    variant = "elementwise"
+                    attributes = {"operation": "cast_int32_int64", "reads": 1, "writes": 1,
+                        "tensor_iterator_source": "pytorch_2_8_sm90"}
+                else:
+                    variant = "gather"
+                    attributes = {"gather_factor": 1, "index_count": elements,
+                        "index_bytes": 8, "scattered": True, "materialized_output": True}
+            physical_shape = {"element_count": elements}
+            launch_shape = {**selection_shape, "element_count": elements}
+            # The division contract revalidates the exact broadcast geometry
+            # using T/E/K; preserve these dimensions on the physical spec.
+            if role == "normalize_div":
+                physical_shape = launch_shape
+            stage_selection_attributes["source_moe_router_stage"] = role
+        elif variant == "moe_zero_output":
+            # The0.30 EP-map body zeroes every routed W2 output slot,
+            # including local slots subsequently overwritten by W2.
+            if ("tensor_iterator_source" not in selection_attributes
+                    or selection_attributes["tensor_iterator_source"] != "pytorch_2_13_sm90"):
+                raise NotImplementedError("H2000.30 output zero requires explicit Torch2.13 Fill source")
+            elements = selection_shape["tokens"] * selection_shape["topk"] * selection_shape["hidden"]
+            kind = KernelKind.VECTOR
+            variant = "elementwise"
+            physical_shape = {"element_count": elements}
+            launch_shape = physical_shape
+            attributes = {"operation": "fill", "reads": 0, "writes": 1}
         elif variant.startswith("moe_"):
             kind = KernelKind.VECTOR
             attributes = {}
         else:
             raise ValueError(f"unknown fused-MoE recipe variant: {variant!r}")
 
+        if hardware_id == "nvidia_h200" and variant == "moe_topk":
+            # fused_topk consumes the FP32 producer, even when the logical
+            # public call received BF16 gate logits before logits_cast.
+            stage_dtype = ("fp32" if selection_attributes["model_execution_version"] == "vllm_0_11_0"
+                else selection_attributes["routing_input_dtype"])
+            stage_selection_attributes["routing_input_dtype"] = stage_dtype
+
         attributes.update(graph_token_domain_attributes)
+        if graph_token_domain_attributes and physical_shape is not shape:
+            attributes["model_input_shape"] = dict(physical_shape)
 
         if ascend018 and variant in ("moe_init_routing", "moe_abs", "moe_token_unpermute"):
             specs.append(KernelSpec(kind, hardware_id, shape, dtype=dtype, variant=variant,
@@ -207,6 +286,7 @@ def build_fused_moe_physical_specs(
             continue
 
         launch_attributes = dict(selection_attributes)
+        launch_attributes.update(stage_selection_attributes)
         for name, value in attributes.items():
             if (name in launch_attributes
                     and launch_attributes[name] != value):
@@ -215,13 +295,15 @@ def build_fused_moe_physical_specs(
                     "its source-derived physical invocation")
             launch_attributes[name] = value
         launch = select_launch_config(
-            hardware_id, kind, selection_shape, dtype, variant,
+            hardware_id, kind, launch_shape, stage_dtype, variant,
             launch_attributes,
             hardware=hardware)
+        support = ({"execution_support": "unsupported", "unsupported_reason": "typed_service_unavailable"}
+            if variant == "elementwise" and attributes["operation"] == "div" else {})
         specs.append(KernelSpec(
-            kind, hardware_id, shape, dtype=dtype,
+            kind, hardware_id, physical_shape, dtype=stage_dtype,
             variant=launch.execution_variant,
-            launch=launch, attributes=attributes))
+            launch=launch, attributes=attributes, **support))
 
     if fill_ordinal != fill_invocations:
         raise AssertionError("typed moe_fill invocation count did not conserve")

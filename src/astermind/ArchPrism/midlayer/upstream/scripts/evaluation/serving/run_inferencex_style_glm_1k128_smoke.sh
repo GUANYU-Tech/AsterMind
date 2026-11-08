@@ -3,7 +3,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/../../.."
-PYTHONHASHSEED=0 /home/yangxinhao/miniconda3/envs/r2r_qwen3_next/bin/python -c 'from evaluation.serving.simulation.simulation_runner import main; raise SystemExit(main())' \
+PYTHONHASHSEED=0 "${MIDLAYER_PYTHON:-python}" -c 'from evaluation.serving.simulation.simulation_runner import main; raise SystemExit(main())' \
   --canonical-requests serving_dataset/synthetic/inferencex_style/glm_5_2_h200_1k128_c4/requests.csv \
   --canonical-requests-sha256 a22431264a5e76189a1b5111e82174fcc1c16d54e413f715273b083240855e2f \
   --model configs/model/glm-5.2-fp8.json --model-config-sha256 fb2555ddea2a16f6aa9915a6d7a5acca1cd7dd8406255e66b65ab48805ca4f3d \

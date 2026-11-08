@@ -1244,7 +1244,27 @@ class PerformanceFormula:
                 else:
                     service_fraction = (
                         stage.work_fraction * work_plan.worker_count)
-                    duration = service_time[stage.service] * service_fraction
+                    if stage.completion_resource_roles is not None:
+                        # A coherent store can retire at an earlier node while
+                        # its downstream bytes continue to drain. All nodes
+                        # retain their aggregate resource/arbitration bounds.
+                        if stage.service in overridden_memory_services:
+                            raise ValueError(
+                                "filtered memory completion cannot consume an overridden path")
+                        memory = memory_by_service[stage.service]
+                        if any(item.path_name == memory.path_name
+                               for item in memory_access_class_diagnostics):
+                            raise ValueError(
+                                "filtered memory capacity cannot replace a typed memory service")
+                        roles = set(stage.completion_resource_roles)
+                        unknown = roles - {node.resource_role for node in memory.nodes}
+                        if unknown:
+                            raise ValueError(
+                                f"pipeline completion references unknown memory nodes: {sorted(unknown)}")
+                        duration = max(node.capacity_time_s for node in memory.nodes
+                                       if node.resource_role in roles) * service_fraction
+                    else:
+                        duration = service_time[stage.service] * service_fraction
                     if stage.aiv_ingress_group_size is not None:
                         duration /= stage.aiv_ingress_group_size
                     if (stage.include_first_request_latency
@@ -6491,7 +6511,7 @@ class PerformanceFormula:
 
     def _resolve_fia_split_fuse_work_plan(
             self, work_plan, active_units, launch_task_kind,
-            resource_time_overrides_ns):
+            resource_time_overrides_ns, memory_diagnostics=()):
         """Solve the compressed SplitFuse AIC-to-dual-AIV source pipeline."""
 
         if not isinstance(work_plan, FiaSplitFuseWorkPlan):
@@ -6516,6 +6536,23 @@ class PerformanceFormula:
         active_aiv_count = 2 * active_aic_count
         if active_aic_count <= 0:
             raise ValueError("SplitFuse work plan has no active AIC group")
+        mte2_paths = tuple(
+            diagnostic for diagnostic in memory_diagnostics
+            if diagnostic.path_name == "mte2_read")
+        if memory_diagnostics and len(mte2_paths) != 1:
+            raise ValueError("SplitFuse requires one mte2_read memory path")
+        if mte2_paths:
+            nodes = {node.resource_role: node for node in mte2_paths[0].nodes}
+            if set(nodes) != {"l2_cache", "dram"}:
+                raise ValueError("SplitFuse MTE2 path requires L2 and DRAM")
+            if (nodes["l2_cache"].bytes <= 0
+                    or not 0 <= nodes["dram"].bytes
+                    <= nodes["l2_cache"].bytes):
+                raise ValueError("SplitFuse MTE2 miss bytes are invalid")
+            mte2_dram_miss_fraction = (
+                nodes["dram"].bytes / nodes["l2_cache"].bytes)
+        else:
+            mte2_dram_miss_fraction = None
         # CANN 8.5.1 SplitFuse has no ICachePreLoad.  A workload-independent
         # FIA Vec1/Vec2 probe at the same 24-group, dual-AIV topology measures
         # this conservative first-Vec1 cold-fill lower bound.
@@ -6623,6 +6660,21 @@ class PerformanceFormula:
                 "compute_fma").exact_request_service_time_s(
                     "aic_scalar_global_get_value_serialized", 1)
             if work_plan.paged_kv_cache else 0.0)
+        # Source tasks repeatedly issue the same physical descriptor sizes.
+        # Keep these exact HWSpec service results for this prediction only;
+        # the active group count and hardware object are fixed in this scope.
+        serial_mte2_ns = {}
+        stream_mte2_ns = {}
+
+        def mte2_service_ns(byte_count, *, stream):
+            cache = stream_mte2_ns if stream else serial_mte2_ns
+            if byte_count not in cache:
+                cache[byte_count] = (
+                    self.hw.aic_mte2_nd2nz_stream_time_ns(byte_count, active_aic_count)
+                    if stream else
+                    self.hw.aic_mte2_nd2nz_serial_time_ns(byte_count, active_aic_count))
+            return cache[byte_count]
+
         aic_count = work_plan.aic_worker_count
         aiv_count = 2 * aic_count
         tensor_scale = work_plan.tensor_operation_scale
@@ -6651,7 +6703,8 @@ class PerformanceFormula:
             )
 
         def aic_mte2_sequence_time(
-                descriptor_bytes, *, paged_address_dependency=False):
+                descriptor_bytes, *, paged_address_dependency=False,
+                paged_kv_source=False):
             """Return one source copy burst with optional address lookups."""
 
             serial_minimum = self.hw.aic_mte2_nd2nz_service[
@@ -6663,16 +6716,33 @@ class PerformanceFormula:
             for ordinal, byte_count in enumerate(descriptor_bytes):
                 physical_bytes = max(byte_count, serial_minimum)
                 if ordinal == 0 or byte_count < stream_minimum:
-                    duration_ns = self.hw.aic_mte2_nd2nz_serial_time_ns(
-                        physical_bytes, active_aic_count)
+                    duration_ns = mte2_service_ns(physical_bytes, stream=False)
                 else:
-                    duration_ns = self.hw.aic_mte2_nd2nz_stream_time_ns(
-                        physical_bytes, active_aic_count)
+                    duration_ns = mte2_service_ns(physical_bytes, stream=True)
                 if paged_address_dependency:
                     scalar_available_s += paged_lookup_s
                 mte2_available_s = (
                     max(mte2_available_s, scalar_available_s)
                     + duration_ns * 1e-9)
+            if (paged_kv_source and work_plan.head_dim == 128
+                    and work_plan.kv_head_count == 8
+                    and active_aic_count == 24
+                    and mte2_dram_miss_fraction is not None
+                    and len(descriptor_bytes) >= 3):
+                # A measured full-page prefix must still constrain a longer
+                # source stream whose final descriptor is only a partial page.
+                finite_s = max((
+                    self.hw.split_fuse_mte2_short_tail_time_ns(
+                        count, 24, mte2_dram_miss_fraction,
+                        two_slot_overlap=True) * 1e-9
+                    for count in (3, 4, 5, 7)
+                    if len(descriptor_bytes) >= count
+                    and all(byte_count == 32768
+                            for byte_count in descriptor_bytes[:count])
+                ), default=0.0)
+                # The finite probe supplies a lower bound on the full ingress
+                # path; it cannot erase the existing descriptor service.
+                return max(finite_s, mte2_available_s)
             return mte2_available_s
 
         def axis_slices(size, block_size):
@@ -6693,7 +6763,8 @@ class PerformanceFormula:
             return available[-1]
 
         def mte2_tensor_output_pipeline_time(
-                stage_rows, *, paged_address_dependency=False):
+                stage_rows, *, paged_address_dependency=False,
+                paged_kv_source=False):
             """Solve a two-buffer descriptor stream through AIC pipes."""
 
             scalar_available = 0.0
@@ -6711,8 +6782,7 @@ class PerformanceFormula:
                 physical_bytes = max(descriptor_bytes, serial_minimum)
                 serial_time = max(
                     aic_l2_time(physical_bytes),
-                    self.hw.aic_mte2_nd2nz_serial_time_ns(
-                        physical_bytes, active_aic_count) * 1e-9,
+                    mte2_service_ns(physical_bytes, stream=False) * 1e-9,
                 )
                 if descriptor_bytes < self.hw.aic_mte2_nd2nz_service[
                         "stream_descriptor_bytes"][0]:
@@ -6720,8 +6790,7 @@ class PerformanceFormula:
                 else:
                     stream_time = max(
                         aic_l2_time(physical_bytes),
-                        self.hw.aic_mte2_nd2nz_stream_time_ns(
-                            physical_bytes, active_aic_count) * 1e-9,
+                        mte2_service_ns(physical_bytes, stream=True) * 1e-9,
                     )
                 if paged_address_dependency:
                     scalar_available += paged_lookup_s
@@ -6732,7 +6801,25 @@ class PerformanceFormula:
                 tensor_available = tensor_start + tensor_time
                 output_start = max(output_available, tensor_available)
                 output_available = output_start + output_time
-            return max(mte2_available, tensor_available, output_available)
+            completion = max(mte2_available, tensor_available, output_available)
+            if (paged_kv_source and work_plan.head_dim == 128
+                    and work_plan.kv_head_count == 8
+                    and active_aic_count == 24
+                    and mte2_dram_miss_fraction is not None
+                    and len(stage_rows) >= 3):
+                # Preserve every measured full-page prefix as a completion
+                # lower bound when the source stream continues past it.
+                finite_s = max((
+                    self.hw.split_fuse_mte2_short_tail_time_ns(
+                        count, 24, mte2_dram_miss_fraction,
+                        two_slot_overlap=False) * 1e-9
+                    for count in (3, 4, 5, 7)
+                    if len(stage_rows) >= count
+                    and all(row[0] == 32768
+                            for row in stage_rows[:count])
+                ), default=0.0)
+                completion = max(completion, finite_s)
+            return completion
 
         task_duration_cache = {}
 
@@ -6767,7 +6854,8 @@ class PerformanceFormula:
                     )
                     for columns in stack_widths
                     for n_rows in axis_slices(columns, 128)),
-                    paged_address_dependency=work_plan.paged_kv_cache)
+                    paged_address_dependency=work_plan.paged_kv_cache,
+                    paged_kv_source=work_plan.paged_kv_cache)
             )
             if work_plan.paged_kv_cache:
                 # CANN's fixed ``PRE_LAUNCH=2`` means that only a V prefix
@@ -6784,7 +6872,8 @@ class PerformanceFormula:
                                 aic_mte2_sequence_time(tuple(
                                     2 * v_rows * work_plan.head_dim
                                     for v_rows in axis_slices(columns, 128)),
-                                    paged_address_dependency=True),
+                                    paged_address_dependency=True,
+                                    paged_kv_source=True),
                                 aic_mte2_sequence_time(tuple(
                                     2 * packed_rows * k_rows
                                     for k_rows in axis_slices(columns, 256))),
@@ -6808,11 +6897,9 @@ class PerformanceFormula:
                     physical_bytes = max(byte_count, serial_minimum)
                     if (descriptor_ordinal == 0
                             or byte_count < stream_minimum):
-                        duration_ns = self.hw.aic_mte2_nd2nz_serial_time_ns(
-                            physical_bytes, active_aic_count)
+                        duration_ns = mte2_service_ns(physical_bytes, stream=False)
                     else:
-                        duration_ns = self.hw.aic_mte2_nd2nz_stream_time_ns(
-                            physical_bytes, active_aic_count)
+                        duration_ns = mte2_service_ns(physical_bytes, stream=True)
                     return max(
                         aic_l2_time(physical_bytes), duration_ns * 1e-9)
 
@@ -6845,7 +6932,8 @@ class PerformanceFormula:
                         tuple(
                             2 * v_rows * work_plan.head_dim
                             for v_rows in axis_slices(columns, 128)),
-                        paged_address_dependency=work_plan.paged_kv_cache),
+                        paged_address_dependency=work_plan.paged_kv_cache,
+                        paged_kv_source=work_plan.paged_kv_cache),
                 )
                 for stack_index, columns in enumerate(stack_widths)
                 if stack_index + 2 < len(stack_widths)
@@ -6963,7 +7051,12 @@ class PerformanceFormula:
                 # the MTE3 write, so it uses the same measured typed service.
                 vec2_compute = vector_scale * (
                     lane_outputs / cast_fp32_to_bf16_rate
-                    + lane_outputs / div_rate)
+                    + lane_outputs / div_rate
+                    # block_epilogue_rescale_o.hpp: every non-first stack
+                    # rescales the retained output with Mul then Add. This
+                    # work also executes when no GM accumulator is needed.
+                    + 2 * lane_outputs * (len(stack_widths) - 1)
+                    / generic_rate)
                 vec2_compute += (
                     div_invocations * div_setup
                     + cast_invocations * cast_fp32_to_bf16_setup)
@@ -7020,269 +7113,184 @@ class PerformanceFormula:
             "fia_output_init_syncall": initial_sync_all_s,
             "fia_cross_domain_program_span": 0.0,
             "fia_split_fuse_cross_core_handoff": (
-                3.0 * handoff_edge_s * work_plan.task_count),
+                3.0 * handoff_edge_s * sum(
+                    count * math.ceil(kv / work_plan.kv_stack_ceiling)
+                    for geometries in work_plan.worker_geometry_counts
+                    for _, _, kv, count in geometries)),
         }
-
-        def schedule_vec1(state, task):
-            ends = []
-            for lane, duration in enumerate(task["durations"][1]):
-                start = max(state["aiv"][lane],
-                            task["mm1_end"] + handoff_edge_s)
-                if state["vec1_cold_fill_pending"][lane]:
-                    duration += split_fuse_aiv_instruction_cold_fill_s
-                    state["vec1_cold_fill_pending"][lane] = False
-                end = start + duration
-                state["aiv"][lane] = end
-                ends.append(end)
-            task["vec1_end"] = max(ends)
-
-        def schedule_mm2_v_ingress(state, task):
-            """Issue the source-valid paged PV V prefix before Vec1 waits."""
-
-            duration = task["durations"][10]
-            if duration < 0.0:
-                raise ValueError("SplitFuse V ingress duration is negative")
-            state["aic"] += duration
-
-        def schedule_mm2(state, task):
-            start = max(state["aic"], task["vec1_end"] + handoff_edge_s)
-            duration = task["durations"][2] - task["durations"][10]
-            if duration < 0.0:
-                raise ValueError("SplitFuse PV tail duration is negative")
-            end = start + duration
-            state["aic"] = end
-            task["mm2_end"] = end
-
-        def schedule_vec2(state, task):
-            ends = []
-            for lane, duration in enumerate(task["durations"][3]):
-                start = max(state["aiv"][lane],
-                            task["mm2_end"] + handoff_edge_s)
-                end = start + duration
-                state["aiv"][lane] = end
-                ends.append(end)
-            task["vec2_end"] = max(ends)
-
-        def advance_one(state, durations):
-            # The source task loop is strictly sequential per core: the last
-            # fused-loop iteration blocks on the final stack's softmaxReady
-            # before the loop ends, and the next task's blocking loadQGM and
-            # QK issue only run afterwards.  Model the boundary as a lower
-            # bound on the next task's first MTE2: previous mm1 end + QK
-            # crossing + full softmax + SOFTMAX_READY crossing.
-            mm1_start = state["aic"]
-            if state["pending"]:
-                previous = state["pending"][-1]
-                mm1_start = max(
-                    mm1_start,
-                    previous["mm1_end"]
-                    + 2.0 * handoff_edge_s
-                    + max(previous["durations"][1]))
-            mm1_end = mm1_start + durations[0]
-            state["aic"] = mm1_end
-            current = {
-                "durations": durations,
-                "mm1_start": mm1_start,
-                "mm1_end": mm1_end,
-            }
-            state["pending"].append(current)
-            if len(state["pending"]) >= 2:
-                previous = state["pending"][-2]
-                schedule_mm2_v_ingress(state, previous)
-                schedule_vec1(state, previous)
-                schedule_mm2(state, previous)
-            if len(state["pending"]) >= 3:
-                oldest = state["pending"].pop(0)
-                schedule_vec2(state, oldest)
 
         negative = float("-inf")
 
-        def task_transition(oldest, newest, current):
-            current_mm1 = current[0]
-            newest_vec1 = newest[1]
-            newest_mm2 = newest[2]
-            newest_mm2_tail = newest_mm2 - newest[10]
-            if newest_mm2_tail < 0.0:
-                raise ValueError("SplitFuse PV tail duration is negative")
-            oldest_vec2 = oldest[3]
-            newest_vec1_max = max(newest_vec1)
-            # Edge delays: the softmax-gated entries add SOFTMAX_READY
-            # (Vec1 -> MM2 tail), the mm2_end-gated entries add PV_READY
-            # (MM2 -> Vec2), and the mm1_end-state entries add the
-            # sequential task boundary (previous softmax + QK/SOFTMAX_READY
-            # crossings before the next task's first MTE2) -- each edge
-            # equals one third of the measured three-handoff per-depth cost.
-            # Rows 0/4 state[3] entries additionally traverse mm1(current)
-            # and the whole mm2 ingress because the boundary gate pushes the
-            # next task's QK behind the previous task's softmax drain.
-            return (
-                (
-                    current_mm1 + newest_mm2,
-                    newest_vec1[0] + newest_mm2_tail + handoff_edge_s,
-                    newest_vec1[1] + newest_mm2_tail + handoff_edge_s,
-                    current_mm1 + newest_mm2 + newest_vec1_max
-                    + 2.0 * handoff_edge_s,
-                    negative,
-                    negative,
-                ),
-                (
-                    negative,
-                    newest_vec1[0] + oldest_vec2[0],
-                    negative,
-                    newest_vec1[0] + oldest_vec2[0] + handoff_edge_s,
-                    oldest_vec2[0] + handoff_edge_s,
-                    negative,
-                ),
-                (
-                    negative,
-                    negative,
-                    newest_vec1[1] + oldest_vec2[1],
-                    newest_vec1[1] + oldest_vec2[1] + handoff_edge_s,
-                    oldest_vec2[1] + handoff_edge_s,
-                    negative,
-                ),
-                (
-                    current_mm1,
-                    negative,
-                    negative,
-                    current_mm1 + newest_vec1_max + 2.0 * handoff_edge_s,
-                    negative,
-                    negative,
-                ),
-                (
-                    current_mm1 + newest_mm2,
-                    newest_vec1[0] + newest_mm2_tail + handoff_edge_s,
-                    newest_vec1[1] + newest_mm2_tail + handoff_edge_s,
-                    current_mm1 + newest_mm2 + newest_vec1_max
-                    + 2.0 * handoff_edge_s,
-                    negative,
-                    negative,
-                ),
-                (negative, negative, negative, negative, negative, 0.0),
-            )
+        source_task_cache = {}
 
-        def pending_state_vector(state):
-            if len(state["pending"]) != 2:
-                raise AssertionError(
-                    "SplitFuse periodic program requires two pending tasks")
-            return (
-                state["aic"],
-                state["aiv"][0],
-                state["aiv"][1],
-                state["pending"][-1]["mm1_end"],
-                state["pending"][-2]["mm2_end"],
-                0.0,
-            )
+        def source_task_stacks(query_rows, packed_rows, attended_kv):
+            """Materialize source stack stages, with one Q ingress per task."""
+            key = (query_rows, packed_rows, attended_kv)
+            if key in source_task_cache:
+                return source_task_cache[key]
+            q_bytes = 2 * packed_rows * work_plan.head_dim
+            q_load = max(aic_l2_time(q_bytes), aic_mte2_sequence_time((q_bytes,)))
+            stacks = []
+            for offset in range(0, attended_kv, work_plan.kv_stack_ceiling):
+                columns = min(work_plan.kv_stack_ceiling, attended_kv - offset)
+                first = offset == 0
+                last = offset + columns == attended_kv
+                masked = attended_kv - query_rows < offset + columns - 1
+                base = task_durations(query_rows if masked else 1, packed_rows, columns)
+                vec1, vec2 = [], []
+                vec2_brcb = []
+                alignment = 32 if masked else 16
+                rounded = math.ceil(columns / alignment) * alignment
+                row_tile = min((8192 // rounded // 8) * 8, 64)
+                for lane in range(2):
+                    rows = packed_rows // 2 if lane == 0 else packed_rows - packed_rows // 2
+                    if rows == 0:
+                        vec1.append(0.0)
+                        vec2.append(0.0)
+                        vec2_brcb.append(0.0)
+                        continue
+                    outputs = rows * work_plan.head_dim
+                    v1 = base[1][lane]
+                    if not first:
+                        # UpdateGlobalRowMax/RowSum are per non-first stack,
+                        # independent of whether its causal mask is active.
+                        v1 += vector_scale * (4 * rows / generic_rate + rows / exp_rate)
+                        v1 += math.ceil(rows / row_tile) * exp_setup
+                    vec1.append(v1)
+                    # The first stack seeds the UB accumulator. Subsequent
+                    # stacks execute Mul/Add; only the final stack Div/Casts
+                    # and stores the public output. This retains de9b02abc.
+                    v2 = aiv_l2_time(4 * outputs)
+                    # block_epilogue_rescale_o.hpp:185-190,243-249:
+                    # broadcast dm for each non-first stack and gl for the
+                    # terminal stack, once per source output row chunk.
+                    brcb = (int(not first) + int(last)) * math.fsum(
+                        self.hw.fia_brcb_time_ns(
+                            math.ceil(min(vec2_row_tile, rows - start) / 8) * 8
+                        ) * 1e-9
+                        for start in range(0, rows, vec2_row_tile))
+                    v2 += brcb
+                    vec2_brcb.append(brcb)
+                    if rows > vec2_row_tile:
+                        # The accumulator cannot stay in UB across row
+                        # loops: nonterminal stacks spill gUpdate and later
+                        # stacks reload it (source:192-198,343-347).
+                        if not first:
+                            v2 += aiv_l2_time(4 * outputs)
+                        if not last:
+                            v2 += aiv_write_time(4 * outputs)
+                    if not first:
+                        v2 += vector_scale * 2 * outputs / generic_rate
+                    if last:
+                        v2 += base[3][lane] - aiv_l2_time(4 * outputs)
+                    vec2.append(v2)
+                v_ingress = max(aic_l2_time(2 * columns * work_plan.head_dim),
+                    aic_mte2_sequence_time(tuple(
+                        2 * rows * work_plan.head_dim
+                        for rows in axis_slices(columns, 128)),
+                        paged_address_dependency=work_plan.paged_kv_cache,
+                        paged_kv_source=work_plan.paged_kv_cache)
+                    ) if work_plan.pv_v_ingress_before_softmax else 0.0
+                if v_ingress > base[2]:
+                    raise ValueError("SplitFuse V ingress exceeds its PV service")
+                stacks.append((base[0] if first else base[0] - q_load,
+                    tuple(vec1), base[2], tuple(vec2),
+                    base[4], base[5], base[6] + tuple(vec2_brcb),
+                    base[7], base[8], base[9], v_ingress))
+            source_task_cache[key] = tuple(stacks)
+            return source_task_cache[key]
 
-        def restore_pending_state(state, vector, oldest, newest):
-            state["aic"] = vector[0]
-            state["aiv"] = [vector[1], vector[2]]
-            state["pending"] = [
-                {"durations": oldest, "mm2_end": vector[4]},
-                {"durations": newest, "mm1_end": vector[3]},
-            ]
+        source_transition_cache = {}
 
-        transition_program_cache = {}
+        def source_task_transition(geometry, cold):
+            """Three-actor source loop, with PRE_LAUNCH inside one task.
 
-        def advance_sequence(state, duration_runs, repeat_count):
-            if len(state["pending"]) != 2:
-                raise AssertionError(
-                    "SplitFuse max-plus sequence requires a full pipeline")
-            oldest = state["pending"][-2]["durations"]
-            newest = state["pending"][-1]["durations"]
-            cache_key = (oldest, newest, duration_runs)
-            if cache_key in transition_program_cache:
-                transition, final_oldest, final_newest = (
-                    transition_program_cache[cache_key])
-            else:
-                transitions = []
-                final_oldest = oldest
-                final_newest = newest
-                for current, run_count in duration_runs:
-                    if run_count <= 0:
-                        raise ValueError(
-                            "SplitFuse duration-run count must be positive")
-                    transitions.append(task_transition(
-                        final_oldest, final_newest, current))
-                    final_oldest, final_newest = final_newest, current
-                    if run_count >= 2:
-                        transitions.append(task_transition(
-                            final_oldest, final_newest, current))
-                        final_oldest, final_newest = (
-                            final_newest, current)
-                    if run_count >= 3:
-                        steady_transition = task_transition(
-                            final_oldest, final_newest, current)
-                        transitions.append(_maxplus_power_matrix(
-                            _maxplus_powers(steady_transition, run_count - 2),
-                            run_count - 2,
-                            len(steady_transition),
-                        ))
-                transition = compose_maxplus_transitions(tuple(transitions))
-                transition_program_cache[cache_key] = (
-                    transition, final_oldest, final_newest)
-            vector = apply_repeated_maxplus_transition(
-                transition, repeat_count, pending_state_vector(state))
-            restore_pending_state(
-                state, vector, final_oldest, final_newest)
+            QK(k), Vec1(k), PV(k-2), Vec2(k-2) retain source order. The
+            complete stack loop drains before the next request/head task;
+            AIC and both AIV clocks still overlap between adjacent tasks.
+            AIC stages retain the existing internal pipe approximation.
+            """
+            key = (*geometry, *cold)
+            if key in source_transition_cache:
+                return source_transition_cache[key]
+            stacks = source_task_stacks(*geometry)
+            aic = (0.0, negative, negative)
+            aiv = [(negative, 0.0, negative), (negative, negative, 0.0)]
+            softmax_ready = []
+            pending_cold = list(cold)
+
+            def delayed(value, duration):
+                return tuple(entry + duration for entry in value)
+
+            def joined(*values):
+                return tuple(max(entries) for entries in zip(*values))
+
+            # flash_attention_regular.h:297,311,420,499-501. The two drain
+            # iterations belong to this task, not the next two tasks.
+            for iteration in range(len(stacks) + 2):
+                if iteration < len(stacks):
+                    stack = stacks[iteration]
+                    aic = delayed(aic, stack[0])
+                    for lane in range(2):
+                        duration = stack[1][lane]
+                        if pending_cold[lane]:
+                            duration += split_fuse_aiv_instruction_cold_fill_s
+                            pending_cold[lane] = False
+                        aiv[lane] = delayed(joined(aiv[lane],
+                            delayed(aic, handoff_edge_s)), duration)
+                    softmax_ready.append(joined(*aiv))
+                if iteration >= 2:
+                    ordinal = iteration - 2
+                    stack = stacks[ordinal]
+                    # BlockMmadPV loads V before waiting for softmaxReady.
+                    aic = delayed(aic, stack[10])
+                    aic = delayed(joined(aic,
+                        delayed(softmax_ready[ordinal], handoff_edge_s)),
+                        stack[2] - stack[10])
+                    for lane in range(2):
+                        aiv[lane] = delayed(joined(aiv[lane],
+                            delayed(aic, handoff_edge_s)), stack[3][lane])
+            transition = (aic, *aiv)
+            source_transition_cache[key] = transition
+            return transition
 
         def advance_program(state, program, repeat_count):
-            if repeat_count <= 0:
-                raise ValueError(
-                    "SplitFuse periodic program requires positive repeats")
-            duration_runs = tuple(
-                (task_durations(query_rows, packed_rows, attended_kv),
-                 run_count)
-                for (query_rows, packed_rows, attended_kv,
-                     run_count) in program)
-            if not duration_runs:
-                raise ValueError(
-                    "SplitFuse AIC received an empty periodic program")
-            run_index = 0
-            remaining_in_run = duration_runs[0][1]
-            while len(state["pending"]) < 2:
-                advance_one(state, duration_runs[run_index][0])
-                remaining_in_run -= 1
-                if remaining_in_run == 0:
-                    run_index += 1
-                    if run_index == len(duration_runs):
-                        run_index = 0
-                        remaining_in_run = duration_runs[0][1]
-                        repeat_count -= 1
-                        if not repeat_count:
-                            return
-                    else:
-                        remaining_in_run = duration_runs[run_index][1]
-            if run_index or remaining_in_run != duration_runs[0][1]:
-                suffix_runs = (
-                    ((duration_runs[run_index][0], remaining_in_run),)
-                    + duration_runs[run_index + 1:])
-                advance_sequence(state, suffix_runs, 1)
+            if repeat_count <= 0 or not program:
+                raise ValueError("SplitFuse source program requires positive repeats and tasks")
+            vector = (state["aic"], *state["aiv"])
+            if any(state["vec1_cold_fill_pending"]):
+                for query_rows, packed_rows, attended_kv, count in program:
+                    geometry = (query_rows, packed_rows, attended_kv)
+                    vector = apply_repeated_maxplus_transition(
+                        source_task_transition(geometry, state["vec1_cold_fill_pending"]),
+                        1, vector)
+                    state["vec1_cold_fill_pending"] = [False, False]
+                    if count > 1:
+                        vector = apply_repeated_maxplus_transition(
+                            source_task_transition(geometry, (False, False)),
+                            count - 1, vector)
                 repeat_count -= 1
-                if not repeat_count:
-                    return
-            final_duration, final_count = duration_runs[-1]
-            target_newest = final_duration
-            if final_count >= 2:
-                target_oldest = final_duration
-            elif len(duration_runs) == 1:
-                target_oldest = final_duration
-            else:
-                target_oldest = duration_runs[-2][0]
-            while (state["pending"][-2]["durations"] != target_oldest
-                   or state["pending"][-1]["durations"] != target_newest):
-                advance_sequence(state, duration_runs, 1)
-                repeat_count -= 1
-                if not repeat_count:
-                    return
-            advance_sequence(state, duration_runs, repeat_count)
+            if repeat_count:
+                transitions = tuple(_maxplus_power_matrix(
+                    _maxplus_powers(source_task_transition((q, p, k), (False, False)), count),
+                    count, 3) for q, p, k, count in program)
+                vector = apply_repeated_maxplus_transition(
+                    compose_maxplus_transitions(transitions), repeat_count, vector)
+            state["aic"], state["aiv"] = vector[0], list(vector[1:])
 
         compressed_task_count = 0
         for geometries in work_plan.worker_geometry_counts:
             for (query_rows, packed_rows, attended_kv,
                  multiplier) in geometries:
-                durations = task_durations(
-                    query_rows, packed_rows, attended_kv)
+                stacks = source_task_stacks(query_rows, packed_rows, attended_kv)
+                durations = tuple(
+                    math.fsum(stack[index] for stack in stacks)
+                    if index in (0, 2, 7, 10) else
+                    tuple(math.fsum(stack[index][lane] for stack in stacks)
+                          for lane in range(2))
+                    if index in (1, 3) else
+                    tuple(value for stack in stacks for value in stack[index])
+                    for index in range(11))
                 compressed_task_count += multiplier
                 stage_service_s["split_fuse_mm1"] += (
                     multiplier * durations[0])
@@ -7338,23 +7346,6 @@ class PerformanceFormula:
 
         states = [None] * aic_count
         for workers, state in state_classes:
-            if len(state["pending"]) == 2:
-                oldest, newest = state["pending"]
-                schedule_mm2_v_ingress(state, newest)
-                schedule_vec1(state, newest)
-                schedule_mm2(state, newest)
-                schedule_vec2(state, oldest)
-                schedule_vec2(state, newest)
-            elif len(state["pending"]) == 1:
-                newest, = state["pending"]
-                schedule_mm2_v_ingress(state, newest)
-                schedule_vec1(state, newest)
-                schedule_mm2(state, newest)
-                schedule_vec2(state, newest)
-            else:
-                if any(work_plan.task_counts[worker] for worker in workers):
-                    raise RuntimeError(
-                        "SplitFuse active AIC group received no tasks")
             for worker in workers:
                 states[worker] = state
         if any(state is None for state in states):
@@ -8109,6 +8100,7 @@ class PerformanceFormula:
                 inp.active_units,
                 inp.launch_task_kind,
                 inp.resource_time_overrides_ns,
+                tuple(memory_diagnostics),
             )
             staged_resources = {
                 self.hw.resource_by_role("compute_tensor").name,

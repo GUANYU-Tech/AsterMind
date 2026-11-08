@@ -1,6 +1,6 @@
 #!/bin/bash
 # usage: chain.sh <gpu> <plan> [<plan> ...] : run plans back to back on one GPU
-K=/mnt/public/yangxinhao/h200_microbench/kcampaign
+K=${MIDLAYER_H200_PUBLIC_ROOT:?set MIDLAYER_H200_PUBLIC_ROOT}/h200_microbench/kcampaign
 GPU=$1; shift
 for PLAN in "$@"; do
   echo "$(date '+%F %T') START $PLAN gpu$GPU"

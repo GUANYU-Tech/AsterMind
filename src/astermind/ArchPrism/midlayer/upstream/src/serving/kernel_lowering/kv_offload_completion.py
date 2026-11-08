@@ -27,8 +27,9 @@ def build_kv_cache_transfer_completion(
 ) -> KVCacheTransferCompletion:
     if not isinstance(event, KVCacheEvent):
         raise TypeError("KV transfer completion requires a KVCacheEvent")
-    if event.action not in (KVCacheAction.LOAD, KVCacheAction.EVICT):
-        raise ValueError("KV transfer completion requires load or evict intent")
+    if event.action not in (KVCacheAction.LOAD, KVCacheAction.EVICT,
+                            KVCacheAction.STORE):
+        raise ValueError("KV transfer completion requires load, evict or store intent")
     if not isinstance(workload, WorkloadGraph):
         raise TypeError("KV transfer completion requires a WorkloadGraph")
     if not isinstance(plan, KernelPlan):
@@ -84,6 +85,8 @@ def build_kv_cache_transfer_completion(
         raise ValueError(
             "KV transfer workload pool/ranks disagree with its owner")
     nodes_by_id = {node.node_id: node for node in workload.nodes}
+    transfer_only = all(
+        node.kind is WorkloadKind.KV_OFFLOAD for node in workload.nodes)
     for node in nodes:
         predecessors = tuple(
             nodes_by_id[edge.source]
@@ -104,8 +107,9 @@ def build_kv_cache_transfer_completion(
                 raise ValueError(
                     "KV load workload must be the dependency predecessor of "
                     "compute on every owner rank")
-        elif event.action is KVCacheAction.EVICT:
-            if successors or not any(
+        elif event.action in (KVCacheAction.EVICT, KVCacheAction.STORE):
+            if successors or not (event.action is KVCacheAction.STORE
+                    and transfer_only and not predecessors) and not any(
                     predecessor.kind is not WorkloadKind.KV_OFFLOAD
                     and predecessor.pool_name == expected_pool_name
                     and (
@@ -155,6 +159,12 @@ def build_kv_cache_transfer_completion(
                 or node.attributes["tier"] != event.tier):
             raise ValueError(
                 "KV transfer workload provenance disagrees with its intent")
+        if event.source_request_id is None:
+            if "source_request_id" in node.attributes:
+                raise ValueError("request-private KV transfer has a shared source")
+        elif ("source_request_id" not in node.attributes
+              or node.attributes["source_request_id"] != event.source_request_id):
+            raise ValueError("shared KV transfer source identity disagrees")
         if (call.call_id != node.node_id
                 or call.source_node_ids != (node.node_id,)
                 or call.pool_name != expected_pool_name
@@ -163,8 +173,11 @@ def build_kv_cache_transfer_completion(
                 or interval.rank != node.rank):
             raise ValueError(
                 "KV transfer node/call/interval ownership disagrees")
+        expected_physical_direction = (
+            "evict" if event.action is KVCacheAction.STORE
+            else event.action.value)
         if (physical.bytes != event.bytes
-                or physical.direction != event.action.value
+                or physical.direction != expected_physical_direction
                 or physical.tier != event.tier
                 or physical.link != node.attributes["link"]
                 or call.resource != physical.link

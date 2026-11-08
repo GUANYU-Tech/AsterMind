@@ -12,7 +12,6 @@ from evaluation.serving.metrics import sharegpt_compact_evaluation as compact
 
 
 EXPECTED_CASE_COUNT = 45
-MAX_CASE_JOBS = 64
 
 
 def run_compact_alignment_suite(
@@ -84,13 +83,8 @@ def run_compact_alignment_suite(
 
 def _resolve_jobs(jobs: int | None) -> int:
     if jobs is None:
-        return min(MAX_CASE_JOBS, os.cpu_count() or 1)
-    if type(jobs) is not int:
-        raise TypeError("compact alignment jobs must be an exact integer")
-    if jobs < 1 or jobs > MAX_CASE_JOBS:
-        raise ValueError(
-            f"compact alignment jobs must be in [1, {MAX_CASE_JOBS}]"
-        )
+        return os.cpu_count() or 1
+    compact._validate_jobs(jobs)
     return jobs
 
 

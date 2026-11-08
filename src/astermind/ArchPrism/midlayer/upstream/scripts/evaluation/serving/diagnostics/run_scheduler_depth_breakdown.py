@@ -49,7 +49,7 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--final-serving-quantiles-only", action="store_true")
     parser.add_argument("--full-serving-report-only", action="store_true")
-    parser.add_argument("--jobs", type=int, default=min(64, os.cpu_count() or 1))
+    parser.add_argument("--jobs", type=int, default=os.cpu_count() or 1)
     return parser.parse_args()
 
 def main() -> None:

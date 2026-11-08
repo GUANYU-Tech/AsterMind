@@ -1,41 +1,12 @@
-"""Physical presets and resource validation, independent of model parallelism."""
-import copy
-from network_sim import PhysicalTopology, Scenario
-
-
-def expand_presets(physical):
-    data = copy.deepcopy(physical)
-    templates = []
-    for preset in data.get("templates", []):
-        if preset["kind"] != "mesh":
-            templates.append(preset)
-            continue
-        rows, columns = preset["rows"], preset["columns"]
-        members = preset["devices"]
-        if type(rows) is not int or type(columns) is not int or min(rows, columns) < 1 or rows * columns != len(members):
-            raise ValueError("Mesh dimensions must exactly cover its devices")
-        if len(set(members)) != len(members):
-            raise ValueError("Mesh devices must be distinct")
-        unknown = set(preset) - {"id", "kind", "devices", "rows", "columns", "bandwidth_gbps", "latency_ns"}
-        if unknown:
-            raise ValueError(f"unknown Mesh fields: {unknown}")
-        for row in range(rows):
-            for column in range(columns):
-                here = row * columns + column
-                neighbors = ([here + 1] if column + 1 < columns else []) + ([here + columns] if row + 1 < rows else [])
-                for other in neighbors:
-                    data.setdefault("links", []).append(dict(
-                        id=f"{preset['id']}.{here}.{other}", source=members[here], target=members[other],
-                        bandwidth_gbps=preset["bandwidth_gbps"], latency_ns=preset.get("latency_ns", 0)))
-    data["templates"] = templates
-    return data
+"""Validate serving placements and endpoints against the compiled physical topology."""
+from network_sim.physical.resources import build_physical_topology, expand_presets as expand_presets
 
 
 def compile_topology(config):
-    from .environment import prepare_environment
-    physical, environment, grid = prepare_environment(config, expand_presets(config.physical))
-    topology = PhysicalTopology(Scenario.model_validate(physical))
-    topology.environment_report, topology.orbit_grid = environment, grid
+    topology = build_physical_topology(
+        config.physical, orbit=config.orbit, ground_owners=config.ground_owners,
+        horizon_ns=config.horizon_ns, link_parameters=config.link_parameters,
+    )
     ground = set(config.ground_owners)
     if not ground <= set(topology.satellites):
         raise ValueError("unknown ground owner")
@@ -53,8 +24,6 @@ def compile_topology(config):
         if role == "mixed" and not external:
             raise ValueError(f"satellite {satellite}: role does not match external access")
     for cell in config.cells:
-        if any(p.pool != "main" for p in cell.placements):
-            raise ValueError("first serving entry point requires the main pool")
         for placement in cell.placements:
             if placement.device in gpu_devices:
                 raise ValueError("two Cells cannot occupy the same physical GPU")
@@ -69,6 +38,8 @@ def compile_topology(config):
         if cell.ingress_device != placement_by_rank[0]:
             raise ValueError("first serving entry point delivers input to first-stage rank zero")
         output_rank = cell.parallel.tp * (cell.parallel.pp - 1)
+        if cell.deployment == "pd_disagg":
+            output_rank += cell.parallel.workers
         if cell.output_device != placement_by_rank[output_rank]:
             raise ValueError("Cell output must originate at the final pipeline stage leader")
         terminals = []

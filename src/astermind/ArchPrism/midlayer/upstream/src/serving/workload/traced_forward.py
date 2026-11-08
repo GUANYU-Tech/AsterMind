@@ -7,11 +7,14 @@ GPU retirement, allocator reservation, or undocumented library workspace.
 """
 
 from dataclasses import asdict, dataclass, replace
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping, MutableMapping, Sequence
 from types import MappingProxyType
 from collections import OrderedDict
 from copy import copy
-from functools import lru_cache
+from functools import lru_cache, wraps
+from contextlib import contextmanager
+from contextvars import ContextVar
+import hashlib
 import sys
 import weakref
 import operator
@@ -25,17 +28,19 @@ from src.serving.deployment.deployment_config import (
 from .workload_graph import WorkloadEdge, WorkloadGraph, WorkloadKind, WorkloadNode, _workload_node_field_updates, _workload_node_field_updates_read, _node_update_source_unchanged
 
 
-def _frame_rebinding(value, prefix, view_counter, bound_names):
+def _frame_rebinding(value, prefix, view_counter, bound_names, collective_prefixes=()):
     """Compile binding leaves without a recursive closure retaining its frame."""
     if isinstance(value, str):
         if (value in bound_names or value == prefix or value.startswith(prefix + ":")
-                or value == view_counter or value.startswith(view_counter + ":")):
+                or value == view_counter or value.startswith(view_counter + ":")
+                or any(value == item or value.startswith(item + ":") for item in collective_prefixes)):
             return lambda rename: rename(value)
         return None
     if isinstance(value, (tuple, list, Mapping)):
         items = value.items() if isinstance(value, Mapping) else enumerate(value)
         changes = tuple((key, program) for key, item in items
-            if (program := _frame_rebinding(item, prefix, view_counter, bound_names)) is not None)
+            if (program := _frame_rebinding(item, prefix, view_counter, bound_names,
+                collective_prefixes)) is not None)
         if not changes:
             return None
 
@@ -49,6 +54,49 @@ def _frame_rebinding(value, prefix, view_counter, bound_names):
     return None
 
 
+class _ModuleFrameStorage(MutableMapping):
+    """Exact source storage records, materialized only when a consumer reads them.
+
+    Dead internal views/allocations need no Python contract objects during
+    execution. Their original event IDs and typed geometry remain expandable;
+    live output handles use the ordinary TensorView/MemoryAllocation owners.
+    """
+    def __init__(self, values, kind, stats):
+        self.rows, self.kind, self.stats = dict(values), kind, stats
+
+    def __len__(self): return len(self.rows)
+    def __iter__(self): return iter(self.rows)
+    def __contains__(self, name): return name in self.rows
+    def __setitem__(self, name, value): self.rows[name] = value
+    def __delitem__(self, name): del self.rows[name]
+
+    def __getitem__(self, name):
+        value = self.rows[name]
+        if type(value) is tuple:
+            template, rename, events = value
+            if self.kind == "allocation":
+                value = template.with_lifetime(name, events[template.allocated_event],
+                    None if template.freed_event is None else events[template.freed_event])
+            else:
+                value = template.with_identity(name, rename(template.allocation_id))
+            self.rows[name] = value
+            self.stats[self.kind + "_materialized"] += 1
+        return value
+
+    def bind(self, name, template, rename, events):
+        self.rows[name] = (template, rename, events)
+        self.stats[self.kind + "_bound"] += 1
+
+    def copy(self):
+        result = object.__new__(_ModuleFrameStorage)
+        result.rows, result.kind, result.stats = dict(self.rows), self.kind, self.stats
+        return result
+
+
+def _module_storage_snapshot(values):
+    return values.copy() if type(values) is _ModuleFrameStorage else dict(values)
+
+
 class _ForwardModuleFrame:
     """Detached metadata program recorded from one actual source invocation."""
 
@@ -60,11 +108,35 @@ class _ForwardModuleFrame:
                 or before["checkpoints"] != trace._checkpoints
                 or before["workspaces"] != trace._workspace_capacities
                 or before["captures"] != len(trace._captures)
-                or before["collectives"] != trace._collective_ids):
+                or not before["collectives"] <= trace._collective_ids
+                or before["group"] is None and before["collectives"] != trace._collective_ids):
             return
+        self.collectives = frozenset(trace._collective_ids - before["collectives"])
+        self.collective_records = None
+        self.collective_sequence = ()
+        self.collective_prefix = None
+        self.collective_sequence_prefix = None
+        if before["group"] is not None:
+            group, sequence_length, submissions, group_prefix = before["group"]
+            rank = trace.rank
+            self.collective_sequence_prefix = group_prefix[len(group.namespace) + 1:]
+            self.collective_records = tuple(
+                (identifier, group._contracts[identifier], group._layouts[identifier], current[rank])
+                for identifier, current in group._submissions.items()
+                if rank in current and (identifier not in submissions or submissions[identifier] != current[rank]))
+            self.collective_sequence = tuple(group._sequences[rank][sequence_length:])
+            self.collective_prefix = group_prefix
+            if (len(self.collective_records) != len(self.collectives)
+                    or len(self.collective_sequence) != len(self.collectives)):
+                return
         self.persistent = frozenset(trace._persistent_ids - before["persistent"])
         self.prefix = prefix
+        self.dependencies = before["dependencies"]
         self.arguments = tuple(None if value is None else value.view for value in arguments)
+        self.readonly_views = frozenset(self.arguments[index].view_id
+            for index in before["readonly_arguments"])
+        self.readonly_allocations = frozenset(self.arguments[index].allocation_id
+            for index in before["readonly_arguments"])
         self.argument_writers = tuple(None if value is None else before["writers"][value.view.allocation_id]
             for value in arguments)
         self.outputs = tuple((value.view.view_id,
@@ -72,8 +144,8 @@ class _ForwardModuleFrame:
             for value in result)
         self.nodes = tuple(trace._nodes.values())[before["nodes"]:]
         self.edges = tuple(trace._edges[before["edges"]:])
-        self.views = tuple(value for name, value in trace._views.items() if name not in before["views"])
-        self.allocations = tuple(value for name, value in trace._allocations.items() if name not in before["allocations"])
+        self.views = tuple(trace._views[name] for name in trace._views if name not in before["views"])
+        self.allocations = tuple(trace._allocations[name] for name in trace._allocations if name not in before["allocations"])
         self.events = tuple(trace._events[before["events"]:])
         if any(event.split(":", 2)[1] not in ("allocate", "return", "free") for event in self.events):
             return
@@ -81,9 +153,13 @@ class _ForwardModuleFrame:
         bound_names = {name for view in self.arguments if view is not None
             for name in (view.view_id, view.allocation_id)}
         bound_names.update(writer for writer in self.argument_writers if writer is not None)
+        bound_names.update(self.dependencies)
 
+        collective_prefixes = (() if self.collective_prefix is None else
+            (self.collective_prefix, trace.qualify(self.collective_prefix)))
         self.node_rebindings = tuple((node, tuple((name, program) for name, value in node.attributes.items()
-            if (program := _frame_rebinding(value, prefix, self.view_counter, bound_names)) is not None))
+            if (program := _frame_rebinding(value, prefix, self.view_counter, bound_names,
+                collective_prefixes)) is not None))
             for node in self.nodes)
         self.names = tuple((name, before["names"][name] if name in before["names"] else None, value)
             for name, value in trace._names.items() if name not in before["names"] or value != before["names"][name])
@@ -101,6 +177,10 @@ class _ForwardModuleFrame:
         self.external = {name: (before["allocations"][name], before["references"][name],
             before["writers"][name], before["readers"][name])
             for name in touched if name in before["allocations"]}
+        if (self.readonly_allocations.intersection(written)
+                or any(view.allocation_id in self.readonly_allocations for view in self.views)
+                or any(value.view.allocation_id in self.readonly_allocations for value in result)):
+            return
         self.writers = {name: trace._writers[name] for name in touched}
         self.readers = {name: set(trace._readers[name]) for name in touched}
         self.written = written
@@ -120,9 +200,14 @@ class _ForwardModuleFrame:
             if trace._references[name] != expected:
                 return
         self.supported = True
+        self.node_templates = {node.node_id: node for node in self.nodes}
+        for node in self.nodes:
+            object.__setattr__(node, "_module_source_frame", weakref.ref(self))
 
-    def replay(self, trace, prefix, arguments):
+    def replay(self, trace, prefix, arguments, group=None, group_prefix=None, dependencies=()):
         substitutions = {}
+        for source, target in zip(self.dependencies, dependencies, strict=True):
+            substitutions[source] = target
         for old, old_writer, current in zip(self.arguments, self.argument_writers, arguments, strict=True):
             if old is None:
                 continue
@@ -142,10 +227,20 @@ class _ForwardModuleFrame:
                 old_view_start = -1 if initial is None else initial
                 new_view_start = trace._names[name] if name in trace._names else -1
 
+        local_collective_prefix = (None if self.collective_prefix is None else
+            trace.qualify(self.collective_prefix))
+        trace_namespace = trace.namespace
+
         def rename(value):
             if value in substitutions:
                 return substitutions[value]
-            if value == self.prefix or value.startswith(self.prefix + ":"):
+            if (local_collective_prefix is not None
+                    and (value == local_collective_prefix or value.startswith(local_collective_prefix + ":"))):
+                result = trace_namespace + ":" + group_prefix + value[len(local_collective_prefix):]
+            elif (self.collective_prefix is not None
+                    and (value == self.collective_prefix or value.startswith(self.collective_prefix + ":"))):
+                result = group_prefix + value[len(self.collective_prefix):]
+            elif value == self.prefix or value.startswith(self.prefix + ":"):
                 result = prefix + value[len(self.prefix):]
             elif old_view_start is not None and (value == self.view_counter or value.startswith(self.view_counter + ":")):
                 index = 0 if value == self.view_counter else int(value[len(self.view_counter) + 1:])
@@ -164,7 +259,11 @@ class _ForwardModuleFrame:
 
         for old in self.external_views:
             name = rename(old.view_id)
-            if name not in trace._views or geometry(trace._views[name]) != geometry(old):
+            if name not in trace._views:
+                return None
+            current_geometry, old_geometry = geometry(trace._views[name]), geometry(old)
+            if ((current_geometry[1:] != old_geometry[1:]) if old.view_id in self.readonly_views
+                    else current_geometry != old_geometry):
                 return None
             if trace._views[name].allocation_id != rename(old.allocation_id):
                 return None
@@ -173,8 +272,9 @@ class _ForwardModuleFrame:
             if target not in trace._allocations:
                 return None
             actual = trace._allocations[target]
-            if (actual.size_bytes != allocation.size_bytes or actual.memory_domain != allocation.memory_domain
-                    or actual.device_id != allocation.device_id or trace._references[target] != references
+            readonly = name in self.readonly_allocations
+            if (not readonly and actual.size_bytes != allocation.size_bytes or actual.memory_domain != allocation.memory_domain
+                    or actual.device_id != allocation.device_id or not readonly and trace._references[target] != references
                     or trace._writers[target] != (None if writer is None else rename(writer))):
                 return None
             if name in self.written and trace._readers[target] != {rename(reader) for reader in readers}:
@@ -193,6 +293,31 @@ class _ForwardModuleFrame:
                 or any(rename(view.view_id) in trace._views for view in self.views)
                 or any(rename(a.allocation_id) in trace._allocations for a in self.allocations)):
             return None
+        collective_records = []
+        if self.collective_records is not None:
+            if (group is None or group_prefix is None or type(group) is not ForwardCollectiveGroup
+                    or not any(trace is current for current in group.traces)):
+                return None
+            for identifier, contract, layout, submission in self.collective_records:
+                if identifier == self.collective_prefix or identifier.startswith(self.collective_prefix + ":"):
+                    target = group_prefix + identifier[len(self.collective_prefix):]
+                else:
+                    return None
+                local_id = rename(submission)
+                if target in group._submissions and trace.rank in group._submissions[target]:
+                    return None
+                current = contract.with_attributes(contract.attributes, node_id=target)
+                if (target in group._contracts and group._contracts[target] != current
+                        or target in group._layouts and group._layouts[target] != layout):
+                    return None
+                collective_records.append((target, current, layout, local_id))
+            sequence_prefix = group_prefix[len(group.namespace) + 1:]
+            collective_sequence = []
+            for name in self.collective_sequence:
+                if name == self.collective_sequence_prefix or name.startswith(self.collective_sequence_prefix + ":"):
+                    collective_sequence.append(sequence_prefix + name[len(self.collective_sequence_prefix):])
+                else:
+                    return None
         events = {}
         for index, event in enumerate(self.events, start=len(trace._events)):
             _, kind, payload = event.split(":", 2)
@@ -200,22 +325,49 @@ class _ForwardModuleFrame:
 
         trace._events.extend(events[event] for event in self.events)
         trace._names.update(names)
+        deferred_storage = bool(self.readonly_allocations)
+        if deferred_storage and type(trace._allocations) is not _ModuleFrameStorage:
+            trace._allocations = _ModuleFrameStorage(trace._allocations, "allocation", trace._module_frame_stats)
+        if deferred_storage and type(trace._views) is not _ModuleFrameStorage:
+            trace._views = _ModuleFrameStorage(trace._views, "view", trace._module_frame_stats)
         for allocation in self.allocations:
             target = rename(allocation.allocation_id)
-            trace._allocations[target] = allocation.with_lifetime(target, events[allocation.allocated_event],
-                None if allocation.freed_event is None else events[allocation.freed_event])
+            if deferred_storage:
+                trace._allocations.bind(target, allocation, rename, events)
+            else:
+                trace._allocations[target] = allocation.with_lifetime(target, events[allocation.allocated_event],
+                    None if allocation.freed_event is None else events[allocation.freed_event])
             trace._references[target] = 0
         trace._persistent_ids.update(rename(name) for name in self.persistent)
         for view in self.views:
             target = rename(view.view_id)
-            trace._views[target] = view.with_identity(target, rename(view.allocation_id))
+            if deferred_storage:
+                trace._views.bind(target, view, rename, events)
+            else:
+                trace._views[target] = view.with_identity(target, rename(view.allocation_id))
         for node, programs in self.node_rebindings:
             target = rename(node.node_id)
-            attributes = dict(node.attributes)
+            attributes = {}
             for name, program in programs:
                 attributes[name] = program(rename)
-            trace._nodes[target] = node.with_attributes(attributes, node_id=target)
-        trace._edges.extend(WorkloadEdge(rename(edge.source), rename(edge.destination), edge.kind) for edge in self.edges)
+            trace._nodes[target] = node.with_updates({}, attributes, node_id=target, compose=True)
+        edges = tuple(WorkloadEdge(rename(edge.source), rename(edge.destination), edge.kind) for edge in self.edges)
+        if self.dependencies:
+            # Binding external predecessors can change their lexical order.
+            # Preserve call()'s data-then-barrier, sorted-source convention.
+            positions = {rename(node.node_id): index for index, node in enumerate(self.nodes)}
+            edges = tuple(sorted(edges, key=lambda edge: (
+                positions[edge.destination], edge.kind != "data", edge.source)))
+        trace._edges.extend(edges)
+        if self.collective_records is not None:
+            for target, contract, layout, local_id in collective_records:
+                group._contracts[target] = contract
+                group._layouts[target] = layout
+                if target not in group._submissions:
+                    group._submissions[target] = {}
+                group._submissions[target][trace.rank] = local_id
+            group._sequences[trace.rank].extend(collective_sequence)
+        trace._collective_ids.update(rename(name) for name in self.collectives)
         for name, writer in self.writers.items():
             trace._writers[rename(name)] = None if writer is None else rename(writer)
         for name, readers in self.readers.items():
@@ -237,14 +389,54 @@ class _ForwardModuleFrame:
         return tuple(result)
 
 
-@lru_cache(maxsize=4096)
+_SOURCE_LAYOUT_CACHES = ContextVar("serving_source_layout_caches", default=None)
+_SOURCE_LAYOUT_FACTORIES = ()
+
+
+def _source_layout_cache(maxsize):
+    """Keep the original bounded C LRU, owned by one experiment context."""
+    def decorate(builder):
+        global _SOURCE_LAYOUT_FACTORIES
+        index = len(_SOURCE_LAYOUT_FACTORIES)
+        _SOURCE_LAYOUT_FACTORIES += ((builder, maxsize),)
+        default = lru_cache(maxsize=maxsize)(builder)
+
+        def current():
+            caches = _SOURCE_LAYOUT_CACHES.get()
+            return default if caches is None else caches[index]
+
+        @wraps(builder)
+        def cached(*args, **kwargs):
+            return current()(*args, **kwargs)
+
+        cached.cache_info = lambda: current().cache_info()
+        cached.cache_clear = lambda: current().cache_clear()
+        cached.cache_parameters = default.cache_parameters
+        return cached
+    return decorate
+
+
+@contextmanager
+def _source_layout_cache_scope():
+    caches = tuple(lru_cache(maxsize=limit)(builder)
+        for builder, limit in _SOURCE_LAYOUT_FACTORIES)
+    token = _SOURCE_LAYOUT_CACHES.set(caches)
+    try:
+        yield
+    finally:
+        _SOURCE_LAYOUT_CACHES.reset(token)
+        for cache in caches:
+            cache.cache_clear()
+
+
+@_source_layout_cache(maxsize=4096)
 def _source_allocation_template(device_id, memory_domain, size_bytes):
     """Reuse validated source storage geometry; each call binds fresh IDs/events."""
     return MemoryAllocation("source-allocation-layout", device_id, memory_domain,
         size_bytes, AddressLevel.OBJECT, None, None, "source-allocation-layout", None)
 
 
-@lru_cache(maxsize=2048)
+@_source_layout_cache(maxsize=2048)
 def _dense_layout(shape, dtype):
     """Reuse a fully validated immutable layout, without retaining a trace.
 
@@ -259,7 +451,7 @@ def _dense_layout(shape, dtype):
     return TensorView("layout", "layout", 0, shape, tuple(reversed(strides)), dtype, DTYPE_BYTES[dtype])
 
 
-@lru_cache(maxsize=4096)
+@_source_layout_cache(maxsize=4096)
 def _strided_layout(shape, strides_bytes, dtype, offset_bytes):
     return TensorView("layout", "layout", offset_bytes, shape, strides_bytes, dtype, DTYPE_BYTES[dtype])
 
@@ -433,15 +625,42 @@ class ForwardTrace:
         self._edges = []
         self._names = {}
         self._persistent_ids = set()
+        self._external_input_origins = {}
         self._checkpoints = {}
         self._collective_ids = set()
         self._workspace_capacities = {}
         self._capture = None
         self._captures = []
-        self._module_frames = {}
+        self._source_program_cache = SourceProgramCache()
+        # Whole-source bindings and repeated source bodies use the same
+        # run-local program owner and eviction policy.
+        self._module_frames = self._source_program_cache.programs
+        self._module_frame_stats = {"hits": 0, "misses": 0, "declined": 0,
+            "allocation_bound": 0, "allocation_materialized": 0,
+            "view_bound": 0, "view_materialized": 0, "node_bound": 0}
         self._module_program_count = 0
         self._module_program_types = {}
         self._recorded_graph = None
+
+    def _has_mla_slot_proof(self, slots, capacity, dummy_rows):
+        """Reuse only a retained native tuple's validated range/disjointness."""
+        if "_mla_slot_proofs" not in self.__dict__:
+            return False
+        key = (id(slots), capacity, dummy_rows)
+        if key not in self._mla_slot_proofs:
+            return False
+        if self._mla_slot_proofs[key] is not slots:
+            raise RuntimeError("MLA slot proof identity collision")
+        return True
+
+    def _remember_mla_slot_proof(self, slots, capacity, dummy_rows):
+        # The constructor calls this only after every original check passes.
+        # Retaining the tuple prevents id reuse; the trace owns its lifetime.
+        if "_mla_slot_proofs" not in self.__dict__:
+            self._mla_slot_proofs = {}
+        self._mla_slot_proofs[id(slots), capacity, dummy_rows] = slots
+        if len(self._mla_slot_proofs) > 32:
+            del self._mla_slot_proofs[next(iter(self._mla_slot_proofs))]
 
     def _module_program(self, module_type):
         """Name one homogeneous constructor scope without retaining its model."""
@@ -449,37 +668,65 @@ class ForwardTrace:
         self._module_program_types[self._module_program_count] = module_type
         return self._module_program_count
 
-    def _call_module_frame(self, program, prefix, module, arguments):
-        """Replay a recorded metadata frame within one homogeneous source loop."""
+    def _call_module_frame(self, program, prefix, module, arguments, group=None, *, dependencies=(),
+            readonly_arguments=()):
+        """Replay one homogeneous frame with current tensor and dependency ports.
+
+        Dependency ports bind actual preceding readers, such as a shared
+        workspace's WAR predecessors. Replay still checks the complete live
+        reader set before mutating state; missing ports decline the binding.
+        """
         if type(program) is not int or program not in self._module_program_types:
             raise ValueError("module frame requires its registered constructor scope")
         if type(module) is not self._module_program_types[program]:
             raise ValueError("module frame type differs from its homogeneous constructor scope")
         if not isinstance(arguments, tuple):
             raise TypeError("module frame arguments must be a tuple")
+        if (type(dependencies) is not tuple
+                or any(type(name) is not str or name not in self._nodes for name in dependencies)
+                or len(set(dependencies)) != len(dependencies)):
+            raise ValueError("module frame dependency ports must name distinct actual preceding nodes")
         if not isinstance(prefix, str) or not prefix:
             raise ValueError("module frame needs its nonempty source prefix")
+        if group is not None and (type(group) is not ForwardCollectiveGroup
+                or not any(self is trace for trace in group.traces)):
+            raise ValueError("module frame collective group must contain this source rank")
         tensors = tuple(value for value in arguments if value is not None)
         for tensor in tensors:
             self._check_tensor(tensor)
+        if (type(readonly_arguments) is not tuple or len(set(readonly_arguments)) != len(readonly_arguments)
+                or any(type(index) is not int or not 0 <= index < len(arguments)
+                    or arguments[index] is None for index in readonly_arguments)):
+            raise ValueError("readonly module ports must name distinct actual input arguments")
         layouts = tuple(None if value is None else (
-            value.view.offset_bytes, value.shape, value.view.strides_bytes, value.dtype,
-            self._references[value.view.allocation_id]) for value in arguments)
+            0 if index in readonly_arguments else value.view.offset_bytes,
+            value.shape, value.view.strides_bytes, value.dtype,
+            0 if index in readonly_arguments else self._references[value.view.allocation_id])
+            for index, value in enumerate(arguments))
         aliases = tuple(left.view.allocation_id == right.view.allocation_id
             for left in tensors for right in tensors)
         writers = tuple(self._writers[value.view.allocation_id] for value in tensors)
         writer_aliases = tuple(left == right for left in writers for right in writers)
-        key = (program, type(module).__call__, layouts, aliases, tuple(value is None for value in writers), writer_aliases)
+        key = (program, type(module).__call__, layouts, aliases, tuple(value is None for value in writers), writer_aliases,
+            len(dependencies), readonly_arguments)
+        group_prefix = None if group is None else group.namespace + ":" + prefix
         if key in self._module_frames:
-            frame = self._module_frames[key]
+            frame = self._source_program_cache.lookup(key)
             if frame is not None:
-                replay = frame.replay(self, self.qualify(prefix), arguments)
+                replay = frame.replay(self, self.qualify(prefix), arguments,
+                    group=group, group_prefix=group_prefix, dependencies=dependencies)
                 if replay is not None:
+                    self._module_frame_stats["hits"] += 1
+                    self._module_frame_stats["node_bound"] += len(frame.nodes)
                     return replay
-            self._module_frames[key] = None
+            self._source_program_cache.store_module_frame(key, None)
+            self._module_frame_stats["declined"] += 1
             return module(*arguments)
+        self._module_frame_stats["misses"] += 1
         before = {
-            "views": dict(self._views), "allocations": dict(self._allocations),
+            "readonly_arguments": readonly_arguments,
+            "dependencies": dependencies,
+            "views": _module_storage_snapshot(self._views), "allocations": _module_storage_snapshot(self._allocations),
             "references": dict(self._references), "writers": dict(self._writers),
             "readers": {name: set(readers) for name, readers in self._readers.items()},
             "names": dict(self._names), "events": len(self._events),
@@ -487,10 +734,13 @@ class ForwardTrace:
             "persistent": set(self._persistent_ids), "checkpoints": dict(self._checkpoints),
             "workspaces": dict(self._workspace_capacities), "captures": len(self._captures),
             "collectives": set(self._collective_ids),
+            "group": None if group is None else (group, len(group._sequences[self.rank]),
+                {identifier: submissions[self.rank] for identifier, submissions in group._submissions.items()
+                    if self.rank in submissions}, group_prefix),
         }
         result = module(*arguments)
         frame = _ForwardModuleFrame(self, self.qualify(prefix), arguments, result, before)
-        self._module_frames[key] = frame if frame.supported else None
+        self._source_program_cache.store_module_frame(key, frame if frame.supported else None)
         return result
 
     def bind_launch_policy(self, policy):
@@ -528,6 +778,8 @@ class ForwardTrace:
         This records a source graph's object identities, not CUDA pool
         reservation or a compiled allocation/replay observation.
         """
+        fa3_aot = (source_stage is None and isinstance(extra_inputs,dict)
+            and set(extra_inputs)=={"fa3_cu_query","fa3_used_key","fa3_scheduler_metadata"})
         pipeline = source_stage == "vllm_pipeline"
         af = source_stage == "midlayer_af"
         local_stage = pipeline or af
@@ -556,9 +808,20 @@ class ForwardTrace:
         if source_graph_batch_size is not None and (source_stage is None
                 or type(source_graph_batch_size) is not int or source_graph_batch_size <= 0):
             raise ValueError("source graph request-batch identity requires a positive staged declaration")
-        if extra_inputs is not None and (source_stage is None or not isinstance(extra_inputs, dict)
+        if extra_inputs is not None and ((source_stage is None and not fa3_aot) or not isinstance(extra_inputs, dict)
                 or any(not isinstance(role, str) or not role or role in inputs for role in extra_inputs)):
             raise ValueError("additional capture inputs require distinct named staged source ports")
+        if fa3_aot:
+            for tensor in extra_inputs.values():self._check_tensor(tensor)
+            seq=extra_inputs["fa3_used_key"]
+            if runtime_mode!="FULL" or seq.dtype!="int32" or len(seq.shape)!=1:
+                raise ValueError("FA3 FULL AOT requires its actual INT32 sequence input")
+            b=seq.shape[0]
+            n=(3 if b<=992 else 2)*((b+3)//4*4)+1
+            if (not logical_tokens<=b<=model_input_tokens
+                    or extra_inputs["fa3_cu_query"].dtype!="int32" or extra_inputs["fa3_cu_query"].shape!=(b+1,)
+                    or extra_inputs["fa3_scheduler_metadata"].dtype!="int32" or extra_inputs["fa3_scheduler_metadata"].shape!=(n,)):
+                raise ValueError("FA3 FULL AOT static ports must preserve actual padded metadata geometry")
         if local_stage and (extra_inputs is not None or source_graph_batch_size is not None):
             raise ValueError("pipeline capture takes only its original model stage ports")
         if source_stage is not None and not local_stage:
@@ -866,6 +1129,28 @@ class ForwardTrace:
             raise ValueError("forward view exceeds its backing storage")
         return self._handle(view)
 
+    def declare_legacy_dummy_PP_input(self, tensor, *, role):
+        """Declare inherited runner storage without a device write or value."""
+        self._check_tensor(tensor)
+        if (role not in ("hidden_states", "residual") or tensor.dtype != "bf16" or len(tensor.shape) != 2
+                or not tensor.is_contiguous or tensor.view.offset_bytes != 0
+                or tensor.view.allocation_id != self.qualify("worker.intermediate:" + role)
+                or tensor.view.allocation_id not in self._persistent_ids
+                or self._writers[tensor.view.allocation_id] is not None):
+            raise ValueError("legacy dummy PP input requires its own persistent unknown active prefix")
+        self._external_input_origins[tensor.view.view_id] = (role, tensor.view)
+
+    def _legacy_dummy_PP_origin(self, tensor):
+        self._check_tensor(tensor)
+        if self._writers[tensor.view.allocation_id] is not None or tensor.view.view_id not in self._external_input_origins:
+            return None
+        role, original = self._external_input_origins[tensor.view.view_id]
+        if original != tensor.view or tensor.view.allocation_id not in self._persistent_ids:
+            raise ValueError("legacy dummy external input changed its bound layout or backing")
+        return {"source": "vllm_0_30_legacy_dummy_PP_retained", "rank": self.rank, "role": role,
+            "values_bound": False, "view": asdict(tensor.view),
+            "allocation_bytes": self._allocations[tensor.view.allocation_id].size_bytes}
+
     def _complete_producer_view(self, tensor):
         """Resolve a same-layout alias to its one complete producer port."""
         self._check_tensor(tensor)
@@ -953,6 +1238,46 @@ class ForwardTrace:
         self._event(f"return:{node_id}")
         return result
 
+    def call_effect(self, node, inputs, *, writes=(), controls=()):
+        """Record a source launch with only declared in-place or no writes.
+
+        A conditional kernel may launch while every lane skips its stores.
+        Partial writes name real alias regions; this does not add element-level
+        initialization tracking to the allocation-level dependency model.
+        """
+        if self._recorded_graph is not None:
+            raise ValueError('a bound source program is a closed forward trace')
+        if not isinstance(node, WorkloadNode) or node.rank != self.rank:
+            raise ValueError("forward effect must declare this physical rank")
+        name=self.qualify(node.node_id)
+        if name in self._nodes:
+            raise ValueError("forward effect operator IDs must be unique")
+        for values in (inputs,writes,controls):
+            if type(values) is not tuple:
+                raise TypeError("forward effect ports must be explicit tuples")
+            for tensor in values:
+                self._check_tensor(tensor)
+        dependencies={self._writers[tensor.view.allocation_id] for tensor in (*inputs,*writes)}
+        dependencies.discard(None)
+        for tensor in writes:
+            dependencies.update(self._readers[tensor.view.allocation_id])
+        barriers={self._writers[tensor.view.allocation_id] for tensor in controls}
+        barriers.discard(None)
+        self._nodes[name]=node.with_attributes({**node.attributes,
+            'symbolic_tensor_inputs':tuple(tensor.view.view_id for tensor in inputs),
+            'symbolic_tensor_outputs':tuple(tensor.view.view_id for tensor in writes),
+            **({'symbolic_tensor_controls':tuple(tensor.view.view_id for tensor in controls)} if controls else {})},node_id=name)
+        self._edges.extend(WorkloadEdge(source,name) for source in sorted(dependencies))
+        self._edges.extend(WorkloadEdge(source,name,'barrier') for source in sorted(barriers-dependencies))
+        for tensor in inputs:
+            self._readers[tensor.view.allocation_id].add(name)
+        for tensor in writes:
+            storage=tensor.view.allocation_id
+            self._writers[storage]=name
+            self._readers[storage].clear()
+        self._event(f'return:{name}')
+        return name
+
     def call_outputs(self, node, inputs, *, outputs, workspace=(), controls=(), parameters=()):
         """One source operation with multiple independent fresh tensor outputs.
 
@@ -1004,7 +1329,7 @@ class ForwardTrace:
             raise ValueError("rank-local collective traces require the joined group graph")
         if self._recorded_graph is not None:
             nodes, graph = self._recorded_graph
-            if nodes is self._nodes and len(nodes) == len(graph.nodes):
+            if nodes is self._nodes and graph is not None and len(nodes) == len(graph.__dict__["nodes"]):
                 return graph
         return WorkloadGraph(tuple(self._nodes.values()), self._capture_program_edges())
 
@@ -1104,6 +1429,8 @@ class ForwardTrace:
                 and "_closed_storage_inputs" in self.__dict__):
             allocations, persistent, events, activations = self.__dict__["_closed_storage_inputs"]
             if self._allocations is allocations and self._persistent_ids is persistent and self._events is events:
+                if "_owned_memory_storage" in self.__dict__:
+                    return tuple(self._allocations[value.allocation_id] for value in activations)
                 return activations
         return tuple(a for name, a in self._allocations.items() if name not in self._persistent_ids)
 
@@ -1128,6 +1455,13 @@ class ForwardTrace:
         return tuple(self._events)
 
 
+def _copy_capture_dicts(value):
+    """Detach public mutable capture metadata; source tuples remain immutable."""
+    if type(value) is dict:
+        return {key: _copy_capture_dicts(item) for key, item in value.items()}
+    return value
+
+
 class ForwardSourceProgram:
     """Bind a recorded complete source to values from its actual source prefix.
 
@@ -1138,7 +1472,10 @@ class ForwardSourceProgram:
     """
 
     def __init__(self, source, prefix, *, node_bindings, allocation_bindings, collective_groups=None,
-                 transient_allocation_bindings=(), view_bindings=(), capture_bindings=()):
+                 transient_allocation_bindings=(), view_bindings=(), capture_bindings=(), geometry_rebind=False):
+        if type(geometry_rebind) is not bool:
+            raise TypeError("source geometry rebinding requires an explicit boolean")
+        self.geometry_rebind = geometry_rebind
         if not isinstance(source, ForwardTrace) or not isinstance(prefix, ForwardTrace):
             raise TypeError("source program requires actual complete and prefix traces")
         if (source.namespace != prefix.namespace or source.rank != prefix.rank
@@ -1147,6 +1484,9 @@ class ForwardSourceProgram:
                 or (source._collective_ids and collective_groups is None)):
             raise ValueError("source program requires a closed ordinary rank-local source")
         self.source, self.prefix = source, prefix
+        self.rank_programs = (self,)
+        self.collective_attribute_bindings = ()
+        self.collective_geometry_bindings = ()
         self.node_bindings = tuple(node_bindings)
         persistent_bindings = tuple(allocation_bindings)
         transient_bindings = tuple(transient_allocation_bindings)
@@ -1160,23 +1500,28 @@ class ForwardSourceProgram:
         self.bound_prefix_views = {origin for _, origin in self.view_bindings}
         self.capture_fields = {}
         capture_targets = set()
+        capture_geometry = ("logical_tokens", "model_input_tokens", "key", "inputs", "output")
         for target, origin, fields in self.capture_bindings:
             if (type(target) is not int or type(origin) is not int
-                    or fields != ("logical_tokens",) or target in capture_targets or origin in self.capture_fields
+                    or (fields != ("logical_tokens",)
+                        and not (geometry_rebind and fields == capture_geometry))
+                    or target in capture_targets or origin in self.capture_fields
                     or not 0 <= target < len(source.source_captures)
                     or not 0 <= origin < len(prefix.source_captures)
                     or any(type(capture["logical_tokens"]) is not int
                         or type(capture["model_input_tokens"]) is not int
                         or not 0 < capture["logical_tokens"] <= capture["model_input_tokens"]
                         for capture in (source.source_captures[target], prefix.source_captures[origin]))
-                    or source.source_captures[target]["logical_tokens"] != prefix.source_captures[origin]["logical_tokens"]):
+                    or not geometry_rebind and source.source_captures[target]["logical_tokens"] != prefix.source_captures[origin]["logical_tokens"]):
                 raise ValueError("source capture binding requires explicit matching logical token extents")
             capture_targets.add(target)
             self.capture_fields[origin] = fields
         for target, origin in self.view_bindings:
             left, right = source._views[target], prefix._views[origin]
-            if (left.shape, left.strides_bytes, left.offset_bytes, left.dtype) != (
-                    right.shape, right.strides_bytes, right.offset_bytes, right.dtype):
+            if ((left.dtype, left.element_bytes, len(left.shape)) != (
+                    right.dtype, right.element_bytes, len(right.shape))
+                    or not geometry_rebind and (left.shape, left.strides_bytes, left.offset_bytes) != (
+                        right.shape, right.strides_bytes, right.offset_bytes)):
                 raise ValueError("initial source view binding has incompatible typed geometry")
         if collective_groups is not None:
             if (not isinstance(collective_groups, tuple) or len(collective_groups) != 2
@@ -1190,9 +1535,9 @@ class ForwardSourceProgram:
         ignored_shapes, ignored_attributes = {}, {}
         for target, origin, shapes, attributes in self.node_bindings:
             node, current = source._nodes[target], prefix._nodes[origin]
-            if any(node.shape[name] != current.shape[name] for name in shapes):
+            if not geometry_rebind and any(node.shape[name] != current.shape[name] for name in shapes):
                 raise ValueError("source program initial shape binding disagrees with complete source")
-            if any(node.attributes[name] != current.attributes[name] for name in attributes):
+            if not geometry_rebind and any(node.attributes[name] != current.attributes[name] for name in attributes):
                 raise ValueError("source program initial attribute binding disagrees with complete source")
             if origin not in ignored_shapes:
                 ignored_shapes[origin], ignored_attributes[origin] = set(), set()
@@ -1211,13 +1556,18 @@ class ForwardSourceProgram:
             if ((target in source._persistent_ids) != (not transient)
                     or (origin in prefix._persistent_ids) != (not transient)):
                 raise ValueError("source geometry binding must preserve its declared persistent/transient role")
-            if self._allocation_geometry(source._allocations[target]) != self._allocation_geometry(prefix._allocations[origin]):
+            left_allocation = self._allocation_geometry(source._allocations[target])
+            right_allocation = self._allocation_geometry(prefix._allocations[origin])
+            if (left_allocation[1:] if geometry_rebind else left_allocation) != (
+                    right_allocation[1:] if geometry_rebind else right_allocation):
                 raise ValueError("source program initial persistent allocation geometry disagrees")
             left, right = source._views[target], prefix._views[origin]
             if left.allocation_id != target or right.allocation_id != origin:
                 raise ValueError("persistent program geometry requires the complete backing view")
-            if (left.shape, left.strides_bytes, left.offset_bytes, left.dtype) != (
-                    right.shape, right.strides_bytes, right.offset_bytes, right.dtype):
+            if ((left.dtype, left.element_bytes, len(left.shape)) != (
+                    right.dtype, right.element_bytes, len(right.shape))
+                    or not geometry_rebind and (left.shape, left.strides_bytes, left.offset_bytes) != (
+                        right.shape, right.strides_bytes, right.offset_bytes)):
                 raise ValueError("source program initial persistent view geometry disagrees")
 
     @staticmethod
@@ -1280,8 +1630,9 @@ class ForwardSourceProgram:
             if actual_shape != shape or actual_attributes != attributes:
                 return None
         result = copy(self.source)
-        result._nodes, result._allocations, result._views = (
-            dict(self.source._nodes), dict(self.source._allocations), dict(self.source._views))
+        if not native_frame:
+            result._nodes, result._allocations, result._views = (
+                dict(self.source._nodes), dict(self.source._allocations), dict(self.source._views))
         if native_frame:
             updates = {}
             for target, origin, shapes, attributes in self.node_bindings:
@@ -1327,13 +1678,22 @@ class ForwardSourceProgram:
                     result._nodes[target] = bound
                 else:
                     result._nodes[target] = node.with_attributes(bound_attributes)
-        self._bind_storage_parameters(result, prefix._allocations, prefix._views, prefix.source_captures)
+        native_storage = native_frame and _bind_native_storage(self, result, prefix._allocations, prefix._views)
+        if not native_storage:
+            if native_frame:
+                result._allocations, result._views = dict(self.source._allocations), dict(self.source._views)
+            self._bind_storage_parameters(result, prefix._allocations, prefix._views, prefix.source_captures)
+        else:
+            self._bind_capture_parameters(result, prefix.source_captures)
         if native_frame:
             result._recorded_graph = (result._nodes, None)
             _seal_native_bound_storage(self, result)
+            if not self.source._collective_ids:
+                result._recorded_graph = (result._nodes, _issue_source_frame(self, result, {}))
         else:
             graph = self.graph.with_nodes(result._nodes.values())
             result._recorded_graph = (result._nodes, graph)
+        result._captures = [_copy_capture_dicts(capture) for capture in result.source_captures]
         return result
 
 
@@ -1350,11 +1710,36 @@ class ForwardSourceProgram:
             for view in result._views.values():
                 if region_end(view.region()) > result._allocations[view.allocation_id].size_bytes:
                     raise ValueError("bound source view exceeds its actual backing allocation")
+        self._bind_capture_parameters(result, captures)
+
+    def _bind_capture_parameters(self, result, captures):
         if self.capture_bindings:
             result._captures = [dict(capture) for capture in self.source.source_captures]
             for target, origin, fields in self.capture_bindings:
                 for name in fields:
-                    result._captures[target][name] = captures[origin][name]
+                    if name != "output":
+                        result._captures[target][name] = _copy_capture_dicts(captures[origin][name])
+                        continue
+                    source_capture = self.source.source_captures[target]
+                    output = source_capture["output"]
+                    storage_id = f"rank:{result.rank}:{source_capture['key']}:hidden_states"
+                    if output["storage_id"] != storage_id:
+                        raise ValueError("capture geometry requires its declared terminal hidden-state port")
+                    view = result._views[output["allocation_id"]]
+                    allocation = result._allocations[view.allocation_id]
+                    result._captures[target][name] = {**output,
+                        "storage_id": f"rank:{result.rank}:{captures[origin]['key']}:hidden_states",
+                        "shape": view.shape, "bytes": allocation.size_bytes}
+
+
+def _source_activation_allocations(trace):
+    """Private closed storage for internal reporters; public receipts own copies."""
+    if (type(trace) is ForwardTrace and "_owned_memory_storage" in trace.__dict__
+            and "_closed_storage_inputs" in trace.__dict__):
+        allocations, persistent, events, activations = trace.__dict__["_closed_storage_inputs"]
+        if trace._allocations is allocations and trace._persistent_ids is persistent and trace._events is events:
+            return activations
+    return trace.activation_allocations
 
 
 def _seal_native_bound_storage(program, trace):
@@ -1388,14 +1773,21 @@ def _seal_native_bound_storage(program, trace):
 class _NativeStorageOverlay(Mapping):
     """Closed source mapping with independently bound current backing values."""
 
-    __slots__ = ("base", "bindings", "current_values", "allocation", "cache")
+    __slots__ = ("base", "bindings", "current_values", "allocation", "preserve_backing", "cache", "values_cache")
 
-    def __init__(self, base, bindings, values, *, allocation):
+    def __init__(self, base, bindings, values, *, allocation, preserve_backing=False):
+        if type(preserve_backing) is not bool:
+            raise TypeError("native view backing preservation requires an explicit boolean")
         object.__setattr__(self, "base", base)
         object.__setattr__(self, "bindings", bindings)
-        object.__setattr__(self, "current_values", MappingProxyType(dict(values)))
+        # Current inputs cross this closed-frame boundary by value. Keeping
+        # only declared origins also avoids retaining unrelated prefix ports.
+        object.__setattr__(self, "current_values", MappingProxyType({
+            name: replace(values[name]) for name in dict.fromkeys(bindings.values())}))
         object.__setattr__(self, "allocation", allocation)
+        object.__setattr__(self, "preserve_backing", preserve_backing)
         object.__setattr__(self, "cache", {})
+        object.__setattr__(self, "values_cache", None)
 
     def __setattr__(self, name, value):
         raise TypeError("bound source storage is immutable")
@@ -1409,61 +1801,117 @@ class _NativeStorageOverlay(Mapping):
     def __iter__(self):
         return iter(self.base)
 
+    def values(self):
+        if self.values_cache is None:
+            object.__setattr__(self, "values_cache", tuple(self[name] for name in self.base))
+        return self.values_cache
+
     def __getitem__(self, name):
-        if name not in self.bindings:
-            return self.base[name]
         if name not in self.cache:
-            value = self.current_values[self.bindings[name]]
-            if self.allocation:
-                old = self.base[name]
-                value = value.with_lifetime(name, old.allocated_event, old.freed_event)
+            if name not in self.bindings:
+                value = replace(self.base[name])
             else:
-                value = value.with_identity(name, name)
+                value = self.current_values[self.bindings[name]]
+                if self.allocation:
+                    old = self.base[name]
+                    value = value.with_lifetime(name, old.allocated_event, old.freed_event)
+                else:
+                    value = value.with_identity(name,
+                        self.base[name].allocation_id if self.preserve_backing else name)
             self.cache[name] = value
         return self.cache[name]
 
 
-def _bind_native_storage(program, trace, allocations, views):
-    """Reuse detached static storage after comparing the actual template.
+def _source_view_layouts(trace):
+    """Read current view geometry without reconstructing immutable static views.
 
-    Ordered keys and every current frozen referent are checked in C;
-    mutable source identity is never a validity proof. Canonical frozen storage
-    values can then be shared while every declared backing is derived afresh.
-    More general view/transient programs keep the complete ordinary binder.
+    This projection exposes layout facts only. Callers that consume a port,
+    allocation lifetime or public memory receipt still use the actual frame.
     """
+    owned = trace.__dict__["_owned_memory_storage"] if "_owned_memory_storage" in trace.__dict__ else None
+    if (type(trace) is ForwardTrace and type(owned) is tuple and len(owned) == 6
+            and trace._allocations is owned[0] and trace._views is owned[1]
+            and trace._persistent_ids is owned[4] and trace._events is owned[5]
+            and type(owned[1]) is MappingProxyType
+            and type(owned[3]) is _NativeStorageOverlay and owned[3].allocation is False
+            and type(owned[3].base) is MappingProxyType):
+        overlay = owned[3]
+        return (overlay[name] if name in overlay.bindings else view
+            for name, view in overlay.base.items())
+    return trace._views.values()
+
+
+def _bind_native_storage(program, trace, allocations, views):
+    """Reuse detached storage after comparing the actual source template."""
     source = program.source
-    if (program.view_bindings or program.capture_bindings or program.transient_origins
-            or type(source._allocations) is not dict or type(source._views) is not dict
-            or type(source._persistent_ids) is not set or type(source._events) is not list):
+    dynamic = program.geometry_rebind
+    if not dynamic and (program.view_bindings or program.capture_bindings or program.transient_origins):
         return False
-    # Boundary validation remains eager even when no consumer reads persistent
-    # backing values. Only canonical frozen inputs enter the lazy derivation.
+    mutable_source = (type(source._allocations) is dict and type(source._views) is dict
+        and type(source._persistent_ids) is set and type(source._events) is list)
+    sealed_source = False
+    if not mutable_source:
+        owned = source.__dict__["_owned_memory_storage"] if "_owned_memory_storage" in source.__dict__ else None
+        sealed_source = (not dynamic and type(owned) is tuple and len(owned) == 6
+            and type(source._allocations) is MappingProxyType and type(source._views) is MappingProxyType
+            and type(source._persistent_ids) is frozenset and type(source._events) is tuple
+            and source._allocations is owned[0] and source._views is owned[1]
+            and type(owned[2]) is _NativeStorageOverlay and owned[2].allocation is True
+            and type(owned[3]) is _NativeStorageOverlay and owned[3].allocation is False
+            and source._persistent_ids is owned[4] and source._events is owned[5])
+        if not sealed_source:
+            return False
     for _, origin in program.allocation_bindings:
         if type(allocations[origin]) is not MemoryAllocation or type(views[origin]) is not TensorView:
+            return False
+    for _, origin in program.view_bindings:
+        if type(views[origin]) is not TensorView:
             return False
     snapshot = program.__dict__["_native_storage_template"] if "_native_storage_template" in program.__dict__ else None
     if (snapshot is None or tuple(source._allocations) != snapshot[8] or tuple(source._views) != snapshot[9]
             or not all(map(operator.is_, source._allocations.values(), snapshot[0].values()))
             or not all(map(operator.is_, source._views.values(), snapshot[1].values()))
-            or source._persistent_ids != snapshot[2] or source._events != snapshot[3]
-            or program.allocation_bindings is not snapshot[11]):
+            or source._persistent_ids != snapshot[2]
+            or source._events != (snapshot[6] if sealed_source else snapshot[3])
+            or program.allocation_bindings is not snapshot[11]
+            or program.view_bindings is not snapshot[12] or program.capture_bindings is not snapshot[13]
+            or program.transient_origins != snapshot[14] or dynamic is not snapshot[15]):
         if (any(type(value) is not MemoryAllocation for value in source._allocations.values())
                 or any(type(value) is not TensorView for value in source._views.values())
                 or any(type(name) is not str for name in source._persistent_ids)
-                or any(target not in source._persistent_ids for target, _ in program.allocation_bindings)):
+                or not dynamic and any(target not in source._persistent_ids for target, _ in program.allocation_bindings)):
             return False
         allocation_base, view_base = dict(source._allocations), dict(source._views)
+        owned_allocations = {name: replace(value) for name, value in allocation_base.items()}
+        owned_views = {name: replace(value) for name, value in view_base.items()}
         persistent, events = frozenset(source._persistent_ids), list(source._events)
-        activations = tuple(value for name, value in allocation_base.items() if name not in persistent)
+        activations = tuple(value for name, value in owned_allocations.items() if name not in persistent)
+        view_bindings = dict(program.allocation_bindings)
+        view_bindings.update(program.view_bindings)
         snapshot = (allocation_base, view_base, persistent, events,
-            MappingProxyType(allocation_base), MappingProxyType(view_base), tuple(events), activations,
+            MappingProxyType(owned_allocations), MappingProxyType(owned_views), tuple(events), activations,
             tuple(allocation_base), tuple(view_base), MappingProxyType(dict(program.allocation_bindings)),
-            program.allocation_bindings)
+            program.allocation_bindings, program.view_bindings, program.capture_bindings,
+            frozenset(program.transient_origins), dynamic, MappingProxyType(view_bindings))
         program.__dict__["_native_storage_template"] = snapshot
-    trace._allocations = MappingProxyType(_NativeStorageOverlay(snapshot[4], snapshot[10], allocations, allocation=True))
-    trace._views = MappingProxyType(_NativeStorageOverlay(snapshot[5], snapshot[10], views, allocation=False))
+    if dynamic:
+        bound_allocations = dict(program.allocation_bindings)
+        for target, origin in program.view_bindings:
+            target_root = source._views[target].allocation_id
+            allocation = (allocations[bound_allocations[target_root]] if target_root in bound_allocations
+                else source._allocations[target_root])
+            if region_end(views[origin].region()) > allocation.size_bytes:
+                raise ValueError("bound source view exceeds its actual backing allocation")
+    allocation_overlay = _NativeStorageOverlay(snapshot[4], snapshot[10], allocations, allocation=True)
+    view_overlay = _NativeStorageOverlay(snapshot[5], snapshot[16], views,
+        allocation=False, preserve_backing=True)
+    trace._allocations = MappingProxyType(allocation_overlay)
+    trace._views = MappingProxyType(view_overlay)
     trace._persistent_ids, trace._events = snapshot[2], snapshot[6]
-    trace.__dict__["_closed_storage_inputs"] = (trace._allocations, trace._persistent_ids, trace._events, snapshot[7])
+    trace.__dict__["_owned_memory_storage"] = (trace._allocations, trace._views,
+        allocation_overlay, view_overlay, trace._persistent_ids, trace._events)
+    if not program.transient_origins:
+        trace.__dict__["_closed_storage_inputs"] = (trace._allocations, trace._persistent_ids, trace._events, snapshot[7])
     return True
 
 
@@ -1476,10 +1924,23 @@ class SourceProgramCache:
         self.max_entries = max_entries
         self.programs = OrderedDict()
         self.next_program_id = 0
+        # Live DSpark recurrence is run-owned state, separate from evictable
+        # recorded templates. Losing it cannot restart a request with new KV.
+        self.dspark_sources = {}
+        # Legacy dummy calls read the last prepared input buffer. These value
+        # declarations live with the run, independently of template eviction.
+        self.qwen_legacy_inputs = {}
+        self.glm_legacy_inputs = {}
+        # MTP dummy_run retains the real proposer's indexer toggle. This is
+        # structural run history, independent of evictable graph templates.
+        self.glm_mtp_legacy_states = {}
 
-    def namespace(self, model_type, pool, rank, source_version):
-        identity = self.next_program_id
-        self.next_program_id += 1
+    def namespace(self, model_type, pool, rank, source_version, *, cache_key=None):
+        if cache_key is None:
+            identity = self.next_program_id
+            self.next_program_id += 1
+        else:
+            identity = hashlib.sha256(repr(cache_key).encode("utf-8")).hexdigest()
         return f"source-program:{model_type}:{pool}:rank-{rank}:{source_version}:{identity}"
 
     def lookup(self, key):
@@ -1491,11 +1952,18 @@ class SourceProgramCache:
     def store(self, key, program):
         if not isinstance(program, ForwardSourceProgram):
             raise TypeError("source cache entries must be actual recorded source programs")
+        self._retain(key, program)
+
+    def store_module_frame(self, key, frame):
+        if frame is not None and (type(frame) is not _ForwardModuleFrame or not frame.supported):
+            raise TypeError("source fragments require an actual supported recorded module body")
+        self._retain(key, frame)
+
+    def _retain(self, key, program):
         self.programs[key] = program
         self.programs.move_to_end(key)
         while len(self.programs) > self.max_entries:
             self.programs.popitem(last=False)
-
 
 class ForwardWorkspace:
     """One explicitly initialized, aligned source workspace lane.
@@ -1557,30 +2025,46 @@ class ForwardPipelineGroup:
 
     Source scopes retain send buffers; receives allocate on the destination.
     This records data/control edges, not transport metadata, async retirement
-    or a distributed runtime. Equal TP2 or TP8 stages use flattened lane views,
+    or a distributed runtime. Equal TP stages use flattened lane views,
     full receiver backings and separately traced destination all-gathers.
     """
 
-    def __init__(self, traces, *, namespace, collective_groups=()):
+    def __init__(self, traces, *, namespace, collective_groups=(), tensor_roles=("hidden_states", "residual"),
+                 stage_tensor_roles=None):
         if (not isinstance(traces, tuple) or len(traces) < 2
                 or any(not isinstance(trace, ForwardTrace) or trace.namespace is None for trace in traces)
                 or len({trace.rank for trace in traces}) != len(traces)
                 or len({trace.namespace for trace in traces}) != len(traces)
                 or not isinstance(namespace, str) or not namespace):
             raise ValueError("pipeline tracing requires distinct, namespaced stage ranks")
-        self.traces, self.namespace = traces, namespace
+        auxiliary_roles = ("hidden_states", "aux_hidden_states_0", "aux_hidden_states_1", "aux_hidden_states_2")
+        if tensor_roles not in (("hidden_states", "residual"), ("hidden_states",), auxiliary_roles):
+            raise ValueError("pipeline tensor roles must match the source intermediate dictionary")
+        self.traces, self.namespace, self.tensor_roles = traces, namespace, tensor_roles
         if collective_groups:
             if (not isinstance(collective_groups, tuple) or len(collective_groups) < 2
-                    or any(not isinstance(group, ForwardCollectiveGroup) or len(group.traces) not in (2, 8)
+                    or any(not isinstance(group, ForwardCollectiveGroup) or len(group.traces) < 2
                         for group in collective_groups)
                     or len({len(group.traces) for group in collective_groups}) != 1
                     or tuple(trace for group in collective_groups for trace in group.traces) != traces):
-                raise ValueError("sliced pipeline requires ordered equal TP2 or TP8 stage groups")
+                raise ValueError("sliced pipeline requires ordered equal multi-lane stage groups")
         self.collective_groups = collective_groups
+        stage_count = len(traces) // (len(collective_groups[0].traces) if collective_groups else 1)
+        if tensor_roles == auxiliary_roles:
+            if (type(stage_tensor_roles) is not tuple or len(stage_tensor_roles) != stage_count
+                    or any(type(roles) is not tuple or not roles or roles[0] != "hidden_states"
+                        or len(set(roles)) != len(roles) or not set(roles) <= set(auxiliary_roles)
+                        or tuple(sorted(roles[1:])) != auxiliary_roles[1:len(roles)] for roles in stage_tensor_roles)
+                    or set(stage_tensor_roles[-1]) != set(auxiliary_roles)
+                    or any(not set(before) <= set(after) for before, after in zip(stage_tensor_roles, stage_tensor_roles[1:]))):
+                raise ValueError("auxiliary PP requires every stage's exact ordered tensor roles")
+        elif stage_tensor_roles is not None:
+            raise ValueError("ordinary PP tensor roles cannot carry auxiliary stage declarations")
+        self.stage_tensor_roles = stage_tensor_roles
         self._previous = {trace.rank: None for trace in traces}
 
     def send(self, tensor, *, config, pool_name, tensor_name, frontier, out=None):
-        if not isinstance(config, PipelineP2PConfig) or tensor_name not in ("hidden_states", "residual"):
+        if not isinstance(config, PipelineP2PConfig) or tensor_name not in self.tensor_roles:
             raise ValueError("pipeline transport requires canonical config and intermediate tensor role")
         tp = len(self.collective_groups[0].traces) if self.collective_groups else 1
         if not 0 <= config.source_stage < config.destination_stage < len(self.traces) // tp:
@@ -1597,8 +2081,10 @@ class ForwardPipelineGroup:
             destination = self.collective_groups[config.destination_stage].traces[lane]
         source._check_tensor(tensor)
         source._check_tensor(frontier)
-        if tensor.dtype != "bf16" or len(tensor.shape) != (2 if tp == 1 else 1) or not tensor.is_contiguous:
-            raise NotImplementedError("pipeline requires a contiguous BF16 full tensor or TP lane")
+        expanded = self.tensor_roles == ("hidden_states",) or self.stage_tensor_roles is not None
+        full_rank = 3 if expanded and tensor_name == "hidden_states" else 2
+        if tensor.dtype not in ("bf16", "fp16") or len(tensor.shape) != (full_rank if tp == 1 else 1) or not tensor.is_contiguous:
+            raise NotImplementedError("pipeline requires a contiguous 16-bit full tensor or TP lane")
         if (tp == 1 and out is not None) or (tp > 1 and out is None):
             raise ValueError("sliced PP requires an explicit full-backing destination view")
         suffix = "" if tp == 1 else f":lane-{lane}"
@@ -1606,10 +2092,14 @@ class ForwardPipelineGroup:
         name = f"{boundary}:{tensor_name}{suffix}"
         if name in source._nodes:
             raise ValueError("pipeline tensor has already been sent across this boundary")
-        expected_previous = (None if tensor_name == "hidden_states" else
-            f"{boundary}:hidden_states{suffix}")
+        roles = (self.tensor_roles if self.stage_tensor_roles is None else self.stage_tensor_roles[config.source_stage])
+        if tensor_name not in roles:
+            raise ValueError("pipeline tensor is not present at this stage's source boundary")
+        index = roles.index(tensor_name)
+        expected_previous = None if index == 0 else f"{boundary}:{roles[index - 1]}{suffix}"
         if self._previous[source.rank] != expected_previous:
-            raise ValueError("pipeline sends must follow hidden_states then residual order")
+            raise ValueError("pipeline sends must follow hidden_states then residual order" if self.stage_tensor_roles is None else
+                "pipeline sends must follow the declared source tensor-dictionary order")
         writer = source._writers[tensor.view.allocation_id]
         ready = source._writers[frontier.view.allocation_id]
         if writer is None or ready is None:
@@ -1633,13 +2123,13 @@ class ForwardPipelineGroup:
                 "payload_tensor": {"name": tensor_name, "shape": tensor.shape, "dtype": tensor.dtype, "bytes": size},
                 "symbolic_tensor_inputs": (tensor.view.view_id,),
                 "symbolic_tensor_outputs": (received.view.view_id,),
+                "symbolic_tensor_output_allocations": (received.view.allocation_id,),
                 **({"symbolic_pipeline_views": {
                     "source": asdict(tensor.view), "destination": asdict(received.view),
                     "source_backing_bytes": source._allocations[tensor.view.allocation_id].size_bytes,
                     "destination_backing_bytes": destination._allocations[received.view.allocation_id].size_bytes,
                     "source_producer_views": tuple(asdict(source._views[view_id])
-                        for view_id in source._nodes[writer].attributes["symbolic_tensor_outputs"])}}
-                    if tp > 1 else {})})
+                        for view_id in source._nodes[writer].attributes["symbolic_tensor_outputs"])}})})
         source._edges.append(WorkloadEdge(writer, name))
         previous = self._previous[source.rank]
         for dependency in (ready, previous):
@@ -1807,7 +2297,7 @@ class ForwardCollectiveGroup:
     asynchronous retirement and actual provider selection are not inferred.
     """
 
-    def __init__(self, traces, *, namespace, participant_nic_ids=(), ring_order=()):
+    def __init__(self, traces, *, namespace, participant_nic_ids=(), ring_order=(), subgroups=()):
         if (not isinstance(traces, tuple) or len(traces) < 2
                 or any(not isinstance(trace, ForwardTrace) for trace in traces)):
             raise ValueError("collective tracing requires at least two rank traces")
@@ -1818,6 +2308,12 @@ class ForwardCollectiveGroup:
             raise ValueError("collective traces require distinct rank namespaces")
         if not isinstance(namespace, str) or not namespace:
             raise ValueError("collective group requires a nonempty namespace")
+        if (not isinstance(subgroups, tuple) or any(not isinstance(group, ForwardCollectiveGroup)
+                or group.subgroups or not set(group.traces) <= set(traces) for group in subgroups)
+                or len({group.namespace for group in subgroups}) != len(subgroups)
+                or any(group.namespace == namespace for group in subgroups)):
+            raise ValueError("collective subgroups must be distinct direct groups over these actual rank traces")
+        self.subgroups = subgroups
         self.traces = traces
         self.namespace = namespace
         self.participants = tuple(trace.rank for trace in traces)
@@ -1840,7 +2336,7 @@ class ForwardCollectiveGroup:
         self._recorded_graph = None
 
     def call(self, name, tensor, *, pool_name, config, inplace, dim=None, moe_invocation_id=None, output_shape=None,
-             implementation=None, residual=None, rmsnorm_weight=None, rmsnorm_epsilon=None):
+             implementation=None, residual=None, rmsnorm_weight=None, rmsnorm_epsilon=None, group_dimension="tensor"):
         """All-reduce (fresh or in-place) or fresh, axis-expanding all-gather.
 
         Input bytes are per-rank logical bytes, as in PhysicalTransferConfig.
@@ -1857,6 +2353,8 @@ class ForwardCollectiveGroup:
             raise ValueError("symbolic collective input belongs to another rank group")
         if not isinstance(config, CollectiveConfig) or type(inplace) is not bool:
             raise TypeError("symbolic collective requires canonical config and explicit storage mode")
+        if group_dimension not in ("tensor", "context") or (group_dimension == "context" and config.operation != "all_gather"):
+            raise ValueError("ordinary source collectives require TP or an explicit PCP all-gather")
         if config.link == "roce" and not self.participant_nic_ids:
             raise ValueError("RoCE collective requires explicit shared physical NIC placement")
         if self._explicit_ring_order and (config.algorithm != "ring" or config.backend != "analytical_roofline_v1"):
@@ -1913,12 +2411,14 @@ class ForwardCollectiveGroup:
                 "bytes_semantics": "per_rank_input", "direction": "collective",
                 "link": config.link, "topology": config.topology,
                 "participants": self.participants, "operation": config.operation,
+                **({"collective_group": group_dimension} if group_dimension != "tensor" else {}),
                 **({"participant_nic_ids": self.participant_nic_ids} if config.link == "roce" else {}),
                 "source_rank": None, "destination_rank": None,
                 "ring_order": self.ring_order if config.algorithm == "ring" else (),
                 "reduction": "sum" if config.operation == "all_reduce" else None,
                 "resource_id": config.resource_id,
                 "symbolic_collective_storage": "inplace" if inplace else "fresh",
+                "symbolic_collective_input_shape": tensor.shape,
                 "symbolic_collective_dim": dim,
                 **({"implementation": implementation} if implementation is not None else {}),
                 **({"rmsnorm_epsilon": rmsnorm_epsilon, "symbolic_workspace_complete": False,
@@ -1938,7 +2438,33 @@ class ForwardCollectiveGroup:
                 raise ValueError("symbolic collective invocation collides with another module name")
         local = replace(contract, rank=rank)
         trace = tensor.trace
-        producer_port = trace._complete_producer_view(tensor) if moe_invocation_id is not None else None
+        input_producer = trace._writers[tensor.view.allocation_id]
+        external_origin = trace._legacy_dummy_PP_origin(tensor)
+        if external_origin is not None and (config.operation != "all_reduce" or inplace or dim is not None
+                or implementation is not None or group_dimension != "tensor" or external_origin["role"] != "hidden_states"):
+            raise ValueError("legacy dummy external collective input is confined to fresh stage-entry TP all-reduce")
+        producer_port = tensor.view if external_origin is not None else None
+        if moe_invocation_id is not None and external_origin is None:
+            producer = trace._nodes[input_producer] if input_producer is not None else None
+            if producer is not None and "symbolic_glm_moe_sp_restore" in producer.attributes:
+                proof = producer.attributes["symbolic_glm_moe_sp_restore"]
+                if set(proof) != {"logical_rows", "gathered_rows", "tensor_parallel_size"}:
+                    raise ValueError("GLM MoE SP restore requires its complete physical prefix geometry")
+                rows, padded, lanes = (proof[key] for key in ("logical_rows", "gathered_rows", "tensor_parallel_size"))
+                ports = tuple(trace._views[name] for name in producer.attributes["symbolic_tensor_outputs"])
+                if (any(type(value) is not int or value <= 0 for value in (rows, padded, lanes))
+                        or lanes != len(self.traces) or padded != -(-rows // lanes) * lanes
+                        or producer.kind is not WorkloadKind.COLLECTIVE or producer.attributes["operation"] != "all_gather"
+                        or producer.attributes["participants"] != self.participants
+                        or len(tensor.shape) != 2 or tensor.shape[0] != rows or tensor.dtype != "bf16"
+                        or tensor.view.offset_bytes != 0 or tensor.view.strides_bytes != (2 * tensor.shape[1], 2)
+                        or not any(view.allocation_id == tensor.view.allocation_id and view.shape == (padded, tensor.shape[1])
+                            and view.offset_bytes == 0 and view.dtype == "bf16" and view.strides_bytes == tensor.view.strides_bytes for view in ports)
+                        or producer.attributes["symbolic_collective_input_shape"] != (padded // lanes, tensor.shape[1])):
+                    raise ValueError("GLM MoE SP restore must consume the real-row prefix of its actual padded TP gather")
+                producer_port = tensor.view
+            else:
+                producer_port = trace._complete_producer_view(tensor)
         if fused_norm:
             # FlashInfer's wrapper allocates both empty_like outputs; it does
             # not mutate/alias x or residual. Workspace remains unbound.
@@ -1956,6 +2482,9 @@ class ForwardCollectiveGroup:
             result = result.view_as_shape(output_shape)
             trace._nodes[local_id] = trace._nodes[local_id].with_attributes({
                 **trace._nodes[local_id].attributes, "symbolic_tensor_outputs": (result.view.view_id,)})
+        trace._nodes[local_id] = trace._nodes[local_id].with_attributes({**trace._nodes[local_id].attributes,
+            "symbolic_collective_input_producers": (input_producer,),
+            **({"symbolic_collective_external_inputs": (external_origin,)} if external_origin is not None else {})})
         if sequence:
             previous_name = sequence[-1]
             previous_count = sequence.count(previous_name) - 1
@@ -1970,53 +2499,172 @@ class ForwardCollectiveGroup:
         self._submissions[identifier][rank] = local_id
         return result
 
+    def call_variable(self, name, trace, tensor, *, pool_name, config, rows_by_rank, row_shape, dtype,
+                      moe_invocation_id=None, group_dimension="expert"):
+        """One rank's variable-row expert gather or sum-scatter submission.
+
+        Empty inputs/outputs have no fake tensor or allocation. Every rank
+        still submits the operation, preserving process-group ordering.
+        """
+        if (self._recorded_graph is not None or trace not in self.traces
+                or not isinstance(name, str) or not name
+                or not isinstance(config, CollectiveConfig)
+                or config.operation not in ("all_gatherv", "reduce_scatterv")):
+            raise ValueError("variable collective requires its current source rank and canonical operation")
+        if (not isinstance(rows_by_rank, tuple) or len(rows_by_rank) != len(self.traces)
+                or any(type(rows) is not int or rows < 0 for rows in rows_by_rank) or not sum(rows_by_rank)
+                or not isinstance(row_shape, tuple) or not row_shape
+                or any(type(size) is not int or size <= 0 for size in row_shape) or dtype not in DTYPE_BYTES):
+            raise ValueError("variable collective needs explicit nonnegative row extents and scalar row geometry")
+        if group_dimension not in ("expert", "data", "data_context", "context", "tensor"):
+            raise ValueError("variable source requires an explicit expert or data process group")
+        if self._explicit_ring_order or self.participant_nic_ids:
+            raise ValueError("variable direct-pairwise source does not infer ring/shared-NIC routing")
+        if moe_invocation_id is not None and (not isinstance(moe_invocation_id, str) or not moe_invocation_id):
+            raise ValueError("MoE invocation must be explicit and nonempty")
+        rank, gather = trace.rank, config.operation == "all_gatherv"
+        local_rows, total_rows = rows_by_rank[self.participants.index(rank)], sum(rows_by_rank)
+        input_rows, output_rows = (local_rows, total_rows) if gather else (total_rows, local_rows)
+        if input_rows:
+            if (not isinstance(tensor, ForwardTensor) or tensor.trace is not trace or not tensor.is_contiguous
+                    or tensor.shape != (input_rows, *row_shape) or tensor.dtype != dtype):
+                raise ValueError("variable collective input disagrees with this participant's exact rows")
+            trace._check_tensor(tensor)
+        elif tensor is not None:
+            raise ValueError("zero-row gather participants must not invent payload storage")
+        input_producers = (trace._writers[tensor.view.allocation_id],) if input_rows else ()
+        sequence = self._sequences[rank]
+        invocation = sequence.count(name)
+        identifier = self.namespace + ":" + name + (f":{invocation}" if invocation else "")
+        for other in self._sequences.values():
+            if len(other) > len(sequence) and other[len(sequence)] != name:
+                raise ValueError("symbolic collective order disagrees across ranks")
+        partitions = tuple(rows * prod(row_shape) * DTYPE_BYTES[dtype] for rows in rows_by_rank)
+        contract = WorkloadNode(identifier, WorkloadKind.COLLECTIVE, pool_name, {}, dtype=dtype,
+            rank=self.participants[0], attributes={
+                "algorithm": config.algorithm, "backend": config.backend, "backend_config_sha256": config.backend_config_sha256,
+                "bytes": sum(partitions), "bytes_semantics": "aggregate_input" if gather else "per_rank_input",
+                "direction": "collective", "link": config.link, "topology": config.topology,
+                "participants": self.participants, "operation": config.operation,
+                "source_rank": None, "destination_rank": None, "ring_order": (),
+                "reduction": None if gather else "sum", "resource_id": config.resource_id,
+                "partition_bytes": partitions, "collective_group": group_dimension,
+                "symbolic_variable_rows": rows_by_rank, "symbolic_variable_row_shape": row_shape,
+                **({"moe_invocation_id": moe_invocation_id} if moe_invocation_id is not None else {})})
+        layout = (rows_by_rank, row_shape, dtype)
+        if identifier in self._contracts and (self._contracts[identifier] != contract
+                or self._layouts[identifier] != layout or rank in self._submissions[identifier]):
+            raise ValueError("variable collective contract or invocation disagrees across participants")
+        local, local_id = replace(contract, rank=rank), trace.qualify(identifier)
+        if output_rows:
+            if tensor is None:
+                result = trace.tensor(identifier + ":output", (output_rows, *row_shape), dtype)
+                trace.call(local, (), shape=result.shape, dtype=dtype, out=result)
+            else:
+                result = trace.call(local, (tensor,), shape=(output_rows, *row_shape), dtype=dtype)
+        else:
+            # An empty reduce-scatter destination still contributes its full
+            # expert result. Record the read and completion without storage.
+            if local_id in trace._nodes:
+                raise ValueError("variable collective invocation is not fresh")
+            trace._nodes[local_id] = local.with_attributes({**local.attributes,
+                "symbolic_tensor_inputs": (tensor.view.view_id,), "symbolic_tensor_outputs": ()}, node_id=local_id)
+            writer = trace._writers[tensor.view.allocation_id]
+            if writer is not None:
+                trace._edges.append(WorkloadEdge(writer, local_id))
+            trace._readers[tensor.view.allocation_id].add(local_id)
+            trace._event(f"return:{local_id}")
+            result = None
+        trace._nodes[local_id] = trace._nodes[local_id].with_attributes({**trace._nodes[local_id].attributes,
+            "symbolic_collective_input_producers": input_producers})
+        if sequence:
+            previous = sequence[-1]
+            previous_id = self.namespace + ":" + previous
+            count = sequence.count(previous) - 1
+            if count:
+                previous_id += f":{count}"
+            trace._edges.append(WorkloadEdge(trace.qualify(previous_id), local_id, "barrier"))
+        trace._collective_ids.add(local_id)
+        sequence.append(name)
+        if identifier not in self._contracts:
+            self._contracts[identifier], self._layouts[identifier], self._submissions[identifier] = contract, layout, {}
+        self._submissions[identifier][rank] = local_id
+        return result
+
     @property
     def operator_order_by_rank(self):
         """Preserve each source program's order with canonical collective IDs."""
-        self._joined_parts()  # Validate the complete rank submissions first.
-        mapping = {local_id: identifier for identifier, submissions in self._submissions.items()
-            for local_id in submissions.values()}
-        return {trace.rank: tuple(mapping[name] if name in mapping else name for name in trace._nodes)
-            for trace in self.traces}
+        if self._recorded_graph is not None:
+            frame = (self._recorded_graph.__dict__["_native_source_frame"]
+                if "_native_source_frame" in self._recorded_graph.__dict__ else None)
+            if type(frame) is _NativeSourceFrame:
+                owner = frame.owner()
+                if (type(owner) is ForwardCollectiveSourceProgram
+                        and self._sequences == owner.source._sequences
+                        and self._submissions == owner.source._submissions):
+                    if "_operator_order_by_rank" not in owner.__dict__:
+                        owner.__dict__["_operator_order_by_rank"] = owner.source._joined_parts(order_only=True)
+                    return owner.__dict__["_operator_order_by_rank"]
+        return self._joined_parts(order_only=True)
 
-    def _joined_parts(self):
-        reference = self._sequences[self.participants[0]]
-        if any(sequence != reference for sequence in self._sequences.values()):
-            raise ValueError("symbolic collective group has missing rank submissions")
-        mapping = {}
-        joined = {}
-        for identifier, submissions in self._submissions.items():
-            if set(submissions) != set(self.participants):
+    def _joined_parts(self, *, order_only=False):
+        mapping, joined = {}, {}
+        for group in (self, *self.subgroups):
+            reference = group._sequences[group.participants[0]]
+            if any(sequence != reference for sequence in group._sequences.values()):
                 raise ValueError("symbolic collective group has missing rank submissions")
-            inputs, outputs = [], []
-            for trace in self.traces:
-                local_id = submissions[trace.rank]
-                mapping[local_id] = identifier
-                local = trace._nodes[local_id]
-                inputs.extend(local.attributes["symbolic_tensor_inputs"])
-                outputs.extend(local.attributes["symbolic_tensor_outputs"])
-            joined[identifier] = replace(self._contracts[identifier], attributes={
-                **self._contracts[identifier].attributes,
-                "symbolic_tensor_inputs": tuple(inputs),
-                "symbolic_tensor_outputs": tuple(outputs),
-            })
+            for identifier, submissions in group._submissions.items():
+                if identifier in joined or set(submissions) != set(group.participants):
+                    raise ValueError("symbolic collective group has missing or colliding rank submissions")
+                inputs, outputs, producers, external_inputs = [], [], [], []
+                for trace in group.traces:
+                    local_id = submissions[trace.rank]
+                    if local_id in mapping:
+                        raise ValueError("one source call cannot belong to multiple collective groups")
+                    mapping[local_id] = identifier
+                    local = trace._nodes[local_id]
+                    inputs.extend(local.attributes["symbolic_tensor_inputs"])
+                    outputs.extend(local.attributes["symbolic_tensor_outputs"])
+                    if "symbolic_collective_input_producers" in local.attributes:
+                        producers.extend(local.attributes["symbolic_collective_input_producers"])
+                        external_inputs.extend(local.attributes["symbolic_collective_external_inputs"]
+                            if "symbolic_collective_external_inputs" in local.attributes else
+                            (None,) * len(local.attributes["symbolic_collective_input_producers"]))
+                joined[identifier] = replace(group._contracts[identifier], attributes={
+                    **group._contracts[identifier].attributes,
+                    "symbolic_tensor_inputs": tuple(inputs), "symbolic_tensor_outputs": tuple(outputs),
+                    "symbolic_collective_input_producers": tuple(producers),
+                    **({"symbolic_collective_external_inputs": tuple(external_inputs)} if any(value is not None for value in external_inputs) else {})})
+        for identifier, node in tuple(joined.items()):
+            if "symbolic_collective_input_producers" in node.attributes:
+                joined[identifier] = node.with_attributes({**node.attributes,
+                    "symbolic_collective_input_producers": tuple(mapping[name] if name in mapping else name
+                        for name in node.attributes["symbolic_collective_input_producers"])})
         nodes, edges = [], set()
         emitted = set()
         for trace in self.traces:
             if trace._collective_ids - set(mapping):
                 raise ValueError("rank trace contains collectives from another group")
-            for local_id, node in trace._nodes.items():
-                if local_id in mapping:
-                    identifier = mapping[local_id]
-                    if identifier not in emitted:
-                        nodes.append(joined[identifier])
-                        emitted.add(identifier)
-                else:
-                    nodes.append(node)
+            if not order_only:
+                for local_id, node in trace._nodes.items():
+                    if local_id in mapping:
+                        identifier = mapping[local_id]
+                        if identifier not in emitted:
+                            nodes.append(joined[identifier])
+                            emitted.add(identifier)
+                    else:
+                        nodes.append(node)
             for edge in trace._capture_program_edges():
                 source = mapping[edge.source] if edge.source in mapping else edge.source
                 destination = mapping[edge.destination] if edge.destination in mapping else edge.destination
-                edges.add(WorkloadEdge(source, destination, edge.kind))
+                # The order query retains typed-edge and capture validation,
+                # but does not retain, deduplicate or sort an unused graph.
+                joined_edge = WorkloadEdge(source, destination, edge.kind)
+                if not order_only:
+                    edges.add(joined_edge)
+        if order_only:
+            return {trace.rank: tuple(mapping[name] if name in mapping else name for name in trace._nodes)
+                for trace in self.traces}
         # A data edge already enforces the process-group order. Avoid duplicate
         # KernelCall dependencies when ranks contributed both edge kinds.
         edges = {edge for edge in edges if edge.kind != "barrier"
@@ -2043,21 +2691,26 @@ class ForwardCollectiveSourceProgram(ForwardSourceProgram):
     """
 
     def __init__(self, source, prefix, *, node_bindings, allocation_bindings, collective_attribute_bindings=(),
-                 transient_allocation_bindings=(), view_bindings=(), capture_bindings=(), collective_geometry_bindings=()):
+                 transient_allocation_bindings=(), view_bindings=(), capture_bindings=(), collective_geometry_bindings=(),
+                 geometry_rebind=False):
         if not isinstance(source, ForwardCollectiveGroup) or not isinstance(prefix, ForwardCollectiveGroup):
             raise TypeError("collective source program requires actual source/prefix groups")
         source_parts = source._joined_parts()
         prefix._joined_parts()
         if (source.namespace != prefix.namespace or source.participants != prefix.participants
+                or source.subgroups or prefix.subgroups
                 or len(source.traces) != 2 or source.participant_nic_ids != prefix.participant_nic_ids
                 or source.ring_order != prefix.ring_order or source._explicit_ring_order != prefix._explicit_ring_order):
             raise ValueError("collective source programs require matching explicit dual-rank groups")
         self.collective_geometry_bindings = tuple(collective_geometry_bindings)
         for target, origin in self.collective_geometry_bindings:
-            if (not self._collective_geometry_matches(source, target)
-                    or not self._collective_geometry_matches(prefix, origin)
-                    or replace(source._contracts[target], node_id=prefix._contracts[origin].node_id) != prefix._contracts[origin]
-                    or source._layouts[target] != prefix._layouts[origin]):
+            if not self._collective_geometry_matches(source, target) or not self._collective_geometry_matches(prefix, origin):
+                raise ValueError("initial collective geometry must be actual matching source facts")
+            actual = prefix._contracts[origin]
+            expected = replace(source._contracts[target], node_id=actual.node_id)
+            if geometry_rebind:
+                expected = expected.with_updates({}, {"bytes": actual.attributes["bytes"]})
+            if expected != actual or not geometry_rebind and source._layouts[target] != prefix._layouts[origin]:
                 raise ValueError("initial collective geometry must be actual matching source facts")
         self.collective_attribute_bindings = tuple(collective_attribute_bindings)
         targets = tuple(binding[0] for binding in self.collective_attribute_bindings)
@@ -2084,11 +2737,12 @@ class ForwardCollectiveSourceProgram(ForwardSourceProgram):
                     raise ValueError("collective local and joined invocation identities disagree")
                 local_bindings.append((source_id, prefix_id, (), attributes))
         for target, origin in self.collective_geometry_bindings:
-            if origin in ignored and ignored[origin] != ("bytes",):
+            geometry_attributes = ("bytes", "symbolic_collective_input_shape")
+            if origin in ignored and ignored[origin] != geometry_attributes:
                 raise ValueError("collective geometry cannot overlap annotation bindings")
-            ignored[origin] = ("bytes",)
+            ignored[origin] = geometry_attributes
             for trace, current in zip(source.traces, prefix.traces, strict=True):
-                local_bindings.append((source._submissions[target][trace.rank], prefix._submissions[origin][current.rank], (), ("bytes",)))
+                local_bindings.append((source._submissions[target][trace.rank], prefix._submissions[origin][current.rank], (), geometry_attributes))
         self.ignored_collective_attributes = ignored
         self.prefix_collective_contracts = {identifier: self._collective_signature(node,
             ignored[identifier] if identifier in ignored else ()) for identifier, node in prefix._contracts.items()}
@@ -2117,7 +2771,7 @@ class ForwardCollectiveSourceProgram(ForwardSourceProgram):
             collective_groups=(source, prefix),
             transient_allocation_bindings=tuple(binding for binding in transient_allocation_bindings if binding[0] in trace._allocations),
             view_bindings=tuple(binding for binding in view_bindings if binding[0] in trace._views),
-            capture_bindings=capture_bindings)
+            capture_bindings=capture_bindings, geometry_rebind=geometry_rebind)
             for trace, current in zip(source.traces, prefix.traces, strict=True))
 
     @staticmethod
@@ -2138,6 +2792,7 @@ class ForwardCollectiveSourceProgram(ForwardSourceProgram):
         value = contract.attributes["bytes"]
         if (type(value) is not int or value <= 0
                 or any(type(size) is not int or size <= 0 for size in layout[0])
+                or contract.attributes["symbolic_collective_input_shape"] != layout[0]
                 or value != prod(layout[0]) * DTYPE_BYTES[layout[1]]
                 or layout[2] != ((len(group.participants) * layout[0][0], *layout[0][1:])
                     if operation == "all_gather" else layout[0])):
@@ -2150,7 +2805,8 @@ class ForwardCollectiveSourceProgram(ForwardSourceProgram):
         for trace in group.traces:
             local = trace._nodes[group._submissions[identifier][trace.rank]]
             if any(local.attributes[field] != contract.attributes[field] for field in (
-                    "operation", "symbolic_collective_storage", "symbolic_collective_dim", "bytes")):
+                    "operation", "symbolic_collective_storage", "symbolic_collective_dim", "bytes",
+                    "symbolic_collective_input_shape")):
                 return False
             inputs, outputs = local.attributes["symbolic_tensor_inputs"], local.attributes["symbolic_tensor_outputs"]
             if len(inputs) != 1 or len(outputs) != 1:
@@ -2239,8 +2895,9 @@ class ForwardCollectiveSourceProgram(ForwardSourceProgram):
             for target, origin, attributes in self.collective_attribute_bindings:
                 updates[target] = ({}, {name: prefix._contracts[origin].attributes[name] for name in attributes})
             for target, origin in self.collective_geometry_bindings:
-                value = prefix._contracts[origin].attributes["bytes"]
-                updates[target] = ({}, {"bytes": value})
+                changes = {name: prefix._contracts[origin].attributes[name]
+                    for name in ("bytes", "symbolic_collective_input_shape")}
+                updates[target] = ({}, changes)
                 result._layouts[target] = prefix._layouts[origin]
             result._contracts = _SourceFrameNodes(MappingProxyType(dict(self.source._contracts)),updates,None)
             joined = _SourceFrameNodes(MappingProxyType({target:self.graph.node(target) for target in updates}),updates,None)
@@ -2256,11 +2913,12 @@ class ForwardCollectiveSourceProgram(ForwardSourceProgram):
                 joined[target] = original.with_updates({}, changes)
             for target, origin in self.collective_geometry_bindings:
                 contract = result._contracts[target]
-                value = prefix._contracts[origin].attributes["bytes"]
-                result._contracts[target] = contract.with_updates({}, {"bytes": value})
+                changes = {name: prefix._contracts[origin].attributes[name]
+                    for name in ("bytes", "symbolic_collective_input_shape")}
+                result._contracts[target] = contract.with_updates({}, changes)
                 result._layouts[target] = prefix._layouts[origin]
                 original = self.graph.node(target)
-                joined[target] = original.with_updates({}, {"bytes": value})
+                joined[target] = original.with_updates({}, changes)
         # Every collective node, full submission and edge is retained from the
         # original complete group. Only current per-rank compute nodes change.
         if native_frame:
@@ -2344,7 +3002,7 @@ _SOURCE_LINEAGE_RECIPES = weakref.WeakKeyDictionary()
 
 
 def _lineage_binding_recipe(program):
-    if (type(program) is not ForwardCollectiveSourceProgram or type(program.graph) is not WorkloadGraph
+    if (type(program) not in (ForwardSourceProgram, ForwardCollectiveSourceProgram) or type(program.graph) is not WorkloadGraph
             or type(program.rank_programs) is not tuple):
         return None
     if any(type(rank) is not ForwardSourceProgram for rank in program.rank_programs):return None
@@ -2388,7 +3046,8 @@ def _lineage_binding_recipe(program):
     for binding in program.collective_geometry_bindings:
         if type(binding) is not tuple or len(binding) != 2:return None
         target, origin = binding
-        if type(origin) is not str or not write(target, ("collective", origin), (), ("bytes",)):return None
+        if type(origin) is not str or not write(target, ("collective", origin), (),
+                ("bytes", "symbolic_collective_input_shape")):return None
     bindings = tuple((node.node_id, *writes[node.node_id]) for node in program.graph.nodes if node.node_id in writes)
     _SOURCE_LINEAGE_RECIPES[program] = (weakref.ref(program.graph), declarations, bindings)
     return bindings
@@ -2481,10 +3140,10 @@ class ForwardKVCacheGroup:
                     attributes=attributes)
                 if attributes["direction"] == "load":
                     loads.append(node)
-                elif attributes["direction"] == "evict":
+                elif attributes["direction"] in ("evict", "store"):
                     evicts.append(node)
                 else:
-                    raise ValueError("KV effects only accept load and evict directions")
+                    raise ValueError("KV effects only accept load, evict and store directions")
             # Each intent must independently be a pre-compute root or a
             # post-compute leaf, as required by the existing completion
             # contract. Copy engines/link resources serialize overlapping
@@ -2523,13 +3182,36 @@ class ForwardLocalGroup:
         return tensor
 
 
+class _SourceParameterSlots(Mapping):
+    """Cold node-to-slot layout with one current parameter packet per slot.
+
+    Layouts are private immutable recipes. Values belong to this binding only;
+    node IDs and each node's static fields remain in the recorded source.
+    """
+    __slots__ = ("layout", "packets")
+    def __init__(self, layout, packets):
+        self.layout = layout
+        self.packets = packets
+    def __setattr__(self, name, value):
+        if hasattr(self, name): raise TypeError("source parameter slots are immutable")
+        object.__setattr__(self, name, value)
+    def __len__(self): return len(self.layout)
+    def __iter__(self): return iter(self.layout)
+    def __getitem__(self, name): return self.packets[self.layout[name]]
+
+
 class _SourceFrameNodes(Mapping):
     """One immutable actual binding; canonical node objects are inspection views."""
     __slots__ = ("base", "updates", "cache", "launch_policy")
     def __init__(self, base, updates, launch_policy):
         self.base = base
-        self.updates = MappingProxyType({name: (MappingProxyType(shape), MappingProxyType(attrs))
-            for name, (shape, attrs) in updates.items()})
+        if type(updates) is _SourceParameterSlots:
+            self.updates = _SourceParameterSlots(updates.layout,
+                tuple((MappingProxyType(shape), MappingProxyType(attrs))
+                    for shape, attrs in updates.packets))
+        else:
+            self.updates = MappingProxyType({name: (MappingProxyType(shape), MappingProxyType(attrs))
+                for name, (shape, attrs) in updates.items()})
         self.cache = {}
         self.launch_policy = launch_policy
     def __setattr__(self, name, value):
@@ -2538,10 +3220,12 @@ class _SourceFrameNodes(Mapping):
     def __len__(self): return len(self.base)
     def __iter__(self): return iter(self.base)
     def __getitem__(self, name):
-        if name not in self.updates: return self.base[name]
         if name not in self.cache:
-            shape, attrs = self.updates[name]
-            self.cache[name] = self.base[name].with_updates(dict(shape), dict(attrs))
+            if name in self.updates:
+                shape, attrs = self.updates[name]
+                self.cache[name] = self.base[name].with_updates(dict(shape), dict(attrs))
+            else:
+                self.cache[name] = self.base[name].with_attributes(self.base[name].attributes)
         return self.cache[name]
 
 
@@ -2568,11 +3252,26 @@ def _source_rank_frame(program, updates):
 
 
 class _SourceFrameSequence(Sequence):
-    def __init__(self, frame): self.frame = frame
-    def __len__(self): return len(self.frame.ids)
+    """Own node-view inputs without retaining the frame that owns this view."""
+    def __init__(self, frame):
+        self.ids, self.origins = frame.ids, frame.origins
+        self.base_nodes, self.node_maps = frame.base_nodes, frame.node_maps
+        self.joined, self.detached_nodes = frame.joined, frame.detached_nodes
+    def __setattr__(self, name, value):
+        if hasattr(self, name): raise TypeError("source node sequence binding is immutable")
+        object.__setattr__(self, name, value)
+    def __len__(self): return len(self.ids)
     def __getitem__(self, index):
-        if isinstance(index, slice): return tuple(self.frame.node(name) for name in self.frame.ids[index])
-        return self.frame.node(self.frame.ids[index])
+        if isinstance(index, slice): return tuple(self.node(name) for name in self.ids[index])
+        return self.node(self.ids[index])
+    def node(self, name):
+        origin = self.origins[name]
+        if origin is None:
+            if name not in self.detached_nodes:
+                self.detached_nodes[name] = self.base_nodes[name].with_attributes(self.base_nodes[name].attributes)
+            return self.detached_nodes[name]
+        if origin == "collective": return self.joined[name]
+        return self.node_maps[origin][name]
 
 
 class _SourceFrameLookup(Mapping):
@@ -2585,23 +3284,33 @@ class _SourceFrameLookup(Mapping):
 _NATIVE_SOURCE_RECIPES = weakref.WeakKeyDictionary()
 
 
+def _source_frame_traces(source):
+    if type(source) is ForwardTrace:
+        return (source,)
+    if type(source) is ForwardCollectiveGroup:
+        return source.traces
+    raise TypeError("native source frames require actual local or collective traces")
+
+
 class _NativeSourceFrame:
     def __init__(self, program, result, graph, joined, compiled):
         self.program_reference, self.graph_reference = weakref.ref(program), weakref.ref(graph)
         self.template_reference = weakref.ref(program.graph)
         self.recipe_signature = _native_recipe_signature(program)
-        self.trace_references = tuple(weakref.ref(trace) for trace in result.traces)
-        self.trace_types = tuple(type(trace) for trace in result.traces)
-        self.node_maps = tuple(trace._nodes for trace in result.traces)
+        self.trace_references = tuple(weakref.ref(trace) for trace in _source_frame_traces(result))
+        self.trace_types = tuple(type(trace) for trace in _source_frame_traces(result))
+        self.node_maps = tuple(trace._nodes for trace in _source_frame_traces(result))
         self.joined = joined
         self.ids, self.origins, self.layout, self.workload_contract, self.routing_ids, self.storage_rows, self.base_nodes, self.expected_rank_bases = compiled
-        self.nodes = _SourceFrameSequence(self)
         self.materialized = None
+        self.detached_nodes = {}
+        self.nodes = _SourceFrameSequence(self)
+        self.exported_topology = {}
         self.token_domains = tuple((trace.rank, trace.source_captures[0]["logical_tokens"],
-            trace.source_captures[0]["model_input_tokens"]) for trace in result.traces)
+            trace.source_captures[0]["model_input_tokens"]) for trace in _source_frame_traces(result))
     def owner(self, *, check_source=True):
         owner, graph = self.program_reference(), self.graph_reference()
-        if (type(owner) is not ForwardCollectiveSourceProgram or owner.graph is not self.template
+        if (type(owner) not in (ForwardSourceProgram, ForwardCollectiveSourceProgram) or owner.graph is not self.template
                 or graph is None or graph.__dict__["_ep_source_binding"] is not self
                 or not _native_recipe_matches(owner,self.recipe_signature)
                 or self.expected_rank_bases is None
@@ -2611,7 +3320,7 @@ class _NativeSourceFrame:
                     for reference, nodes in zip(self.trace_references, self.node_maps, strict=True))):
             return None
         if check_source:
-            if (type(owner.source) is ForwardCollectiveGroup
+            if (type(owner.source) in (ForwardTrace, ForwardCollectiveGroup)
                     and all(type(rank) is ForwardSourceProgram for rank in owner.rank_programs)
                     and type(self.trace_types) is tuple
                     and len(self.trace_types) == len(self.trace_references)
@@ -2624,10 +3333,30 @@ class _NativeSourceFrame:
                 if not source._DENSE_METADATA_SOURCE_CONTRACT.unchanged(): return None
         return owner
     def node(self, name):
+        return self.nodes.node(name)
+    def pool_name(self, name):
+        # Pool membership cannot be changed by shape/attribute bindings. If
+        # the current frame has already exported a node, honor that input.
         origin = self.origins[name]
-        if origin is None: return self.base_nodes[name]
-        if origin == "collective": return self.joined[name]
-        return self.node_maps[origin][name]
+        if origin is None:
+            nodes = self.detached_nodes
+        elif origin == "collective":
+            nodes = self.joined.cache
+        else:
+            nodes = self.node_maps[origin].cache
+        return (nodes[name] if name in nodes else self.base_nodes[name]).pool_name
+    def public_topology(self, name):
+        if name not in self.exported_topology:
+            if name == "edges":
+                value = tuple(replace(edge) for edge in self.workload_contract[1])
+            elif name == "block_repeats":
+                value = tuple(replace(repeat,
+                    feedback_edges=tuple(replace(edge) for edge in repeat.feedback_edges))
+                    for repeat in self.workload_contract[2])
+            else:
+                raise ValueError("unknown source topology export")
+            self.exported_topology[name] = value
+        return self.exported_topology[name]
     def fields(self, name):
         base = self.base_nodes[name]
         origin = self.origins[name]
@@ -2671,7 +3400,7 @@ def _issue_source_frame(program, result, joined):
         for node in template.nodes:
             if node.node_id in joined: origins[node.node_id] = "collective"
             else:
-                indices = tuple(index for index, trace in enumerate(result.traces)
+                indices = tuple(index for index, trace in enumerate(_source_frame_traces(result))
                     if node.node_id in trace._nodes and node.node_id not in trace._collective_ids)
                 if len(indices) > 1: raise ValueError("source frame has ambiguous rank node")
                 origins[node.node_id] = indices[0] if indices else None
@@ -2679,10 +3408,10 @@ def _issue_source_frame(program, result, joined):
         # Dynamic transient/view bindings retain their ordinary reporter path.
         static_storage = not any(rank.transient_origins for rank in program.rank_programs)
         rows = None if not static_storage else tuple((trace.rank, trace.activation_allocations,
-            len(trace._views), MappingProxyType(trace.workspace_capacity_bytes)) for trace in program.source.traces)
-        rank_bases = tuple(trace._nodes.base for trace in result.traces)
+            len(trace._views), MappingProxyType(trace.workspace_capacity_bytes)) for trace in _source_frame_traces(program.source))
+        rank_bases = tuple(trace._nodes.base for trace in _source_frame_traces(result))
         static_matches = all(node is template.node(name)
-            for trace, base in zip(result.traces, rank_bases, strict=True)
+            for trace, base in zip(_source_frame_traces(result), rank_bases, strict=True)
             for name, node in base.items() if name not in trace._collective_ids)
         compiled = (tuple(node.node_id for node in template.nodes), MappingProxyType(origins),
             (weakref.ref(template), template.nodes, bindings),
@@ -2706,57 +3435,154 @@ def _native_recipe_signature(program):
     ranks = (id(program.rank_programs), tuple(weakref.ref(rank) for rank in program.rank_programs))
     return (weakref.ref(program.graph), ranks, tuple((rank.node_bindings,rank.allocation_bindings,
             rank.view_bindings,rank.capture_bindings) for rank in program.rank_programs),
-        program.collective_attribute_bindings,program.collective_geometry_bindings)
+        program.collective_attribute_bindings,program.collective_geometry_bindings,
+        program.__dict__["_retained_full_execution_context"] if "_retained_full_execution_context" in program.__dict__ else None)
 
 
 def _native_recipe_matches(program, signature):
-    graph_reference,ranks,bindings,attrs,geometry = signature
+    graph_reference,ranks,bindings,attrs,geometry,context = signature
     return (program.graph is graph_reference() and id(program.rank_programs) == ranks[0]
         and len(program.rank_programs) == len(ranks[1])
         and all(rank is reference() for rank, reference in zip(program.rank_programs, ranks[1], strict=True))
         and all(all(current is old for current,old in zip((rank.node_bindings,rank.allocation_bindings,
             rank.view_bindings,rank.capture_bindings),binding,strict=True)) for rank,binding in zip(program.rank_programs,bindings,strict=True))
-        and program.collective_attribute_bindings is attrs and program.collective_geometry_bindings is geometry)
+        and program.collective_attribute_bindings is attrs and program.collective_geometry_bindings is geometry
+        and (program.__dict__["_retained_full_execution_context"]
+            if "_retained_full_execution_context" in program.__dict__ else None) is context)
+
+
+def _native_capture_output_contract(group, trace, capture):
+    """Prove a capture's own terminal typed port, without renaming its backing."""
+    port = capture["output"]
+    if set(port) != {"storage_id", "allocation_id", "shape", "dtype", "bytes"}:
+        return None
+    if (type(port["shape"]) is not tuple or not port["shape"]
+            or any(type(size) is not int or size <= 0 for size in port["shape"])
+            or type(port["dtype"]) is not str):
+        raise ValueError("source capture output requires exact typed dimensions and dtype")
+    name = port["allocation_id"]
+    if (name not in trace._views or name not in trace._allocations
+            or name not in trace._persistent_ids or name not in trace._writers):
+        raise ValueError("source capture output requires its actual persistent backing")
+    view, allocation = trace._views[name], trace._allocations[name]
+    if type(view) is not TensorView or type(allocation) is not MemoryAllocation:
+        raise TypeError("source capture output requires canonical typed storage")
+    # Revalidate current submitted values, including bool offsets and rank.
+    checked_view = replace(view)
+    replace(allocation)
+    writer = trace._writers[name]
+    if not capture["model_node_ids"]:
+        return None
+    terminal = capture["model_node_ids"][-1]
+    expected_writer = (group._submissions[terminal][trace.rank]
+        if type(group) is ForwardCollectiveGroup and terminal in group._submissions else terminal)
+    if (view.view_id != name or view.allocation_id != name
+            or allocation.allocation_id != name or allocation.device_id != f"rank:{trace.rank}"
+            or region_end(checked_view.region()) > allocation.size_bytes
+            or port["storage_id"] != f"rank:{trace.rank}:{capture['key']}:hidden_states"
+            or port["shape"] != view.shape or port["dtype"] != view.dtype
+            or type(port["bytes"]) is not int or port["bytes"] != allocation.size_bytes
+            or writer != expected_writer
+            or writer not in trace._nodes
+            or view.view_id not in trace._nodes[writer].attributes["symbolic_tensor_outputs"]):
+        raise ValueError("source capture output disagrees with its terminal typed port")
+    if (view.offset_bytes != 0 or prod(view.shape) * view.element_bytes != allocation.size_bytes
+            or len(view.shape) != 2 or view.shape[0] != capture["model_input_tokens"]):
+        return None
+    stride = view.element_bytes
+    for size, actual in zip(reversed(view.shape), reversed(view.strides_bytes), strict=True):
+        if actual != stride:
+            return None
+        stride *= size
+    return (port["storage_id"], view.shape, view.dtype, allocation.size_bytes,
+        view.offset_bytes, view.strides_bytes, allocation.device_id)
 
 
 def _native_source_scope(program, prefix):
-    if (type(program) is not ForwardCollectiveSourceProgram or len(prefix.traces) != 2
-            or program.collective_geometry_bindings
+    single = type(program) is ForwardSourceProgram
+    if single:
+        if (type(prefix) is not ForwardTrace
+                or "_retained_full_execution_context" not in program.__dict__
+                or program.rank_programs != (program,)):
+            return False
+    elif type(program) is not ForwardCollectiveSourceProgram or len(prefix.traces) != 2:
+        return False
+    traces = _source_frame_traces(prefix)
+    dynamic = all(rank.geometry_rebind and (
+            rank.source.source_captures[0]["runtime_mode"] == "PIECEWISE"
+            or (rank.source.source_captures[0]["runtime_mode"] == "FULL"
+                and rank.source._nodes[rank.source.qualify("layer-0:attention")].attributes[
+                    "source_model_execution_version"] == "vllm_0_11_0"))
+        for rank in program.rank_programs)
+    if dynamic and any(trace.source_captures[0]["runtime_mode"] == "FULL"
+            and _native_capture_output_contract(group, trace, trace.source_captures[0]) is None
+            for group in (program.source, program.prefix, prefix) for trace in _source_frame_traces(group)):
+        return False
+    if not dynamic and (program.collective_geometry_bindings
             or any(rank.transient_origins or any(target not in rank.source._persistent_ids
                 for target,origin in rank.allocation_bindings) for rank in program.rank_programs)):
         return False
-    for index,trace in enumerate(prefix.traces):
+    for index,trace in enumerate(traces):
         captures = trace.source_captures
         if (len(captures) != 1 or type(captures[0]["logical_tokens"]) is not int
                 or captures[0]["logical_tokens"] <= 0
                 or type(captures[0]["model_input_tokens"]) is not int
                 or captures[0]["logical_tokens"] > captures[0]["model_input_tokens"]): return False
-        if captures[0]["logical_tokens"] != captures[0]["model_input_tokens"]:
+        if not dynamic and captures[0]["logical_tokens"] != captures[0]["model_input_tokens"]:
             capture = captures[0]
-            exact_fields = ("key","logical_tokens","model_input_tokens","runtime_mode","source_stage","source_graph_batch_size","inputs","output")
+            exact_fields = ("key","logical_tokens","model_input_tokens","runtime_mode","source_stage","source_graph_batch_size","inputs")
             if (not set(exact_fields) <= set(capture) or capture["runtime_mode"] != "FULL"
                     or capture["source_stage"] is not None): return False
-            for recorded in (program.source.traces[index],program.prefix.traces[index]):
+            output = _native_capture_output_contract(prefix, trace, capture)
+            if output is None or capture["output"] != _source_frame_traces(program.prefix)[index].source_captures[0]["output"]:
+                return False
+            for group in (program.source, program.prefix):
+                recorded = _source_frame_traces(group)[index]
                 actual = recorded.source_captures
-                if (len(actual) != 1 or not set(exact_fields) <= set(actual[0])
-                        or any(capture[name] != actual[0][name] for name in exact_fields)): return False
+                if (len(actual) != 1 or recorded.rank != trace.rank or not set(exact_fields) <= set(actual[0])
+                        or any(capture[name] != actual[0][name] for name in exact_fields)
+                        or _native_capture_output_contract(group, recorded, actual[0]) != output): return False
     if "_native_frame_scope" in program.__dict__:
         signature, eligible = program.__dict__["_native_frame_scope"]
         if _native_recipe_matches(program,signature): return eligible
     attention = tuple(node for node in program.graph.nodes if node.kind is WorkloadKind.FLASH_ATTN)
-    eligible = (bool(attention) and all(node.shape["batch"] > 0 and (node.shape["q_len"] == 1
+    eligible = (bool(attention) and (dynamic or all(node.shape["batch"] > 0 and (node.shape["q_len"] == 1
             or ("mathematical_program" in node.attributes
                 and node.attributes["mathematical_program"] == "ascend_0_18_full_fia_softmax_v1"
                 and "q_lens" in node.attributes and type(node.attributes["q_lens"]) is tuple
                 and bool(node.attributes["q_lens"])
-                and all(type(length) is int and length == 1 for length in node.attributes["q_lens"]))) for node in attention)
-        and all(len(trace.source_captures) == 1 for trace in program.source.traces))
+                and all(type(length) is int and length == 1 for length in node.attributes["q_lens"]))) for node in attention))
+        and all(len(trace.source_captures) == 1 for trace in _source_frame_traces(program.source))
+        and (not single or all(node.attributes["source_program"] == "vllm_0_30_fa3_gqa_full_decode"
+            for node in attention)))
     program._native_frame_scope = (_native_recipe_signature(program),eligible)
     return eligible
 
 
+def _source_bound_pool_names(graph, names):
+    """Read every requested node's current pool without exporting its fields."""
+    if "_native_source_frame" in graph.__dict__:
+        frame = graph.__dict__["_native_source_frame"]
+        if type(frame) is _NativeSourceFrame and frame.owner() is not None:
+            return {frame.pool_name(name) for name in names}
+    return {graph.node(name).pool_name for name in names}
+
+
+def _source_bound_topology(graph):
+    """Private topology identity for consumers of a checked native frame."""
+    if "_native_source_frame" in graph.__dict__:
+        frame = graph.__dict__["_native_source_frame"]
+        if type(frame) is _NativeSourceFrame and frame.owner() is not None:
+            return frame.workload_contract[1:3]
+    return graph.edges, graph.block_repeats
+
+
 def _source_bound_execution_projection(graph):
-    if "_native_source_frame" not in graph.__dict__: return None
+    if "_native_source_frame" not in graph.__dict__:
+        if "_glm_decode_binding" not in graph.__dict__:
+            return None
+        from .traced_models import _decode_source_execution_projection
+        return _decode_source_execution_projection(graph)
     frame = graph.__dict__["_native_source_frame"]
     if type(frame) is not _NativeSourceFrame or frame.owner() is None: return None
     routing = []
@@ -2769,13 +3595,15 @@ def _source_bound_execution_projection(graph):
 def _source_bound_storage_projection(source, graph):
     if "_native_source_frame" not in graph.__dict__: return None
     frame = graph.__dict__["_native_source_frame"]
-    if (type(frame) is not _NativeSourceFrame or frame.owner() is None or source._recorded_graph is not graph
-            or len(source.traces) != len(frame.trace_references) or frame.storage_rows is None
-            or any(trace is not reference() for trace,reference in zip(source.traces,frame.trace_references,strict=True))): return None
-    rows = tuple((row[0], trace.activation_allocations, len(trace._views),
+    traces = _source_frame_traces(source)
+    recorded = source._recorded_graph[1] if type(source) is ForwardTrace else source._recorded_graph
+    if (type(frame) is not _NativeSourceFrame or frame.owner() is None or recorded is not graph
+            or len(traces) != len(frame.trace_references) or frame.storage_rows is None
+            or any(trace is not reference() for trace,reference in zip(traces,frame.trace_references,strict=True))): return None
+    rows = tuple((row[0], _source_activation_allocations(trace), len(trace._views),
         MappingProxyType(trace.workspace_capacity_bytes))
-        for row, trace in zip(frame.storage_rows, source.traces, strict=True))
-    return len(frame.ids), len(graph.edges), rows
+        for row, trace in zip(frame.storage_rows, traces, strict=True))
+    return len(frame.ids), len(frame.workload_contract[1]), rows
 
 
 def _source_bound_node_sequence(graph):
@@ -2798,7 +3626,14 @@ def _bind_native_source_parameters(program, rank_values, collective_values):
             result._allocations, result._views = dict(rank_program.source._allocations), dict(rank_program.source._views)
             rank_program._bind_storage_parameters(result, allocations, views, rank_program.prefix.source_captures)
             _seal_native_bound_storage(rank_program, result)
+        result._captures = [_copy_capture_dicts(capture) for capture in result.source_captures]
         traces.append(result)
+    if type(program) is ForwardSourceProgram:
+        if collective_values or len(traces) != 1:
+            raise ValueError("rank-local source parameters cannot contain collective updates")
+        result, = traces
+        result._recorded_graph = (result._nodes, _issue_source_frame(program, result, {}))
+        return result
     result = copy(program.source)
     result.traces = tuple(traces)
     result._layouts = dict(program.source._layouts)
@@ -2812,7 +3647,7 @@ def _bind_native_source_parameters(program, rank_values, collective_values):
 # traced_models source guard; consumers validate only their execution surface.
 def _native_consumer_source_unchanged():
     if not _node_update_source_unchanged(): return False
-    for name, cls, bases, keys, members in _NATIVE_CONSUMER_CLASSES:
+    for name, cls, bases, keys, reader, values, identical in _NATIVE_CONSUMER_CLASSES:
         if globals()[name] is not cls or cls.__bases__ != bases: return False
         namespace = vars(cls)
         if cls in (ForwardTrace, ForwardCollectiveGroup, MemoryAllocation) and "__slotnames__" in namespace:
@@ -2821,8 +3656,13 @@ def _native_consumer_source_unchanged():
         else:
             current_keys = namespace.keys()
         if current_keys != keys: return False
-        if any((key in namespace) != present or (present and namespace[key] is not value)
-                for key, present, value in members): return False
+        # The complete key-set check above also proves every declared absent
+        # member stays absent. Read present members in C, then compare identity;
+        # equality-overloaded descriptors cannot satisfy this source guard.
+        if len(values) == 1:
+            if reader(namespace) is not values[0]: return False
+        elif values and not all(map(identical, reader(namespace), values)):
+            return False
     valid = (all(globals()[name] is function for name, function in _NATIVE_CONSUMER_GLOBALS)
         and all(function.__code__ is code and function.__defaults__ == defaults
             and function.__kwdefaults__ == kwdefaults
@@ -2835,6 +3675,7 @@ def _native_consumer_snapshot():
     declarations = (
         ('_NativeSourceFrame', tuple(vars(_NativeSourceFrame))),
         ('_SourceFrameNodes', tuple(vars(_SourceFrameNodes))),
+        ('_SourceParameterSlots', tuple(vars(_SourceParameterSlots))),
         ('_SourceFrameSequence', tuple(vars(_SourceFrameSequence))),
         ('_SourceFrameLookup', tuple(vars(_SourceFrameLookup))),
         ('_OverlayFields', tuple(vars(_OverlayFields))),
@@ -2859,13 +3700,17 @@ def _native_consumer_snapshot():
         members = tuple((key, key in namespace, namespace[key] if key in namespace else None) for key in names)
         keys = frozenset(key for key in namespace if key != "__slotnames__"
             or cls not in (ForwardTrace, ForwardCollectiveGroup, MemoryAllocation))
-        classes.append((name, cls, cls.__bases__, keys, members))
+        present_names = tuple(key for key, present, _ in members if present)
+        values = tuple(value for _, present, value in members if present)
+        reader = operator.itemgetter(*present_names) if present_names else None
+        classes.append((name, cls, cls.__bases__, keys, reader, values, operator.is_))
         for _, present, member in members:
             if present and type(member) is FunctionType: functions.append(member)
             elif present and type(member) is property:
                 functions.extend(function for function in (member.fget, member.fset, member.fdel) if function is not None)
-    names = ('_native_consumer_source_unchanged', '_native_recipe_matches', '_source_bound_node_layout',
+    names = ('_source_frame_traces', '_native_consumer_source_unchanged', '_native_recipe_matches', '_source_bound_node_layout',
         '_source_bound_execution_projection', '_source_bound_storage_projection', '_source_bound_node_sequence',
+        '_source_activation_allocations', '_source_bound_topology', '_source_bound_pool_names',
         '_ep_source_owner', '_ep_source_token_domains', '_node_update_source_unchanged')
     global_functions = tuple((name, globals()[name]) for name in names)
     functions.extend(function for _, function in global_functions)

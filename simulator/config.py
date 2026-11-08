@@ -4,14 +4,13 @@ from typing import Literal, Annotated
 import json
 
 from pydantic import Field, model_validator
-from network_sim.model import Contract, Identifier, Nanoseconds
+from network_sim.physical.model import Contract, Identifier, LinkParameters, Nanoseconds, OrbitConfiguration
 
 Positive = Annotated[int, Field(strict=True, gt=0)]
 
 
 class Parallelism(Contract):
-    # Native physical worker count is TP * PP. EP reuses TP ranks and is
-    # selected through native_expert_parallel, not another multiplicative axis.
+    # Native physical worker count is TP * PP. EP reuses the TP ranks.
     dp: Positive = 1
     tp: Positive = 1
     sp: Positive = 1
@@ -24,8 +23,10 @@ class Parallelism(Contract):
 
     @model_validator(mode="after")
     def validate_native_axes(self):
-        if (self.dp, self.sp, self.ep) != (1, 1, 1):
-            raise ValueError("this M-L Cell entry supports DP=SP=EP=1; native EP reuses TP ranks")
+        if (self.dp, self.sp) != (1, 1):
+            raise ValueError("one Cell owns one replica and requires DP=SP=1")
+        if self.ep not in (1, self.tp):
+            raise ValueError("native EP must reuse the full TP group")
         return self
 
 
@@ -49,9 +50,11 @@ class ServingCell(Contract):
     max_requests: Positive = 4
     num_kv_blocks: Positive = 64
     kv_block_size_tokens: Positive = 16
+    scheduler_adapter: Literal["auto", "upstream_exact", "vllm_0_31"] = "auto"
     prefix_caching: bool = False
     native_expert_parallel: bool = False
     expert_routing_seed: Annotated[int, Field(strict=True, ge=0)] | None = None
+    deployment: Literal["colocated", "pd_disagg"] = "colocated"
     host_launch_profile: str | None = None
     memory_policy_file: str | None = None
     watermark: Annotated[float, Field(ge=0, lt=1, allow_inf_nan=False)] = 0
@@ -60,10 +63,23 @@ class ServingCell(Contract):
     external_terminals: tuple[Identifier, ...]
     graph_backend: Literal["midlayer"] = "midlayer"
 
+    @property
+    def expert_parallel_enabled(self):
+        return self.native_expert_parallel or self.parallel.ep > 1
+
     @model_validator(mode="after")
     def validate_placement(self):
         ranks = [p.rank for p in self.placements]
-        if sorted(ranks) != list(range(self.parallel.workers)):
+        workers = self.parallel.workers
+        if self.deployment == "pd_disagg":
+            if self.prefix_caching or self.watermark or self.memory_policy_file:
+                raise ValueError("PD smoke uses explicit KV capacity and no session cache")
+            if any(p.pool != ("prefill" if p.rank < workers else "decode") for p in self.placements):
+                raise ValueError("PD placement requires prefill ranks followed by decode ranks")
+            workers *= 2
+        elif any(p.pool != "main" for p in self.placements):
+            raise ValueError("colocated Cell placements use the main pool")
+        if sorted(ranks) != list(range(workers)):
             raise ValueError("placements must cover every logical rank exactly once")
         if len({p.device for p in self.placements}) != len(ranks):
             raise ValueError("logical ranks require exclusive physical GPUs")
@@ -103,38 +119,6 @@ class Migration(Contract):
     session_id: str
     context_id: str
     mode: Literal["copy", "move"] = "copy"
-
-
-class OrbitConfiguration(Contract):
-    # The existing O-S module produces the canonical, hash-verified trace.
-    trace_manifest: str | None = None
-    samples: tuple[dict, ...] = ()
-    elements_file: str | None = None
-    simulation_epoch_utc: str | None = None
-    sample_step_ns: Positive = 1_000_000_000
-    mode: Literal["per_member", "reference_offsets"] = "per_member"
-    reference_satellite: Identifier | None = None
-    offsets_itrs_km: dict[str, tuple[float, float, float]] = {}
-    max_isl_range_km: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 10000
-    min_ground_elevation_deg: Annotated[float, Field(ge=-90, le=90)] = 0
-
-    @model_validator(mode="after")
-    def validate_source(self):
-        if sum((self.trace_manifest is not None, bool(self.samples), self.elements_file is not None)) != 1:
-            raise ValueError("supply one orbit source: canonical manifest, samples, or SGP4 elements")
-        if self.elements_file and not self.simulation_epoch_utc:
-            raise ValueError("SGP4 propagation needs simulation_epoch_utc")
-        if self.mode == "reference_offsets" and not self.reference_satellite:
-            raise ValueError("reference-offset formation needs a reference satellite")
-        if self.mode == "per_member" and (self.reference_satellite or self.offsets_itrs_km):
-            raise ValueError("independent propagation cannot contain reference offsets")
-        return self
-
-
-class LinkParameters(Contract):
-    kind: Literal["manual", "islsim"] = "manual"
-    distance_km: Annotated[float, Field(gt=0, allow_inf_nan=False)] | None = None
-    fso: dict = {}
 
 
 class SimulationConfig(Contract):
@@ -187,4 +171,7 @@ class SimulationConfig(Contract):
                 raise ValueError("unknown migration trigger request")
             if migration.source_cell not in known or migration.target_cell not in known or migration.source_cell == migration.target_cell:
                 raise ValueError("migration needs two distinct known Cells")
+            if any(c.deployment == "pd_disagg" and c.id in (migration.source_cell, migration.target_cell)
+                   for c in self.cells):
+                raise ValueError("session migration requires colocated Cells")
         return self

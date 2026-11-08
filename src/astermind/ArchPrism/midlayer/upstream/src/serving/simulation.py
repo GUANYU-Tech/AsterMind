@@ -1,11 +1,14 @@
 """Composition root for no-GPU serving simulation."""
 
 from contextlib import ExitStack, contextmanager
+from contextvars import copy_context
 from dataclasses import dataclass, replace
+from functools import partial
 import math
 import multiprocessing
 from multiprocessing.pool import ThreadPool
 import os
+import sys
 import time
 from typing import Callable, Mapping, Optional, Tuple
 
@@ -24,6 +27,7 @@ from src.serving.deployment.validated_scope import (
 )
 from src.serving.kernel_lowering.execution_timeline import (
     call_reserved_resource_ids,
+    experiment_cache_scope,
     ExecutionResourceCalendar,
 )
 from src.serving.kernel_lowering.kv_offload_completion import (
@@ -65,10 +69,11 @@ from src.serving.schedule.schedule_trace import (
     ScheduleTraceEntry,
     TransferTraceEntry,
 )
-from src.serving.deployment.validated_scope import is_validated_tp1_tp2_multi_pool_scope
-from src.serving.workload.kv_transfer_workload import build_pd_kv_transfer_workload
+from src.serving.deployment.validated_scope import is_validated_tp1_tp2_multi_pool_scope, is_gqa_pd_source_scope, is_qwen3_moe_dp_sp_source_scope
+from src.serving.workload.kv_transfer_workload import build_pd_kv_transfer_workload, validate_pd_kv_layout
 from src.serving.schedule.schedule_step import is_non_mtp_async_terminal_placeholder
 from src.serving.workload.model_config import (
+    is_deepseek_v4_parallel_model_scope,
     ModelConfig,
     is_validated_llama_tp2_model_scope,
     is_validated_qwen3_moe_ep2_model_scope,
@@ -260,6 +265,9 @@ class SimulationConfig:
     ] | None = None
     closed_loop_client_count: int | None = None
     model_source_inputs_by_step: Mapping[str, V32PaddedMTPInputs | VLLMDenseGraphInputs | None] | None = None
+    collect_source_state: bool = False
+    record_execution_timeline: bool = False
+    vllm_executor_backend: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.model, ModelConfig):
@@ -280,6 +288,12 @@ class SimulationConfig:
         from src.serving.workload.traced_models import bind_ordinary_forward_source
         object.__setattr__(self, "runtime_inputs", bind_ordinary_forward_source(
             self.model, self.deployment, self.runtime_inputs))
+        prompt_lengths = self.runtime_inputs.symbolic_source_prompt_lengths_by_request
+        if prompt_lengths is not None:
+            expected = {request.request_id: request.input_tokens
+                for request in self.requests}
+            if dict(prompt_lengths) != expected:
+                raise ValueError("source prompt lengths by request must exactly match the request stream")
         object.__setattr__(self, "model_source_inputs_by_step",
             bind_model_source_input_frames(self.runtime_inputs, self.model_source_inputs_by_step))
         if not isinstance(self.authorized_h200_pd_mtp_sweep, bool):
@@ -293,7 +307,7 @@ class SimulationConfig:
             raise ValueError(
                 f"unsupported Serving prediction method: "
                 f"{self.prediction_method!r}")
-        if self.execution_mode not in ("accelerated", "reference"):
+        if self.execution_mode not in ("accelerated", "reference", "fast"):
             raise ValueError(
                 f"unknown Serving execution mode: {self.execution_mode!r}")
         if self.step_retention not in ("full", "streaming_aggregate"):
@@ -304,10 +318,23 @@ class SimulationConfig:
                 or self.execution_workers < 0):
             raise ValueError(
                 "Serving execution_workers must be a non-negative integer")
+        if type(self.collect_source_state) is not bool:
+            raise TypeError("collect_source_state must be boolean")
+        if not isinstance(self.record_execution_timeline, bool):
+            raise TypeError("record_execution_timeline must be boolean")
+        if self.vllm_executor_backend not in (None, "uni", "mp"):
+            raise ValueError("vLLM executor backend must be 'uni', 'mp' or absent")
         validate_serving_timing_mode(self.timing_mode)
         hardware_ids = {
             pool.hardware_id for pool in self.deployment.worker_pools.values()
         }
+        if self.vllm_executor_backend is not None:
+            if hardware_ids != {"ascend_910b"}:
+                raise ValueError("explicit vLLM executor backend currently supports only 910B")
+            if (self.vllm_executor_backend == "uni"
+                    and any(len(pool.ranks) != 1
+                        for pool in self.deployment.worker_pools.values())):
+                raise ValueError("UniProcExecutor requires one rank per worker pool")
         requires_host_profiles = self.timing_mode != "device_only"
         if not requires_host_profiles:
             if (self.host_launch_profiles is not None
@@ -357,7 +384,7 @@ class SimulationConfig:
                     raise ValueError(
                         "Host request path profile mapping disagrees with "
                         "hardware ID")
-        if (self.execution_mode == "accelerated"
+        if (self.execution_mode in ("accelerated", "fast")
                 and self.runtime_inputs.expert_routing.source_kind
                 == "replay_observation"):
             raise NotImplementedError(
@@ -1088,6 +1115,7 @@ class SimulationResult:
     # means the canonical stream was used.
     metrics_requests: RequestStream | None = None
     source_activation_memory: Mapping[str, object] | None = None
+    pd_kv_lifecycle: tuple[dict, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1117,8 +1145,16 @@ class StreamingSimulationResult:
     execution_performance_stats: Mapping[str, object]
     num_simulation_transfers: int = 0
     source_activation_memory: Mapping[str, object] | None = None
+    pd_kv_lifecycle: tuple[dict, ...] = ()
+    kv_offload: Optional["SimulationKVOffload"] = None
+    recorded_transfers: Tuple["SimulationTransfer", ...] = ()
 
     def __post_init__(self) -> None:
+        if not isinstance(self.recorded_transfers, tuple) or any(
+                not isinstance(item, SimulationTransfer) for item in self.recorded_transfers):
+            raise TypeError("recorded_transfers must be a tuple of SimulationTransfer")
+        if self.recorded_transfers and len(self.recorded_transfers) != self.num_simulation_transfers:
+            raise ValueError("recorded transfer count disagrees with simulation")
         for name in ("num_steps", "num_kernel_calls"):
             value = getattr(self, name)
             if (isinstance(value, bool) or not isinstance(value, int)):
@@ -1135,6 +1171,9 @@ class StreamingSimulationResult:
         if transfer_count < 0:
             raise ValueError(
                 "streaming simulation transfer count must be non-negative")
+        if (self.kv_offload is not None
+                and not isinstance(self.kv_offload, SimulationKVOffload)):
+            raise TypeError("streaming KV offload must be SimulationKVOffload or null")
         if self.num_steps != len(self.schedule_trace.entries):
             raise ValueError(
                 "streaming simulation step count disagrees with trace")
@@ -1174,6 +1213,54 @@ class SimulationStep:
     predictions: Mapping[str, object]
     execution_timeline: object
     source_activation_memory: Mapping[str, object] | None = None
+    source_state_summary: Mapping[str, object] | None = None
+
+
+def _apply_tail_worker_limit(requested_workers, cpu_count, memory_worker_limit):
+    """Worker cap shared by the parallel tail and adaptive grant paths.
+
+    Automatic execution uses the available CPU count. Explicit requests and
+    adaptive grants retain the CPU and memory headroom bounds, and the caller
+    bounds the result by the pending step count.
+    """
+    limit = cpu_count if requested_workers == 0 else requested_workers
+    return min(limit, cpu_count, memory_worker_limit)
+
+
+def _validate_tail_worker_grant(grant):
+    if isinstance(grant, bool) or not isinstance(grant, int) or grant < 1:
+        raise ValueError("adaptive tail worker grant must be a positive integer")
+    return grant
+
+
+def _state_audit_snapshot(step):
+    if not isinstance(step, SimulationStep):
+        raise TypeError("state audit requires SimulationStep")
+    if step.source_state_summary is None:
+        raise ValueError("state audit requires source state for every step")
+    summary = step.source_state_summary
+    if not isinstance(summary, Mapping) or not isinstance(summary["ranks"], Mapping):
+        raise TypeError("state audit source summary has an invalid rank mapping")
+    occurrences = {}
+    for repeat in step.kernel_plan.block_repeats:
+        for call_id in repeat.call_ids:
+            occurrences[call_id] = repeat.repeat_count
+    calls = []
+    for call in step.kernel_plan.calls:
+        count = occurrences[call.call_id] if call.call_id in occurrences else 1
+        transfer = call.kernel_spec.transfer
+        operation = (None if transfer is None else
+            transfer.operation if transfer.operation is not None else "not_declared")
+        calls.append((call.call_id, call.pool_name, str(call.rank),
+            call.kernel_spec.kind.value, count, operation,
+            0 if transfer is None else transfer.bytes))
+    return {
+        "schema_version": "serving_state_audit_step_v1",
+        "step_id": step.backend_step.schedule.step_id,
+        "pool_name": step.backend_step.schedule.pool_name,
+        "source_state_summary": summary,
+        "calls": tuple(calls),
+    }
 
 
 @dataclass(frozen=True)
@@ -1185,6 +1272,8 @@ class _ParallelStepExecution:
     cache_deltas: Mapping[str, tuple[int, int, int]]
     phase_wall_time_s: Mapping[str, float]
     source_activation_memory: Mapping[str, object] | None = None
+    step_timing: StreamingStepTiming | None = None
+    state_audit_snapshot: Mapping[str, object] | None = None
 
 
 _PARALLEL_EXECUTION_CONTEXT = None
@@ -1193,15 +1282,65 @@ _PARALLEL_TAIL_BATCH_SIZE = 1024
 _PARALLEL_WORKER_MAX_TASKS = 4
 
 
+def _transfer_free_decode_step(step):
+    schedule = step.schedule
+    return (bool(schedule.requests) and not schedule.preempted_request_ids
+        and all(request.phase == "decode" and request.scheduled_tokens == 1
+            and not request.trace_prefix_hit_tokens and not request.resumed_from_preemption
+            for request in schedule.requests)
+        and all(event.action not in (KVCacheAction.LOAD, KVCacheAction.EVICT, KVCacheAction.STORE)
+            for event in step.kv_cache_events))
+
+
+def _fixed_source_segment_fits(cache, steps):
+    """Keep every actual q1 source class resident before any preparation."""
+    from src.serving.workload.traced_forward import SourceProgramCache
+    return (type(cache) is SourceProgramCache and type(cache.max_entries) is int
+        and cache.max_entries > 0 and len({tuple(request.scheduled_tokens
+            for request in step.schedule.requests) for step in steps}) <= cache.max_entries)
+
+
+def _fixed_source_program_key(cache, graph):
+    """Find the actual source owner's unique existing key, without deriving it."""
+    from src.serving.workload.traced_models import _GLMDecodeSourceBinding
+    binding = graph.__dict__["_glm_decode_binding"] if "_glm_decode_binding" in graph.__dict__ else None
+    program = binding.owner(graph) if type(binding) is _GLMDecodeSourceBinding else None
+    if program is None:
+        raise RuntimeError("fixed-source preparation lost its owned decode program")
+    keys = tuple(key for key, value in cache.programs.items() if value is program)
+    if len(keys) != 1:
+        raise RuntimeError("fixed-source preparation requires one actual source cache key")
+    return keys[0], program
+
+
+def _restore_fixed_source_program_order(cache, steps, programs_by_shape):
+    """Replay every real lookup, preserving the next segment's LRU victims."""
+    for step in steps:
+        shape = tuple(request.scheduled_tokens for request in step.schedule.requests)
+        if shape not in programs_by_shape:
+            raise RuntimeError("fixed-source segment lost a prepared shape")
+        key, program = programs_by_shape[shape]
+        if cache.lookup(key) is not program:
+            raise RuntimeError("fixed-source segment lost its actual prepared program")
+
+
 @_metadata_collection_scope()
-def _parallel_execute_step(backend_step: BackendStep, *, execution=None, projector=None) -> _ParallelStepExecution:
+def _parallel_execute_step(backend_step: BackendStep, *, execution=None, projector=None,
+        allow_capture_history=False, allow_invariant_decode_workspace=False) -> _ParallelStepExecution:
     execution = _PARALLEL_EXECUTION_CONTEXT if execution is None else execution
     projector = _PARALLEL_STEP_PROJECTOR if projector is None else projector
     if execution is None or projector is None:
         raise RuntimeError("parallel Serving execution worker is not initialized")
+    if type(allow_capture_history) is not bool or type(allow_invariant_decode_workspace) is not bool:
+        raise TypeError("parallel source-history permissions must be boolean")
+    workspace_capacities = None
     if execution.runtime_inputs.symbolic_workspace_initial_capacity_bytes is not None:
-        raise RuntimeError("source workspace history requires sequential cross-step execution")
-    if (execution.runtime_inputs.symbolic_forward_source is not None
+        if allow_invariant_decode_workspace:
+            workspace_capacities = execution._independent_decode_workspace_capacities(backend_step.schedule)
+        if workspace_capacities is None:
+            raise RuntimeError("source workspace history requires sequential cross-step execution")
+    if (not allow_capture_history
+            and execution.runtime_inputs.symbolic_forward_source is not None
             and execution.runtime_inputs.graph_execution.enabled):
         raise RuntimeError("source capture history requires sequential cross-step execution")
     cache_before = execution.cache_stats()
@@ -1212,6 +1351,13 @@ def _parallel_execute_step(backend_step: BackendStep, *, execution=None, project
         embedding_token_ids=backend_step.embedding_token_ids,
         model_source_inputs=backend_step.model_source_inputs,
     )
+    if workspace_capacities is not None:
+        pool = execution.deployment.worker_pools[backend_step.schedule.pool_name]
+        actual = tuple(components.source_activation_memory["ranks"][str(rank)][
+            "source_workspace_capacity_bytes"]["worker.workspace"] for rank in pool.ranks)
+        if (actual != workspace_capacities or execution._independent_decode_workspace_capacities(
+                backend_step.schedule) != workspace_capacities):
+            raise RuntimeError("independent decode changed its actual source workspace history")
     simulation_step = SimulationStep(
         backend_step,
         components.workload,
@@ -1219,6 +1365,7 @@ def _parallel_execute_step(backend_step: BackendStep, *, execution=None, project
         components.predictions,
         components.execution_timeline,
         components.source_activation_memory,
+        components.source_state_summary,
     )
     execution_contract_digest = projector(simulation_step)
     cache_after = execution.cache_stats()
@@ -1245,10 +1392,25 @@ def _parallel_execute_step(backend_step: BackendStep, *, execution=None, project
             for name in phase_after
         },
         components.source_activation_memory,
+        (None if execution.host_launch_profiles is None else StreamingStepTiming(
+            backend_step.schedule.step_id,
+            components.execution_timeline.predicted_device_time_s,
+            components.execution_timeline.launch_cpu_time_s,
+            components.execution_timeline.launch_critical_path_s,
+            components.execution_timeline.host_device_overlap_s,
+            components.execution_timeline.eager_dispatch_count,
+            components.execution_timeline.graph_replay_count,
+            components.execution_timeline.launch_kinds,
+        )),
+        _state_audit_snapshot(simulation_step) if execution.collect_source_state else None,
     )
 
 
-def _single_worker_tail_executor(initial_execution, projector):
+def _parallel_execute_fixed_decode_step(backend_step):
+    return _parallel_execute_step(backend_step, allow_invariant_decode_workspace=True)
+
+
+def _single_worker_tail_executor(initial_execution, projector, *, allow_capture_history=False):
     """Bind a thread-local executor with bounded caches, without forking.
 
     Recycle after four steps, a stricter bound than the process pool's four
@@ -1269,13 +1431,16 @@ def _single_worker_tail_executor(initial_execution, projector):
                 host_runtime_prepare_profiles=initial_execution.host_runtime_prepare_profiles,
                 runtime_prepare_event_builder=initial_execution.runtime_prepare_event_builder,
                 model_source_inputs_by_step=initial_execution.model_source_inputs_by_step,
-                materialize_timeline_details=False)
+                collect_source_state=initial_execution.collect_source_state,
+                materialize_timeline_details=initial_execution.materialize_timeline_details)
             completed = 0
-        result = _parallel_execute_step(backend_step, execution=execution, projector=projector)
+        result = _parallel_execute_step(backend_step, execution=execution, projector=projector,
+            allow_capture_history=allow_capture_history)
         completed += 1
         return result
 
-    return execute
+    scope = copy_context()
+    return lambda backend_step: scope.run(execute, backend_step)
 
 
 def _tail_execution_pool(worker_count):
@@ -1283,6 +1448,50 @@ def _tail_execution_pool(worker_count):
         return ThreadPool(1)
     return multiprocessing.get_context("fork").Pool(
         worker_count, maxtasksperchild=_PARALLEL_WORKER_MAX_TASKS)
+
+
+def _initialize_causal_execution_worker(execution, projector):
+    """Initialize only the child's run-owned executor, never parent globals."""
+    global _PARALLEL_EXECUTION_CONTEXT, _PARALLEL_STEP_PROJECTOR
+    _PARALLEL_EXECUTION_CONTEXT = execution
+    _PARALLEL_STEP_PROJECTOR = projector
+
+
+def _causal_execute_step(backend_step):
+    started = time.perf_counter()
+    result = _parallel_execute_step(backend_step, allow_capture_history=True)
+    return started, time.perf_counter(), result
+
+
+def _resolve_causal_cpu_result(pending, workers):
+    """Fail closed if a Pool replaces a worker with an unreturned task."""
+    while True:
+        try:
+            return pending.get(timeout=0.1)
+        except multiprocessing.TimeoutError:
+            if pending.ready():
+                return pending.get()
+            if any(worker.exitcode is not None for worker in workers):
+                raise RuntimeError("causal CPU execution worker exited before returning its result")
+
+
+def _independent_runtime_prepare_builder(builder):
+    """Recognize the source-owned pure mapper and its immutable configuration."""
+    from src.serving.runtime_prepare import runtime_prepare_events
+    if builder is None:
+        return True
+    if (type(builder) is not partial or builder.func is not runtime_prepare_events
+            or builder.args or set(builder.keywords) not in (
+                {"enabled_mechanisms"},
+                {"enabled_mechanisms", "ascend_compilation_mode"})):
+        return False
+    if ("ascend_compilation_mode" in builder.keywords
+            and builder.keywords["ascend_compilation_mode"] not in (
+                "NONE", "FULL", "FULL_DECODE_ONLY", "PIECEWISE")):
+        return False
+    mechanisms = builder.keywords["enabled_mechanisms"]
+    return (type(mechanisms) is tuple and bool(mechanisms)
+        and all(type(value) is str for value in mechanisms))
 
 
 @dataclass(frozen=True)
@@ -1311,8 +1520,9 @@ class SimulationKVCacheTransfer:
             raise TypeError(
                 "KV cache transfer completion must be canonical")
         if self.event.action not in (
-                KVCacheAction.LOAD, KVCacheAction.EVICT):
-            raise ValueError("KV cache transfer requires load or evict")
+                KVCacheAction.LOAD, KVCacheAction.EVICT,
+                KVCacheAction.STORE):
+            raise ValueError("KV cache transfer requires load, evict or store")
         if (self.event.ready_event != self.completion.ready_event
                 or self.event.action is not self.completion.action
                 or self.event.bytes != self.completion.bytes
@@ -1335,9 +1545,10 @@ class SimulationKVOffload:
         if not isinstance(self.transfers, (list, tuple)):
             raise TypeError("KV offload transfers must be a list or tuple")
         object.__setattr__(self, "transfers", tuple(self.transfers))
-        if (not self.transfers
-                or any(not isinstance(item, SimulationKVCacheTransfer)
-                       for item in self.transfers)):
+        if (any(not isinstance(item, SimulationKVCacheTransfer)
+                for item in self.transfers)
+                or (not self.transfers
+                    and self.mode != "fixed_prefix_tier_replay")):
             raise ValueError(
                 "KV offload requires canonical transfer completions")
         if not isinstance(self.final_tier_state, Mapping):
@@ -1346,12 +1557,16 @@ class SimulationKVOffload:
                 and not isinstance(self.lifecycle_replay, Mapping)):
             raise TypeError(
                 "KV offload lifecycle replay must be a mapping or null")
-        if self.mode != "modeled_host_kv_serial":
+        if self.mode not in ("modeled_host_kv_serial", "fixed_prefix_tier_replay"):
             raise ValueError(f"unknown KV offload mode: {self.mode!r}")
-        if self.validation_status != "modeled_request_private_full_blocks":
+        if self.validation_status not in (
+                "modeled_request_private_full_blocks",
+                "modeled_shared_prefix_full_blocks"):
             raise ValueError(
                 "unknown KV offload validation status: "
                 f"{self.validation_status!r}")
+        if self.final_tier_state["validation_status"] != self.validation_status:
+            raise ValueError("KV offload validation status disagrees with tier state")
 
 
 def _is_validated_host_kv_independent_preemption_scope(
@@ -1501,6 +1716,62 @@ class _BoundKVLifecycle:
         ) if replay is not None else frozenset()
         self._transfers = []
         self._saw_transfer_intent = False
+        if (manager.fixed_prefix_hbm_percent is not None
+                and replay is not None):
+            raise ValueError("fixed prefix tiers cannot combine with lifecycle replay")
+
+    def _fixed_prefix_events(
+        self, backend_step: BackendStep,
+    ) -> BackendStep:
+        percent = self._manager.fixed_prefix_hbm_percent
+        if percent is None:
+            return backend_step
+        block_tokens = self._manager.block_size_tokens
+        placements = {}
+        for request in backend_step.schedule.requests:
+            if not request.trace_prefix_hit_tokens:
+                continue
+            hbm_blocks, host_blocks = self._manager.fixed_prefix_block_counts(
+                request.scheduler_prefix_hit_tokens)
+            placements[request.request_id] = (
+                hbm_blocks * block_tokens,
+                (hbm_blocks + host_blocks) * block_tokens)
+        if not placements:
+            return backend_step
+        if any(event.action in (KVCacheAction.LOAD, KVCacheAction.EVICT,
+                                KVCacheAction.STORE)
+               for event in backend_step.kv_cache_events):
+            raise ValueError("fixed prefix tiers cannot combine with native KV transfers")
+        transformed = []
+        for event in backend_step.kv_cache_events:
+            if (event.request_id not in placements
+                    or event.action not in (KVCacheAction.ALLOCATE, KVCacheAction.HIT)):
+                transformed.append(event)
+                continue
+            host_start, host_end = placements[event.request_id]
+            boundaries = sorted({event.token_start, event.token_end,
+                max(event.token_start, min(host_start, event.token_end)),
+                max(event.token_start, min(host_end, event.token_end))})
+            for start, end in zip(boundaries, boundaries[1:]):
+                tier = "host" if host_start <= start < host_end else "hbm"
+                transformed.append(replace(event, tier=tier, token_start=start,
+                    token_end=end, bytes=(end - start) * self._manager.config.bytes_per_token))
+        loads = []
+        for request_id, (host_start, host_end) in placements.items():
+            if host_start < host_end:
+                loads.append(KVCacheEvent(
+                    request_id, KVCacheAction.LOAD, "host", host_start,
+                    host_end, (host_end - host_start)
+                    * self._manager.config.bytes_per_token,
+                    source_tier="host", destination_tier="hbm",
+                    ready_event=(f"fixed-prefix:{backend_step.schedule.step_id}:"
+                        f"{request_id}:{host_start}-{host_end}")))
+        if not loads:
+            return replace(backend_step, kv_cache_events=tuple(transformed))
+        first_release = next((index for index, event in enumerate(transformed)
+            if event.action is KVCacheAction.RELEASE), len(transformed))
+        return replace(backend_step, kv_cache_events=tuple(
+            transformed[:first_release] + loads + transformed[first_release:]))
 
     def prepare_step(
         self,
@@ -1508,6 +1779,7 @@ class _BoundKVLifecycle:
     ) -> tuple[BackendStep, Tuple[KVCacheEvent, ...]]:
         if not isinstance(backend_step, BackendStep):
             raise TypeError("KV lifecycle step must be a BackendStep")
+        backend_step = self._fixed_prefix_events(backend_step)
         if self._cursor is None:
             replay_events = ()
         else:
@@ -1515,7 +1787,8 @@ class _BoundKVLifecycle:
         if (self._cursor is not None
                 and any(
                     event.action in (
-                        KVCacheAction.LOAD, KVCacheAction.EVICT)
+                        KVCacheAction.LOAD, KVCacheAction.EVICT,
+                        KVCacheAction.STORE)
                     for event in backend_step.kv_cache_events)):
             raise ValueError(
                 "KV lifecycle replay cannot be combined with native "
@@ -1540,7 +1813,8 @@ class _BoundKVLifecycle:
                 + completion_release_events)
         transfer_events = tuple(
             event for event in backend_step.kv_cache_events
-            if event.action in (KVCacheAction.LOAD, KVCacheAction.EVICT)
+            if event.action in (KVCacheAction.LOAD, KVCacheAction.EVICT,
+                                KVCacheAction.STORE)
         )
         preempted_or_resumed_request_ids = frozenset(
             backend_step.schedule.preempted_request_ids
@@ -1572,9 +1846,17 @@ class _BoundKVLifecycle:
                     f"{sorted(overlap)!r}")
         preempted_request_ids = frozenset(
             backend_step.schedule.preempted_request_ids)
+        host_replacement_releases = tuple(
+            event for event in backend_step.kv_cache_events
+            if (event.action is KVCacheAction.RELEASE
+                and event.tier == "host")
+        )
+        for event in host_replacement_releases:
+            self._manager.apply_capacity_event(event)
         preemption_release_events = tuple(
             event for event in backend_step.kv_cache_events
             if (event.action is KVCacheAction.RELEASE
+                and event.tier == "hbm"
                 and event.request_id in preempted_request_ids))
         released_preempted_request_ids = frozenset(
             event.request_id for event in preemption_release_events)
@@ -1591,10 +1873,12 @@ class _BoundKVLifecycle:
                 continue
             if event in preemption_release_events:
                 continue
+            if event in host_replacement_releases:
+                continue
             if event.action in (
                     KVCacheAction.ALLOCATE, KVCacheAction.LOAD):
                 event_phase = 0
-            elif event.action is KVCacheAction.EVICT:
+            elif event.action in (KVCacheAction.EVICT, KVCacheAction.STORE):
                 event_phase = 1
             elif event.action is KVCacheAction.RELEASE:
                 event_phase = 2
@@ -1609,7 +1893,8 @@ class _BoundKVLifecycle:
             if event.action is KVCacheAction.ALLOCATE:
                 self._manager.apply_capacity_event(event)
             elif event.action in (
-                    KVCacheAction.LOAD, KVCacheAction.EVICT):
+                    KVCacheAction.LOAD, KVCacheAction.EVICT,
+                    KVCacheAction.STORE):
                 self._manager.register_transfer_intent(
                     event,
                     pool_name=self._owner_pool_name,
@@ -1662,24 +1947,121 @@ class _BoundKVLifecycle:
             self._saw_transfer_intent = True
         for event in backend_step.kv_cache_events:
             if (event.action is KVCacheAction.RELEASE
+                    and event.tier != "host"
                     and event.request_id not in
                     backend_step.schedule.preempted_request_ids):
                 self._manager.apply_capacity_event(event)
 
+    def prepare_independent_decode_step(self, backend_step):
+        """Apply the actual ordered capacity events of a transfer-free step.
+
+        The actual request metadata must show that prefix admission has
+        already completed. Transfers, preemption and replay keep their
+        ordinary sequential completion boundary.
+        """
+        if (self._cursor is not None or self._manager.fixed_prefix_hbm_percent is None
+                or not _transfer_free_decode_step(backend_step)):
+            raise ValueError("independent fixed-tier step requires actual transfer-free decode")
+        prepared, transfers = self.prepare_step(backend_step)
+        if transfers:
+            raise RuntimeError("independent decode introduced a transfer intent")
+        for event in prepared.kv_cache_events:
+            if event.action is KVCacheAction.RELEASE and event.tier != "host":
+                self._manager.apply_capacity_event(event)
+        return prepared
+
+    def apply_completed_simple_cpu_releases(
+        self, events: tuple[KVCacheEvent, ...],
+    ) -> None:
+        for event in events:
+            if event.action is not KVCacheAction.RELEASE or event.tier != "hbm":
+                raise ValueError("completed SimpleCPU release must retire HBM")
+            self._manager.apply_capacity_event(event)
+
     def finish(self) -> SimulationKVOffload:
         if self._cursor is not None:
             self._cursor.assert_exhausted()
-        if not self._saw_transfer_intent:
+        if (not self._saw_transfer_intent
+                and self._manager.fixed_prefix_hbm_percent is None):
             raise NotImplementedError(
                 "modeled Host KV offload requires explicit framework "
                 "load/evict lifecycle intents")
         self._manager.assert_quiescent()
+        final_tier_state = self._manager.manifest()
         return SimulationKVOffload(
             tuple(self._transfers),
-            self._manager.manifest(),
+            final_tier_state,
             None if self._replay is None else self._replay.manifest(),
+            mode=("fixed_prefix_tier_replay"
+                if self._manager.fixed_prefix_hbm_percent is not None
+                else "modeled_host_kv_serial"),
+            validation_status=final_tier_state["validation_status"],
         )
 
+
+
+def _validate_dp_backend_placement(backend, pool, model):
+    import re
+
+    from src.serving.backend.vllm import VLLMBackend
+    from src.serving.parallelism.pp import pipeline_layer_ranges_for_plan
+
+    config = pool.parallel_plan.config
+    size = config.data_parallel_size
+    if isinstance(backend, VLLMBackend):
+        if backend.data_parallel_size != size:
+            raise ValueError("native DP Scheduler replica count disagrees with physical deployment")
+        # Legacy/injected single-replica control planes do not expose the
+        # native0.30 receipt. They retain their existing validation path.
+        if size == 1 and not hasattr(backend._control_plane, "runtime_info"):
+            return
+        info = backend.runtime_info
+        if size == 1 and (not isinstance(info, dict) or "version" not in info or info["version"] != "0.30.0"):
+            return
+        replicas = info["replicas"] if size > 1 else (info,)
+        expected_ranges = pipeline_layer_ranges_for_plan(pool.parallel_plan, num_layers=model.num_hidden_layers)
+        expected_partition = tuple(end - first for first, end in expected_ranges)
+        if (len(replicas) != size or info["model_config_sha256"] != model.config_sha256
+                or any(replica["model_config_sha256"] != model.config_sha256
+                    or replica["effective_tensor_parallel_size"] != config.tensor_parallel_size
+                    or replica["effective_pipeline_parallel_size"] != config.pipeline_parallel_size
+                    for replica in replicas)):
+            raise ValueError("native Scheduler model or TP/PP geometry disagrees with physical deployment")
+        if config.pipeline_parallel_size == 1:
+            return
+        for replica in replicas:
+            fields = ("effective_pipeline_layer_ranges", "effective_pipeline_layer_partition",
+                "native_worker_cache_owners_by_rank", "mtp_num_speculative_tokens")
+            if any(field not in replica for field in fields):
+                raise ValueError("native Scheduler is missing actual PP layer ownership")
+            if (tuple(tuple(bounds) for bounds in replica["effective_pipeline_layer_ranges"]) != expected_ranges
+                    or tuple(replica["effective_pipeline_layer_partition"]) != expected_partition):
+                raise ValueError("native Scheduler actual PP layer ownership disagrees with physical deployment")
+            owners = replica["native_worker_cache_owners_by_rank"]
+            if len(owners) != config.tensor_parallel_size * config.pipeline_parallel_size:
+                raise ValueError("native Scheduler cache owners must cover every local TP/PP rank")
+            for rank, names in enumerate(owners):
+                stage = rank // config.tensor_parallel_size
+                first, end = expected_ranges[stage]
+                expected_layers = set(range(first, end))
+                if stage == config.pipeline_parallel_size - 1 and replica["mtp_num_speculative_tokens"]:
+                    if model.model_type == 'deepseek_v4':
+                        if (replica['speculative_method'] != 'dspark' or replica['mtp_num_speculative_tokens'] != 5
+                                or tuple(replica['dspark_draft_layer_indices']) != tuple(range(model.num_hidden_layers,model.num_hidden_layers+3))):
+                            raise ValueError('native DSpark Scheduler must retain all three final-stage cache owners')
+                        expected_layers.update(replica['dspark_draft_layer_indices'])
+                    else:
+                        expected_layers.update(range(model.num_hidden_layers, model.num_hidden_layers + model.num_mtp_layers))
+                layers = set()
+                for name in names:
+                    match = re.search(r"(?:^|\.)layers\.(\d+)\.", name)
+                    if match is None:
+                        raise ValueError("native Scheduler cache owner has no source decoder layer")
+                    layers.add(int(match[1]))
+                if layers != expected_layers:
+                    raise ValueError("native Scheduler actual cache layer owners disagree with physical PP deployment")
+    elif size != 1:
+        raise NotImplementedError("coordinated DP requires actual per-replica native Scheduler/cache owners")
 
 def validate_workload_emission_parallelism(
     deployment: DeploymentPlan,
@@ -1711,7 +2093,11 @@ def validate_workload_emission_parallelism(
         is_validated_tp1_tp2_multi_pool_scope(deployment, model))
     validated_pd_rank_local = (
         deployment.mode == "pd_disagg"
-        and validated_tp1_tp2_multi_pool
+        and (validated_tp1_tp2_multi_pool or (
+            runtime_inputs is not None
+            and runtime_inputs.model_execution_version == "vllm_0_30_0"
+            and runtime_inputs.symbolic_forward_source == "cuda_eager_inplace"
+            and is_gqa_pd_source_scope(deployment, model)))
     )
     validated_replicated_colocated_rank_local = (
         deployment.mode == "colocated"
@@ -1720,21 +2106,186 @@ def validate_workload_emission_parallelism(
     if (validated_pd_rank_local
             or validated_replicated_colocated_rank_local):
         for pool in deployment.worker_pools.values():
-            if pool.parallel_plan.config.tensor_parallel_size > 1:
-                tuple(
-                    pool.collective_for(operation)
-                    for operation in ("all_reduce", "all_gather")
-                )
+            operations = (("all_reduce", "all_gather") if pool.parallel_plan.config.tensor_parallel_size > 1 else ())
+            if is_qwen3_moe_dp_sp_source_scope(pool, model):
+                operations += ("all_gatherv", "reduce_scatterv")
+            for operation in operations:
+                pool.collective_for(operation)
     unsupported = []
     for pool_name in sorted(deployment.worker_pools):
         pool = deployment.worker_pools[pool_name]
         parallelism = pool.parallel_plan.config
+        from src.serving.workload.runtime_inputs import DSparkFirstProposalInputs
+        if (runtime_inputs is not None
+                and isinstance(runtime_inputs.model_source_inputs, DSparkFirstProposalInputs)):
+            from src.serving.workload.model_config import validate_named_target_identity
+            validate_named_target_identity(model)
+            draft = runtime_inputs.model_source_inputs.draft_model
+            if (deployment.mode != "colocated" or len(deployment.worker_pools) != 1
+                    or pool.role != "colocated" or pool.hardware_id != "nvidia_h200"
+                    or model.model_type != "deepseek_v4" or model.compute_dtype != "bf16"
+                    or draft.model_id != model.model_id + "-DSpark"
+                    or draft.dspark_block_size != 5
+                    or draft.num_hidden_layers != model.num_hidden_layers
+                    or any(getattr(model, key) != getattr(draft, key) for key in (
+                        "hidden_size", "num_attention_heads", "head_dim", "vocab_size",
+                        "hc_mult", "window_size", "compute_dtype", "weight_dtype"))
+                    or len(pool.ranks) != 8 or parallelism.worker_count != 8
+                    or parallelism.tensor_parallel_size != 8 or not parallelism.is_rank_local
+                    or parallelism.enable_expert_parallel
+                    or any(value != 1 for value in (
+                        parallelism.pipeline_parallel_size, parallelism.sequence_parallel_size,
+                        parallelism.context_parallel_size, parallelism.data_parallel_size))):
+                raise NotImplementedError(
+                    "DSpark emission requires paired official V4 target/draft on one H200 TP8 eager pool")
+            for operation in ("all_reduce", "all_gather"):
+                pool.collective_for(operation)
+            continue
+        if runtime_inputs is not None and runtime_inputs.symbolic_forward_source == "vllm_0_30_v4_dspark":
+            from src.serving.deployment.validated_scope import is_dspark_runtime_source_scope
+            if (deployment.mode != "colocated" or len(deployment.worker_pools) != 1
+                    or not is_dspark_runtime_source_scope(pool, model, runtime_inputs)):
+                raise NotImplementedError("DSpark runtime requires exact eager colocated V4 TP/DP/EP/PP source geometry")
+            if parallelism.tensor_parallel_size > 1:
+                for operation in ("all_reduce", "all_gather"): pool.collective_for(operation)
+            if parallelism.data_parallel_size > 1:
+                for operation in ("all_gatherv", "reduce_scatterv"): pool.collective_for(operation)
+            if parallelism.pipeline_parallel_size > 1: pool.collective_for('broadcast')
+            for stage in range(parallelism.pipeline_parallel_size - 1): pool.pipeline_p2p_for(stage, stage + 1)
+            continue
+        from src.serving.deployment.validated_scope import is_kimi_k3_runtime_source_scope
+        if runtime_inputs is not None and runtime_inputs.symbolic_forward_source == "vllm_0_30_k3_mxfp4_sync":
+            if (deployment.mode != "colocated" or len(deployment.worker_pools) != 1
+                    or not is_kimi_k3_runtime_source_scope(pool, model, runtime_inputs)):
+                raise NotImplementedError("K3 initial source requires its exact eager geometry and explicit latent tier")
+            if parallelism.tensor_parallel_size > 1:
+                for operation in ("all_reduce", "all_gather"):
+                    pool.collective_for(operation)
+            if parallelism.data_parallel_size > 1:
+                for operation in ("all_gatherv", "reduce_scatterv"):
+                    pool.collective_for(operation)
+            for stage in range(parallelism.pipeline_parallel_size - 1):
+                pool.pipeline_p2p_for(stage, stage + 1)
+            continue
         if len(pool.ranks) == 1 and parallelism.worker_count == 1:
+            continue
+        from src.serving.deployment.validated_scope import (is_dense_parallel_source_scope,
+            is_qwen3_moe_rank_local_source_scope)
+        if (runtime_inputs is not None and deployment.mode == "colocated"
+                and any(predicate(pool, model,
+                    model_execution_version=runtime_inputs.model_execution_version,
+                    symbolic_forward_source=runtime_inputs.symbolic_forward_source,
+                    graph_enabled=runtime_inputs.graph_execution.enabled)
+                    for predicate in (is_dense_parallel_source_scope, is_qwen3_moe_rank_local_source_scope))):
+            if parallelism.tensor_parallel_size > 1:
+                for operation in ("all_reduce", "all_gather"):
+                    pool.collective_for(operation)
+            for stage in range(parallelism.pipeline_parallel_size - 1):
+                pool.pipeline_p2p_for(stage, stage + 1)
+            continue
+        from src.serving.deployment.validated_scope import (is_glm_distributed_source_scope,
+            is_glm_bf16_tensor_source_scope, is_glm_bf16_pipeline_source_scope, is_glm_fp8_rank_local_source_scope,
+            is_glm_fp8_mtp_rank_local_source_scope, is_glm_fp8_data_parallel_source_scope)
+        from src.serving.workload.model_config import is_glm_mtp_data_parallel_model_scope
+        glm_fp8_mtp_dp = (runtime_inputs is not None and model.weight_dtype == "fp8"
+            and deployment.mode == "colocated" and len(deployment.worker_pools) == 1
+            and pool.hardware_id == "nvidia_h200" and len(pool.ranks) == parallelism.worker_count
+            and isinstance(runtime_inputs.model_source_inputs, V32PaddedMTPInputs)
+            and runtime_inputs.target_sampling_source == "vllm_0_30_rejection_raw_logits_bf16"
+            and runtime_inputs.mtp_draft_sampling_source == "vllm_0_30_legacy_full_logits_greedy"
+            and (is_glm_mtp_data_parallel_model_scope(model, parallelism) or is_glm_fp8_mtp_rank_local_source_scope(pool, model)))
+        if (runtime_inputs is not None and runtime_inputs.model_execution_version == "vllm_0_30_0"
+                and runtime_inputs.symbolic_forward_source == f"vllm_0_30_v32_{model.weight_dtype}_sync_explicit_allreduce"
+                and not runtime_inputs.graph_execution.enabled
+                and (is_glm_distributed_source_scope(pool, model) or is_glm_bf16_tensor_source_scope(pool, model)
+                    or is_glm_bf16_pipeline_source_scope(pool, model) or is_glm_fp8_rank_local_source_scope(pool, model)
+                    or glm_fp8_mtp_dp
+                    or deployment.mode == "colocated" and len(deployment.worker_pools) == 1
+                        and runtime_inputs.mtp_draft_sampling_source is None
+                        and is_glm_fp8_data_parallel_source_scope(pool, model))
+                and deployment.mode in ("colocated", "pd_disagg")):
+            operations = ("all_reduce",) if parallelism.tensor_parallel_size > 1 else ()
+            operations += (("all_gather", "all_gatherv", "reduce_scatterv")
+                if parallelism.context_parallel_size > 1 or parallelism.data_parallel_size > 1 else ("all_gather",))
+            for operation in operations:
+                pool.collective_for(operation)
+            continue
+        if (runtime_inputs is not None and runtime_inputs.model_execution_version == "vllm_0_30_0"
+                and runtime_inputs.symbolic_forward_source == "cuda_eager_inplace"
+                and not runtime_inputs.graph_execution.enabled and is_qwen3_moe_dp_sp_source_scope(pool, model)
+                and deployment.mode == "colocated" and len(deployment.worker_pools) == 1):
+            operations = (("all_reduce", "all_gather") if parallelism.tensor_parallel_size > 1 else ())
+            for operation in (*operations, "all_gatherv", "reduce_scatterv"):
+                pool.collective_for(operation)
+            continue
+        from src.serving.deployment.validated_scope import is_kimi_k2_rank_local_source_scope
+        from src.serving.deployment.validated_scope import is_deepseek_parallel_source_scope
+        from src.serving.deployment.validated_scope import is_kimi_k2_data_parallel_source_scope
+        if (runtime_inputs is not None and deployment.mode == "colocated" and len(deployment.worker_pools) == 1
+                and runtime_inputs.mtp_draft_sampling_source is None and runtime_inputs.mtp_proposer_execution_source is None
+                and runtime_inputs.model_source_inputs is None
+                and (is_deepseek_parallel_source_scope if model.model_type != "kimi_k2" else is_kimi_k2_data_parallel_source_scope)(pool, model,
+                    model_execution_version=runtime_inputs.model_execution_version,
+                    symbolic_forward_source=runtime_inputs.symbolic_forward_source,
+                    graph_enabled=runtime_inputs.graph_execution.enabled)
+                and (model.model_type != "deepseek_v4" or parallelism.pipeline_parallel_size == 1
+                    or runtime_inputs.v4_source_use_deep_gemm is False)):
+            operations = (("all_reduce", "all_gather") if parallelism.tensor_parallel_size > 1 else ())
+            if parallelism.data_parallel_size > 1:
+                operations += ("all_gatherv", "reduce_scatterv")
+            for operation in operations:
+                pool.collective_for(operation)
+            for stage in range(parallelism.pipeline_parallel_size - 1):
+                pool.pipeline_p2p_for(stage, stage + 1)
+            continue
+        from src.serving.workload.model_config import is_deepseek_v3_parallel_model_scope
+        if (runtime_inputs is not None and runtime_inputs.model_execution_version == "vllm_0_27_1"
+                and runtime_inputs.symbolic_forward_source == "vllm_0_27_1_deepseek_v3_sync_fp8"
+                and not runtime_inputs.graph_execution.enabled and deployment.mode == "colocated"
+                and len(deployment.worker_pools) == 1 and pool.hardware_id == "nvidia_h200"
+                and parallelism.is_rank_local and not parallelism.enable_expert_parallel
+                and len(pool.ranks) == parallelism.worker_count
+                and is_deepseek_v3_parallel_model_scope(model, parallelism.tensor_parallel_size, parallelism.pipeline_parallel_size)):
+            if parallelism.tensor_parallel_size > 1:
+                for operation in ("all_reduce", "all_gather"):
+                    pool.collective_for(operation)
+            for stage in range(parallelism.pipeline_parallel_size - 1):
+                pool.pipeline_p2p_for(stage, stage + 1)
+            continue
+        if (runtime_inputs is not None and runtime_inputs.model_execution_version == "vllm_0_30_0"
+                and runtime_inputs.symbolic_forward_source == "vllm_0_30_v4_sync_fp8_ds_mla"
+                and runtime_inputs.v4_source_use_deep_gemm is False and not runtime_inputs.graph_execution.enabled
+                and deployment.mode == "colocated" and len(deployment.worker_pools) == 1
+                and pool.hardware_id == "nvidia_h200" and model.model_type == "deepseek_v4"
+                and model.compute_dtype == "bf16" and model.weight_dtype == "fp8"
+                and is_deepseek_v4_parallel_model_scope(model, parallelism.tensor_parallel_size, parallelism.pipeline_parallel_size)
+                and len(pool.ranks) == parallelism.worker_count
+                and parallelism.is_rank_local and not parallelism.enable_expert_parallel):
+            if parallelism.tensor_parallel_size > 1:
+                for operation in ("all_reduce", "all_gather"):
+                    pool.collective_for(operation)
+            for stage in range(parallelism.pipeline_parallel_size - 1):
+                pool.pipeline_p2p_for(stage, stage + 1)
+            continue
+        if (runtime_inputs is not None and runtime_inputs.model_execution_version == "vllm_0_30_0"
+                and runtime_inputs.symbolic_forward_source == "vllm_0_30_k2_6_int4_sync_explicit_allreduce"
+                and not runtime_inputs.graph_execution.enabled
+                and deployment.mode == "colocated" and len(deployment.worker_pools) == 1
+                and is_kimi_k2_rank_local_source_scope(pool, model)):
+            if parallelism.tensor_parallel_size > 1:
+                for operation in ("all_reduce", "all_gather"):
+                    pool.collective_for(operation)
+            for stage in range(parallelism.pipeline_parallel_size - 1):
+                pool.pipeline_p2p_for(stage, stage + 1)
             continue
         if (runtime_inputs is not None
                 and runtime_inputs.symbolic_forward_source == "vllm_0_30_k2_6_int4_sync_explicit_allreduce"
                 and deployment.mode == "colocated" and len(deployment.worker_pools) == 1
-                and pool.hardware_id == "nvidia_h200" and model.model_id == "moonshotai/Kimi-K2.6"
+                and pool.hardware_id == "nvidia_h200"
+                and (model.model_id == "moonshotai/Kimi-K2.6" or (
+                    model.model_id == "moonshotai/Kimi-K2.7-Code"
+                    and runtime_inputs.model_execution_version == "vllm_0_30_0"
+                    and not runtime_inputs.graph_execution.enabled))
                 and model.model_type == "kimi_k2" and model.attention_layout == "mla"
                 and model.compute_dtype == "bf16" and model.weight_dtype == "mixed_int4_bf16"
                 and len(pool.ranks) == parallelism.worker_count == parallelism.tensor_parallel_size == 8
@@ -1744,6 +2295,9 @@ def validate_workload_emission_parallelism(
             # The shared virtual Runner emits TP-sharded experts and both
             # vocabulary/hidden collectives. The legacy EP8 exception is
             # unchanged; this admits only the explicit EP-off source body.
+            if model.model_id == "moonshotai/Kimi-K2.7-Code":
+                from src.serving.workload.model_config import validate_named_target_identity
+                validate_named_target_identity(model)
             for operation in ("all_reduce", "all_gather"):
                 pool.collective_for(operation)
             continue
@@ -1873,6 +2427,15 @@ def validate_workload_emission_parallelism(
                     pool.hardware_id == "nvidia_a800"
                     and is_validated_llama_tp2_model_scope(model)
                 )
+                or (pool.hardware_id == "nvidia_h200" and runtime_inputs is not None
+                    and runtime_inputs.model_execution_version == "vllm_0_30_0"
+                    and runtime_inputs.symbolic_forward_source == "cuda_eager_inplace"
+                    and runtime_inputs.graph_execution.configured_mode in (
+                        "NONE", "PIECEWISE", "FULL_DECODE_ONLY", "FULL_AND_PIECEWISE")
+                    and model.model_type == "llama" and model.architecture == "LlamaForCausalLM"
+                    and model.compute_dtype == model.weight_dtype == "bf16" and model.head_dim == 128
+                    and model.hidden_act == "silu" and not model.attention_bias
+                    and model.rope_scaling_type in ("default", "llama3") and model.rms_norm_eps is not None)
             )
             and model.attention_layout == "standard_gqa"
             and model.num_experts == 0
@@ -2151,6 +2714,19 @@ def _with_in_step_transfer_trace(
     )
 
 
+def _emit_weight_placements(config, consumer, v4_weight_storage_profile):
+    """Emit the same optional startup inventory for either simulation root."""
+    if v4_weight_storage_profile is not None and consumer is None:
+        raise ValueError("weight storage profile requires a placement consumer")
+    if consumer is not None:
+        if not callable(consumer):
+            raise TypeError("weight placement consumer must be callable")
+        from src.serving.kv_cache.model_residency import deployment_weight_placements
+        consumer(deployment_weight_placements(config.model, config.deployment,
+            v4_weight_storage_profile=v4_weight_storage_profile,
+            model_execution_version=config.runtime_inputs.model_execution_version))
+
+
 class Simulation:
     """Single-use composition root that owns and closes its backend."""
 
@@ -2168,13 +2744,31 @@ class Simulation:
         ] = None,
         streaming_step_projector: Optional[Callable[[SimulationStep], object]] = None,
         streaming_prehashed_step_consumer: Optional[Callable[..., None]] = None,
+        weight_placement_consumer: Optional[Callable[[tuple[dict, ...]], None]] = None,
+        v4_weight_storage_profile: Optional[str] = None,
+        adaptive_tail_workers: Optional[Callable[[], int]] = None,
     ) -> None:
         self.config = config
         self.backend = backend
         self.hardware_by_id = dict(hardware_by_id)
+        self._adaptive_tail_workers = adaptive_tail_workers
+        from src.serving.backend.vllm import VLLMBackend
+        simple_cpu_runtime = None
+        if (isinstance(backend, VLLMBackend)
+                and hasattr(backend._control_plane, "runtime_info")):
+            runtime = backend.runtime_info
+            if (isinstance(runtime, dict)
+                    and "kv_connector" in runtime
+                    and runtime["kv_connector"] == "SimpleCPUOffloadConnector"):
+                simple_cpu_runtime = runtime
+        self._modeled_simple_cpu = simple_cpu_runtime is not None
         if (kv_cache_tier_manager is not None or kv_lifecycle_replay is not None
                 or config.closed_loop_client_count is not None):
-            if any(request.prompt_token_ids is not None for request in config.requests):
+            if (any(request.prompt_token_ids is not None for request in config.requests)
+                    and not (simple_cpu_runtime is not None
+                             and kv_cache_tier_manager is not None
+                             and kv_lifecycle_replay is None
+                             and config.closed_loop_client_count is None)):
                 raise NotImplementedError("token identity replay does not support external KV tiers/lifecycle or closed-loop clients")
         self.kv_cache_tier_manager = kv_cache_tier_manager
         self.kv_lifecycle_replay = kv_lifecycle_replay
@@ -2210,6 +2804,7 @@ class Simulation:
                 "Simulation requires exactly one colocated scheduler pool; "
                 "use MultiSimulation for routed or multi-pool deployments")
         pool_name = next(iter(config.deployment.worker_pools))
+        _validate_dp_backend_placement(backend, config.deployment.worker_pools[pool_name], config.model)
         if backend.config.pool_name != pool_name:
             raise ValueError(
                 "backend pool does not match the single deployment pool")
@@ -2299,11 +2894,38 @@ class Simulation:
             raise NotImplementedError(
                     "rank-local TP=2/uniform-PP emission does not yet support KV "
                     "offload outside the validated colocated Qwen3 TP=2 scope")
-        if (config.step_retention == "streaming_aggregate"
-                and (kv_cache_tier_manager is not None
-                     or kv_lifecycle_replay is not None)):
-            raise NotImplementedError(
-                "streaming aggregate retention does not support KV offload")
+        if simple_cpu_runtime is not None:
+            if (kv_cache_tier_manager is None
+                    or kv_lifecycle_replay is not None
+                    or kv_cache_tier_manager.fixed_prefix_hbm_percent is not None
+                    or any(request.prompt_token_ids is None
+                           or request.output_token_ids is None
+                           or request.prefix_hit_tokens != 0
+                           for request in config.requests)):
+                raise NotImplementedError(
+                    "native SimpleCPU offload requires a tier manager and "
+                    "explicit token IDs without trace hits or lifecycle replay")
+            block_bytes = kv_cache_tier_manager.block_bytes
+            cpu_bytes = simple_cpu_runtime["simple_cpu_offload_bytes_per_rank"]
+            geometry = simple_cpu_runtime["kv_group_geometry"]
+            tiers = {
+                tier.name: tier for tier in kv_cache_tier_manager.config.tiers
+            }
+            if (len(geometry) != 1
+                    or tuple(geometry[0]) != (
+                        backend.config.kv_block_size_tokens, block_bytes)
+                    or block_bytes != (backend.config.kv_bytes_per_token
+                                       * backend.config.kv_block_size_tokens)
+                    or len(pool.ranks) != simple_cpu_runtime["effective_tensor_parallel_size"]
+                    or tiers["hbm"].capacity_bytes
+                        != backend.config.num_kv_blocks * block_bytes
+                    or tiers["host"].capacity_bytes
+                        != cpu_bytes // block_bytes * block_bytes):
+                raise ValueError(
+                    "native SimpleCPU tier capacity or rank geometry disagrees "
+                    "with the real Scheduler")
+            backend.enable_modeled_simple_cpu_offload()
+        _emit_weight_placements(config, weight_placement_consumer, v4_weight_storage_profile)
 
     def _async_output_release(self) -> str:
         """HWSpec-declared release semantics for this pool's async outputs."""
@@ -2323,6 +2945,7 @@ class Simulation:
                 f"of {hardware_id!r}")
         return release
 
+    @experiment_cache_scope()
     def run(self) -> SimulationResult | StreamingSimulationResult:
         if self._has_run:
             raise RuntimeError("Simulation instances are single-use")
@@ -2338,6 +2961,8 @@ class Simulation:
         (parallel_results_by_step_id, parallel_cache_deltas,
          parallel_phase_wall_time_s) = _new_parallel_accumulators()
         parallel_worker_count = 0
+        self._adaptive_tail_grants = []
+        self._adaptive_tail_pool = None
         parallel_step_count = 0
         parallel_execution_wall_time_s = 0.0
         execution = ServingExecutionContext(
@@ -2351,19 +2976,22 @@ class Simulation:
             host_launch_profiles=self.config.host_launch_profiles,
             host_runtime_prepare_profiles=self.config.host_runtime_prepare_profiles,
             runtime_prepare_event_builder=self.config.runtime_prepare_event_builder,
-            materialize_timeline_details=retain_full_steps,
+            materialize_timeline_details=(retain_full_steps or self.config.record_execution_timeline),
             model_source_inputs_by_step=self.config.model_source_inputs_by_step,
+            collect_source_state=self.config.collect_source_state,
         )
         collection_window = ExitStack()
         collection_window_steps = 0
 
         @_metadata_collection_scope()
-        def step_duration(backend_step):
+        def step_duration(backend_step, *, origin_time_s=0.0,
+                          device_floor_s=0.0, return_worker_service=False):
             nonlocal collection_window_steps
             if self._kv_lifecycle is None:
                 if any(
                         event.action in (
-                            KVCacheAction.LOAD, KVCacheAction.EVICT)
+                            KVCacheAction.LOAD, KVCacheAction.EVICT,
+                            KVCacheAction.STORE)
                         for event in backend_step.kv_cache_events):
                     raise ValueError(
                         "KV load/evict events require a tier lifecycle manager")
@@ -2373,9 +3001,12 @@ class Simulation:
                     self._kv_lifecycle.prepare_step(backend_step))
             components = execution.execute_step(
                 backend_step.schedule,
+                origin_time_s=origin_time_s,
+                device_floor_s=device_floor_s,
                 kv_cache_events=backend_step.kv_cache_events,
                 embedding_token_ids=backend_step.embedding_token_ids,
                 model_source_inputs=backend_step.model_source_inputs,
+                require_timeline_details=bool(transfer_events),
             )
             # The step already defers cyclic scans while constructing metadata.
             # Keep that scope over a bounded run of bound recorded sources,
@@ -2383,8 +3014,10 @@ class Simulation:
             # decode. This is a Python-object budget, not a hardware parameter.
             # Unbound sources, other phases and the finite boundary resume the
             # caller's collection policy; reference counting never changes.
-            cached_decode = (not retain_full_steps and self.config.execution_mode == "accelerated"
-                and self.config.timing_mode == "device_only" and self._kv_lifecycle is None
+            # Host-inclusive scheduling consumes the same bounded metadata;
+            # timing profiles do not change Python object ownership.
+            cached_decode = (not retain_full_steps and self.config.execution_mode in ("accelerated", "fast")
+                and self._kv_lifecycle is None
                 and execution._recorded_source_program_bound
                 and backend_step.schedule.token_count > 0
                 and all(request.phase == "decode" and request.scheduled_tokens == 1
@@ -2409,11 +3042,14 @@ class Simulation:
                 predictions=predictions,
                 execution_timeline=execution_timeline,
                 source_activation_memory=components.source_activation_memory,
+                source_state_summary=components.source_state_summary,
             )
             if components.source_activation_memory is not None:
                 source_memory.consume(backend_step.schedule.pool_name, backend_step.schedule.step_id,
                     components.source_activation_memory)
-            project_immediately = (not retain_full_steps and self.config.timing_mode == "device_only"
+            project_immediately = (not retain_full_steps and self._kv_lifecycle is None
+                and not self.config.collect_source_state
+                and self.config.timing_mode == "device_only"
                 and self.streaming_step_projector is not None)
             if retain_full_steps:
                 simulation_steps.append(simulation_step)
@@ -2445,10 +3081,18 @@ class Simulation:
                     self.streaming_step_projector(simulation_step),
                     kernel_plan.logical_call_count, bool(kernel_plan.block_repeats),
                     {}, {}, None)  # Source memory was consumed above, once.
+            if return_worker_service:
+                return (execution_timeline.duration_s,
+                        execution_timeline.worker_host_wall_s)
             return execution_timeline.duration_s
 
         def on_step_complete(backend_step, virtual_time_s):
             nonlocal streamed_step_count, streamed_kernel_call_count
+            if self._modeled_simple_cpu:
+                if self._kv_lifecycle is None:
+                    raise RuntimeError("modeled SimpleCPU lost its tier lifecycle")
+                self._kv_lifecycle.apply_completed_simple_cpu_releases(
+                    self.backend.take_modeled_simple_cpu_releases())
             step_id = backend_step.schedule.step_id
             if step_id in parallel_results_by_step_id:
                 parallel_result = parallel_results_by_step_id.pop(step_id)
@@ -2459,34 +3103,43 @@ class Simulation:
                     virtual_time_s - parallel_result.duration_s,
                     virtual_time_s,
                 )
-                self.streaming_prehashed_step_consumer(
+                completion_time_s = virtual_time_s
+                arguments = (
                     backend_step,
                     entry,
                     parallel_result.execution_contract_digest,
                     parallel_result.logical_kernel_call_count,
                     parallel_result.compact,
                 )
+                if parallel_result.state_audit_snapshot is None:
+                    self.streaming_prehashed_step_consumer(*arguments)
+                else:
+                    self.streaming_prehashed_step_consumer(
+                        *arguments, parallel_result.state_audit_snapshot)
+                if parallel_result.step_timing is not None:
+                    streamed_step_timings.append(parallel_result.step_timing)
                 streamed_step_count += 1
                 streamed_kernel_call_count += (
                     parallel_result.logical_kernel_call_count)
                 if self.progress_callback is not None:
-                    self.progress_callback(backend_step, virtual_time_s)
+                    self.progress_callback(backend_step, completion_time_s)
                 return
             if not retain_full_steps:
                 if step_id not in pending_streaming_steps:
                     raise RuntimeError(
                         "streaming simulation completed without a pending step")
                 pending_streaming_step = pending_streaming_steps.pop(step_id)
-                if pending_streaming_step.backend_step is not backend_step:
+                if pending_streaming_step.backend_step.schedule is not backend_step.schedule:
                     raise RuntimeError(
                         "streaming simulation completed a different step")
                 duration_s = (
                     pending_streaming_step.execution_timeline.duration_s)
                 entry = ScheduleTraceEntry(
-                    backend_step,
+                    pending_streaming_step.backend_step,
                     virtual_time_s - duration_s,
                     virtual_time_s,
                 )
+                completion_time_s = virtual_time_s
                 self.streaming_step_consumer(
                     pending_streaming_step, entry)
                 if self.config.timing_mode != "device_only":
@@ -2504,8 +3157,142 @@ class Simulation:
                 streamed_step_count += 1
                 streamed_kernel_call_count += (
                     pending_streaming_step.kernel_plan.logical_call_count)
+            completion_time_s = virtual_time_s
             if self.progress_callback is not None:
-                self.progress_callback(backend_step, virtual_time_s)
+                self.progress_callback(backend_step, completion_time_s)
+
+        def normalize_capture_history(backend_step, result):
+            if not self.config.runtime_inputs.graph_execution.enabled:
+                return result
+            report = result.source_activation_memory
+            if not isinstance(report, Mapping) or not isinstance(report["ranks"], Mapping):
+                raise TypeError("parallel capture history requires per-rank source memory")
+            ranks = {}
+            changed = False
+            for rank, facts in report["ranks"].items():
+                if "source_captures" in facts:
+                    raise NotImplementedError("parallel capture history requires one capture per rank")
+                if "source_capture" not in facts:
+                    ranks[rank] = facts
+                    continue
+                capture = facts["source_capture"]
+                key = (backend_step.schedule.pool_name, int(rank), capture["key"])
+                static_ports = capture["static_ports"]
+                replay = key in execution._source_capture_ports
+                if replay and execution._source_capture_ports[key] != static_ports:
+                    raise RuntimeError("parallel source capture changed static input/output identity or typed extent")
+                if not replay:
+                    execution._source_capture_ports[key] = static_ports
+                updated = {**capture, "logical_replay": replay}
+                changed = changed or updated != capture
+                ranks[rank] = {**facts, "source_capture": updated}
+            if not changed:
+                return result
+            return replace(result, source_activation_memory={**report, "ranks": ranks})
+
+        def execute_fixed_source_segment(remaining):
+            """Execute one actual transfer-free decode segment completely."""
+            nonlocal parallel_worker_count, parallel_step_count, parallel_execution_wall_time_s
+            if not remaining:
+                return
+            independent = all(_transfer_free_decode_step(step) for step in remaining)
+            available_bytes = os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+            memory_worker_limit = max(
+                1, (available_bytes - 64 * 1024 ** 3) // (2 * 1024 ** 3))
+            workers = min(
+                _apply_tail_worker_limit(
+                    self.config.execution_workers,
+                    len(os.sched_getaffinity(0)),
+                    memory_worker_limit,
+                ),
+                len(remaining),
+            )
+            if (not independent or workers < 2
+                    or not _fixed_source_segment_fits(execution._source_program_cache, remaining)
+                    or (self.config.runtime_inputs.symbolic_workspace_initial_capacity_bytes is not None
+                        and execution._independent_decode_workspace_capacities(remaining[0].schedule) is None)):
+                for step in remaining:
+                    yield step, step_duration(step)
+                return
+            if self._kv_lifecycle is None:
+                raise RuntimeError("fixed-source tail lost its actual KV lifecycle")
+            self._kv_lifecycle._manager.assert_quiescent()
+            # Actual ALLOCATE/RELEASE events retain native order and capacity
+            # validation. There are no outstanding transfers at this boundary.
+            remaining = tuple(self._kv_lifecycle.prepare_independent_decode_step(step) for step in remaining)
+            # Source-program IDs name the first actual occurrence of a shape.
+            # Warm precisely those real occurrences before forking so every
+            # worker inherits the same complete program and source namespace
+            # that sequential execution would have used. No price files or
+            # summaries are read, and all this preparation remains timed.
+            programs_by_shape = {}
+            for step in remaining:
+                shape = tuple(request.scheduled_tokens for request in step.schedule.requests)
+                if shape in programs_by_shape:
+                    continue
+                capacities = (execution._independent_decode_workspace_capacities(step.schedule)
+                    if execution.runtime_inputs.symbolic_workspace_initial_capacity_bytes is not None else None)
+                components = execution.execute_step(step.schedule, kv_cache_events=step.kv_cache_events,
+                    embedding_token_ids=step.embedding_token_ids, model_source_inputs=step.model_source_inputs)
+                programs_by_shape[shape] = _fixed_source_program_key(
+                    execution._source_program_cache, components.workload)
+                if (capacities is not None
+                        and execution._independent_decode_workspace_capacities(step.schedule) != capacities):
+                    raise RuntimeError("source preparation changed certified decode workspace")
+            # First-occurrence warming establishes the real namespace. Every
+            # actual lookup must also reach the parent cache in step order:
+            # otherwise a later segment can evict a different namespace.
+            _restore_fixed_source_program_order(execution._source_program_cache, remaining, programs_by_shape)
+            parallel_worker_count = workers
+            with multiprocessing.get_context("fork").Pool(workers,
+                    initializer=_initialize_causal_execution_worker,
+                    initargs=(execution, self.streaming_step_projector)) as cpu_workers:
+                original_workers = tuple(cpu_workers._pool)
+                batch_size = (min(_PARALLEL_TAIL_BATCH_SIZE, 2 * workers)
+                    if self.config.collect_source_state else _PARALLEL_TAIL_BATCH_SIZE)
+                for offset in range(0, len(remaining), batch_size):
+                    batch = remaining[offset:offset + batch_size]
+                    started = time.perf_counter()
+                    pending = cpu_workers.map_async(_parallel_execute_fixed_decode_step, batch,
+                        chunksize=max(1, len(batch) // (workers * 4)))
+                    results = _resolve_causal_cpu_result(pending, original_workers)
+                    parallel_execution_wall_time_s += time.perf_counter() - started
+                    for step, result in zip(batch, results, strict=True):
+                        step_id = step.schedule.step_id
+                        if step_id in parallel_results_by_step_id:
+                            raise RuntimeError("fixed-source tail produced a duplicate step")
+                        parallel_results_by_step_id[step_id] = result
+                        parallel_step_count += 1
+                        for name, delta in result.cache_deltas.items():
+                            totals = parallel_cache_deltas[name]
+                            for index, value in enumerate(delta):
+                                totals[index] += value
+                        for name, value in result.phase_wall_time_s.items():
+                            parallel_phase_wall_time_s[name] += value
+                        yield step, result.duration_s
+
+        def drain_fixed_source_tail(backend):
+            """Replay native steps in order, retaining real prefix/transfer barriers.
+
+            Once all arrivals are injected, device-only native decisions do
+            not consume predicted durations. Transfers and prefills still run
+            in the parent; independent decode on either side uses its own
+            actually established KV state and source workspace capacity.
+            """
+            segment = []
+            has_more = backend.has_work()
+            while has_more:
+                steps, has_more = backend.drain_steps(_PARALLEL_TAIL_BATCH_SIZE)
+                if not steps and has_more:
+                    raise RuntimeError("fixed-source tail control plane made no progress")
+                for step in steps:
+                    if _transfer_free_decode_step(step):
+                        segment.append(step)
+                    else:
+                        yield from execute_fixed_source_segment(segment)
+                        segment = []
+                        yield step, step_duration(step)
+            yield from execute_fixed_source_segment(segment)
 
         def drain_tail(backend):
             nonlocal parallel_worker_count, parallel_step_count
@@ -2530,6 +3317,8 @@ class Simulation:
                         "backend tail batch made no progress while work "
                         "remains")
                 return
+            if self.config.timing_mode != "device_only" and not hasattr(backend, "scheduler_update_cpu_s"):
+                raise NotImplementedError("Host parallel tail requires profiled update CPU")
             available_bytes = (
                 os.sysconf("SC_AVPHYS_PAGES")
                 * os.sysconf("SC_PAGE_SIZE"))
@@ -2538,10 +3327,30 @@ class Simulation:
                 (available_bytes - 64 * 1024 ** 3) // (2 * 1024 ** 3),
             )
             requested_workers = self.config.execution_workers
+            parallel_worker_limit = _apply_tail_worker_limit(
+                requested_workers, os.cpu_count() or 1, memory_worker_limit)
+            self._adaptive_tail_pool = None
+
+            def apply_adaptive_tail_grant():
+                """Consume one grant per batch boundary, preserving all caps.
+
+                A malformed grant fails closed instead of being silently
+                ignored; the step count bound is applied by each caller on
+                the returned value.
+                """
+                nonlocal parallel_worker_limit
+                if self._adaptive_tail_workers is None:
+                    return parallel_worker_limit
+                grant = self._adaptive_tail_workers()
+                if grant is None:
+                    return parallel_worker_limit
+                parallel_worker_limit = _apply_tail_worker_limit(
+                    _validate_tail_worker_grant(grant),
+                    os.cpu_count() or 1, memory_worker_limit)
+                return parallel_worker_limit
+
             parallel_worker_count = min(
-                64 if requested_workers == 0 else requested_workers,
-                os.cpu_count() or 1,
-                memory_worker_limit,
+                apply_adaptive_tail_grant(),
                 len(backend_steps),
             )
             parallel_execution = ServingExecutionContext(
@@ -2555,49 +3364,91 @@ class Simulation:
                 host_launch_profiles=self.config.host_launch_profiles,
                 host_runtime_prepare_profiles=self.config.host_runtime_prepare_profiles,
                 runtime_prepare_event_builder=self.config.runtime_prepare_event_builder,
-                materialize_timeline_details=False,
+                collect_source_state=self.config.collect_source_state,
+                materialize_timeline_details=self.config.record_execution_timeline,
                 model_source_inputs_by_step=self.config.model_source_inputs_by_step,
             )
             global _PARALLEL_EXECUTION_CONTEXT, _PARALLEL_STEP_PROJECTOR
             _PARALLEL_EXECUTION_CONTEXT = parallel_execution
             _PARALLEL_STEP_PROJECTOR = self.streaming_step_projector
-            execute_tail_step = (_single_worker_tail_executor(parallel_execution, self.streaming_step_projector)
-                if parallel_worker_count == 1 else _parallel_execute_step)
+            allow_capture_history = (
+                self.config.execution_mode == "fast"
+                and self.config.runtime_inputs.graph_execution.enabled)
+            adaptive_grants = []
+
+            def make_execute_tail_step(worker_count):
+                if worker_count == 1:
+                    return _single_worker_tail_executor(
+                        parallel_execution, self.streaming_step_projector,
+                        allow_capture_history=allow_capture_history)
+                from functools import partial
+                return partial(
+                    _parallel_execute_step,
+                    allow_capture_history=allow_capture_history,
+                )
+
             try:
-                with _tail_execution_pool(parallel_worker_count) as pool:
-                    def submit_batch(steps):
-                        chunk_size = max(
-                            1,
-                            len(steps)
-                            // (parallel_worker_count * 4),
-                        )
-                        completed_at = []
-                        completed_results = []
-                        failed_with = []
-                        started_at = time.perf_counter()
+                pool = None
+                pool_workers = 0
+                current_execute_tail_step = None
 
-                        def record_completion(results):
-                            completed_at.append(time.perf_counter())
-                            completed_results.append(results)
+                def ensure_pool(worker_count):
+                    nonlocal pool, pool_workers, current_execute_tail_step
+                    if pool is not None and pool_workers == worker_count:
+                        return pool
+                    if pool is not None:
+                        pool.close()
+                        pool.join()
+                        pool = None
+                        self._adaptive_tail_pool = None
+                    pool_workers = worker_count
+                    current_execute_tail_step = make_execute_tail_step(worker_count)
+                    pool = _tail_execution_pool(worker_count)
+                    self._adaptive_tail_pool = pool
+                    return pool
 
-                        def record_failure(error):
-                            failed_with.append(error)
+                def submit_batch(steps):
+                    applied_worker_count = min(
+                        apply_adaptive_tail_grant(), len(steps))
+                    if applied_worker_count not in adaptive_grants:
+                        adaptive_grants.append(applied_worker_count)
+                    if applied_worker_count not in self._adaptive_tail_grants:
+                        self._adaptive_tail_grants.append(applied_worker_count)
+                    pool = ensure_pool(applied_worker_count)
+                    chunk_size = max(
+                        1,
+                        len(steps)
+                        // (applied_worker_count * 4),
+                    )
+                    completed_at = []
+                    completed_results = []
+                    failed_with = []
+                    started_at = time.perf_counter()
 
-                        pending = pool.map_async(
-                            execute_tail_step,
-                            steps,
-                            chunksize=chunk_size,
-                            callback=record_completion,
-                            error_callback=record_failure,
-                        )
-                        return (
-                            pending,
-                            started_at,
-                            completed_at,
-                            completed_results,
-                            failed_with,
-                        )
+                    def record_completion(results):
+                        completed_at.append(time.perf_counter())
+                        completed_results.append(results)
 
+                    def record_failure(error):
+                        failed_with.append(error)
+
+                    pending = pool.map_async(
+                        current_execute_tail_step,
+                        steps,
+                        chunksize=chunk_size,
+                        callback=record_completion,
+                        error_callback=record_failure,
+                    )
+                    return (
+                        applied_worker_count,
+                        pending,
+                        started_at,
+                        completed_at,
+                        completed_results,
+                        failed_with,
+                    )
+
+                try:
                     pending_batch = submit_batch(backend_steps)
                     while backend_steps:
                         next_backend_steps = ()
@@ -2611,12 +3462,17 @@ class Simulation:
                                     "backend tail batch made no progress "
                                     "while work remains")
                         (
+                            batch_worker_count,
                             pending,
                             batch_started,
                             completed_at,
                             completed_results,
                             failed_with,
                         ) = pending_batch
+                        if batch_worker_count != pool_workers:
+                            raise RuntimeError(
+                                "tail batch applied worker count disagrees "
+                                "with the live pool size")
                         pending.wait()
                         if failed_with:
                             if len(failed_with) != 1:
@@ -2636,14 +3492,15 @@ class Simulation:
                         parallel_execution_wall_time_s += (
                             completed_at[0] - batch_started)
                         parallel_step_count += len(backend_steps)
-                        next_pending_batch = (
-                            submit_batch(next_backend_steps)
-                            if next_backend_steps else None
-                        )
+                        if next_backend_steps:
+                            next_pending_batch = submit_batch(next_backend_steps)
+                        else:
+                            next_pending_batch = None
                         for backend_step, result in zip(
                                 backend_steps,
                                 parallel_results,
                                 strict=True):
+                            result = normalize_capture_history(backend_step, result)
                             step_id = backend_step.schedule.step_id
                             if step_id in parallel_results_by_step_id:
                                 raise RuntimeError(
@@ -2656,39 +3513,160 @@ class Simulation:
                                     totals[index] += value
                             for name, value in result.phase_wall_time_s.items():
                                 parallel_phase_wall_time_s[name] += value
-                            yield backend_step, result.duration_s
+                            if self.config.timing_mode == "device_plus_launch_plus_scheduler":
+                                yield (backend_step, result.duration_s,
+                                    backend.scheduler_update_cpu_s(backend_step, self.config.timing_mode))
+                            else:
+                                yield backend_step, result.duration_s
                         if next_pending_batch is None:
                             break
                         backend_steps = next_backend_steps
                         has_more = next_has_more
                         pending_batch = next_pending_batch
+                finally:
+                    # Exception cleanup cancels the speculative in-flight
+                    # batch; the normal path drains it with close/join.
+                    if pool is not None:
+                        if sys.exc_info()[0] is None:
+                            pool.close()
+                            pool.join()
+                        else:
+                            pool.terminate()
+                            pool.join()
+                        pool = None
+                        self._adaptive_tail_pool = None
             finally:
-                _PARALLEL_EXECUTION_CONTEXT = None
-                _PARALLEL_STEP_PROJECTOR = None
+                if self._adaptive_tail_pool is None:
+                    _PARALLEL_EXECUTION_CONTEXT = None
+                    _PARALLEL_STEP_PROJECTOR = None
 
-        use_parallel_tail = (
+        legacy_parallel_tail = (
             not retain_full_steps
+            and not self.config.collect_source_state
             and self._kv_lifecycle is None
             and self.config.execution_mode == "accelerated"
-            # Manager growth is a causal cross-step source dependency.
-            # Independent fork workers cannot each restart from its entry
-            # history; retain the cached but sequential execution path.
             and self.config.runtime_inputs.symbolic_workspace_initial_capacity_bytes is None
             and not (self.config.runtime_inputs.symbolic_forward_source is not None
                 and self.config.runtime_inputs.graph_execution.enabled)
             and self.config.timing_mode == "device_only"
             and self.backend.config.scheduler_pipeline_depth == 1
-            # A closed-loop successor must be admitted at its client's
-            # completion instant; the tail drain runs the current queue to
-            # empty before the engine can admit injected successors, which
-            # would convoy the chains, so closed-loop runs take the causal
-            # step-by-step path.
             and self.config.closed_loop_client_count is None
             and self.streaming_step_projector is not None
             and sum(
                 request.output_tokens for request in self.config.requests)
             >= 512
         )
+        pool = next(iter(self.config.deployment.worker_pools.values()))
+        fast_parallel_tail = (
+            not retain_full_steps
+            and self._kv_lifecycle is None
+            and self.config.execution_mode == "fast"
+            and self.config.deployment.mode == "colocated"
+            and len(self.config.deployment.worker_pools) == 1
+            and pool.parallel_plan.config.pipeline_parallel_size == 1
+            and ((self.config.model.model_type == "qwen3_moe"
+                and self.config.model.num_experts > 0
+                and len(pool.ranks) == 2
+                and pool.parallel_plan.config.tensor_parallel_size == 2
+                and pool.parallel_plan.config.enable_expert_parallel)
+                or (self.config.model.model_type in ("qwen3", "llama")
+                and len(pool.ranks) == pool.parallel_plan.config.tensor_parallel_size
+                and len(pool.ranks) in (1, 2)
+                and not pool.parallel_plan.config.enable_expert_parallel))
+            and self.config.runtime_inputs.symbolic_forward_source in (
+                "cuda_eager_inplace", "vllm_ascend_eager")
+            and self.config.runtime_inputs.model_execution_version in (
+                "vllm_0_11_0", "vllm_0_18_0", "vllm_0_24_0")
+            and self.config.runtime_inputs.graph_execution.enabled
+            and self.config.runtime_inputs.symbolic_workspace_initial_capacity_bytes is None
+            and self.config.closed_loop_client_count is None
+            and self.config.execution_workers != 1
+            and self.backend.config.scheduler_pipeline_depth == 2
+            and self.config.timing_mode == "device_plus_launch_plus_scheduler"
+            and self.streaming_step_projector is not None
+            and sum(
+                request.output_tokens for request in self.config.requests)
+            >= 512
+        )
+        use_parallel_tail = legacy_parallel_tail or fast_parallel_tail
+        from src.serving.backend.vllm import VLLMBackend, _NativeVLLMControlPlane
+        from src.serving.backend.vllm_scheduler_process import VLLMSchedulerProcess, VLLM030SchedulerProcess
+        fixed_source_parallel_tail = (
+            not retain_full_steps and self.config.execution_mode == "fast"
+            and self.config.deployment.mode == "colocated"
+            and len(self.config.deployment.worker_pools) == 1
+            and pool.hardware_id == "nvidia_h200" and len(pool.ranks) == 8
+            and pool.parallel_plan.config.tensor_parallel_size == 8
+            and pool.parallel_plan.config.expert_parallel_size == 1
+            and all(value == 1 for value in (pool.parallel_plan.config.pipeline_parallel_size,
+                pool.parallel_plan.config.context_parallel_size, pool.parallel_plan.config.sequence_parallel_size,
+                pool.parallel_plan.config.data_parallel_size))
+            and self.config.model.model_type in ("glm_moe_dsa", "kimi_k2")
+            and self.config.runtime_inputs.model_execution_version == "vllm_0_30_0"
+            and self.config.runtime_inputs.symbolic_forward_source in (
+                "vllm_0_30_v32_bf16_sync_explicit_allreduce",
+                "vllm_0_30_v32_fp8_sync_explicit_allreduce", "vllm_0_30_k2_6_int4_sync_explicit_allreduce")
+            and not self.config.runtime_inputs.graph_execution.enabled
+            and self.config.runtime_inputs.model_source_inputs is None
+            and self.config.runtime_inputs.mtp_draft_sampling_source is None
+            and self.config.runtime_inputs.mtp_proposer_execution_source is None
+            and self.config.runtime_inputs.target_sampling_source == "vllm_0_30_plain_greedy_bf16"
+            and self.config.model_source_inputs_by_step is None
+            and self.config.closed_loop_client_count is None
+            and self.config.timing_mode == "device_only"
+            and self.config.execution_workers != 1
+            and self.backend.config.scheduler_pipeline_depth == 1
+            and type(self.backend) is VLLMBackend
+            and type(self.backend._control_plane) is VLLM030SchedulerProcess
+            and self._kv_lifecycle is not None
+            and self._kv_lifecycle._cursor is None
+            and self._kv_lifecycle._manager.fixed_prefix_hbm_percent is not None
+            and self.streaming_step_projector is not None
+            and self.streaming_prehashed_step_consumer is not None
+            and len(os.sched_getaffinity(0)) >= 2)
+        causal_execution = (fast_parallel_tail
+            and self._async_output_release() == "self"
+            and _independent_runtime_prepare_builder(self.config.runtime_prepare_event_builder)
+            and self.config.model_source_inputs_by_step is None
+            and self.streaming_prehashed_step_consumer is not None
+            and type(self.backend) is VLLMBackend
+            and (type(self.backend._control_plane) is VLLMSchedulerProcess
+                or (type(self.backend._control_plane) is _NativeVLLMControlPlane
+                    and self.backend._in_process_baseline_libraries is not None))
+            and self.backend._control_plane.scheduler_config.scheduler_host_profile is not None
+            and len(os.sched_getaffinity(0)) >= 2
+            and os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") >= 72 * 1024 ** 3)
+        cpu_pending = {}
+        cpu_execution_intervals = []
+        cpu_pool = None
+        cpu_workers = ()
+
+        def submit_cpu_step(backend_step):
+            step_id = backend_step.schedule.step_id
+            if cpu_pool is None or step_id in cpu_pending or step_id in parallel_results_by_step_id:
+                raise RuntimeError("causal CPU submission has no pool or duplicates a step")
+            if len(cpu_pending) >= 2:
+                raise RuntimeError("causal CPU execution exceeded its Scheduler slots")
+            cpu_pending[step_id] = cpu_pool.apply_async(_causal_execute_step, (backend_step,))
+
+        def resolve_cpu_step(backend_step):
+            nonlocal parallel_step_count
+            step_id = backend_step.schedule.step_id
+            if step_id not in cpu_pending:
+                raise RuntimeError("causal CPU resolution has no submitted step")
+            started, finished, result = _resolve_causal_cpu_result(
+                cpu_pending.pop(step_id), cpu_workers)
+            cpu_execution_intervals.append((started, finished))
+            result = normalize_capture_history(backend_step, result)
+            parallel_results_by_step_id[step_id] = result
+            parallel_step_count += 1
+            for name, delta in result.cache_deltas.items():
+                totals = parallel_cache_deltas[name]
+                for index, value in enumerate(delta):
+                    totals[index] += value
+            for name, value in result.phase_wall_time_s.items():
+                parallel_phase_wall_time_s[name] += value
+            return result.duration_s
 
         closed_loop_clients = _closed_loop_clients(self.config)
         if closed_loop_clients is None:
@@ -2698,21 +3676,96 @@ class Simulation:
         else:
             engine_requests = RequestStream(
                 closed_loop_clients.initial_requests())
+        async_output_release = self._async_output_release()
+        # Installed vLLM-Ascend 0.18 inherits WorkerProc.worker_busy_loop:
+        # one Host execute_model call at a time, with a separate async output
+        # thread waiting on each step's own Device event. Retiming the actual
+        # per-call DAG keeps that worker boundary distinct from Device work.
+        source_async_worker = (
+            self.backend.config.scheduler_pipeline_depth > 1
+            and self.config.timing_mode != "device_only"
+            and async_output_release == "self"
+            and {pool.hardware_id for pool in
+                 self.config.deployment.worker_pools.values()}
+            == {"ascend_910b"})
+
+        if source_async_worker:
+            if self.config.vllm_executor_backend is None:
+                raise ValueError("910B async Host timing requires explicit vLLM executor backend")
+            # This path requires the current absolute Host/Device origins.
+            # Independent duration workers cannot determine those origins.
+            causal_execution = False
+            use_parallel_tail = False
+
+        from src.serving.workload.runtime_inputs import DSparkFirstProposalInputs
+        source_request_progress = isinstance(
+            self.config.runtime_inputs.model_source_inputs, DSparkFirstProposalInputs)
+        if source_request_progress:
+            if (self.backend.config.scheduler_pipeline_depth != 1
+                    or self.config.timing_mode != "device_only"
+                    or self.config.execution_workers not in (0, 1)):
+                raise NotImplementedError(
+                    "DSpark sequential source requires synchronous device-only execution and one state owner")
+            # A predecessor ledger uses absolute completion times. The engine
+            # already owns the actual start/floor; pass them through its
+            # existing callback so a step returns elapsed time only once.
+            causal_execution = False
+            use_parallel_tail = False
+            fixed_source_parallel_tail = False
+
+        def execute_async_worker_step(backend_step, origin_time_s,
+                                      device_floor_s):
+            return step_duration(
+                backend_step, origin_time_s=origin_time_s,
+                device_floor_s=device_floor_s,
+                return_worker_service=True)
+
         with ExitStack() as backend_lifecycle:
             backend_lifecycle.enter_context(
                 _managed_backend(self.backend))
             backend_lifecycle.enter_context(collection_window)
+            # The Kernel source recipe is immutable for this synchronous run.
+            # Check it at entry and exit instead of rescanning it per step;
+            # nested plan scopes still validate every operand boundary.
+            from src.kernel.memory_access_builder import memory_prediction_source_scope
+            backend_lifecycle.enter_context(memory_prediction_source_scope())
+            if causal_execution:
+                # The native Scheduler exposes at most two legal pending
+                # plans. Keep these bounded run-owned caches warm; per-task
+                # tail-worker recycling would rebuild them every four steps.
+                cpu_pool = backend_lifecycle.enter_context(
+                    multiprocessing.get_context("fork").Pool(2,
+                        initializer=_initialize_causal_execution_worker,
+                        initargs=(execution, self.streaming_step_projector)))
+                cpu_workers = tuple(cpu_pool._pool)
+                parallel_worker_count = 2
             schedule_trace = run_single_pool_schedule(
                 self.backend,
                 engine_requests,
-                step_duration,
+                resolve_cpu_step if causal_execution else step_duration,
                 self.backend.config.scheduler_pipeline_depth,
-                async_output_release=self._async_output_release(),
+                async_output_release=async_output_release,
                 on_step_complete=on_step_complete,
-                tail_drain=drain_tail if use_parallel_tail else None,
+                tail_drain=(drain_fixed_source_tail if fixed_source_parallel_tail else
+                    drain_tail if use_parallel_tail and not causal_execution else None),
                 timing_mode=self.config.timing_mode,
                 closed_loop=closed_loop_clients,
+                submit_step_duration=submit_cpu_step if causal_execution else None,
+                step_execution_at=(
+                    execute_async_worker_step if (source_async_worker or source_request_progress) else None),
+                engine_core_worker_call_is_synchronous=(
+                    source_async_worker
+                    and self.config.vllm_executor_backend == "uni"),
             )
+            if cpu_pending:
+                raise RuntimeError("causal CPU execution ended with unresolved steps")
+        # Actual worker occupancy includes execution, projection and metadata
+        # scope exit. Queueing, IPC, pool lifecycle and parent Scheduler work
+        # remain in the enclosing Simulation wall clock. Overlap is counted once.
+        interval_end = -math.inf
+        for started, finished in sorted(cpu_execution_intervals):
+            parallel_execution_wall_time_s += max(0.0, finished - max(started, interval_end))
+            interval_end = max(interval_end, finished)
         metrics_requests = (
             self.config.requests if closed_loop_clients is None
             else closed_loop_clients.effective_request_stream())
@@ -2744,6 +3797,10 @@ class Simulation:
                 parallel_execution_wall_time_s)
             performance_stats["parallel_worker_aggregate_phase_s"] = dict(
                 parallel_phase_wall_time_s)
+            if self._kv_lifecycle is not None:
+                kv_offload = self._kv_lifecycle.finish()
+            else:
+                kv_offload = None
             return StreamingSimulationResult(
                 schedule_trace=schedule_trace,
                 metrics=compute_serving_metrics(
@@ -2755,6 +3812,7 @@ class Simulation:
                 execution_cache_stats=cache_stats,
                 execution_performance_stats=performance_stats,
                 source_activation_memory=source_memory.manifest(total_steps=streamed_step_count),
+                kv_offload=kv_offload,
             )
         schedule_trace = _with_in_step_transfer_trace(
             schedule_trace, tuple(simulation_steps))
@@ -2829,6 +3887,8 @@ class MultiSimulation:
             Callable[[SimulationStep], object]
         ] = None,
         streaming_prehashed_step_consumer: Optional[Callable[..., None]] = None,
+        weight_placement_consumer: Optional[Callable[[tuple[dict, ...]], None]] = None,
+        v4_weight_storage_profile: Optional[str] = None,
     ) -> None:
         self.config = config
         self.backends = dict(backends)
@@ -2886,11 +3946,6 @@ class MultiSimulation:
                 and scheduler_runtime_sha256 is None):
             raise ValueError(
                 "KV lifecycle replay requires a Scheduler runtime SHA256")
-        if (config.step_retention == "streaming_aggregate"
-                and (kv_cache_tier_manager is not None
-                     or kv_lifecycle_replay is not None)):
-            raise NotImplementedError(
-                "streaming aggregate retention does not support KV offload")
         if not isinstance(enable_standalone_af_mtp, bool):
             raise TypeError("standalone AF MTP enable flag must be boolean")
         if not isinstance(enable_standalone_af_mtp_preemption, bool):
@@ -2976,6 +4031,7 @@ class MultiSimulation:
                 raise ValueError(
                     f"backend mapping key {pool_name!r} does not match its config")
             pool = config.deployment.worker_pools[pool_name]
+            _validate_dp_backend_placement(backend, pool, config.model)
             if (backend_phase(backend.config.role)
                     != worker_role_phase(pool.role)
                     or worker_role_operator_group(backend.config.role)
@@ -3140,11 +4196,24 @@ class MultiSimulation:
                 for destination in destinations:
                     source_pool = config.deployment.worker_pools[source]
                     destination_pool = config.deployment.worker_pools[destination]
-                    pd_kv_transfer_rank_pairs(
-                        source_pool,
-                        destination_pool,
-                        config.model.num_key_value_heads,
-                    )
+                    for source_dp in range(source_pool.parallel_plan.config.data_parallel_size):
+                        for destination_dp in range(destination_pool.parallel_plan.config.data_parallel_size):
+                            pd_kv_transfer_rank_pairs(source_pool, destination_pool, config.model.num_key_value_heads,
+                                source_data_parallel_rank=source_dp, destination_data_parallel_rank=destination_dp,
+                                attention_layout=config.model.attention_layout)
+                    layout = validate_pd_kv_layout(source_pool, destination_pool, config.model.attention_layout)
+                    if layout is not None:
+                        if self.backends[source].config.kv_block_size_tokens != self.backends[destination].config.kv_block_size_tokens:
+                            raise NotImplementedError("PD KV block-format conversion requires an explicit reblocking contract")
+                        from src.serving.backend.vllm import VLLMBackend
+                        for name in (source, destination):
+                            backend = self.backends[name]
+                            if isinstance(backend, VLLMBackend):
+                                info = backend.runtime_info
+                                if not isinstance(info, Mapping) or info["version"] != "0.30.0":
+                                    raise NotImplementedError("declared PD layouts require the prepared0.30 cache-capability contract")
+                                if any(layout not in capabilities for capabilities in info["supported_layouts_by_rank"]):
+                                    raise ValueError("PD layout is outside an endpoint's declared per-rank cache capabilities")
         elif config.deployment.mode in ("colocated", "af_disagg"):
             unexpected = sorted(
                 pool_name for pool_name, phase in phases.items()
@@ -3188,6 +4257,7 @@ class MultiSimulation:
             allow_single_pool_tp1_pp=False,
             allow_single_pool_tp2_pp2=False,
         )
+        _emit_weight_placements(config, weight_placement_consumer, v4_weight_storage_profile)
 
     def _decode_destinations(self, source_engine_id: str) -> Tuple[str, ...]:
         destinations = []
@@ -3206,6 +4276,7 @@ class MultiSimulation:
                 destinations.append(destination)
         return tuple(destinations)
 
+    @experiment_cache_scope()
     def run(self) -> SimulationResult | StreamingSimulationResult:
         if self._has_run:
             raise RuntimeError("MultiSimulation instances are single-use")
@@ -3219,6 +4290,7 @@ class MultiSimulation:
         streamed_kernel_call_count = 0
         streamed_step_timings = []
         simulation_transfers = []
+        pd_kv_lifecycle = []
         (parallel_results_by_step_id, parallel_cache_deltas,
          parallel_phase_wall_time_s) = _new_parallel_accumulators()
         parallel_worker_count = 0
@@ -3246,11 +4318,34 @@ class MultiSimulation:
             host_launch_profiles=self.config.host_launch_profiles,
             host_runtime_prepare_profiles=self.config.host_runtime_prepare_profiles,
             runtime_prepare_event_builder=self.config.runtime_prepare_event_builder,
-            materialize_timeline_details=retain_full_steps,
+            materialize_timeline_details=(retain_full_steps or self.config.record_execution_timeline),
             model_source_inputs_by_step=self.config.model_source_inputs_by_step,
+            collect_source_state=self.config.collect_source_state,
         )
 
+        def request_placement(pool_name, request_id):
+            from src.serving.backend.vllm import VLLMBackend
+            pool = self.config.deployment.worker_pools[pool_name]
+            size = pool.parallel_plan.config.data_parallel_size
+            if size == 1:
+                return 0, pool.ranks
+            backend = self.backends[pool_name]
+            if not isinstance(backend, VLLMBackend) or backend.data_parallel_size != size:
+                raise ValueError("request placement requires this pool's actual DP Scheduler owners")
+            replica = backend.request_data_parallel_rank(request_id)
+            width = pool.parallel_plan.config.worker_count // size
+            return replica, pool.ranks[replica * width:(replica + 1) * width]
+
         def step_duration(pool_name, backend_step, start_time_s):
+            from src.serving.backend.vllm import VLLMBackend
+            backend = self.backends[pool_name]
+            if isinstance(backend, VLLMBackend) and backend.config.is_prefill_only:
+                for request_id in backend_step.finished_request_ids:
+                    if requests_by_id[request_id].output_tokens > 1:
+                        blocks = backend.retain_pd_kv(request_id)
+                        pd_kv_lifecycle.append({"action": "retain_source", "pool": pool_name,
+                            "ranks": request_placement(pool_name, request_id)[1],
+                            "data_parallel_rank": request_placement(pool_name, request_id)[0], "request_id": request_id, "time_s": start_time_s, "block_groups": blocks})
             if backend_step.schedule.pool_name != pool_name:
                 raise ValueError("backend step pool does not match scheduler pool")
             if (self._enable_standalone_af_mtp
@@ -3337,7 +4432,8 @@ class MultiSimulation:
             if self._kv_lifecycle is None:
                 if any(
                         event.action in (
-                            KVCacheAction.LOAD, KVCacheAction.EVICT)
+                            KVCacheAction.LOAD, KVCacheAction.EVICT,
+                            KVCacheAction.STORE)
                         for event in backend_step.kv_cache_events):
                     raise ValueError(
                         "KV load/evict events require a tier lifecycle manager")
@@ -3350,6 +4446,7 @@ class MultiSimulation:
                 kv_cache_events=backend_step.kv_cache_events,
                 embedding_token_ids=backend_step.embedding_token_ids,
                 model_source_inputs=backend_step.model_source_inputs,
+                require_timeline_details=bool(transfer_events),
                 origin_time_s=start_time_s,
                 shared_resource_calendar=resource_calendar,
             )
@@ -3364,6 +4461,7 @@ class MultiSimulation:
                 predictions=predictions,
                 execution_timeline=execution_timeline,
                 source_activation_memory=components.source_activation_memory,
+                source_state_summary=components.source_state_summary,
             )
             if components.source_activation_memory is not None:
                 source_memory.consume(backend_step.schedule.pool_name, backend_step.schedule.step_id,
@@ -3400,18 +4498,26 @@ class MultiSimulation:
                     virtual_time_s - parallel_result.duration_s,
                     virtual_time_s,
                 )
-                self.streaming_prehashed_step_consumer(
+                completion_time_s = virtual_time_s
+                arguments = (
                     backend_step,
                     entry,
                     parallel_result.execution_contract_digest,
                     parallel_result.logical_kernel_call_count,
                     parallel_result.compact,
                 )
+                if parallel_result.state_audit_snapshot is None:
+                    self.streaming_prehashed_step_consumer(*arguments)
+                else:
+                    self.streaming_prehashed_step_consumer(
+                        *arguments, parallel_result.state_audit_snapshot)
+                if parallel_result.step_timing is not None:
+                    streamed_step_timings.append(parallel_result.step_timing)
                 streamed_step_count += 1
                 streamed_kernel_call_count += (
                     parallel_result.logical_kernel_call_count)
                 if self.progress_callback is not None:
-                    self.progress_callback(backend_step, virtual_time_s)
+                    self.progress_callback(backend_step, completion_time_s)
                 return
             if not retain_full_steps:
                 if step_id not in pending_streaming_steps:
@@ -3419,12 +4525,12 @@ class MultiSimulation:
                         "streaming simulation completed without a pending "
                         "step")
                 pending_streaming_step = pending_streaming_steps.pop(step_id)
-                if pending_streaming_step.backend_step is not backend_step:
+                if pending_streaming_step.backend_step.schedule is not backend_step.schedule:
                     raise RuntimeError(
                         "streaming simulation completed a different step")
                 duration_s = pending_streaming_step.execution_timeline.duration_s
                 entry = ScheduleTraceEntry(
-                    backend_step,
+                    pending_streaming_step.backend_step,
                     virtual_time_s - duration_s,
                     virtual_time_s,
                 )
@@ -3452,6 +4558,8 @@ class MultiSimulation:
             nonlocal parallel_worker_count, parallel_step_count
             nonlocal parallel_execution_wall_time_s
             if (retain_full_steps
+                    or self._kv_lifecycle is not None
+                    or self.config.collect_source_state
                     or self.config.execution_mode != "accelerated"
                     or self.config.runtime_inputs.symbolic_workspace_initial_capacity_bytes is not None
                     or (self.config.runtime_inputs.symbolic_forward_source is not None
@@ -3500,7 +4608,7 @@ class MultiSimulation:
                     self.config.host_runtime_prepare_profiles),
                 runtime_prepare_event_builder=(
                     self.config.runtime_prepare_event_builder),
-                materialize_timeline_details=False,
+                materialize_timeline_details=self.config.record_execution_timeline,
                 model_source_inputs_by_step=self.config.model_source_inputs_by_step,
             )
             global _PARALLEL_EXECUTION_CONTEXT, _PARALLEL_STEP_PROJECTOR
@@ -3685,6 +4793,19 @@ class MultiSimulation:
                         now,
                         source_engine_id=pool_name,
                     )
+                    from src.serving.backend.vllm import VLLMBackend
+                    destination_backend = self.backends[decision.selected_engine_id]
+                    # The trace hit describes KV already available at P.
+                    # D receives the complete prompt KV through this handoff;
+                    # reserve and admission must use that same destination
+                    # identity without replaying P's cache-hit observation.
+                    destination_request = replace(
+                        original, arrival_time_s=now, prefix_hit_tokens=0)
+                    if isinstance(destination_backend, VLLMBackend):
+                        blocks = destination_backend.reserve_pd_destination(destination_request)
+                        pd_kv_lifecycle.append({"action": "reserve_destination", "pool": decision.selected_engine_id,
+                            "ranks": request_placement(decision.selected_engine_id, request_id)[1],
+                            "data_parallel_rank": request_placement(decision.selected_engine_id, request_id)[0], "request_id": request_id, "time_s": now, "block_groups": blocks})
                     transfer_workload = build_pd_kv_transfer_workload(
                         request_id,
                         original.input_tokens,
@@ -3692,6 +4813,8 @@ class MultiSimulation:
                         self.config.deployment,
                         pool_name,
                         decision.selected_engine_id,
+                        source_data_parallel_rank=request_placement(pool_name, request_id)[0],
+                        destination_data_parallel_rank=request_placement(decision.selected_engine_id, request_id)[0],
                     )
                     physical_transfers = []
                     for transfer_node in transfer_workload.nodes:
@@ -3758,7 +4881,7 @@ class MultiSimulation:
                         ))
                     handoffs.append(HandoffDispatch(
                         decision=decision,
-                        request=replace(original, arrival_time_s=now, prefix_hit_tokens=0),
+                        request=destination_request,
                         transfers=tuple(physical_transfers),
                     ))
                     handed_off_request_ids.add(request_id)
@@ -3778,6 +4901,15 @@ class MultiSimulation:
                     f"pd_disagg pool roles: {sorted(roles)}")
             engine_requests = RequestStream(
                 closed_loop_clients.initial_requests())
+        def transfer_completed(source, request_id, now):
+            from src.serving.backend.vllm import VLLMBackend
+            backend = self.backends[source]
+            if isinstance(backend, VLLMBackend):
+                blocks = backend.release_pd_kv(request_id)
+                pd_kv_lifecycle.append({"action": "release_source", "pool": source,
+                    "ranks": request_placement(source, request_id)[1],
+                    "data_parallel_rank": request_placement(source, request_id)[0], "request_id": request_id, "time_s": now, "blocks": blocks})
+
         with ExitStack() as backend_lifecycle:
             for backend in self.backends.values():
                 backend_lifecycle.enter_context(_managed_backend(backend))
@@ -3795,10 +4927,17 @@ class MultiSimulation:
                 tail_drain=(
                     drain_decode_tail
                     if not retain_full_steps and closed_loop_clients is None
+                    and self.config.execution_mode == "accelerated"
+                    and self.config.runtime_inputs.symbolic_workspace_initial_capacity_bytes is None
+                    and not (self.config.runtime_inputs.symbolic_forward_source is not None
+                        and self.config.runtime_inputs.graph_execution.enabled)
+                    and self.config.timing_mode == "device_only"
+                    and self.streaming_step_projector is not None
                     else None),
                 on_step_complete=on_step_complete,
                 timing_mode=self.config.timing_mode,
                 closed_loop=closed_loop_clients,
+                on_transfer_complete=transfer_completed,
             )
         metrics_requests = (
             self.config.requests if closed_loop_clients is None
@@ -3828,6 +4967,10 @@ class MultiSimulation:
                 parallel_execution_wall_time_s)
             performance_stats["parallel_worker_aggregate_phase_s"] = dict(
                 parallel_phase_wall_time_s)
+            if self._kv_lifecycle is not None:
+                kv_offload = self._kv_lifecycle.finish()
+            else:
+                kv_offload = None
             return StreamingSimulationResult(
                 schedule_trace=schedule_trace,
                 metrics=compute_serving_metrics(
@@ -3836,10 +4979,13 @@ class MultiSimulation:
                 num_steps=streamed_step_count,
                 num_kernel_calls=streamed_kernel_call_count,
                 num_simulation_transfers=len(simulation_transfers),
+                pd_kv_lifecycle=tuple(pd_kv_lifecycle),
+                recorded_transfers=(tuple(simulation_transfers) if self.config.record_execution_timeline else ()),
                 step_timings=tuple(streamed_step_timings),
                 execution_cache_stats=cache_stats,
                 execution_performance_stats=performance_stats,
                 source_activation_memory=source_memory.manifest(total_steps=streamed_step_count),
+                kv_offload=kv_offload,
             )
         schedule_trace = _with_in_step_transfer_trace(
             schedule_trace, tuple(simulation_steps))
@@ -3871,6 +5017,7 @@ class MultiSimulation:
             steps=tuple(simulation_steps),
             source_activation_memory=source_memory.manifest(total_steps=len(simulation_steps)),
             transfers=tuple(simulation_transfers),
+            pd_kv_lifecycle=tuple(pd_kv_lifecycle),
             kv_offload=kv_offload,
             execution_cache_stats=execution.cache_stats(),
             execution_performance_stats=execution.performance_stats(),

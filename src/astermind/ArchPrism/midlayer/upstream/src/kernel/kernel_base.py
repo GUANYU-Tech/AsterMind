@@ -102,7 +102,8 @@ class KernelPredictor(ABC):
             analytical_transfer = (
                 kernel.kind is KernelKind.COMMUNICATION
                 and kernel.transfer.backend == "analytical_roofline_v1"
-                and kernel.transfer.link == "roce")
+                and (kernel.transfer.link == "roce"
+                    or kernel.transfer.link == "pcie" and kernel.transfer.traffic_matrix_bytes))
             analytical_transfer = analytical_transfer or (
                 kernel.kind is KernelKind.MEMCPY and kernel.transfer.algorithm == "fpga_staging")
             if (not analytical_transfer
@@ -223,8 +224,12 @@ def predict(kernel_spec: KernelSpec, hardware,
     from src.kernel.memory_access_builder import (
         prediction_memory_bindings, prediction_memory_input_scope,
     )
-    with (prediction_memory_input_scope(),
-            prediction_memory_bindings(kernel_spec, memory_bindings, method)):
+    from src.kernel.prediction_cache import (
+        prediction_cache_scope, _public_resource_input_producer,
+    )
+    with (prediction_cache_scope(reuse=True), prediction_memory_input_scope(),
+            prediction_memory_bindings(kernel_spec, memory_bindings, method),
+            _public_resource_input_producer(kernel_spec, hardware, method)):
         return create_predictor(kernel_spec.kind).predict(
             kernel_spec, hardware, method,
             oracle_input=oracle_input, model_hardware=model_hardware)

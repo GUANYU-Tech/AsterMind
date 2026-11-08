@@ -71,6 +71,8 @@ def main():
     parser.add_argument("--v4-source-use-deep-gemm", action=argparse.BooleanOptionalAction, default=None,
                         help="declared process-lifetime VLLM_USE_DEEP_GEMM before cached dispatch; not observed provider support")
     args = parser.parse_args()
+    model_path = Path(args.model)
+    args.model = str(model_path if model_path.is_absolute() else ROOT / model_path)
     args.symbolic_forward_source, source_normalization = normalize_model_operator_probe_source(
         args.model, args.target_sampling_source)
     ordinary_source_options = (args.source_max_model_len, args.source_max_batched_tokens,

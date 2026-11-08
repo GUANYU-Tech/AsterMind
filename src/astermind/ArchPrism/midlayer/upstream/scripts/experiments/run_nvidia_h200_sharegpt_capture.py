@@ -47,23 +47,26 @@ import time
 
 ROOT = Path(__file__).resolve().parents[2]
 
-PUBLIC = Path("/mnt/public/yangxinhao")
-DEFAULTS = {
-    "output_root": PUBLIC / "serving_capture",
-    "models_root": PUBLIC / "models",
-    "dataset": PUBLIC / "datasets" / "ShareGPT_V3_unfiltered_cleaned_split.json",
-    "nsys": PUBLIC / "tools" / "nsys_2025.6.1" / "bin" / "nsys",
-    "cuda_home": PUBLIC / "tools" / "cuda-12.9",
-    "gpu_lock_dir": PUBLIC / "h200_microbench" / "kcampaign" / "runs",
-    "cache_root": PUBLIC / "cache",
-    "home": PUBLIC / "h200_microbench" / "home",
-    # cp312 wheels the repository imports but vLLM does not ship (zstandard).
-    "pydeps": PUBLIC / "envs" / "midlayer_pydeps_cp312",
-}
-PYTHON_BY_RUNTIME = {
-    "0.30.0": PUBLIC / "envs" / "vllm030" / "bin" / "python",
-    "0.11.0": PUBLIC / "envs" / "vllm011" / "bin" / "python",
-}
+RUNTIME_ENVIRONMENTS = {"0.30.0": "vllm030", "0.11.0": "vllm011"}
+DEFAULT_PATH_KEYS = (
+    "output_root", "models_root", "dataset", "nsys", "cuda_home",
+    "gpu_lock_dir", "cache_root", "home", "pydeps",
+)
+
+
+def _default_paths(public_root: Path) -> dict[str, Path]:
+    return {
+        "output_root": public_root / "serving_capture",
+        "models_root": public_root / "models",
+        "dataset": public_root / "datasets" / "ShareGPT_V3_unfiltered_cleaned_split.json",
+        "nsys": public_root / "tools" / "nsys_2025.6.1" / "bin" / "nsys",
+        "cuda_home": public_root / "tools" / "cuda-12.9",
+        "gpu_lock_dir": public_root / "h200_microbench" / "kcampaign" / "runs",
+        "cache_root": public_root / "cache",
+        "home": public_root / "h200_microbench" / "home",
+        # cp312 wheels the repository imports but vLLM does not ship (zstandard).
+        "pydeps": public_root / "envs" / "midlayer_pydeps_cp312",
+    }
 PROBE = ROOT / "microbench" / "nvidia_a800" / "runtime" / "host_request_path" / (
     "vllm_delivery_region_runner.py")
 PROBE_FANOUTS = "1,2,4,8,16,32,64"
@@ -111,7 +114,10 @@ class Lane:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.runtime = args.runtime_version
-        self.python = Path(args.python) if args.python else PYTHON_BY_RUNTIME[self.runtime]
+        self.python = (
+            Path(args.python) if args.python else args.public_root / "envs"
+            / RUNTIME_ENVIRONMENTS[self.runtime] / "bin" / "python"
+        )
         self.gpus = [int(value) for value in args.gpus.split(",")]
         if len(set(self.gpus)) != len(self.gpus):
             raise ValueError("GPUs must be unique")
@@ -365,7 +371,14 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("action", choices=("run", "plan", "rerun-trace-on"))
-    parser.add_argument("--runtime-version", choices=tuple(PYTHON_BY_RUNTIME), required=True)
+    parser.add_argument("--runtime-version", choices=tuple(RUNTIME_ENVIRONMENTS), required=True)
+    parser.add_argument(
+        "--public-root",
+        type=Path,
+        default=(Path(os.environ["MIDLAYER_H200_PUBLIC_ROOT"])
+                 if "MIDLAYER_H200_PUBLIC_ROOT" in os.environ else None),
+        help="H200 dependency/output root; may use MIDLAYER_H200_PUBLIC_ROOT",
+    )
     parser.add_argument("--gpus", required=True,
                         help="run: this lane's GPUs (e.g. 4 or 4,5); plan: all usable GPUs")
     parser.add_argument("--case", action="append", choices=tuple(CASES))
@@ -377,8 +390,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--tag", help="rerun-trace-on: writes trace_on_<tag>/")
     parser.add_argument("--pairs", type=int, default=0,
                         help="plan: number of GPU pairs reserved for TP2/EP2 lanes")
-    for key, value in DEFAULTS.items():
-        parser.add_argument(f"--{key.replace('_', '-')}", default=str(value))
+    for key in DEFAULT_PATH_KEYS:
+        parser.add_argument(f"--{key.replace('_', '-')}")
     return parser
 
 
@@ -409,9 +422,14 @@ def _plan(args: argparse.Namespace) -> None:
         name = "gpu" + "-".join(map(str, lane_gpus))
         command = [sys.executable, str(Path(__file__).resolve()), "run",
                    "--runtime-version", args.runtime_version,
+                   "--public-root", str(args.public_root),
                    "--gpus", ",".join(map(str, lane_gpus))]
         if args.allow_gpu0:
             command.append("--allow-gpu0")
+        for key in DEFAULT_PATH_KEYS:
+            command.extend((f"--{key.replace('_', '-')}", getattr(args, key)))
+        if args.python is not None:
+            command.extend(("--python", args.python))
         for case in lane_cases:
             command += ["--case", case]
         print(f"setsid nohup {shlex.join(command)} > {log_root}/{name}.log 2>&1 < /dev/null &")
@@ -419,6 +437,12 @@ def _plan(args: argparse.Namespace) -> None:
 
 def main() -> int:
     args = _parser().parse_args()
+    if args.public_root is None:
+        raise ValueError("--public-root or MIDLAYER_H200_PUBLIC_ROOT is required")
+    defaults = _default_paths(args.public_root)
+    for key in DEFAULT_PATH_KEYS:
+        if getattr(args, key) is None:
+            setattr(args, key, str(defaults[key]))
     if args.action == "plan":
         _plan(args)
         return 0

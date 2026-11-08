@@ -281,6 +281,22 @@ def _normalize_fused_moe(op_attributes: Mapping, kdata: Mapping,
             "padded_rows": _positive_int(
                 tiling_data, "EM", "FUSED_MOE tiling"),
         })
+        if hardware_id == "nvidia_h200":
+            # NSYS records include the actual dynamic shared allocation. Keep
+            # this launch fact attached to the observed program so a
+            # source-scoped mechanism cannot match on tile shape alone.
+            parameters["dynamic_shared_memory_bytes"] = (
+                metrics["dynamic_smem_per_block"])
+            parameters["registers_per_thread"] = metrics["regs_per_thread"]
+            parameters["static_shared_bytes"] = metrics["static_smem_per_block"]
+            from src.kernel.launch_config.nvidia_h200.moe_source_launch import (
+                observed_operand_pipeline_depth,
+            )
+            tiling = dataclasses.replace(tiling, pipeline_depth=observed_operand_pipeline_depth(
+                shape, hardware.kernel_dtype, tiling, parameters["group_size_m"],
+                metrics["block_size"], parameters["dynamic_shared_memory_bytes"],
+                registers_per_thread=parameters["registers_per_thread"],
+                static_shared_bytes=parameters["static_shared_bytes"]))
         if hardware_id == "metax_c500":
             from src.kernel.launch_config.metax_c500.fused_moe_launch import (
                 select_fused_moe_operand_replay,

@@ -43,7 +43,7 @@ def _validate_execution_and_host_timing(
     label: str,
 ) -> None:
     execution_mode = result["execution_mode"]
-    if execution_mode not in ("accelerated", "reference"):
+    if execution_mode not in ("accelerated", "reference", "fast"):
         raise ValueError(f"{label} execution mode is invalid")
     mode = validate_serving_timing_mode(result["serving_timing_mode"])
     hardware_ids = tuple(

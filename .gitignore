@@ -21,8 +21,8 @@ __pycache__/
 *.pdb
 /simulator/build/
 /simulator/runs/
-/network_sim/build/
-/network_sim/runs/
+/src/network_sim/build/
+/src/network_sim/runs/
 .venv/
 
 build/

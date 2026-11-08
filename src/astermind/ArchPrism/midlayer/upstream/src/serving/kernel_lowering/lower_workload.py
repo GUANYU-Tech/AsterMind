@@ -1,17 +1,22 @@
 """Explicit WorkloadNode-to-KernelSpec lowering rules."""
 
 import dataclasses
+from math import prod
 from collections import OrderedDict
+from contextvars import ContextVar
 from dataclasses import fields
 import pickle
 import weakref
 
 _SOURCE_LAYOUT_UNSET = object()
+_CURRENT_GEMM_SOURCE_BINDINGS = ContextVar("current_gemm_source_bindings", default=None)
+_CURRENT_DSPARK_SOURCE_GRAPH = ContextVar("current_dspark_source_graph", default=None)
 from types import MappingProxyType
 from typing import Callable, Mapping
 
 from src.kernel.hardware_spec import HWSpec
 from src.kernel.kernel_spec import (
+    DTYPE_BYTES,
     KernelKind,
     KernelSpec,
     PhysicalTransferConfig,
@@ -40,6 +45,8 @@ from src.kernel.launch_config.select_launch_config import (
     select_fused_moe_input_quant_launch,
     select_gemm_reducer_launch,
     select_launch_config,
+    select_workload_source_launch_recipe,
+    select_source_flash_attn_partial_launch,
 )
 from src.serving.deployment.deployment_config import (
     collective_ring_order,
@@ -270,6 +277,21 @@ _SOURCE_OBJECT_ATTRIBUTES = frozenset((
     "symbolic_tensor_inputs", "symbolic_tensor_outputs", "symbolic_tensor_controls", "symbolic_parameter_inputs",
     "symbolic_slot_mapping", "symbolic_model_input_order", "symbolic_prefill_workspace_requests",
     "symbolic_prefill_gather_workspace",
+    "symbolic_shared_topk_clear", "symbolic_topk_token_range",
+    "symbolic_collective_input_producers",
+    "fa3_gqa_metadata_prepare_node",
+    "fa3_full_input_producers", "fa3_full_aot_input_producers",
+    "source_topk_allocation_id", "source_topk_input_writer",
+))
+# These fields bind the actual heterogeneous source's payload rows/views.
+# validate_heterogeneous_graph still validates scope/placement/transfers on
+# the original complete graph (these row/view records remain source evidence);
+# heterogeneous_moe_specs selects typed shape/traffic/format fields and does
+# not consume these identities when constructing any KernelSpec. Keep all
+# network bytes/endpoints/NICs, gather counts and other physical inputs.
+_HETEROGENEOUS_SOURCE_BINDING_ATTRIBUTES = frozenset((
+    "source_view", "destination_view", "assignment_rows_experts", "expert_gpu_row_order",
+    "expert_output_ids", "return_assignment_rows_experts", "global_token_ids", "assumed_topk_ids",
 ))
 _SOURCE_NODE_FIELDS = tuple(field.name for field in fields(WorkloadNode))
 if _SOURCE_NODE_FIELDS != (
@@ -279,15 +301,418 @@ _SOURCE_CONTRACT_FIELDS = tuple(name for name in _SOURCE_NODE_FIELDS
     if name not in ("node_id", "rank", "attributes"))
 
 
-def _logical_node_contract(node: WorkloadNode, routing_relabelling=None):
-    """Freeze KernelSpec inputs, excluding placement and traced object IDs."""
+def _declared_dspark_source(node):
+    """Closed all-valid standalone source domain; this is not native admission."""
+    attrs = node.attributes
+    if "source_v4_aux_capture" in attrs:
+        required_aux = {"model_execution_version", "model_source_profile", "source_projection_only",
+            "launch_policy", "symbolic_tensor_inputs", "symbolic_tensor_outputs"}
+        return (required_aux.issubset(attrs) and attrs["source_v4_aux_capture"] is True
+            and attrs["model_execution_version"] == "vllm_0_30_0"
+            and attrs["model_source_profile"] == "vllm_0_30_v4_sync_fp8_ds_mla"
+            and attrs["source_projection_only"] is True
+            and attrs["launch_policy"] == "analytical_launch"
+            and ("source_dummy_run" not in attrs or attrs["source_dummy_run"] is False)
+            and "symbolic_tensor_inputs" in attrs and "symbolic_tensor_outputs" in attrs)
+    required = {"source_dspark_standalone", "source_dspark_data_parallel", "source_dspark_bound_target",
+        "model_execution_version", "model_source_profile", "source_projection_only",
+        "symbolic_tensor_inputs", "symbolic_tensor_outputs"}
+    if (not required.issubset(attrs) or any(type(attrs[name]) is not bool for name in (
+                "source_dspark_standalone", "source_dspark_bound_target", "source_dspark_data_parallel"))
+            or (attrs["source_dspark_standalone"], attrs["source_dspark_bound_target"], attrs["model_source_profile"]) not in (
+                (True, False, "vllm_0_30_v4_dspark_standalone"),
+                (False, True, "vllm_0_30_v4_dspark_same_tp_target_bound"))
+            or attrs["source_dspark_data_parallel"] is not False
+            or attrs["model_execution_version"] != "vllm_0_30_0"
+            or attrs["source_projection_only"] is not True
+            or ("source_dummy_run" in attrs and attrs["source_dummy_run"] is not False)
+            or any(not isinstance(attrs[name], (tuple, list)) or any(not isinstance(port, str) or not port
+                for port in attrs[name]) for name in ("symbolic_tensor_inputs", "symbolic_tensor_outputs"))
+            or not attrs["symbolic_tensor_outputs"]):
+        return False
+    components = {
+        (WorkloadKind.GATHER, "gather"): (None,),
+        (WorkloadKind.GATHER, "embedding"): ("vllm_0_30_symbolic_vocab_embedding",),
+        (WorkloadKind.GATHER, "dspark_markov_embedding"): ("vllm_0_30_dspark_torch_embedding",),
+        (WorkloadKind.LINEAR, "gemm"): (None,),
+        (WorkloadKind.LINEAR, "batched_gemm"): ("vllm_0_30_symbolic_v4_grouped_output",),
+        (WorkloadKind.LM_HEAD, "gemm"): (None,), (WorkloadKind.LM_HEAD, "gemv"): (None,),
+        (WorkloadKind.ROUTER, "gemm"): (None,),
+        (WorkloadKind.NORM, "rmsnorm"): (None,),
+        (WorkloadKind.NORM, "dsv4_q_kv_rmsnorm"): ("vllm_0_30_symbolic_v4_qkv_norm",),
+        (WorkloadKind.ELEMENTWISE, "elementwise"): (None,), (WorkloadKind.ELEMENTWISE, "add"): (None,),
+        (WorkloadKind.ACTIVATION, "silu"): (None,),
+        (WorkloadKind.KV_UPDATE, "dsv4_qnorm_rope_kv_insert"): ("vllm_0_30_symbolic_v4_swa_insert",),
+        (WorkloadKind.EAGER_ATTN, "dspark_noncausal_swa"): ("vllm_0_30_dspark_noncausal_swa",),
+        (WorkloadKind.VECTOR, "dspark_noncausal_swa_indices"): ("vllm_0_30_dspark_noncausal_swa",),
+        (WorkloadKind.VECTOR, "dspark_direct_argmax"): ("vllm_0_30_dspark_greedy_full_vocab",),
+        (WorkloadKind.VECTOR, "dsv4_inv_rope_fp8_quant"): ("vllm_0_30_symbolic_v4_inverse_rope",),
+        (WorkloadKind.VECTOR, "dsv4_moe_route"): ("vllm_0_30_symbolic_v4_routing",),
+        (WorkloadKind.VECTOR, "vllm_logits_gather_reorder"): ("vllm_0_30_symbolic_logits_boundary",),
+        (WorkloadKind.FUSED_MOE, "full"): ("vllm_0_30_symbolic_v4_marlin",),
+        (WorkloadKind.COLLECTIVE, None): (None,),
+    }
+    for variant in ("mhc_prenorm", "mhc_pre_norm"):
+        components[(WorkloadKind.VECTOR, variant)] = ("vllm_0_30_symbolic_v4_dspark_prenorm",)
+    for variant in ("mhc_post_pre", "mhc_post", "hc_head"):
+        components[(WorkloadKind.VECTOR, variant)] = ("vllm_0_30_symbolic_mhc",)
+    if attrs["source_dspark_bound_target"] is True:
+        components[(WorkloadKind.VECTOR, "vllm_embedding_id_widen")] = ("vllm_0_30_symbolic_embedding",)
+        components[(WorkloadKind.GATHER, "embedding")] = (None, "vllm_0_30_symbolic_vocab_embedding")
+        components[(WorkloadKind.ELEMENTWISE, "elementwise")] = (None,
+            "vllm_0_30_RequestState_last_sampled_constructor", "vllm_0_30_InputBuffers_constructor",
+            "vllm_0_30_RequestState_SamplingStates_constructor", "vllm_0_30_RequestState_draft_constructor")
+        for variant, component in (
+                ("dspark_prepare_inputs", "vllm_0_30_prepare_dflash_inputs"),
+                ("dspark_token_request_mapping", "vllm_0_30_dspark_attention_metadata"),
+                ("dspark_slot_validity", "vllm_0_30_dspark_attention_metadata"),
+                ("dspark_validity_copy", "vllm_0_30_dspark_attention_metadata"),
+                ("vllm_gpu_v2_post_update", "vllm_0_30_gpu_post_update"),
+                ("vllm_gpu_v2_store_drafts", "vllm_0_30_RequestState_drafts"),
+                ("vllm_gpu_v2_stage_requests", "vllm_0_30_RequestState_add_request")):
+            components[(WorkloadKind.VECTOR, variant)] = (component,)
+    key = (node.kind, node.variant)
+    if key not in components or (attrs["source_component"] if "source_component" in attrs else None) not in components[key]:
+        return False
+    if node.kind is WorkloadKind.COLLECTIVE:
+        return (attrs["operation"] in ("all_reduce", "all_gather")
+            and len(attrs["symbolic_tensor_inputs"]) == len(attrs["participants"])
+            and len(attrs["symbolic_tensor_outputs"]) == len(attrs["participants"]))
+    if ("target_capture_layers" not in attrs or "draft_layer_indices" not in attrs
+            or (tuple(attrs["target_capture_layers"]), tuple(attrs["draft_layer_indices"])) not in (
+                ((40, 41, 42), (43, 44, 45)), ((58, 59, 60), (61, 62, 63)))
+            or attrs["launch_policy"] != "analytical_launch"):
+        return False
+    return True
 
+
+def _dspark_typed_math_specs(node, hardware_id):
+    """Adapt only four exact source operations to their existing mathematical owners."""
+    attrs, shape = node.attributes, node.shape
+    ports, outputs = attrs["symbolic_tensor_inputs"], attrs["symbolic_tensor_outputs"]
+    common = dict(launch=None, execution_support="unsupported", unsupported_reason="launch_selector_unavailable")
+    if (node.variant == "dsv4_qnorm_rope_kv_insert" and "masked_dspark_context" in attrs
+            and attrs["masked_dspark_context"] is True):
+        valid = attrs["cache_write_valid_rows"]
+        slots = tuple(attrs["symbolic_slot_mapping"])
+        scoped = _CURRENT_DSPARK_SOURCE_GRAPH.get()
+        if (not _declared_dspark_source(node) or attrs["source_dspark_bound_target"] is not True
+                or attrs["masked_dspark_context"] is not True or node.dtype != "bf16"
+                or node.kind is not WorkloadKind.KV_UPDATE or shape["seq_len"] != 6
+                or type(valid) is not int or not 1 <= valid <= 6 or len(slots) != 6
+                or any(type(slot) is not int or slot < 0 for slot in slots[:valid])
+                or slots[valid:] != (-1,) * (6 - valid)
+                or attrs["slot_mapping_all_valid"] is not (valid == 6)
+                or attrs["cache_write_semantics"] != "masked_target_context_overwrite"
+                or scoped is None or scoped[2] is None or node.node_id not in scoped[2]._by_node):
+            raise ValueError("DSpark context overwrite requires the current six-row source and exact accepted slot prefix")
+        source = scoped[2]._by_node[node.node_id]
+        if (source.rank != node.rank or source.pool_name != node.pool_name or source.attributes != attrs
+                or tuple(view.view_id for view in source.inputs) != tuple(ports)
+                or tuple(view.view_id for view in source.outputs) != tuple(outputs)
+                or len(source.inputs) != 5 or len(source.outputs) != 2
+                or source.inputs[0].dtype != "bf16" or prod(source.inputs[0].shape) != 6 * shape["num_query_heads"] * 512
+                or source.inputs[1].dtype != "bf16" or prod(source.inputs[1].shape) != 6 * 512
+                or source.inputs[2].dtype != "int64" or prod(source.inputs[2].shape) != 6
+                or source.inputs[4].dtype != "int64" or prod(source.inputs[4].shape) != 6):
+            raise ValueError("DSpark context overwrite source ports differ from current typed receipt")
+        return (KernelSpec(KernelKind.KV_CACHE, hardware_id, _vector_shape(node), dtype="bf16",
+            variant=node.variant, attributes={**{name: attrs[name] for name in (
+                "cache_layout", "cache_write_semantics", "quantization", "slot_mapping_all_valid")},
+                "mathematical_program": "vllm_0_30_dspark_partial_context_insert_v1", "valid_token_count": valid}, **common),)
+    metadata_operations = {
+        "dspark_prepare_inputs": ("vllm_0_30_prepare_dflash_inputs", ("prepare_inputs",)),
+        "dspark_token_request_mapping": ("vllm_0_30_dspark_attention_metadata", ("token_request_mapping",)),
+        "dspark_slot_validity": ("vllm_0_30_dspark_attention_metadata", ("slot_mapping_ge_zero",)),
+        "dspark_validity_copy": ("vllm_0_30_dspark_attention_metadata", ("validity_copy",)),
+        "vllm_gpu_v2_greedy_sampler": ("vllm_0_30_gpu_V2_plain_sampler", (
+            "gumbel_block_argmax", "gumbel_reduce_argmax", "gumbel_gather", "seed_num_sampled_ones", "sampled_rejected_counts")),
+        "vllm_gpu_v2_greedy_rejection": ("vllm_0_30_gpu_V2_rejection_sampler", (
+            "chunk_cu_subtract", "local_stats", "rejection", "resample", "insert", "sampled_rejected_counts")),
+        "vllm_gpu_v2_post_update": ("vllm_0_30_gpu_post_update", ("post_update",)),
+        "vllm_gpu_v2_store_drafts": ("vllm_0_30_RequestState_drafts", ("indexed_assignment",)),
+        "vllm_gpu_v2_stage_requests": ("vllm_0_30_RequestState_add_request", ("project_staged_writes",)),
+    }
+    scoped = _CURRENT_DSPARK_SOURCE_GRAPH.get()
+    constructor = (node.kind is WorkloadKind.ELEMENTWISE and node.variant == "elementwise"
+        and attrs["operation"] == "fill" and scoped is not None and node.rank in scoped[1]
+        and ("source_dspark_bound_target" in attrs and attrs["source_dspark_bound_target"] is True
+            or "source_v4_aux_capture" in attrs
+            or "source_component" in attrs and attrs["source_component"] == "vllm_0_30_RequestState_draft_constructor"))
+    if node.variant in metadata_operations or constructor:
+        if scoped is None or node.rank not in scoped[1] or scoped[0].node(node.node_id) is not node:
+            raise ValueError("DSpark typed role projection requires current target/capture source proof")
+        memory = scoped[2]
+        if memory is None or node.node_id not in memory._by_node:
+            raise ValueError("DSpark mixed typed roles require the current TraceMemoryContext")
+        source = memory._by_node[node.node_id]
+        if (source.node_id != node.node_id or source.rank != node.rank or source.pool_name != node.pool_name
+                or source.kind is not node.kind or source.variant != node.variant or source.attributes != attrs
+                or tuple(view.view_id for view in source.inputs) != tuple(ports)
+                or tuple(view.view_id for view in source.outputs) != tuple(outputs)
+                or tuple(key for key in source.predecessors if key in scoped[0]._nodes_by_id)
+                    != tuple(scoped[0].predecessors(node.node_id))):
+            raise ValueError("DSpark typed source context is stale or differs from this node/ports/pool/rank")
+        if not constructor:
+            component, operations = metadata_operations[node.variant]
+            if (attrs["source_component"] != component or attrs["source_operation"] not in operations
+                    or attrs["source_projection_only"] is not True):
+                raise ValueError("DSpark typed role projection rejects foreign metadata programs")
+        if node.variant in ("vllm_gpu_v2_greedy_sampler", "vllm_gpu_v2_greedy_rejection"):
+            if attrs["source_profile"] != "vllm_0_30_V2_plain_allgreedy_no_sampling_params":
+                raise ValueError("DSpark V2 payload projection requires its explicit all-greedy source")
+            if attrs["source_operation"] == "gumbel_block_argmax":
+                rows = shape["rows"]
+                if (node.dtype != "bf16" or shape["vocab"] != 129280 or shape["elements"] != rows * 129280
+                        or attrs["vocab_block_size"] != 1024 or attrs["all_greedy"] is not True
+                        or attrs["apply_temperature"] is not False or source.inputs[0].shape != (rows, 129280)
+                        or source.inputs[0].dtype != "bf16"
+                        or tuple(view.shape for view in source.outputs) != ((rows, 127), (rows, 127))
+                        or tuple(view.dtype for view in source.outputs) != ("int64", "fp32")):
+                    raise ValueError("DSpark Gumbel projection must scan exact masked BF16 vocab once and write both real partial roles")
+        specs = []
+        for reading, views in ((True, source.inputs), (False, source.outputs)):
+            for view in views:
+                if view.dtype not in ("bool", "int32", "int64", "fp32", "bf16"):
+                    raise ValueError("DSpark typed payload cannot change an unknown source dtype")
+                elements = prod(view.shape)
+                if elements == 0:
+                    continue
+                if view.element_bytes != DTYPE_BYTES[view.dtype]:
+                    raise ValueError("DSpark source dtype and element width disagree")
+                specs.append(KernelSpec(KernelKind.VECTOR, hardware_id, {"element_count": elements},
+                    dtype=view.dtype, variant="elementwise", attributes={
+                        "mathematical_program": "vllm_0_30_dspark_typed_role_bytes_v1",
+                        "operation": "read" if reading else "fill", "reads": int(reading), "writes": int(not reading)}, **common))
+        if not specs:
+            raise ValueError("DSpark source metadata must expose at least one real typed payload role")
+        return tuple(specs)
+    if node.variant == "v4_aux_hidden_mean":
+        if (not _declared_dspark_source(node) or node.kind is not WorkloadKind.VECTOR or node.dtype != "bf16"
+                or shape["streams"] != 4 or shape["hidden"] not in (4096, 7168)
+                or shape["elements"] != shape["rows"] * 4 * shape["hidden"]
+                or attrs["source_component"] != "vllm_0_30_v4_target_aux_mhc_mean"
+                or attrs["operation"] != "torch_mean" or attrs["reduction_axis"] != 1
+                or attrs["output_elements"] != shape["rows"] * shape["hidden"]
+                or len(ports) != 1 or len(outputs) != 1):
+            raise ValueError("DSpark auxiliary mean requires exact target hc4 BF16 source geometry")
+        return (KernelSpec(KernelKind.VECTOR, hardware_id,
+            {"element_count": attrs["output_elements"], "rows": shape["rows"], "width": shape["hidden"], "source_rows": 4 * shape["rows"]},
+            dtype="bf16", variant="vllm_mtp_eager", attributes={"model_execution_version": "vllm_0_30_0", "operation": "dspark_aux_mean"}, **common),)
+    if node.variant in ("dspark_noncausal_swa", "dspark_noncausal_swa_indices"):
+        names = {"causal", "q_lens", "prefix_lens", "visible_kv_lens", "visible_logical_slot_ids_by_request",
+            "index_capacity", "future_query_keys_visible", "invalid_index_fill", "native_provider_bound",
+            "physical_output_rows", "active_output_rows", "unwritten_output_tail_rows"}
+        if not names.issubset(attrs):
+            raise ValueError("DSpark noncausal source requires its complete shape and visibility facts")
+        queries, prefixes, visible = (tuple(attrs[name]) for name in ("q_lens", "prefix_lens", "visible_kv_lens"))
+        if (not queries or any(type(q) is not int or q != 5 for q in queries)
+                or len(queries) != len(prefixes) or len(queries) != len(visible)
+                or any(type(kv) is not int or kv < 1 for kv in prefixes)
+                or visible != tuple(5 + min(prefix, 128) for prefix in prefixes)
+                or tuple(len(slots) for slots in attrs["visible_logical_slot_ids_by_request"]) != visible
+                or attrs["causal"] is not False or attrs["future_query_keys_visible"] is not True
+                or attrs["invalid_index_fill"] != -1 or attrs["native_provider_bound"] is not False
+                or attrs["index_capacity"] != 192 or attrs["active_output_rows"] != sum(queries)
+                or attrs["physical_output_rows"] != sum(queries) or attrs["unwritten_output_tail_rows"] != 0):
+            raise ValueError("DSpark math requires complete noncausal five-query blocks without dummy or unwritten tail")
+        lengths = tuple(prefix + 5 for prefix in prefixes)
+        if node.variant == "dspark_noncausal_swa_indices":
+            if (node.kind is not WorkloadKind.VECTOR or node.dtype != "int32" or len(ports) not in (1, 3, 6)
+                    or len(outputs) != 2 or shape != {"elements": sum(queries) * 192, "rows": sum(queries), "index_width": 192}):
+                raise ValueError("DSpark index source requires its exact INT32 two-output geometry")
+            return (KernelSpec(KernelKind.VECTOR, hardware_id,
+                {"element_count": sum(queries) * 192, "rows": sum(queries), "width": 192, "source_rows": len(queries)},
+                dtype="int32", variant="vllm_mtp_eager", attributes={"model_execution_version": "vllm_0_30_0",
+                    "operation": "dspark_swa_indices", "num_speculative_tokens": 5, "kv_lens": lengths}, **common),)
+        if (node.kind is not WorkloadKind.EAGER_ATTN or node.dtype != "bf16" or len(ports) != 4 or len(outputs) != 1
+                or shape["batch"] != len(queries) or shape["q_len"] != 5 or shape["kv_len"] != max(lengths)
+                or shape["qk_head_dim"] != 512 or shape["v_head_dim"] != 512 or shape["num_kv_heads"] != 1
+                or shape["num_query_heads"] not in (64, 128) or shape["window_size"] != 128):
+            raise ValueError("DSpark attention requires its exact BF16 source geometry and Q/KV/index/lens ports")
+        return (KernelSpec(KernelKind.SPARSE_ATTN, hardware_id,
+            {"batch": len(queries), "q_len": 5, "kv_len": max(lengths), "num_query_heads": shape["num_query_heads"],
+             "qk_head_dim": 512, "v_head_dim": 512, "topk": 0, "window_size": 128, "compress_ratio": 1,
+             "compressed_state_bytes": 584, "swa_token_bytes": 584}, dtype="bf16", variant="dsv4_sparse_decode",
+            attributes={"causal": False, "indexer_type": "shared", "kv_layout": "mla", "kv_dist": "uniform",
+                "q_lens": queries, "kv_lens": lengths, "selected_kv_lens": (0,) * len(queries),
+                "topk_capacity": attrs["index_capacity"], "topk_index_dtype": "int32", "swa_kv_lens": visible,
+                "compressed_selection": "candidate_upper_bound", "num_speculative_tokens": 5,
+                "mathematical_program": "vllm_0_30_dspark_swa_noncausal_softmax_v1"}, **common),)
+    if node.variant == "dspark_markov_embedding":
+        parameters = attrs["symbolic_parameter_inputs"] if "symbolic_parameter_inputs" in attrs else ()
+        if (node.kind is not WorkloadKind.GATHER or node.dtype != "bf16" or len(ports) != 2 or len(outputs) != 1
+                or tuple(parameters) != (ports[1],) or shape["hidden"] not in (256, 512)
+                or not 1 <= shape["rows"] <= 16 or shape["elements"] != shape["rows"] * shape["hidden"]
+                or attrs["index_bytes"] not in (4, 8) or attrs["gather_factor"] != 1
+                or attrs["index_count"] != shape["rows"] or attrs["scattered"] is not True
+                or attrs["materialized_output"] is not True):
+            raise ValueError("DSpark Markov embedding requires actual BF16 parameter and INT32/INT64 index ports")
+        return (KernelSpec(KernelKind.VECTOR, hardware_id, _vector_shape(node), dtype="bf16", variant="gather",
+            attributes={name: attrs[name] for name in ("gather_factor", "index_count", "index_bytes", "scattered", "materialized_output")}, **common),)
+    if node.variant == "dspark_direct_argmax":
+        if (node.kind is not WorkloadKind.VECTOR or node.dtype != "bf16" or len(ports) != 1 or len(outputs) != 1
+                or attrs["argmax_output_dtype"] != "int64" or attrs["probabilistic"] is not False
+                or attrs["topk_truncation"] is not False or attrs["values_computed"] is not False):
+            raise ValueError("DSpark argmax requires BF16 full-vocab input and explicit INT64 greedy output")
+        return (KernelSpec(KernelKind.VECTOR, hardware_id, _vector_shape(node), dtype="bf16", variant="dsv32_draft_argmax",
+            attributes={"sampling_source": "vllm_0_30_dspark_full_vocab_greedy_bf16"}, **common),)
+    return None
+
+
+def _validate_dspark_source_ports(node, graph):
+    """Keep actual producer ports before any cached lowering can be reused."""
+    attrs = node.attributes
+    bound = ("source_v4_aux_capture" in attrs or
+        "source_dspark_bound_target" in attrs and attrs["source_dspark_bound_target"] is True)
+    if bound:
+        binding = _CURRENT_DSPARK_SOURCE_GRAPH.get()
+        if binding is None or binding[0] is not graph or graph.node(node.node_id) is not node:
+            raise ValueError("DSpark bound source requires this invocation's actual graph/node proof")
+        proofs = binding[1]
+        if node.rank not in proofs:
+            # The first actual target embedding identifies this invocation.
+            # Source lookup is direct; no graph scan or lazy materialization.
+            marker = ":embedding"
+            tp1_widen = (node.kind is WorkloadKind.VECTOR and node.variant == "vllm_embedding_id_widen"
+                and node.dtype == "int32" and "source_component" in attrs
+                and attrs["source_component"] == "vllm_0_30_symbolic_embedding"
+                and "embedding_source" in attrs and attrs["embedding_source"] == "vllm_0_30_unquantized_tp1")
+            if ((node.variant != "embedding" and not tp1_widen) or marker not in node.node_id
+                    or "source_v4_aux_capture" not in attrs or not _declared_dspark_source(node)):
+                raise ValueError("DSpark bound target requires its actual current target embedding before capture")
+            if tp1_widen:
+                memory = binding[2]
+                if memory is None or node.node_id not in memory._by_node:
+                    raise ValueError("DSpark TP1 embedding requires the current TraceMemoryContext")
+                source = memory._by_node[node.node_id]
+                rows = node.shape["rows"]
+                if (node.shape != {"rows": rows, "elements": rows} or rows < 1
+                        or source.rank != node.rank or source.pool_name != node.pool_name or source.attributes != attrs
+                        or source.kind is not node.kind or source.variant != node.variant
+                        or len(source.inputs) != 1 or len(source.outputs) != 1
+                        or source.inputs[0].dtype != "int32" or source.outputs[0].dtype != "int64"
+                        or source.inputs[0].shape != (rows,) or source.outputs[0].shape != (rows,)
+                        or tuple(view.view_id for view in source.inputs) != tuple(attrs["symbolic_tensor_inputs"])
+                        or tuple(view.view_id for view in source.outputs) != tuple(attrs["symbolic_tensor_outputs"])):
+                    raise ValueError("DSpark TP1 embedding requires its actual INT32-to-INT64 producer ports")
+            prefix, invocation = node.node_id.split(marker, 1)
+            if invocation and (not invocation.startswith(":") or not invocation[1:].isdigit()):
+                raise ValueError("DSpark target invocation must retain its source recorder identity")
+            ordinal = int(invocation[1:]) if invocation else 0
+            candidates = tuple(prefix + ":draft:capture-concat" + (f":{index}" if index else "")
+                for index in range(ordinal + 1))
+            present = tuple(name for name in candidates if name in graph._nodes_by_id)
+            if len(present) != 1:
+                raise ValueError("DSpark target auxiliary source requires one actual current draft capture consumer")
+            concat_id, = present
+            suffix = concat_id[len(prefix + ":draft:capture-concat"):]
+            concat = graph.node(concat_id)
+            if (not _declared_dspark_source(concat) or concat.attributes["source_dspark_bound_target"] is not True
+                    or concat.rank != node.rank or concat.pool_name != node.pool_name
+                    or concat.attributes["source_operation"] != "cat_last_dim"):
+                raise ValueError("DSpark capture consumer must retain exact same-TP bound target identity")
+            layers = tuple(concat.attributes["target_capture_layers"])
+            hidden = { (40, 41, 42): 4096, (58, 59, 60): 7168 }[layers]
+            rows = concat.shape["rows"]
+            if (concat.kind is not WorkloadKind.GATHER or concat.variant != "gather" or concat.dtype != "bf16"
+                    or concat.shape != {"rows": rows, "hidden": 3 * hidden, "elements": rows * 3 * hidden}
+                    or rows <= 0 or len(concat.attributes["symbolic_tensor_outputs"]) != 1):
+                raise ValueError("DSpark capture concat must materialize three exact BF16 target layers")
+            means = []
+            for layer in layers:
+                mean_id = prefix + f":aux-layer-{layer}:mean" + suffix
+                post_id = prefix + f":aux-layer-{layer}:mhc-post" + suffix
+                if mean_id not in graph._nodes_by_id or post_id not in graph._nodes_by_id:
+                    raise ValueError("DSpark target capture is missing its actual layer mean/post producer")
+                mean, post = graph.node(mean_id), graph.node(post_id)
+                if (mean.rank != node.rank or post.rank != node.rank or mean.pool_name != node.pool_name
+                        or post.pool_name != node.pool_name or not _declared_dspark_source(mean)
+                        or not _declared_dspark_source(post) or mean.variant != "v4_aux_hidden_mean"
+                        or mean.shape != {"elements": rows * 4 * hidden, "rows": rows, "streams": 4, "hidden": hidden}
+                        or post.kind is not WorkloadKind.VECTOR or post.variant != "mhc_post" or post.dtype != "bf16"
+                        or post.shape["hidden"] != hidden or post.shape["hc_mult"] != 4
+                        or post.shape["elements"] != rows * 4 * hidden
+                        or tuple(mean.attributes["symbolic_tensor_inputs"]) != tuple(post.attributes["symbolic_tensor_outputs"])
+                        or post_id not in graph.predecessors(mean_id)
+                        or mean_id not in graph.predecessors(concat_id)):
+                    raise ValueError("DSpark capture requires real typed target hc4 post->mean->concat producer ports")
+                means.extend(mean.attributes["symbolic_tensor_outputs"])
+            if tuple(concat.attributes["symbolic_tensor_inputs"]) != tuple(means):
+                raise ValueError("DSpark concat must consume the three ordered actual target mean outputs")
+            projection_id = prefix + ":draft:main-proj" + suffix
+            if projection_id not in graph._nodes_by_id:
+                raise ValueError("DSpark captured target states require their actual draft main projection")
+            projection = graph.node(projection_id)
+            if (projection.kind is not WorkloadKind.LINEAR or projection.dtype != "bf16"
+                    or projection.shape != {"b": 1, "m": rows, "n": hidden, "k": 3 * hidden}
+                    or tuple(projection.attributes["symbolic_tensor_inputs"]) != tuple(concat.attributes["symbolic_tensor_outputs"])
+                    or concat_id not in graph.predecessors(projection_id)):
+                raise ValueError("DSpark captured states must feed exact BF16/FP8 draft main projection")
+            proofs[node.rank] = (prefix, suffix, layers, hidden)
+        prefix, suffix, layers, hidden = proofs[node.rank]
+        if ((node.kind is not WorkloadKind.COLLECTIVE and not node.node_id.startswith(prefix + ":")) or node.pool_name != graph.node(prefix + ":draft:capture-concat" + suffix).pool_name
+                or "target_capture_layers" in attrs and tuple(attrs["target_capture_layers"]) != layers):
+            raise ValueError("DSpark source node disagrees with its current target/draft capture identity")
+    if node.variant not in ("dspark_noncausal_swa", "dspark_markov_embedding", "dspark_direct_argmax"):
+        return
+    attrs = node.attributes
+    predecessors = tuple(graph.node(key) for key in graph.predecessors(node.node_id))
+    producers = {port: prior for prior in predecessors for port in (
+        prior.attributes["symbolic_tensor_outputs"] if "symbolic_tensor_outputs" in prior.attributes else ())}
+    inputs = attrs["symbolic_tensor_inputs"]
+    if node.variant == "dspark_noncausal_swa":
+        if any(port not in producers for port in inputs):
+            raise ValueError("DSpark attention requires its actual Q/KV/index/lens producers")
+        indices, lengths = (producers[inputs[index]] for index in (2, 3))
+        if (indices.node_id != lengths.node_id or indices.variant != "dspark_noncausal_swa_indices"
+                or tuple(inputs[2:4]) != tuple(indices.attributes["symbolic_tensor_outputs"])
+                or any(tuple(indices.attributes[name]) != tuple(attrs[name]) for name in ("q_lens", "prefix_lens", "visible_kv_lens"))):
+            raise ValueError("DSpark attention indices and visible rows must come from the same actual source kernel")
+    elif node.variant == "dspark_markov_embedding":
+        if inputs[0] not in producers:
+            raise ValueError("DSpark Markov embedding needs its actual preceding token producer")
+        previous = producers[inputs[0]]
+        if previous.variant == "dspark_direct_argmax" and previous.attributes["argmax_output_dtype"] == "int64":
+            width = 8
+        elif previous.dtype in ("int32", "int64"):
+            width = DTYPE_BYTES[previous.dtype]
+        else:
+            raise ValueError("DSpark Markov embedding requires an integer token producer")
+        if attrs["index_bytes"] != width:
+            raise ValueError("DSpark Markov input index width differs from its actual producer")
+    elif inputs[0] not in producers or producers[inputs[0]].kind is not WorkloadKind.ELEMENTWISE or producers[inputs[0]].dtype != "bf16":
+        raise ValueError("DSpark argmax requires its actual BF16 biased-logit producer")
+
+
+def _require_source_lowering_contract(node):
+    """Validate each consumed node without materializing a lazy source graph."""
+    late_dspark_storage = (node.variant == "vllm_gpu_v2_store_drafts" or node.kind is WorkloadKind.ELEMENTWISE
+        and "source_component" in node.attributes
+        and node.attributes["source_component"] == "vllm_0_30_RequestState_draft_constructor")
+    if late_dspark_storage:
+        binding = _CURRENT_DSPARK_SOURCE_GRAPH.get()
+        if binding is None or node.rank not in binding[1] or binding[0].node(node.node_id) is not node:
+            raise ValueError("DSpark resident storage requires current graph/capture proof")
+    if "source_gemm_runtime" in node.attributes:
+        checked = _CURRENT_GEMM_SOURCE_BINDINGS.get()
+        if checked is None or id(node) not in checked:
+            raise ValueError("pre-marked GEMM runtime requires current source_launch_inputs and full source validation")
+    if ("source_v4_aux_capture" in node.attributes or node.variant == "v4_aux_hidden_mean"
+            or "source_dspark_bound_target" in node.attributes and node.attributes["source_dspark_bound_target"] is True):
+        binding = _CURRENT_DSPARK_SOURCE_GRAPH.get()
+        if binding is None or not _declared_dspark_source(node):
+            raise NotImplementedError("V4 target auxiliary capture source has no bound DSpark operator/lowering contract")
+        _validate_dspark_source_ports(node, binding[0])
+    if "source_dspark_standalone" in node.attributes or node.variant in (
+            "dspark_noncausal_swa", "dspark_noncausal_swa_indices", "dspark_markov_embedding", "dspark_direct_argmax"):
+        if not _declared_dspark_source(node):
+            raise NotImplementedError("DSpark complete noncausal source has no bound KernelSpec/lowering program; Goal05 pricing remains unbound")
+
+
+def _node_physical_attributes(node, routing_relabelling=None):
+    """Keep pricing geometry while leaving source identities on their calls."""
     attributes = dict(node.attributes)
-    # Source TP embedding lowering derives vocabulary-shard ownership from
-    # the node's rank in its deployment. Identical IDs on two ranks do not
-    # imply identical weight reads or emitted KernelSpecs.
-    rank_sensitive_embedding = (node.kind is WorkloadKind.GATHER and node.variant == "embedding"
-        and "embedding_source" in attributes)
     # These are WorkloadGraph provenance/binding metadata, not inputs to
     # KernelSpec construction. Keep them on the original graph and calls;
     # per-step object names and logical slot coordinates must not retain a
@@ -296,6 +721,21 @@ def _logical_node_contract(node: WorkloadNode, routing_relabelling=None):
     for name in _SOURCE_OBJECT_ATTRIBUTES:
         if name in attributes:
             attributes.pop(name)
+    if (node.kind is WorkloadKind.FLASH_ATTN
+            and "source_program" in attributes
+            and attributes["source_program"] == "vllm_0_30_fa3_gqa_full_decode"
+            and "fa3_full_physical_parents" in attributes):
+        # Allocation/producer/lifetime identities are checked by the source
+        # and memory binders, per actual call. Retain their offsets, shapes
+        # and strides in the physical key as well.
+        parents = attributes["fa3_full_physical_parents"]
+        if (type(parents) is tuple and len(parents) == 2
+                and all(type(parent) is tuple and len(parent) == 6 for parent in parents)):
+            attributes["fa3_full_physical_parents"] = tuple(parent[1:4] for parent in parents)
+    if is_heterogeneous_moe(node):
+        for name in _HETEROGENEOUS_SOURCE_BINDING_ATTRIBUTES:
+            if name in attributes:
+                attributes.pop(name)
     if node.kind is WorkloadKind.FUSED_MOE:
         attributes.pop("routing_provenance")
         attributes.pop("moe_invocation_id")
@@ -306,6 +746,17 @@ def _logical_node_contract(node: WorkloadNode, routing_relabelling=None):
     elif (node.kind is WorkloadKind.COLLECTIVE
           and "moe_invocation_id" in attributes):
         attributes.pop("moe_invocation_id")
+    return attributes
+
+
+def _logical_node_contract(node: WorkloadNode, routing_relabelling=None):
+    """Freeze KernelSpec inputs, excluding placement and traced object IDs."""
+
+    _require_source_lowering_contract(node)
+    attributes = _node_physical_attributes(node, routing_relabelling)
+    # TP embedding reads the actual rank's vocabulary shard.
+    rank_sensitive_embedding = (node.kind is WorkloadKind.GATHER and node.variant == "embedding"
+        and "embedding_source" in attributes)
     if type(node) is WorkloadNode:
         # Canonical fields have a fixed public order. Keep the exact existing
         # pickle contract without rebuilding dataclass metadata for each node.
@@ -353,8 +804,14 @@ def _memo_contracts(graph: WorkloadGraph, memo=None, *, source_layout=_SOURCE_LA
         bound = memo.source_bound_contracts(graph, source_layout=source_layout)
         if bound is not None:
             return bound
-    freeze = (memo.logical_contract if memo is not None and graph._is_node_binding
-        else _logical_node_contract)
+    if memo is not None and not graph._is_node_binding:
+        from src.serving.workload.workload_graph import (
+            _node_update_source_unchanged, _workload_node_field_updates_read)
+        if _node_update_source_unchanged():
+            return {node.node_id: (memo.module_contract(node, _workload_node_field_updates_read(node))
+                    if "_module_source_frame" in node.__dict__ else _logical_node_contract(node))
+                for node in graph.nodes if node.kind is not WorkloadKind.FUSED_MOE}
+    freeze = memo.logical_contract if memo is not None and graph._is_node_binding else _logical_node_contract
     return {
         node.node_id: freeze(node)
         for node in graph.nodes
@@ -362,7 +819,7 @@ def _memo_contracts(graph: WorkloadGraph, memo=None, *, source_layout=_SOURCE_LA
     }
 
 
-def _fused_moe_routing_relabelling(node, hardware_id, hardware):
+def _fused_moe_routing_relabelling(node, hardware_id, hardware, canonical_axes=None):
     """Return this MoE node's canonical routing, or ``None`` to keep its own.
 
     The grouped projections read the expert axis only through the physical
@@ -372,9 +829,32 @@ def _fused_moe_routing_relabelling(node, hardware_id, hardware):
     stream keeps its exact histogram instead.
     """
 
-    if "owned_experts" not in node.attributes:
+    if ("source_component" in node.attributes
+            and node.attributes["source_component"] == "sglang_0_5_19_symbolic_fused_shared_moe"
+            and hardware.supports_source_contract("sglang_0_5_19_symbolic_fused_shared_moe")):
+        # Its existing external router also supplies the fused shared column.
+        # Keep the declared axis; a vLLM recipe cannot identify this caller.
         return None
-    recipe = select_fused_moe_recipe(hardware_id, node.shape, hardware)
+    if _h200_bf16_expert_math_domain(node, hardware_id):
+        if "owned_experts" not in node.attributes or not node.attributes["owned_experts"]:
+            return None
+        counts, owned = node.attributes["tokens_per_expert"], node.attributes["owned_experts"]
+        native = (canonical_axes is not None and type(counts) is tuple and type(owned) is tuple
+            and all(type(value) is int for value in counts) and all(type(value) is int for value in owned))
+        if not native:
+            return canonical_expert_axis(counts, owned)
+        key = id(counts), owned
+        if key in canonical_axes:
+            retained, result = canonical_axes[key]
+            if retained is not counts:
+                raise RuntimeError("source expert-axis identity collision")
+            return result
+        result = canonical_expert_axis(counts, owned)
+        canonical_axes[key] = counts, result
+        return result
+    if "owned_experts" not in node.attributes or not node.attributes["owned_experts"]:
+        return None
+    recipe = select_fused_moe_recipe(hardware_id, node.shape, hardware, node.attributes)
     if ROUTING_ORDER_SENSITIVE_RECIPE_VARIANTS.intersection(recipe):
         return None
     return canonical_expert_axis(
@@ -397,6 +877,7 @@ class KernelLoweringMemo:
             raise ValueError("kernel lowering memo max_entries must be a positive int")
         self._max_entries = max_entries
         self._specs = OrderedDict()
+        self._source_vector_recipes = OrderedDict()
         self._hardware_objects = {}
         self._hit_count = 0
         self._miss_count = 0
@@ -405,6 +886,90 @@ class KernelLoweringMemo:
         self._source_compactions = OrderedDict()
         self._source_binding_contracts = OrderedDict()
         self._source_moe_static_contracts = OrderedDict()
+        self._module_contracts = OrderedDict()
+        self._call_templates = OrderedDict()
+        self.call_template_hits = 0
+        self.call_template_misses = 0
+        self.module_contract_hits = 0
+        self.module_contract_misses = 0
+        self._glm_decode_plans = weakref.WeakKeyDictionary()
+
+    def source_vector_recipe(self, node, contract, hardware_id, hardware):
+        """Reuse immutable geometry after the ordinary exact node contract.
+
+        Source object identities are excluded by the same contract as specs;
+        vector selectors read only the retained shape/layout/branch fields.
+        Current source ports and graph validation still run on every step.
+        """
+        key = (contract, id(hardware))
+        if key in self._source_vector_recipes:
+            self._source_vector_recipes.move_to_end(key)
+            return self._source_vector_recipes[key]
+        recipe = _node_source_launches(node, hardware_id, hardware)
+        self._retain_source_value(self._source_vector_recipes, key, recipe)
+        return recipe
+
+    def bind_call(self, call_id, spec, pool, rank, resource, source, dependencies):
+        """Reuse validated per-node compiled call fields; always bind the DAG."""
+        key = (id(spec), pool, rank, resource)
+        if key in self._call_templates:
+            template = self._call_templates[key]
+            if template.kernel_spec is not spec:
+                raise RuntimeError("compiled call recipe identity collision")
+            self._call_templates.move_to_end(key)
+            self.call_template_hits += 1
+            return template.bind_source_call(call_id, source, dependencies)
+        call = KernelCall(call_id, spec, pool, rank, resource, (source,), dependencies)
+        self._retain_source_value(self._call_templates, key, call)
+        self.call_template_misses += 1
+        return call
+
+    def module_contract(self, node, lineage):
+        """Compile an exact physical class from recorded source write facts.
+
+        Source ports and annotations remain current on the complete graph.
+        Only this owner's existing KernelSpec projection is shared. Opaque
+        physical fields take the ordinary serializer path on every call.
+        """
+        if lineage is None:
+            return _logical_node_contract(node)
+        parent, shapes, attributes = lineage
+        from src.serving.workload.traced_forward import _ForwardModuleFrame
+        if "_module_source_frame" not in parent.__dict__:
+            return _logical_node_contract(node)
+        reference = parent.__dict__["_module_source_frame"]
+        frame = reference() if type(reference) is weakref.ReferenceType else None
+        if (type(frame) is not _ForwardModuleFrame or parent.node_id not in frame.node_templates
+                or frame.node_templates[parent.node_id] is not parent):
+            return _logical_node_contract(node)
+        ignored = _SOURCE_OBJECT_ATTRIBUTES
+        if is_heterogeneous_moe(node):
+            ignored = ignored | _HETEROGENEOUS_SOURCE_BINDING_ATTRIBUTES
+        # Fused/collective provenance has its own graph validation/recipes.
+        if node.kind in (WorkloadKind.FUSED_MOE, WorkloadKind.COLLECTIVE):
+            return _logical_node_contract(node)
+        physical = tuple((name, node.attributes[name]) for name in attributes if name not in ignored)
+        geometry = tuple((name, node.shape[name]) for name in shapes)
+        if not self._immutable_source_value((geometry, physical)):
+            return _logical_node_contract(node)
+        # Python tuple equality merges bool/int/float and signed zero. Keep
+        # the ordinary exact contract's type/bit distinctions in bound writes.
+        key = (id(parent), pickle.dumps((geometry, physical), protocol=5), is_heterogeneous_moe(node))
+        if key in self._module_contracts:
+            reference, contract = self._module_contracts[key]
+            if reference() is parent:
+                self._module_contracts.move_to_end(key)
+                self.module_contract_hits += 1
+                return contract
+            del self._module_contracts[key]
+        if (not self._immutable_source_value(tuple(parent.shape.items()))
+                or any(not self._immutable_source_value(value) for name, value in parent.attributes.items()
+                    if name not in ignored)):
+            return _logical_node_contract(node)
+        contract = _logical_node_contract(node)
+        self._retain_source_value(self._module_contracts, key, (weakref.ref(parent), contract))
+        self.module_contract_misses += 1
+        return contract
 
     def _retain_source_value(self, cache, key, value):
         cache[key] = value
@@ -787,17 +1352,107 @@ def _source_linear_data_inputs(node):
     return (inputs[0],)
 
 
+
+
+def _qwen030_dp_sp(config):
+    return (config.data_parallel_size > 1 and config.tensor_parallel_size >= 1
+        and config.expert_parallel_size == (config.tensor_parallel_size * config.data_parallel_size if config.enable_expert_parallel else 1)
+        and config.sequence_parallel_size in ((1, config.tensor_parallel_size) if config.enable_expert_parallel else (1,))
+        and config.context_parallel_size == 1)
+
+
+def _validate_distributed_ep_gate(graph, node, logits_gather, gate_outputs, expert_inputs):
+    """Each gathered router shard consumes its matching gathered hidden shard."""
+    rows = node.attributes["source_dp_lane_rows"]
+    logical = node.attributes["source_dp_logical_rows"]
+    tp = node.attributes["source_tensor_parallel_size"]
+    ep = node.attributes["expert_parallel_size"] > 1
+    sp = ep and tp > 1
+    if (not isinstance(rows, tuple) or not isinstance(logical, tuple) or len(logical) < 2
+            or any(type(value) is not int or value < 0 for value in (*rows, *logical))
+            or type(tp) is not int or tp < 1
+            or (ep and len(rows) != node.attributes["expert_parallel_size"])):
+        raise ValueError("distributed MoE requires complete logical/lane row geometry")
+    expected = tuple(-(-value // tp) for value in logical for _ in range(tp)) if sp else logical
+    order = "dp_then_tp_lane_then_row" if sp else "dp_then_row"
+    if (rows != expected or sum(rows) != node.shape["tokens"]
+            or node.attributes["model_execution_version"] != "vllm_0_30_0"
+            or node.attributes["source_dp_row_order"] != order
+            or node.attributes["source_padding_routing"] != "declared_routing_for_physical_rows_including_padding_not_observed_topk"):
+        raise ValueError("distributed MoE padding and physical routing geometry disagree")
+    candidates = tuple(graph.node(name) for name in graph.predecessors(node.node_id)
+        if graph.node(name).kind is WorkloadKind.COLLECTIVE
+        and expert_inputs[0] in graph.node(name).attributes["symbolic_tensor_outputs"])
+    if len(candidates) != 1:
+        raise ValueError("distributed EP experts require one actual gathered hidden-state input")
+    hidden_gather, = candidates
+    participants = logits_gather.attributes["participants"]
+    for gather, width in ((hidden_gather, node.shape["hidden"]), (logits_gather, node.shape["experts"])):
+        attributes = gather.attributes
+        if (gather.kind is not WorkloadKind.COLLECTIVE or gather.pool_name != node.pool_name or gather.dtype != "bf16"
+                or attributes["operation"] != "all_gatherv" or attributes["participants"] != participants
+                or attributes["symbolic_variable_rows"] != rows or attributes["symbolic_variable_row_shape"] != (width,)
+                or attributes["bytes"] != sum(rows) * width * 2
+                or len(attributes["symbolic_tensor_outputs"]) != len(rows)
+                or len(attributes["symbolic_tensor_inputs"]) != sum(bool(value) for value in rows)):
+            raise ValueError("distributed EP gather must preserve the complete ordered participant row extents")
+    if node.rank not in participants:
+        raise ValueError("distributed MoE rank is outside its actual dispatch group")
+    rank_index = participants.index(node.rank)
+    if (len(participants) != len(rows) or participants[rank_index] != node.rank
+            or gate_outputs != (logits_gather.attributes["symbolic_tensor_outputs"][rank_index],)
+            or expert_inputs[0] != hidden_gather.attributes["symbolic_tensor_outputs"][rank_index]):
+        raise ValueError("distributed EP routing must bind this rank's gathered public tensor views")
+    gates = tuple(graph.node(edge.source) for edge in graph.edges
+        if edge.destination == logits_gather.node_id and edge.kind == "data")
+    active = tuple((rank, count) for rank, count in zip(participants, rows, strict=True) if count)
+    if len(gates) != len(active):
+        raise ValueError("distributed EP logits require one real gate per nonempty lane")
+    for (rank, count), hidden_port, logits_port in zip(active,
+            hidden_gather.attributes["symbolic_tensor_inputs"], logits_gather.attributes["symbolic_tensor_inputs"], strict=True):
+        matches = tuple(gate for gate in gates if gate.rank == rank)
+        if len(matches) != 1:
+            raise ValueError("distributed EP router gates must preserve physical participant ownership")
+        gate, = matches
+        if (gate.kind is not WorkloadKind.ROUTER or gate.pool_name != node.pool_name or gate.dtype != "bf16"
+                or gate.variant != "gemm" or dict(gate.shape) != {"b": 1, "m": count, "n": node.shape["experts"], "k": node.shape["hidden"]}
+                or _source_linear_data_inputs(gate) != (hidden_port,)
+                or gate.attributes["symbolic_tensor_outputs"] != (logits_port,)):
+            raise ValueError("distributed EP router shards must consume the corresponding actual hidden segments")
+    outputs = node.attributes["symbolic_tensor_outputs"]
+    combines = tuple(graph.node(edge.destination) for edge in graph.edges
+        if edge.source == node.node_id and edge.kind == "data" and graph.node(edge.destination).kind is WorkloadKind.COLLECTIVE
+        and outputs[0] in graph.node(edge.destination).attributes["symbolic_tensor_inputs"])
+    if len(combines) != 1:
+        raise ValueError("distributed MoE expert output must enter one matching sum-scatter")
+    combine, = combines
+    attrs = combine.attributes
+    if (attrs["operation"] != "reduce_scatterv" or attrs["participants"] != participants
+            or attrs["reduction"] != "sum" or attrs["symbolic_variable_rows"] != rows
+            or attrs["symbolic_variable_row_shape"] != (node.shape["hidden"],)
+            or attrs["moe_invocation_id"] != node.attributes["moe_invocation_id"]
+            or attrs["symbolic_tensor_inputs"][rank_index] != outputs[0]
+            or len(attrs["symbolic_tensor_outputs"]) != sum(bool(value) for value in rows)):
+        raise ValueError("distributed MoE combine must retain actual participant slices and expert output identities")
+
 def _validate_virtual_ep_router_inputs(graph, node):
     """Bind the separate gate/route outputs to this rank's EP experts."""
     if "symbolic_tensor_inputs" not in node.attributes:
         raise ValueError("virtual EP experts omitted their source tensor inputs")
     inputs = node.attributes["symbolic_tensor_inputs"]
     if "memory_input_roles" in node.attributes:
-        roles = ("hidden_states", "routing_weights", "expert_ids", "w13_weight", "w2_weight")
+        empty = "symbolic_zero_extent_parameter_roles" in node.attributes
+        if empty and (node.attributes["symbolic_zero_extent_parameter_roles"] != ("w13_weight", "w2_weight")
+                or node.attributes["expert_parallel_size"] <= node.shape["experts"]
+                or node.attributes["owned_experts"] or node.attributes["model_execution_version"] != "vllm_0_30_0"
+                or "symbolic_parameter_inputs" in node.attributes):
+            raise ValueError("empty expert rank cannot invent parameters or nonempty ownership")
+        roles = (("hidden_states", "routing_weights", "expert_ids") if empty else
+            ("hidden_states", "routing_weights", "expert_ids", "w13_weight", "w2_weight"))
         if (node.attributes["memory_input_roles"] != roles or len(inputs) != len(roles)
                 or len(set(inputs)) != len(inputs)
                 or node.attributes["memory_output_roles"] != ("output",)
-                or node.attributes["symbolic_parameter_inputs"] != tuple(inputs[3:])
+                or (not empty and node.attributes["symbolic_parameter_inputs"] != tuple(inputs[3:]))
                 or node.attributes["expert_parameter_layout"] != "unquantized_checkpoint_expert_major_nk"
                 or node.attributes["model_execution_version"] not in (
                     "vllm_0_11_0", "vllm_0_18_0", "vllm_0_24_0", "vllm_0_30_0")):
@@ -915,6 +1570,9 @@ def _validate_virtual_ep_router_inputs(graph, node):
         gate_outputs = cast.attributes["symbolic_tensor_inputs"]
     if {"symbolic_tensor_inputs", "symbolic_tensor_outputs"} - set(gate.attributes):
         raise ValueError("virtual EP gate omitted its source tensor ports")
+    if "source_dp_lane_rows" in node.attributes:
+        _validate_distributed_ep_gate(graph, node, gate, gate_outputs, inputs)
+        return
     if (gate.kind is not WorkloadKind.ROUTER or gate.rank != node.rank or gate.pool_name != node.pool_name
             or gate.dtype != "bf16" or gate.variant != "gemm"
             or gate.shape != {"b": 1, "m": node.shape["tokens"], "n": node.shape["experts"], "k": node.shape["hidden"]}
@@ -967,8 +1625,10 @@ def _ep_verifier_functions():
     from src.serving.deployment.deployment_config import _normalize_worker_role
     names = ("_validate_ep_fused_moe_graph", "_validate_virtual_ep_router_inputs",
         "_graph_token_domain", "_symbolic_glm_pipeline_projection", "_symbolic_kimi_pipeline_projection",
+        "_symbolic_kimi_parallel_projection",
         "_reuse_ep_native_frame_recipe", "_native_plan_binding_layout", "_explicit_source_expert_specs",
-        "_flash_attn_specs", "_source_flash_attn_specs", "_fused_moe_specs", "_logical_node_contract", "_fused_moe_routing_relabelling")
+        "_flash_attn_specs", "_source_flash_attn_specs", "_fused_moe_specs", "_logical_node_contract", "_fused_moe_routing_relabelling",
+        "_node_physical_attributes", "_native_lowering_group_key")
     if any(name not in globals() for name in names):
         return None
     functions = tuple(globals()[name] for name in names)
@@ -1044,6 +1704,7 @@ def _ep_unpadded_source_rows(graph):
 
 
 def _ep_validation_layout(graph,deployment):
+    from src.serving.workload.traced_forward import _source_bound_topology
     dep=_ep_deployment_projection(deployment)
     if dep is None or graph.block_repeats:return None
     experts=tuple(node for node in graph.nodes if node.kind is WorkloadKind.FUSED_MOE)
@@ -1059,6 +1720,9 @@ def _ep_validation_layout(graph,deployment):
             or node.attributes['source_component']!='symbolic_unquantized_experts' for node in experts)
             or any('source_program' not in node.attributes
                 or not (node.attributes['source_program']=='vllm_0_11_fp32_softmax_topk'
+                    or (node.attributes['source_program']=='vllm_0_30_bf16_softmax_topk'
+                        and node.dtype == 'bf16'
+                        and HWSpec.source_contract_supported('unbound_bf16_expert_source_math', deployment.worker_pools[node.pool_name].hardware_id))
                     or (node.attributes['source_program']=='vllm_0_24_bf16_softmax_topk'
                         and HWSpec.source_contract_supported('vllm_0_24_bf16_softmax_topk', deployment.worker_pools[node.pool_name].hardware_id))
                     or (node.attributes['source_program']=='vllm_0_18_bf16_softmax_topk'
@@ -1084,7 +1748,7 @@ def _ep_validation_layout(graph,deployment):
         if not _ep_native_value(fixed[:1]+fixed[2:6]):return None
         proof.append((node.kind,(node,fixed,static)))
     if any(type(edge) is not WorkloadEdge or not all(type(value) is str for value in (edge.source,edge.destination,edge.kind)) for edge in graph.edges):return None
-    return dep,tuple(proof),graph.edges
+    return dep,tuple(proof),_source_bound_topology(graph)[0]
 
 _EP_SOURCE_RECIPE_LAYOUTS = weakref.WeakKeyDictionary()
 
@@ -1146,7 +1810,7 @@ def _reuse_ep_source_recipe(graph, deployment, owner, layout, *, source_layout=_
     """Reuse only source-issued immutable structure; all current routing stays live."""
     from src.serving.workload.traced_forward import _source_bound_node_layout
     from src.serving.workload.runtime_inputs import _routing_certificate_context, _routing_certificate_contexts_native
-    from src.serving.workload.traced_forward import _source_bound_node_sequence
+    from src.serving.workload.traced_forward import _source_bound_node_sequence, _source_bound_topology
     nodes = _source_bound_node_sequence(graph)
     if owner not in _EP_SOURCE_RECIPE_LAYOUTS:
         return None
@@ -1163,7 +1827,7 @@ def _reuse_ep_source_recipe(graph, deployment, owner, layout, *, source_layout=_
     if not _ep_verifier_unchanged(behavior):
         return False
     current_dep = _ep_deployment_projection(deployment)
-    if (current_dep is None or current_dep != dep or graph.edges is not expected_edges
+    if (current_dep is None or current_dep != dep or _source_bound_topology(graph)[0] is not expected_edges
             or len(nodes) != len(template_nodes)):
         return False
     rows = _ep_unpadded_source_rows(graph)
@@ -1233,6 +1897,7 @@ def _reuse_ep_source_recipe(graph, deployment, owner, layout, *, source_layout=_
 
 
 def _reuse_ep_source_validation(graph, deployment, *, source_layout=_SOURCE_LAYOUT_UNSET):
+    from src.serving.workload.traced_forward import _source_bound_topology
     from src.serving.workload.traced_forward import _ep_source_owner
     from src.serving.workload.runtime_inputs import _routing_certificate_context
     owner = _ep_source_owner(graph, check_source=False)
@@ -1248,7 +1913,7 @@ def _reuse_ep_source_validation(graph, deployment, *, source_layout=_SOURCE_LAYO
     if _ep_source_owner(graph, check_source=True) is not owner or not _ep_verifier_unchanged(behavior):
         return False
     current_dep=_ep_deployment_projection(deployment)
-    if current_dep is None or current_dep!=dep or graph.edges is not edges or len(graph.nodes)!=len(proof):return False
+    if current_dep is None or current_dep!=dep or _source_bound_topology(graph)[0] is not edges or len(graph.nodes)!=len(proof):return False
     rows = _ep_unpadded_source_rows(graph)
     if rows is None:
         return False
@@ -1334,6 +1999,14 @@ def _validate_ep_fused_moe_graph(
         if node.pool_name not in deployment.worker_pools:
             raise ValueError(
                 f"FUSED_MOE node references unknown pool {node.pool_name!r}")
+        source_pool = deployment.worker_pools[node.pool_name]
+        if any(key.startswith("source_fp8_") for key in node.attributes) and not (
+                _symbolic_glm_fp8_rank_local_mtp_ep_projection(node, source_pool)
+                or _symbolic_glm_mtp_data_projection(node, source_pool)
+                or _symbolic_glm_fp8_target_dp_projection(node, source_pool)):
+            raise ValueError("deferred FP8 expert metadata requires its exact source scope; legacy mapped EP8 is distinct")
+        if _symbolic_glm_fp8_rank_local_mtp_ep_projection(node, source_pool):
+            _validate_glm_rank_local_fp8_expert_node(node, source_pool)
         expected_expert_parallel_size = (
             deployment.worker_pools[
                 node.pool_name].parallel_plan.config.expert_parallel_size)
@@ -1348,6 +2021,7 @@ def _validate_ep_fused_moe_graph(
         pool
         for pool in deployment.worker_pools.values()
         if pool.parallel_plan.config.enable_expert_parallel
+        and any(node.pool_name == pool.name for node in graph.nodes)
     )
     if not ep_pools:
         if ep_nodes:
@@ -1368,6 +2042,16 @@ def _validate_ep_fused_moe_graph(
     ep_pool_name = next(iter(ep_pool_names))
     ep_pool = deployment.worker_pools[ep_pool_name]
     parallelism = ep_pool.parallel_plan.config
+    if parallelism.data_parallel_size > 1 and all(_symbolic_kimi_dp_projection(node, ep_pool) for node in ep_nodes):
+        return  # Dedicated Kimi DP graph validator already checked dispatch/combine/ownership.
+    if ((parallelism.context_parallel_size > 1 or parallelism.data_parallel_size > 1)
+            and all(_symbolic_glm_pcp_projection(node, ep_pool) for node in ep_nodes)):
+        _validate_glm_pcp_expert_graph(graph, ep_pool, ep_nodes)
+        return
+    if (parallelism.context_parallel_size == parallelism.data_parallel_size == parallelism.sequence_parallel_size == 1
+            and all(_symbolic_glm_pcp_projection(node, ep_pool) for node in ep_nodes)):
+        _validate_glm_tensor_expert_graph(graph, ep_pool, ep_nodes)
+        return
     common_ep2 = (
         len(ep_pool.ranks) == 2
         and parallelism.worker_count == 2
@@ -1378,6 +2062,15 @@ def _validate_ep_fused_moe_graph(
         and parallelism.context_parallel_size == 1
         and parallelism.data_parallel_size == 1
     )
+    source_ep = (parallelism.tensor_parallel_size >= 1
+        and len(ep_pool.ranks) == parallelism.worker_count == parallelism.tensor_parallel_size * parallelism.pipeline_parallel_size * parallelism.data_parallel_size
+        and parallelism.expert_parallel_size == parallelism.tensor_parallel_size * parallelism.data_parallel_size
+        and parallelism.context_parallel_size == 1
+        and (parallelism.sequence_parallel_size == 1 if parallelism.data_parallel_size == 1
+            else _qwen030_dp_sp(parallelism))
+        and all("source_component" in node.attributes and node.attributes["source_component"] == "symbolic_unquantized_experts"
+            and "model_execution_version" in node.attributes
+            and node.attributes["model_execution_version"] == "vllm_0_30_0" for node in ep_nodes))
     glm_pipeline_ep8 = (deployment.mode == "colocated" and len(deployment.worker_pools) == 1
         and all(_symbolic_glm_pipeline_projection(node, ep_pool) for node in ep_nodes)
         and all(node.attributes["checkpoint_weight_dtype"] == node.attributes["routed_weight_dtype"] == "bf16"
@@ -1385,7 +2078,8 @@ def _validate_ep_fused_moe_graph(
         and HWSpec.source_contract_supported("glm_tp8_pp4_ep8_source_projection", ep_pool.hardware_id)
         and parallelism.pipeline_parallel_size == 4)
     kimi_pipeline_ep8 = (deployment.mode == "colocated" and len(deployment.worker_pools) == 1
-        and all(_symbolic_kimi_pipeline_projection(node, ep_pool) for node in ep_nodes))
+        and all(_symbolic_kimi_pipeline_projection(node, ep_pool)
+            or _symbolic_kimi_parallel_projection(node, ep_pool) for node in ep_nodes))
     replicated_ep8 = (((deployment.mode == "colocated" and len(deployment.worker_pools) == 1)
             or (deployment.mode == "pd_disagg" and worker_role_phase(ep_pool.role) in ("prefill", "decode")))
         and HWSpec.source_contract_supported("mla_tp8_ep8_source_projection", ep_pool.hardware_id)
@@ -1437,14 +2131,15 @@ def _validate_ep_fused_moe_graph(
         and attention_pools[0].parallel_plan.config.context_parallel_size == 1
         and attention_pools[0].parallel_plan.config.data_parallel_size == 1
     )
-    if not (kimi_ep8 or glm_ep8 or (common_ep2 and (independently_scheduled_ep2 or af_ep2))):
+    if not (kimi_ep8 or glm_ep8 or (common_ep2 and (independently_scheduled_ep2 or af_ep2))
+            or (source_ep and independently_scheduled_ep2)):
         raise NotImplementedError(
             "rank-local EP lowering supports independently scheduled "
             "colocated/PD or standalone AF TP=EP=2 pools with "
             "DP=PP=SP=CP=1, or the H200 GLM/Kimi replicated-row TP=EP8 source")
     tuple(
         ep_pool.collective_for(operation)
-        for operation in ("all_reduce", "all_gather")
+        for operation in (("all_reduce", "all_gather") if parallelism.tensor_parallel_size > 1 else ())
     )
     required_attributes = {
         "tokens_per_expert",
@@ -1521,7 +2216,7 @@ def _validate_ep_fused_moe_graph(
                     "EP FUSED_MOE physical tokens disagree with its graph "
                     "token-domain contract")
         if (
-            first.shape["experts"] % ep_size
+            (first.shape["experts"] % ep_size and not source_ep)
             or first.shape["topk"] > first.shape["experts"]
         ):
             raise NotImplementedError(
@@ -1669,7 +2364,8 @@ def _validate_ep_fused_moe_graph(
                 if ("symbolic_tensor_outputs" not in shared.attributes or len(shared.attributes["symbolic_tensor_outputs"]) != 1
                         or shared.kind is not WorkloadKind.LINEAR or shared.variant != "gemm" or shared.dtype != "bf16"
                         or shared.rank != node.rank or shared.pool_name != node.pool_name
-                        or dict(shared.shape) != {"b": 1, "m": node.shape["tokens"], "n": node.shape["hidden"], "k": node.shape["intermediate"] // 8}
+                        or dict(shared.shape) != {"b": 1, "m": node.shape["tokens"], "n": node.shape["hidden"],
+                            "k": node.shape["intermediate"] // parallelism.tensor_parallel_size}
                         or addition.kind is not WorkloadKind.ELEMENTWISE or addition.variant != "add"
                         or addition.rank != node.rank or addition.pool_name != node.pool_name or addition.dtype != "bf16"
                         or dict(addition.shape) != {"elements": node.shape["tokens"] * node.shape["hidden"]}
@@ -1713,7 +2409,7 @@ def _validate_ep_fused_moe_graph(
         collective = graph.node(next(iter(successor_ids)))
         if (collective.kind is not WorkloadKind.COLLECTIVE
                 or collective.pool_name != pool_name
-                or collective.attributes["operation"] != "all_reduce"
+                or collective.attributes["operation"] != ("reduce_scatterv" if parallelism.data_parallel_size > 1 and source_ep else "all_reduce")
                 or collective.attributes["bytes_semantics"] != "per_rank_input"
                 or collective.attributes["reduction"] != "sum"
                 or tuple(collective.attributes["participants"])
@@ -1773,6 +2469,12 @@ def _selected_target_compute_spec(
     shape: Mapping[str, int],
     attributes: Mapping[str, object],
 ) -> KernelSpec:
+    if variant in ("dsv32_eh_norm", "dsv32_embed_eh_norm") and "input_values_source" in node.attributes:
+        raise NotImplementedError("GLM legacy dummy EH norm requires retained position-mask/input-ID values; Goal05 pricing is unbound")
+    if (variant == "dsv32_fused_norm_rope" and attributes["cache_slot_scope"] in (
+            "outputs_only_no_cache_slots", "no_metadata_no_cache_slots")):
+        return KernelSpec(kind=kind, hardware_id=hardware_id, shape=shape, dtype=node.dtype, variant=variant,
+            attributes=attributes, launch=None, execution_support="unsupported", unsupported_reason="launch_selector_unavailable")
     launch = select_launch_config(
         hardware_id,
         kind,
@@ -1805,7 +2507,8 @@ def _selected_target_compute_spec(
 def _source_vocab_embedding_spec(node, pool, hardware_id):
     """Shared typed CUDA TP embedding lowering for source and traced callers."""
     if (node.kind is not WorkloadKind.GATHER or node.variant != "embedding"
-            or node.attributes["embedding_source"] not in ("vllm_0_30_cuda_unquantized_tp", "sglang_0_5_19_triton_unquantized_tp")):
+            or node.attributes["embedding_source"] not in ("vllm_0_30_cuda_unquantized_tp", "sglang_0_5_19_triton_unquantized_tp",
+                "vllm_0_27_1_useful_tp_embedding_aggregate")):
         raise ValueError("unsupported target embedding source")
     tp_size = pool.parallel_plan.config.tensor_parallel_size
     if node.attributes["tensor_parallel_size"] != tp_size:
@@ -2209,6 +2912,16 @@ def _target_sparse_indexer_spec(
     else:
         raise ValueError(
             f"unknown DSA indexer variant: {node.variant!r}")
+    if HWSpec.source_contract_supported("multistage_attention_indexer_unbound_source_math", hardware_id) and node.variant != "dsa_index_reuse":
+        # An indexer comprises multiple dependent physical kernels. Its
+        # logical arithmetic is valid without a single aggregate launch;
+        # prepared stage recipes bind through the KernelCall sidecar.
+        # Neither the TopK stage alone nor another GPU's recipe can stand
+        # in for this whole operator.
+        return KernelSpec(kind=KernelKind.SPARSE_ATTN_INDEXER,
+            hardware_id=hardware_id, shape=shape, dtype=node.dtype,
+            variant=node.variant, attributes=attributes, launch=None,
+            execution_support="unsupported", unsupported_reason="launch_selector_unavailable")
     return _selected_target_compute_spec(
         node, hardware_id, hardware, KernelKind.SPARSE_ATTN_INDEXER,
         node.variant, shape, attributes)
@@ -2231,6 +2944,12 @@ def _target_sparse_attention_spec(
         name: node.attributes[name]
         for name in attribute_names
     }
+    if ("mathematical_program" in node.attributes and node.attributes["mathematical_program"]
+            == "vllm_0_30_dspark_swa_noncausal_softmax_v1"):
+        attributes.update(mathematical_program=node.attributes["mathematical_program"],
+            num_speculative_tokens=node.attributes["num_speculative_tokens"])
+        return KernelSpec(KernelKind.SPARSE_ATTN,hardware_id,node.shape,dtype=node.dtype,variant=node.variant,
+            attributes=attributes,launch=None,execution_support="unsupported",unsupported_reason="launch_selector_unavailable")
     if node.variant == "dsv4_sparse_decode":
         # The per-request split-KV plan is a hardware launch decision owned
         # by the launch package (H200 vector_launch); Serving lowering
@@ -2264,6 +2983,14 @@ def _target_kv_cache_update_spec(
         attribute_names = (
             "cache_layout", "cache_write_semantics", "quantization",
             "slot_mapping_all_valid")
+        if "mathematical_program" in node.attributes:
+            if node.attributes["mathematical_program"] != "vllm_0_30_dspark_partial_context_insert_v1":
+                raise ValueError("unknown DSpark partial context insert mathematical program")
+            return KernelSpec(kind=KernelKind.KV_CACHE, hardware_id=hardware_id,
+                shape=shape, dtype=node.dtype, variant=node.variant,
+                attributes={name: node.attributes[name] for name in (
+                    *attribute_names, "mathematical_program", "valid_token_count")},
+                launch=None, execution_support="unsupported", unsupported_reason="launch_selector_unavailable")
     elif node.variant == "paged_kv_cache":
         attribute_names = (
             "cache_layout", "cache_head_layout", "kv_cache_dtype",
@@ -2288,16 +3015,24 @@ def _target_kv_cache_update_specs(node, hardware_id, hardware):
             and node.shape["compress_ratio"] == 128):
         if "finish_stage" in node.attributes and node.attributes["finish_stage"] is not None:
             raise ValueError("logical DSV4 finish node cannot preselect a split stage")
-        parent = _target_kv_cache_update_spec(node, hardware_id, hardware)
+        # Validate the logical packed output through the real store spec;
+        # selecting a parent aggregate would invent one physical launch for
+        # two distinct source kernels. KernelSpec owns request-boundary and
+        # payload validation, including zero completed states.
+        store = _target_kv_cache_update_spec(dataclasses.replace(node,
+            attributes={**node.attributes, "finish_stage": "store"}),
+            hardware_id, hardware)
         states = sum(new // 128 - old // 128 for old, new in zip(
-            parent.attributes["state_old_lens"], parent.attributes["state_new_lens"], strict=True))
-        return tuple(_target_kv_cache_update_spec(
+            store.attributes["state_old_lens"], store.attributes["state_new_lens"], strict=True))
+        # seq_len remains the source token extent in both launches. Only
+        # initialized scratch payload scales with completed boundaries.
+        compress = _target_kv_cache_update_spec(
             dataclasses.replace(node,
-                dtype="fp32" if stage == "compress" else "uint8",
-                shape={**node.shape, "dtype_bytes": 4 if stage == "compress" else 1,
-                       "elements": states * (512 if stage == "compress" else node.shape["state_bytes"])},
-                attributes={**node.attributes, "finish_stage": stage}),
-            hardware_id, hardware) for stage in ("compress", "store"))
+                dtype="fp32",
+                shape={**node.shape, "dtype_bytes": 4, "elements": states * 512},
+                attributes={**node.attributes, "finish_stage": "compress"}),
+            hardware_id, hardware)
+        return compress, store
     return (_target_kv_cache_update_spec(node, hardware_id, hardware),)
 
 
@@ -2338,11 +3073,67 @@ def _flash_attn_selection_attributes(
     return normalized
 
 
+def _h200_legacy_norm_copy_source(node, hardware_id):
+    """The actual 0.11 wrapper materializes its grouped strided input.
+
+    Copy.cu routes this noncontiguous no-cast iterator to CUDALoops.cuh;
+    the byte-offset bound includes the gaps between the real input groups.
+    No pointer alignment is needed by this strided launch branch.
+    """
+    if (not HWSpec.source_contract_supported("pytorch_2_8_grouped_strided_norm_copy_source", hardware_id) or node.kind is not WorkloadKind.ELEMENTWISE
+            or node.variant != "elementwise"
+            or "model_execution_version" not in node.attributes
+            or node.attributes["model_execution_version"] != "vllm_0_11_0"
+            or "input_materialization" not in node.attributes
+            or node.attributes["input_materialization"] != "grouped_strided_to_contiguous"):
+        return None
+    attrs = node.attributes
+    groups, rows, group_stride, row_stride = (
+        attrs[name] for name in _NORM_INPUT_MATERIALIZATION_FIELDS[1:])
+    if (any(type(value) is not int or value <= 0
+            for value in (groups, rows, group_stride, row_stride))
+            or node.shape["elements"] != groups * rows * row_stride
+            or group_stride <= rows * row_stride
+            or (attrs["operation"], attrs["reads"], attrs["writes"]) != ("copy", 1, 1)):
+        raise ValueError("legacy Norm copy must preserve its actual grouped input extent and strides")
+    return {**attrs, "tensor_iterator_source": "pytorch_2_8_sm90",
+        "source_input_layout": "strided_nocast",
+        "source_maximum_offset_bytes": DTYPE_BYTES[node.dtype] * (
+            (groups - 1) * group_stride + rows * row_stride - 1)}
+
+
 def _compute_spec(node: WorkloadNode, hardware_id: str, hardware) -> KernelSpec:
     if node.dtype is None or not node.dtype.strip():
         raise ValueError(f"compute workload {node.node_id!r} requires dtype")
     if node.variant is None or not node.variant.strip():
         raise ValueError(f"compute workload {node.node_id!r} requires variant")
+    if (node.kind is WorkloadKind.VECTOR and "source_component" in node.attributes
+            and node.attributes["source_component"] == "symbolic_vllm030_kda_chunk_stage"):
+        raise NotImplementedError("KDA chunk source children require reviewed per-stage KernelSpec and typed-service admission")
+    if (HWSpec.source_contract_supported("h200_partial_source_programs", hardware_id) and "source_component" in node.attributes
+            and node.attributes["source_component"] == "vllm_0_11_symbolic_router_logits_cast"
+            and node.attributes["launch_policy"] == "injected_launch"):
+        attrs = node.attributes
+        if (hardware.hardware_id != hardware_id or node.kind is not WorkloadKind.ELEMENTWISE
+                or node.dtype != "bf16" or node.variant != "elementwise"
+                or attrs["model_execution_version"] != "vllm_0_11_0"):
+            raise ValueError("0.11 router cast requires its exact H200 BF16 source")
+        geometry = attrs["source_moe_router_shape"]
+        if (not isinstance(geometry, tuple) or len(geometry) != 3
+                or any(type(value) is not int or value <= 0 for value in geometry)):
+            raise ValueError("0.11 router cast requires actual tokens/experts/topk")
+        tokens, experts, topk = geometry
+        if dict(node.shape) != {"elements": tokens * experts}:
+            raise ValueError("0.11 router cast extent differs from its logits matrix")
+        semantic = {name: attrs[name] for name in ("operation", "reads", "writes")}
+        # The selector's FP32 argument names the output lambda. KernelSpec
+        # retains the BF16 input; its existing cast ABI writes real FP32 bytes.
+        launch = select_launch_config(hardware_id, KernelKind.VECTOR,
+            {"tokens": tokens, "experts": experts, "topk": topk, "element_count": tokens * experts},
+            "fp32", "elementwise", {**attrs, "source_moe_router_stage": "logits_cast",
+                "routing_input_dtype": "bf16"}, hardware)
+        return KernelSpec(KernelKind.VECTOR, hardware_id, {"element_count": tokens * experts},
+            "bf16", "elementwise", attributes=semantic, launch=launch)
     kind = _SINGLE_COMPUTE_KIND[node.kind]
     if kind is KernelKind.VECTOR and node.kind is WorkloadKind.NORM:
         physical_shape = node.shape
@@ -2410,6 +3201,11 @@ def _compute_spec(node: WorkloadNode, hardware_id: str, hardware) -> KernelSpec:
         else:
             raise AssertionError(
                 f"unhandled VECTOR workload kind: {node.kind.value}")
+        missing_attributes = set(prediction_attribute_names) - set(node.attributes)
+        if missing_attributes:
+            raise ValueError(
+                f"unsupported VECTOR/{node.variant} workload: missing required attributes "
+                f"{sorted(missing_attributes)}")
         prediction_attributes = {
             name: node.attributes[name]
             for name in prediction_attribute_names
@@ -2472,6 +3268,8 @@ def _compute_spec(node: WorkloadNode, hardware_id: str, hardware) -> KernelSpec:
         }
     elif kind is KernelKind.GEMM:
         prediction_attributes = {}
+        if "source_gemm_runtime" in node.attributes:
+            prediction_attributes["source_gemm_runtime"] = node.attributes["source_gemm_runtime"]
         if "output_dtype" in node.attributes:
             prediction_attributes["output_dtype"] = node.attributes["output_dtype"]
         if "helper_launch" in node.attributes:
@@ -2530,6 +3328,15 @@ def _compute_spec(node: WorkloadNode, hardware_id: str, hardware) -> KernelSpec:
     if kind is not KernelKind.FLASH_ATTN:
         prediction_attributes.update(_kernel_graph_token_attributes(
             token_domain, physical_shape))
+    if "bf16_gemm_model" in node.attributes:
+        if (kind is not KernelKind.GEMM
+                or node.kind not in (WorkloadKind.LINEAR, WorkloadKind.LM_HEAD)
+                or not hardware.supports_source_contract("h200_partial_source_programs")):
+            raise ValueError("BF16 tiled reference requires ordinary H200 Linear/head")
+        launch = select_launch_config(hardware_id, kind, physical_shape, node.dtype,
+            variant, selection_attributes, hardware=hardware)
+        return KernelSpec(kind=kind, hardware_id=hardware_id, shape=shape, dtype=node.dtype,
+            variant=launch.execution_variant, launch=launch, attributes=prediction_attributes)
     if (kind is KernelKind.GEMM and "output_dtype" in prediction_attributes
             and prediction_attributes["output_dtype"] is not None
             and prediction_attributes["output_dtype"] != node.dtype
@@ -2583,12 +3390,29 @@ def _compute_spec(node: WorkloadNode, hardware_id: str, hardware) -> KernelSpec:
         return KernelSpec(kind=kind, hardware_id=hardware_id, shape=shape, dtype=node.dtype,
             variant=variant, attributes=prediction_attributes, launch=None,
             execution_support="unsupported", unsupported_reason="launch_selector_unavailable")
-    if (HWSpec.source_contract_supported("symbolic_fp16_unbound_source_lowering", hardware_id) and node.dtype == "fp16"
+    if (node.dtype in ("bf16", "fp16") and node.kind is WorkloadKind.NORM
+            and HWSpec.source_contract_supported("h200_partial_source_programs", hardware_id)
+            and "model_execution_version" in node.attributes
+            and node.attributes["model_execution_version"] == "vllm_0_30_0"
+            and "source_batch_invariant" not in node.attributes
+            and selection_attributes["launch_policy"] == "injected_launch"):
+        raise NotImplementedError("FP16 normalization native selection requires explicit source_batch_invariant")
+    native_fp16_vector_declared = (node.dtype == "fp16"
+        and HWSpec.source_contract_supported("vllm_source_vector_launch_binding", hardware_id)
+        and node.kind in (WorkloadKind.NORM, WorkloadKind.ACTIVATION, WorkloadKind.ROTARY, WorkloadKind.KV_UPDATE)
+        and variant in ("rmsnorm", "add_rmsnorm", "silu", "rotary", "rope", "paged_kv_cache")
+        and {"model_execution_version", "source_input_layout"}.issubset(node.attributes)
+        and (node.kind is not WorkloadKind.NORM or node.attributes["model_execution_version"] == "vllm_0_11_0"
+            or "source_batch_invariant" in node.attributes)
+        and ("swiglu_limit" not in node.attributes or node.attributes["swiglu_limit"] is None))
+    if ((HWSpec.source_contract_supported("symbolic_fp16_unbound_source_lowering", hardware_id)
+            or HWSpec.source_contract_supported("dense_fp16_symbolic_source_math", hardware_id)
+                and not native_fp16_vector_declared) and node.dtype == "fp16"
             and "symbolic_tensor_inputs" in node.attributes
             and selection_attributes["launch_policy"] == "analytical_launch"):
-        # This is an explicit source-math domain, selected before any native
-        # launch lookup. The retained C500 artifact binds BF16 only; it cannot
-        # supply a physical FP16 launch even though the typed source is known.
+        # Keep the C500 mathematical domain and unbound H200 operands.
+        # An explicitly declared H200 vector/cache source reaches its exact
+        # selector below; invalid source facts raise there without fallback.
         if token_domain is not None:
             raise NotImplementedError("FP16 source math does not bind graph-padded physical execution")
         if kind is KernelKind.GEMM:
@@ -2609,6 +3433,96 @@ def _compute_spec(node: WorkloadNode, hardware_id: str, hardware) -> KernelSpec:
                 attributes={**prediction_attributes, "mathematical_program": "dense_fp16_source_flops_bytes_v1"},
                 launch=None, execution_support="unsupported", unsupported_reason="launch_selector_unavailable")
         raise NotImplementedError("this FP16 source operator has no bound C500 launch or explicit mathematical program")
+    if (HWSpec.source_contract_supported("bf16_fp32_symbolic_matmul_source_math", hardware_id) and node.dtype == "bf16" and kind is KernelKind.GEMM
+            and {"has_bias", "weight_dtype", "weight_group_size"}.issubset(node.attributes)
+            and selection_attributes["launch_policy"] == "analytical_launch"
+            and variant == "gemm" and "output_dtype" in prediction_attributes and prediction_attributes["output_dtype"] == "fp32"
+            and node.attributes["has_bias"] is False and node.attributes["weight_dtype"] == "bf16"
+            and node.attributes["weight_group_size"] == 0 and "weight_quantization" not in node.attributes):
+        return KernelSpec(kind=kind, hardware_id=hardware_id, shape=shape, dtype="bf16", variant="gemm",
+            attributes={"output_dtype": "fp32", "weight_dtype": "bf16", "weight_group_size": 0,
+                **({"helper_launch": prediction_attributes["helper_launch"]} if "helper_launch" in prediction_attributes else {})},
+            launch=None, execution_support="unsupported", unsupported_reason="launch_selector_unavailable")
+    if (HWSpec.source_contract_supported("bf16_symbolic_matmul_source_math", hardware_id) and node.dtype == "bf16" and kind is KernelKind.GEMM
+            and {"has_bias", "weight_dtype", "weight_group_size"}.issubset(node.attributes)
+            and selection_attributes["launch_policy"] == "analytical_launch"
+            and variant in ("gemm", "gemv") and shape["b"] == 1
+            and node.attributes["has_bias"] is False
+            and "weight_dtype" in node.attributes and node.attributes["weight_dtype"] == "bf16"
+            and node.attributes["weight_group_size"] == 0 and "weight_quantization" not in node.attributes
+            and ("output_dtype" not in prediction_attributes or prediction_attributes["output_dtype"] in (None, "bf16"))):
+        return KernelSpec(kind=kind, hardware_id=hardware_id, shape=shape, dtype="bf16", variant="gemm",
+            attributes={"mathematical_program": "unquantized_bf16_flops_bytes_v1",
+                "weight_dtype": "bf16", "weight_group_size": 0, "has_bias": False},
+            launch=None, execution_support="unsupported", unsupported_reason="launch_selector_unavailable")
+    if (HWSpec.source_contract_supported("bf16_symbolic_vector_source_math", hardware_id) and node.dtype == "bf16"
+            and "symbolic_tensor_inputs" in node.attributes
+            and selection_attributes["launch_policy"] == "analytical_launch"
+            and ((kind is KernelKind.VECTOR and variant in ("rmsnorm", "add_rmsnorm", "silu", "rotary", "elementwise"))
+                or (kind is KernelKind.KV_CACHE and variant == "paged_kv_cache"))
+            and not ({"model_execution_version", "source_input_layout", "source_batch_invariant"}.issubset(selection_attributes)
+                or ({"model_execution_version", "source_input_layout"}.issubset(selection_attributes)
+                    and selection_attributes["model_execution_version"] in ("vllm_0_30_0", "vllm_0_27_1")
+                    and node.kind in (WorkloadKind.NORM, WorkloadKind.ACTIVATION, WorkloadKind.ROTARY, WorkloadKind.KV_UPDATE)
+                    and variant in ("rmsnorm", "add_rmsnorm", "silu", "rotary", "paged_kv_cache")
+                    and (node.kind is not WorkloadKind.NORM or "source_batch_invariant" in selection_attributes)
+                    and ("swiglu_limit" not in prediction_attributes or prediction_attributes["swiglu_limit"] is None)))
+            and not {"tensor_iterator_source", "source_input_layout"}.issubset(selection_attributes)):
+        # Only Norm dispatch reads the batch-invariant flag. SiLU, RoPE and
+        # cache source wrappers need their version/layout, not that flag.
+        # The virtual source fixes the arithmetic and typed storage even
+        # when provider/layout/branch facts do not identify a native launch.
+        # Reuse the existing source-work implementation with BF16 operands;
+        # no SM80 launch, missing flag or native price is substituted.
+        if token_domain is not None:
+            raise NotImplementedError("BF16 source math does not bind graph-padded native execution")
+        if (kind is KernelKind.VECTOR and variant == "silu" and "swiglu_limit" in prediction_attributes
+                and prediction_attributes["swiglu_limit"] is not None):
+            return KernelSpec(kind=kind, hardware_id=hardware_id, shape=shape, dtype="bf16", variant=variant,
+                attributes=prediction_attributes, launch=None,
+                execution_support="unsupported", unsupported_reason="launch_selector_unavailable")
+        return KernelSpec(kind=kind, hardware_id=hardware_id, shape=shape, dtype="bf16", variant=variant,
+            attributes={**prediction_attributes, "mathematical_program": "dense_bf16_source_flops_bytes_v1"},
+            launch=None, execution_support="unsupported", unsupported_reason="launch_selector_unavailable")
+    if (HWSpec.source_contract_supported("h200_partial_source_programs", hardware_id)
+            and HWSpec.source_contract_supported("unbound_materialized_gather_source_math", hardware_id)
+            and kind is KernelKind.VECTOR and variant == "gather" and node.dtype in ("bf16", "fp16")
+            and node.kind is WorkloadKind.GATHER and node.variant == "embedding"
+            and selection_attributes["launch_policy"] == "injected_launch"
+            and {"embedding_source", "model_execution_version", "source_operation"}.issubset(node.attributes)
+            and node.attributes["embedding_source"] == "vllm_0_30_unquantized_tp1"
+            and node.attributes["model_execution_version"] == "vllm_0_30_0"
+            and node.attributes["source_operation"] == "embedding"
+            and {"rows", "hidden", "source_rows"}.issubset(physical_shape)
+            and {"index_bytes", "index_count", "gather_factor", "scattered", "materialized_output"}.issubset(prediction_attributes)
+            and prediction_attributes["index_bytes"] == 8
+            and prediction_attributes["index_count"] == physical_shape["rows"]
+            and prediction_attributes["gather_factor"] == 1
+            and prediction_attributes["scattered"] is True
+            and prediction_attributes["materialized_output"] is True
+            and "index_select_source" not in prediction_attributes):
+        # The approved performance-only helper policy prices the existing
+        # selected-row read + fresh output + Long-ID ledger. This does not
+        # identify Torch/compiler resources or widen native launch support.
+        if token_domain is not None:
+            raise NotImplementedError("FP16 embedding helper does not bind graph-padded native execution")
+        return KernelSpec(kind=kind, hardware_id=hardware_id, shape=shape, dtype=node.dtype,
+            variant=variant, attributes=prediction_attributes, launch=None,
+            execution_support="unsupported", unsupported_reason="launch_selector_unavailable")
+    if (HWSpec.source_contract_supported("unbound_materialized_gather_source_math", hardware_id) and kind is KernelKind.VECTOR and variant == "gather"
+            and selection_attributes["launch_policy"] == "analytical_launch"
+            and "index_select_source" not in prediction_attributes):
+        # Existing source typed-byte math does not identify an ATen/native
+        # embedding program. Select that declared analytical domain before
+        # native lookup; do not invent missing runtime/source_rows facts.
+        if token_domain is not None:
+            raise NotImplementedError("generic gather source does not bind graph-padded native execution")
+        return KernelSpec(kind=kind, hardware_id=hardware_id, shape=shape, dtype=node.dtype,
+            variant=variant, attributes=prediction_attributes, launch=None,
+            execution_support="unsupported", unsupported_reason="launch_selector_unavailable")
+    norm_copy_source = _h200_legacy_norm_copy_source(node, hardware_id)
+    if norm_copy_source is not None:
+        selection_attributes = norm_copy_source
     launch = select_launch_config(
         hardware_id, kind, physical_shape, node.dtype, variant,
         selection_attributes, hardware=hardware)
@@ -2623,7 +3537,135 @@ def _compute_spec(node: WorkloadNode, hardware_id: str, hardware) -> KernelSpec:
     )
 
 
+def _symbolic_dsv3_l32_tp4_projection(node, pool):
+    """Consume actual validated model/source facts, not a shape-only TP4 label."""
+    from src.serving.workload.model_config import DEEPSEEK_V3_L32_CONFIG_SHA256
+    config = pool.parallel_plan.config
+    return (HWSpec.source_contract_supported("symbolic_dsv3_routed_experts", pool.hardware_id)
+        and config.tensor_parallel_size == 4
+        and len(pool.ranks) == 4 and len(pool.parallel_plan.layer_to_pipeline_stage) == 32
+        and not config.enable_expert_parallel and all(value == 1 for value in (
+            config.pipeline_parallel_size, config.sequence_parallel_size,
+            config.context_parallel_size, config.data_parallel_size))
+        and "source_component" in node.attributes and node.attributes["source_component"] in (
+            "symbolic_mla_decode_mathematical", "symbolic_mla_cache_update",
+            "vllm_0_27_1_symbolic_grouped_routing", "symbolic_dsv3_routed_experts",
+            "vllm_0_27_1_symbolic_mtp_eager", "vllm_0_27_1_symbolic_mtp_position_where")
+        and "source_model_config_sha256" in node.attributes
+        and node.attributes["source_model_config_sha256"] == DEEPSEEK_V3_L32_CONFIG_SHA256
+        and "source_model_profile" in node.attributes
+        and node.attributes["source_model_profile"] == "vllm_0_27_1_deepseek_v3_sync_fp8"
+        and "source_tensor_parallel_size" in node.attributes
+        and type(node.attributes["source_tensor_parallel_size"]) is int
+        and node.attributes["source_tensor_parallel_size"] == 4)
+
+
 def _source_flash_attn_specs(node, hardware_id, hardware):
+    if "source_component" in node.attributes and node.attributes["source_component"] == "fa3_expanded_mla_prefill_call":
+        revision = hardware.fa3_mla_source_revision_for_model(node.attributes["source_model_execution_version"])
+        if (node.kind is not WorkloadKind.FLASH_ATTN or node.variant != "mla_prefill" or node.dtype != "bf16"
+                or (node.shape["qk_head_dim"], node.shape["v_head_dim"], node.shape["kv_lora_rank"]) != (256, 256, 512)
+                or node.attributes["fa3_expanded_source_revision"] != revision
+                or node.attributes["fa3_backend_source"] != "vllm_0_30_default_hopper_flash_attn3"
+                or node.attributes["scheduler_metadata_precomputed"] is not False
+                or node.attributes["fa3_runtime_binary_bound"] is not False
+                or node.attributes["fa3_length_array_transport_bound"] is not False
+                or node.attributes["fa3_native_workspace_bound"] is not False
+                or node.attributes["causal"] is not True or node.attributes["return_softmax_lse"] is not False
+                or node.attributes["q_lens"] != node.attributes["kv_lens"]
+                or node.attributes["full_cuda_graphs"] is not False
+                or type(node.attributes["max_cudagraph_capture_size"]) is not int
+                or node.attributes["max_cudagraph_capture_size"] != 0
+                or "flash_attn_version" in node.attributes and (
+                    type(node.attributes["flash_attn_version"]) is not int or node.attributes["flash_attn_version"] != 3)
+                or any(field in node.attributes for field in ("attention_backend", "graph_runtime_mode",
+                    "graph_logical_tokens", "graph_model_input_tokens", "model_input_shape",
+                    "model_input_q_lens", "model_input_kv_lens"))):
+            raise ValueError("expanded FA3 prefill requires its exact fresh eager source scenario")
+        attrs = {name: node.attributes[name] for name in (
+            "causal", "kv_dist", "kv_layout", "q_lens", "kv_lens", "return_softmax_lse",
+            "full_cuda_graphs", "max_cudagraph_capture_size")}
+        return hardware.fa3_mla_forward_specs(node.shape, node.dtype, node.variant, attrs,
+            scheduler_metadata_precomputed=False)
+    if "fa3_full_aot_component" in node.attributes:
+        from dataclasses import replace
+        component=node.attributes["fa3_full_aot_component"]
+        if not hardware.supports_source_contract("vllm_0_30_fa3_gqa_fresh_prefill") or node.dtype!="int32":
+            raise ValueError("FA3 AOT helper requires its exact H200 INT32 caller")
+        if component=="prepare":
+            attrs={name:node.attributes[name] for name in ("q_lens","kv_lens","model_input_q_lens","model_input_kv_lens",
+                "graph_runtime_mode","graph_model_input_tokens")}
+            attrs.update({"source_program":"vllm_0_30_fa3_gqa_full_decode","causal":True,"kv_layout":"paged_varlen","kv_dist":"uniform"})
+            if (node.attributes["fa3_full_aot_head_shape"] != tuple(node.shape[field] for field in (
+                    "num_query_heads", "num_kv_heads", "head_dim"))
+                    or node.attributes["fa3_gqa_operand_dtype"] not in ("bf16", "fp16")):
+                raise ValueError("FA3 AOT prepare must preserve the actual rank-local head geometry and operand dtype")
+            selected=hardware.fa3_gqa_forward_specs(node.shape,node.attributes["fa3_gqa_operand_dtype"],attrs,
+                page_size=16,num_splits=32,scheduler_metadata_precomputed=False)[0]
+            return (replace(selected,attributes={"source_program":"vllm_0_30_fa3_full_aot_prepare",
+                "use_dynamic_split":node.shape["batch"]<=992,"head_swizzle":True}),)
+        if component=="clear":
+            return (KernelSpec(kind=KernelKind.VECTOR,hardware_id=hardware_id,shape={"elements":node.shape["elements"]},
+                dtype="int32",variant="elementwise",attributes={"reads":0,"writes":1,"operation":"fill",
+                    "mathematical_program":"vllm_0_30_fa3_aot_tail_clear"},launch=None,execution_support="unsupported",
+                    unsupported_reason="launch_selector_unavailable"),)
+        raise ValueError("FA3 AOT helper component is unknown")
+    if "fa3_gqa_caller_scenario" in node.attributes:
+        from .attention_memory_bindings import fa3_gqa_caller_facts
+        metadata = node.attributes["source_component"] == "fa3_gqa_shared_metadata_prepare"
+        expected = fa3_gqa_caller_facts(node.attributes,hardware)
+        if any(type(node.attributes[name]) is not type(value) or node.attributes[name] != value
+                for name, value in expected.items()):
+            raise ValueError("FA3 GQA caller facts differ from the declared source scenario")
+        full = ("source_program" in node.attributes
+            and node.attributes["source_program"] == "vllm_0_30_fa3_gqa_full_decode")
+        if not full and (node.attributes["graph_runtime_mode"] != "NONE"
+                or any(name in node.attributes for name in (
+                    "graph_logical_tokens", "graph_model_input_tokens", "model_input_q_lens", "model_input_kv_lens"))):
+            raise ValueError("FA3 GQA source caller has unbound captured/padded inputs")
+        attributes = {name: node.attributes[name] for name in (
+            "causal", "kv_layout", "kv_dist", "q_lens", "kv_lens", "source_model_execution_version")}
+        if full:
+            attributes.update({name:node.attributes[name] for name in ("source_program", "graph_runtime_mode",
+                "graph_model_input_tokens", "model_input_q_lens", "model_input_kv_lens")})
+        rows = attributes["graph_model_input_tokens"] if full else sum(attributes["q_lens"])
+        if "fa3_gqa_query_tokens" in expected and rows!=expected["fa3_gqa_query_tokens"]:
+            raise ValueError("FA3 source split policy must use the actual caller query extent")
+        for name in ("flash_attn_version", "attention_backend", "full_cuda_graphs", "max_cudagraph_capture_size"):
+            if name in node.attributes:
+                attributes[name] = node.attributes[name]
+        parts = hardware.fa3_gqa_forward_specs(node.shape, node.attributes["fa3_gqa_operand_dtype"], attributes,
+            page_size=node.attributes["fa3_gqa_page_size"], num_splits=node.attributes["fa3_gqa_num_splits"],
+            scheduler_metadata_precomputed=False if metadata else node.attributes["fa3_gqa_scheduler_metadata_precomputed"])
+        return (parts[0],) if metadata else parts
+    if ("source_component" in node.attributes
+            and node.attributes["source_component"] in (
+                "fa3_mla_split_prefill_call", "fa3_mla_unsplit_prefill_call")):
+        if (node.kind is not WorkloadKind.FLASH_ATTN or node.variant != "mla_prefill"
+                or node.dtype != "bf16"
+                or node.attributes["source_component"] == "fa3_mla_split_prefill_call" and node.attributes["causal"] is not False
+                or node.attributes["scheduler_metadata_precomputed"] is not False
+                or node.attributes["fa3_backend_source"] != hardware.fa3_mla_model_backend_source(
+                    node.attributes["source_model_execution_version"])
+                or node.attributes["fa3_runtime_binary_bound"] is not False
+                or node.attributes["fa3_length_array_transport_bound"] is not False
+                or "attention_backend" in node.attributes
+                or any(name in node.attributes for name in (
+                    "graph_runtime_mode", "graph_logical_tokens", "graph_model_input_tokens",
+                    "model_input_shape", "model_input_q_lens", "model_input_kv_lens"))):
+            raise ValueError("FA3 model source requires its explicit eager default-backend call")
+        if "flash_attn_version" in node.attributes and (
+                type(node.attributes["flash_attn_version"]) is not int or node.attributes["flash_attn_version"] != 3):
+            raise ValueError("FA3 model source cannot replace a FlashAttention version override")
+        revision = hardware.fa3_mla_source_revision_for_model(node.attributes["source_model_execution_version"])
+        if node.attributes["fa3_source_revision"] != revision:
+            raise ValueError("FA3 model source and selected dependency revision disagree")
+        hardware.require_fa3_mla_source_revision(revision)
+        attributes = {name: node.attributes[name] for name in (
+            "causal", "kv_dist", "kv_layout", "q_lens", "kv_lens", "full_cuda_graphs",
+            "max_cudagraph_capture_size", "return_softmax_lse")}
+        return hardware.fa3_mla_forward_specs(node.shape, node.dtype, node.variant, attributes,
+            scheduler_metadata_precomputed=node.attributes["scheduler_metadata_precomputed"])
     if ("source_component" not in node.attributes or node.attributes["source_component"] != "symbolic_gqa_mathematical"):
         return _flash_attn_specs(node,hardware_id,hardware)
     if node.kind is not WorkloadKind.FLASH_ATTN or node.variant not in ("prefill", "decode"):
@@ -2660,6 +3702,20 @@ def _source_flash_attn_specs(node, hardware_id, hardware):
             return _flash_attn_specs(node, hardware_id, hardware)
     if node.attributes["launch_policy"] not in ("analytical_launch", "injected_launch"):
         raise ValueError("symbolic GQA requires an explicit analytical or injected launch policy")
+    if (hardware.supports_source_contract("vllm_0_30_fa3_gqa_fresh_prefill")
+            and node.attributes["source_model_execution_version"] == "vllm_0_30_0"
+            and node.attributes["launch_policy"] == "analytical_launch"
+            and node.dtype == "bf16"
+            and node.variant == "prefill"):
+        # This mathematical source binds only the main. Complete caller
+        # facts above retain their own setup, combine and semaphore Fill.
+        source_launch = select_source_flash_attn_partial_launch(
+            hardware_id, node.shape, node.dtype, node.variant, node.attributes, hardware)
+        if source_launch is not None:
+            return (KernelSpec(kind=KernelKind.FLASH_ATTN, hardware_id=hardware_id,
+                shape=node.shape, dtype=node.dtype, variant=node.variant, launch=source_launch,
+                attributes={key: node.attributes[key] for key in (
+                    "causal", "kv_layout", "kv_dist", "fa_ksteps", "fa_eff_mfrac", "q_lens", "kv_lens")}),)
     return (KernelSpec(kind=KernelKind.FLASH_ATTN, hardware_id=hardware_id,
         shape=node.shape, dtype=node.dtype, variant=node.variant,
         attributes={"mathematical_program": "ascend_0_18_full_fia_softmax_v1" if ascend_fia else "gqa_softmax_v1",
@@ -3363,8 +4419,10 @@ def _gemm_specs(
         selection_variant: str,
         selection_attributes: Mapping[str, object],
         hardware_id: str, hardware):
-    if (main.launch is None and "mathematical_program" in main.attributes
-            and main.attributes["mathematical_program"] == "unquantized_fp16_flops_bytes_v1"):
+    if (main.launch is None and (("mathematical_program" in main.attributes
+            and main.attributes["mathematical_program"] in (
+                "unquantized_fp16_flops_bytes_v1", "unquantized_bf16_flops_bytes_v1"))
+            or (main.dtype == "bf16" and main.attributes["output_dtype"] == "fp32"))):
         # Useful source matmul has neither a physical quantizer nor a
         # selected split-K launch from which to derive reducer work.
         return (main,)
@@ -3380,8 +4438,43 @@ def _gemm_main_and_reducer_specs(
         selection_variant: str,
         selection_attributes: Mapping[str, object],
         hardware_id: str, hardware):
+    if main.launch.algorithm == "h200_cublaslt129_bf16_external_aggregate_gemm":
+        reducer_launch = select_gemm_reducer_launch(hardware_id, selection_shape,
+            main.dtype, selection_variant, selection_attributes, hardware=hardware)
+        if reducer_launch is None:
+            raise ValueError("legacy BF16 aggregate requires its observed separate reducer")
+        reducer = KernelSpec(kind=KernelKind.VECTOR, hardware_id=hardware_id,
+            shape={"element_count": selection_shape["b"] * selection_shape["m"] * selection_shape["n"]},
+            dtype=main.dtype, variant="gemm_reduce", launch=reducer_launch,
+            attributes={"split_k": int(main.launch.parameters["modeled_split_k"]),
+                "source_gemm_shape": {name: selection_shape[name] for name in ("b", "m", "n", "k")}})
+        return main, reducer
+    if main.launch.algorithm == "h200_vllm030_torch213_fp16_external_aggregate_gemm":
+        reducer_launch = select_gemm_reducer_launch(hardware_id, selection_shape,
+            main.dtype, selection_variant, selection_attributes, hardware=hardware)
+        if reducer_launch is None:
+            raise ValueError("external aggregate main requires its separate source reducer launch")
+        reducer = KernelSpec(kind=KernelKind.VECTOR, hardware_id=hardware_id,
+            shape={"element_count": selection_shape["b"] * selection_shape["m"] * selection_shape["n"]},
+            dtype=main.dtype, variant="gemm_reduce", launch=reducer_launch,
+            attributes={"split_k": int(main.launch.parameters["modeled_split_k"]),
+                "source_gemm_runtime": main.attributes["source_gemm_runtime"],
+                "source_gemm_shape": {name: selection_shape[name] for name in ("b", "m", "n", "k")}})
+        return main, reducer
     tiling = main.launch.tiling
     if tiling is None:
+        if (main.hardware_id == hardware_id
+                and HWSpec.source_contract_supported("h200_partial_source_programs", hardware_id)
+                and main.launch.algorithm in ("h200_cublaslt129_injected_gemm",
+                    "h200_vllm030_torch213_fp16_observed_gemm")
+                and main.variant == "gemm" and main.dtype in ("bf16", "fp16") and main.shape["b"] == 1
+                and main.attributes["output_dtype"] in (None, main.dtype)):
+            # The observed ordinary call already contains its whole result.
+            # A partial-output main still needs unknown split/reducer facts;
+            # do not turn that missing consumer into an omitted zero service.
+            if main.launch.parameters["split_k_partial_bytes_per_element"] != 0.0:
+                raise NotImplementedError("grid-only GEMM external reduction requires actual split/reducer facts")
+            return (main,)
         if main.launch.execution_variant == "gemv":
             return (main,)
         raise ValueError("production GEMM launch must declare tiling")
@@ -3562,6 +4655,18 @@ def _target_fused_moe_specs(
     model_contract: str,
 ) -> tuple[KernelSpec, ...]:
     routed_weight_dtype = node.attributes["routed_weight_dtype"]
+    if (HWSpec.source_contract_supported("unbound_grouped_bf16_expert_source_math", hardware_id) and routed_weight_dtype == "bf16"
+            and node.attributes["launch_policy"] == "analytical_launch"
+            and node.attributes["source_component"] == "symbolic_grouped_routed_experts"
+            and node.attributes["routing_source_stage"] == "dsv32_moe_route"
+            and node.attributes["checkpoint_weight_dtype"] == "bf16"
+            and node.attributes["weight_group_size"] == 0
+            and node.attributes["output_is_reduced"] is False):
+        attributes = _fused_moe_prediction_attributes(node)
+        attributes["mathematical_program"] = "unquantized_bf16_grouped_swiglu_v1"
+        return (KernelSpec(kind=KernelKind.FUSED_MOE, hardware_id=hardware_id, shape=node.shape,
+            dtype="bf16", variant="routed_experts", attributes=attributes, launch=None,
+            execution_support="unsupported", unsupported_reason="launch_selector_unavailable"),)
     if routed_weight_dtype in ("bf16", "fp8"):
         specs = _fused_moe_specs(node, hardware_id, hardware)
         if "routing_source_stage" in node.attributes:
@@ -3574,6 +4679,18 @@ def _target_fused_moe_specs(
     if routed_weight_dtype != "int4" and routed_weight_dtype != "mxfp4":
         raise ValueError(
             f"unsupported target routed weight dtype: {routed_weight_dtype!r}")
+    if (HWSpec.source_contract_supported("kimi_grouped_marlin_source_math", hardware_id) and routed_weight_dtype == "int4"
+            and node.attributes["launch_policy"] == "analytical_launch"
+            and node.attributes["source_component"] == "symbolic_grouped_routed_experts"
+            and node.attributes["routing_source_stage"] == "kimi_moe_route"):
+        # The historical program name also covers EP-off's full expert set.
+        # Preserve the producer's actual I shard and EP1 histogram; Core and
+        # the mathematical helper jointly validate its supported source domain.
+        attributes = _fused_moe_prediction_attributes(node)
+        attributes["mathematical_program"] = "kimi_ep_marlin_swiglu_v1"
+        return (KernelSpec(kind=KernelKind.FUSED_MOE, hardware_id=hardware_id, shape=node.shape,
+            dtype="bf16", variant="routed_experts", attributes=attributes, launch=None,
+            execution_support="unsupported", unsupported_reason="launch_selector_unavailable"),)
     if (model_contract == "deepseek_v4_vllm_0_30_0_logical_v1"
             and node.attributes["expert_parallel_size"] == 1):
         # EP-off TP shards apply the same expert assignment, each with its
@@ -3596,7 +4713,8 @@ def _target_fused_moe_specs(
         "routed_experts", node.shape, attributes),)
 
 
-def _transfer_spec(node: WorkloadNode, hardware_id: str) -> KernelSpec:
+def _transfer_spec(node: WorkloadNode, hardware_id: str, *,
+                   destination_hardware=None) -> KernelSpec:
     attributes = dict(node.attributes)
     if "bytes" not in attributes:
         raise ValueError(f"{node.kind.value} requires explicit bytes")
@@ -3619,11 +4737,19 @@ def _transfer_spec(node: WorkloadNode, hardware_id: str) -> KernelSpec:
             backend=attributes["backend"],
             resource_id=attributes["resource_id"],
             backend_config_sha256=attributes["backend_config_sha256"],
+            partition_bytes=(tuple(attributes["partition_bytes"]) if "partition_bytes" in attributes else ()),
             participant_nic_ids=(tuple(attributes["participant_nic_ids"])
                 if "participant_nic_ids" in attributes else ()),
             implementation=(
                 attributes["implementation"]
                 if "implementation" in attributes else None),
+            destination_hardware_id=(destination_hardware.hardware_id
+                if destination_hardware is not None else None),
+            destination_bandwidth_bytes_s=(min(
+                destination_hardware.analytical_link_bandwidth_bytes_s(attributes["link"]),
+                destination_hardware.resource_by_role("dram").capacity,
+                destination_hardware.interconnect["pcie_bw_bytes_s"])
+                if destination_hardware is not None else None),
         )
     elif node.kind is WorkloadKind.MEMCPY:
         kind = KernelKind.MEMCPY
@@ -3650,9 +4776,12 @@ def _transfer_spec(node: WorkloadNode, hardware_id: str) -> KernelSpec:
             raise ValueError(
                 "KV_OFFLOAD requires exactly one HBM endpoint, got "
                 f"{source!r} -> {destination!r}")
+        # STORE has the same D2H byte service as EVICT. The workload event
+        # keeps STORE identity so the KV ledger retains the GPU copy.
         transfer = PhysicalTransferConfig(
             algorithm=attributes["algorithm"], bytes=attributes["bytes"],
-            direction=attributes["direction"], link=attributes["link"],
+            direction=("evict" if attributes["direction"] == "store"
+                       else attributes["direction"]), link=attributes["link"],
             tier=non_hbm_tier,
         )
     else:
@@ -3668,7 +4797,7 @@ def _dense_tp_producer_output_bytes(node: WorkloadNode) -> int:
             "validated dense TP collective producer dtype must be bf16 or fp16")
     if (node.kind is WorkloadKind.VECTOR and node.variant == "vllm_masked_embedding"
             and "source_component" in node.attributes
-            and node.attributes["source_component"] in ("vllm_0_11_symbolic_masked_embedding", "vllm_0_18_symbolic_masked_embedding", "vllm_0_24_symbolic_masked_embedding", "vllm_0_30_symbolic_masked_embedding")):
+            and node.attributes["source_component"] in ("vllm_0_11_symbolic_masked_embedding", "vllm_0_18_symbolic_masked_embedding", "vllm_0_24_symbolic_masked_embedding", "vllm_0_27_1_symbolic_masked_embedding", "vllm_0_30_symbolic_masked_embedding")):
         if (node.attributes["stage"] != "mask_output" or set(node.shape) != {"elements", "rows", "hidden"}
                 or node.shape["elements"] != node.shape["rows"] * node.shape["hidden"]):
             raise ValueError("masked embedding collective producer must expose its complete BF16/FP16 output")
@@ -3729,13 +4858,43 @@ def _validate_collective_node(
     node: WorkloadNode,
     pool,
     graph: WorkloadGraph,
+    *, gqa_source: bool = False,
 ) -> None:
     attributes = node.attributes
     operation = attributes["operation"]
     collective = pool.collective_for(operation)
     logical_rank = pool.logical_rank_for_physical_rank(node.rank)
-    participants = pool.physical_rank_group("tensor", logical_rank)
-    if operation == "all_reduce":
+    variable = operation in ("all_gatherv", "reduce_scatterv")
+    if variable:
+        dimension = attributes["collective_group"]
+        if dimension not in ("expert", "data", "data_context", "context", "tensor") or (dimension != "expert"
+                and pool.parallel_plan.config.enable_expert_parallel and not (
+                    _symbolic_kimi_dp_projection(node, pool) and (
+                        dimension == "data" and pool.parallel_plan.config.tensor_parallel_size == 1
+                        or dimension == "tensor" and operation == "reduce_scatterv"
+                        and pool.parallel_plan.config.pipeline_parallel_size == 1)
+                    or _symbolic_glm_pcp_projection(node, pool) and (
+                        dimension == "data_context" and pool.parallel_plan.config.data_parallel_size == 1
+                        or dimension == "tensor" and operation == "reduce_scatterv"
+                        and pool.parallel_plan.config.pipeline_parallel_size == 1
+                        and pool.parallel_plan.config.data_parallel_size > 1
+                        and pool.parallel_plan.config.tensor_parallel_size > 1
+                        and pool.parallel_plan.config.sequence_parallel_size in (1, pool.parallel_plan.config.tensor_parallel_size)))):
+            raise ValueError("variable MoE collective requires the declared expert or EP-off data group")
+        if dimension in ("context", "tensor") and not (_symbolic_glm_pcp_projection(node, pool)
+                or dimension == "tensor" and operation == "reduce_scatterv" and _symbolic_kimi_dp_projection(node, pool)
+                and pool.parallel_plan.config.pipeline_parallel_size == 1):
+            raise ValueError("variable TP/PCP collective requires its explicit GLM PCP source scope")
+    else:
+        dimension = attributes["collective_group"] if "collective_group" in attributes else "tensor"
+        if (dimension not in ("tensor", "context") or (dimension == "context" and (
+                operation != "all_gather" or pool.parallel_plan.config.context_parallel_size < 2))):
+            raise ValueError("ordinary collective group must be TP or a configured PCP all-gather")
+    participants = pool.physical_rank_group(dimension, logical_rank)
+    if variable:
+        expected_reduction = "sum" if operation == "reduce_scatterv" else None
+        expected_ring_order = ()
+    elif operation == "all_reduce":
         expected_reduction = "sum"
         expected_ring_order = collective_ring_order(
             collective.algorithm, participants)
@@ -3751,7 +4910,9 @@ def _validate_collective_node(
             f"unknown collective operation: {operation!r}")
     if (is_heterogeneous_moe(node) and collective.link == "roce"
             and collective.backend == "analytical_roofline_v1"
-            and collective.algorithm == "ring" and pool.name == "prefill_gpu"):
+            and collective.algorithm == "ring" and (pool.name == "prefill_gpu"
+                or pool.name == "decode_gpu" and "heterogeneous_forward_scope" in node.attributes
+                and node.attributes["heterogeneous_forward_scope"] == "gpu_decode_only")):
         # This scoped scenario configures a switch-only logical ring;
         # TP shard order stays unchanged. It is not a discovered library
         # ring or permission to change any other collective contract.
@@ -3767,7 +4928,7 @@ def _validate_collective_node(
         "algorithm": collective.algorithm,
         "backend": collective.backend,
         "backend_config_sha256": collective.backend_config_sha256,
-        "bytes_semantics": "per_rank_input",
+        "bytes_semantics": "aggregate_input" if operation == "all_gatherv" else "per_rank_input",
         "direction": "collective",
         "link": collective.link,
         "operation": collective.operation,
@@ -3788,11 +4949,79 @@ def _validate_collective_node(
         raise ValueError(
             "collective workload disagrees with deployment config: "
             f"{mismatched!r}")
+    if variable:
+        rows, shape = attributes["symbolic_variable_rows"], attributes["symbolic_variable_row_shape"]
+        if (not isinstance(rows, tuple) or len(rows) != len(participants)
+                or any(type(value) is not int or value < 0 for value in rows) or not sum(rows)
+                or not isinstance(shape, tuple) or not shape
+                or any(type(value) is not int or value <= 0 for value in shape) or node.dtype not in DTYPE_BYTES):
+            raise ValueError("variable collective requires complete row geometry")
+        partitions = tuple(value * prod(shape) * DTYPE_BYTES[node.dtype] for value in rows)
+        if partitions != attributes["partition_bytes"] or sum(partitions) != attributes["bytes"]:
+            raise ValueError("variable collective byte extents disagree with participant rows")
+        expected_inputs = len(tuple(value for value in rows if value)) if operation == "all_gatherv" else len(rows)
+        expected_outputs = len(rows) if operation == "all_gatherv" else len(tuple(value for value in rows if value))
+        if (len(attributes["symbolic_tensor_inputs"]) != expected_inputs
+                or len(attributes["symbolic_tensor_outputs"]) != expected_outputs):
+            raise ValueError("variable collective requires exactly its nonempty participant payload ports")
+        if _symbolic_glm_pcp_projection(node, pool):
+            producers = attributes["symbolic_collective_input_producers"]
+            if len(producers) != expected_inputs or any(not isinstance(name, str) or name == node.node_id for name in producers):
+                raise ValueError("GLM PCP collective requires each actual payload producer identity")
+            incoming = {edge.source for edge in graph.edges if edge.destination == node.node_id and edge.kind == "data"}
+            if not set(producers) <= incoming:
+                raise ValueError("GLM PCP collective requires each actual payload producer completion dependency")
+        return
+    if _symbolic_glm_pcp_projection(node, pool):
+        shape = attributes["symbolic_collective_input_shape"]
+        if (not isinstance(shape, tuple) or not shape or any(type(size) is not int or size <= 0 for size in shape)
+                or node.dtype not in DTYPE_BYTES or prod(shape) * DTYPE_BYTES[node.dtype] != attributes["bytes"]):
+            raise ValueError("GLM source collective bytes must match its actual public payload shape")
+        producers = attributes["symbolic_collective_input_producers"]
+        incoming = {edge.source for edge in graph.edges if edge.destination == node.node_id and edge.kind == "data"}
+        if "symbolic_collective_external_inputs" in attributes:
+            from src.kernel.memory_access import TensorView, region_end
+            origins = attributes["symbolic_collective_external_inputs"]
+            first = next(index for index, owner in enumerate(pool.parallel_plan.layer_to_pipeline_stage)
+                if owner == (pool.logical_rank_for_physical_rank(participants[0]) // pool.parallel_plan.config.tensor_parallel_size
+                    % pool.parallel_plan.config.pipeline_parallel_size))
+            if (operation != "all_reduce" or dimension != "tensor" or attributes["symbolic_collective_storage"] != "fresh"
+                    or first == 0 or not node.node_id.endswith(f":layer-{first}:input-all-reduce")
+                    or len(origins) != len(participants) or len(producers) != len(participants)
+                    or len(attributes["symbolic_tensor_inputs"]) != len(participants)):
+                raise ValueError("GLM external PP input requires its complete stage-entry TP all-reduce")
+            for lane, (producer, origin) in enumerate(zip(producers, origins, strict=True)):
+                if producer is not None:
+                    if origin is not None or not isinstance(producer,str) or producer not in incoming:
+                        raise ValueError("GLM collective input needs exactly its producer or its external origin")
+                    continue
+                if (not isinstance(origin,Mapping) or set(origin)!={"source","rank","role","values_bound","view","allocation_bytes"}
+                        or origin["source"] != "vllm_0_30_legacy_dummy_PP_retained" or type(origin["rank"]) is not int
+                        or origin["rank"] != participants[lane] or origin["role"] != "hidden_states" or origin["values_bound"] is not False
+                        or type(origin["allocation_bytes"]) is not int or origin["allocation_bytes"] <= 0):
+                    raise ValueError("GLM external PP input must declare its actual rank-local unknown hidden buffer")
+                view = TensorView(**dict(origin["view"]))
+                consumers = tuple(graph.node(edge.destination) for edge in graph.edges if edge.source==node.node_id and edge.kind=="data"
+                    and graph.node(edge.destination).rank==participants[lane]
+                    and graph.node(edge.destination).node_id.endswith(f":layer-{first}:input-norm"))
+                if (view.view_id != attributes["symbolic_tensor_inputs"][lane] or view.shape != shape or view.dtype != "bf16"
+                        or view.offset_bytes != 0 or len(shape)!=2 or view.strides_bytes != (shape[1]*2,2)
+                        or not view.allocation_id.endswith(f":rank-{participants[lane]}:worker.intermediate:hidden_states")
+                        or region_end(view.region()) > origin["allocation_bytes"] or len(consumers)!=1
+                        or "source_dummy_run" not in consumers[0].attributes or consumers[0].attributes["source_dummy_run"] is not True
+                        or consumers[0].attributes["source_actual_request_count"] != 0):
+                    raise ValueError("GLM external PP input must match its complete active view and actual dummy norm consumer")
+            return
+        if (len(producers) != len(participants) or any(not isinstance(name, str) or name == node.node_id for name in producers)
+                or not set(producers) <= incoming):
+            raise ValueError("GLM source collective requires each actual payload producer completion dependency")
+        return
     parallelism = pool.parallel_plan.config
     dense_tp_only = (
-        parallelism.tensor_parallel_size == 2
+        (parallelism.tensor_parallel_size == 2 or
+            (gqa_source and parallelism.tensor_parallel_size > 1 and "symbolic_collective_storage" in attributes))
         and parallelism.expert_parallel_size == 1
-        and parallelism.pipeline_parallel_size in (1, 2)
+        and (parallelism.pipeline_parallel_size in (1, 2) or "symbolic_collective_storage" in attributes)
         and parallelism.sequence_parallel_size == 1
         and parallelism.context_parallel_size == 1
         and parallelism.data_parallel_size == 1
@@ -3801,7 +5030,7 @@ def _validate_collective_node(
         return
     incoming_edges = tuple(
         edge for edge in graph.edges if edge.destination == node.node_id)
-    if (parallelism.pipeline_parallel_size == 2 and operation == "all_gather"
+    if (parallelism.pipeline_parallel_size > 1 and operation == "all_gather"
             and any(graph.node(edge.source).kind is WorkloadKind.P2P for edge in incoming_edges)):
         # The complete sliced boundary, ports, backing geometry and ordering
         # are checked by _validate_symbolic_sliced_pipeline_graph (or the legacy
@@ -3858,10 +5087,15 @@ def _validate_collective_node(
         raise ValueError(
             "dense TP collective producers must have the same shape, dtype, "
             "and variant")
-    producer_bytes = tuple(
-        _dense_tp_producer_output_bytes(producer)
-        for producer in producers
-    )
+    kimi_sum = all((_symbolic_kimi_parallel_projection(producer, pool) or _symbolic_v3_parallel_projection(producer, pool))
+            and producer.kind is WorkloadKind.ELEMENTWISE and producer.variant == "add"
+            and producer.dtype == "bf16" and producer.node_id.endswith(":mlp:shared-add")
+            and set(producer.shape) == {"elements"} for producer in producers)
+    v4_sum = all(_symbolic_v4_parallel_projection(producer, pool)
+        and producer.kind is WorkloadKind.ELEMENTWISE and producer.variant == "add" and producer.dtype == "bf16"
+        and producer.node_id.endswith(":ffn:shared-add") and set(producer.shape) == {"elements"} for producer in producers)
+    producer_bytes = tuple(producer.shape["elements"] * 2 if kimi_sum or v4_sum else
+        _dense_tp_producer_output_bytes(producer) for producer in producers)
     if len(set(producer_bytes)) != 1:
         raise ValueError(
             "dense TP collective producers have inconsistent output bytes")
@@ -3872,7 +5106,7 @@ def _validate_collective_node(
             f"and dtype: expected={expected_bytes}, "
             f"actual={attributes['bytes']}")
     producer_kind = producers[0].kind
-    if producer_kind in (WorkloadKind.GATHER, WorkloadKind.LINEAR, WorkloadKind.FUSED_MOE, WorkloadKind.VECTOR):
+    if kimi_sum or v4_sum or producer_kind in (WorkloadKind.GATHER, WorkloadKind.LINEAR, WorkloadKind.FUSED_MOE, WorkloadKind.VECTOR):
         expected_operation = "all_reduce"
     elif producer_kind is WorkloadKind.LM_HEAD:
         expected_operation = "all_gather"
@@ -3915,16 +5149,38 @@ def _validate_pipeline_p2p_node(node: WorkloadNode, pool) -> None:
             raise ValueError(
                 "pipeline P2P graph token domains must be complete")
         required |= graph_domain_fields
-    symbolic_fields = {"symbolic_tensor_inputs", "symbolic_tensor_outputs"}
+    symbolic_fields = {"symbolic_tensor_inputs", "symbolic_tensor_outputs", "symbolic_tensor_output_allocations"}
     if symbolic_fields & set(attributes):
         tp = pool.parallel_plan.config.tensor_parallel_size
-        if tp not in (1, 2) and not _symbolic_mla_pipeline_projection(node, pool):
+        dense_pipeline = ((pool.parallel_plan.config.is_rank_local or _qwen030_dp_sp(pool.parallel_plan.config))
+            and (HWSpec.source_contract_supported("glm_tp8_pp4_ep8_source_projection", pool.hardware_id)
+                or HWSpec.source_contract_supported("glm_tp8_pp2_ep1_source_projection", pool.hardware_id)))
+        if (tp not in (1, 2) and not dense_pipeline and not _symbolic_mla_pipeline_projection(node, pool)
+                and not _symbolic_v4_pipeline_topology_projection(node, pool) and not _symbolic_mla_dp_pipeline_projection(node, pool)
+                and not _symbolic_k3_pipeline_topology_projection(node, pool)):
             raise NotImplementedError("symbolic pipeline ports require TP1, TP2/PP2 or the declared GLM TP8/PP2 projection")
         required |= symbolic_fields
-        if tp > 1:
+        if tp > 1 or "symbolic_pipeline_views" in attributes:
             required.add("symbolic_pipeline_views")
         if _symbolic_mla_pipeline_projection(node, pool):
             required |= {"source_projection_only", "model_execution_version"}
+        if _symbolic_kimi_pipeline_projection(node, pool) and "model_source_profile" in attributes:
+            required.add("model_source_profile")
+        if _symbolic_v3_parallel_projection(node, pool) or _symbolic_mla_dp_pipeline_projection(node, pool):
+            required |= {"source_projection_only", "model_execution_version", "model_source_profile"}
+        if _symbolic_v4_pipeline_topology_projection(node, pool):
+            required |= {"source_projection_only", "model_execution_version", "model_source_profile"}
+        if _symbolic_k3_pipeline_topology_projection(node, pool):
+            required |= {"source_projection_only", "model_execution_version", "model_source_profile"}
+        if _symbolic_glm_pcp_projection(node, pool):
+            required |= {"glm_parallel_source", "source_projection_only", "model_execution_version",
+                "model_source_profile", "source_pipeline_stage", "pipeline_layer_partition"}
+            if _symbolic_glm_fp8_target_dp_projection(node, pool):
+                required.add("source_glm_fp8_target_only")
+            if _symbolic_glm_fp8_rank_local_mtp_ep_projection(node, pool):
+                required.add("source_glm_rank_local_fp8_mtp_ep")
+            required |= {key for key in ("source_data_parallel_rank", "source_glm_model_sequence_parallel",
+                "source_glm_moe_sequence_parallel") if key in attributes}
         for key in symbolic_fields:
             if (key not in attributes or not isinstance(attributes[key], tuple) or len(attributes[key]) != 1
                     or not isinstance(attributes[key][0], str) or not attributes[key][0]):
@@ -3940,13 +5196,27 @@ def _validate_pipeline_p2p_node(node: WorkloadNode, pool) -> None:
     source_ranks = pool.physical_ranks_for_pipeline_stage(source_stage)
     destination_ranks = pool.physical_ranks_for_pipeline_stage(
         destination_stage)
+    distributed = (_qwen030_dp_sp(pool.parallel_plan.config)
+        or pool.parallel_plan.config.data_parallel_size > 1 and _symbolic_v4_pipeline_topology_projection(node, pool)
+        or _symbolic_mla_dp_pipeline_projection(node, pool)
+        or pool.parallel_plan.config.data_parallel_size > 1 and _symbolic_k3_pipeline_topology_projection(node, pool))
+    if distributed:
+        source_rank = attributes["source_rank"]
+        if source_rank not in source_ranks or symbolic_fields - set(attributes):
+            raise ValueError("distributed pipeline requires a typed source in its declared stage")
+        logical_rank = pool.logical_rank_for_physical_rank(source_rank)
+        source_ranks = pool.physical_rank_group("tensor", logical_rank)
+        destination_ranks = tuple(pool.physical_rank_group("pipeline",
+            pool.logical_rank_for_physical_rank(rank))[destination_stage] for rank in source_ranks)
     if len(source_ranks) == 1 and len(destination_ranks) == 1:
         source_rank = source_ranks[0]
         destination_rank = destination_ranks[0]
-        expected_payload_rank = 2
+        expected_payload_rank = 3 if _symbolic_v4_pipeline_topology_projection(node, pool) else 2
     elif (len(source_ranks) == len(destination_ranks)
-          and len(source_ranks) in (2, 8)):
+          and len(source_ranks) > 1):
         parallelism = pool.parallel_plan.config
+        symbolic_dense = (symbolic_fields <= set(attributes)
+            and (parallelism.is_rank_local or distributed))
         tp2_scope = (
             len(source_ranks) == 2
             and parallelism.tensor_parallel_size == 2
@@ -3966,8 +5236,8 @@ def _validate_pipeline_p2p_node(node: WorkloadNode, pool) -> None:
             and not parallelism.enable_expert_parallel
             and parallelism.expert_parallel_size == 1
         )
-        if (not (tp2_scope or target_scope or tp8_pp2_unpartitioned_scope)
-                or not parallelism.is_rank_local):
+        if (not (tp2_scope or target_scope or tp8_pp2_unpartitioned_scope or symbolic_dense)
+                or not (parallelism.is_rank_local or distributed)):
             raise NotImplementedError(
                 "multi-lane pipeline P2P lowering requires either exact "
                 "TP2/PP2, target TP=EP=8 with PP2/PP4, or TP8/PP2/EP1")
@@ -4034,9 +5304,9 @@ def _validate_pipeline_p2p_node(node: WorkloadNode, pool) -> None:
     if any(value <= 0 for value in shape):
         raise ValueError(
             "pipeline P2P payload_tensor dimensions must be positive")
-    if payload["dtype"] != "bf16":
+    if payload["dtype"] not in ("bf16", "fp16"):
         raise ValueError(
-            "validated pipeline P2P payload_tensor dtype must be bf16")
+            "validated pipeline P2P payload_tensor dtype must be bf16 or fp16")
     expected_elements = 1
     for dimension in shape:
         expected_elements *= dimension
@@ -4064,6 +5334,7 @@ def _validate_pd_kv_transfer_node(
     required = {
         "algorithm",
         "bytes",
+        "token_start", "token_end", "bytes_per_token", "attention_layout", "head_dim", "cache_dtype", "cache_layout",
         "bytes_semantics",
         "backend",
         "backend_config_sha256",
@@ -4085,8 +5356,14 @@ def _validate_pd_kv_transfer_node(
         "destination_tensor_parallel_size",
         "kv_head_start",
         "kv_head_end",
+        "layer_start",
+        "layer_end",
         "num_key_value_heads",
     }
+    compressed = attributes["attention_layout"] in ("mla", "dsa_mla") if "attention_layout" in attributes else False
+    if compressed:
+        required |= {"model_num_key_value_heads", "compressed_dim", "index_head_dim", "full_indexer_layers",
+            "source_context_parallel_size", "destination_context_parallel_size"}
     if set(attributes) != required:
         raise ValueError(
             "PD KV transfer attributes must match the canonical contract: "
@@ -4099,6 +5376,10 @@ def _validate_pd_kv_transfer_node(
             f"{destination_pool_name!r}")
     source_pool = deployment.worker_pools[node.pool_name]
     destination_pool = deployment.worker_pools[destination_pool_name]
+    from src.serving.workload.kv_transfer_workload import validate_pd_kv_layout
+    layout = validate_pd_kv_layout(source_pool, destination_pool, attributes["attention_layout"])
+    if attributes["cache_layout"] != layout:
+        raise ValueError("PD KV cache layout disagrees with its endpoint declarations")
     if worker_role_phase(source_pool.role) != "prefill":
         raise ValueError("PD KV transfer source must have a prefill role")
     if worker_role_phase(destination_pool.role) != "decode":
@@ -4108,10 +5389,17 @@ def _validate_pd_kv_transfer_node(
         raise ValueError(
             "PD KV transfer endpoints must be unsplit or Attention-owner "
             "pools, not FFN pools")
+    if attributes["destination_rank"] not in destination_pool.ranks:
+        raise ValueError("PD KV transfer destination rank disagrees with deployment config")
     rank_pairs = pd_kv_transfer_rank_pairs(
         source_pool,
         destination_pool,
         attributes["num_key_value_heads"],
+        source_data_parallel_rank=source_pool.logical_rank_for_physical_rank(node.rank) // (
+            source_pool.parallel_plan.config.worker_count // source_pool.parallel_plan.config.data_parallel_size),
+        destination_data_parallel_rank=destination_pool.logical_rank_for_physical_rank(attributes["destination_rank"]) // (
+            destination_pool.parallel_plan.config.worker_count // destination_pool.parallel_plan.config.data_parallel_size),
+        attention_layout=attributes["attention_layout"],
     )
     routes = tuple(
         route for route in deployment.routes
@@ -4124,6 +5412,9 @@ def _validate_pd_kv_transfer_node(
             "PD KV transfer requires exactly one configured route: "
             f"{source_pool.name!r}->{destination_pool.name!r}")
     route = routes[0]
+    if source_pool.hardware_id != destination_pool.hardware_id and (
+            route.link != "infiniband" or route.backend != "analytical_roofline_v1"):
+        raise ValueError("cross-hardware KV requires a declared analytical InfiniBand route")
     matching_rank_pairs = tuple(
         rank_pair for rank_pair in rank_pairs
         if (rank_pair.source_logical_rank
@@ -4134,7 +5425,9 @@ def _validate_pd_kv_transfer_node(
             and rank_pair.source_rank == attributes["source_rank"]
             and rank_pair.destination_rank == attributes["destination_rank"]
             and rank_pair.kv_head_start == attributes["kv_head_start"]
-            and rank_pair.kv_head_end == attributes["kv_head_end"])
+            and rank_pair.kv_head_end == attributes["kv_head_end"]
+            and rank_pair.layer_start == attributes["layer_start"]
+            and rank_pair.layer_end == attributes["layer_end"])
     )
     if len(matching_rank_pairs) != 1:
         raise ValueError(
@@ -4148,6 +5441,40 @@ def _validate_pd_kv_transfer_node(
             or not isinstance(transfer_bytes, int)
             or transfer_bytes <= 0):
         raise TypeError("PD KV transfer bytes must be a positive integer")
+    if (type(attributes["token_start"]) is not int or attributes["token_start"] != 0
+            or type(attributes["token_end"]) is not int or attributes["token_end"] <= 0
+            or type(attributes["bytes_per_token"]) is not int or attributes["bytes_per_token"] <= 0):
+        raise ValueError("PD KV transfer requires a positive whole-prompt token interval and byte stride")
+    if attributes["attention_layout"] == "standard_gqa":
+        from src.serving.workload.kv_transfer_workload import gqa_kv_interval_bytes_per_token
+        stride = gqa_kv_interval_bytes_per_token(
+            rank_pair.layer_end - rank_pair.layer_start,
+            rank_pair.kv_head_end - rank_pair.kv_head_start, attributes["head_dim"], attributes["cache_dtype"])
+        if stride != attributes["bytes_per_token"]:
+            raise ValueError("GQA KV payload stride disagrees with its layer/head/dtype interval")
+    elif attributes["attention_layout"] in ("mla", "dsa_mla"):
+        if (attributes["head_dim"] is not None or attributes["cache_dtype"] != "bf16"
+                or type(attributes["compressed_dim"]) is not int or attributes["compressed_dim"] <= 0
+                or type(attributes["model_num_key_value_heads"]) is not int or attributes["model_num_key_value_heads"] <= 0
+                or attributes["num_key_value_heads"] != 1
+                or (attributes["kv_head_start"], attributes["kv_head_end"]) != (0, 1)
+                or attributes["source_context_parallel_size"] != source_pool.parallel_plan.config.context_parallel_size
+                or attributes["destination_context_parallel_size"] != destination_pool.parallel_plan.config.context_parallel_size):
+            raise ValueError("compressed MLA payload disagrees with deployment config: requires one replicated BF16 cache with explicit CP identities")
+        full_layers = attributes["full_indexer_layers"]
+        if (not isinstance(full_layers, tuple) or full_layers != tuple(sorted(set(full_layers)))
+                or any(type(layer) is not int or not rank_pair.layer_start <= layer < rank_pair.layer_end for layer in full_layers)
+                or (attributes["attention_layout"] == "mla" and (full_layers or attributes["index_head_dim"] != 0))
+                or (attributes["attention_layout"] == "dsa_mla" and attributes["index_head_dim"] != 128)):
+            raise ValueError("compressed MLA payload must bind its actual full-indexer layer intervals")
+        stride = ((rank_pair.layer_end - rank_pair.layer_start) * attributes["compressed_dim"]
+            * DTYPE_BYTES[attributes["cache_dtype"]] + len(full_layers) * 132)
+        if stride != attributes["bytes_per_token"]:
+            raise ValueError("compressed MLA byte stride disagrees with layer and full-indexer intervals")
+    else:
+        raise ValueError("PD KV payload has an unsupported attention layout")
+    if transfer_bytes != attributes["token_end"] * attributes["bytes_per_token"]:
+        raise ValueError("PD KV payload bytes disagree with the token interval")
     expected = {
         "algorithm": route.algorithm,
         "bytes_semantics": "payload",
@@ -4164,7 +5491,7 @@ def _validate_pd_kv_transfer_node(
         "reduction": None,
         "resource_id": route.resource_id,
         "destination_pool": destination_pool.name,
-        "rank_mapping": "kv_head_overlap",
+        "rank_mapping": "replicated_mla_cache" if compressed else "kv_head_overlap",
         "source_logical_rank": rank_pair.source_logical_rank,
         "destination_logical_rank": rank_pair.destination_logical_rank,
         "source_tensor_parallel_size": (
@@ -4173,6 +5500,8 @@ def _validate_pd_kv_transfer_node(
             destination_pool.parallel_plan.config.tensor_parallel_size),
         "kv_head_start": rank_pair.kv_head_start,
         "kv_head_end": rank_pair.kv_head_end,
+        "layer_start": rank_pair.layer_start,
+        "layer_end": rank_pair.layer_end,
         "num_key_value_heads": attributes["num_key_value_heads"],
     }
     mismatched = {
@@ -4438,6 +5767,21 @@ def _validate_af_activation_transfer_node(
                         raise ValueError("AF initial residual requires its canonical embedding source")
                     # The0.11 embedding program carries its padded table
                     # extent; that input extent does not alter this output.
+                    embedding_shape.add("source_rows")
+                elif typed and "embedding_source" in producer.attributes:
+                    source_fields = {"model_execution_version", "source_operation"}
+                    if (source_fields - set(producer.attributes)
+                            or producer.attributes["embedding_source"] != "vllm_0_30_unquantized_tp1"
+                            or producer.attributes["model_execution_version"] != "vllm_0_30_0"
+                            or producer.attributes["source_operation"] != "embedding"):
+                        raise ValueError("AF initial residual requires its canonical embedding source")
+                    # The0.30 ordinary embedding now retains its known,
+                    # globally padded table extent, separate from output rows.
+                    if ("source_rows" not in producer.shape
+                            or type(producer.shape["source_rows"]) is not int
+                            or producer.shape["source_rows"] <= 0
+                            or producer.shape["source_rows"] % 64):
+                        raise ValueError("AF initial residual requires its padded embedding table extent")
                     embedding_shape.add("source_rows")
                 if (producer.variant != "embedding"
                         or set(producer.shape) != embedding_shape):
@@ -4881,6 +6225,490 @@ def _validate_af_activation_boundaries(
                 f"actual_lanes={actual_lanes!r}")
 
 
+def _symbolic_glm_fp8_rank_local_mtp_ep_projection(node, pool):
+    """MTP's declared un-reduced Cutlass FP8 EP source, separate from pricing."""
+    config = pool.parallel_plan.config
+    return (HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id) and pool.role == "colocated" and config.is_rank_local
+        and config.enable_expert_parallel and len(pool.ranks) == config.worker_count
+        and pool.parallel_plan.num_layers == 78 and pool.parallel_plan.num_experts == 256
+        and "source_glm_rank_local_fp8_mtp_ep" in node.attributes
+        and node.attributes["source_glm_rank_local_fp8_mtp_ep"] is True
+        and "source_projection_only" in node.attributes and node.attributes["source_projection_only"] is True
+        and node.attributes["glm_parallel_source"] is True
+        and node.attributes["model_execution_version"] == "vllm_0_30_0"
+        and node.attributes["model_source_profile"] == "vllm_0_30_v32_fp8_sync_explicit_allreduce")
+
+
+def _symbolic_glm_fp8_target_dp_projection(node, pool):
+    """Ordinary target source identity; never impersonates an MTP pass."""
+    config, attrs = pool.parallel_plan.config, node.attributes
+    tp, dp = config.tensor_parallel_size, config.data_parallel_size
+    return (HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id) and pool.role == "colocated" and config.context_parallel_size == 1
+        and dp > 1 and 2048 % (tp * 128) == 0
+        and (256 % config.expert_parallel_size == 0 if config.enable_expert_parallel else 2048 % (tp * dp * 128) == 0)
+        and config.sequence_parallel_size in ((1, tp) if config.enable_expert_parallel else (1,))
+        and pool.parallel_plan.num_layers == 78 and pool.parallel_plan.num_experts == 256
+        and "source_glm_fp8_target_only" in attrs and attrs["source_glm_fp8_target_only"] is True
+        and "glm_parallel_source" in attrs and attrs["glm_parallel_source"] is True
+        and "source_projection_only" in attrs and attrs["source_projection_only"] is True
+        and attrs["model_execution_version"] == "vllm_0_30_0"
+        and attrs["model_source_profile"] == "vllm_0_30_v32_fp8_sync_explicit_allreduce")
+
+
+def _symbolic_glm_pcp_projection(node, pool):
+    config = pool.parallel_plan.config
+    pcp = ("pcp_source" in node.attributes and node.attributes["pcp_source"] is True
+        and config.context_parallel_size > 1)
+    ordinary = ("glm_parallel_source" in node.attributes and node.attributes["glm_parallel_source"] is True
+        and config.context_parallel_size == 1)
+    pipeline = (config.pipeline_parallel_size == 1 or
+        "source_pipeline_stage" in node.attributes and type(node.attributes["source_pipeline_stage"]) is int
+        and node.attributes["source_pipeline_stage"] == (
+            pool.logical_rank_for_physical_rank(node.rank) // config.tensor_parallel_size) % config.pipeline_parallel_size)
+    return ((pcp or ordinary)
+        and "source_projection_only" in node.attributes and node.attributes["source_projection_only"] is True
+        and node.attributes["model_execution_version"] == "vllm_0_30_0"
+        and (node.attributes["model_source_profile"] == "vllm_0_30_v32_bf16_sync_explicit_allreduce"
+            or ordinary and node.attributes["model_source_profile"] == "vllm_0_30_v32_fp8_sync_explicit_allreduce"
+            and config.context_parallel_size == 1 and HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id)
+            and (not config.enable_expert_parallel and config.sequence_parallel_size == 1
+                or _symbolic_glm_fp8_rank_local_mtp_ep_projection(node, pool)
+                or _symbolic_glm_fp8_target_dp_projection(node, pool)
+                or config.enable_expert_parallel and config.data_parallel_size > 1
+                and config.sequence_parallel_size in (1, config.tensor_parallel_size)
+                and "source_data_parallel_rank" in node.attributes))
+        and (HWSpec.source_contract_supported("glm_tp8_pp4_ep8_source_projection", pool.hardware_id)
+            or HWSpec.source_contract_supported("glm_tp8_pp2_ep1_source_projection", pool.hardware_id))
+        and pipeline
+        and (config.sequence_parallel_size == 1 and (not config.enable_expert_parallel or config.data_parallel_size == 1)
+            or config.enable_expert_parallel and config.data_parallel_size > 1
+                and config.sequence_parallel_size in (1, config.tensor_parallel_size) and config.tensor_parallel_size > 1
+            or config.enable_expert_parallel and config.tensor_parallel_size == config.sequence_parallel_size == 1
+                and config.data_parallel_size > 1
+                and (config.context_parallel_size == 1 or "source_pcp_expert_communication_scope" in node.attributes
+                and node.attributes["source_pcp_expert_communication_scope"] == "analytical_global_expert_projection"
+                and "native_provider_equivalence" in node.attributes and node.attributes["native_provider_equivalence"] is False))
+        and len(pool.ranks) == config.worker_count)
+
+
+def _symbolic_glm_mtp_data_projection(node, pool):
+    """Only the explicit whole-shard BF16-compute MTP DP source declares distributed drafts."""
+    config = pool.parallel_plan.config
+    return ("source_glm_fp8_target_only" not in node.attributes and HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id)
+        and config.data_parallel_size > 1 and config.context_parallel_size == 1
+        and config.sequence_parallel_size in ((1, config.tensor_parallel_size) if config.enable_expert_parallel else (1,))
+        and pool.parallel_plan.num_layers == 78 and pool.parallel_plan.num_experts == 256
+        and _symbolic_glm_pcp_projection(node, pool)
+        and node.attributes["model_source_profile"] in ("vllm_0_30_v32_bf16_sync_explicit_allreduce",
+            "vllm_0_30_v32_fp8_sync_explicit_allreduce")
+        and "source_data_parallel_rank" in node.attributes
+        and type(node.attributes["source_data_parallel_rank"]) is int
+        and "source_glm_model_sequence_parallel" in node.attributes
+        and node.attributes["source_glm_model_sequence_parallel"] is (config.enable_expert_parallel
+            and config.tensor_parallel_size > 1 and config.pipeline_parallel_size == 1)
+        and "source_glm_moe_sequence_parallel" in node.attributes
+        and node.attributes["source_glm_moe_sequence_parallel"] is (config.enable_expert_parallel and config.tensor_parallel_size > 1)
+        and node.attributes["source_data_parallel_rank"] == (
+            pool.logical_rank_for_physical_rank(node.rank) // (config.tensor_parallel_size * config.pipeline_parallel_size)))
+
+
+def _symbolic_glm_mtp_last_stage_projection(node, pool):
+    """The complete GLM drafter is local to the target's last PP stage."""
+    config = pool.parallel_plan.config
+    return (HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id) and (config.is_rank_local or _symbolic_glm_mtp_data_projection(node, pool))
+        and pool.parallel_plan.num_layers == 78 and pool.parallel_plan.num_experts == 256
+        and set(pool.parallel_plan.layer_to_pipeline_stage) == set(range(config.pipeline_parallel_size))
+        and _symbolic_glm_pcp_projection(node, pool)
+        and node.rank in pool.physical_ranks_for_pipeline_stage(config.pipeline_parallel_size - 1))
+
+
+def _validate_glm_mtp_dp_expert_graph(graph, deployment):
+    """Bind each MTP DP shard to actual dispatch and sum-scatter ports."""
+    for pool in deployment.worker_pools.values():
+        if not any(node.pool_name == pool.name and node.variant == "vllm_mtp_eager"
+                and _symbolic_glm_mtp_data_projection(node, pool) for node in graph.nodes):
+            continue
+        nodes = tuple(node for node in graph.nodes if node.pool_name == pool.name and node.kind is WorkloadKind.FUSED_MOE)
+        config = pool.parallel_plan.config
+        dimension = "expert" if config.enable_expert_parallel else "data"
+        predecessors = {node.node_id: [] for node in graph.nodes}
+        successors = {node.node_id: [] for node in graph.nodes}
+        additions = {}
+        for item in graph.nodes:
+            if item.kind is WorkloadKind.ELEMENTWISE and "symbolic_tensor_inputs" in item.attributes:
+                for port in item.attributes["symbolic_tensor_inputs"]:
+                    key = (item.rank, port)
+                    if key not in additions:
+                        additions[key] = []
+                    additions[key].append(item)
+        for edge in graph.edges:
+            if edge.kind == "data":
+                predecessors[edge.destination].append(graph.node(edge.source))
+                successors[edge.source].append(graph.node(edge.destination))
+        combines, reductions = {}, {}
+        for item in graph.nodes:
+            if (item.pool_name == pool.name and item.kind is WorkloadKind.COLLECTIVE
+                    and item.attributes["operation"] == "reduce_scatterv" and "moe_invocation_id" in item.attributes):
+                name = (item.attributes["moe_invocation_id"], item.attributes["participants"])
+                if name not in combines:
+                    combines[name] = []
+                combines[name].append(item)
+            if (item.pool_name == pool.name and item.kind is WorkloadKind.COLLECTIVE
+                    and item.attributes["operation"] == "all_reduce" and "moe_invocation_id" in item.attributes):
+                name = (item.attributes["moe_invocation_id"], item.attributes["participants"])
+                if name not in reductions:
+                    reductions[name] = []
+                reductions[name].append(item)
+        invocations, programs = {}, {}
+        for node in nodes:
+            if not _symbolic_glm_mtp_data_projection(node, pool) or node.attributes["expert_parallel_size"] != config.expert_parallel_size:
+                raise ValueError("MTP DP experts require their exact whole-shard BF16 source expert group")
+            weight_dtype = ("fp8" if node.attributes["model_source_profile"] == "vllm_0_30_v32_fp8_sync_explicit_allreduce" else "bf16")
+            if (node.attributes["checkpoint_weight_dtype"] != weight_dtype or node.attributes["routed_weight_dtype"] != weight_dtype
+                    or node.attributes["weight_group_size"] != 0
+                    or weight_dtype == "fp8" and node.shape["intermediate"] % 128):
+                raise ValueError("MTP DP experts must preserve their source weight dtype and whole FP8 scale blocks")
+            if weight_dtype == "fp8":
+                from src.serving.workload.traced_glm_pcp import glm_fp8_deferred_expert_source_metadata
+                expected = glm_fp8_deferred_expert_source_metadata()
+                if any(key not in node.attributes or type(node.attributes[key]) is not type(value) or node.attributes[key] != value
+                        for key, value in expected.items()):
+                    raise ValueError("FP8 MTP DP requires its exact deferred Cutlass BF16 prepare source facts")
+            _validate_routing_provenance(node)
+            invocation = node.attributes["moe_invocation_id"]
+            participants = pool.physical_rank_group(dimension, pool.logical_rank_for_physical_rank(node.rank))
+            key = (invocation, participants)
+            if key not in invocations:
+                invocations[key] = []
+            invocations[key].append(node)
+            if invocation not in programs:
+                programs[invocation] = []
+            programs[invocation].append(node)
+            rank_index = participants.index(node.rank)
+            rows = node.attributes["source_pcp_expert_rows" if config.enable_expert_parallel else "source_pcp_data_rows"]
+            if config.enable_expert_parallel:
+                order = ("data_then_context_then_tensor_lane_then_local_row_including_padding" if config.tensor_parallel_size > 1
+                    else "data_then_context_then_local_row_including_padding")
+                if node.attributes["source_pcp_row_order"] != order:
+                    raise ValueError("MTP DP expert row order must retain its actual TP lanes, including internal MoE SP")
+            if len(rows) != len(participants) or sum(rows) != node.shape["tokens"]:
+                raise ValueError("MTP DP expert rows must conserve the complete target/draft dispatch")
+            inputs = node.attributes["symbolic_tensor_inputs"]
+            if len(inputs) != 3:
+                raise ValueError("MTP DP experts require actual hidden, weights and IDs inputs")
+            for port, width, dtype in zip(inputs, (node.shape["hidden"], node.shape["topk"], node.shape["topk"]),
+                    ("bf16", "fp32", "int32"), strict=True):
+                sources = tuple(item for item in predecessors[node.node_id]
+                    if "symbolic_tensor_outputs" in item.attributes and port in item.attributes["symbolic_tensor_outputs"])
+                if len(sources) != 1:
+                    raise ValueError("MTP DP expert input requires one actual data dispatch producer")
+                source, = sources
+                if (source.kind is not WorkloadKind.COLLECTIVE or source.attributes["operation"] != "all_gatherv"
+                        or source.attributes["participants"] != participants or source.attributes["collective_group"] != dimension
+                        or source.attributes["symbolic_variable_rows"] != rows
+                        or source.attributes["symbolic_variable_row_shape"] != (width,) or source.dtype != dtype
+                        or source.attributes["symbolic_tensor_outputs"][rank_index] != port):
+                    raise ValueError("MTP DP expert input must preserve its own gathered rank and physical rows")
+            if key not in combines or len(combines[key]) != 1:
+                raise ValueError("MTP DP experts require one matching routed-output sum-scatter")
+            combine, = combines[key]
+            attrs = combine.attributes
+            if (attrs["participants"] != participants or attrs["collective_group"] != dimension
+                    or attrs["reduction"] != "sum" or attrs["symbolic_variable_rows"] != rows
+                    or attrs["symbolic_variable_row_shape"] != (node.shape["hidden"],)
+                    or combine.dtype != "bf16" or node not in predecessors[combine.node_id]
+                    or attrs["symbolic_tensor_inputs"][rank_index] != node.attributes["symbolic_tensor_outputs"][0]):
+                raise ValueError("MTP DP expert output must reach its matching actual sum-scatter input")
+        for members in invocations.values():
+            expected = pool.physical_rank_group(dimension, pool.logical_rank_for_physical_rank(members[0].rank))
+            if len(members) != len(expected) or {node.rank for node in members} != set(expected):
+                raise ValueError("MTP DP invocation must include every actual expert shard, including idle replicas")
+            if any(node.shape != members[0].shape or node.attributes["tokens_per_expert"] != members[0].attributes["tokens_per_expert"]
+                    for node in members):
+                raise ValueError("MTP DP shards must preserve the same global routing and geometry")
+            invocation = members[0].attributes["moe_invocation_id"]
+            combine, = combines[(invocation, expected)]
+            active = tuple(rank for rank, count in zip(expected, combine.attributes["symbolic_variable_rows"], strict=True) if count)
+            outputs = combine.attributes["symbolic_tensor_outputs"]
+            if len(outputs) != len(active):
+                raise ValueError("MTP DP sum-scatter must return one output for each active request replica")
+            for rank, port in zip(active, outputs, strict=True):
+                key = (rank, port)
+                if key not in additions or len(additions[key]) != 1 or combine not in predecessors[additions[key][0].node_id]:
+                    raise ValueError("MTP DP shared/routed add must consume its actual sum-scatter data output")
+                if pool.parallel_plan.config.tensor_parallel_size == 1:
+                    continue
+                add = additions[key][0]
+                tensor = pool.physical_rank_group("tensor", pool.logical_rank_for_physical_rank(rank))
+                if config.enable_expert_parallel and config.pipeline_parallel_size == 1:
+                    # Model SP keeps each combined shard local through the
+                    # next residual norm, then gathers it for attention or
+                    # the final head. There is no source late TP sum here.
+                    count = combine.attributes["symbolic_variable_rows"][expected.index(rank)]
+                    norms = tuple(item for item in successors[add.node_id]
+                        if item.kind is WorkloadKind.NORM and item.variant == "add_rmsnorm" and item.rank == rank
+                        and item.shape == {"rows": count, "hidden": members[0].shape["hidden"]})
+                    if len(norms) != 1:
+                        raise ValueError("MTP model SP result requires its actual local residual norm data input")
+                    norm, = norms
+                    gathers = tuple(item for item in successors[norm.node_id] if item.kind is WorkloadKind.COLLECTIVE
+                        and item.attributes["operation"] == "all_gather" and item.attributes["participants"] == tensor)
+                    if len(gathers) != 1:
+                        raise ValueError("MTP model SP norm requires its actual complete TP gather data input")
+                    gather, = gathers
+                    index = tensor.index(rank)
+                    attrs = gather.attributes
+                    if (gather.dtype != "bf16" or attrs["symbolic_collective_dim"] != 0
+                            or attrs["symbolic_collective_storage"] != "fresh"
+                            or attrs["symbolic_collective_input_shape"] != (count, members[0].shape["hidden"])
+                            or len(attrs["symbolic_collective_input_producers"]) != len(tensor)
+                            or attrs["symbolic_collective_input_producers"][index] != norm.node_id
+                            or attrs["symbolic_tensor_inputs"][index] not in norm.attributes["symbolic_tensor_outputs"]):
+                        raise ValueError("MTP model SP gather must preserve its own normalized TP shard and rows")
+                    continue
+                producer = add
+                if config.enable_expert_parallel:
+                    restores = tuple(item for item in graph.nodes if item.kind is WorkloadKind.COLLECTIVE
+                        and item.attributes["operation"] == "all_gather" and item.attributes["participants"] == tensor
+                        and "symbolic_glm_moe_sp_restore" in item.attributes and add in predecessors[item.node_id])
+                    if len(restores) != 1:
+                        raise ValueError("MTP DP MoE sequence shards require their actual complete TP restore")
+                    producer, = restores
+                reduction_key = (invocation, tensor)
+                if reduction_key in reductions:
+                    local = reductions[reduction_key]
+                    if len(local) != 1 or producer not in predecessors[local[0].node_id]:
+                        raise ValueError("MTP DP routed/shared result requires its actual late TP reduction data input")
+                else:
+                    stage = pool.logical_rank_for_physical_rank(rank) // len(tensor) % pool.parallel_plan.config.pipeline_parallel_size
+                    layer = members[0].attributes["routing_provenance"]["layer_index"]
+                    final = max(index for index, owner in enumerate(pool.parallel_plan.layer_to_pipeline_stage) if owner == stage)
+                    messages = tuple(item for item in graph.nodes if item.kind is WorkloadKind.P2P and item.rank == rank
+                        and item.attributes["payload_tensor"]["name"] == "hidden_states" and producer in predecessors[item.node_id])
+                    member = next(item for item in members if item.rank==rank)
+                    replica = pool.logical_rank_for_physical_rank(rank)//(config.tensor_parallel_size*config.pipeline_parallel_size)
+                    if (layer==final and stage+1<config.pipeline_parallel_size
+                            and "source_dummy_run" in member.attributes and member.attributes["source_dummy_run"] is True
+                            and member.attributes["source_actual_request_count"]==0
+                            and member.attributes["source_pcp_request_rows"][replica]==0):
+                        # Legacy eager dummy discards this non-last stage's
+                        # actual partial result locally; it does not send PP.
+                        if any(item.kind is WorkloadKind.P2P and item.rank==rank for item in graph.nodes):
+                            raise ValueError("MTP dummy stage result cannot introduce a request PP message")
+                        continue
+                    if layer != final or stage + 1 >= pool.parallel_plan.config.pipeline_parallel_size or len(messages) != 1:
+                        raise ValueError("MTP DP expert result requires its late TP reduction or actual target PP frontier")
+        for members in programs.values():
+            logical = pool.logical_rank_for_physical_rank(members[0].rank)
+            stage = logical // pool.parallel_plan.config.tensor_parallel_size % pool.parallel_plan.config.pipeline_parallel_size
+            expected = pool.physical_ranks_for_pipeline_stage(stage)
+            if len(members) != len(expected) or {node.rank for node in members} != set(expected):
+                raise ValueError("MTP TP/DP invocation requires every tensor/data expert shard")
+            if any(node.shape != members[0].shape or node.attributes["tokens_per_expert"] != members[0].attributes["tokens_per_expert"] for node in members):
+                raise ValueError("MTP TP/DP shards must preserve global routing and intermediate geometry")
+
+
+def _validate_glm_rank_local_fp8_expert_node(node, pool):
+    from src.kernel.kernel_spec import linear_expert_partition
+    from src.serving.workload.traced_glm_mtp import glm_fp8_rank_local_expert_source_metadata
+    expected = glm_fp8_rank_local_expert_source_metadata()
+    if {key for key in node.attributes if key.startswith("source_fp8_")} != set(expected):
+        raise ValueError("rank-local FP8 MTP EP requires its complete NoDPEP deferred Cutlass source fields")
+    if any(key not in node.attributes or type(node.attributes[key]) is not type(value) or node.attributes[key] != value
+            for key, value in expected.items()):
+        raise ValueError("rank-local FP8 MTP EP requires exact NoDPEP deferred Cutlass source facts")
+    config, attrs = pool.parallel_plan.config, node.attributes
+    participants = pool.physical_rank_group("tensor", pool.logical_rank_for_physical_rank(node.rank))
+    rank = participants.index(node.rank)
+    owned = linear_expert_partition(256, config.expert_parallel_size, rank)
+    counts = attrs["tokens_per_expert"]
+    layer = attrs["routing_provenance"]["layer_index"]
+    expected_stage = config.pipeline_parallel_size - 1 if layer is None else pool.parallel_plan.layer_to_pipeline_stage[layer]
+    actual_stage = pool.logical_rank_for_physical_rank(node.rank) // config.tensor_parallel_size
+    if actual_stage != expected_stage:
+        raise ValueError("rank-local FP8 target/draft expert must remain in its actual source pipeline stage")
+    if (node.dtype != "bf16" or tuple(node.shape[key] for key in ("experts", "topk", "hidden", "intermediate")) != (256, 8, 6144, 2048)
+            or config.expert_parallel_size != config.tensor_parallel_size or 256 % config.expert_parallel_size
+            or attrs["checkpoint_weight_dtype"] != "fp8" or attrs["routed_weight_dtype"] != "fp8"
+            or any(type(value) is not int for value in (*attrs["tokens_per_expert"], *attrs["local_tokens_per_expert"], *attrs["owned_experts"]))
+            or type(attrs["expert_rank"]) is not int or type(attrs["expert_parallel_size"]) is not int
+            or attrs["weight_group_size"] != 0 or attrs["routed_scaling_factor"] != 2.5
+            or attrs["output_is_reduced"] is not False or attrs["expert_rank"] != rank
+            or attrs["expert_parallel_size"] != config.expert_parallel_size or tuple(attrs["owned_experts"]) != owned
+            or tuple(attrs["local_tokens_per_expert"]) != tuple(count if expert in owned else 0 for expert, count in enumerate(counts))):
+        raise ValueError("rank-local FP8 MTP EP must conserve exact dimensions and stage-local linear expert ownership")
+
+
+def _validate_glm_tensor_expert_graph(graph, pool, nodes):
+    """Ordinary TP expert contributions reach the source's late TP sum."""
+    # These indices are local to this complete validation. Keep only data
+    # edges, preserving duplicate producers and edge order, so control edges
+    # cannot replace a missing expert contribution or PP frontier.
+    data_successors = {item.node_id: [] for item in graph.nodes}
+    data_predecessors = {item.node_id: [] for item in graph.nodes}
+    for edge in graph.edges:
+        if edge.kind == "data":
+            data_successors[edge.source].append(edge.destination)
+            data_predecessors[edge.destination].append(edge.source)
+    all_reductions = tuple(item for item in graph.nodes if item.kind is WorkloadKind.COLLECTIVE
+        and item.attributes["operation"] == "all_reduce" and "moe_invocation_id" in item.attributes)
+    grouped = {}
+    for node in nodes:
+        _validate_routing_provenance(node)
+        _validate_virtual_ep_router_inputs(graph, node)
+        invocation = node.attributes["moe_invocation_id"]
+        if invocation not in grouped:
+            grouped[invocation] = []
+        grouped[invocation].append(node)
+        reductions = tuple(item for item in all_reductions if item.attributes["moe_invocation_id"] == invocation)
+        participants = pool.physical_rank_group("tensor", pool.logical_rank_for_physical_rank(node.rank))
+        local_reductions = tuple(item for item in reductions if item.attributes["participants"] == participants)
+        adds = {name for name in data_successors[node.node_id] if graph.node(name).kind is WorkloadKind.ELEMENTWISE}
+        stage = (pool.logical_rank_for_physical_rank(node.rank) // pool.parallel_plan.config.tensor_parallel_size
+            % pool.parallel_plan.config.pipeline_parallel_size)
+        final_layer = max(index for index, owner in enumerate(pool.parallel_plan.layer_to_pipeline_stage) if owner == stage)
+        if (not local_reductions and stage + 1 < pool.parallel_plan.config.pipeline_parallel_size
+                and node.attributes["routing_provenance"]["layer_index"] == final_layer):
+            messages = tuple(graph.node(name) for source in adds for name in data_successors[source]
+                if graph.node(name).kind is WorkloadKind.P2P and graph.node(name).rank == node.rank
+                and graph.node(name).attributes["payload_tensor"]["name"] == "hidden_states")
+            if (len(messages) != 1 or messages[0].attributes["source_stage"] != stage
+                    or messages[0].attributes["destination_stage"] != stage + 1):
+                raise ValueError("GLM TP experts require their matching TP-group reduction or actual next-stage frontier")
+            producers = tuple(graph.node(name) for name in data_predecessors[messages[0].node_id])
+            if len(producers) != 1:
+                raise ValueError("GLM TP pipeline requires one actual final-layer source producer")
+            _validate_glm_pipeline_frontier(graph, pool, producers[0], participants, stage,
+                node.shape["tokens"], node.shape["hidden"], source_rank=node.rank)
+            continue
+        if len(local_reductions) != 1 or len(reductions) != 1:
+            raise ValueError("GLM TP experts require their matching TP-group late tensor reduction")
+        if not any(name in adds for name in data_predecessors[local_reductions[0].node_id]):
+            raise ValueError("GLM TP expert contributions must complete before the shared/routed tensor sum")
+    for members in grouped.values():
+        participants = pool.physical_rank_group("tensor", pool.logical_rank_for_physical_rank(members[0].rank))
+        if len(members) != len(participants) or {node.rank for node in members} != set(participants):
+            raise ValueError("GLM TP expert invocation requires every physical expert rank")
+        if any(node.shape != members[0].shape or node.attributes["tokens_per_expert"] != members[0].attributes["tokens_per_expert"]
+                for node in members):
+            raise ValueError("GLM TP expert ranks must preserve global routing and geometry")
+
+
+def _validate_glm_pcp_expert_graph(graph, pool, nodes):
+    """Bind PCP's actual modular dispatch ports and expert participants."""
+    config = pool.parallel_plan.config
+    by_invocation = {}
+    checked_dispatches = set()
+    for node in nodes:
+        fp8 = ((_symbolic_glm_mtp_data_projection(node, pool) or _symbolic_glm_fp8_target_dp_projection(node, pool))
+            and node.attributes["model_source_profile"] == "vllm_0_30_v32_fp8_sync_explicit_allreduce")
+        expected_dtype = "fp8" if fp8 else "bf16"
+        if fp8:
+            from src.serving.workload.traced_glm_pcp import glm_fp8_deferred_expert_source_metadata
+            if (any(key not in node.attributes or type(node.attributes[key]) is not type(value) or node.attributes[key] != value
+                    for key, value in glm_fp8_deferred_expert_source_metadata().items())
+                    or tuple(node.shape[key] for key in ("experts", "topk", "hidden", "intermediate")) != (256, 8, 6144, 2048)):
+                raise ValueError("GLM FP8 EP requires exact deferred Cutlass source dimensions and prepare facts")
+        if (node.attributes["source_component"] != "symbolic_grouped_routed_experts"
+                or node.attributes["routing_source_stage"] != "dsv32_moe_route"
+                or node.attributes["checkpoint_weight_dtype"] != expected_dtype
+                or node.attributes["routed_weight_dtype"] != expected_dtype):
+            raise ValueError("GLM PCP EP requires its explicit source weight dtype and modular expert source")
+        _validate_routing_provenance(node)
+        invocation = node.attributes["moe_invocation_id"]
+        if invocation not in by_invocation:
+            by_invocation[invocation] = []
+        by_invocation[invocation].append(node)
+        inputs = node.attributes["symbolic_tensor_inputs"]
+        if len(inputs) != 3:
+            raise ValueError("GLM PCP EP requires hidden, routing weights and expert IDs")
+        predecessors = tuple(graph.node(edge.source) for edge in graph.edges
+            if edge.destination == node.node_id and edge.kind == "data")
+        dimension = "expert" if config.data_parallel_size > 1 else "data_context"
+        expected_group = pool.physical_rank_group(dimension, pool.logical_rank_for_physical_rank(node.rank))
+        rank_index = expected_group.index(node.rank)
+        dispatch_rows = None
+        dispatches = []
+        for port, width, dtype in zip(inputs, (node.shape["hidden"], node.shape["topk"], node.shape["topk"]),
+                ("bf16", "fp32", "int32"), strict=True):
+            producers = tuple(item for item in predecessors if "symbolic_tensor_outputs" in item.attributes
+                and port in item.attributes["symbolic_tensor_outputs"])
+            if (len(producers) != 1 or producers[0].kind is not WorkloadKind.COLLECTIVE
+                    or producers[0].attributes["operation"] != "all_gatherv"
+                    or producers[0].attributes["collective_group"] != dimension
+                    or producers[0].attributes["participants"] != expected_group
+                    or producers[0].attributes["symbolic_variable_row_shape"] != (width,)
+                    or producers[0].dtype != dtype):
+                raise ValueError("GLM PCP EP must consume its actual hidden/weights/IDs context gathers")
+            gather = producers[0].attributes
+            rows = gather["symbolic_variable_rows"]
+            if (not isinstance(rows, tuple) or len(rows) != len(expected_group)
+                    or any(type(value) is not int or value < 0 for value in rows)
+                    or sum(rows) != node.shape["tokens"]
+                    or dispatch_rows is not None and rows != dispatch_rows
+                    or len(gather["symbolic_tensor_outputs"]) != len(expected_group)
+                    or gather["symbolic_tensor_outputs"][rank_index] != port):
+                raise ValueError("GLM PCP EP dispatch partitions and rank output ports must match its actual expert rows")
+            dispatch_rows = rows
+            dispatches.append(producers[0])
+        dispatch_key = tuple(item.node_id for item in dispatches)
+        if dispatch_key not in checked_dispatches:
+            hidden, weights, ids = dispatches
+            active = tuple((rank, count) for rank, count in zip(expected_group, dispatch_rows, strict=True) if count)
+            if any(len(item.attributes["symbolic_tensor_inputs"]) != len(active)
+                    or len(item.attributes["symbolic_collective_input_producers"]) != len(active) for item in dispatches):
+                raise ValueError("GLM PCP EP dispatch must retain every active source payload")
+            for index, (rank, count) in enumerate(active):
+                weight_producer = weights.attributes["symbolic_collective_input_producers"][index]
+                id_producer = ids.attributes["symbolic_collective_input_producers"][index]
+                if weight_producer != id_producer:
+                    raise ValueError("GLM PCP EP weights and IDs must come from the same actual route")
+                route = graph.node(weight_producer)
+                if (route.kind is not WorkloadKind.VECTOR or route.variant != "dsv32_moe_route"
+                        or route.rank != rank or route.pool_name != node.pool_name
+                        or route.shape != {"elements": count * node.shape["experts"], "rows": count,
+                            "experts": node.shape["experts"], "topk": node.shape["topk"]}
+                        or route.attributes["symbolic_tensor_outputs"] != (
+                            weights.attributes["symbolic_tensor_inputs"][index], ids.attributes["symbolic_tensor_inputs"][index])):
+                    raise ValueError("GLM PCP EP routing payloads must preserve their actual source rank and row extent")
+                logits = route.attributes["symbolic_tensor_inputs"][0]
+                gates = tuple(graph.node(name) for name in graph.predecessors(route.node_id)
+                    if graph.node(name).kind is WorkloadKind.ROUTER
+                    and logits in graph.node(name).attributes["symbolic_tensor_outputs"])
+                if (len(gates) != 1 or gates[0].rank != rank
+                        or gates[0].shape != {"b": 1, "m": count, "n": node.shape["experts"], "k": node.shape["hidden"]}
+                        or _source_linear_data_inputs(gates[0]) != (hidden.attributes["symbolic_tensor_inputs"][index],)
+                        or not any(edge.source == hidden.attributes["symbolic_collective_input_producers"][index]
+                            and edge.destination == gates[0].node_id and edge.kind == "data" for edge in graph.edges)):
+                    raise ValueError("GLM PCP EP gate and hidden dispatch must share the actual rank-local payload producer")
+            checked_dispatches.add(dispatch_key)
+        combines = tuple(item for item in graph.nodes if item.kind is WorkloadKind.COLLECTIVE
+            and item.attributes["operation"] == "reduce_scatterv"
+            and "moe_invocation_id" in item.attributes and item.attributes["moe_invocation_id"] == invocation
+            and item.attributes["participants"] == expected_group)
+        if len(combines) != 1 or not any(edge.source == node.node_id and edge.destination == combines[0].node_id
+                and edge.kind == "data" for edge in graph.edges):
+            raise ValueError("GLM PCP EP requires its matching routed-output sum-scatter dependency")
+        combine = combines[0]
+        attrs = combine.attributes
+        if (attrs["collective_group"] != dimension or attrs["reduction"] != "sum"
+                or attrs["symbolic_variable_rows"] != dispatch_rows
+                or attrs["symbolic_variable_row_shape"] != (node.shape["hidden"],)
+                or combine.dtype != "bf16"
+                or len(node.attributes["symbolic_tensor_outputs"]) != 1
+                or len(attrs["symbolic_tensor_inputs"]) != len(expected_group)
+                or attrs["symbolic_tensor_inputs"][rank_index] != node.attributes["symbolic_tensor_outputs"][0]):
+            raise ValueError("GLM PCP EP combine partitions and rank input ports must match its actual expert output")
+    for members in by_invocation.values():
+        participants = pool.physical_rank_group("expert", pool.logical_rank_for_physical_rank(members[0].rank))
+        if {node.rank for node in members} != set(participants) or len(members) != len(participants):
+            raise ValueError("GLM PCP EP must execute each expert rank once per invocation")
+        first = members[0]
+        if any(node.attributes["tokens_per_expert"] != first.attributes["tokens_per_expert"]
+                or node.shape != first.shape for node in members):
+            raise ValueError("GLM PCP EP ranks must preserve the same global routing and expert geometry")
+
+
 def _symbolic_glm_pipeline_projection(node, pool):
     """Only admit the declared original GLM TP-partial PP source program."""
     config = pool.parallel_plan.config
@@ -4899,16 +6727,230 @@ def _symbolic_glm_pipeline_projection(node, pool):
         and all(value == 1 for value in (config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size)))
 
 
+def _symbolic_v3_parallel_projection(node, pool):
+    config = pool.parallel_plan.config
+    return (HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id) and config.is_rank_local and not config.enable_expert_parallel
+        and len(pool.ranks) == config.worker_count
+        and "source_projection_only" in node.attributes and node.attributes["source_projection_only"] is True
+        and "model_execution_version" in node.attributes and node.attributes["model_execution_version"] == "vllm_0_27_1"
+        and "model_source_profile" in node.attributes
+        and node.attributes["model_source_profile"] == "vllm_0_27_1_deepseek_v3_sync_fp8")
+
+
+def _symbolic_v3_dp_pipeline_projection(node, pool):
+    """Versioned distributed PP topology; operator pricing stays separate."""
+    config = pool.parallel_plan.config
+    return (HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id) and config.context_parallel_size == config.sequence_parallel_size == 1
+        and config.data_parallel_size > 1 and config.pipeline_parallel_size > 1
+        and len(pool.ranks) == config.worker_count
+        and "source_projection_only" in node.attributes and node.attributes["source_projection_only"] is True
+        and "model_execution_version" in node.attributes and node.attributes["model_execution_version"] == "vllm_0_27_1"
+        and "model_source_profile" in node.attributes
+        and node.attributes["model_source_profile"] == "vllm_0_27_1_deepseek_v3_sync_fp8")
+
+
+def _validate_kimi_dp_expert_graph(graph, deployment):
+    """Bind every BF16 dispatch, linear INT4 owner and actual returned rows.
+
+    Routing includes the declared physical padding rows. This source check
+    does not select a GPU provider, assign a price or accept normal memory.
+    """
+    parents = {node.node_id: [] for node in graph.nodes}
+    children = {node.node_id: [] for node in graph.nodes}
+    for edge in graph.edges:
+        if edge.kind == "data":
+            parents[edge.destination].append(graph.node(edge.source))
+            children[edge.source].append(graph.node(edge.destination))
+    for pool in deployment.worker_pools.values():
+        nodes = tuple(node for node in graph.nodes if node.pool_name == pool.name)
+        if not any(_symbolic_kimi_dp_projection(node, pool) for node in nodes):
+            continue
+        config = pool.parallel_plan.config
+        tp, dp, pp = config.tensor_parallel_size, config.data_parallel_size, config.pipeline_parallel_size
+        ep, sp = config.expert_parallel_size, config.enable_expert_parallel and tp > 1
+        expert_tp = 1 if config.enable_expert_parallel else tp * dp
+        if (deployment.mode != "colocated" or len(deployment.worker_pools) != 1
+                or 2048 % expert_tp or 2048 // expert_tp % 32 or 384 % ep
+                or ep != (tp * dp if config.enable_expert_parallel else 1)):
+            raise ValueError("Kimi DP requires whole INT4/group32 shards or uniform linear global EP")
+        logical_rows = []
+        for replica in range(dp):
+            ranks = tuple(pool.physical_rank_for_logical_rank(replica * pp * tp + lane) for lane in range(tp))
+            norms = tuple(node for node in nodes if node.rank in ranks and node.kind is WorkloadKind.NORM
+                and node.node_id.endswith(":layer-0:input-norm"))
+            if norms and (len(norms) != tp or {node.rank for node in norms} != set(ranks)
+                    or len({node.shape["rows"] for node in norms}) != 1):
+                raise ValueError("Kimi DP must preserve each original replica's actual input rows")
+            logical_rows.append(norms[0].shape["rows"] if norms else 0)
+        rows = tuple(-(-count // tp) for count in logical_rows for _ in range(tp)) if sp else tuple(logical_rows)
+        physical_rows = sum(rows)
+        experts = tuple(node for node in nodes if node.kind is WorkloadKind.FUSED_MOE)
+        # Both named checkpoints have one dense prefix and sixty MoE layers.
+        if len(pool.parallel_plan.layer_to_pipeline_stage) != 61 or len(experts) != 60 * tp * dp:
+            raise ValueError("Kimi DP requires all sixty source MoE layers and every expert participant")
+        for layer in range(1, 61):
+            calls = tuple(node for node in experts if node.attributes["routing_provenance"]["layer_index"] == layer)
+            stage = pool.parallel_plan.layer_to_pipeline_stage[layer]
+            stage_ranks = tuple(pool.physical_rank_for_logical_rank((replica * pp + stage) * tp + lane)
+                for replica in range(dp) for lane in range(tp))
+            if len(calls) != tp * dp or {node.rank for node in calls} != set(stage_ranks):
+                raise ValueError("Kimi DP expert layer must cover its actual source-stage ranks")
+            counts = calls[0].attributes["tokens_per_expert"]
+            invocation = calls[0].attributes["moe_invocation_id"]
+            for expert in calls:
+                attrs = expert.attributes
+                logical = pool.logical_rank_for_physical_rank(expert.rank)
+                replica, lane = logical // (pp * tp), logical % tp
+                expert_rank = replica * tp + lane if ep > 1 else 0
+                from src.kernel.kernel_spec import linear_expert_partition
+                owned = linear_expert_partition(384, ep, expert_rank)
+                if (not _symbolic_kimi_dp_projection(expert, pool)
+                        or expert.shape != {"tokens": physical_rows, "experts": 384, "topk": 8, "hidden": 7168,
+                            "intermediate": 2048 // expert_tp}
+                        or expert.dtype != "bf16" or attrs["routed_weight_dtype"] != "int4"
+                        or attrs["checkpoint_weight_dtype"] != "int4" or attrs["weight_group_size"] != 32
+                        or attrs["routing_source_stage"] != "kimi_moe_route" or attrs["routed_scaling_factor"] != 1.0
+                        or attrs["output_is_reduced"] is not False or attrs["expert_parallel_size"] != ep
+                        or attrs["expert_rank"] != expert_rank or attrs["owned_experts"] != owned
+                        or attrs["tokens_per_expert"] != counts or attrs["moe_invocation_id"] != invocation
+                        or attrs["local_tokens_per_expert"] != tuple(count if index in owned else 0 for index, count in enumerate(counts))):
+                    raise ValueError("Kimi DP must preserve exact dimensions, INT4/group32, routing and global expert ownership")
+                _validate_routing_provenance(expert)
+                dimension = "expert" if sp else "data"
+                participants = pool.physical_rank_group(dimension, logical)
+                dispatched = []
+                for port, role, width, dtype, item_bytes in zip(attrs["symbolic_tensor_inputs"],
+                        ("input", "weights", "ids"), (7168, 8, 8), ("bf16", "fp32", "int32"), (2, 4, 4), strict=True):
+                    matches = tuple(node for node in parents[expert.node_id] if node.node_id.endswith(":dispatch-" + role))
+                    if len(matches) != 1:
+                        raise ValueError("Kimi DP expert requires each actual dispatch data edge")
+                    dispatch, = matches
+                    da = dispatch.attributes
+                    if (dispatch.kind is not WorkloadKind.COLLECTIVE or dispatch.dtype != dtype
+                            or da["operation"] != "all_gatherv" or da["participants"] != participants
+                            or da["collective_group"] != dimension or da["symbolic_variable_rows"] != rows
+                            or da["symbolic_variable_row_shape"] != (width,) or da["bytes"] != physical_rows * width * item_bytes
+                            or port != da["symbolic_tensor_outputs"][participants.index(expert.rank)]):
+                        raise ValueError("Kimi DP dispatch must bind exact BF16/weight/ID rows, bytes and participant ports")
+                    dispatched.append(dispatch)
+                hidden_gather, weights_gather, ids_gather = dispatched
+                active = tuple((rank, count) for rank, count in zip(participants, rows, strict=True) if count)
+                routes = tuple(node for node in parents[weights_gather.node_id] if node.variant == "kimi_moe_route")
+                if len(routes) != len(active) or {node.node_id for node in parents[ids_gather.node_id]} != {node.node_id for node in routes}:
+                    raise ValueError("Kimi DP must route each nonempty local shard before dispatch")
+                for index, (rank, count) in enumerate(active):
+                    route_matches = tuple(node for node in routes if node.rank == rank)
+                    if len(route_matches) != 1:
+                        raise ValueError("Kimi DP router must retain the actual nonempty source rank")
+                    route, = route_matches
+                    gates = tuple(node for node in parents[route.node_id] if node.kind is WorkloadKind.ROUTER)
+                    if (len(gates) != 1 or gates[0].dtype != "bf16" or gates[0].rank != rank
+                            or gates[0].shape != {"b": 1, "m": count, "n": 384, "k": 7168}
+                            or _source_linear_data_inputs(gates[0]) != (hidden_gather.attributes["symbolic_tensor_inputs"][index],)
+                            or route.attributes["symbolic_tensor_outputs"] != (weights_gather.attributes["symbolic_tensor_inputs"][index],
+                                ids_gather.attributes["symbolic_tensor_inputs"][index])):
+                        raise ValueError("Kimi DP routing must consume its matching local BF16 gate/input and dispatch actual outputs")
+                combines = tuple(node for node in children[expert.node_id] if node.kind is WorkloadKind.COLLECTIVE)
+                if len(combines) != 1:
+                    raise ValueError("Kimi DP expert requires one actual sum-scatter data edge")
+                combine, = combines
+                ca = combine.attributes
+                contributions = tuple(node for node in parents[combine.node_id] if node.kind is WorkloadKind.FUSED_MOE)
+                if (ca["operation"] != "reduce_scatterv" or ca["reduction"] != "sum"
+                        or ca["participants"] != participants or ca["collective_group"] != dimension
+                        or ca["symbolic_variable_rows"] != rows or ca["symbolic_variable_row_shape"] != (7168,)
+                        or ca["bytes"] != physical_rows * 7168 * 2 or ca["moe_invocation_id"] != invocation
+                        or len(contributions) != len(participants) or {node.rank for node in contributions} != set(participants)
+                        or ca["symbolic_tensor_inputs"] != tuple(next(node for node in contributions if node.rank == rank)
+                            .attributes["symbolic_tensor_outputs"][0] for rank in participants)):
+                    raise ValueError("Kimi DP combine must retain every physical expert contribution including idle owners")
+                own_rows = -(-logical_rows[replica] // tp) if sp else logical_rows[replica]
+                if not own_rows:
+                    continue
+                copies = tuple(node for node in children[combine.node_id] if node.rank == expert.rank
+                    and node.node_id.endswith(f":layer-{layer}:mlp:finalize-copy"))
+                if len(copies) != 1:
+                    raise ValueError("Kimi DP returned rows require a same-rank finalize copy")
+                copy, = copies
+                if (copy.attributes["symbolic_tensor_inputs"] != (ca["symbolic_tensor_outputs"][[rank for rank, _ in active].index(expert.rank)],)
+                        or copy.shape != {"elements": own_rows * 7168, "rows": own_rows, "hidden": 7168}):
+                    raise ValueError("Kimi DP finalize must consume only its original local returned rows")
+                scales = tuple(node for node in children[copy.node_id] if node.node_id.endswith(":output-scale"))
+                if (len(scales) != 1 or scales[0].attributes["scalar_value"] != 2.827
+                        or scales[0].kind is not WorkloadKind.ELEMENTWISE or scales[0].rank != expert.rank
+                        or scales[0].dtype != "bf16" or scales[0].shape != {"elements": own_rows * 7168}
+                        or scales[0].attributes["symbolic_tensor_inputs"] != copy.attributes["symbolic_tensor_outputs"]):
+                    raise ValueError("Kimi DP must preserve routed output scaling after finalize")
+                scale, = scales
+                additions = tuple(node for node in children[scale.node_id] if node.node_id.endswith(":shared-add"))
+                if len(additions) != 1:
+                    raise ValueError("Kimi DP scale must feed its real shared-add")
+                addition, = additions
+                shared = tuple(node for node in parents[addition.node_id] if node.kind is WorkloadKind.LINEAR)
+                if (addition.rank != expert.rank or addition.shape != {"elements": own_rows * 7168}
+                        or len(shared) != 1 or shared[0].rank != expert.rank
+                        or shared[0].shape != {"b": 1, "m": own_rows, "n": 7168, "k": 2048 // (1 if sp else tp)}
+                        or addition.attributes["symbolic_tensor_inputs"] != (shared[0].attributes["symbolic_tensor_outputs"][0],
+                            scale.attributes["symbolic_tensor_outputs"][0])):
+                    raise ValueError("Kimi DP shared weights and local routed output must retain the actual TP/SP sum")
+                if tp > 1 and not (sp and pp == 1):
+                    restores = tuple(node for node in children[addition.node_id] if node.kind is WorkloadKind.COLLECTIVE)
+                    if len(restores) != 1:
+                        raise ValueError("Kimi DP shared-add requires its actual late TP sum or sequence restore")
+                    restore, = restores
+                    ra = restore.attributes
+                    tensor_ranks = pool.physical_rank_group("tensor", logical)
+                    contributors = tuple(node for node in parents[restore.node_id] if node.node_id.endswith(f":layer-{layer}:mlp:shared-add"))
+                    if (ra["operation"] != ("all_gather" if sp else "all_reduce") or ra["participants"] != tensor_ranks
+                            or ra["bytes"] != own_rows * 7168 * 2
+                            or {node.rank for node in contributors} != set(tensor_ranks)
+                            or ra["symbolic_tensor_inputs"] != tuple(next(node for node in contributors if node.rank == rank)
+                                .attributes["symbolic_tensor_outputs"][0] for rank in tensor_ranks)):
+                        raise ValueError("Kimi DP late TP operation must consume all actual local shared-add ports")
+
+
+
+def _symbolic_kimi_dp_projection(node, pool):
+    """Versioned K2 DP program marker; exact expert ports checked graph-wide."""
+    config = pool.parallel_plan.config
+    return (HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id) and config.data_parallel_size > 1
+        and config.context_parallel_size == config.sequence_parallel_size == 1
+        and len(pool.ranks) == config.worker_count
+        and "source_projection_only" in node.attributes and node.attributes["source_projection_only"] is True
+        and "model_execution_version" in node.attributes and node.attributes["model_execution_version"] == "vllm_0_30_0"
+        and "model_source_profile" in node.attributes
+        and node.attributes["model_source_profile"] == "vllm_0_30_k2_6_int4_sync_explicit_allreduce")
+
+
+def _symbolic_mla_dp_pipeline_projection(node, pool):
+    return (_symbolic_v3_dp_pipeline_projection(node, pool)
+        or pool.parallel_plan.config.pipeline_parallel_size > 1 and _symbolic_kimi_dp_projection(node, pool))
+
+
+def _symbolic_kimi_parallel_projection(node, pool):
+    """H200 K2 source marker, with stage-local TP/EP and nonempty layers."""
+    config = pool.parallel_plan.config
+    return (HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id) and config.is_rank_local
+        and len(pool.ranks) == config.worker_count
+        and all(pool.parallel_plan.layer_to_pipeline_stage.count(stage) > 0
+            for stage in range(config.pipeline_parallel_size))
+        and "source_projection_only" in node.attributes and node.attributes["source_projection_only"] is True
+        and "model_execution_version" in node.attributes and node.attributes["model_execution_version"] == "vllm_0_30_0"
+        and "model_source_profile" in node.attributes
+        and node.attributes["model_source_profile"] == "vllm_0_30_k2_6_int4_sync_explicit_allreduce")
+
+
 def _symbolic_kimi_pipeline_projection(node, pool):
     config = pool.parallel_plan.config
+    h200 = config.pipeline_parallel_size > 1 and _symbolic_kimi_parallel_projection(node, pool)
     return ("source_projection_only" in node.attributes and node.attributes["source_projection_only"] is True
         and "model_execution_version" in node.attributes and node.attributes["model_execution_version"] == "vllm_0_30_0"
-        and HWSpec.source_contract_supported("kimi_tp8_pp2_ep8_source_projection", pool.hardware_id)
+        and (h200 or HWSpec.source_contract_supported("kimi_tp8_pp2_ep8_source_projection", pool.hardware_id)
         and len(pool.ranks) == 16
         and config.tensor_parallel_size == config.expert_parallel_size == 8
         and config.pipeline_parallel_size == 2 and config.enable_expert_parallel and config.is_rank_local
         and pool.parallel_plan.layer_to_pipeline_stage == (0,) * 31 + (1,) * 30
-        and all(value == 1 for value in (config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size)))
+        and all(value == 1 for value in (config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))))
 
 
 def _symbolic_kimi_single_rank_projection(node, pool):
@@ -4924,41 +6966,134 @@ def _symbolic_kimi_single_rank_projection(node, pool):
             config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size)))
 
 
+def _symbolic_k3_pipeline_projection(node, pool):
+    from src.serving.parallelism.pp import pipeline_layer_ranges
+    config = pool.parallel_plan.config
+    pp = config.pipeline_parallel_size
+    if not 1 < pp <= pool.parallel_plan.num_layers or pool.parallel_plan.num_layers != 93:
+        return False
+    expected_layers = tuple(stage for stage, (start, end) in enumerate(
+        pipeline_layer_ranges(pool.parallel_plan.num_layers, pp)) for _ in range(start, end))
+    return ("source_projection_only" in node.attributes and node.attributes["source_projection_only"] is True
+        and "model_execution_version" in node.attributes and node.attributes["model_execution_version"] == "vllm_0_30_0"
+        and HWSpec.source_contract_supported("kimi_k3_pp16_source_projection", pool.hardware_id)
+        and len(pool.ranks) == pp
+        and config.tensor_parallel_size == 1
+        and not config.enable_expert_parallel and config.is_rank_local
+        and pool.parallel_plan.layer_to_pipeline_stage == expected_layers
+        and all(value == 1 for value in (config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size)))
+
+
+def _symbolic_k3_pipeline_topology_projection(node, pool):
+    """K3 PP transport identity, independent of operator pricing scope."""
+    config = pool.parallel_plan.config
+    return (HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id) and pool.parallel_plan.num_layers == 93
+        and 1 < config.pipeline_parallel_size <= pool.parallel_plan.num_layers
+        and config.context_parallel_size == config.sequence_parallel_size == 1
+        and len(pool.ranks) == config.worker_count
+        and "source_projection_only" in node.attributes and node.attributes["source_projection_only"] is True
+        and "model_execution_version" in node.attributes and node.attributes["model_execution_version"] == "vllm_0_30_0"
+        and "model_source_profile" in node.attributes and node.attributes["model_source_profile"] == "vllm_0_30_k3_mxfp4_sync")
+
+
+def _is_k3_source_pipeline_graph(graph, pool):
+    return (HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id) and pool.parallel_plan.num_layers == 93
+        and pool.parallel_plan.config.pipeline_parallel_size > 1
+        and any(node.pool_name == pool.name and node.variant == "kimi_k3_attn_res"
+            and "source_projection_only" in node.attributes and node.attributes["source_projection_only"] is True
+            and "model_execution_version" in node.attributes and node.attributes["model_execution_version"] == "vllm_0_30_0"
+            for node in graph.nodes))
+
+
+def _symbolic_v4_parallel_projection(node, pool):
+    config = pool.parallel_plan.config
+    # The two pinned V4 targets have8/16 output groups. The model boundary
+    # checks its own exact group count and whole quantized intermediate.
+    return (HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id) and config.is_rank_local and not config.enable_expert_parallel
+        and 16 % config.tensor_parallel_size == 0 and 1 <= config.pipeline_parallel_size <= pool.parallel_plan.num_layers
+        and len(pool.ranks) == config.worker_count
+        and "source_projection_only" in node.attributes and node.attributes["source_projection_only"] is True
+        and "model_execution_version" in node.attributes and node.attributes["model_execution_version"] == "vllm_0_30_0"
+        and "model_source_profile" in node.attributes
+        and node.attributes["model_source_profile"] == "vllm_0_30_v4_sync_fp8_ds_mla")
+
+
+def _symbolic_v4_pipeline_projection(node, pool):
+    return pool.parallel_plan.config.pipeline_parallel_size > 1 and _symbolic_v4_parallel_projection(node, pool)
+
+
+def _symbolic_v4_pipeline_topology_projection(node, pool):
+    """Versioned V4 PP geometry, independent of operator pricing support."""
+    config = pool.parallel_plan.config
+    return (HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id) and config.context_parallel_size == config.sequence_parallel_size == 1
+        and 16 % config.tensor_parallel_size == 0 and 1 < config.pipeline_parallel_size <= pool.parallel_plan.num_layers
+        and len(pool.ranks) == config.worker_count
+        and "source_projection_only" in node.attributes and node.attributes["source_projection_only"] is True
+        and "model_execution_version" in node.attributes and node.attributes["model_execution_version"] == "vllm_0_30_0"
+        and "model_source_profile" in node.attributes
+        and node.attributes["model_source_profile"] == "vllm_0_30_v4_sync_fp8_ds_mla")
+
+
 def _symbolic_mla_pipeline_projection(node, pool):
-    return _symbolic_glm_pipeline_projection(node, pool) or _symbolic_kimi_pipeline_projection(node, pool)
+    return (_symbolic_glm_pipeline_projection(node, pool) or _symbolic_kimi_pipeline_projection(node, pool)
+        or pool.parallel_plan.config.pipeline_parallel_size > 1 and _symbolic_glm_pcp_projection(node, pool)
+        or _symbolic_k3_pipeline_projection(node, pool)
+        or pool.parallel_plan.config.pipeline_parallel_size > 1 and _symbolic_v3_parallel_projection(node, pool))
 
 
 def _symbolic_pipeline_endpoint(node, pool, stage):
     config = pool.parallel_plan.config
-    return ((config.tensor_parallel_size == 1 or (config.tensor_parallel_size, config.pipeline_parallel_size) == (2, 2)
-            or _symbolic_mla_pipeline_projection(node, pool))
-        and config.pipeline_parallel_size > 1
-        and config.is_rank_local and (not config.enable_expert_parallel or _symbolic_mla_pipeline_projection(node, pool))
+    return (config.pipeline_parallel_size > 1 and (config.is_rank_local or _qwen030_dp_sp(config) or _symbolic_kimi_dp_projection(node, pool))
         and node.rank in pool.physical_ranks_for_pipeline_stage(stage))
 
 
-def _pipeline_worker_copy_consumer(graph, copy, input_port, rank):
+def _pipeline_worker_copy_consumer(graph, copy, input_port, rank, input_allocation, k3_projection, *, dtype="bf16"):
     """Follow one typed receive/gather through its source runner copy_."""
+    if dtype not in ("bf16", "fp16"):
+        raise ValueError("pipeline worker copy requires its declared 16-bit dtype")
     required = {"index_count", "gather_factor", "scattered", "materialized_output",
         "symbolic_tensor_inputs", "symbolic_tensor_outputs"}
-    if (required - set(copy.attributes) or copy.rank != rank or copy.kind is not WorkloadKind.GATHER or copy.variant != "gather" or copy.dtype != "bf16"
+    if (required - set(copy.attributes) or copy.rank != rank or copy.kind is not WorkloadKind.GATHER or copy.variant != "gather" or copy.dtype != dtype
             or copy.attributes["index_count"] != 0 or copy.attributes["gather_factor"] != 1
             or copy.attributes["scattered"] is not False or copy.attributes["materialized_output"] is not True
-            or copy.attributes["symbolic_tensor_inputs"] != (input_port,)
             or len(copy.attributes["symbolic_tensor_outputs"]) != 1
             or copy.attributes["symbolic_tensor_outputs"][0] == input_port):
         raise ValueError("pipeline receive port must enter its same-rank worker copy")
+    input_mismatch = copy.attributes["symbolic_tensor_inputs"] != (input_port,)
+    k3_reshape = (k3_projection and copy.node_id.endswith(":receive:runner-copy:residual")
+        and "symbolic_tensor_input_allocations" in copy.attributes
+        and copy.attributes["symbolic_tensor_input_allocations"] == (input_allocation,))
+    if input_mismatch and not k3_reshape:
+        raise ValueError("pipeline receive port must enter its same-rank worker copy")
     successors = tuple(graph.node(edge.destination) for edge in graph.edges
         if edge.source == copy.node_id and edge.kind == "data")
-    if (len(successors) != 1 or successors[0].rank != rank or successors[0].pool_name != copy.pool_name
+    k3_consumers = bool(successors) and all(
+        node.rank == rank and node.pool_name == copy.pool_name
+        and (node.kind is WorkloadKind.P2P or (node.variant == "kimi_k3_attn_res"
+            and node.attributes["source_component"] == "vllm_0_30_kimi_k3_attention_residual"))
+        and "symbolic_tensor_inputs" in node.attributes
+        and (copy.node_id.endswith((":residual", ":attn-res:receive-copy"))
+            or copy.attributes["symbolic_tensor_outputs"][0] in node.attributes["symbolic_tensor_inputs"])
+        for node in successors)
+    if not k3_consumers and (len(successors) != 1 or successors[0].rank != rank or successors[0].pool_name != copy.pool_name
             or "symbolic_tensor_inputs" not in successors[0].attributes
             or copy.attributes["symbolic_tensor_outputs"][0] not in successors[0].attributes["symbolic_tensor_inputs"]):
-        raise ValueError("pipeline copied receive port must feed one destination input norm")
-    if (set(copy.shape) != {"elements", "rows", "hidden"}
-            or set(successors[0].shape) != {"rows", "hidden"}
+        raise ValueError("pipeline copied receive port must feed one destination input norm: "
+            f"copy={copy.node_id}, successors={tuple(node.node_id for node in successors)}, "
+            f"output={copy.attributes['symbolic_tensor_outputs'][0]}, "
+            f"details={tuple((node.variant, node.attributes['source_component'] if 'source_component' in node.attributes else '', node.attributes['symbolic_tensor_inputs']) for node in successors)}")
+    residual_copy = successors[0].node_id.endswith(":attn-res:receive-copy")
+    if not k3_consumers and (set(copy.shape) != {"elements", "rows", "hidden"}
+            or (residual_copy and copy.shape != successors[0].shape)
+            or (not residual_copy and set(successors[0].shape) != {"rows", "hidden"})
             or any(copy.shape[name] != successors[0].shape[name] for name in ("rows", "hidden"))
             or copy.shape["elements"] != copy.shape["rows"] * copy.shape["hidden"]):
         raise ValueError("pipeline worker copy must match its destination decoder extent")
+    if (copy.node_id.endswith(":receive:runner-copy:residual")
+            and successors[0].node_id.endswith(":attn-res:receive-copy")):
+        return _pipeline_worker_copy_consumer(graph, successors[0],
+            copy.attributes["symbolic_tensor_outputs"][0], rank,
+            copy.attributes["symbolic_tensor_output_allocations"][0], k3_projection, dtype=dtype)
     return successors[0]
 
 
@@ -4983,7 +7118,12 @@ def _validate_symbolic_tp1_pipeline_graph(graph, pool, p2p_nodes):
         raise ValueError("pipeline must carry both intermediate tensors at every boundary")
     for stage in range(pool.parallel_plan.config.pipeline_parallel_size - 1):
         hidden, residual = (pairs[stage, name] for name in ("hidden_states", "residual"))
-        if hidden.attributes["payload_tensor"]["shape"] != residual.attributes["payload_tensor"]["shape"]:
+        k3_scope = _symbolic_k3_pipeline_projection(hidden, pool)
+        if k3_scope:
+            if (hidden.attributes["payload_tensor"]["shape"][-1] != residual.attributes["payload_tensor"]["shape"][-1]
+                    or hidden.attributes["payload_tensor"]["dtype"] != residual.attributes["payload_tensor"]["dtype"]):
+                raise ValueError("K3 pipeline tensor width and dtype must agree")
+        elif hidden.attributes["payload_tensor"]["shape"] != residual.attributes["payload_tensor"]["shape"]:
             raise ValueError("pipeline intermediate tensor shapes must agree")
         source_compute = {node.node_id for node in graph.nodes if node.pool_name == pool.name
             and node.rank == hidden.rank and node.kind is not WorkloadKind.P2P}
@@ -4996,9 +7136,28 @@ def _validate_symbolic_tp1_pipeline_graph(graph, pool, p2p_nodes):
         for node in (hidden, residual):
             producers = [graph.node(edge.source) for edge in graph.edges
                 if edge.destination == node.node_id and edge.kind == "data"]
-            if (len(producers) != 1 or producers[0].rank != node.rank or producers[0].dtype != "bf16"
+            alias_bound = False
+            if (len(producers) == 1 and (_symbolic_kimi_pipeline_projection(node, pool) or _symbolic_v3_parallel_projection(node, pool))
+                    and "symbolic_pipeline_views" in node.attributes):
+                from src.kernel.memory_access import TensorView
+                views = node.attributes["symbolic_pipeline_views"]
+                sent = TensorView(**dict(views["source"]))
+                outputs = tuple(TensorView(**dict(view)) for view in views["source_producer_views"])
+                alias_bound = (sent.view_id == node.attributes["symbolic_tensor_inputs"][0]
+                    and sent.dtype == node.attributes["payload_tensor"]["dtype"]
+                    and sent.shape == tuple(node.attributes["payload_tensor"]["shape"])
+                    and sent.strides_bytes == (sent.shape[-1] * 2, 2)
+                    and any(output.view_id in producers[0].attributes["symbolic_tensor_outputs"]
+                        and output.allocation_id == sent.allocation_id and output.dtype == sent.dtype
+                        and output.strides_bytes == sent.strides_bytes and len(output.shape) == 2
+                        and output.offset_bytes <= sent.offset_bytes
+                        and sent.offset_bytes + node.attributes["bytes"] <= output.offset_bytes + prod(output.shape) * 2
+                        for output in outputs))
+            if (len(producers) != 1 or producers[0].rank != node.rank or producers[0].dtype != node.attributes["payload_tensor"]["dtype"]
                     or "symbolic_tensor_outputs" not in producers[0].attributes
-                    or node.attributes["symbolic_tensor_inputs"][0] not in producers[0].attributes["symbolic_tensor_outputs"]):
+                    or ((node is hidden or not k3_scope)
+                        and node.attributes["symbolic_tensor_inputs"][0] not in producers[0].attributes["symbolic_tensor_outputs"]
+                        and not alias_bound)):
                 raise ValueError("pipeline source port must bind its same-rank producer")
             source_producers.append(producers[0])
             if node is hidden and producers[0].node_id not in terminals:
@@ -5007,8 +7166,16 @@ def _validate_symbolic_tp1_pipeline_graph(graph, pool, p2p_nodes):
                 if edge.source == node.node_id and edge.kind == "data"]
             if len(successors) == 1:
                 successors = [_pipeline_worker_copy_consumer(graph, successors[0],
-                    node.attributes["symbolic_tensor_outputs"][0], node.attributes["destination_rank"])]
-            if (len(successors) != 1 or successors[0].rank != node.attributes["destination_rank"]
+                    node.attributes["symbolic_tensor_outputs"][0], node.attributes["destination_rank"],
+                    node.attributes["symbolic_tensor_output_allocations"][0], k3_scope,
+                    dtype=node.attributes["payload_tensor"]["dtype"])]
+            if k3_scope:
+                if (not successors or any(item.rank != node.attributes["destination_rank"]
+                        or (item.kind is not WorkloadKind.P2P and (item.variant != "kimi_k3_attn_res"
+                            or item.attributes["source_component"] != "vllm_0_30_kimi_k3_attention_residual"))
+                        or "symbolic_tensor_inputs" not in item.attributes for item in successors)):
+                    raise ValueError("K3 pipeline receive port must feed Attention Residual consumers")
+            elif (len(successors) != 1 or successors[0].rank != node.attributes["destination_rank"]
                     or successors[0].kind is not WorkloadKind.NORM
                     or "symbolic_tensor_inputs" not in successors[0].attributes
                     ):
@@ -5016,15 +7183,42 @@ def _validate_symbolic_tp1_pipeline_graph(graph, pool, p2p_nodes):
             consumers.append(successors[0])
         if consumers[0].node_id != consumers[1].node_id:
             raise ValueError("pipeline hidden and residual must feed the same destination decoder")
+        if hidden.attributes["payload_tensor"]["dtype"] != residual.attributes["payload_tensor"]["dtype"]:
+            raise ValueError("pipeline hidden and residual must preserve the same source dtype")
         shape = consumers[0].shape
-        if (set(shape) != {"rows", "hidden"} or consumers[0].dtype != "bf16"
+        if k3_scope:
+            if (consumers[0].dtype != "bf16" or set(shape) != {"rows", "hidden", "elements"}
+                    or tuple(hidden.attributes["payload_tensor"]["shape"]) != (shape["rows"], shape["hidden"])
+                    or shape["elements"] != shape["rows"] * shape["hidden"]):
+                raise ValueError("K3 pipeline payload must match the Attention Residual shape and dtype")
+        elif (set(shape) != {"rows", "hidden"} or consumers[0].dtype != hidden.attributes["payload_tensor"]["dtype"]
                 or tuple(hidden.attributes["payload_tensor"]["shape"]) != (shape["rows"], shape["hidden"])):
             raise ValueError("pipeline payload must match the destination decoder shape and dtype")
         final, residual_writer = source_producers
-        if (final.kind is not WorkloadKind.LINEAR or final.variant != "gemm"
-                or final.shape["b"] != 1 or final.shape["m"] != shape["rows"] or final.shape["n"] != shape["hidden"]
-                or residual_writer.kind is not WorkloadKind.NORM or dict(residual_writer.shape) != dict(shape)):
-            raise ValueError("pipeline tensor shapes must match the source MLP and residual norm")
+        if k3_scope:
+            if (final.kind is not WorkloadKind.ELEMENTWISE or final.variant != "add"
+                    or final.shape["elements"] != shape["rows"] * shape["hidden"]
+                    or (residual_writer.variant != "kimi_k3_attn_res"
+                        and (residual_writer.variant != "gather"
+                            or residual_writer.shape["elements"] != residual.attributes["payload_tensor"]["bytes"] // 2))):
+                raise ValueError("K3 pipeline tensor shapes must match the shared add and Attention Residual: "
+                    f"final={final.kind}/{final.variant}/{final.shape}, "
+                    f"residual={residual_writer.kind}/{residual_writer.variant}/{residual_writer.shape}, expected={shape}")
+        else:
+            dense_final = (final.kind is WorkloadKind.LINEAR and final.variant == "gemm"
+                and final.shape["b"] == 1 and final.shape["m"] == shape["rows"] and final.shape["n"] == shape["hidden"])
+            moe_final = (final.kind is WorkloadKind.FUSED_MOE and final.variant == "full"
+                and "source_component" in final.attributes
+                and final.attributes["source_component"] == "symbolic_unquantized_experts"
+                and final.attributes["model_execution_version"] == "vllm_0_30_0"
+                and final.shape["tokens"] == shape["rows"] and final.shape["hidden"] == shape["hidden"])
+            kimi_final = ((_symbolic_kimi_pipeline_projection(hidden, pool) or _symbolic_v3_parallel_projection(hidden, pool))
+                and final.kind is WorkloadKind.ELEMENTWISE and final.variant == "add"
+                and final.shape["elements"] == shape["rows"] * shape["hidden"]
+                and final.node_id.endswith(":mlp:shared-add"))
+            if (not (dense_final or moe_final or kimi_final) or residual_writer.kind is not WorkloadKind.NORM
+                    or dict(residual_writer.shape) != dict(shape)):
+                raise ValueError("pipeline tensor shapes must match the source MLP/MoE and residual norm")
         if WorkloadEdge(hidden.node_id, residual.node_id, "barrier") not in graph.edges:
             raise ValueError("pipeline messages must retain source dictionary send order")
     for edge in graph.edges:
@@ -5042,13 +7236,35 @@ def _validate_tp1_pipeline_graph(
 
     target_contract = _target_model_semantics_contract(graph)
     for pool in deployment.worker_pools.values():
+        if _is_k3_source_pipeline_graph(graph, pool):
+            # The dedicated PP validator below checks both TP1 and sliced
+            # K3 payloads, including complete removal of the PP messages.
+            continue
+        if any(node.pool_name == pool.name and _symbolic_v4_pipeline_topology_projection(node, pool) for node in graph.nodes):
+            # V4 sends one expanded mHC tensor; the complete boundary is
+            # validated by _validate_v4_pipeline_graph below.
+            continue
+        if not any(node.pool_name == pool.name and node.kind is not WorkloadKind.PD_KV_TRANSFER
+                for node in graph.nodes):
+            continue
         parallelism = pool.parallel_plan.config
         pipeline_size = parallelism.pipeline_parallel_size
         if parallelism.tensor_parallel_size != 1 or pipeline_size == 1:
             continue
+        glm = tuple(node for node in graph.nodes if node.pool_name == pool.name and node.kind is WorkloadKind.P2P)
+        if any(node.pool_name == pool.name and _symbolic_kimi_dp_projection(node, pool) for node in graph.nodes):
+            _validate_symbolic_dp_pipeline_graph(graph, pool)
+            continue
+        if glm and all(_symbolic_glm_pcp_projection(node, pool) for node in glm):
+            _validate_symbolic_dp_pipeline_graph(graph, pool)
+            continue
+        if _qwen030_dp_sp(parallelism):
+            _validate_symbolic_dp_pipeline_graph(graph, pool)
+            continue
         if (pipeline_size < 2
-                or deployment.mode != "colocated"
-                or len(deployment.worker_pools) != 1
+                or deployment.mode not in ("colocated", "pd_disagg")
+                or (deployment.mode == "colocated" and len(deployment.worker_pools) != 1
+                    and not (glm and all("symbolic_tensor_inputs" in node.attributes for node in glm)))
                 or parallelism.worker_count != pipeline_size
                 or parallelism.expert_parallel_size != 1
                 or not parallelism.is_rank_local):
@@ -5246,17 +7462,439 @@ def _validate_symbolic_sliced_pipeline_graph(graph, pool, p2p_nodes):
         _validate_symbolic_sliced_pipeline_boundary(graph, pool, boundary, stage)
 
 
-def _validate_symbolic_sliced_pipeline_boundary(graph, pool, p2p_nodes, stage):
+def _validate_mla_dp_pipeline_frontier(graph, pool, producer, source_ranks, stage, rows, hidden):
+    """Bind0.27 FP8 /0.30 Kimi BF16 expert combine/copy/scale/shared-add to the PP output.
+
+    This proves physical ports and stage ownership, not operator pricing or
+    GPU provider support. MoE-only SP restores padded hidden rows before PP;
+    the wire and destination retain exactly the original request rows.
+    """
+    kimi = _symbolic_kimi_dp_projection(producer, pool)
+    config = pool.parallel_plan.config
+    tp = config.tensor_parallel_size
+    layer = max(index for index, owner in enumerate(pool.parallel_plan.layer_to_pipeline_stage) if owner == stage)
+    stage_experts = tuple(node for node in graph.nodes if node.pool_name == pool.name
+        and node.kind is WorkloadKind.FUSED_MOE and node.attributes["routing_provenance"]["layer_index"] == layer)
+    sequence = bool(stage_experts) and config.enable_expert_parallel and tp > 1
+    local_rows = -(-rows // tp) if sequence else rows
+
+    def parents(node):
+        return tuple(graph.node(edge.source) for edge in graph.edges if edge.destination == node.node_id and edge.kind == "data")
+
+    if tp > 1:
+        attrs = producer.attributes
+        if (producer.kind is not WorkloadKind.COLLECTIVE
+                or attrs["operation"] != ("all_gather" if sequence else "all_reduce")
+                or attrs["participants"] != source_ranks or attrs["symbolic_collective_storage"] != "fresh"
+                or attrs["bytes"] != local_rows * hidden * 2
+                or sequence and attrs["symbolic_collective_dim"] != 0):
+            raise ValueError("V3 PP requires its actual source TP reduction or padded MoE-only SP restore")
+        outputs = parents(producer)
+        if (len(outputs) != tp or {node.rank for node in outputs} != set(source_ranks)
+                or tuple(producer.attributes["symbolic_tensor_inputs"]) != tuple(
+                    next(node for node in outputs if node.rank == rank).attributes["symbolic_tensor_outputs"][0] for rank in source_ranks)):
+            raise ValueError("V3 PP restore must consume each local source output port exactly once")
+    else:
+        outputs = (producer,)
+    if not stage_experts:
+        if any(node.kind is not WorkloadKind.LINEAR or not node.node_id.endswith(f":layer-{layer}:mlp:down")
+                or node.shape["m"] != rows or node.shape["n"] != hidden for node in outputs):
+            raise ValueError("V3 dense-only PP stage must finish its actual final dense projection")
+        return rows * hidden * 2
+    for output in outputs:
+        if (output.kind is not WorkloadKind.ELEMENTWISE or output.variant != "add"
+                or output.shape != {"elements": local_rows * hidden}
+                or not output.node_id.endswith(f":layer-{layer}:mlp:shared-add")):
+            raise ValueError("V3 PP MoE frontier must finish its final shared/routed sum")
+        inputs = parents(output)
+        shared = tuple(node for node in inputs if node.kind is WorkloadKind.LINEAR)
+        scaled = tuple(node for node in inputs if node.kind is WorkloadKind.ELEMENTWISE)
+        if len(inputs) != 2 or len(shared) != 1 or len(scaled) != 1:
+            raise ValueError("V3 PP final sum requires both shared projection and scaled routed output")
+        shared, scale = shared[0], scaled[0]
+        if (shared.rank != output.rank or not shared.node_id.endswith(f":layer-{layer}:mlp:shared:down")
+                or shared.shape["m"] != local_rows or shared.shape["n"] != hidden
+                or scale.rank != output.rank or not scale.node_id.endswith(f":layer-{layer}:mlp:output-scale")
+                or scale.shape != {"elements": local_rows * hidden}
+                or set(output.attributes["symbolic_tensor_inputs"]) != {
+                    shared.attributes["symbolic_tensor_outputs"][0], scale.attributes["symbolic_tensor_outputs"][0]}):
+            raise ValueError("V3 PP shared-add must retain its actual same-rank source ports")
+        copies = parents(scale)
+        if len(copies) != 1:
+            raise ValueError("V3 PP routed scale requires its actual finalize copy")
+        copy, = copies
+        if (copy.kind is not WorkloadKind.GATHER or copy.rank != output.rank
+                or not copy.node_id.endswith(f":layer-{layer}:mlp:finalize-copy")
+                or copy.shape != {"elements": local_rows * hidden, "rows": local_rows, "hidden": hidden}
+                or scale.attributes["symbolic_tensor_inputs"] != copy.attributes["symbolic_tensor_outputs"]):
+            raise ValueError("V3 PP routed scale must consume its own real finalize-copy output")
+        combines = parents(copy)
+        if len(combines) != 1:
+            raise ValueError("V3 PP finalize copy requires its matching DP sum-scatter")
+        combine, = combines
+        attrs = combine.attributes
+        dimension = "expert" if sequence else "data"
+        participants = pool.physical_rank_group(dimension, pool.logical_rank_for_physical_rank(output.rank))
+        if (combine.kind is not WorkloadKind.COLLECTIVE or attrs["operation"] != "reduce_scatterv"
+                or attrs["collective_group"] != dimension or attrs["reduction"] != "sum"
+                or attrs["participants"] != participants or attrs["symbolic_variable_row_shape"] != (hidden,)):
+            raise ValueError("V3 PP combine must stay in its source-stage expert/data group")
+        active = tuple(rank for rank, count in zip(participants, attrs["symbolic_variable_rows"], strict=True) if count)
+        if (output.rank not in active or copy.attributes["symbolic_tensor_inputs"] != (
+                attrs["symbolic_tensor_outputs"][active.index(output.rank)],)):
+            raise ValueError("V3 PP finalize copy must bind its own sum-scatter output")
+        experts = parents(combine)
+        if (len(experts) != len(participants) or {node.rank for node in experts} != set(participants)
+                or attrs["symbolic_tensor_inputs"] != tuple(
+                    next(node for node in experts if node.rank == rank).attributes["symbolic_tensor_outputs"][0] for rank in participants)):
+            raise ValueError("V3 PP combine must retain every physical expert contribution")
+        for expert in experts:
+            if (expert.kind is not WorkloadKind.FUSED_MOE or expert not in stage_experts
+                    or expert.attributes["source_component"] != ("symbolic_grouped_routed_experts" if kimi else "symbolic_dsv3_routed_experts")
+                    or not kimi and expert.attributes["source_dispatched_input_dtype"] != "fp8"
+                    or expert.attributes["moe_invocation_id"] != attrs["moe_invocation_id"]
+                    or expert.shape["tokens"] != sum(attrs["symbolic_variable_rows"])):
+                raise ValueError("V3 PP expert contribution must bind the final FP8 source invocation")
+            dispatched = parents(expert)
+            suffixes = (":dispatch-input", ":dispatch-weights", ":dispatch-ids") + (() if kimi else (":dispatch-scales",))
+            widths = (hidden, expert.shape["topk"], expert.shape["topk"]) + (() if kimi else (hidden // 128,))
+            for port, suffix, width, item_bytes in zip(expert.attributes["symbolic_tensor_inputs"], suffixes, widths, (2, 4, 4) if kimi else (1, 4, 4, 4), strict=True):
+                owners = tuple(node for node in dispatched if node.node_id.endswith(suffix))
+                if len(owners) != 1:
+                    raise ValueError("V3 PP expert requires each actual FP8/scale/weight/ID dispatch")
+                dispatch, = owners
+                metadata = dispatch.attributes
+                if (dispatch.kind is not WorkloadKind.COLLECTIVE or metadata["operation"] != "all_gatherv"
+                        or metadata["participants"] != participants or metadata["collective_group"] != dimension
+                        or metadata["symbolic_variable_rows"] != attrs["symbolic_variable_rows"]
+                        or metadata["symbolic_variable_row_shape"] != (width,)
+                        or metadata["bytes"] != sum(attrs["symbolic_variable_rows"]) * width * item_bytes
+                        or port != metadata["symbolic_tensor_outputs"][participants.index(expert.rank)]):
+                    raise ValueError("V3 PP FP8 dispatch bytes/ports must match the actual expert group")
+    return (local_rows * tp if sequence else rows) * hidden * 2
+
+
+def _validate_distributed_pipeline_frontier(graph, pool, producer, source_ranks, stage, rows, hidden, *, output_port=None):
+    """Prove the real-row prefix of a DP MoE combine/sequence restore."""
+    config = pool.parallel_plan.config
+    tp = config.tensor_parallel_size
+    ep = config.enable_expert_parallel
+    sequence = ep and tp > 1
+    expected_operation = "all_gather" if sequence else "all_reduce"
+    if tp > 1:
+        attrs = producer.attributes
+        if (producer.kind is not WorkloadKind.COLLECTIVE or attrs["operation"] != expected_operation
+                or attrs["participants"] != source_ranks or attrs["symbolic_collective_storage"] != "fresh"
+                or attrs["bytes"] != (-(-rows // tp) * hidden * 2 if sequence else rows * hidden * 2)
+                or (sequence and attrs["symbolic_collective_dim"] != 0)):
+            raise ValueError("distributed pipeline requires its source TP restore or output reduction")
+        combines = tuple(graph.node(edge.source) for edge in graph.edges
+            if edge.destination == producer.node_id and edge.kind == "data")
+        if len(combines) != (1 if ep else tp):
+            raise ValueError("distributed pipeline restore must consume exactly its DP combines")
+    else:
+        combines = (producer,)
+    final_layer = max(index for index, owner in enumerate(pool.parallel_plan.layer_to_pipeline_stage) if owner == stage)
+    ports = {}
+    for combine in combines:
+        attrs = combine.attributes
+        dimension = "expert" if ep else "data"
+        if (combine.kind is not WorkloadKind.COLLECTIVE or attrs["operation"] != "reduce_scatterv"
+                or attrs["collective_group"] != dimension or attrs["reduction"] != "sum"
+                or attrs["symbolic_variable_row_shape"] != (hidden,)):
+            raise ValueError("distributed pipeline must follow the matching sum-scatter")
+        participants = attrs["participants"]
+        expected = pool.physical_rank_group(dimension, pool.logical_rank_for_physical_rank(combine.rank))
+        if participants != expected:
+            raise ValueError("distributed pipeline combine cannot cross its stage or TP lane")
+        experts = tuple(graph.node(edge.source) for edge in graph.edges
+            if edge.destination == combine.node_id and edge.kind == "data")
+        if len(experts) != len(participants) or {node.rank for node in experts} != set(participants):
+            raise ValueError("distributed pipeline requires every actual expert contribution")
+        for expert in experts:
+            if (expert.kind is not WorkloadKind.FUSED_MOE or expert.pool_name != pool.name
+                    or expert.attributes["source_component"] != "symbolic_unquantized_experts"
+                    or expert.attributes["model_execution_version"] != "vllm_0_30_0"
+                    or expert.attributes["routing_provenance"]["layer_index"] != final_layer
+                    or expert.attributes["moe_invocation_id"] != attrs["moe_invocation_id"]
+                    or expert.attributes["source_dp_lane_rows"] != attrs["symbolic_variable_rows"]
+                    or expert.shape["tokens"] != sum(attrs["symbolic_variable_rows"])
+                    or expert.shape["hidden"] != hidden):
+                raise ValueError("distributed pipeline frontier must be the final source-stage MoE invocation")
+            _validate_virtual_ep_router_inputs(graph, expert)
+        active_ranks = tuple(rank for rank, count in zip(participants, attrs["symbolic_variable_rows"], strict=True) if count)
+        for rank, port in zip(active_ranks, attrs["symbolic_tensor_outputs"], strict=True):
+            if rank in source_ranks:
+                ports[rank] = port
+    if set(ports) != set(source_ranks):
+        raise ValueError("distributed pipeline must retain exactly every active local TP lane")
+    if tp > 1 and producer.attributes["symbolic_tensor_inputs"] != tuple(ports[rank] for rank in source_ranks):
+        raise ValueError("distributed pipeline TP restore must read its own ordered combine output ports")
+    if tp == 1 and output_port != ports[source_ranks[0]]:
+        raise ValueError("distributed pipeline TP1 requires its own combine output")
+    return (-(-rows // tp) * tp if sequence else rows) * hidden * 2
+
+
+def _validate_glm_pipeline_frontier(graph, pool, producer, source_ranks, stage, rows, hidden, *, source_rank):
+    """Prove GLM's last dense partial or shared/routed output and SP restore."""
+    final_layer = max(index for index, owner in enumerate(pool.parallel_plan.layer_to_pipeline_stage) if owner == stage)
+
+    def partial(node, count, rank):
+        if (node.rank != rank or node.dtype != "bf16"
+                or f":layer-{final_layer}:mlp:" not in node.node_id):
+            raise ValueError("GLM pipeline must retain its actual source-rank final-layer FFN producer")
+        if node.kind is WorkloadKind.LINEAR:
+            if (node.variant != "gemm" or not node.node_id.endswith(":mlp:down")
+                    or (node.shape["b"], node.shape["m"], node.shape["n"]) != (1, count, hidden)):
+                raise ValueError("GLM dense pipeline frontier must preserve all active hidden rows")
+            return
+        if (node.kind is not WorkloadKind.ELEMENTWISE or node.variant != "add"
+                or node.shape != {"elements": count * hidden} or not node.node_id.endswith(":shared-add")):
+            raise ValueError("GLM pipeline frontier requires its real shared/routed sum")
+        inputs = tuple(graph.node(edge.source) for edge in graph.edges if edge.destination == node.node_id and edge.kind == "data")
+        shared = tuple(item for item in inputs if item.kind is WorkloadKind.LINEAR and item.rank == node.rank
+            and item.node_id.endswith(f":layer-{final_layer}:mlp:shared:down")
+            and item.shape["m"] == count and item.shape["n"] == hidden)
+        routed = tuple(item for item in inputs if item not in shared)
+        if len(inputs) != 2 or len(shared) != 1 or len(routed) != 1:
+            raise ValueError("GLM pipeline sum must retain exactly its local shared and routed producers")
+        item, = routed
+        if item.kind is WorkloadKind.FUSED_MOE:
+            if (item.rank != node.rank or item.shape["tokens"] != count or item.shape["hidden"] != hidden
+                    or item.attributes["routing_provenance"]["layer_index"] != final_layer):
+                raise ValueError("GLM pipeline direct routed producer must preserve its local rows")
+        elif item.kind is WorkloadKind.COLLECTIVE:
+            attrs = item.attributes
+            group = "expert" if pool.parallel_plan.config.enable_expert_parallel else "data"
+            expected = pool.physical_rank_group(group, pool.logical_rank_for_physical_rank(node.rank))
+            if (attrs["operation"] != "reduce_scatterv" or attrs["collective_group"] != group
+                    or attrs["participants"] != expected or attrs["symbolic_variable_row_shape"] != (hidden,)
+                    or attrs["symbolic_variable_rows"][expected.index(node.rank)] != count):
+                raise ValueError("GLM pipeline routed sum must use its actual stage-local DP/EP combine")
+            active = tuple(rank for rank, extent in zip(expected, attrs["symbolic_variable_rows"], strict=True) if extent)
+            port = attrs["symbolic_tensor_outputs"][active.index(node.rank)]
+            if port not in node.attributes["symbolic_tensor_inputs"]:
+                raise ValueError("GLM pipeline sum must consume its own rank's actual routed output")
+            experts = tuple(graph.node(name) for name in attrs["symbolic_collective_input_producers"])
+            if (len(experts) != len(expected) or any(expert.kind is not WorkloadKind.FUSED_MOE
+                    or expert.rank != rank or expert.attributes["routing_provenance"]["layer_index"] != final_layer
+                    or expert.attributes["moe_invocation_id"] != attrs["moe_invocation_id"]
+                    or expert.attributes["symbolic_tensor_outputs"] != (input_port,)
+                    for expert, rank, input_port in zip(experts, expected, attrs["symbolic_tensor_inputs"], strict=True))):
+                raise ValueError("GLM pipeline routed combine must retain every actual final-layer expert output")
+        else:
+            raise ValueError("GLM pipeline routed result requires its actual experts or sum-scatter")
+
+    if producer.kind is WorkloadKind.COLLECTIVE:
+        attrs = producer.attributes
+        if (attrs["operation"] != "all_gather" or attrs["participants"] != source_ranks
+                or "symbolic_glm_moe_sp_restore" not in attrs):
+            raise ValueError("GLM pipeline SP output requires its actual padded TP gather")
+        proof = attrs["symbolic_glm_moe_sp_restore"]
+        padded = -(-rows // len(source_ranks)) * len(source_ranks)
+        if (dict(proof) != {"logical_rows": rows, "gathered_rows": padded, "tensor_parallel_size": len(source_ranks)}
+                or attrs["symbolic_collective_input_shape"] != (padded // len(source_ranks), hidden)):
+            raise ValueError("GLM pipeline SP restore must preserve its real-row prefix and padding")
+        writers = tuple(graph.node(name) for name in attrs["symbolic_collective_input_producers"])
+        if (len(writers) != len(source_ranks)
+                or len(attrs["symbolic_tensor_inputs"]) != len(source_ranks)
+                or any(node.rank != rank or port not in node.attributes["symbolic_tensor_outputs"]
+                    for node, rank, port in zip(writers, source_ranks, attrs["symbolic_tensor_inputs"], strict=True))):
+            raise ValueError("GLM pipeline SP restore requires every actual local TP shard")
+        for node, rank in zip(writers, source_ranks, strict=True):
+            partial(node, padded // len(source_ranks), rank)
+        return padded * hidden * 2
+    partial(producer, rows, source_rank)
+    return rows * hidden * 2
+
+
+def _validate_glm_pipeline_full_views(message, producer, rows, hidden, backing_bytes):
+    from src.kernel.memory_access import TensorView
+    views = message.attributes["symbolic_pipeline_views"]
+    source, destination = (TensorView(**dict(views[name])) for name in ("source", "destination"))
+    originals = tuple(TensorView(**dict(value)) for value in views["source_producer_views"])
+    if (source.view_id != message.attributes["symbolic_tensor_inputs"][0]
+            or destination.view_id != message.attributes["symbolic_tensor_outputs"][0]
+            or source.allocation_id == destination.allocation_id or source.shape != (rows, hidden)
+            or source.dtype != "bf16" or source.offset_bytes != 0 or source.strides_bytes != (2 * hidden, 2)
+            or destination.shape != source.shape or destination.dtype != source.dtype or destination.offset_bytes != 0
+            or destination.strides_bytes != source.strides_bytes or views["source_backing_bytes"] != backing_bytes
+            or backing_bytes < rows * hidden * 2 or views["destination_backing_bytes"] != rows * hidden * 2
+            or not any(view.view_id in producer.attributes["symbolic_tensor_outputs"]
+                and view.allocation_id == source.allocation_id and view.shape == source.shape
+                and view.offset_bytes == source.offset_bytes and view.strides_bytes == source.strides_bytes
+                for view in originals)):
+        raise ValueError("GLM pipeline full tensor must bind its actual producer and independent receive view")
+
+
+def _validate_symbolic_dp_pipeline_graph(graph, pool):
+    """Validate each active request replica's PP boundaries independently."""
+    config = pool.parallel_plan.config
+    experts = tuple(node for node in graph.nodes if node.pool_name == pool.name and node.kind is WorkloadKind.FUSED_MOE)
+    if any("source_component" in node.attributes
+            and node.attributes["source_component"] == "vllm_0_30_symbolic_v4_marlin" for node in experts):
+        _validate_v4_pipeline_graph(graph, pool, tuple(node for node in graph.nodes
+            if node.pool_name == pool.name and node.kind is WorkloadKind.P2P))
+        return
+    v3 = bool(experts) and all(_symbolic_mla_dp_pipeline_projection(node, pool) for node in experts)
+    if any("source_component" in node.attributes and node.attributes["source_component"] == "symbolic_dsv3_routed_experts"
+            for node in experts) and not v3:
+        raise NotImplementedError("V3 DP source requires its versioned FP8 dispatch, expert and pipeline pricing bindings")
+    glm = bool(experts) and all(_symbolic_glm_pcp_projection(node, pool) for node in experts)
+    # MTP recurrences have their own physical DP row extents. PP transports
+    # the target batch; draft dispatch/combine is validated per invocation.
+    pipeline_experts = tuple(node for node in experts if not (
+        glm and _symbolic_glm_mtp_data_projection(node, pool)
+        and node.attributes["routing_provenance"]["layer_index"] is None))
+    if v3:
+        rows = []
+        for replica in range(config.data_parallel_size):
+            first_stage = tuple(pool.physical_rank_for_logical_rank(replica * config.pipeline_parallel_size
+                * config.tensor_parallel_size + lane) for lane in range(config.tensor_parallel_size))
+            norms = tuple(node for node in graph.nodes if node.pool_name == pool.name and node.rank in first_stage
+                and node.kind is WorkloadKind.NORM and node.node_id.endswith(":layer-0:input-norm"))
+            if norms and (len(norms) != config.tensor_parallel_size or {node.rank for node in norms} != set(first_stage)
+                    or len({node.shape["rows"] for node in norms}) != 1):
+                raise ValueError("MLA DP pipeline requires the original matching rows on every input lane")
+            dummy = tuple("source_dummy_run" in node.attributes and node.attributes["source_dummy_run"] is True
+                for node in norms)
+            if any(dummy) and (not all(dummy) or any(node.shape["rows"] != 1
+                    or node.attributes["source_actual_request_count"] != 0 for node in norms)):
+                raise ValueError("MLA DP dummy pipeline requires matching one-row non-request inputs on every lane")
+            if any(dummy):
+                replica_ranks = set(pool.physical_rank_for_logical_rank(replica * config.pipeline_parallel_size
+                    * config.tensor_parallel_size + offset) for offset in range(config.pipeline_parallel_size * config.tensor_parallel_size))
+                if any(node.pool_name == pool.name and node.rank in replica_ranks
+                        and node.kind in (WorkloadKind.KV_UPDATE, WorkloadKind.LM_HEAD) for node in graph.nodes):
+                    raise ValueError("legacy MLA dummy pipeline cannot write request cache or sample target logits")
+            rows.append(norms[0].shape["rows"] if norms and not any(dummy) else 0)
+        geometries = {tuple(rows)}
+    elif glm and config.data_parallel_size == 1:
+        geometries = {(node.shape["rows"],) for node in graph.nodes if node.pool_name == pool.name
+            and node.kind is WorkloadKind.NORM and node.node_id.endswith(":layer-0:input-norm")}
+    else:
+        geometries = {node.attributes["source_pcp_request_rows" if glm else "source_dp_request_rows"] for node in pipeline_experts}
+    if len(geometries) != 1:
+        raise ValueError("distributed pipeline requires one consistent DP row geometry")
+    logical_rows, = geometries
+    if len(logical_rows) != config.data_parallel_size:
+        raise ValueError("distributed pipeline row geometry must cover all DP replicas")
+    messages = tuple(node for node in graph.nodes if node.pool_name == pool.name and node.kind is WorkloadKind.P2P)
+    tp, pp = config.tensor_parallel_size, config.pipeline_parallel_size
+    if len(messages) != sum(bool(rows) for rows in logical_rows) * (pp - 1) * tp * 2:
+        raise ValueError("distributed pipeline requires both payload roles for exactly its active DP replicas")
+    for replica, rows in enumerate(logical_rows):
+        if not rows:
+            continue
+        for stage in range(pp - 1):
+            source_ranks = tuple(pool.physical_rank_for_logical_rank(replica * pp * tp + stage * tp + lane) for lane in range(tp))
+            destination_ranks = tuple(pool.physical_rank_for_logical_rank(replica * pp * tp + (stage + 1) * tp + lane) for lane in range(tp))
+            boundary = tuple(node for node in messages if node.rank in source_ranks)
+            if tp > 1:
+                _validate_symbolic_sliced_pipeline_boundary(graph, pool, boundary, stage,
+                    rank_pair=(source_ranks, destination_ranks))
+                continue
+            roles = {node.attributes["payload_tensor"]["name"]: node for node in boundary}
+            if len(boundary) != 2 or set(roles) != {"hidden_states", "residual"}:
+                raise ValueError("distributed TP1 pipeline requires both roles at every active boundary")
+            consumers = []
+            for role, message in roles.items():
+                _validate_pipeline_p2p_node(message, pool)
+                if (message.attributes["source_stage"] != stage or message.attributes["destination_stage"] != stage + 1
+                        or message.attributes["destination_rank"] != destination_ranks[0]
+                        or message.attributes["payload_tensor"]["shape"] != (rows, experts[0].shape["hidden"])):
+                    raise ValueError("distributed TP1 payload must preserve its own DP stage and real rows")
+                producers = tuple(graph.node(edge.source) for edge in graph.edges if edge.destination == message.node_id and edge.kind == "data")
+                if len(producers) != 1:
+                    raise ValueError("distributed TP1 pipeline requires one actual source producer")
+                producer, = producers
+                if (message.attributes["symbolic_tensor_inputs"][0] not in producer.attributes["symbolic_tensor_outputs"]
+                        and not (glm or v3)):
+                    raise ValueError("distributed pipeline message must bind an actual producer output")
+                if role == "hidden_states":
+                    if glm:
+                        backing_bytes = _validate_glm_pipeline_frontier(graph, pool, producer, source_ranks, stage,
+                            rows, experts[0].shape["hidden"], source_rank=message.rank)
+                        _validate_glm_pipeline_full_views(message, producer, rows, experts[0].shape["hidden"], backing_bytes)
+                    elif v3:
+                        backing_bytes = _validate_mla_dp_pipeline_frontier(graph, pool, producer, source_ranks, stage,
+                            rows, experts[0].shape["hidden"])
+                        _validate_glm_pipeline_full_views(message, producer, rows, experts[0].shape["hidden"], backing_bytes)
+                    else:
+                        _validate_distributed_pipeline_frontier(graph, pool, producer, source_ranks, stage, rows, experts[0].shape["hidden"],
+                            output_port=message.attributes["symbolic_tensor_inputs"][0])
+                elif (producer.kind is not WorkloadKind.NORM or producer.rank != source_ranks[0]
+                        or producer.shape != {"rows": rows, "hidden": experts[0].shape["hidden"]}):
+                    raise ValueError("distributed pipeline residual must retain its source norm")
+                elif glm or v3:
+                    _validate_glm_pipeline_full_views(message, producer, rows, experts[0].shape["hidden"],
+                        message.attributes["symbolic_pipeline_views"]["source_backing_bytes"])
+                successors = tuple(graph.node(edge.destination) for edge in graph.edges if edge.source == message.node_id and edge.kind == "data")
+                if len(successors) != 1:
+                    raise ValueError("distributed TP1 receive must enter exactly one worker copy")
+                consumers.append(_pipeline_worker_copy_consumer(graph, successors[0],
+                    message.attributes["symbolic_tensor_outputs"][0], destination_ranks[0],
+                    None, False))
+            if (consumers[0].node_id != consumers[1].node_id or consumers[0].kind is not WorkloadKind.NORM
+                    or WorkloadEdge(roles["hidden_states"].node_id, roles["residual"].node_id, "barrier") not in graph.edges):
+                raise ValueError("distributed pipeline roles must retain dictionary order and the same destination input norm")
+    if v3:
+        for stage in range(pp - 1):
+            stage_ranks = set(pool.physical_ranks_for_pipeline_stage(stage))
+            active_stage_ranks = {pool.physical_rank_for_logical_rank((replica * pp + stage) * tp + lane)
+                for replica, rows in enumerate(logical_rows) if rows for lane in range(tp)}
+            local = {node.node_id for node in graph.nodes if node.pool_name == pool.name and node.kind is not WorkloadKind.P2P
+                and (set(node.attributes["participants"]) <= stage_ranks
+                    and bool(set(node.attributes["participants"]) & active_stage_ranks) if node.kind is WorkloadKind.COLLECTIVE
+                    else node.rank in active_stage_ranks)}
+            nonterminals = {edge.source for edge in graph.edges if edge.source in local and edge.destination in local}
+            boundary = tuple(message for message in messages if message.attributes["source_stage"] == stage)
+            parents = {edge.source for edge in graph.edges if edge.kind == "data"
+                and any(edge.destination == message.node_id for message in boundary)}
+            hidden_parents = {edge.source for edge in graph.edges if edge.kind == "data"
+                and any(edge.destination == message.node_id and message.attributes["payload_tensor"]["name"] == "hidden_states"
+                    for message in boundary)}
+            terminals = local - nonterminals
+            if terminals - parents or hidden_parents - terminals:
+                raise ValueError("V3 PP must finish every source-stage dependency before sending its actual hidden frontier")
+    for edge in graph.edges:
+        source, destination = graph.node(edge.source), graph.node(edge.destination)
+        if source.pool_name != pool.name or destination.pool_name != pool.name:
+            continue
+        source_group = source.attributes["participants"] if source.kind is WorkloadKind.COLLECTIVE else (source.rank,)
+        destination_group = destination.attributes["participants"] if destination.kind is WorkloadKind.COLLECTIVE else (destination.rank,)
+        source_stages = {pool.logical_rank_for_physical_rank(rank) // tp % pp for rank in source_group}
+        destination_stages = {pool.logical_rank_for_physical_rank(rank) // tp % pp for rank in destination_group}
+        if (len(source_stages) != 1 or len(destination_stages) != 1
+                or (source_stages != destination_stages and (source.kind is not WorkloadKind.P2P
+                    or source.attributes["destination_rank"] not in destination_group))):
+            raise ValueError("distributed pipeline cross-stage dependencies must pass through their declared PP message")
+        if v3:
+            if (source.kind is not WorkloadKind.COLLECTIVE and destination.kind is not WorkloadKind.COLLECTIVE
+                    and pool.logical_rank_for_physical_rank(source.rank) // (tp * pp)
+                    != pool.logical_rank_for_physical_rank(destination.rank) // (tp * pp)):
+                raise ValueError("V3 cross-replica dependency must use its actual collective")
+            if (source.kind is WorkloadKind.P2P and destination.kind is WorkloadKind.COLLECTIVE
+                    and any(pool.logical_rank_for_physical_rank(rank) // (tp * pp)
+                        != pool.logical_rank_for_physical_rank(source.rank) // (tp * pp) for rank in destination_group)):
+                raise ValueError("V3 PP receive cannot enter another replica's collective")
+
+
+def _validate_symbolic_sliced_pipeline_boundary(graph, pool, p2p_nodes, stage, *, rank_pair=None):
     """Bind source lane views to independent receives and fresh TP gathers."""
     from src.kernel.memory_access import TensorView
-    source_ranks = pool.physical_ranks_for_pipeline_stage(stage)
-    destination_ranks = pool.physical_ranks_for_pipeline_stage(stage + 1)
+    source_ranks, destination_ranks = ((pool.physical_ranks_for_pipeline_stage(stage),
+        pool.physical_ranks_for_pipeline_stage(stage + 1)) if rank_pair is None else rank_pair)
     tp = pool.parallel_plan.config.tensor_parallel_size
-    glm_projection = tp == 8 and all(_symbolic_glm_pipeline_projection(node, pool) for node in p2p_nodes)
-    kimi_projection = tp == 8 and all(_symbolic_kimi_pipeline_projection(node, pool) for node in p2p_nodes)
-    target_projection = glm_projection or kimi_projection
-    if tp != 2 and not target_projection:
-        raise NotImplementedError("sliced pipeline requires TP2 or an explicit existing MLA TP8 projection")
+    glm_projection = all(_symbolic_glm_pipeline_projection(node, pool) or _symbolic_glm_pcp_projection(node, pool)
+        for node in p2p_nodes)
+    v3_distributed = bool(p2p_nodes) and all(_symbolic_mla_dp_pipeline_projection(node, pool) for node in p2p_nodes)
+    distributed = _qwen030_dp_sp(pool.parallel_plan.config) and not (glm_projection or v3_distributed)
+    kimi_projection = all(_symbolic_kimi_pipeline_projection(node, pool) for node in p2p_nodes)
+    v3_projection = v3_distributed or all(_symbolic_v3_parallel_projection(node, pool) for node in p2p_nodes)
+    target_projection = glm_projection or kimi_projection or v3_projection
+    if tp < 2:
+        raise NotImplementedError("sliced pipeline requires at least two TP lanes")
     messages = {}
     for node in p2p_nodes:
         _validate_pipeline_p2p_node(node, pool)
@@ -5271,6 +7909,7 @@ def _validate_symbolic_sliced_pipeline_boundary(graph, pool, p2p_nodes, stage):
     gathers = {}
     for role in ("hidden_states", "residual"):
         lanes = tuple(messages[rank, role] for rank in source_ranks)
+        dtype = lanes[0].attributes["payload_tensor"]["dtype"]
         successors = tuple({edge.destination for edge in graph.edges
             if edge.source == node.node_id and edge.kind == "data"} for node in lanes)
         if any(len(ids) != 1 for ids in successors) or any(ids != successors[0] for ids in successors[1:]):
@@ -5328,10 +7967,10 @@ def _validate_symbolic_sliced_pipeline_boundary(graph, pool, p2p_nodes, stage):
             consumers = tuple(consumers)
         else:
             consumers = tuple(_pipeline_worker_copy_consumer(graph, copy,
-                attrs["symbolic_tensor_outputs"][destination_ranks.index(copy.rank)], copy.rank)
-                for copy in direct_consumers)
+                attrs["symbolic_tensor_outputs"][destination_ranks.index(copy.rank)], copy.rank,
+                None, False, dtype=dtype) for copy in direct_consumers)
         if (len(consumers) != tp or {node.rank for node in consumers} != set(destination_ranks)
-                or any(node.kind is not WorkloadKind.NORM or node.dtype != "bf16"
+                or any(node.kind is not WorkloadKind.NORM or node.dtype != dtype
                     or set(node.shape) != {"rows", "hidden"} for node in consumers)
                 or any(dict(node.shape) != dict(consumers[0].shape) for node in consumers[1:])):
             raise ValueError("sliced pipeline gathered tensors must feed all destination input norms")
@@ -5350,12 +7989,24 @@ def _validate_symbolic_sliced_pipeline_boundary(graph, pool, p2p_nodes, stage):
             if set(views) != {"source", "destination", "source_backing_bytes", "destination_backing_bytes", "source_producer_views"}:
                 raise ValueError("sliced pipeline view contract fields must be complete")
             source_view, destination_view = (TensorView(**dict(views[key])) for key in ("source", "destination"))
+            producers = tuple(graph.node(edge.source) for edge in graph.edges
+                if edge.destination == message.node_id and edge.kind == "data")
+            if len(producers) != 1:
+                raise ValueError("sliced pipeline requires one source storage producer")
+            producer = producers[0]
+            producer_bytes = (_validate_glm_pipeline_frontier(graph, pool, producer, source_ranks, stage, rows, hidden,
+                source_rank=message.rank)
+                if glm_projection and _symbolic_glm_pcp_projection(message, pool) and role == "hidden_states" else
+                _validate_mla_dp_pipeline_frontier(graph, pool, producer, source_ranks, stage, rows, hidden)
+                    if v3_distributed and role == "hidden_states" else
+                _validate_distributed_pipeline_frontier(graph, pool, producer,
+                    source_ranks, stage, rows, hidden) if distributed and role == "hidden_states" else full_bytes)
             # A later stage's in-place residual aliases the active prefix of
             # its persistent max-batched-token intermediate buffer. Transmit
             # only the active lane; retain the larger physical backing in the
             # lifecycle report and validate its full active producer below.
-            source_backing_valid = (views["source_backing_bytes"] == full_bytes or (
-                glm_projection and stage > 0 and role == "residual"
+            source_backing_valid = (views["source_backing_bytes"] == producer_bytes or (
+                target_projection and stage > 0 and role == "residual"
                 and views["source_backing_bytes"] >= full_bytes
                 and views["source_backing_bytes"] % (hidden * 2) == 0))
             if (source_view.view_id != message.attributes["symbolic_tensor_inputs"][0]
@@ -5367,21 +8018,22 @@ def _validate_symbolic_sliced_pipeline_boundary(graph, pool, p2p_nodes, stage):
                 raise ValueError("sliced pipeline view ports and independent full backings must match its payload")
             for view in (source_view, destination_view):
                 if (view.shape != (rows * hidden // tp,) or view.strides_bytes != (2,)
-                        or view.dtype != "bf16" or view.offset_bytes != lane * (full_bytes // tp)):
+                        or view.dtype != dtype or view.offset_bytes != lane * (full_bytes // tp)):
                     raise ValueError("sliced pipeline view must select its canonical flattened TP lane")
-            producers = tuple(graph.node(edge.source) for edge in graph.edges
-                if edge.destination == message.node_id and edge.kind == "data")
-            if len(producers) != 1:
-                raise ValueError("sliced pipeline requires one source storage producer")
-            producer = producers[0]
             producer_views = tuple(TensorView(**dict(view)) for view in views["source_producer_views"])
             if (not producer_views or any(view.view_id not in producer.attributes["symbolic_tensor_outputs"]
                     for view in producer_views)
                     or not any(view.allocation_id == source_view.allocation_id
-                        and view.shape == (rows, hidden) and view.offset_bytes == 0
-                        and view.strides_bytes == (hidden * 2, 2) and view.dtype == "bf16" for view in producer_views)):
+                        and view.shape == (producer_bytes // (hidden * 2), hidden) and view.offset_bytes == 0
+                        and view.strides_bytes == (hidden * 2, 2) and view.dtype == dtype for view in producer_views)):
                 raise ValueError("sliced pipeline source alias must bind its producer's full output")
             if role == "hidden_states":
+                if glm_projection and _symbolic_glm_pcp_projection(message, pool):
+                    continue
+                if distributed or v3_distributed:
+                    # The exact padded restore and its real-row prefix were
+                    # proved above, including each stage-local expert input.
+                    continue
                 if glm_projection:
                     final_layer = max(index for index, owner in enumerate(pool.parallel_plan.layer_to_pipeline_stage)
                         if owner == stage)
@@ -5402,9 +8054,16 @@ def _validate_symbolic_sliced_pipeline_boundary(graph, pool, p2p_nodes, stage):
                         if edge.destination == producer.node_id and edge.kind == "data")
                     valid_inputs = (all(node.kind is WorkloadKind.ELEMENTWISE and node.variant == "add"
                         and node.dtype == "bf16" and dict(node.shape) == {"elements": rows * hidden}
-                        for node in inputs) if kimi_projection else
-                        all(node.kind is WorkloadKind.LINEAR and node.variant == "gemm"
-                            and node.shape["m"] == rows and node.shape["n"] == hidden for node in inputs))
+                        or node.kind is WorkloadKind.LINEAR and node.variant == "gemm" and node.dtype == "bf16"
+                        and node.node_id.endswith(":mlp:down") and node.shape["m"] == rows and node.shape["n"] == hidden
+                        for node in inputs) if kimi_projection or v3_projection else
+                        all((node.kind is WorkloadKind.LINEAR and node.variant == "gemm"
+                                and node.shape["m"] == rows and node.shape["n"] == hidden)
+                            or (node.kind is WorkloadKind.FUSED_MOE
+                                and node.attributes["source_component"] == "symbolic_unquantized_experts"
+                                and node.attributes["model_execution_version"] == "vllm_0_30_0"
+                                and node.shape["tokens"] == rows and node.shape["hidden"] == hidden)
+                            for node in inputs))
                     if len(inputs) != tp or not valid_inputs or {node.rank for node in inputs} != set(source_ranks):
                         raise ValueError("sliced pipeline frontier must follow the source MLP outputs")
             else:
@@ -5428,6 +8087,433 @@ def _validate_symbolic_sliced_pipeline_boundary(graph, pool, p2p_nodes, stage):
             raise ValueError("sliced pipeline cross-stage dependencies must use their declared receive lane")
 
 
+def _validate_k3_pipeline_graph(graph, pool, messages):
+    """Bind both K3 PP roles through real reshapes and block-buffer copies.
+
+    Attention Residual capacity comes from the source operators. The
+    transport proof never grants operator/provider or normal-memory support.
+    """
+    from src.kernel.memory_access import TensorView
+    config = pool.parallel_plan.config
+    tp, dp, pp = config.tensor_parallel_size, config.data_parallel_size, config.pipeline_parallel_size
+    if pp <= 1 or any(not _symbolic_k3_pipeline_topology_projection(node, pool) for node in messages):
+        raise ValueError("K3 pipeline requires its versioned typed source messages")
+    parents, children = {}, {}
+    for edge in graph.edges:
+        if edge.kind == "data":
+            if edge.destination not in parents:
+                parents[edge.destination] = []
+            if edge.source not in children:
+                children[edge.source] = []
+            parents[edge.destination].append(graph.node(edge.source))
+            children[edge.source].append(graph.node(edge.destination))
+    first_layers = tuple(next(layer for layer, owner in enumerate(pool.parallel_plan.layer_to_pipeline_stage) if owner == stage)
+        for stage in range(pp))
+    entries = {}
+    for node in graph.nodes:
+        if node.pool_name != pool.name or node.variant != "kimi_k3_attn_res":
+            continue
+        stage = pool.logical_rank_for_physical_rank(node.rank) // tp % pp
+        if node.node_id.endswith(f":layer-{first_layers[stage]}:pre-attn"):
+            if (node.rank in entries or node.kind is not WorkloadKind.VECTOR or node.dtype != "bf16"
+                    or node.attributes["source_component"] != "vllm_0_30_kimi_k3_attention_residual"):
+                raise ValueError("K3 pipeline requires one real Attention Residual entry per active worker")
+            entries[node.rank] = node
+    rows_by_replica, widths = [], set()
+    for replica in range(dp):
+        ranks = tuple(pool.physical_rank_for_logical_rank(replica * pp * tp + lane) for lane in range(tp))
+        present = tuple(entries[rank] for rank in ranks if rank in entries)
+        if not present:
+            rows_by_replica.append(0)
+            continue
+        if len(present) != tp or len({node.shape["rows"] for node in present}) != 1:
+            raise ValueError("K3 PP requires matching original rows on all active TP lanes")
+        dummy=tuple('source_dummy_run' in node.attributes and node.attributes['source_dummy_run'] is True for node in present)
+        if any(dummy) and (not all(dummy) or any(node.shape['rows']!=1 or node.attributes['source_actual_request_count']!=0
+                or node.attributes['source_k3_request_rows'][replica]!=0 for node in present)):
+            raise ValueError("K3 dummy PP requires one physical non-request input on every lane")
+        rows_by_replica.append(0 if any(dummy) else present[0].shape["rows"])
+        widths.update(node.shape["hidden"] for node in present)
+    if len(widths) != 1 or len(messages) != sum(bool(rows) for rows in rows_by_replica) * (pp - 1) * tp * 2:
+        raise ValueError("K3 PP requires both payload roles on every active replica boundary")
+    hidden, = widths
+
+    def only_relation(node_id, relations, description):
+        if node_id not in relations or len(relations[node_id]) != 1:
+            raise ValueError("K3 PP requires exactly one actual " + description)
+        return relations[node_id][0]
+
+    def copy_node(node, rank, rows, width):
+        if (node.rank != rank or node.kind is not WorkloadKind.GATHER or node.variant != "gather" or node.dtype != "bf16"
+                or node.shape != {"elements": rows * width, "rows": rows, "hidden": width}
+                or node.attributes["index_count"] != 0 or node.attributes["gather_factor"] != 1
+                or node.attributes["scattered"] is not False or node.attributes["materialized_output"] is not True
+                or len(node.attributes["symbolic_tensor_inputs"]) != 1 or len(node.attributes["symbolic_tensor_outputs"]) != 1):
+            raise ValueError("K3 PP requires its same-rank materialized worker copy and exact extent")
+
+    def dense_view(view, shape, *, offset=0):
+        stride, strides = 2, []
+        for size in reversed(shape):
+            strides.insert(0, stride)
+            stride *= size
+        return (view.shape == shape and view.strides_bytes == tuple(strides)
+            and view.dtype == "bf16" and view.offset_bytes == offset)
+
+    for stage in range(pp - 1):
+        hidden_frontiers = set()
+        for replica, rows in enumerate(rows_by_replica):
+            source = tuple(pool.physical_rank_for_logical_rank((replica * pp + stage) * tp + lane) for lane in range(tp))
+            destination = tuple(pool.physical_rank_for_logical_rank((replica * pp + stage + 1) * tp + lane) for lane in range(tp))
+            lanes = tuple(message for message in messages if message.rank in source)
+            if not rows:
+                if lanes or any(rank not in entries or 'source_dummy_run' not in entries[rank].attributes
+                        or entries[rank].attributes['source_dummy_run'] is not True
+                        or entries[rank].attributes['source_actual_request_count']!=0
+                        or entries[rank].attributes['source_k3_request_rows'][replica]!=0
+                        or entries[rank].shape!={'rows':1,'hidden':hidden,'elements':hidden}
+                        for rank in (*source,*destination)):
+                    raise ValueError("idle K3 replica requires its complete local dummy body without PP payload")
+                continue
+            if any(rank not in entries for rank in (*source, *destination)):
+                raise ValueError("K3 PP must preserve its active owner's stage-entry workers")
+            capacity = entries[source[0]].attributes["block_capacity"]
+            if (any(entries[rank].shape != {"rows": rows, "hidden": hidden, "elements": rows * hidden}
+                    or entries[rank].attributes["block_capacity"] != capacity for rank in source)
+                    or any(entries[rank].shape != entries[source[0]].shape
+                        or entries[rank].attributes["num_blocks"] != capacity
+                        or entries[rank].attributes["block_capacity"] < capacity
+                        or entries[rank].attributes["has_delta"] is not False for rank in destination)):
+                raise ValueError("K3 PP residual prefix must match its original rows and next-stage block count")
+            for rank in source:
+                inherited = entries[rank].attributes["num_blocks"]
+                writes = tuple(node.attributes["block_write_idx"] for node in graph.nodes
+                    if node.pool_name == pool.name and node.rank == rank and node.variant == "kimi_k3_attn_res"
+                    and node.attributes["block_write_idx"] >= 0)
+                if not 0 <= inherited <= capacity or sorted(writes) != list(range(inherited, capacity)):
+                    raise ValueError("K3 PP residual prefix must retain each inherited or actually written block")
+            paired = {(message.rank, message.attributes["payload_tensor"]["name"]): message for message in lanes}
+            if len(lanes) != tp * 2 or set(paired) != {(rank, role) for rank in source for role in ("hidden_states", "residual")}:
+                raise ValueError("K3 PP requires both ordered roles on each active TP lane")
+            gathers = {}
+            for role in ("hidden_states", "residual"):
+                role_lanes = tuple(paired[rank, role] for rank in source)
+                total = rows * hidden * (capacity if role == "residual" else 1)
+                if total % tp:
+                    raise ValueError("K3 PP payload must divide its physical TP lanes")
+                wire_shape = ((rows * (capacity if role == "residual" else 1), hidden) if tp == 1 else (total // tp,))
+                for lane, message in enumerate(role_lanes):
+                    _validate_pipeline_p2p_node(message, pool)
+                    metadata = message.attributes["symbolic_pipeline_views"]
+                    sent, received = (TensorView(**dict(metadata[name])) for name in ("source", "destination"))
+                    writer = only_relation(message.node_id, parents, "source producer")
+                    if (message.attributes["payload_tensor"]["dtype"] != "bf16"
+                            or tuple(message.attributes["payload_tensor"]["shape"]) != wire_shape
+                            or message.attributes["bytes"] != total * 2 // tp
+                            or metadata["source_backing_bytes"] != total * 2 or metadata["destination_backing_bytes"] != total * 2
+                            or not dense_view(sent, wire_shape, offset=lane * total * 2 // tp)
+                            or not dense_view(received, wire_shape, offset=lane * total * 2 // tp)
+                            or sent.view_id != message.attributes["symbolic_tensor_inputs"][0]
+                            or received.view_id != message.attributes["symbolic_tensor_outputs"][0]
+                            or received.allocation_id != message.attributes["symbolic_tensor_output_allocations"][0]
+                            or sent.allocation_id == received.allocation_id or writer.rank != message.rank or writer.dtype != "bf16"):
+                        raise ValueError("K3 PP wire must preserve its actual full backing and exact hidden/residual lane")
+                    produced = tuple(TensorView(**dict(view)) for view in metadata["source_producer_views"])
+                    bound = tuple(view for view in produced if view.allocation_id == sent.allocation_id
+                        and view.view_id in writer.attributes["symbolic_tensor_outputs"])
+                    if role == "hidden_states":
+                        if (writer.kind is not WorkloadKind.ELEMENTWISE or writer.variant != "add"
+                                or not writer.node_id.endswith(":pipeline:prefix-add") or writer.shape != {"elements": rows * hidden}
+                                or not any(dense_view(view, (rows, hidden)) for view in bound)):
+                            raise ValueError("K3 PP hidden must follow its actual final prefix-add")
+                        hidden_frontiers.add(writer.node_id)
+                    elif writer.variant == "kimi_k3_attn_res":
+                        index = writer.attributes["block_write_idx"]
+                        if (writer.attributes["block_capacity"] != capacity or index != capacity - 1
+                                or not any(view.shape == (rows, 1, hidden) and view.strides_bytes == (capacity * hidden * 2, hidden * 2, 2)
+                                    and view.dtype == "bf16" and view.offset_bytes == index * hidden * 2 for view in bound)):
+                            raise ValueError("K3 PP residual must alias the actual last block writer")
+                    elif (not writer.node_id.endswith(":attn-res:receive-copy")
+                            or not any(dense_view(view, (rows, capacity, hidden)) for view in bound)):
+                        raise ValueError("K3 PP unchanged residual must retain its actual inherited block copy")
+                    post = only_relation(message.node_id, children, "destination receive postprocess")
+                    if tp > 1:
+                        attrs = post.attributes
+                        if (post.kind is not WorkloadKind.COLLECTIVE or attrs["operation"] != "all_gather"
+                                or attrs["participants"] != destination or attrs["symbolic_collective_storage"] != "fresh"
+                                or attrs["symbolic_collective_dim"] != 0 or attrs["bytes"] != total * 2 // tp
+                                or attrs["symbolic_tensor_inputs"] != tuple(node.attributes["symbolic_tensor_outputs"][0] for node in role_lanes)
+                                or {node.node_id for node in parents[post.node_id]} != {node.node_id for node in role_lanes}):
+                            raise ValueError("K3 PP receive lanes must enter their own fresh destination gather")
+                        gathers[role] = post.node_id
+                        if post.node_id not in children:
+                            raise ValueError("K3 PP gather requires exactly one actual runner copy per TP rank")
+                        copies = tuple(node for node in children[post.node_id] if node.rank == destination[lane])
+                        if len(children[post.node_id]) != tp or len(copies) != 1:
+                            raise ValueError("K3 PP gather requires exactly one actual runner copy per TP rank")
+                        copy, = copies
+                        port = attrs["symbolic_tensor_outputs"][lane]
+                    else:
+                        copy, port = post, received.view_id
+                    width = hidden * (capacity if role == "residual" else 1)
+                    copy_node(copy, destination[lane], rows, width)
+                    if not copy.node_id.endswith(":receive:runner-copy:" + role):
+                        raise ValueError("K3 PP must enter its actual role-specific runner copy")
+                    views = metadata["destination_postprocess_views"]
+                    original, reshaped = (TensorView(**dict(views[key])) for key in ("received_or_gathered", "runner_input"))
+                    expected = (rows, capacity, hidden) if role == "residual" else (rows, hidden)
+                    if (original.view_id != port or not dense_view(original, (rows * (capacity if role == "residual" else 1), hidden))
+                            or not dense_view(reshaped, expected) or original.allocation_id != reshaped.allocation_id
+                            or reshaped.view_id != copy.attributes["symbolic_tensor_inputs"][0]
+                            or copy.attributes["symbolic_tensor_input_allocations"] != (reshaped.allocation_id,)
+                            or tp > 1 and original.allocation_id == received.allocation_id):
+                        raise ValueError("K3 PP worker copy receive reshape must alias its actual gathered view without inventing a copy")
+                    target = entries[destination[lane]]
+                    if role == "hidden_states":
+                        if (metadata["destination_residual_views"] is not None
+                                or copy.attributes["symbolic_tensor_outputs"][0] != target.attributes["symbolic_tensor_inputs"][0]
+                                or WorkloadEdge(copy.node_id, target.node_id, "data") not in graph.edges):
+                            raise ValueError("K3 PP hidden copy must enter its own first Attention Residual prefix")
+                    else:
+                        block_copy = only_relation(copy.node_id, children, "destination block copy")
+                        copy_node(block_copy, destination[lane], rows, capacity * hidden)
+                        if not block_copy.node_id.endswith(":attn-res:receive-copy"):
+                            raise ValueError("K3 residual runner buffer must be copied into its actual block arena")
+                        receipts = metadata["destination_residual_views"]
+                        runner_out, block_in, block_out, attention_in = (TensorView(**dict(receipts[key]))
+                            for key in ("runner_output", "block_copy_input", "block_copy_output", "attention_input"))
+                        target_capacity = target.attributes["block_capacity"]
+                        if (runner_out.view_id != copy.attributes["symbolic_tensor_outputs"][0]
+                                or not dense_view(runner_out, expected) or block_in != runner_out
+                                or block_in.view_id != block_copy.attributes["symbolic_tensor_inputs"][0]
+                                or block_out.view_id != block_copy.attributes["symbolic_tensor_outputs"][0]
+                                or attention_in.view_id != target.attributes["symbolic_tensor_inputs"][-1]
+                                or block_out.allocation_id == runner_out.allocation_id
+                                or block_out.allocation_id != attention_in.allocation_id
+                                or block_out.shape != expected or attention_in.shape != expected
+                                or block_out.offset_bytes != 0 or attention_in.offset_bytes != 0
+                                or block_out.strides_bytes != (target_capacity * hidden * 2, hidden * 2, 2)
+                                or attention_in.strides_bytes != block_out.strides_bytes
+                                or block_out.dtype != "bf16" or attention_in.dtype != "bf16"
+                                or receipts["block_residual_backing_bytes"] != rows * target_capacity * hidden * 2
+                                or WorkloadEdge(block_copy.node_id, target.node_id, "data") not in graph.edges):
+                            raise ValueError("K3 PP block copy must bind the same real residual arena read by Attention Residual")
+                if tp > 1 and len(set(gathers.values())) != len(gathers):
+                    raise ValueError("K3 hidden and block residual need distinct destination gathers")
+            for rank in source:
+                if WorkloadEdge(paired[rank, "hidden_states"].node_id, paired[rank, "residual"].node_id, "barrier") not in graph.edges:
+                    raise ValueError("K3 PP must retain hidden-then-residual dictionary send order")
+            if tp > 1 and WorkloadEdge(gathers["hidden_states"], gathers["residual"], "barrier") not in graph.edges:
+                raise ValueError("K3 PP must retain hidden-then-residual destination gather order")
+        stage_ranks = set(pool.physical_ranks_for_pipeline_stage(stage))
+        active_stage_ranks={rank for rank in stage_ranks
+            if rows_by_replica[pool.logical_rank_for_physical_rank(rank)//(tp*pp)]}
+        local = {node.node_id for node in graph.nodes if node.pool_name == pool.name and node.kind is not WorkloadKind.P2P
+            and (set(node.attributes["participants"]) <= stage_ranks and bool(set(node.attributes['participants'])&active_stage_ranks)
+                if node.kind is WorkloadKind.COLLECTIVE else node.rank in active_stage_ranks
+                or node.kind is WorkloadKind.FUSED_MOE and node.rank in stage_ranks)}
+        nonterminals = {edge.source for edge in graph.edges if edge.source in local and edge.destination in local}
+        if local - nonterminals != hidden_frontiers:
+            raise ValueError("K3 PP must finish all stage compute and idle expert dependencies before sending its hidden frontier")
+    for edge in graph.edges:
+        source, destination = graph.node(edge.source), graph.node(edge.destination)
+        if source.pool_name != pool.name or destination.pool_name != pool.name:
+            continue
+        left = source.attributes["participants"] if source.kind is WorkloadKind.COLLECTIVE else (source.rank,)
+        right = destination.attributes["participants"] if destination.kind is WorkloadKind.COLLECTIVE else (destination.rank,)
+        before = {pool.logical_rank_for_physical_rank(rank) // tp % pp for rank in left}
+        after = {pool.logical_rank_for_physical_rank(rank) // tp % pp for rank in right}
+        if (len(before) != 1 or len(after) != 1 or before != after and (source.kind is not WorkloadKind.P2P
+                or source.attributes["destination_rank"] not in right)):
+            raise ValueError("K3 cross-stage dependencies must pass through their actual PP message")
+        if (source.kind is not WorkloadKind.COLLECTIVE and destination.kind is not WorkloadKind.COLLECTIVE
+                and pool.logical_rank_for_physical_rank(source.rank) // (tp * pp)
+                != pool.logical_rank_for_physical_rank(destination.rank) // (tp * pp)):
+            raise ValueError("K3 cross-replica dependencies must pass through their actual collective")
+        if source.kind is WorkloadKind.P2P and any(pool.logical_rank_for_physical_rank(rank) // (tp * pp)
+                != pool.logical_rank_for_physical_rank(source.rank) // (tp * pp) for rank in right):
+            raise ValueError("K3 PP receive cannot enter a foreign replica")
+
+
+def _validate_v4_pipeline_boundary(graph, pool, lanes, source, destination, *, expected_rows, expected_hidden, expected_hc_mult):
+    """One active DP owner's expanded hidden lanes and receive/gather ports."""
+    from src.kernel.memory_access import TensorView
+    tp = pool.parallel_plan.config.tensor_parallel_size
+    if len(lanes) != tp or {node.rank for node in lanes} != set(source):
+        raise ValueError("V4 pipeline duplicates or loses a source lane")
+    gather_ids = set()
+    posts = set()
+    for message in lanes:
+        _validate_pipeline_p2p_node(message, pool)
+        if message.attributes["payload_tensor"]["name"] != "hidden_states":
+            raise ValueError("V4 pipeline must not invent a residual message")
+        parents = tuple(graph.node(edge.source) for edge in graph.edges
+            if edge.destination == message.node_id and edge.kind == "data")
+        if len(parents) != 1:
+            raise ValueError("V4 hidden lane needs one completed mHC post producer")
+        post = parents[0]
+        if (post.rank != message.rank or post.kind is not WorkloadKind.VECTOR or post.variant != "mhc_post"
+                or post.dtype != "bf16" or not post.node_id.endswith(":final-mhc-post")):
+            raise ValueError("V4 PP hidden must follow its stage-final mHC post")
+        posts.add(post.node_id)
+        h, c = post.shape["hidden"], post.shape["hc_mult"]
+        size = post.shape["elements"] * 2
+        if post.shape["elements"] % (h * c) or size % tp:
+            raise ValueError("V4 PP mHC rows must divide the typed TP lanes")
+        rows, lane = post.shape["elements"] // (h * c), source.index(message.rank)
+        if rows != expected_rows or h != expected_hidden or c != expected_hc_mult:
+            raise ValueError("V4 pipeline must preserve its own replica rows and hidden width")
+        metadata = message.attributes["symbolic_pipeline_views"]
+        sent, received = (TensorView(**dict(metadata[name])) for name in ("source", "destination"))
+        output_views = tuple(TensorView(**dict(view)) for view in metadata["source_producer_views"])
+        wire_shape = (rows, c, h) if tp == 1 else (size // (2 * tp),)
+        wire_strides = (c * h * 2, h * 2, 2) if tp == 1 else (2,)
+        if (message.attributes["bytes"] != size // tp
+                or tuple(message.attributes["payload_tensor"]["shape"]) != wire_shape
+                or metadata["source_backing_bytes"] != size or metadata["destination_backing_bytes"] != size
+                or sent.allocation_id == received.allocation_id
+                or sent.view_id != message.attributes["symbolic_tensor_inputs"][0]
+                or received.view_id != message.attributes["symbolic_tensor_outputs"][0]
+                or any(view.shape != wire_shape or view.strides_bytes != wire_strides
+                    or view.offset_bytes != lane * size // tp or view.dtype != "bf16" for view in (sent, received))
+                or not any(view.view_id in post.attributes["symbolic_tensor_outputs"]
+                    and view.allocation_id == sent.allocation_id and view.shape == (rows, c, h)
+                    and view.strides_bytes == (c * h * 2, h * 2, 2) and view.offset_bytes == 0 for view in output_views)):
+            raise ValueError("V4 PP lane must preserve its expanded mHC views and independent full backing")
+        children = tuple(graph.node(edge.destination) for edge in graph.edges
+            if edge.source == message.node_id and edge.kind == "data")
+        if len(children) != 1:
+            raise ValueError("V4 PP lane must converge on one destination gather")
+        if tp == 1:
+            copies = children
+            input_ports = message.attributes["symbolic_tensor_outputs"]
+            if copies[0].rank != destination[0]:
+                raise ValueError("V4 TP1 hidden must enter its destination runner copy")
+        else:
+            gather = children[0]
+            gather_ids.add(gather.node_id)
+            attrs = gather.attributes
+            if (gather.kind is not WorkloadKind.COLLECTIVE or attrs["operation"] != "all_gather"
+                    or tuple(attrs["participants"]) != destination or attrs["bytes"] != size // tp
+                    or attrs["symbolic_collective_storage"] != "fresh" or attrs["symbolic_collective_dim"] != 0
+                    or len(attrs["symbolic_tensor_outputs"]) != tp):
+                raise ValueError("V4 pipeline needs a fresh all-gather over its destination TP group")
+            incoming = {edge.source for edge in graph.edges if edge.destination == gather.node_id and edge.kind == "data"}
+            if incoming != {node.node_id for node in lanes} or set(attrs["symbolic_tensor_inputs"]) != {
+                    node.attributes["symbolic_tensor_outputs"][0] for node in lanes}:
+                raise ValueError("V4 gather must bind exactly the received lane ports")
+            copies = tuple(graph.node(edge.destination) for edge in graph.edges
+                if edge.source == gather.node_id and edge.kind == "data")
+            if len(copies) != tp or {node.rank for node in copies} != set(destination):
+                raise ValueError("V4 gathered hidden needs one runner copy per destination rank")
+            input_ports = attrs["symbolic_tensor_outputs"]
+        for copy in copies:
+            index = destination.index(copy.rank)
+            if (copy.kind is not WorkloadKind.GATHER or copy.variant != "gather" or copy.dtype != "bf16"
+                    or dict(copy.shape) != {"elements": rows * c * h, "rows": rows, "hidden": c * h}
+                    or copy.attributes["symbolic_tensor_inputs"] != (input_ports[index],)
+                    or not copy.node_id.endswith(":receive:runner-copy:hidden_states")):
+                raise ValueError("V4 runner copy must retain its own expanded hidden gather")
+            consumers = tuple(graph.node(edge.destination) for edge in graph.edges
+                if edge.source == copy.node_id and edge.kind == "data")
+            prenorms = tuple(node for node in consumers if node.variant == "mhc_prenorm")
+            if len(prenorms) != 1 or prenorms[0].rank != copy.rank:
+                raise ValueError("V4 copied hidden must enter its same-rank nonbroadcast prenorm")
+            prenorm = prenorms[0]
+            if prenorm.attributes["symbolic_tensor_inputs"] != copy.attributes["symbolic_tensor_outputs"]:
+                raise ValueError("V4 stage-entry prenorm must consume its actual copied port")
+    if len(gather_ids) != (1 if tp > 1 else 0):
+        raise ValueError("V4 boundary lanes must converge on the same all-gather")
+    return posts
+
+
+def _validate_v4_pipeline_graph(graph, pool, messages):
+    """V4 mHC transport over each active replica, with global stage frontiers.
+
+    DP expert collectives share a stage across replicas. Idle replicas keep
+    expert dependencies but have no embedding, PP payload or model head.
+    This validates topology only, without extending operator pricing scope.
+    """
+    config = pool.parallel_plan.config
+    tp, dp, pp = config.tensor_parallel_size, config.data_parallel_size, config.pipeline_parallel_size
+    if any(not _symbolic_v4_pipeline_topology_projection(node, pool) for node in messages):
+        raise ValueError("V4 pipeline requires one complete hidden lane per boundary/rank")
+    embeddings = tuple(node for node in graph.nodes if node.pool_name == pool.name
+        and node.kind in (WorkloadKind.GATHER, WorkloadKind.VECTOR) and node.node_id.endswith(":embedding"))
+    rows_by_replica, hidden_geometry = [], set()
+    for replica in range(dp):
+        first_stage = tuple(pool.physical_rank_for_logical_rank(replica * pp * tp + lane) for lane in range(tp))
+        entries = tuple(node for node in embeddings if node.rank in first_stage)
+        if not entries:
+            rows_by_replica.append(0)
+            continue
+        if (len(entries) != tp or {node.rank for node in entries} != set(first_stage)
+                or any(not _symbolic_v4_pipeline_topology_projection(node, pool) for node in entries)
+                or len({node.shape["rows"] for node in entries}) != 1):
+            raise ValueError("V4 pipeline requires matching original embedding rows on each active TP lane")
+        dummy = tuple("source_dummy_run" in node.attributes and node.attributes["source_dummy_run"] is True for node in entries)
+        if any(dummy) and (not all(dummy) or any(node.attributes["source_actual_request_count"] != 0 for node in entries)):
+            raise ValueError("V4 dummy pipeline requires the same non-request declaration on every lane")
+        if any(dummy):
+            owned = {pool.physical_rank_for_logical_rank(replica * pp * tp + offset) for offset in range(pp * tp)}
+            if any(node.pool_name == pool.name and node.rank in owned and (node.kind is WorkloadKind.LM_HEAD
+                    or node.kind is WorkloadKind.KV_UPDATE and node.attributes["cache_write_valid_rows"] != 0) for node in graph.nodes):
+                raise ValueError("V4 dummy pipeline cannot sample or write a real request cache")
+        rows_by_replica.append(0 if any(dummy) else entries[0].shape["rows"])
+        prelude = tuple(node for node in graph.nodes if node.pool_name == pool.name
+            and node.rank in first_stage and node.node_id.endswith(":layer-0:pre"))
+        if (len(prelude) != tp or {node.rank for node in prelude} != set(first_stage)
+                or any(node.kind is not WorkloadKind.VECTOR or node.variant != "mhc_pre"
+                    or node.shape["elements"] != entries[0].shape["rows"] * node.shape["hidden"] * node.shape["hc_mult"]
+                    for node in prelude)):
+            raise ValueError("V4 pipeline embedding rows must enter the original expanded mHC prelude")
+        hidden_geometry.update((node.shape["hidden"], node.shape["hc_mult"]) for node in prelude)
+    if len(hidden_geometry) != 1 or len(messages) != sum(bool(rows) for rows in rows_by_replica) * tp * (pp - 1):
+        raise ValueError("V4 pipeline requires one complete hidden lane per boundary/rank of each active replica")
+    (hidden, hc_mult), = hidden_geometry
+    for stage in range(pp - 1):
+        posts = set()
+        for replica, rows in enumerate(rows_by_replica):
+            source = tuple(pool.physical_rank_for_logical_rank((replica * pp + stage) * tp + lane) for lane in range(tp))
+            destination = tuple(pool.physical_rank_for_logical_rank((replica * pp + stage + 1) * tp + lane) for lane in range(tp))
+            lanes = tuple(node for node in messages if node.rank in source)
+            if not rows:
+                if lanes:
+                    raise ValueError("idle V4 replica cannot send a pipeline payload")
+                continue
+            posts.update(_validate_v4_pipeline_boundary(graph, pool, lanes, source, destination,
+                expected_rows=rows, expected_hidden=hidden, expected_hc_mult=hc_mult))
+        stage_ranks = set(pool.physical_ranks_for_pipeline_stage(stage))
+        active_stage_ranks = {pool.physical_rank_for_logical_rank((replica * pp + stage) * tp + lane)
+            for replica, count in enumerate(rows_by_replica) if count for lane in range(tp)}
+        stage_nodes = {node.node_id for node in graph.nodes if node.pool_name == pool.name and node.kind is not WorkloadKind.P2P
+            and (set(node.attributes["participants"]) <= stage_ranks
+                and bool(set(node.attributes["participants"]) & active_stage_ranks) if node.kind is WorkloadKind.COLLECTIVE
+                else node.rank in active_stage_ranks)}
+        nonterminals = {edge.source for edge in graph.edges if edge.source in stage_nodes and edge.destination in stage_nodes}
+        if stage_nodes - nonterminals != posts:
+            raise ValueError("V4 stage must finish all its compute before sending its completed mHC hidden: "
+                f"extra={sorted(stage_nodes - nonterminals - posts)}, missing={sorted(posts - (stage_nodes - nonterminals))}")
+    for edge in graph.edges:
+        left, right = graph.node(edge.source), graph.node(edge.destination)
+        if left.pool_name != pool.name or right.pool_name != pool.name:
+            continue
+        def stages(node):
+            ranks = node.attributes["participants"] if node.kind is WorkloadKind.COLLECTIVE else (node.rank,)
+            return {pool.logical_rank_for_physical_rank(rank) // tp % pp for rank in ranks}
+        left_stages, right_stages = stages(left), stages(right)
+        if (len(left_stages) != 1 or len(right_stages) != 1 or (left_stages != right_stages
+                and (left.kind is not WorkloadKind.P2P or right_stages != {left.attributes["destination_stage"]}))):
+            raise ValueError("V4 cross-stage dependency must pass through its declared PP message")
+        if (left.kind is not WorkloadKind.COLLECTIVE and right.kind is not WorkloadKind.COLLECTIVE
+                and pool.logical_rank_for_physical_rank(left.rank) // (tp * pp)
+                != pool.logical_rank_for_physical_rank(right.rank) // (tp * pp)):
+            raise ValueError("V4 cross-replica dependency must pass through its declared collective")
+        if (left.kind is WorkloadKind.P2P and right.kind is WorkloadKind.COLLECTIVE
+                and any(pool.logical_rank_for_physical_rank(rank) // (tp * pp)
+                    != pool.logical_rank_for_physical_rank(left.rank) // (tp * pp) for rank in right.attributes["participants"])):
+            raise ValueError("V4 pipeline receive cannot enter another replica's collective")
+
+
 def _validate_tp2_pp2_pipeline_graph(
     graph: WorkloadGraph,
     deployment: DeploymentPlan,
@@ -5435,7 +8521,57 @@ def _validate_tp2_pp2_pipeline_graph(
     """Validate the complete pinned vLLM TP=2, PP=2 boundary."""
 
     for pool in deployment.worker_pools.values():
+        if not any(node.pool_name == pool.name and node.kind is not WorkloadKind.PD_KV_TRANSFER
+                for node in graph.nodes):
+            continue
         parallelism = pool.parallel_plan.config
+        glm = tuple(node for node in graph.nodes if node.pool_name == pool.name and node.kind is WorkloadKind.P2P)
+        if _is_k3_source_pipeline_graph(graph, pool):
+            _validate_k3_pipeline_graph(graph, pool, glm)
+            continue
+        if parallelism.pipeline_parallel_size > 1 and any(node.pool_name == pool.name and _symbolic_kimi_dp_projection(node, pool) for node in graph.nodes):
+            _validate_symbolic_dp_pipeline_graph(graph, pool)
+            continue
+        if glm and all(_symbolic_mla_dp_pipeline_projection(node, pool) for node in glm):
+            _validate_symbolic_dp_pipeline_graph(graph, pool)
+            continue
+        if (parallelism.tensor_parallel_size > 1 and parallelism.pipeline_parallel_size > 1
+                and any(node.pool_name == pool.name and _symbolic_v3_parallel_projection(node, pool) for node in graph.nodes)):
+            if len(glm) != 2 * parallelism.tensor_parallel_size * (parallelism.pipeline_parallel_size - 1):
+                raise ValueError("V3 pipeline requires both hidden/residual lanes at every boundary")
+            _validate_symbolic_sliced_pipeline_graph(graph, pool, glm)
+            continue
+        if parallelism.pipeline_parallel_size > 1 and any(node.pool_name == pool.name
+                and "model_source_profile" in node.attributes
+                and node.attributes["model_source_profile"] == "vllm_0_30_v4_sync_fp8_ds_mla"
+                for node in graph.nodes):
+            _validate_v4_pipeline_graph(graph, pool, glm)
+            continue
+        if (parallelism.tensor_parallel_size > 1 and parallelism.pipeline_parallel_size > 1
+                and glm and all(_symbolic_glm_pcp_projection(node, pool) for node in glm)):
+            _validate_symbolic_dp_pipeline_graph(graph, pool)
+            continue
+        if parallelism.tensor_parallel_size > 1 and parallelism.pipeline_parallel_size > 1 and _qwen030_dp_sp(parallelism):
+            _validate_symbolic_dp_pipeline_graph(graph, pool)
+            continue
+        if (parallelism.tensor_parallel_size > 1 and parallelism.pipeline_parallel_size > 1
+                and parallelism.is_rank_local and deployment.mode in ("colocated", "pd_disagg")
+                and glm and any(node.pool_name == pool.name and "source_component" in node.attributes
+                    and node.attributes["source_component"] == "symbolic_gqa_mathematical" for node in graph.nodes)):
+            if any("symbolic_tensor_inputs" not in node.attributes for node in glm):
+                raise ValueError("GQA source pipeline requires complete typed boundaries")
+            # Each routed replica owns a complete local PP graph. Validate
+            # its actual lanes/ports at every width and every PP boundary.
+            _validate_symbolic_sliced_pipeline_graph(graph, pool, glm)
+            continue
+        if (deployment.mode == "pd_disagg" and parallelism.tensor_parallel_size > 1
+                and parallelism.pipeline_parallel_size > 1 and parallelism.is_rank_local):
+            p2p_nodes = tuple(node for node in graph.nodes if node.pool_name == pool.name
+                and node.kind is WorkloadKind.P2P)
+            if not p2p_nodes or any("symbolic_tensor_inputs" not in node.attributes for node in p2p_nodes):
+                raise ValueError("PD pipeline requires complete typed source boundaries")
+            _validate_symbolic_sliced_pipeline_graph(graph, pool, p2p_nodes)
+            continue
         if parallelism.tensor_parallel_size == 8 and parallelism.pipeline_parallel_size > 1:
             projection_nodes = tuple(node for node in graph.nodes if node.pool_name == pool.name
                 and node.kind is WorkloadKind.P2P and "symbolic_tensor_inputs" in node.attributes)
@@ -5826,8 +8962,71 @@ def _eager_attn_specs(node: WorkloadNode, hardware_id: str, hardware):
     return tuple(result)
 
 
+def _h200_bf16_expert_math_domain(node, hardware_id):
+    return (HWSpec.source_contract_supported("unbound_bf16_expert_source_math", hardware_id) and node.kind is WorkloadKind.FUSED_MOE
+        and node.variant == "full" and node.dtype == "bf16"
+        and "source_component" in node.attributes
+        and node.attributes["source_component"] == "symbolic_unquantized_experts"
+        and {"model_execution_version", "launch_policy", "expert_parallel_size",
+            "routing_weight_dtype", "expert_parameter_layout"}.issubset(node.attributes)
+        and node.attributes["model_execution_version"] in ("vllm_0_11_0", "vllm_0_30_0")
+        and node.attributes["launch_policy"] == "analytical_launch"
+        # The existing0.30 grouped mathematical program also consumes the
+        # declared DP/SP expert group. Graph validation proves its complete
+        # gather/route/ownership/combine ports before this source is lowered.
+        and (node.attributes["expert_parallel_size"] in (1, 2)
+            or node.attributes["model_execution_version"] == "vllm_0_30_0"
+            and type(node.attributes["expert_parallel_size"]) is int
+            and node.attributes["expert_parallel_size"] > 2
+            and not {"source_moe_config", "source_routing", "source_batch_invariant", "source_has_expert_map"}.intersection(node.attributes)
+            and {"source_dp_logical_rows", "source_dp_request_rows", "source_dp_lane_rows",
+                "source_dp_row_order", "source_tensor_parallel_size", "source_padding_routing"}.issubset(node.attributes)
+            and node.attributes["source_padding_routing"] == "declared_routing_for_physical_rows_including_padding_not_observed_topk")
+        and node.attributes["routing_weight_dtype"] == "fp32"
+        and node.attributes["expert_parameter_layout"] == "unquantized_checkpoint_expert_major_nk"
+        and "graph_runtime_mode" not in node.attributes)
+
+
 def _explicit_source_expert_specs(node, hardware_id, hardware, routing_relabelling=None):
     """Emit the same expert-axis representative that names the memo key."""
+    if "symbolic_zero_extent_parameter_roles" in node.attributes:
+        if (node.attributes["owned_experts"] or sum(node.attributes["local_tokens_per_expert"])
+                or node.attributes["model_execution_version"] != "vllm_0_30_0"):
+            raise ValueError("empty expert rank requires an actual empty zero contribution")
+        fill = WorkloadNode(node.node_id, WorkloadKind.ELEMENTWISE, node.pool_name,
+            {"elements": node.shape["tokens"] * node.shape["hidden"]}, dtype=node.dtype, variant="elementwise",
+            rank=node.rank, attributes={"operation": "fill", "reads": 0, "writes": 1,
+                "launch_policy": node.attributes["launch_policy"]})
+        if HWSpec.source_contract_supported("bf16_symbolic_vector_source_math", hardware_id) and node.dtype == "bf16":
+            return (KernelSpec(kind=KernelKind.VECTOR, hardware_id=hardware_id,
+                shape={"element_count": fill.shape["elements"]}, dtype="bf16", variant="elementwise",
+                attributes={"operation": "fill", "reads": 0, "writes": 1,
+                    "mathematical_program": "dense_bf16_source_flops_bytes_v1"}, launch=None,
+                execution_support="unsupported", unsupported_reason="launch_selector_unavailable"),)
+        return (_compute_spec(fill, hardware_id, hardware),)
+    native_source_facts = {"model_execution_version", "source_moe_config", "source_routing",
+        "source_batch_invariant", "source_has_expert_map", "source_input_layout",
+        "source_topk_id_dtype", "routed_weight_dtype", "routing_input_dtype"}
+    legacy_recipe_facts = {"source_router_renormalize", "source_moe_chunk_size"}
+    if (HWSpec.source_contract_supported("vllm_unquantized_prepared_expert_source_recipe", hardware_id) and native_source_facts.issubset(node.attributes)
+            and (node.attributes["model_execution_version"] == "vllm_0_30_0"
+                or node.attributes["model_execution_version"] == "vllm_0_11_0"
+                and legacy_recipe_facts.issubset(node.attributes))):
+        source = dict(node.attributes)
+        if "source_router_state" in source and source["source_router_state"] != "prepared_topk_weights_and_ids":
+            raise ValueError("explicit source experts consume existing top-k weights and IDs")
+        source["source_router_state"] = "prepared_topk_weights_and_ids"
+        return _fused_moe_specs(node.with_attributes(source), hardware_id, hardware, routing_relabelling)
+    if _h200_bf16_expert_math_domain(node, hardware_id):
+        attributes = _fused_moe_prediction_attributes(node, routing_relabelling)
+        return (KernelSpec(kind=KernelKind.FUSED_MOE, hardware_id=hardware_id, shape=node.shape,
+            dtype="bf16", variant="routed_experts", attributes={**attributes,
+                "routed_weight_dtype": "bf16", "weight_group_size": 0, "routed_scaling_factor": 1.0,
+                "mathematical_program": ("unquantized_bf16_swiglu_v1" if attributes["expert_parallel_size"] == 1
+                    else "unquantized_bf16_legacy_grouped_swiglu_v1"
+                    if node.attributes["model_execution_version"] == "vllm_0_11_0"
+                    else "unquantized_bf16_grouped_swiglu_v1")}, launch=None,
+            execution_support="unsupported", unsupported_reason="launch_selector_unavailable"),)
     specs = _fused_moe_specs(node, hardware_id, hardware, routing_relabelling)
     if "routing_weight_dtype" in node.attributes and node.attributes["routing_weight_dtype"] == "bf16":
         if (not hardware.supports_source_contract("vllm_0_18_bf16_routed_expert_native_projection")
@@ -5840,6 +9039,574 @@ def _explicit_source_expert_specs(node, hardware_id, hardware, routing_relabelli
     return tuple(spec for spec in specs if not (spec.kind is KernelKind.VECTOR and spec.variant == route_variant))
 
 
+def _node_source_launches(node, hardware_id, hardware):
+    """Attach exact source stages without replacing logical cost semantics."""
+    norm_copy_source = _h200_legacy_norm_copy_source(node, hardware_id)
+    if norm_copy_source is not None:
+        launch = select_launch_config(hardware_id, KernelKind.VECTOR,
+            _vector_shape(node), node.dtype, "elementwise", norm_copy_source, hardware)
+        return (("native_input_materialization", launch),)
+    if (HWSpec.source_contract_supported("vllm_source_vector_launch_binding", hardware_id) and node.dtype in ("bf16", "fp16")
+            and node.kind in (WorkloadKind.NORM, WorkloadKind.ACTIVATION, WorkloadKind.ROTARY, WorkloadKind.KV_UPDATE)
+            and node.variant in ("rmsnorm", "add_rmsnorm", "silu", "rotary", "rope", "paged_kv_cache")
+            and {"model_execution_version", "source_input_layout"}.issubset(node.attributes)
+            and node.attributes["model_execution_version"] in ("vllm_0_11_0", "vllm_0_27_1", "vllm_0_30_0")):
+        runtime, layout = node.attributes["model_execution_version"], node.attributes["source_input_layout"]
+        norm = node.variant in ("rmsnorm", "add_rmsnorm")
+        branch_bound = (not norm or runtime == "vllm_0_11_0" or (
+            "source_batch_invariant" in node.attributes and node.attributes["source_batch_invariant"] is False))
+        layout_bound = (layout == "contiguous_aligned_16"
+            or layout == "contiguous" and (node.variant != "add_rmsnorm" or runtime != "vllm_0_11_0")
+            or layout == "unit_final_stride" and (node.variant in ("rotary", "rope", "paged_kv_cache")
+                or node.variant == "rmsnorm" and runtime != "vllm_0_11_0"))
+        unclamped = "swiglu_limit" not in node.attributes or node.attributes["swiglu_limit"] is None
+        if branch_bound and layout_bound and unclamped:
+            kind = KernelKind.KV_CACHE if node.kind is WorkloadKind.KV_UPDATE else KernelKind.VECTOR
+            shape = node.shape if node.kind is WorkloadKind.NORM else _vector_shape(node)
+            launch = select_launch_config(hardware_id, kind, shape, node.dtype, node.variant,
+                node.attributes, hardware=hardware)
+            return (("native_main", launch),)
+    if (HWSpec.source_contract_supported("vllm_0_30_symbolic_mtp_eager", hardware_id) and node.kind is WorkloadKind.VECTOR
+            and node.variant == "vllm_mtp_eager"
+            and node.attributes["source_component"] == "vllm_0_30_symbolic_mtp_eager"):
+        operation = node.attributes["operation"]
+        bound_triton_stage = operation in ("prepare_next_padded", "prepare_inputs_padded", "step_metadata", "rejection")
+        bound_materialization = (operation in ("copy", "cast_ids", "cast_fp32", "fill", "argmax")
+            and "source_geometry_program" in node.attributes
+            and node.attributes["source_geometry_program"] == "vllm_0_30_torch_2_13_cuda_source"
+            and tuple(node.attributes["source_geometry_input_contiguous"]) == (() if operation == "fill" else (True,))
+            and (operation != "fill" or node.dtype in ("int32", "int64", "bf16", "fp32"))
+            and node.attributes["source_geometry_output_contiguous"] is True)
+        if bound_triton_stage or bound_materialization:
+            return select_workload_source_launch_recipe(hardware_id, _vector_shape(node), node.dtype,
+                node.variant, node.attributes, hardware)
+    return None
+
+
+def _count_sort_producer_source_inputs(graph, node, attributes):
+    """Qualify only the actual0.30 unmasked, unmodified global TopK ID path.
+
+    The ordinary GPUModelRunner source binds its None forward-context mask;
+    GPU-v2 instead clears actual rows and marks a captured tail. Consume
+    the actual producer's source argument when bound, otherwise require an
+    explicit argument. An absent mask stays unknown.
+    """
+    from src.serving.workload.traced_operators import VLLM030_GPU_MODEL_RUNNER_TOPK_CONTEXT
+    routes = tuple(graph.node(name) for name in graph.predecessors(node.node_id)
+        if graph.node(name).kind is WorkloadKind.VECTOR and graph.node(name).variant == "moe_topk")
+    producer_mask = len(routes) == 1 and "source_topk_padding_mask" in routes[0].attributes
+    if (not producer_mask and "source_topk_padding_mask" not in attributes
+            and "source_topk_id_domain" not in attributes):
+        return attributes
+    if "source_topk_id_domain" in attributes:
+        raise ValueError("count-sort ID domain must be derived from its actual producer")
+    if (graph.source_model_execution_version != "vllm_0_30_0"
+            or node.attributes["model_execution_version"] != "vllm_0_30_0"
+            or node.attributes["source_component"] != "symbolic_unquantized_experts"
+            or attributes["source_has_expert_map"] is not False
+            or attributes["source_topk_id_dtype"] != "int32"
+            or node.attributes["expert_parallel_size"] != 1):
+        raise ValueError("count-sort producer proof requires the exact0.30 global INT32 no-map caller")
+    domain = _graph_token_domain(node)
+    if domain is not None and domain[0] != domain[1]:
+        raise NotImplementedError("count-sort padded rows require their filtered-ID source")
+    _validate_virtual_ep_router_inputs(graph, node)
+    route, = routes
+    if (route.attributes["source_component"] != "symbolic_softmax_topk"
+            or route.attributes["source_program"] != "vllm_0_30_bf16_softmax_topk"
+            or route.dtype != "bf16" or len(route.attributes["symbolic_tensor_outputs"]) != 3):
+        raise ValueError("count-sort requires the actual unmodified0.30 softmax TopK producer")
+    gate_id, = graph.predecessors(route.node_id)
+    allowed = {route.node_id, *graph.predecessors(gate_id)}
+    if set(graph.predecessors(node.node_id)) - allowed:
+        raise ValueError("count-sort IDs have an intervening or unproved writer")
+    if producer_mask:
+        if (route.attributes["source_topk_padding_mask_program"] != VLLM030_GPU_MODEL_RUNNER_TOPK_CONTEXT
+                or route.attributes["source_topk_padding_mask"] is not None):
+            raise ValueError("count-sort producer padding argument differs from its exact runner source")
+        mask = route.attributes["source_topk_padding_mask"]
+        if "source_topk_padding_mask" in attributes and attributes["source_topk_padding_mask"] != mask:
+            raise ValueError("count-sort caller padding mask disagrees with its actual producer")
+    else:
+        mask = attributes["source_topk_padding_mask"]
+    if mask is not None:
+        if (type(mask) is not tuple or len(mask) != node.shape["tokens"]
+                or any(type(value) is not bool for value in mask)):
+            raise ValueError("count-sort padding mask must cover every actual producer row")
+        if any(mask):
+            raise NotImplementedError("count-sort masked TopK IDs require their filtered-ID source")
+    return {**attributes, "source_topk_id_domain": "vllm_0_30_topk_softmax_global_int32_no_padding"}
+
+
+def _bind_plan_source_launch_inputs(plan, inputs, hardware_by_id, graph):
+    """Bind explicit physical MLA inputs to actual lowered call identities.
+
+    Logical cache arenas do not prove native page/layout/build facts. Those
+    are supplied explicitly here and checked against both the logical call
+    shape and the versioned source selector; none are guessed from a model.
+    """
+    if not isinstance(inputs, Mapping) or not inputs:
+        raise ValueError("source launch inputs require a nonempty mapping of actual call IDs")
+    calls = {call.call_id: call for call in plan.calls}
+    normalized = {}
+    for source_id, binding in inputs.items():
+        if source_id in calls:
+            targets = (source_id,)
+        else:
+            targets = (source_id + ":0", source_id + ":1")
+            if (any(target not in calls for target in targets)
+                    or tuple(calls[target].kernel_spec.launch.algorithm for target in targets) != (
+                        "h200_vllm030_torch213_fp16_external_aggregate_gemm",
+                        "h200_vllm030_torch213_fp16_external_aggregate_reduce")
+                    or any(calls[target].source_node_ids != (source_id,) for target in targets)
+                    or calls[targets[1]].dependencies != (targets[0],)):
+                raise ValueError("source launch inputs refer to unknown lowered call IDs")
+        for target in targets:
+            if target in normalized:
+                raise ValueError("ambiguous duplicate source launch binding")
+            normalized[target] = binding
+    inputs = normalized
+    if set(inputs) - set(calls):
+        raise ValueError("source launch inputs refer to unknown lowered call IDs")
+    updates = {}
+    for call_id, binding in inputs.items():
+        call = calls[call_id]
+        kernel = call.kernel_spec
+        if (kernel.kind in (KernelKind.GEMM, KernelKind.VECTOR)
+                and "source_gemm_runtime" in kernel.attributes):
+            if not isinstance(binding, Mapping) or set(binding) != {"shape", "attributes"}:
+                raise ValueError("observed FP16 GEMM binding requires complete shape and attributes")
+            shape, attrs = binding["shape"], binding["attributes"]
+            if (not isinstance(shape, Mapping) or not isinstance(attrs, Mapping)
+                    or set(attrs) != {"model_execution_version", "source_gemm_runtime"}
+                    or len(call.source_node_ids) != 1):
+                raise ValueError("observed FP16 GEMM binding requires its explicit runtime and source caller")
+            node = graph.node(call.source_node_ids[0])
+            if (dict(shape) != dict(node.shape)
+                    or attrs["model_execution_version"] != graph.source_model_execution_version
+                    or attrs["source_gemm_runtime"] != kernel.attributes["source_gemm_runtime"]
+                    or node.attributes["source_gemm_runtime"] != attrs["source_gemm_runtime"]
+                    or kernel.launch is None):
+                raise ValueError("observed FP16 GEMM facts disagree with their actual source caller")
+            updates[call_id] = dataclasses.replace(call,
+                source_launches=((("modeled_aggregate_main" if kernel.kind is KernelKind.GEMM
+                    else "modeled_aggregate_reducer") if kernel.launch.algorithm in (
+                        "h200_vllm030_torch213_fp16_external_aggregate_gemm",
+                        "h200_vllm030_torch213_fp16_external_aggregate_reduce") else "native_main", kernel.launch),))
+            continue
+        if (HWSpec.source_contract_supported("vllm_0_30_symbolic_dsa_sparse", kernel.hardware_id) and kernel.kind is KernelKind.SPARSE_ATTN
+                and kernel.variant in ("dsa_sparse_decode", "dsa_sparse_prefill", "dsa_sparse_mixed")):
+            if not isinstance(binding, Mapping) or set(binding) != {"shape", "attributes"}:
+                raise ValueError("BF16 sparse source binding requires complete shape and attributes")
+            shape, attrs = binding["shape"], binding["attributes"]
+            if not isinstance(shape, Mapping) or not isinstance(attrs, Mapping):
+                raise TypeError("BF16 sparse source binding requires shape and attribute mappings")
+            if len(call.source_node_ids) != 1:
+                raise ValueError("BF16 sparse source binding requires one actual workload producer")
+            node = graph.node(call.source_node_ids[0])
+            if (graph.source_model_execution_version != "vllm_0_30_0"
+                    or attrs["model_execution_version"] != graph.source_model_execution_version
+                    or node.attributes["source_component"] != "vllm_0_30_symbolic_dsa_sparse"
+                    or attrs["source_component"] != "vllm_0_30_flashmla_sparse_bf16"
+                    or attrs["source_kv_cache_layout"] != "paged_bf16_rows_576"):
+                raise ValueError("BF16 sparse source identity/cache disagrees with its actual model caller")
+            physical = {"rows": sum(node.attributes["q_lens"]), "num_heads": node.shape["num_query_heads"],
+                "qk_head_dim": node.shape["qk_head_dim"], "v_head_dim": node.shape["v_head_dim"],
+                "topk": node.attributes["topk_capacity"]}
+            if any(shape[name] != value for name, value in physical.items()):
+                raise ValueError("BF16 sparse source shape disagrees with its actual logical call")
+            strides = tuple(node.attributes["source_query_strides_bytes"])
+            heads, dim = physical["num_heads"], physical["qk_head_dim"]
+            if attrs["source_q_input_layout"] == "caller_padded_head_backing":
+                backing = attrs["source_q_backing_heads"]
+                if (type(backing) is not int or strides != (backing * dim * 2, dim * 2, 2)
+                        or node.attributes["source_query_offset_bytes"] % 16):
+                    raise ValueError("BF16 sparse padded-Q source disagrees with its actual view strides")
+            elif attrs["source_q_input_layout"] == "contiguous_unpadded":
+                if (strides != (heads * dim * 2, dim * 2, 2)
+                        or (heads % 64 == 0 and node.attributes["source_query_offset_bytes"] % 16)):
+                    raise ValueError("BF16 sparse tensor-Q source disagrees with its actual view strides")
+            else:
+                raise NotImplementedError("BF16 sparse Q layout requires its actual source view")
+            dependencies = call.dependencies
+            group_mode = attrs["source_index_group_mode"]
+            if node.variant != "dsa_sparse_decode":
+                if (group_mode != "direct_batch" or attrs["source_index_remap_state"] != "build_current_indices"
+                        or attrs["source_index_remap_stream"] != "caller_stream"):
+                    raise ValueError("BF16 sparse prefill/mixed requires its actual direct batch remap")
+            elif group_mode == "fresh_first_layer":
+                if (node.attributes["indexer_type"] != "full"
+                        or attrs["source_index_remap_state"] != "build_current_indices"
+                        or attrs["source_index_remap_stream"] != "index_group_side_stream"):
+                    raise ValueError("BF16 sparse first index-group layer requires its actual side-stream remap")
+            elif group_mode == "capacity_bypass":
+                capacity = attrs["source_index_group_capacity_rows"]
+                if (type(capacity) is not int or not 0 <= capacity < physical["rows"]
+                        or attrs["source_index_remap_state"] != "build_current_indices"
+                        or attrs["source_index_remap_stream"] != "caller_stream"):
+                    raise ValueError("BF16 sparse remap bypass requires actual index-group capacity overflow")
+            elif group_mode != "reuse_current_group" or attrs["source_index_remap_state"] != "provided_current_indices_and_counts":
+                raise ValueError("BF16 sparse decode requires its actual index-group remap ownership")
+            if attrs["source_index_remap_state"] == "provided_current_indices_and_counts":
+                producer_id = attrs["source_index_producer_call_id"]
+                order = tuple(calls)
+                if (producer_id not in inputs or producer_id not in calls
+                        or order.index(producer_id) >= order.index(call_id)):
+                    raise ValueError("BF16 sparse index reuse requires an earlier bound physical-index producer")
+                producer = calls[producer_id]
+                prior = graph.node(producer.source_node_ids[0])
+                if (producer.kernel_spec.kind is not KernelKind.SPARSE_ATTN
+                        or producer.rank != call.rank
+                        or prior.attributes["source_component"] != "vllm_0_30_symbolic_dsa_sparse"
+                        or prior.attributes["symbolic_tensor_inputs"][2] != node.attributes["symbolic_tensor_inputs"][2]
+                        or tuple(prior.attributes["q_lens"]) != tuple(node.attributes["q_lens"])
+                        or tuple(prior.attributes["kv_lens"]) != tuple(node.attributes["kv_lens"])
+                        or inputs[producer_id]["attributes"]["source_index_remap_state"] != "build_current_indices"
+                        or inputs[producer_id]["attributes"]["source_kv_cache_layout"] != "paged_bf16_rows_576"
+                        or any(inputs[producer_id]["shape"][name] != shape[name]
+                            for name in ("topk", "block_size", "block_stride_rows"))):
+                    raise ValueError("BF16 sparse index reuse disagrees with the actual same-index producer")
+                # ForwardTrace tracks the last writer per allocation, so
+                # every alias mutation advances this input generation.
+                # Equal view IDs and lengths alone do not establish that
+                # the producer remapped the indices this consumer reads.
+                if (prior.attributes["source_topk_allocation_id"] != node.attributes["source_topk_allocation_id"]
+                        or prior.attributes["source_topk_input_writer"] != node.attributes["source_topk_input_writer"]):
+                    raise ValueError("BF16 sparse index reuse refers to a stale top-k writer generation")
+                for owner in (prior, node):
+                    writer = owner.attributes["source_topk_input_writer"]
+                    if writer is not None and writer not in graph.predecessors(owner.node_id):
+                        raise ValueError("BF16 sparse top-k writer generation is not an actual input dependency")
+                if producer_id not in dependencies:
+                    dependencies = (*dependencies, producer_id)
+            hardware = require_hardware(kernel.hardware_id, hardware_by_id)
+            stages = select_workload_source_launch_recipe(kernel.hardware_id, shape, kernel.dtype,
+                kernel.variant, attrs, hardware)
+            updates[call_id] = dataclasses.replace(call, source_launches=stages, dependencies=dependencies)
+            continue
+        if (HWSpec.source_contract_supported("vllm_0_30_indexer_source_launch_binding", kernel.hardware_id) and (
+                (kernel.kind is KernelKind.SPARSE_ATTN_INDEXER and kernel.variant in (
+                    "dsa_indexer_decode", "dsa_indexer_prefill", "dsa_indexer_mixed",
+                    "dsv4_indexer_decode", "dsv4_indexer_prefill"))
+                or (kernel.kind is KernelKind.VECTOR and kernel.variant == "dsv4_indexer_q_rope_quant"))):
+            if not isinstance(binding, Mapping) or set(binding) != {"shape", "attributes"}:
+                raise ValueError("indexer source binding requires complete shape and attributes")
+            shape, attrs = binding["shape"], binding["attributes"]
+            if not isinstance(shape, Mapping) or not isinstance(attrs, Mapping):
+                raise TypeError("indexer source binding requires shape and attribute mappings")
+            if len(call.source_node_ids) != 1:
+                raise ValueError("indexer source binding requires one actual workload producer")
+            node = graph.node(call.source_node_ids[0])
+            if (graph.source_model_execution_version != "vllm_0_30_0"
+                    or attrs["model_execution_version"] != graph.source_model_execution_version):
+                raise ValueError("indexer source runtime disagrees with the actual model caller")
+            query = kernel.variant == "dsv4_indexer_q_rope_quant"
+            v4 = query or kernel.variant in ("dsv4_indexer_prefill", "dsv4_indexer_decode")
+            component = ("vllm_0_30_symbolic_v4_indexer_query" if query else
+                "vllm_0_30_symbolic_v4_scored_indexer" if v4 else "vllm_0_30_symbolic_dsa_indexer")
+            native_component = "vllm_0_30_deepseek_v4_indexer" if v4 else "vllm_0_30_sparse_attn_indexer"
+            if ("source_component" not in node.attributes or node.attributes["source_component"] != component
+                    or attrs["source_component"] != native_component):
+                raise ValueError("indexer source identity disagrees with its actual workload producer")
+            if query:
+                physical = {"rows": node.shape["seq_len"], "num_heads": node.shape["num_query_heads"],
+                    "head_dim": node.shape["head_dim"], "rope_dim": node.shape["rope_dim"]}
+                if dict(shape) != physical:
+                    raise ValueError("indexer query shape disagrees with its actual logical call")
+                source_dtype = node.dtype
+            else:
+                if node.attributes["selection_cardinality_source"] != "declared_causal_topk":
+                    raise ValueError("indexer source geometry requires the actual declared selection program")
+                queries, phases = tuple(node.attributes["q_lens"]), tuple(node.attributes["request_phases"])
+                decode_rows = sum(q for q, phase in zip(queries, phases, strict=True) if phase == "decode")
+                physical = {"rows": sum(queries), "num_heads": node.shape["num_query_heads"],
+                    "head_dim": node.shape["head_dim"], "topk": node.attributes["topk_capacity"],
+                    "num_decode_tokens": decode_rows, "num_prefill_tokens": sum(queries) - decode_rows}
+                if v4:
+                    physical["compress_ratio"] = node.shape["compress_ratio"]
+                    clear_fields = {"source_topk_clear_rows", "source_topk_clear_state", "source_topk_phase_token_start"}
+                    if clear_fields & set(attrs):
+                        raise ValueError("V4 shared clear is owned by the actual trace,not caller attributes")
+                    clear = node.attributes["symbolic_shared_topk_clear"]
+                    if clear is not None:
+                        if not isinstance(clear, Mapping) or set(clear) != {"owner_node_id", "view_id", "rows"}:
+                            raise ValueError("V4 shared clear requires its complete actual output binding")
+                        owner = graph.node(clear["owner_node_id"])
+                        peers = tuple(item for item in graph.nodes
+                            if "symbolic_shared_topk_clear" in item.attributes
+                            and item.attributes["symbolic_shared_topk_clear"] is not None
+                            and item.attributes["symbolic_shared_topk_clear"]["owner_node_id"] == owner.node_id)
+                        if (len(peers) != 2 or owner.variant != "dsv4_indexer_prefill"
+                                or {item.variant for item in peers} != {"dsv4_indexer_prefill", "dsv4_indexer_decode"}
+                                or any(item.rank != node.rank or item.pool_name != node.pool_name
+                                    or item.attributes["source_component"] != component
+                                    or item.attributes["symbolic_shared_topk_clear"] != clear for item in peers)
+                                or clear["view_id"] not in owner.attributes["symbolic_tensor_outputs"]
+                                or type(clear["rows"]) is not int
+                                or clear["rows"] != sum(sum(item.attributes["q_lens"]) for item in peers)):
+                            raise ValueError("V4 shared clear disagrees with the actual phase output owner")
+                        decode_peer, = (item for item in peers if item.variant == "dsv4_indexer_decode")
+                        shared_decode_rows = sum(decode_peer.attributes["q_lens"])
+                        for peer in peers:
+                            expected_range = ((0, shared_decode_rows) if peer is decode_peer
+                                else (shared_decode_rows, clear["rows"]))
+                            if tuple(peer.attributes["symbolic_topk_token_range"]) != expected_range:
+                                raise ValueError("V4 shared clear phase slices must partition the actual live buffer")
+                        owner_call, = (item for item in plan.calls if item.source_node_ids == (owner.node_id,))
+                        if node is not owner and (owner_call.call_id not in inputs
+                                or owner_call.call_id not in call.dependencies):
+                            raise ValueError("V4 decode requires its bound shared clear owner dependency")
+                        attrs = {**attrs, "source_topk_clear_rows": clear["rows"],
+                            "source_topk_phase_token_start": node.attributes["symbolic_topk_token_range"][0],
+                            "source_topk_clear_state": ("owned_current_invocation" if node is owner
+                                else "provided_current_invocation")}
+                for name, value in physical.items():
+                    if shape[name] != value:
+                        raise ValueError("indexer source shape disagrees with its actual logical call: " + name)
+                if physical["num_prefill_tokens"]:
+                    ratio = node.shape["compress_ratio"] if v4 else 1
+                    ranges, cursor = [], (attrs["source_topk_phase_token_start"]
+                        if v4 and "source_topk_phase_token_start" in attrs else 0)
+                    for q, length, phase in zip(queries, node.attributes["kv_lens"], phases, strict=True):
+                        if phase == "prefill":
+                            ranges.append((cursor, cursor + q, length // ratio))
+                        cursor += q
+                    for chunk in attrs["source_prefill_chunks"]:
+                        start, end = chunk["token_start"], chunk["token_end"]
+                        # A chunk flattens the full KV extent of every
+                        # overlapping request. Query slicing does not slice
+                        # those contexts (indexer.py build_prefill_chunk_metadata).
+                        required = sum(length for first, last, length in ranges
+                            if start < last and first < end)
+                        if (type(chunk["kv_rows"]) is not int or chunk["kv_rows"] < required
+                                or (v4 and (type(chunk["local_total_seq_lens"]) is not int
+                                    or chunk["local_total_seq_lens"] < required))):
+                            raise ValueError("indexer chunk K extent disagrees with actual request contexts")
+                if decode_rows:
+                    decode_queries = tuple(q for q, phase in zip(queries, phases, strict=True) if phase == "decode")
+                    if (shape["batch"] != len(decode_queries)
+                            or decode_queries != (shape["next_n"],) * len(decode_queries)):
+                        raise ValueError("indexer native decode requires the actual uniform query rows")
+                    if v4:
+                        logical = node.attributes["symbolic_score_logical_shape"]
+                        if logical is None or tuple(logical) != (decode_rows, shape["max_model_len"]):
+                            raise ValueError("V4 score capacity disagrees with its actual constructor input")
+                if not v4 and attrs["skip_topk_buffer_clear"] != node.attributes["skip_topk_buffer_clear"]:
+                    raise ValueError("DSA source clear ownership disagrees with its actual caller")
+                source_dtype = "fp8"
+            for name in set(attrs) & set(kernel.attributes) - {"mathematical_program"}:
+                if attrs[name] != kernel.attributes[name]:
+                    raise ValueError("indexer source attributes disagree with their logical call: " + name)
+            hardware = require_hardware(kernel.hardware_id, hardware_by_id)
+            stages = select_workload_source_launch_recipe(kernel.hardware_id, shape, source_dtype,
+                kernel.variant, attrs, hardware)
+            # Chunked prefill and mixed scorer recipes repeat semantic roles.
+            # Keep physical order and assign each submission a unique name.
+            roles = tuple(role for role, _ in stages)
+            if len(roles) != len(set(roles)):
+                stages = tuple((f"{index}_{role}", launch) for index, (role, launch) in enumerate(stages))
+            updates[call_id] = dataclasses.replace(call, source_launches=stages)
+            continue
+        if (HWSpec.source_contract_supported("vllm_source_vector_launch_binding", kernel.hardware_id) and kernel.kind in (KernelKind.VECTOR, KernelKind.KV_CACHE)
+                and kernel.variant in ("rmsnorm", "add_rmsnorm", "silu", "rotary", "rope", "paged_kv_cache", "elementwise")):
+            if not isinstance(binding, Mapping) or set(binding) != {"shape", "attributes"}:
+                raise ValueError("source vector binding requires complete shape and attribute mappings")
+            shape, attrs = binding["shape"], binding["attributes"]
+            if not isinstance(shape, Mapping) or not isinstance(attrs, Mapping) or not shape:
+                raise TypeError("source vector binding requires nonempty shape and attribute mappings")
+            if len(call.source_node_ids) != 1:
+                raise ValueError("source vector binding requires one actual workload producer")
+            node = graph.node(call.source_node_ids[0])
+            if graph.source_model_execution_version is None:
+                raise ValueError("source vector binding requires the actual model caller's source version")
+            if attrs["model_execution_version"] != graph.source_model_execution_version:
+                raise ValueError("source vector runtime disagrees with its actual model caller")
+            physical = node.shape if node.kind is WorkloadKind.NORM else _vector_shape(node)
+            if dict(shape) != dict(physical):
+                raise ValueError("source vector launch shape disagrees with its actual physical workload node")
+            for name in set(attrs) & set(kernel.attributes) - {"mathematical_program"}:
+                if attrs[name] != kernel.attributes[name]:
+                    raise ValueError("source vector attributes disagree with their actual logical call: " + name)
+            hardware = require_hardware(kernel.hardware_id, hardware_by_id)
+            launch = select_launch_config(kernel.hardware_id, kernel.kind, shape, kernel.dtype,
+                kernel.variant, attrs, hardware=hardware)
+            updates[call_id] = dataclasses.replace(call, source_launches=(("native_main", launch),))
+            continue
+        if (HWSpec.source_contract_supported("marlin_routed_expert_source_launch_binding", kernel.hardware_id) and kernel.kind is KernelKind.FUSED_MOE
+                and kernel.variant == "routed_experts"
+                and (kernel.attributes["routed_weight_dtype"] == "mxfp4"
+                    or "mathematical_program" in kernel.attributes
+                    and kernel.attributes["mathematical_program"] == "kimi_ep_marlin_swiglu_v1")):
+            if not isinstance(binding, Mapping) or set(binding) != {"shape", "attributes"}:
+                raise ValueError("Marlin source binding requires complete shape and attributes")
+            shape, attrs = binding["shape"], binding["attributes"]
+            if not isinstance(shape, Mapping) or not isinstance(attrs, Mapping):
+                raise TypeError("Marlin source binding requires shape and attribute mappings")
+            if len(call.source_node_ids) != 1:
+                raise ValueError("Marlin source binding requires one actual expert producer")
+            node = graph.node(call.source_node_ids[0])
+            if (graph.source_model_execution_version != "vllm_0_30_0"
+                    or attrs["model_execution_version"] != graph.source_model_execution_version
+                    or ("model_execution_version" in node.attributes
+                        and node.attributes["model_execution_version"] != graph.source_model_execution_version)):
+                raise ValueError("Marlin source runtime disagrees with its actual model caller")
+            physical = {**node.shape, "local_experts": len(node.attributes["owned_experts"])}
+            if (node.kind is not WorkloadKind.FUSED_MOE or node.variant != "full"
+                    or node.dtype != kernel.dtype or kernel.dtype != "bf16"
+                    or dict(kernel.shape) != {**node.shape, "dtype_bytes": 2}
+                    or "symbolic_tensor_inputs" not in node.attributes or "symbolic_tensor_outputs" not in node.attributes
+                    or len(node.attributes["symbolic_tensor_inputs"]) < 3 or not node.attributes["symbolic_tensor_outputs"]
+                    or dict(shape) != physical or node.attributes["weight_group_size"] != 32
+                    or node.attributes["output_is_reduced"] is not False
+                    or node.attributes["launch_policy"] != "analytical_launch"
+                    or type(attrs["source_has_expert_map"]) is not bool
+                    or attrs["source_has_expert_map"] != (node.attributes["expert_parallel_size"] > 1)
+                    or tuple(node.attributes["owned_experts"]) != tuple(kernel.attributes["owned_experts"])):
+                raise ValueError("Marlin source geometry/ownership disagrees with its actual expert caller")
+            if kernel.attributes["routed_weight_dtype"] == "int4":
+                valid = (node.attributes["source_component"] == "symbolic_grouped_routed_experts"
+                    and node.attributes["routing_source_stage"] == "kimi_moe_route"
+                    and node.attributes["routed_weight_dtype"] == node.attributes["checkpoint_weight_dtype"] == "int4"
+                    and kernel.launch is None and kernel.execution_support == "unsupported"
+                    and attrs["source_weight_type"] == "uint4b8" and attrs["source_scale_dtype"] == kernel.dtype
+                    and attrs["source_activation"] == "silu" and attrs["source_clamp_limit"] is None
+                    and kernel.attributes["swiglu_limit"] is None)
+            else:
+                valid = (node.attributes["source_component"] == "vllm_0_30_symbolic_v4_marlin"
+                    and node.attributes["routed_weight_dtype"] == "mxfp4"
+                    and kernel.launch is not None and kernel.launch.algorithm == "vllm_marlin_moe_mxfp4_aggregate"
+                    and attrs["source_weight_type"] == "float4_e2m1f"
+                    and attrs["source_scale_dtype"] == "float8_e8m0fnu"
+                    and attrs["source_activation"] == "silu_clamped"
+                    and attrs["source_clamp_limit"] == node.attributes["swiglu_limit"] == kernel.attributes["swiglu_limit"]
+                    and node.attributes["expert_parallel_size"] == 1
+                    and (node.attributes["symbolic_marlin_multiprocessors"] is None
+                        or node.attributes["symbolic_marlin_multiprocessors"] == attrs["source_num_compute_units"]))
+            if not valid or attrs["source_group_size"] != node.attributes["weight_group_size"]:
+                raise ValueError("Marlin weight/scale/activation identity disagrees with its actual caller")
+            if attrs["source_router_state"] != "prepared_topk_weights_and_ids":
+                raise ValueError("Marlin expert sidecar must consume its actual external router outputs")
+            for name in set(attrs) & set(kernel.attributes) - {"mathematical_program"}:
+                if attrs[name] != kernel.attributes[name]:
+                    raise ValueError("Marlin source attributes disagree with their logical call: " + name)
+            hardware = require_hardware(kernel.hardware_id, hardware_by_id)
+            stages = select_workload_source_launch_recipe(kernel.hardware_id, shape, kernel.dtype,
+                "marlin_routed_experts", attrs, hardware)
+            updates[call_id] = dataclasses.replace(call, source_launches=stages)
+            continue
+        if (HWSpec.source_contract_supported("bf16_fp8_expert_source_launch_binding", kernel.hardware_id) and kernel.kind is KernelKind.FUSED_MOE
+                and kernel.variant == "routed_experts" and "mathematical_program" in kernel.attributes
+                and kernel.attributes["mathematical_program"] in (
+                    "unquantized_bf16_swiglu_v1", "unquantized_bf16_legacy_grouped_swiglu_v1",
+                    "block_fp8_swiglu_v1", "block_fp8_replicated_ep_swiglu_v1")):
+            if not isinstance(binding, Mapping) or set(binding) != {"shape", "attributes"}:
+                raise ValueError("expert source binding requires shape and attributes")
+            shape, attrs = binding["shape"], binding["attributes"]
+            if not isinstance(shape, Mapping) or not isinstance(attrs, Mapping):
+                raise TypeError("expert source binding requires shape and attribute mappings")
+            if len(call.source_node_ids) != 1:
+                raise ValueError("expert source binding requires one actual expert producer")
+            node = graph.node(call.source_node_ids[0])
+            fp8 = kernel.attributes["mathematical_program"] in (
+                "block_fp8_swiglu_v1", "block_fp8_replicated_ep_swiglu_v1")
+            if fp8:
+                source_domain = (node.kind is WorkloadKind.FUSED_MOE and node.variant == "full"
+                    and node.dtype == kernel.dtype == "bf16"
+                    and node.attributes["source_component"] in (
+                        "symbolic_grouped_routed_experts", "symbolic_dsv3_routed_experts")
+                    and node.attributes["routed_weight_dtype"] == "fp8"
+                    and node.attributes["checkpoint_weight_dtype"] == "fp8"
+                    and node.attributes["weight_group_size"] == 0
+                    and node.attributes["launch_policy"] == "analytical_launch"
+                    and node.attributes["output_is_reduced"] is False
+                    and kernel.launch is None and kernel.execution_support == "unsupported"
+                    and attrs["model_execution_version"] == graph.source_model_execution_version == "vllm_0_30_0"
+                    and ("model_execution_version" not in node.attributes
+                        or node.attributes["model_execution_version"] == "vllm_0_30_0"))
+                if attrs["source_router_state"] != "prepared_topk_weights_and_ids":
+                    raise ValueError("FP8 expert sidecar must consume its actual external router outputs")
+            else:
+                source_domain = (_h200_bf16_expert_math_domain(node, kernel.hardware_id)
+                    and attrs["model_execution_version"] == node.attributes["model_execution_version"]
+                    and graph.source_model_execution_version == node.attributes["model_execution_version"])
+                if kernel.attributes["mathematical_program"] == "unquantized_bf16_legacy_grouped_swiglu_v1":
+                    source_domain = (source_domain and node.attributes["model_execution_version"] == "vllm_0_11_0"
+                        and node.attributes["expert_parallel_size"] == 2)
+                if source_domain and attrs["model_execution_version"] == "vllm_0_11_0":
+                    if attrs["source_router_state"] != "prepared_topk_weights_and_ids":
+                        raise ValueError("legacy expert sidecar must consume its actual external router outputs")
+                    if ("symbolic_tensor_inputs" not in node.attributes
+                            or "symbolic_tensor_outputs" not in node.attributes
+                            or len(node.attributes["symbolic_tensor_outputs"]) != 1
+                            or len(node.attributes["symbolic_tensor_inputs"]) < 3):
+                        raise ValueError("legacy expert binding requires its actual input/output tensor ports")
+                    inplace = (node.attributes["symbolic_tensor_outputs"][0]
+                        == node.attributes["symbolic_tensor_inputs"][0])
+                    if type(attrs["source_inplace"]) is not bool or attrs["source_inplace"] != inplace:
+                        raise ValueError("legacy expert output-alias flag disagrees with its actual caller")
+            if not source_domain or dict(shape) != dict(node.shape):
+                raise ValueError("expert source geometry/version disagrees with its actual model caller")
+            for name in set(attrs) & set(kernel.attributes) - {"mathematical_program"}:
+                if attrs[name] != kernel.attributes[name]:
+                    raise ValueError("expert source attributes disagree with their logical call: " + name)
+            hardware = require_hardware(kernel.hardware_id, hardware_by_id)
+            if not fp8 and attrs["model_execution_version"] == "vllm_0_30_0":
+                attrs = _count_sort_producer_source_inputs(graph, node, attrs)
+            stages = select_workload_source_launch_recipe(kernel.hardware_id, shape, kernel.dtype,
+                kernel.variant, attrs, hardware)
+            updates[call_id] = dataclasses.replace(call, source_launches=stages)
+            continue
+        if (not HWSpec.source_contract_supported("mla_decode_source_launch_binding", kernel.hardware_id) or kernel.kind is not KernelKind.FLASH_ATTN
+                or kernel.variant != "mla_decode" or not isinstance(binding, Mapping)
+                or set(binding) != {"shape", "attributes"}):
+            raise ValueError("explicit source launch binding currently requires a complete H200 MLA decode input")
+        shape, attrs = binding["shape"], binding["attributes"]
+        if not isinstance(shape, Mapping) or not isinstance(attrs, Mapping):
+            raise TypeError("MLA source binding requires shape and attribute mappings")
+        if len(call.source_node_ids) != 1:
+            raise ValueError("MLA source binding requires one exact workload producer")
+        node = graph.node(call.source_node_ids[0])
+        identity = (attrs["model_execution_version"], attrs["source_flashmla_snapshot"])
+        if (graph.source_model_execution_version is not None
+                and graph.source_model_execution_version != attrs["model_execution_version"]):
+            raise ValueError("MLA source launch runtime/snapshot disagrees with the actual model caller")
+        if "source_flashmla_launch_identity" in node.attributes:
+            if tuple(node.attributes["source_flashmla_launch_identity"]) != identity:
+                raise ValueError("MLA source launch runtime/snapshot disagrees with the actual workload producer")
+        else:
+            # The target source may leave backend selection open while
+            # already producing BF16 absorbed Q and latent-cache ports.
+            # Explicit physical inputs can bind FlashMLA to that boundary;
+            # the runtime comes from the actual model caller, never shape.
+            if (graph.source_model_execution_version != "vllm_0_27_1"
+                    or "source_model_execution_version" not in node.attributes
+                    or node.attributes["source_model_execution_version"] != graph.source_model_execution_version
+                    or node.attributes["source_component"] != "symbolic_mla_decode_mathematical"
+                    or identity != ("vllm_0_27_1", "vllm_0_27_1_cmake_pin")
+                    or attrs["source_attention_backend"] != "flashmla_dense"):
+                raise ValueError("MLA source launch runtime/snapshot requires its actual model caller and explicit backend")
+            rows = sum(node.attributes["q_lens"])
+            if (node.dtype != "bf16" or node.attributes["source_query_dtype"] != "bf16"
+                    or node.attributes["source_cache_dtype"] != "bf16"
+                    or tuple(node.attributes["source_query_shape"]) != (rows, node.shape["num_query_heads"], 576)
+                    or len(node.attributes["source_cache_shape"]) != 2
+                    or node.attributes["source_cache_shape"][1] != 576
+                    or node.attributes["source_cache_shape"][0] < sum(node.attributes["kv_lens"])):
+                raise ValueError("MLA source binding disagrees with its actual BF16 query/cache ports")
+        for physical, logical in (("batch", "batch"), ("q_len", "q_len"), ("num_heads", "num_query_heads"),
+                ("qk_head_dim", "qk_head_dim"), ("v_head_dim", "v_head_dim")):
+            if shape[physical] != kernel.shape[logical]:
+                raise ValueError("MLA source launch shape disagrees with its actual logical call")
+        if tuple(kernel.attributes["q_lens"]) != (shape["q_len"],) * shape["batch"]:
+            raise ValueError("dense FlashMLA requires the actual uniform query batch")
+        hardware = require_hardware(kernel.hardware_id, hardware_by_id)
+        stages = select_workload_source_launch_recipe(kernel.hardware_id, shape, kernel.dtype,
+            kernel.variant, attrs, hardware)
+        updates[call_id] = dataclasses.replace(call, source_launches=stages)
+    return KernelPlan((updates[call.call_id] if call.call_id in updates else call for call in plan.calls),
+        plan.block_repeats, memory_context=plan.memory_context)
+
+
 def lower_workload(
     graph: WorkloadGraph,
     deployment: DeploymentPlan,
@@ -5849,6 +9616,12 @@ def lower_workload(
     source_projection_scope: str | None = None,
     compact_source_layers: bool = False,
 ) -> KernelPlan:
+    if (graph.nodes and "source_component" in graph.nodes[0].attributes
+            and graph.nodes[0].attributes["source_component"] == "flash_fp4_decode_switch_v1"):
+        if memo is not None or source_projection_scope is not None or compact_source_layers:
+            raise ValueError("FP4 decode scenario requires its explicit source lowering")
+        from .heterogeneous_moe import lower_flash_fp4_decode_scenario
+        return lower_flash_fp4_decode_scenario(graph, deployment, hardware_by_id)
     if type(compact_source_layers) is not bool:
         raise TypeError("source layer compaction flag must be boolean")
     if compact_source_layers and (memo is None or source_projection_scope is not None):
@@ -5886,9 +9659,13 @@ def lower_workload(
     else:
         logical_node_contracts = _memo_contracts(graph, memo, source_layout=source_layout)
     target_contract = _target_model_semantics_contract(graph)
+    gqa_source = any("source_component" in node.attributes
+        and node.attributes["source_component"] == "symbolic_gqa_mathematical" for node in graph.nodes)
     block_fp8_checkpoint = _dsv3_block_fp8_checkpoint(graph, target_contract)
     _validate_tp1_pipeline_graph(graph, deployment)
     _validate_tp2_pp2_pipeline_graph(graph, deployment)
+    _validate_glm_mtp_dp_expert_graph(graph, deployment)
+    _validate_kimi_dp_expert_graph(graph, deployment)
     ep_source_validation_reused = False
     if graph.nodes and all(is_heterogeneous_moe(n) for n in graph.nodes):
         validate_heterogeneous_graph(graph, deployment)
@@ -5917,7 +9694,16 @@ def lower_workload(
             and _native_graph_routing_certificates(graph.nodes))
         moe_physical_contracts = (memo.source_moe_physical_contracts(graph, source_layout)
             if routing_certificates_valid else None)
+        # Collective payload producer identities belong to the complete source
+        # DAG. Layer folding redirects edges to representatives, while keeping
+        # those physical identities intact. Validate every actual collective
+        # before folding, including occurrences absent from the compact graph.
         for current in graph.nodes:
+            if current.kind is WorkloadKind.COLLECTIVE:
+                if current.pool_name not in deployment.worker_pools:
+                    raise ValueError(f"workload node references unknown pool {current.pool_name!r}")
+                _validate_collective_node(current, deployment.worker_pools[current.pool_name],
+                    graph, gqa_source=gqa_source)
             if current.kind is WorkloadKind.FUSED_MOE:
                 if not routing_certificates_valid:
                     _validate_routing_provenance(current)
@@ -5929,8 +9715,16 @@ def lower_workload(
     call_ids_by_node = {}
     for node_id in graph.topological_order():
         node = graph.node(node_id)
+        _require_source_lowering_contract(node)
+        if "source_dspark_standalone" in node.attributes or "source_v4_aux_capture" in node.attributes:
+            _validate_dspark_source_ports(node, graph)
         if node.variant == "symbolic_storage_only":
             raise NotImplementedError("source storage-only graph has no mathematical or native timing contract")
+        if (node.kind is WorkloadKind.FUSED_MOE and "source_component" in node.attributes
+                and node.attributes["source_component"] == "vllm_0_30_symbolic_v4_marlin"
+                and "source_logical_intermediate" in node.attributes
+                and node.attributes["source_logical_intermediate"] != node.shape["intermediate"]):
+            raise NotImplementedError("V4 padded Marlin source requires separate logical-work and physical-storage pricing bindings")
         if (node_id in fusion_member_heads
                 and fusion_member_heads[node_id] != node_id):
             continue
@@ -5946,6 +9740,28 @@ def lower_workload(
                 f"assigned to pool {pool.name!r}: {pool.ranks!r}")
         hardware_id = pool.hardware_id
         hardware = require_hardware(hardware_id, hardware_by_id)
+        current_dspark_specs = None
+        dspark_typed_role_key = None
+        if ("source_dspark_standalone" in node.attributes or "source_v4_aux_capture" in node.attributes
+                or node.variant == "vllm_gpu_v2_store_drafts" or node.kind is WorkloadKind.ELEMENTWISE
+                and "source_component" in node.attributes
+                and node.attributes["source_component"] == "vllm_0_30_RequestState_draft_constructor"):
+            config = pool.parallel_plan.config
+            if (not hardware.supports_source_contract("vllm_0_30_symbolic_mhc") or deployment.mode != "colocated"
+                    or config.tensor_parallel_size not in (1, 2, 4, 8) or config.enable_expert_parallel
+                    or any(value != 1 for value in (config.pipeline_parallel_size,
+                        config.data_parallel_size, config.context_parallel_size, config.sequence_parallel_size))):
+                raise NotImplementedError("DSpark complete noncausal source outside H200 standalone eager TP1/2/4/8 without EP/DP/PP/SP/CP; Goal05 pricing remains unbound")
+            current_dspark_specs = _dspark_typed_math_specs(node, hardware_id)
+            if current_dspark_specs is not None and all("mathematical_program" in spec.attributes
+                    and spec.attributes["mathematical_program"] == "vllm_0_30_dspark_typed_role_bytes_v1"
+                    for spec in current_dspark_specs):
+                dspark_typed_role_key = tuple((spec.dtype, spec.shape["element_count"], spec.attributes["operation"])
+                    for spec in current_dspark_specs)
+        if (node.variant=='kimi_k3_kda_decode' and (
+                'source_null_state_skip' in node.attributes
+                or 'source_component' in node.attributes and node.attributes['source_component']=='vllm_0_30_kimi_k3_native_decode')):
+            raise NotImplementedError("K3 null-state/native fused KDA source requires its Goal05 pricing contract; no launch bound")
         if node_id in fusion_heads:
             group = fusion_heads[node_id]
             group_ids = tuple(member.node_id for member in group)
@@ -6009,8 +9825,8 @@ def lower_workload(
                 WorkloadKind.P2P,
                 WorkloadKind.AF_ACTIVATION_TRANSFER) and not is_heterogeneous_moe(node):
             _validate_graph_domain_boundary(node, graph)
-        if node.kind is WorkloadKind.COLLECTIVE:
-            _validate_collective_node(node, pool, graph)
+        if node.kind is WorkloadKind.COLLECTIVE and not compact_source_layers:
+            _validate_collective_node(node, pool, graph, gqa_source=gqa_source)
         if node.kind is WorkloadKind.P2P:
             if is_heterogeneous_moe(node):
                 validate_heterogeneous_transfer(node, deployment)
@@ -6028,6 +9844,8 @@ def lower_workload(
             # its provenance check on every step rather than on the steps that
             # happen to open a new class.
             _validate_routing_provenance(node)
+            if "source_dp_lane_rows" in node.attributes and node.attributes["expert_parallel_size"] == 1:
+                _validate_virtual_ep_router_inputs(graph, node)
             if not is_heterogeneous_moe(node) and not ("source_component" in node.attributes
                     and node.attributes["source_component"] in (
                         "vllm_0_30_kimi_k3_marlin_experts", "vllm_0_30_symbolic_v4_marlin",
@@ -6035,15 +9853,43 @@ def lower_workload(
                 routing_relabelling = _fused_moe_routing_relabelling(
                     node, hardware_id, hardware)
         def build_specs():
+            _require_source_lowering_contract(node)
+            if "source_dspark_standalone" in node.attributes or "source_v4_aux_capture" in node.attributes:
+                adapted = _dspark_typed_math_specs(node, hardware_id)
+                if adapted is not None:
+                    return adapted
+                if node.kind is WorkloadKind.VECTOR and node.variant in ("mhc_prenorm", "mhc_pre_norm"):
+                    if node.shape["n_splits"] != 1 or node.attributes["source_use_deep_gemm"] is not False:
+                        raise ValueError("DSpark first expanded prenorm requires its declared TileLang source")
+                    if node.variant == "mhc_pre_norm":
+                        return (_selected_target_compute_spec(node, hardware_id, hardware, KernelKind.VECTOR,
+                            node.variant, _vector_shape(node), {}),)
+                    return (KernelSpec(KernelKind.VECTOR, hardware_id, _vector_shape(node), dtype=node.dtype,
+                        variant=node.variant, attributes={"source_prenorm_backend": "tilelang"},
+                        launch=None, execution_support="unsupported", unsupported_reason="launch_selector_unavailable"),)
+            if (node.variant == "vllm_gpu_v2_store_drafts" or node.kind is WorkloadKind.ELEMENTWISE
+                    and "source_component" in node.attributes
+                    and node.attributes["source_component"] == "vllm_0_30_RequestState_draft_constructor"):
+                if not hardware.supports_source_contract("vllm_0_30_symbolic_mhc"):
+                    raise NotImplementedError("DSpark resident draft storage requires the same bound target source")
+                adapted = _dspark_typed_math_specs(node, hardware_id)
+                if adapted is not None:
+                    return adapted
             a800_glm_pipeline = (HWSpec.source_contract_supported("glm_tp8_pp4_ep8_source_projection", hardware_id)
                 and _symbolic_glm_pipeline_projection(node, pool))
             a800_kimi_pipeline = _symbolic_kimi_pipeline_projection(node, pool)
+            kimi_parallel = _symbolic_kimi_parallel_projection(node, pool) or _symbolic_kimi_dp_projection(node, pool)
+            v3_parallel = _symbolic_v3_parallel_projection(node, pool)
             a800_kimi_single = (HWSpec.source_contract_supported("kimi_tp1_unbound_source_lowering", hardware_id)
                 and _symbolic_kimi_single_rank_projection(node, pool))
-            unbound_target_source = structural_target or a800_glm_pipeline or a800_kimi_pipeline or a800_kimi_single
+            a800_glm_pcp = (HWSpec.source_contract_supported("glm_tp8_pp4_ep8_source_projection", hardware_id)
+                and _symbolic_glm_pcp_projection(node, pool))
+            unbound_target_source = structural_target or a800_glm_pipeline or a800_kimi_pipeline or a800_kimi_single or a800_glm_pcp or kimi_parallel or v3_parallel
             projection_scope = ("a800_tp8_pp4_ep8_glm_source_v1" if a800_glm_pipeline else
-                "a800_tp8_pp2_ep8_kimi_source_v1" if a800_kimi_pipeline else
-                "a800_tp1_kimi_source_v1" if a800_kimi_single else source_projection_scope)
+                ("vllm_0_30_kimi_parallel_source_v1" if HWSpec.source_contract_supported("h200_partial_source_programs", hardware_id)
+                    else "a800_tp8_pp2_ep8_kimi_source_v1") if a800_kimi_pipeline else
+                "a800_tp1_kimi_source_v1" if a800_kimi_single else
+                "vllm_0_30_glm_pcp_source_v1" if a800_glm_pcp else source_projection_scope)
             if is_heterogeneous_moe(node):
                 return heterogeneous_moe_specs(node, hardware_id)
             if (unbound_target_source and node.kind in (WorkloadKind.LINEAR, WorkloadKind.ROUTER)
@@ -6095,25 +9941,36 @@ def lower_workload(
                 # change that pool's TP8 attention/cache geometry.
                 glm_tp1 = (config.tensor_parallel_size == 1 and not config.enable_expert_parallel
                     and (node.shape["qk_head_dim"], node.shape["v_head_dim"], node.shape["kv_lora_rank"]) == (256, 256, 512))
+                glm_parallel_fresh = (_symbolic_glm_pcp_projection(node, pool)
+                    and config.context_parallel_size == 1 and node.dtype == "bf16"
+                    and node.attributes["source_component"] == "symbolic_mla_fresh_prefill_mathematical"
+                    and (node.shape["qk_head_dim"], node.shape["v_head_dim"], node.shape["kv_lora_rank"]) == (256, 256, 512))
+                if glm_parallel_fresh and (node.attributes["q_lens"] != node.attributes["kv_lens"]
+                        or node.attributes["causal"] is not True or node.attributes["return_softmax_lse"] is not False
+                        or node.attributes["mathematical_program"] != "bf16_mla_prefill_softmax_v1"):
+                    raise ValueError("GLM dense fresh-prefill math requires matching causal query/KV lengths and its no-LSE program")
                 kimi_tp1 = (_symbolic_kimi_single_rank_projection(node, pool)
                     and (node.shape["qk_head_dim"], node.shape["v_head_dim"], node.shape["kv_lora_rank"]) == (192, 128, 512))
                 v3_tp1 = (hardware.supports_source_contract(node.attributes["source_component"])
                     and not config.enable_expert_parallel
-                    and all(value == 1 for value in (config.tensor_parallel_size, config.pipeline_parallel_size,
+                    and all(value == 1 for value in (config.pipeline_parallel_size,
                         config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))
                     and "source_model_profile" in node.attributes
                     and node.attributes["source_model_profile"] in ("vllm_0_27_1_deepseek_v3_sync_fp8", "vllm_0_11_deepseek_v3_sync_fp8")
                     and type(node.attributes["source_tensor_parallel_size"]) is int
-                    and node.attributes["source_tensor_parallel_size"] == 1
+                    and node.attributes["source_tensor_parallel_size"] == config.tensor_parallel_size
+                    and (config.tensor_parallel_size == 1 or (config.tensor_parallel_size == 4
+                        and node.attributes["source_model_profile"] == "vllm_0_27_1_deepseek_v3_sync_fp8"
+                        and node.attributes["source_target_layers"] == 32))
                     and (node.shape["num_query_heads"], node.shape["qk_head_dim"],
-                        node.shape["v_head_dim"], node.shape["kv_lora_rank"]) == (128, 192, 128, 512))
-                if ((config.enable_expert_parallel and config.expert_parallel_size != 8)
+                        node.shape["v_head_dim"], node.shape["kv_lora_rank"]) == (128 // config.tensor_parallel_size, 192, 128, 512))
+                if (not glm_parallel_fresh and not kimi_parallel and not v3_parallel and ((config.enable_expert_parallel and config.expert_parallel_size != 8)
                         or (not unbound_target_source and (not hardware.supports_source_contract(node.attributes["source_component"])
                             or (config.tensor_parallel_size != 8 and not (glm_tp1 or kimi_tp1 or v3_tp1))))
                         or not config.is_rank_local or (config.pipeline_parallel_size != 1
                             and not ((_symbolic_glm_pipeline_projection(node, pool)
                                 and (node.shape["qk_head_dim"], node.shape["v_head_dim"], node.shape["kv_lora_rank"]) == (256, 256, 512))
-                                or a800_kimi_pipeline))):
+                                or a800_kimi_pipeline)))):
                     raise NotImplementedError("ordinary MLA math requires H200 TP8 or its declared GLM/Kimi/V3 TP1 EP-off source")
                 if node.kind is not WorkloadKind.FLASH_ATTN or node.variant != "mla_prefill" or node.dtype != "bf16":
                     raise ValueError("ordinary MLA mathematical source requires expanded BF16 attention")
@@ -6128,9 +9985,10 @@ def lower_workload(
                     and node.attributes["source_component"] == "vllm_0_30_symbolic_k3_prefill_attention"):
                 config = pool.parallel_plan.config
                 if (not hardware.supports_source_contract(node.attributes["source_component"]) or config.enable_expert_parallel
-                        or any(value != 1 for value in (config.tensor_parallel_size, config.pipeline_parallel_size,
+                        or (config.pipeline_parallel_size != 1 and not _symbolic_k3_pipeline_projection(node, pool))
+                        or any(value != 1 for value in (config.tensor_parallel_size,
                             config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))):
-                    raise NotImplementedError("K3 prefill source requires H200 TP/PP/SP/CP/DP1 EP-off")
+                    raise NotImplementedError("K3 prefill source requires H200 TP1 nonempty PP SP/CP/DP1 EP-off")
                 if (node.kind is not WorkloadKind.FLASH_ATTN or node.variant != "mla_prefill" or node.dtype != "bf16"
                         or node.attributes["prefill_output_source"] != "supports_out"
                         or node.attributes["q_lens"] != node.attributes["kv_lens"]
@@ -6144,13 +10002,13 @@ def lower_workload(
             if ("source_component" in node.attributes
                     and node.attributes["source_component"] in ("symbolic_mla_decode_mathematical", "symbolic_mla_cache_update")):
                 config = pool.parallel_plan.config
-                supported_tp = (1, 8)
-                if ((not unbound_target_source and (not hardware.supports_source_contract(node.attributes["source_component"])
+                supported_tp = (1, 4, 8) if _symbolic_dsv3_l32_tp4_projection(node, pool) else (1, 8)
+                if (not kimi_parallel and not v3_parallel and not _symbolic_glm_pcp_projection(node, pool) and ((not unbound_target_source and (not hardware.supports_source_contract(node.attributes["source_component"])
                             or config.tensor_parallel_size not in supported_tp))
                         or (config.enable_expert_parallel and config.expert_parallel_size != 8)
                         or ((config.pipeline_parallel_size != 1 and not _symbolic_mla_pipeline_projection(node, pool))
                             or any(value != 1 for value in (config.sequence_parallel_size,
-                            config.context_parallel_size, config.data_parallel_size)))):
+                            config.context_parallel_size, config.data_parallel_size))))):
                     raise NotImplementedError("symbolic BF16 MLA requires H200 and its explicit TP source scope, PP/SP/CP/DP1 EP-off")
                 if node.attributes["source_component"] == "symbolic_mla_cache_update":
                     if node.kind is not WorkloadKind.KV_UPDATE or node.variant != "mla_kv_cache" or node.dtype != "bf16":
@@ -6158,7 +10016,7 @@ def lower_workload(
                     return (_target_kv_cache_update_spec(node, hardware_id, hardware),)
                 if node.kind is not WorkloadKind.FLASH_ATTN or node.variant != "mla_decode" or node.dtype != "bf16":
                     raise ValueError("symbolic MLA decode has an unexpected operation")
-                kimi_multiquery = (_symbolic_kimi_single_rank_projection(node, pool) or a800_kimi_pipeline
+                kimi_multiquery = (kimi_parallel or _symbolic_kimi_single_rank_projection(node, pool) or a800_kimi_pipeline
                     or hardware.supports_source_contract("mla_tp8_ep8_source_projection") and len(pool.ranks) == 8
                     and config.tensor_parallel_size == config.expert_parallel_size == 8
                     and config.pipeline_parallel_size == 1 and config.enable_expert_parallel
@@ -6168,7 +10026,8 @@ def lower_workload(
                     and node.attributes["model_execution_version"] == "vllm_0_30_0"
                     and "source_projection_only" in node.attributes and node.attributes["source_projection_only"] is True)
                 if (any(q > 1 for q in node.attributes["q_lens"])
-                        and (config.tensor_parallel_size != 8 or config.enable_expert_parallel) and not kimi_multiquery):
+                        and (config.tensor_parallel_size != 8 or config.enable_expert_parallel)
+                        and not kimi_multiquery and not _symbolic_dsv3_l32_tp4_projection(node, pool)):
                     raise NotImplementedError("multiquery MLA math requires TP8 EP-off or its declared Kimi source scope")
                 return (KernelSpec(kind=KernelKind.FLASH_ATTN, hardware_id=hardware_id, shape=node.shape,
                     dtype=node.dtype, variant=node.variant, attributes={name: node.attributes[name] for name in (
@@ -6200,13 +10059,18 @@ def lower_workload(
                 config = pool.parallel_plan.config
                 source027 = node.attributes["source_component"] == "vllm_0_27_1_symbolic_mtp_eager"
                 source030 = node.attributes["source_component"] == "vllm_0_30_symbolic_mtp_eager"
+                glm_source = source030 and _symbolic_glm_pcp_projection(node, pool)
                 if (not hardware.supports_source_contract(node.attributes["source_component"]) or node.kind is not WorkloadKind.VECTOR
-                        or node.variant != "vllm_mtp_eager" or config.enable_expert_parallel
+                        or node.variant != "vllm_mtp_eager" or config.enable_expert_parallel and not glm_source
                         or node.attributes["model_execution_version"] != ("vllm_0_30_0" if source030 else "vllm_0_27_1" if source027 else "vllm_0_11_0")
-                        or config.tensor_parallel_size not in ((1, 8) if source030 else (8,) if source027 else (1,))
-                        or any(value != 1 for value in (config.pipeline_parallel_size,
-                            config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))):
-                    raise NotImplementedError("MTP eager source requires its version-bound A800 TP1 or H200 TP1/8 domain")
+                        or (not glm_source
+                            and (config.tensor_parallel_size not in ((1, 8) if source030 else (8,) if source027 else (1,))
+                                and not (source027 and _symbolic_dsv3_l32_tp4_projection(node, pool))))
+                        or config.pipeline_parallel_size != 1 and not _symbolic_glm_mtp_last_stage_projection(node, pool)
+                        or config.context_parallel_size != 1
+                        or config.sequence_parallel_size != 1 and not _symbolic_glm_mtp_data_projection(node, pool)
+                        or config.data_parallel_size != 1 and not _symbolic_glm_mtp_data_projection(node, pool)):
+                    raise NotImplementedError("MTP eager source requires its version-bound legacy TP or declared GLM0.30 TP domain")
                 names = {"operation", "model_execution_version"}
                 if node.attributes["operation"] in ("gather", "scatter"):
                     names |= {"index_bytes", "selected_indices"}
@@ -6218,6 +10082,10 @@ def lower_workload(
                     names |= {"vocab_size", "valid_sampled_counts", "discarded_rows"}
                 elif node.attributes["operation"] == "step_metadata":
                     names |= {"block_size", "max_model_len", "block_table_columns"}
+                elif node.attributes["operation"] in ("dspark_greedy_verify","dspark_roundtrip_prepare"):
+                    names |= {"num_speculative_tokens", "accepted_drafts"}
+                elif node.attributes["operation"] == "dspark_swa_indices":
+                    names |= {"num_speculative_tokens", "kv_lens"}
                 return (KernelSpec(kind=KernelKind.VECTOR, hardware_id=hardware_id, shape=_vector_shape(node),
                     dtype=node.dtype, variant=node.variant, attributes={name: node.attributes[name] for name in names},
                     launch=None, execution_support="unsupported", unsupported_reason="launch_selector_unavailable"),)
@@ -6228,12 +10096,14 @@ def lower_workload(
                         or node.kind is not WorkloadKind.NORM or node.dtype != "bf16"
                         or node.variant not in ("dsv32_eh_norm", "dsv32_embed_eh_norm")
                         or node.attributes["model_execution_version"] != "vllm_0_30_0"
-                        or config.tensor_parallel_size not in (1, 8)
+                        or (config.tensor_parallel_size not in (1, 8) and not _symbolic_glm_pcp_projection(node, pool))
                         or (node.variant == "dsv32_embed_eh_norm" and config.tensor_parallel_size != 1)
-                        or config.enable_expert_parallel
-                        or any(value != 1 for value in (config.pipeline_parallel_size,
-                            config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))):
-                    raise NotImplementedError("V32 fused EH requires its H200 TP1/8 source and full-vocabulary TP1 embedding")
+                        or config.enable_expert_parallel and not _symbolic_glm_pcp_projection(node, pool)
+                        or config.pipeline_parallel_size != 1 and not _symbolic_glm_mtp_last_stage_projection(node, pool)
+                        or config.context_parallel_size != 1
+                        or config.sequence_parallel_size != 1 and not _symbolic_glm_mtp_data_projection(node, pool)
+                        or config.data_parallel_size != 1 and not _symbolic_glm_mtp_data_projection(node, pool)):
+                    raise NotImplementedError("V32 fused EH requires its declared H200 TP source and full-vocabulary TP1 embedding")
                 return (_selected_target_compute_spec(node, hardware_id, hardware, KernelKind.VECTOR,
                     node.variant, node.shape, {}),)
             if ("source_component" in node.attributes
@@ -6243,7 +10113,8 @@ def lower_workload(
                 if (not hardware.supports_source_contract(node.attributes["source_component"]) or node.kind is not WorkloadKind.VECTOR
                         or node.variant != "vllm_mtp_position_mask"
                         or node.attributes["model_execution_version"] != ("vllm_0_27_1" if source027 else "vllm_0_11_0")
-                        or pool.parallel_plan.config.tensor_parallel_size != (8 if source027 else 1)):
+                        or (pool.parallel_plan.config.tensor_parallel_size != (8 if source027 else 1)
+                            and not (source027 and _symbolic_dsv3_l32_tp4_projection(node, pool)))):
                     raise NotImplementedError("MTP position mask requires its version-bound A800 TP1 or H200 TP8 source")
                 return (KernelSpec(kind=KernelKind.VECTOR, hardware_id=hardware_id, shape=_vector_shape(node),
                     dtype=node.dtype, variant=node.variant, attributes={name: node.attributes[name] for name in (
@@ -6283,11 +10154,18 @@ def lower_workload(
                     raise NotImplementedError("0.11 FP32 softmax routing requires CUDA TP1 EP-off or TP=EP2")
                 contract = ("symbolic_softmax_topk" if node.attributes["source_component"] == "symbolic_expert_owner_mask"
                     else node.attributes["source_component"])
+                source030 = ((node.attributes["source_component"] == "symbolic_unquantized_experts"
+                        and node.attributes["model_execution_version"] == "vllm_0_30_0")
+                    or (node.attributes["source_component"] == "symbolic_softmax_topk"
+                        and node.attributes["source_program"] == "vllm_0_30_bf16_softmax_topk"))
                 if (not hardware.supports_source_contract(contract)
                         or node.dtype != ("fp32" if fp32_route011 else "bf16")
-                        or (config.enable_expert_parallel and (config.expert_parallel_size != 2 or config.tensor_parallel_size != 2))
-                        or any(value != 1 for value in (config.pipeline_parallel_size, config.sequence_parallel_size,
-                            config.context_parallel_size, config.data_parallel_size))):
+                        or (config.enable_expert_parallel and (
+                            (config.expert_parallel_size != config.tensor_parallel_size and not (source030 and _qwen030_dp_sp(config)))
+                            or (config.expert_parallel_size != 2 and not source030)))
+                        or (config.pipeline_parallel_size != 1 and not source030)
+                        or (not (source030 and _qwen030_dp_sp(config)) and any(value != 1 for value in (config.sequence_parallel_size,
+                            config.context_parallel_size, config.data_parallel_size)))):
                     raise NotImplementedError("virtual Qwen3 MoE requires BF16, PP/SP/CP/DP1 and EP1 or TP=EP=2")
                 if node.attributes["source_component"] in ("symbolic_softmax_topk", "symbolic_expert_owner_mask"):
                     if node.kind is not WorkloadKind.VECTOR or node.variant != "moe_topk":
@@ -6304,10 +10182,9 @@ def lower_workload(
                     "vllm_0_27_1_symbolic_grouped_routing", "vllm_0_11_symbolic_grouped_routing", "symbolic_dsv3_routed_experts")):
                 config = pool.parallel_plan.config
                 if (not hardware.supports_source_contract("symbolic_dsv3_routed_experts")
-                        or config.tensor_parallel_size not in (1, 8) or config.enable_expert_parallel
-                        or any(value != 1 for value in (config.pipeline_parallel_size, config.sequence_parallel_size,
-                            config.context_parallel_size, config.data_parallel_size))):
-                    raise NotImplementedError("DSV3 grouped source requires its declared TP1/8 PP/SP/CP/DP1 EP-off binding")
+                        or (not v3_parallel and ((config.tensor_parallel_size not in (1, 8) and not _symbolic_dsv3_l32_tp4_projection(node, pool)) or config.enable_expert_parallel
+                            or config.pipeline_parallel_size != 1 or not config.is_rank_local))):
+                    raise NotImplementedError("DSV3 grouped source requires its declared ordinary FP8 TP/PP EP-off binding")
                 if node.attributes["source_component"] in ("vllm_0_27_1_symbolic_grouped_routing", "vllm_0_11_symbolic_grouped_routing"):
                     if (node.kind is not WorkloadKind.VECTOR or node.variant != "moe_topk" or node.dtype != "bf16"
                             or (node.shape["experts"], node.shape["topk"]) != (256, 8)
@@ -6343,6 +10220,12 @@ def lower_workload(
                         or type(node.attributes["expert_parallel_size"]) is not int
                         or node.attributes["expert_parallel_size"] != 1):
                     raise ValueError("DSV3 EP-off experts must preserve identical global/local counts and full expert ownership")
+                if HWSpec.source_contract_supported("symbolic_dsv3_routed_experts", hardware_id) and node.attributes["launch_policy"] == "analytical_launch":
+                    attributes = _fused_moe_prediction_attributes(node)
+                    attributes["mathematical_program"] = "block_fp8_swiglu_v1"
+                    return (KernelSpec(kind=KernelKind.FUSED_MOE, hardware_id=hardware_id,
+                        shape=node.shape, dtype="bf16", variant="routed_experts", attributes=attributes,
+                        launch=None, execution_support="unsupported", unsupported_reason="launch_selector_unavailable"),)
                 specs = _fused_moe_specs(node, hardware_id, hardware)
                 if sum(spec.kind is KernelKind.VECTOR and spec.variant == "moe_topk" for spec in specs) != 1:
                     raise ValueError("explicit DSV3 routing must replace exactly one legacy top-k stage")
@@ -6350,21 +10233,22 @@ def lower_workload(
             if ("source_component" in node.attributes and node.attributes["source_component"] in (
                     "vllm_0_30_symbolic_grouped_routing", "symbolic_grouped_routed_experts")):
                 config = pool.parallel_plan.config
-                kimi_ep8 = (config.expert_parallel_size == 8
+                kimi_ep8 = ((config.expert_parallel_size == 8 or kimi_parallel and config.enable_expert_parallel)
                     and ((node.kind is WorkloadKind.VECTOR and node.variant == "kimi_moe_route")
                          or (node.kind is WorkloadKind.FUSED_MOE and node.attributes["routing_source_stage"] == "kimi_moe_route")))
                 glm_source = ((node.kind is WorkloadKind.VECTOR and node.variant == "dsv32_moe_route")
                     or (node.kind is WorkloadKind.FUSED_MOE and node.attributes["routing_source_stage"] == "dsv32_moe_route"))
                 supported_tp = (1, 8)
-                grouped_ep8 = (config.tensor_parallel_size == config.expert_parallel_size == 8
-                    and (kimi_ep8 or glm_source))
-                if ((not unbound_target_source and (not hardware.supports_source_contract(node.attributes["source_component"])
+                grouped_ep8 = (kimi_parallel and config.enable_expert_parallel or (config.tensor_parallel_size == config.expert_parallel_size == 8
+                    and (kimi_ep8 or glm_source)) or glm_source and config.enable_expert_parallel
+                    and _symbolic_glm_pcp_projection(node, pool))
+                if (not kimi_parallel and not _symbolic_glm_pcp_projection(node, pool) and ((not unbound_target_source and (not hardware.supports_source_contract(node.attributes["source_component"])
                             or config.tensor_parallel_size not in supported_tp))
                         or (config.enable_expert_parallel and not grouped_ep8)
                         or ((config.pipeline_parallel_size != 1 and not (
                             _symbolic_glm_pipeline_projection(node, pool) and glm_source or a800_kimi_pipeline))
                             or any(value != 1 for value in (config.sequence_parallel_size,
-                            config.context_parallel_size, config.data_parallel_size)))):
+                            config.context_parallel_size, config.data_parallel_size))))):
                     raise NotImplementedError("symbolic grouped routing/experts require the declared H200 GLM TP1/8 or Kimi TP8 source scope")
                 if node.attributes["source_component"] == "vllm_0_30_symbolic_grouped_routing":
                     if (node.kind is not WorkloadKind.VECTOR
@@ -6376,7 +10260,7 @@ def lower_workload(
                             "expert_id_selection", "routed_scaling_factor", "score_function", "expert_group_count",
                             "topk_group_count", "normalize_topk_probability", "mathematical_program")
                             if name != "mathematical_program" or name in node.attributes}
-                            | ({"source_projection_scope": projection_scope} if unbound_target_source else {}), launch=None,
+                            | ({"source_projection_scope": projection_scope} if unbound_target_source and not HWSpec.source_contract_supported("h200_partial_source_programs", hardware_id) else {}), launch=None,
                         execution_support="unsupported", unsupported_reason="launch_selector_unavailable"),)
                 if node.kind is not WorkloadKind.FUSED_MOE or node.variant != "full":
                     raise ValueError("symbolic grouped experts have an unexpected operation")
@@ -6395,16 +10279,31 @@ def lower_workload(
                 expert_group = pool.parallel_plan.rank_groups.for_rank(
                     "expert", pool.logical_rank_for_physical_rank(node.rank))
                 expected_rank = expert_group.index(pool.logical_rank_for_physical_rank(node.rank)) if grouped_ep8 else 0
-                owned_count = node.shape["experts"] // config.expert_parallel_size
-                expected_owned = tuple(range(expected_rank * owned_count, (expected_rank + 1) * owned_count))
+                from src.kernel.kernel_spec import linear_expert_partition
+                expected_owned = linear_expert_partition(node.shape["experts"], config.expert_parallel_size, expected_rank)
                 expected_local = tuple(count if expert in expected_owned else 0 for expert, count in enumerate(counts))
                 if (any(type(value) is not int for value in (*counts, *local, *owned))
                         or local != expected_local or owned != expected_owned
                         or type(node.attributes["expert_rank"]) is not int or node.attributes["expert_rank"] != expected_rank
                         or type(node.attributes["expert_parallel_size"]) is not int
                         or node.attributes["expert_parallel_size"] != config.expert_parallel_size):
-                    raise ValueError("symbolic grouped experts must preserve the declared global/local expert axes")
+                    raise ValueError("symbolic grouped experts must preserve expert_rank, owned_experts and the declared global/local expert axes")
+                if "symbolic_zero_extent_parameter_roles" in node.attributes:
+                    if (not _symbolic_glm_pcp_projection(node, pool) or node.attributes["routed_weight_dtype"] != "bf16"
+                            or node.attributes["symbolic_zero_extent_parameter_roles"] != ("w13_weight", "w2_weight")
+                            or node.attributes["memory_input_roles"] != ("hidden_states", "routing_weights", "expert_ids")
+                            or node.attributes["memory_output_roles"] != ("output",)
+                            or node.attributes["expert_parameter_layout"] != "unquantized_checkpoint_expert_major_nk"
+                            or "symbolic_parameter_inputs" in node.attributes
+                            or config.expert_parallel_size <= node.shape["experts"]):
+                        raise ValueError("empty grouped experts require the explicit GLM BF16 source")
+                    return _explicit_source_expert_specs(node, hardware_id, hardware)
                 if node.attributes["routed_weight_dtype"] == "fp8":
+                    if config.enable_expert_parallel and (any(key.startswith("source_fp8_") for key in node.attributes)
+                            or _symbolic_glm_mtp_data_projection(node, pool)
+                            or _symbolic_glm_fp8_target_dp_projection(node, pool)
+                            or _symbolic_glm_fp8_rank_local_mtp_ep_projection(node, pool)):
+                        raise NotImplementedError("GLM block-FP8 EP source uses deferred Cutlass input quantization; Goal05 pricing is unbound, mapped Triton EP8 is not this source")
                     # The existing H200 block-FP8 launch census is for
                     # DeepSeek-V3, not this GLM geometry/provider. Preserve
                     # the expert operation without borrowing BF16 pricing.
@@ -6468,14 +10367,24 @@ def lower_workload(
                     launch=None, execution_support="unsupported",
                     unsupported_reason="launch_selector_unavailable"),)
             if ("source_component" in node.attributes
+                    and node.attributes["source_component"] == "symbolic_dsa_index_cache_update"):
+                if (not _symbolic_glm_pcp_projection(node, pool) or node.kind is not WorkloadKind.KV_UPDATE
+                        or node.variant != "dsa_fp8_index_cache" or node.dtype != "uint8"):
+                    raise NotImplementedError("separate DSA index-cache insertion requires explicit GLM PCP source")
+                return (_target_kv_cache_update_spec(node, hardware_id, hardware),)
+            if ("source_component" in node.attributes
                     and node.attributes["source_component"] == "vllm_0_30_symbolic_dsa"):
-                if ((not unbound_target_source and not hardware.supports_source_contract(node.attributes["source_component"])) or node.kind is not WorkloadKind.VECTOR
+                if ((not unbound_target_source and not _symbolic_glm_pcp_projection(node, pool)
+                        and not hardware.supports_source_contract(node.attributes["source_component"])) or node.kind is not WorkloadKind.VECTOR
                         or node.variant not in ("dsv32_fused_norm_rope", "dsv32_fused_q")):
                     raise NotImplementedError("symbolic V32 fused attention prefix requires H200 source")
                 names = (("has_indexer", "index_rope_interleave", "mla_cache_dtype", "cache_slot_scope")
                     if node.variant == "dsv32_fused_norm_rope" else
                     ("has_indexer", "index_rope_interleave", "quantize_mqa"))
-                if unbound_target_source:
+                if node.variant == "dsv32_fused_norm_rope" and node.attributes["cache_slot_scope"] == "no_metadata_no_cache_slots":
+                    names += ("source_no_attention_metadata", "index_k_output_present", "topk_active_fill")
+                if unbound_target_source or (_symbolic_glm_pcp_projection(node, pool)
+                        and HWSpec.source_contract_supported("glm_tp8_pp4_ep8_source_projection", hardware_id)):
                     return (KernelSpec(kind=KernelKind.VECTOR, hardware_id=hardware_id, shape=node.shape,
                         dtype=node.dtype, variant=node.variant, attributes={name: node.attributes[name] for name in names},
                         launch=None, execution_support="unsupported", unsupported_reason="launch_selector_unavailable"),)
@@ -6484,7 +10393,8 @@ def lower_workload(
                     {name: node.attributes[name] for name in names}),)
             if ("source_component" in node.attributes and node.attributes["source_component"] in (
                     "vllm_0_30_symbolic_dsa_indexer", "vllm_0_30_symbolic_dsa_sparse")):
-                if (not unbound_target_source and not hardware.supports_source_contract(node.attributes["source_component"])) or node.kind is not WorkloadKind.EAGER_ATTN:
+                if (not unbound_target_source and not _symbolic_glm_pcp_projection(node, pool)
+                        and not hardware.supports_source_contract(node.attributes["source_component"])) or node.kind is not WorkloadKind.EAGER_ATTN:
                     raise NotImplementedError("symbolic DSA suffix currently requires H200 source")
                 if node.attributes["selection_cardinality_source"] != "declared_causal_topk":
                     raise ValueError("symbolic DSA suffix requires explicit selected-cardinality applicability")
@@ -6510,11 +10420,11 @@ def lower_workload(
                                 or node.attributes["mathematical_program"] not in ("dsa_weighted_relu_dense_mha_v1", "dsa_weighted_relu_specdecode_v1")))):
                         raise ValueError("DSA symbolic prefill/mixed requires its declared MQA or fresh dense-MHA source")
                     config = pool.parallel_plan.config
-                    if ((not unbound_target_source and config.tensor_parallel_size not in (1, 8))
+                    if (not _symbolic_glm_pcp_projection(node, pool) and ((not unbound_target_source and config.tensor_parallel_size not in (1, 8))
                             or (config.enable_expert_parallel and config.expert_parallel_size != 8)
                             or ((config.pipeline_parallel_size != 1 and not (_symbolic_glm_pipeline_projection(node, pool)))
                             or any(value != 1 for value in (config.sequence_parallel_size,
-                                config.context_parallel_size, config.data_parallel_size)))):
+                                config.context_parallel_size, config.data_parallel_size))))):
                         raise NotImplementedError("DSA source requires TP1/8 PP/SP/CP/DP1 and EP-off or EP8")
                 if "mathematical_program" in node.attributes and node.attributes["mathematical_program"] in (
                         "dsa_weighted_relu_specdecode_v1", "bf16_latent_specdecode_v1"):
@@ -6547,11 +10457,10 @@ def lower_workload(
             if ("source_component" in node.attributes and node.attributes["source_component"] in (
                     "vllm_0_30_symbolic_v4_indexer_query", "vllm_0_30_symbolic_v4_scored_indexer")):
                 config = pool.parallel_plan.config
-                if (not hardware.supports_source_contract(node.attributes["source_component"]) or config.tensor_parallel_size not in (4, 8)
-                        or config.enable_expert_parallel or any(value != 1 for value in (
-                            config.pipeline_parallel_size, config.sequence_parallel_size,
-                            config.context_parallel_size, config.data_parallel_size))):
-                    raise NotImplementedError("symbolic V4 indexer requires H200 TP4/8 EP-off PP/SP/CP/DP1")
+                if (not hardware.supports_source_contract(node.attributes["source_component"]) or 16 % config.tensor_parallel_size != 0
+                        or config.enable_expert_parallel or not config.is_rank_local
+                        or (config.pipeline_parallel_size != 1 and not _symbolic_v4_pipeline_projection(node, pool))):
+                    raise NotImplementedError("symbolic V4 indexer requires H200 legal TP rank-local EP-off and a declared PP projection")
                 if node.attributes["source_component"] == "vllm_0_30_symbolic_v4_indexer_query":
                     if node.kind is not WorkloadKind.VECTOR or node.variant != "dsv4_indexer_q_rope_quant":
                         raise ValueError("symbolic V4 indexer query has an unexpected operation")
@@ -6568,10 +10477,10 @@ def lower_workload(
                     "vllm_0_30_symbolic_v4_routing", "vllm_0_30_symbolic_v4_marlin")):
                 config = pool.parallel_plan.config
                 if (not hardware.supports_source_contract(node.attributes["source_component"]) or config.enable_expert_parallel
-                        or config.tensor_parallel_size not in (4, 8)
-                        or any(value != 1 for value in (config.pipeline_parallel_size,
-                            config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))):
-                    raise NotImplementedError("symbolic V4 modular routing/experts require H200 TP4/8 PP/SP/CP/DP1 EP-off")
+                        or 16 % config.tensor_parallel_size != 0
+                        or not config.is_rank_local
+                        or (config.pipeline_parallel_size != 1 and not _symbolic_v4_pipeline_projection(node, pool))):
+                    raise NotImplementedError("symbolic V4 modular routing/experts require H200 legal TP rank-local EP-off and a declared PP projection")
                 if node.attributes["source_component"] == "vllm_0_30_symbolic_v4_routing":
                     if node.kind is not WorkloadKind.VECTOR or node.variant != "dsv4_moe_route":
                         raise ValueError("symbolic V4 routing has an unexpected operation")
@@ -6584,18 +10493,70 @@ def lower_workload(
                 return _target_fused_moe_specs(node, hardware_id, hardware,
                     model_contract="deepseek_v4_vllm_0_30_0_logical_v1")
             if ("source_component" in node.attributes
-                    and node.attributes["source_component"] in ("vllm_0_11_symbolic_masked_embedding", "vllm_0_18_symbolic_masked_embedding", "vllm_0_24_symbolic_masked_embedding", "vllm_0_30_symbolic_masked_embedding")):
+                    and node.attributes["source_component"] == "vllm_0_27_1_symbolic_masked_embedding_gather"):
+                config = pool.parallel_plan.config
+                if (not hardware.supports_source_contract("vllm_0_27_1_symbolic_masked_embedding")
+                        or config.tensor_parallel_size not in (4, 8) or config.enable_expert_parallel
+                        or any(value != 1 for value in (config.pipeline_parallel_size,
+                            config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))
+                        or (graph.source_model_execution_version is not None
+                            and graph.source_model_execution_version != "vllm_0_27_1")
+                        or node.kind is not WorkloadKind.GATHER or node.variant != "embedding" or node.dtype != "bf16"
+                        or node.attributes["model_execution_version"] != "vllm_0_27_1"
+                        or node.attributes["embedding_source"] != "vllm_0_27_1_masked_index_select"
+                        or node.attributes["source_operation"] != "index_select_dim0"
+                        or node.attributes["index_bytes"] != 8 or node.attributes["gather_factor"] != 1
+                        or node.attributes["index_count"] != node.shape["rows"]
+                        or node.attributes["scattered"] is not True
+                        or node.attributes["materialized_output"] is not True
+                        or set(node.shape) != {"elements", "rows", "hidden", "source_rows"}
+                        or node.shape["elements"] != node.shape["rows"] * node.shape["hidden"]):
+                    raise ValueError("vLLM0.27.1 masked gather requires its complete BF16/INT64 TP4/8 source")
+                masks = tuple(graph.node(name) for name in graph.predecessors(node.node_id)
+                    if "source_component" in graph.node(name).attributes
+                    and graph.node(name).attributes["source_component"] == "vllm_0_27_1_symbolic_masked_embedding"
+                    and graph.node(name).attributes["stage"] == "mask_ids")
+                if len(masks) != 1:
+                    raise ValueError("vLLM0.27.1 masked gather requires its actual mask-ID producer")
+                mask, = masks
+                if (mask.rank != node.rank or mask.pool_name != node.pool_name
+                        or mask.attributes["model_execution_version"] != "vllm_0_27_1"
+                        or mask.attributes["mask_program"] != "vllm_0_27_1"
+                        or mask.attributes["tensor_parallel_size"] != config.tensor_parallel_size
+                        or mask.attributes["tensor_parallel_rank"] != pool.ranks.index(node.rank)
+                        or tuple(node.attributes["symbolic_tensor_inputs"]) != tuple(mask.attributes["symbolic_tensor_outputs"][:1])
+                        or (mask.shape["rows"], mask.shape["hidden"]) != (node.shape["rows"], node.shape["hidden"])
+                        or node.shape["source_rows"] != -(-mask.attributes["vocab_size"] // 64) * 64 // config.tensor_parallel_size):
+                    raise ValueError("vLLM0.27.1 masked gather disagrees with its actual INT64 mask port or padded shard")
+                # Every rank gathers every masked row, including placeholder
+                # row0 on non-owner ranks. Reuse generic typed gather bytes;
+                # table extent stays on the actual source, with no0.11 launch.
+                return (KernelSpec(kind=KernelKind.VECTOR, hardware_id=hardware_id,
+                    shape=_vector_shape(node), dtype=node.dtype, variant="gather",
+                    attributes={name: node.attributes[name] for name in (
+                        "gather_factor", "index_count", "index_bytes", "scattered", "materialized_output")},
+                    launch=None, execution_support="unsupported", unsupported_reason="launch_selector_unavailable"),)
+            if ("source_component" in node.attributes
+                    and node.attributes["source_component"] in ("vllm_0_11_symbolic_masked_embedding", "vllm_0_18_symbolic_masked_embedding", "vllm_0_24_symbolic_masked_embedding", "vllm_0_27_1_symbolic_masked_embedding", "vllm_0_30_symbolic_masked_embedding")):
                 config = pool.parallel_plan.config
                 if node.attributes["source_component"] == "vllm_0_18_symbolic_masked_embedding":
                     if node.attributes["mask_program"] != "vllm_ascend_no_added_vocab":
                         raise ValueError("Ascend0.18 embedding requires its no-added-vocabulary source")
-                elif node.attributes["source_component"] in ("vllm_0_11_symbolic_masked_embedding", "vllm_0_24_symbolic_masked_embedding"):
+                elif node.attributes["source_component"] in ("vllm_0_11_symbolic_masked_embedding", "vllm_0_24_symbolic_masked_embedding", "vllm_0_27_1_symbolic_masked_embedding"):
                     expected = {"vllm_0_11_symbolic_masked_embedding": "vllm_0_11",
-                        "vllm_0_24_symbolic_masked_embedding": "vllm_0_24"}[node.attributes["source_component"]]
+                        "vllm_0_24_symbolic_masked_embedding": "vllm_0_24",
+                        "vllm_0_27_1_symbolic_masked_embedding": "vllm_0_27_1"}[node.attributes["source_component"]]
                     if node.attributes["mask_program"] != expected:
                         raise ValueError("masked embedding source identity disagrees with its expression program")
-                elif "mask_program" in node.attributes and node.attributes["mask_program"] in ("vllm_0_11", "vllm_0_24"):
+                elif "mask_program" in node.attributes and node.attributes["mask_program"] in ("vllm_0_11", "vllm_0_24", "vllm_0_27_1"):
                     raise ValueError("masked embedding source identity disagrees with its expression program")
+                if node.attributes["source_component"] == "vllm_0_27_1_symbolic_masked_embedding" and (
+                        config.tensor_parallel_size not in (4, 8) or config.enable_expert_parallel
+                        or node.attributes["model_execution_version"] != "vllm_0_27_1"
+                        or (graph.source_model_execution_version is not None
+                            and graph.source_model_execution_version != "vllm_0_27_1")
+                        or (node.attributes["stage"] == "mask_output" and node.dtype != "bf16")):
+                    raise ValueError("vLLM0.27.1 masked embedding requires its exact BF16 TP4/8 caller")
                 if (not hardware.supports_source_contract(node.attributes["source_component"])
                         or config.tensor_parallel_size < 2
                         or (config.enable_expert_parallel and not ((config.tensor_parallel_size, config.expert_parallel_size) == (2, 2) or ((hardware.supports_source_contract("mla_tp8_ep8_source_projection") or _symbolic_mla_pipeline_projection(node, pool)) and (config.tensor_parallel_size, config.expert_parallel_size) == (8, 8))))
@@ -6617,10 +10578,41 @@ def lower_workload(
                         if key != "mask_program" or key in node.attributes},
                     launch=None, execution_support="unsupported", unsupported_reason="launch_selector_unavailable"),)
             if ("source_component" in node.attributes
+                    and node.attributes["source_component"] == "vllm_0_27_1_symbolic_vocab_embedding_aggregate"):
+                if (not v3_parallel or node.attributes["native_source_equivalence_bound"] is not False
+                        or node.attributes["aggregated_source_operations"] != ("mask_ids", "int64_gather", "masked_fill")
+                        or node.attributes["omitted_auxiliary_details"] != (
+                            "masked_id_and_mask_materializations", "foreign_row_zero_gather_reads", "separate_launches")):
+                    raise ValueError("V3 TP embedding requires its declared unbound useful-payload aggregation")
+                return (_source_vocab_embedding_spec(node, pool, hardware_id),)
+            if ("source_component" in node.attributes
                     and node.attributes["source_component"] in ("vllm_0_30_symbolic_vocab_embedding", "sglang_0_5_19_symbolic_vocab_embedding")):
                 if not hardware.supports_source_contract(node.attributes["source_component"]):
                     raise NotImplementedError("symbolic fused TP embedding requires a NVIDIA CUDA source")
                 return (_source_vocab_embedding_spec(node, pool, hardware_id),)
+            if ("source_component" in node.attributes
+                    and node.attributes["source_component"] == "vllm_0_30_dspark_regular_mhc_pre"):
+                if not hardware.supports_source_contract("vllm_0_30_symbolic_mhc") or node.variant not in ("mhc_prenorm","mhc_pre_norm"):
+                    raise ValueError("DSpark expanded first mHC requires its H200 source stages")
+                shape=_vector_shape(node)
+                attributes=({"source_prenorm_backend":"tilelang"} if node.variant=="mhc_prenorm" else {})
+                if node.variant=="mhc_prenorm":
+                    return (KernelSpec(KernelKind.VECTOR,hardware_id,shape,dtype=node.dtype,variant=node.variant,
+                        attributes=attributes,launch=None,execution_support="unsupported",unsupported_reason="launch_selector_unavailable"),)
+                return (_selected_target_compute_spec(node,hardware_id,hardware,KernelKind.VECTOR,node.variant,shape,attributes),)
+            if ("source_component" in node.attributes
+                    and node.attributes["source_component"] == "vllm_0_30_symbolic_v4_pipeline_prenorm"):
+                config = pool.parallel_plan.config
+                if (not _symbolic_v4_pipeline_projection(node, pool) or node.kind is not WorkloadKind.VECTOR
+                        or node.variant not in ("mhc_prenorm", "mhc_pre_norm") or node.dtype != "bf16"
+                        or node.shape["n_splits"] != 1 or node.attributes["source_use_deep_gemm"] is not False):
+                    raise ValueError("V4 stage-entry prenorm requires its nonbroadcast optional TileLang source")
+                if node.variant == "mhc_prenorm":
+                    return (KernelSpec(KernelKind.VECTOR, hardware_id, _vector_shape(node), dtype="bf16",
+                        variant=node.variant, attributes={"source_prenorm_backend": "tilelang"}, launch=None,
+                        execution_support="unsupported", unsupported_reason="launch_selector_unavailable"),)
+                return (_selected_target_compute_spec(node, hardware_id, hardware, KernelKind.VECTOR,
+                    node.variant, _vector_shape(node), {}),)
             if ("source_component" in node.attributes
                     and node.attributes["source_component"] == "vllm_0_30_symbolic_mhc"):
                 if (not hardware.supports_source_contract(node.attributes["source_component"]) or node.kind is not WorkloadKind.VECTOR
@@ -6630,7 +10622,9 @@ def lower_workload(
                     raise TypeError("symbolic mHC requires explicit source DeepGEMM branch")
                 return _target_mhc_specs(node, hardware_id, hardware)
             if ("source_component" in node.attributes
-                    and node.attributes["source_component"] == "symbolic_gqa_mathematical"):
+                    and node.attributes["source_component"] in (
+                        "symbolic_gqa_mathematical", "fa3_gqa_shared_metadata_prepare", "fa3_full_aot_prepare", "fa3_full_aot_clear", "fa3_expanded_mla_prefill_call",
+                        "fa3_mla_split_prefill_call", "fa3_mla_unsplit_prefill_call")):
                 return _source_flash_attn_specs(node, hardware_id, hardware)
             if ("source_component" in node.attributes and node.attributes["source_component"] in (
                     "sglang_0_5_19_symbolic_grouped_routing", "sglang_0_5_19_symbolic_fused_shared_moe",
@@ -6687,10 +10681,11 @@ def lower_workload(
                 if (node.kind is not WorkloadKind.FUSED_MOE or node.variant != "full" or node.dtype != "bf16"
                         or node.attributes["fused_shared_experts"] != 1 or node.attributes["routed_scaling_factor"] != 1.0):
                     raise ValueError("SGLang fused shared experts require top-k-scaled routed weights and one shared expert")
-                specs = _fused_moe_specs(node, hardware_id, hardware)
-                if sum(spec.kind is KernelKind.VECTOR and spec.variant == "moe_topk" for spec in specs) != 1:
-                    raise ValueError("explicit SGLang routing must replace exactly one internal top-k stage")
-                return tuple(spec for spec in specs if not (spec.kind is KernelKind.VECTOR and spec.variant == "moe_topk"))
+                attributes = _fused_moe_prediction_attributes(node)
+                attributes["mathematical_program"] = "sglang_0_5_19_fp8_fused_shared_swiglu_v1"
+                return (KernelSpec(kind=KernelKind.FUSED_MOE, hardware_id=hardware_id, shape=node.shape,
+                    dtype=node.dtype, variant="routed_experts", attributes=attributes,
+                    launch=None, execution_support="unsupported", unsupported_reason="launch_selector_unavailable"),)
             if ("source_component" in node.attributes
                     and node.attributes["source_component"] in (
                         "vllm_0_30_symbolic_logits_boundary", "vllm_0_11_symbolic_logits_boundary",
@@ -6706,12 +10701,17 @@ def lower_workload(
                 if node.attributes["model_execution_version"] != source_versions[node.attributes["source_component"]]:
                     raise ValueError("symbolic logits source component disagrees with model_execution_version")
                 if (not hardware.supports_source_contract(node.attributes["source_component"]) or node.kind is not WorkloadKind.VECTOR
-                        or config.tensor_parallel_size not in (1, 2, 4, 8)
-                        or (config.enable_expert_parallel and not ((config.tensor_parallel_size, config.expert_parallel_size) == (2, 2) or ((hardware.supports_source_contract("mla_tp8_ep8_source_projection") or _symbolic_mla_pipeline_projection(node, pool)) and (config.tensor_parallel_size, config.expert_parallel_size) == (8, 8))))
+                        or (config.tensor_parallel_size not in (1, 2, 4, 8) and not v3_parallel
+                            and node.attributes["model_execution_version"] != "vllm_0_30_0")
+                        or (config.enable_expert_parallel and not (_symbolic_kimi_dp_projection(node, pool) or _symbolic_glm_pcp_projection(node, pool) or (config.tensor_parallel_size, config.expert_parallel_size) == (2, 2)
+                            or (node.attributes["model_execution_version"] == "vllm_0_30_0" and (config.expert_parallel_size == config.tensor_parallel_size or _qwen030_dp_sp(config)))
+                            or ((hardware.supports_source_contract("mla_tp8_ep8_source_projection") or _symbolic_mla_pipeline_projection(node, pool)) and (config.tensor_parallel_size, config.expert_parallel_size) == (8, 8))))
                         or (config.pipeline_parallel_size != 1 and not _symbolic_pipeline_endpoint(
                             node, pool, config.pipeline_parallel_size - 1))
-                        or any(value != 1 for value in (config.sequence_parallel_size,
-                            config.context_parallel_size, config.data_parallel_size))):
+                        or (not (_symbolic_kimi_dp_projection(node, pool) or _symbolic_glm_pcp_projection(node, pool)
+                            or node.attributes["model_execution_version"] == "vllm_0_30_0" and _qwen030_dp_sp(config))
+                            and any(value != 1 for value in (config.sequence_parallel_size,
+                                config.context_parallel_size, config.data_parallel_size)))):
                     raise NotImplementedError("symbolic logits boundary requires CUDA-alike TP1/2/4/8 PP/SP/CP/DP1 EP-off")
                 if node.variant == "vllm_logits_row_select":
                     names = ("model_execution_version", "index_source", "selected_indices")
@@ -6776,13 +10776,17 @@ def lower_workload(
                         "vllm_0_18_symbolic_plain_greedy", "vllm_0_24_symbolic_plain_greedy", "vllm_0_27_1_symbolic_plain_greedy")):
                 config = pool.parallel_plan.config
                 if (not hardware.supports_source_contract(node.attributes["source_component"])
-                        or (config.enable_expert_parallel and not ((config.tensor_parallel_size, config.expert_parallel_size) == (2, 2) or ((hardware.supports_source_contract("mla_tp8_ep8_source_projection") or _symbolic_mla_pipeline_projection(node, pool)) and (config.tensor_parallel_size, config.expert_parallel_size) == (8, 8))))
-                        or config.tensor_parallel_size not in (1, 2, 4, 8)
+                        or (config.enable_expert_parallel and not (_symbolic_kimi_dp_projection(node, pool) or _symbolic_glm_pcp_projection(node, pool) or (config.tensor_parallel_size, config.expert_parallel_size) == (2, 2)
+                            or (node.attributes["source_component"] == "vllm_0_30_symbolic_plain_greedy" and (config.expert_parallel_size == config.tensor_parallel_size or _qwen030_dp_sp(config)))
+                            or ((hardware.supports_source_contract("mla_tp8_ep8_source_projection") or _symbolic_mla_pipeline_projection(node, pool)) and (config.tensor_parallel_size, config.expert_parallel_size) == (8, 8))))
+                        or (config.tensor_parallel_size not in (1, 2, 4, 8) and not v3_parallel
+                            and node.attributes["source_component"] != "vllm_0_30_symbolic_plain_greedy")
                         or (config.pipeline_parallel_size != 1 and not _symbolic_pipeline_endpoint(
                             node, pool, config.pipeline_parallel_size - 1))
-                        or any(value != 1 for value in (
-                            config.sequence_parallel_size, config.context_parallel_size,
-                            config.data_parallel_size))):
+                        or (not (_symbolic_kimi_dp_projection(node, pool) or _symbolic_glm_pcp_projection(node, pool)
+                            or node.attributes["source_component"] == "vllm_0_30_symbolic_plain_greedy" and _qwen030_dp_sp(config))
+                            and any(value != 1 for value in (config.sequence_parallel_size, config.context_parallel_size,
+                                config.data_parallel_size)))):
                     raise NotImplementedError("symbolic CUDA-source greedy requires CUDA-alike TP1/2/4/8 PP/SP/CP/DP1 EP-off")
                 if node.kind is not WorkloadKind.VECTOR or node.variant not in (
                         "vllm_logits_fp32_cast", "vllm_plain_greedy_sample"):
@@ -6913,10 +10917,11 @@ def lower_workload(
                     and node.attributes["source_component"] == "vllm_0_30_kimi_k3_plain_greedy"):
                 config = pool.parallel_plan.config
                 if (not hardware.supports_source_contract(node.attributes["source_component"]) or config.enable_expert_parallel
+                        or (config.pipeline_parallel_size != 1 and not _symbolic_k3_pipeline_projection(node, pool))
                         or any(value != 1 for value in (
-                            config.tensor_parallel_size, config.pipeline_parallel_size,
+                            config.tensor_parallel_size,
                             config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))):
-                    raise NotImplementedError("K3 plain greedy source requires H200 TP/PP/SP/CP/DP1 EP-off")
+                    raise NotImplementedError("K3 plain greedy source requires H200 TP1 nonempty PP SP/CP/DP1 EP-off")
                 if node.kind is not WorkloadKind.VECTOR or node.variant not in (
                         "vllm_logits_fp32_cast", "vllm_plain_greedy_sample"):
                     raise ValueError("K3 plain greedy has an unexpected source operation")
@@ -6931,10 +10936,11 @@ def lower_workload(
                     and node.attributes["source_component"] == "vllm_0_30_kimi_k3_nope_context_prefill"):
                 config = pool.parallel_plan.config
                 if (not hardware.supports_source_contract(node.attributes["source_component"]) or config.enable_expert_parallel
+                        or (config.pipeline_parallel_size != 1 and not _symbolic_k3_pipeline_projection(node, pool))
                         or any(value != 1 for value in (
-                            config.tensor_parallel_size, config.pipeline_parallel_size,
+                            config.tensor_parallel_size,
                             config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))):
-                    raise NotImplementedError("K3 NoPE context requires H200 TP/PP/SP/CP/DP1 EP-off")
+                    raise NotImplementedError("K3 NoPE context requires H200 TP1 nonempty PP SP/CP/DP1 EP-off")
                 if node.kind is WorkloadKind.VECTOR and node.variant == "kimi_k3_nope_context":
                     return (KernelSpec(
                         kind=KernelKind.VECTOR, hardware_id=hardware_id, shape=_vector_shape(node),
@@ -6960,10 +10966,11 @@ def lower_workload(
                     and node.attributes["source_component"] == "vllm_0_30_kimi_k3_nope_decode"):
                 config = pool.parallel_plan.config
                 if (not hardware.supports_source_contract(node.attributes["source_component"]) or config.enable_expert_parallel
+                        or (config.pipeline_parallel_size != 1 and not _symbolic_k3_pipeline_projection(node, pool))
                         or any(value != 1 for value in (
-                            config.tensor_parallel_size, config.pipeline_parallel_size,
+                            config.tensor_parallel_size,
                             config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))):
-                    raise NotImplementedError("K3 NoPE decode source requires H200 TP/PP/SP/CP/DP1 EP-off")
+                    raise NotImplementedError("K3 NoPE decode source requires H200 TP1 nonempty PP SP/CP/DP1 EP-off")
                 if node.kind is WorkloadKind.LINEAR and node.variant == "kimi_k3_nope_bmm":
                     return (KernelSpec(
                         kind=KernelKind.GEMM, hardware_id=hardware_id, shape=node.shape,
@@ -6987,10 +10994,11 @@ def lower_workload(
                     and node.attributes["source_component"] == "vllm_0_30_kimi_k3_nope_mixed"):
                 config = pool.parallel_plan.config
                 if (not hardware.supports_source_contract(node.attributes["source_component"]) or config.enable_expert_parallel
+                        or (config.pipeline_parallel_size != 1 and not _symbolic_k3_pipeline_projection(node, pool))
                         or any(value != 1 for value in (
-                            config.tensor_parallel_size, config.pipeline_parallel_size,
+                            config.tensor_parallel_size,
                             config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))):
-                    raise NotImplementedError("K3 NoPE mixed source requires H200 TP/PP/SP/CP/DP1 EP-off")
+                    raise NotImplementedError("K3 NoPE mixed source requires H200 TP1 nonempty PP SP/CP/DP1 EP-off")
                 if node.kind is WorkloadKind.LINEAR and node.variant == "kimi_k3_nope_bmm":
                     return (KernelSpec(
                         kind=KernelKind.GEMM, hardware_id=hardware_id, shape=node.shape,
@@ -7014,9 +11022,9 @@ def lower_workload(
                     and node.attributes["source_component"] == "vllm_0_27_1_symbolic_embedding"):
                 config = pool.parallel_plan.config
                 if (not hardware.supports_source_contract("vllm_0_27_1_symbolic_embedding") or config.enable_expert_parallel
-                        or any(value != 1 for value in (config.tensor_parallel_size,
-                            config.pipeline_parallel_size, config.sequence_parallel_size,
-                            config.context_parallel_size, config.data_parallel_size))
+                        or config.tensor_parallel_size != 1 or not config.is_rank_local
+                        or (config.pipeline_parallel_size != 1 and not (v3_parallel
+                            and _symbolic_pipeline_endpoint(node, pool, 0)))
                         or node.kind is not WorkloadKind.VECTOR or node.variant != "vllm_embedding_id_widen"
                         or node.dtype != "int32"
                         or node.attributes["embedding_source"] != "vllm_0_27_1_unquantized_tp1"):
@@ -7033,13 +11041,15 @@ def lower_workload(
                     and node.attributes["source_component"] in (
                         "vllm_0_30_kimi_k3_tp1_embedding", "vllm_0_30_symbolic_embedding", "vllm_0_18_symbolic_embedding", "vllm_0_24_symbolic_embedding", "vllm_0_11_symbolic_embedding")):
                 config = pool.parallel_plan.config
-                if (not hardware.supports_source_contract(node.attributes["source_component"]) or config.enable_expert_parallel
+                distributed_embedding = (node.attributes["source_component"] == "vllm_0_30_symbolic_embedding"
+                    and (_qwen030_dp_sp(config) or _symbolic_glm_pcp_projection(node, pool)))
+                if (not hardware.supports_source_contract(node.attributes["source_component"]) or (config.enable_expert_parallel and not distributed_embedding)
                         or (config.pipeline_parallel_size != 1 and not (
                             node.attributes["source_component"] in ("vllm_0_30_symbolic_embedding", "vllm_0_11_symbolic_embedding")
                             and _symbolic_pipeline_endpoint(node, pool, 0)))
-                        or any(value != 1 for value in (
-                            config.tensor_parallel_size,
-                            config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))):
+                        or config.tensor_parallel_size != 1
+                        or (not distributed_embedding and any(value != 1 for value in (
+                            config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size)))):
                     raise NotImplementedError("symbolic TP1 embedding requires its NVIDIA source and PP/SP/CP/DP1 EP-off")
                 if node.kind is WorkloadKind.VECTOR and node.variant == "vllm_embedding_id_widen":
                     shape = _vector_shape(node)
@@ -7072,10 +11082,11 @@ def lower_workload(
                     and node.attributes["source_component"] == "vllm_0_30_kimi_k3_fresh_prefill_logits"):
                 config = pool.parallel_plan.config
                 if (not hardware.supports_source_contract(node.attributes["source_component"]) or config.enable_expert_parallel
+                        or (config.pipeline_parallel_size != 1 and not _symbolic_k3_pipeline_projection(node, pool))
                         or any(value != 1 for value in (
-                            config.tensor_parallel_size, config.pipeline_parallel_size,
+                            config.tensor_parallel_size,
                             config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))):
-                    raise NotImplementedError("K3 logits source requires H200 TP/PP/SP/CP/DP1 EP-off")
+                    raise NotImplementedError("K3 logits source requires H200 TP1 nonempty PP SP/CP/DP1 EP-off")
                 if node.kind is WorkloadKind.VECTOR and node.variant == "vllm_logits_row_select":
                     return (KernelSpec(
                         kind=KernelKind.VECTOR, hardware_id=hardware_id,
@@ -7086,16 +11097,28 @@ def lower_workload(
                         unsupported_reason="launch_selector_unavailable"),)
                 if node.kind not in (WorkloadKind.NORM, WorkloadKind.LM_HEAD):
                     raise ValueError("K3 logits boundary has an unexpected source operation")
+                if node.kind is WorkloadKind.NORM:
+                    # This static source component does not carry a runtime
+                    # batch-invariant flag or actual tensor layout. Its
+                    # ordinary RMSNorm arithmetic is explicit; no native
+                    # 0.30 branch or compiler identity follows from that.
+                    return (KernelSpec(kind=KernelKind.VECTOR, hardware_id=hardware_id,
+                        shape=node.shape, dtype=node.dtype, variant=node.variant,
+                        attributes={"epsilon": node.attributes["rms_norm_eps"],
+                            "mathematical_program": "dense_bf16_source_flops_bytes_v1"},
+                        launch=None, execution_support="unsupported",
+                        unsupported_reason="launch_selector_unavailable"),)
             if ("source_component" in node.attributes
                     and node.attributes["source_component"] in ("vllm_0_30_kimi_k3_triton_fresh_prefill",
                                                                "vllm_0_30_kimi_k3_triton_mixed",
                                                                "vllm_0_30_kimi_k3_triton_context_prefill")):
                 config = pool.parallel_plan.config
                 if (not hardware.supports_source_contract(node.attributes["source_component"]) or config.enable_expert_parallel
+                        or (config.pipeline_parallel_size != 1 and not _symbolic_k3_pipeline_projection(node, pool))
                         or any(value != 1 for value in (
-                            config.tensor_parallel_size, config.pipeline_parallel_size,
+                            config.tensor_parallel_size,
                             config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))):
-                    raise NotImplementedError("K3 fresh Triton prefill source requires H200 TP/PP/SP/CP/DP1 EP-off")
+                    raise NotImplementedError("K3 fresh Triton prefill source requires H200 TP1 nonempty PP SP/CP/DP1 EP-off")
                 if node.kind is WorkloadKind.VECTOR and node.variant in ("kimi_k3_kda_prefill", "kimi_k3_kda_mixed", "kimi_k3_kda_context_prefill"):
                     return (KernelSpec(
                         kind=KernelKind.VECTOR, hardware_id=hardware_id,
@@ -7110,10 +11133,11 @@ def lower_workload(
                     and node.attributes["source_component"] == "vllm_0_30_kimi_k3_native_marlin_moe"):
                 config = pool.parallel_plan.config
                 if (not hardware.supports_source_contract(node.attributes["source_component"]) or config.enable_expert_parallel
+                        or (config.pipeline_parallel_size != 1 and not _symbolic_k3_pipeline_projection(node, pool))
                         or any(value != 1 for value in (
-                            config.tensor_parallel_size, config.pipeline_parallel_size,
+                            config.tensor_parallel_size,
                             config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))):
-                    raise NotImplementedError("K3 native Marlin MoE source requires H200 TP/PP/SP/CP/DP1 EP-off")
+                    raise NotImplementedError("K3 native Marlin MoE source requires H200 TP1 nonempty PP SP/CP/DP1 EP-off")
                 if node.kind is WorkloadKind.VECTOR and node.variant == "kimi_k3_moe_route":
                     return (KernelSpec(
                         kind=KernelKind.VECTOR, hardware_id=hardware_id,
@@ -7129,10 +11153,11 @@ def lower_workload(
                     and node.attributes["source_component"] == "vllm_0_30_kimi_k3_marlin_experts"):
                 config = pool.parallel_plan.config
                 if (not hardware.supports_source_contract(node.attributes["source_component"]) or config.enable_expert_parallel
+                        or (config.pipeline_parallel_size != 1 and not _symbolic_k3_pipeline_projection(node, pool))
                         or any(value != 1 for value in (
-                            config.tensor_parallel_size, config.pipeline_parallel_size,
+                            config.tensor_parallel_size,
                             config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))):
-                    raise NotImplementedError("K3 Marlin expert source requires H200 TP/PP/SP/CP/DP1 EP-off")
+                    raise NotImplementedError("K3 Marlin expert source requires H200 TP1 nonempty PP SP/CP/DP1 EP-off")
                 if node.kind is not WorkloadKind.FUSED_MOE or node.variant != "full":
                     raise ValueError("K3 Marlin expert source requires its explicit logical aggregate")
                 return (KernelSpec(
@@ -7148,20 +11173,32 @@ def lower_workload(
                     and node.attributes["source_component"] == "vllm_0_30_kimi_k3_tp1_native_latent_output"):
                 config = pool.parallel_plan.config
                 if (not hardware.supports_source_contract(node.attributes["source_component"]) or config.enable_expert_parallel
+                        or (config.pipeline_parallel_size != 1 and not _symbolic_k3_pipeline_projection(node, pool))
                         or any(value != 1 for value in (
-                            config.tensor_parallel_size, config.pipeline_parallel_size,
+                            config.tensor_parallel_size,
                             config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))):
-                    raise NotImplementedError("K3 native latent output source chain requires H200 TP/PP/SP/CP/DP1 EP-off")
+                    raise NotImplementedError("K3 native latent output source chain requires H200 TP1 nonempty PP SP/CP/DP1 EP-off")
                 if node.kind not in (WorkloadKind.NORM, WorkloadKind.LINEAR, WorkloadKind.ELEMENTWISE):
                     raise ValueError("K3 native latent output has an unexpected source operation")
+                if node.kind in (WorkloadKind.NORM, WorkloadKind.ELEMENTWISE):
+                    attributes = ({"epsilon": node.attributes["rms_norm_eps"]}
+                        if node.kind is WorkloadKind.NORM else
+                        {key: node.attributes[key] for key in ("operation", "reads", "writes")})
+                    return (KernelSpec(kind=KernelKind.VECTOR, hardware_id=hardware_id,
+                        shape=node.shape if node.kind is WorkloadKind.NORM else _vector_shape(node),
+                        dtype=node.dtype, variant="rmsnorm" if node.kind is WorkloadKind.NORM else "elementwise",
+                        attributes={**attributes, "mathematical_program": "dense_bf16_source_flops_bytes_v1"},
+                        launch=None, execution_support="unsupported",
+                        unsupported_reason="launch_selector_unavailable"),)
             if ("source_component" in node.attributes
                     and node.attributes["source_component"] == "vllm_0_30_kimi_k3_nope_fresh_prefill"):
                 config = pool.parallel_plan.config
                 if (not hardware.supports_source_contract(node.attributes["source_component"]) or config.enable_expert_parallel
+                        or (config.pipeline_parallel_size != 1 and not _symbolic_k3_pipeline_projection(node, pool))
                         or any(value != 1 for value in (
-                            config.tensor_parallel_size, config.pipeline_parallel_size,
+                            config.tensor_parallel_size,
                             config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))):
-                    raise NotImplementedError("K3 NoPE prefill source chain requires H200 TP/PP/SP/CP/DP1 EP-off")
+                    raise NotImplementedError("K3 NoPE prefill source chain requires H200 TP1 nonempty PP SP/CP/DP1 EP-off")
                 if node.kind is WorkloadKind.VECTOR and node.variant == "kimi_k3_nope_prefill":
                     return (KernelSpec(
                         kind=KernelKind.VECTOR, hardware_id=hardware_id,
@@ -7178,10 +11215,11 @@ def lower_workload(
                     and node.attributes["source_component"] == "vllm_0_30_kimi_k3_triton_decode"):
                 config = pool.parallel_plan.config
                 if (not hardware.supports_source_contract(node.attributes["source_component"]) or config.enable_expert_parallel
+                        or (config.pipeline_parallel_size != 1 and not _symbolic_k3_pipeline_projection(node, pool))
                         or any(value != 1 for value in (
-                            config.tensor_parallel_size, config.pipeline_parallel_size,
+                            config.tensor_parallel_size,
                             config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))):
-                    raise NotImplementedError("K3 Triton decode source chain requires H200 TP/PP/SP/CP/DP1 EP-off")
+                    raise NotImplementedError("K3 Triton decode source chain requires H200 TP1 nonempty PP SP/CP/DP1 EP-off")
                 if node.kind is WorkloadKind.VECTOR and node.variant == "kimi_k3_kda_decode":
                     return (KernelSpec(
                         kind=KernelKind.VECTOR, hardware_id=hardware_id,
@@ -7195,10 +11233,11 @@ def lower_workload(
                     and node.attributes["source_component"] == "vllm_0_30_kimi_k3_ordinary_mlp"):
                 config = pool.parallel_plan.config
                 if (not hardware.supports_source_contract(node.attributes["source_component"]) or config.enable_expert_parallel
+                        or (config.pipeline_parallel_size != 1 and not _symbolic_k3_pipeline_projection(node, pool))
                         or any(value != 1 for value in (
-                            config.tensor_parallel_size, config.pipeline_parallel_size,
+                            config.tensor_parallel_size,
                             config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))):
-                    raise NotImplementedError("K3 ordinary MLP component requires H200 TP/PP/SP/CP/DP1 EP-off")
+                    raise NotImplementedError("K3 ordinary MLP component requires H200 TP1 nonempty PP SP/CP/DP1 EP-off")
                 if node.kind is WorkloadKind.ACTIVATION and node.variant == "kimi_k3_situ":
                     return (KernelSpec(
                         kind=KernelKind.VECTOR, hardware_id=hardware_id,
@@ -7211,10 +11250,9 @@ def lower_workload(
             if node.kind is WorkloadKind.VECTOR and node.variant == "kimi_k3_attn_res":
                 if node.attributes["source_component"] != "vllm_0_30_kimi_k3_attention_residual":
                     raise ValueError("K3 attention residual requires an explicit source component")
-                if any(value != 1 for value in (
-                        pool.parallel_plan.config.pipeline_parallel_size,
-                        pool.parallel_plan.config.sequence_parallel_size)):
-                    raise NotImplementedError("K3 attention residual source component requires PP/SP1")
+                if ((pool.parallel_plan.config.pipeline_parallel_size != 1 and not _symbolic_k3_pipeline_projection(node, pool))
+                        or pool.parallel_plan.config.sequence_parallel_size != 1):
+                    raise NotImplementedError("K3 attention residual source component requires nonempty PP and SP1")
                 return (KernelSpec(
                     kind=KernelKind.VECTOR, hardware_id=hardware_id,
                     shape=_vector_shape(node), dtype=node.dtype, variant=node.variant,
@@ -7433,12 +11471,25 @@ def lower_workload(
                 return _eager_attn_specs(node, hardware_id, hardware)
             if node.kind in _COMMUNICATION_KINDS or node.kind in (
                     WorkloadKind.MEMCPY, WorkloadKind.KV_OFFLOAD):
-                return (_transfer_spec(node, hardware_id),)
+                destination_hardware = None
+                if node.kind is WorkloadKind.PD_KV_TRANSFER:
+                    destination_pool = deployment.worker_pools[node.attributes["destination_pool"]]
+                    if node.attributes["link"] == "infiniband":
+                        destination_hardware = require_hardware(destination_pool.hardware_id, hardware_by_id)
+                        if destination_hardware.interconnect["pcie_bw_bytes_s"] is None:
+                            raise ValueError("bilateral transport requires receiver PCIe bandwidth")
+                return (_transfer_spec(node, hardware_id,
+                    destination_hardware=destination_hardware),)
             raise NotImplementedError(
                 f"no lowering rule for {node.kind.value}")
 
         if memo is None:
             specs = build_specs()
+        elif dspark_typed_role_key is not None:
+            # Current mixed-port effective geometry belongs to this owner's
+            # physical memo contract, alongside the immutable source node.
+            specs = memo.lower(node, (logical_node_contracts[node.node_id], dspark_typed_role_key),
+                hardware, build_specs)
         elif node.kind is WorkloadKind.FUSED_MOE:
             specs = memo.lower(
                 node,
@@ -7464,7 +11515,12 @@ def lower_workload(
         previous = None
         node_call_ids = []
         for index, spec in enumerate(specs):
-            call_id = node.node_id if len(specs) == 1 else f"{node.node_id}:{index}"
+            # The source recorder uses :1 for repeated module invocations.
+            # DSpark context/query FP8 expansion needs a distinct stage axis.
+            call_id = (node.node_id if len(specs) == 1 else
+                f"{node.node_id}:dspark-stage-{index}" if ("source_dspark_standalone" in node.attributes
+                    or "source_v4_aux_capture" in node.attributes or node.variant == "vllm_gpu_v2_store_drafts") else
+                f"{node.node_id}:{index}")
             dependencies = external_dependencies if previous is None else (previous,)
             if spec.transfer is None:
                 resource = "compute"
@@ -7473,15 +11529,16 @@ def lower_workload(
             else:
                 resource = spec.transfer.link
             rank = node.rank
-            calls.append(KernelCall(
-                call_id,
-                spec,
-                node.pool_name,
-                rank,
-                resource,
-                (node.node_id,),
-                dependencies,
-            ))
+            call = (KernelCall(call_id, spec, node.pool_name, rank, resource, (node.node_id,), dependencies)
+                if memo is None else memo.bind_call(call_id, spec, node.pool_name, rank, resource,
+                    node.node_id, dependencies))
+            source_launches = (memo.source_vector_recipe(node,
+                logical_node_contracts[node.node_id], hardware_id, hardware)
+                if memo is not None and node.kind in (
+                    WorkloadKind.NORM, WorkloadKind.ACTIVATION,
+                    WorkloadKind.ROTARY, WorkloadKind.KV_UPDATE)
+                else _node_source_launches(node, hardware_id, hardware))
+            calls.append(call if source_launches is None else dataclasses.replace(call, source_launches=source_launches))
             node_call_ids.append(call_id)
             previous = call_id
         final_call_by_node[node.node_id] = previous
@@ -7563,7 +11620,7 @@ def _reuse_ep_native_frame_recipe(graph, deployment, owner, layout, *, source_la
     if not _ep_verifier_unchanged(behavior):
         return False
     current_dep = _ep_deployment_projection(deployment)
-    if (current_dep is None or current_dep != dep or graph.edges is not expected_edges
+    if (current_dep is None or current_dep != dep or frame.workload_contract[1] is not expected_edges
             or len(template_nodes) != len(proof)):
         return False
     rows = _ep_unpadded_source_rows(graph)
@@ -7652,23 +11709,42 @@ def _native_plan_binding_layout(frame, plan):
     for repeat in plan.block_repeats:
         for representative, occurrences in repeat.trace_node_ids:
             for name in occurrences: representatives[name] = representative
-    groups = {}
+    groups, guards = {}, []
     for target, origin, shapes, attrs in frame.layout[2]:
         base = frame.template.node(target)
         physical = tuple(name for name in attrs if name not in _SOURCE_OBJECT_ATTRIBUTES
             and name not in ("moe_invocation_id", "routing_provenance"))
         if not shapes and not physical: continue
         if base.kind is WorkloadKind.FLASH_ATTN:
-            if any(name != "kv_len" for name in shapes) or any(name not in ("kv_lens", "model_input_kv_lens") for name in physical):
-                return None
-        elif base.kind is WorkloadKind.FUSED_MOE:
-            if (shapes or any(name not in ("tokens_per_expert", "local_tokens_per_expert") for name in physical)
-                    or base.attributes["source_component"] != "symbolic_unquantized_experts"):
-                return None
-        else: return None
+            dynamic_shapes = tuple(name for name in shapes if name == "kv_len")
+            dynamic_attrs = tuple(name for name in physical if name in ("kv_lens", "model_input_kv_lens"))
+        elif (base.kind is WorkloadKind.FUSED_MOE and not shapes
+                and base.attributes["source_component"] in ("symbolic_unquantized_experts", "symbolic_grouped_routed_experts")
+                and all(name in ("tokens_per_expert", "local_tokens_per_expert") for name in physical)):
+            dynamic_shapes, dynamic_attrs = shapes, physical
+        elif (base.kind in (WorkloadKind.VECTOR, WorkloadKind.MEMCPY)
+                and "fa3_full_aot_component" in base.attributes
+                and all(name == "kv_len" for name in shapes)
+                and all(name in ("kv_lens", "model_input_kv_lens", "fa3_full_aot_used_key") for name in physical)):
+            dynamic_shapes, dynamic_attrs = shapes, physical
+        else:
+            dynamic_shapes, dynamic_attrs = (), ()
+        fixed_shapes = tuple(name for name in shapes if name not in dynamic_shapes)
+        fixed_attrs = tuple(name for name in physical if name not in dynamic_attrs)
+        if fixed_shapes or fixed_attrs:
+            # Only dense native frames may extend the original KV-only path.
+            # These fields are never rebound into old specs: an exact mismatch
+            # selects the complete ordinary compiler and replaces this plan.
+            if frame.routing_ids: return None
+            shape, attributes = frame.fields(target)
+            expected = (tuple((key, shape[key]) for key in fixed_shapes),
+                tuple((key, attributes[key]) for key in fixed_attrs))
+            if not _ep_native_value(expected): return None
+            guards.append((target, fixed_shapes, fixed_attrs, expected))
+        if not dynamic_shapes and not dynamic_attrs: continue
         representative = representatives[target]
         if representative not in groups: groups[representative] = []
-        groups[representative].append((target, shapes, physical))
+        groups[representative].append((target, dynamic_shapes, dynamic_attrs))
     calls = {}
     for call in plan.calls:
         if len(call.source_node_ids) != 1: return None
@@ -7676,10 +11752,297 @@ def _native_plan_binding_layout(frame, plan):
         if name not in calls: calls[name] = []
         calls[name].append(call.call_id)
     if any(name not in calls for name in groups): return None
-    return tuple((name,tuple(rows),tuple(calls[name])) for name,rows in groups.items())
+    by_call = {call.call_id: call for call in plan.calls}
+    merged, keys = [], {}
+    for name, rows in groups.items():
+        node = frame.template.node(name)
+        shapes, attrs = rows[0][1:]
+        key = _native_lowering_group_key(node, shapes, attrs)
+        ids = tuple(calls[name])
+        specs = tuple(by_call[call_id].kernel_spec for call_id in ids)
+        if key is not None and key in keys:
+            index, original_specs = keys[key]
+            if specs == original_specs:
+                merged[index][1].extend(rows)
+                merged[index][2].append(ids)
+                continue
+        if key is not None:
+            keys[key] = len(merged), specs
+        merged.append((name, list(rows), [ids]))
+    return (tuple((name, tuple(rows), tuple(occurrences)) for name, rows, occurrences in merged), tuple(guards))
 
 
-def lower_workload(graph, deployment, hardware_by_id, memo=None, *, source_projection_scope=None, compact_source_layers=False):
+def _native_lowering_group_key(node, shapes, attrs):
+    """Group equal physical source recipes, without folding calls or their DAG.
+
+    Current dynamic fields are compared at every replay. The complete cold
+    compiler also has to emit equal specs before two occurrences can share
+    one invocation of their unchanged lowering factory.
+    """
+    if type(node) is not WorkloadNode:
+        return None
+    attributes = _node_physical_attributes(node)
+    contract = (node.kind.value, node.pool_name, node.dtype, node.variant, shapes, attrs,
+        tuple(node.shape.items()), tuple(attributes.items()))
+    if not _ep_native_value(contract):
+        return None
+    return contract
+
+
+def _native_plan_geometry_matches(frame, guards):
+    for target, shapes, attrs, expected in guards:
+        shape, attributes = frame.fields(target)
+        current = (tuple((key, shape[key]) for key in shapes),
+            tuple((key, attributes[key]) for key in attrs))
+        if not _ep_native_value(current) or current != expected:
+            return False
+    return True
+
+
+def _glm_decode_plan_layout(owner, plan):
+    representatives = {node.node_id: node.node_id for node in owner.graph.nodes}
+    for repeat in plan.block_repeats:
+        for representative, occurrences in repeat.trace_node_ids:
+            for name in occurrences:
+                representatives[name] = representative
+    calls = {}
+    for call in plan.calls:
+        if len(call.source_node_ids) != 1 or call.memory_source is not None:
+            return None
+        name, = call.source_node_ids
+        if name not in calls:
+            calls[name] = []
+        calls[name].append(call)
+    bases = {node.node_id: _logical_node_contract(node, ((), ()))
+        for node in owner.graph.nodes if node.kind is WorkloadKind.FUSED_MOE}
+    return representatives, calls, bases
+
+
+def _glm_decode_bind_plan(binding, owner, graph, deployment, hardware_by_id, memo, entry):
+    if not binding.dynamic_nodes:
+        # Initial snapshots carry the original mutable provenance records;
+        # they are cold-compiled and validated in full on every explicit use.
+        # A later branch recompile must never price an older snapshot.
+        return None
+    old_deployment, old_hardware, source, template, layout = entry
+    if (old_deployment is not deployment or len(old_hardware) != len(hardware_by_id)
+            or any(name not in hardware_by_id or hardware_by_id[name] is not hardware for name, hardware in old_hardware)
+            or not _dense_compiler_unchanged(source)):
+        return None
+    representatives, calls, bases = layout
+    groups, physical, current_representatives, validated = {}, {}, {}, set()
+    retained = []
+    for node in binding.dynamic_nodes:
+        if node.kind not in (WorkloadKind.GATHER, WorkloadKind.EAGER_ATTN, WorkloadKind.FUSED_MOE,
+                WorkloadKind.FLASH_ATTN, WorkloadKind.KV_UPDATE):
+            return None
+        hardware_id = deployment.worker_pools[node.pool_name].hardware_id
+        hardware = require_hardware(hardware_id, hardware_by_id)
+        if node.kind is WorkloadKind.FUSED_MOE:
+            attrs = node.attributes
+            # The issuer shares one immutable current routing packet across
+            # equivalent EP1 ranks. Validate every distinct packet before
+            # physical-class deduplication, including its invocation context.
+            if (type(attrs["routing_provenance"]) is not MappingProxyType
+                    or type(attrs["tokens_per_expert"]) is not tuple
+                    or type(attrs["local_tokens_per_expert"]) is not tuple):
+                return None
+            context = (id(attrs["routing_provenance"]), id(attrs["tokens_per_expert"]),
+                node.shape["tokens"], node.shape["experts"], node.shape["topk"], attrs["moe_invocation_id"])
+            if context not in validated:
+                _validate_routing_provenance(node)
+                validated.add(context)
+                retained.append((attrs["routing_provenance"], attrs["tokens_per_expert"]))
+            key = (bases[node.node_id], id(attrs["tokens_per_expert"]), id(attrs["local_tokens_per_expert"]))
+            if key not in physical:
+                # This explicit source dispatcher preserves expert order in
+                # its specs. Share exact ordered contracts, not merely an
+                # expert-axis permutation class used by other MoE recipes.
+                physical[key] = _logical_node_contract(node)
+            contract = physical[key]
+        else:
+            contract = _logical_node_contract(node)
+        representative = representatives[node.node_id]
+        if representative in current_representatives and current_representatives[representative] != contract:
+            # An old repeated block has split into distinct physical classes.
+            return None
+        current_representatives[representative] = contract
+        if contract not in groups:
+            groups[contract] = (node, [])
+        groups[contract][1].append(representative)
+    # This EP1/PP1 source's three dynamic operator domains have node-local
+    # lowering. Reuse the actual dispatcher, never a second pricing formula.
+    refreshed = _ordinary_lower_workload(WorkloadGraph(tuple(node for node, _ in groups.values()), ()),
+        deployment, hardware_by_id, memo)
+    specs = {}
+    for call in refreshed.calls:
+        name, = call.source_node_ids
+        if name not in specs:
+            specs[name] = []
+        specs[name].append(call.kernel_spec)
+    updates = {}
+    for node, targets in groups.values():
+        current = specs[node.node_id]
+        for target in set(targets):
+            if target not in calls or len(calls[target]) != len(current):
+                return None
+            for call, spec in zip(calls[target], current, strict=True):
+                if (spec.kind is not call.kernel_spec.kind or spec.variant != call.kernel_spec.variant
+                        or spec.hardware_id != call.kernel_spec.hardware_id
+                        or spec.transfer is not None or call.kernel_spec.transfer is not None):
+                    return None
+                updates[call.call_id] = spec
+    return template.bind_kernel_specs(updates)
+
+
+def _source_vector_runtime_graph(graph, inputs, deployment, hardware_by_id):
+    """Bind explicit runtime branch facts before native vector selection.
+
+    The existing source-launch input is keyed by actual call ID. A single
+    normalization call has the same ID as its source node. Its typed layout,
+    shape, version and payload remain owned by that node; only the explicit
+    runtime flag is added. No simulator environment or default is consulted.
+    """
+    if not isinstance(inputs, Mapping) or not inputs:
+        raise ValueError("source launch inputs require a nonempty mapping of actual call IDs")
+    nodes = {node.node_id: node for node in graph.nodes}
+    updates = {}
+    for call_id, binding in inputs.items():
+        if call_id not in nodes:
+            continue  # Compound/unknown IDs are checked by the final binder.
+        node = nodes[call_id]
+        pool = deployment.worker_pools[node.pool_name]
+        if (node.kind in (WorkloadKind.LINEAR, WorkloadKind.LM_HEAD) and node.dtype == "fp16"
+                and HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id)):
+            if not isinstance(binding, Mapping) or set(binding) != {"shape", "attributes"}:
+                raise ValueError("observed FP16 GEMM binding requires complete shape and attributes")
+            shape, attrs = binding["shape"], binding["attributes"]
+            if (not isinstance(shape, Mapping) or not isinstance(attrs, Mapping)
+                    or set(attrs) != {"model_execution_version", "source_gemm_runtime"}):
+                raise ValueError("observed FP16 GEMM requires an explicit source runtime profile")
+            required = {"launch_policy", "has_bias", "weight_dtype", "weight_group_size",
+                "a_layout", "b_layout", "c_layout", "trans_a", "trans_b", "epilogue",
+                "symbolic_tensor_inputs", "symbolic_tensor_outputs", "symbolic_parameter_inputs",
+                "source_gemm_input_shape", "source_gemm_input_strides_bytes", "source_gemm_input_offset_bytes",
+                "source_gemm_weight_shape", "source_gemm_weight_strides_bytes", "source_gemm_weight_offset_bytes"}
+            parallel = pool.parallel_plan.config
+            if (graph.source_model_execution_version != "vllm_0_30_0"
+                    or attrs["model_execution_version"] != graph.source_model_execution_version
+                    or attrs["source_gemm_runtime"] != "vllm_0_30_torch_2_13_cu130_cublas13_1_1_fp16_unquantized"
+                    or dict(shape) != dict(node.shape) or not required.issubset(node.attributes)
+                    or deployment.mode != "colocated" or len(deployment.worker_pools) != 1
+                    or parallel.tensor_parallel_size != 1 or parallel.pipeline_parallel_size != 1
+                    or not parallel.is_rank_local or parallel.enable_expert_parallel
+                    or len(pool.ranks) != 1 or node.rank != pool.ranks[0]
+                    or node.attributes["launch_policy"] != "injected_launch"
+                    or node.attributes["has_bias"] is not False
+                    or node.attributes["weight_dtype"] != "fp16"
+                    or type(node.attributes["weight_group_size"]) is not int or node.attributes["weight_group_size"] != 0
+                    or "weight_quantization" in node.attributes
+                    or "source_component" in node.attributes
+                    or ("source_batch_invariant" in node.attributes and node.attributes["source_batch_invariant"] is not False)
+                    or ("beta" in node.attributes and (type(node.attributes["beta"]) is bool or node.attributes["beta"] != 0))
+                    or ("alpha" in node.attributes and (type(node.attributes["alpha"]) is bool or node.attributes["alpha"] != 1))
+                    or any(node.attributes[name] != "row_major" for name in ("a_layout", "b_layout", "c_layout"))
+                    or node.attributes["trans_a"] is not False or node.attributes["trans_b"] is not True
+                    or node.attributes["epilogue"] != "none" or node.shape["b"] != 1
+                    or _graph_token_domain(node) is not None
+                    or ("model_execution_version" in node.attributes
+                        and node.attributes["model_execution_version"] != graph.source_model_execution_version)
+                    or ("source_gemm_runtime" in node.attributes
+                        and node.attributes["source_gemm_runtime"] != attrs["source_gemm_runtime"])):
+                raise ValueError("observed FP16 GEMM runtime/layout disagrees with the actual eager source caller")
+            ports, outputs, parameters = (node.attributes[name] for name in (
+                "symbolic_tensor_inputs", "symbolic_tensor_outputs", "symbolic_parameter_inputs"))
+            m, n, k = (node.shape[name] for name in ("m", "n", "k"))
+            if (len(ports) != 2 or len(outputs) != 1 or tuple(parameters) != (ports[1],)
+                    or ports[0] == ports[1] or outputs[0] in ports
+                    or tuple(node.attributes["source_gemm_input_shape"]) != (m, k)
+                    or tuple(node.attributes["source_gemm_weight_shape"]) != (n, k)
+                    or tuple(node.attributes["source_gemm_input_strides_bytes"]) != (2 * k, 2)
+                    or tuple(node.attributes["source_gemm_weight_strides_bytes"]) != (2 * k, 2)
+                    or any(type(node.attributes[name]) is not int or node.attributes[name] < 0
+                        or node.attributes[name] % 16 for name in (
+                            "source_gemm_input_offset_bytes", "source_gemm_weight_offset_bytes"))):
+                raise ValueError("observed FP16 GEMM requires its real contiguous input and parameter view bindings")
+            require_hardware(pool.hardware_id, hardware_by_id)
+            updates[call_id] = node.with_attributes({**node.attributes,
+                "source_gemm_runtime": attrs["source_gemm_runtime"],
+                "model_execution_version": attrs["model_execution_version"]})
+            checked = _CURRENT_GEMM_SOURCE_BINDINGS.get()
+            if checked is not None:
+                checked.add(id(updates[call_id]))
+            continue
+        if (node.kind is not WorkloadKind.NORM or node.dtype not in ("bf16", "fp16")
+                or node.variant not in ("rmsnorm", "add_rmsnorm")
+                or graph.source_model_execution_version != "vllm_0_30_0"
+                or not HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id)):
+            continue
+        if not isinstance(binding, Mapping) or set(binding) != {"shape", "attributes"}:
+            raise ValueError("source norm binding requires complete shape and attributes")
+        shape, attrs = binding["shape"], binding["attributes"]
+        required = {"model_execution_version", "source_input_layout", "source_batch_invariant"}
+        if (not isinstance(shape, Mapping) or not isinstance(attrs, Mapping)
+                or not required.issubset(attrs)):
+            raise ValueError("source norm binding requires explicit runtime, layout and batch-invariant facts")
+        if (not {"model_execution_version", "source_input_layout"}.issubset(node.attributes)
+                or dict(shape) != dict(node.shape) or graph.source_model_execution_version != "vllm_0_30_0"
+                or attrs["model_execution_version"] != graph.source_model_execution_version
+                or node.attributes["model_execution_version"] != graph.source_model_execution_version
+                or attrs["source_input_layout"] != node.attributes["source_input_layout"]
+                or type(attrs["source_batch_invariant"]) is not bool
+                or ("source_batch_invariant" in node.attributes
+                    and node.attributes["source_batch_invariant"] != attrs["source_batch_invariant"])):
+            raise ValueError("source norm runtime facts disagree with the actual source node")
+        require_hardware(pool.hardware_id, hardware_by_id)
+        updates[call_id] = node.with_attributes({**node.attributes,
+            "source_batch_invariant": attrs["source_batch_invariant"]})
+    if not updates:
+        return graph
+    return graph.with_nodes(updates[node.node_id] if node.node_id in updates else node for node in graph.nodes)
+
+
+def _lower_workload_with_current_source_inputs(graph, deployment, hardware_by_id, memo=None, *, source_projection_scope=None,
+        compact_source_layers=False, source_launch_inputs=None):
+    if source_launch_inputs is not None:
+        if compact_source_layers:
+            raise ValueError("explicit native source inputs require an uncompressed logical call plan")
+        nodes = {node.node_id: node for node in graph.nodes}
+        norm_inputs_only = (type(source_launch_inputs) is dict and bool(source_launch_inputs)
+            and graph.source_model_execution_version == "vllm_0_30_0"
+            and all(name in nodes and nodes[name].kind is WorkloadKind.NORM
+                and nodes[name].variant in ("rmsnorm", "add_rmsnorm")
+                and nodes[name].dtype in ("bf16", "fp16")
+                and HWSpec.source_contract_supported("h200_partial_source_programs",
+                    deployment.worker_pools[nodes[name].pool_name].hardware_id)
+                and type(binding) is dict and set(binding) == {"shape", "attributes"}
+                and type(binding["shape"]) is dict and type(binding["attributes"]) is dict
+                and set(binding["attributes"]) == {
+                    "model_execution_version", "source_input_layout", "source_batch_invariant"}
+                for name, binding in source_launch_inputs.items()))
+        graph = _source_vector_runtime_graph(graph, source_launch_inputs, deployment, hardware_by_id)
+        plan = _ordinary_lower_workload(graph, deployment, hardware_by_id, memo,
+            source_projection_scope=source_projection_scope, compact_source_layers=False)
+        if norm_inputs_only:
+            # The current shape/layout/version/branch was checked above by
+            # _source_vector_runtime_graph for every logical Norm node. The
+            # ordinary compiler already selected its exact KernelSpec and
+            # native_main recipe (including on memo hits). Re-running the
+            # selector and replacing every call adds no distinct fact.
+            return plan
+        return _bind_plan_source_launch_inputs(plan, source_launch_inputs, hardware_by_id, graph)
+    from src.serving.workload.traced_models import _GLMDecodeSourceBinding
+    binding = graph.__dict__["_glm_decode_binding"] if "_glm_decode_binding" in graph.__dict__ else None
+    glm_owner = binding.owner(graph) if type(binding) is _GLMDecodeSourceBinding else None
+    glm_eligible = (glm_owner is not None and isinstance(memo, KernelLoweringMemo) and compact_source_layers
+        and source_projection_scope is None and deployment.mode == "colocated"
+        and len(deployment.worker_pools) == 1
+        and deployment.worker_pools[glm_owner.pool.name] is glm_owner.pool)
+    if glm_eligible and glm_owner in memo._glm_decode_plans:
+        bound = _glm_decode_bind_plan(binding, glm_owner, graph, deployment, hardware_by_id, memo,
+            memo._glm_decode_plans[glm_owner])
+        if bound is not None:
+            return bound
     from src.serving.workload.traced_forward import _NativeSourceFrame
     frame = graph.__dict__["_native_source_frame"] if "_native_source_frame" in graph.__dict__ else None
     owner = frame.owner() if type(frame) is _NativeSourceFrame else None
@@ -7690,9 +12053,10 @@ def lower_workload(graph, deployment, hardware_by_id, memo=None, *, source_proje
         old_memo, old_hardware, old_dep, old_recipe, layout, template, dense = _COMPILED_NATIVE_PLANS[owner]
         from src.serving.workload.traced_forward import _native_recipe_matches
         if (old_memo is memo and old_dep is deployment and old_hardware is hardware_by_id
-                and _native_recipe_matches(owner,old_recipe)):
+                and _native_recipe_matches(owner,old_recipe)
+                and _native_plan_geometry_matches(frame, layout[1])):
             current_groups = []
-            for name, rows, call_ids in layout:
+            for name, rows, call_ids in layout[0]:
                 signature = None
                 for target, shapes, attrs in rows:
                     shape, attributes = frame.fields(target)
@@ -7715,23 +12079,36 @@ def lower_workload(graph, deployment, hardware_by_id, memo=None, *, source_proje
                     behavior, dep, compiler = dense
                     binding_valid = (not frame.routing_ids and _ep_verifier_unchanged(behavior)
                         and _ep_deployment_projection(deployment) == dep
-                        and graph.edges is frame.template.edges
-                        and graph.block_repeats is frame.template.block_repeats
+                        and frame.workload_contract[1] is frame.template.edges
+                        and frame.workload_contract[2] is frame.template.block_repeats
                         and _dense_compiler_unchanged(compiler))
                 if binding_valid:
                     updates = {}
-                    for name, call_ids in current_groups:
+                    # Repeated layers may share one immutable histogram.
+                    # Canonicalize its actual rank-local axis once within
+                    # this invocation; routed provenance stays on each node.
+                    canonical_axes = {}
+                    for name, call_groups in current_groups:
                         node = frame.node(name)
                         pool = deployment.worker_pools[node.pool_name]
                         hardware_id, hardware = pool.hardware_id, require_hardware(pool.hardware_id,hardware_by_id)
-                        relabel = (_fused_moe_routing_relabelling(node,hardware_id,hardware)
+                        relabel = (_fused_moe_routing_relabelling(node,hardware_id,hardware,canonical_axes=canonical_axes)
                             if node.kind is WorkloadKind.FUSED_MOE else None)
                         def build_specs():
-                            return (_source_flash_attn_specs(node,hardware_id,hardware) if node.kind is WorkloadKind.FLASH_ATTN
-                                else _explicit_source_expert_specs(node,hardware_id,hardware,relabel))
+                            _require_source_lowering_contract(node)
+                            if node.kind is WorkloadKind.FLASH_ATTN:
+                                return _source_flash_attn_specs(node, hardware_id, hardware)
+                            if node.kind is WorkloadKind.FUSED_MOE:
+                                return _explicit_source_expert_specs(node, hardware_id, hardware, relabel)
+                            if node.kind is WorkloadKind.VECTOR:
+                                return _source_flash_attn_specs(node, hardware_id, hardware)
+                            if node.kind is WorkloadKind.MEMCPY:
+                                return (_transfer_spec(node, hardware_id),)
+                            raise AssertionError("uncompiled native source binding kind")
                         specs = memo.lower(node,_logical_node_contract(node,relabel),hardware,build_specs)
-                        if len(specs) != len(call_ids): break
-                        for call_id,spec in zip(call_ids,specs,strict=True): updates[call_id] = spec
+                        if any(len(specs) != len(call_ids) for call_ids in call_groups): break
+                        for call_ids in call_groups:
+                            for call_id,spec in zip(call_ids,specs,strict=True): updates[call_id] = spec
                     else:
                         # A physical branch change selects the complete ordinary
                         # compiler below. Never swallow invalid input exceptions.
@@ -7745,6 +12122,10 @@ def lower_workload(graph, deployment, hardware_by_id, memo=None, *, source_proje
                             return template.bind_kernel_specs(updates)
     result = _ordinary_lower_workload(graph,deployment,hardware_by_id,memo,
         source_projection_scope=source_projection_scope,compact_source_layers=compact_source_layers)
+    if glm_eligible:
+        layout = _glm_decode_plan_layout(glm_owner, result)
+        if layout is not None:
+            memo._glm_decode_plans[glm_owner] = (deployment, tuple(hardware_by_id.items()), _dense_compiler_source(), result, layout)
     if eligible:
         layout = _native_plan_binding_layout(frame,result)
         if layout is not None:
@@ -7756,5 +12137,170 @@ def lower_workload(graph, deployment, hardware_by_id, memo=None, *, source_proje
                 behavior, dep = _ep_verifier_snapshot(), _ep_deployment_projection(deployment)
                 if behavior is not None and dep is not None:
                     dense = (behavior, dep, _dense_compiler_source())
-            _COMPILED_NATIVE_PLANS[owner] = (memo,hardware_by_id,deployment,frame.recipe_signature,layout,result,dense)
+            if not layout[1] or dense is not None:
+                _COMPILED_NATIVE_PLANS[owner] = (memo,hardware_by_id,deployment,frame.recipe_signature,layout,result,dense)
     return result
+
+
+def lower_workload(graph, deployment, hardware_by_id, memo=None, *, source_projection_scope=None,
+        compact_source_layers=False, source_launch_inputs=None, source_memory_context=None):
+    # Validation belongs to this public invocation. Never trust a marker from
+    # an earlier graph/call, including nested calls and lowering-memo hits.
+    from .memory_bindings import TraceMemoryContext
+    if source_memory_context is not None and type(source_memory_context) is not TraceMemoryContext:
+        raise TypeError("source memory input requires the existing current TraceMemoryContext")
+    token = _CURRENT_GEMM_SOURCE_BINDINGS.set(set())
+    dspark_token = _CURRENT_DSPARK_SOURCE_GRAPH.set((graph, {}, source_memory_context))
+    try:
+        return _lower_workload_with_current_source_inputs(graph, deployment, hardware_by_id, memo,
+            source_projection_scope=source_projection_scope, compact_source_layers=compact_source_layers,
+            source_launch_inputs=source_launch_inputs)
+    finally:
+        _CURRENT_DSPARK_SOURCE_GRAPH.reset(dspark_token)
+        _CURRENT_GEMM_SOURCE_BINDINGS.reset(token)
+
+
+def lower_vllm030_kda_chunk_source_calls(context, hardware_by_id, *, source_attributes_by_parent):
+    """Bind explicit prepared bodies to their actual source ports and ready edges.
+
+    Returns existing KernelCalls, retaining external predecessors for the
+    caller's complete plan. This neither substitutes the default aggregate
+    chunk nor admits a native memory ABI; shared child Core/selector admission
+    must already be present. Compiler configurations are mandatory caller facts.
+    """
+    from .memory_bindings import TraceMemoryContext
+    if type(context) is not TraceMemoryContext or not isinstance(source_attributes_by_parent, Mapping):
+        raise TypeError("KDA source lowering requires actual memory receipts and explicit parent compiler facts")
+    ports = {
+        "q_l2norm": (("q",), ("q_normalized",)),
+        "k_l2norm": (("k",), ("k_normalized",)),
+        "gate_cumsum_beta": (("raw_gate", "raw_beta", "query_start", "chunk_indices", "A_log", "dt_bias"), ("cumulative_gate_log2", "sigmoid_beta")),
+        "zero_Akk": ((), ("Akk",)),
+        "intra_sub_chunk": (("q_normalized", "k_normalized", "gate", "beta", "query_start", "chunk_indices"), ("Akkd", "Aqk")),
+        "inter_solve": (("q_normalized", "k_normalized", "gate", "beta", "Akkd", "query_start", "chunk_indices"), ("Akk", "Aqk")),
+        "recompute_w_u": (("k_normalized", "v", "beta", "Akk", "gate", "query_start", "chunk_indices"), ("w", "u", "kg")),
+        "state": (("kg", "w", "u", "gate", "initial_state", "query_start", "chunk_offsets"), ("chunk_h", "v_new", "final_state")),
+        "output": (("q_normalized", "v_new", "gate", "chunk_h", "Aqk", "query_start", "chunk_indices"), ("output_original_v",))}
+    parent_fields = ("stage", "state_indices", "state_pool_slots", "query_start_loc", "has_initial_state", "gate_lower_bound")
+    caller_fields = ("model_execution_version", "source_norm_backend", "source_metadata_state",
+        "source_use_qk_l2norm_in_kernel", "source_output_final_state", "source_out",
+        "source_chunk_indices", "source_chunk_offsets")
+    compiler_fields = {"source_compiler", "source_norm_backend", "source_metadata_state", "tensor_iterator_source",
+        "metadata_dtype", "chunk_offsets_dtype", "source_use_gather", "source_selected_configs"}
+    required_source = set(parent_fields) | set(caller_fields) | {"source_parent_name", "source_parent_variant",
+        "source_stage_role", "memory_input_roles", "memory_output_roles", "source_query_start_view_id"}
+    groups = {}
+    for source in context.nodes:
+        attrs = source.attributes
+        if "source_component" not in attrs or attrs["source_component"] != "symbolic_vllm030_kda_chunk_stage":
+            continue
+        if (required_source - set(attrs) or type(attrs["source_parent_name"]) is not str
+                or not attrs["source_parent_name"] or type(attrs["source_stage_role"]) is not str
+                or attrs["source_stage_role"] not in ports):
+            raise ValueError("KDA source lowering requires complete source stage and parent identities")
+        key = (source.pool_name, source.rank, attrs["source_parent_name"])
+        if key not in groups:
+            groups[key] = []
+        groups[key].append(source)
+    if not groups or set(groups) != set(source_attributes_by_parent):
+        raise ValueError("KDA source lowering requires exact coverage of every actual chunk body")
+    calls = []
+    for key, sources in groups.items():
+        first = sources[0]
+        if tuple(source.attributes["source_stage_role"] for source in sources) != tuple(ports):
+            raise ValueError("KDA source lowering requires all nine ordered submissions")
+        facts = source_attributes_by_parent[key]
+        if not isinstance(facts, Mapping) or set(facts) != compiler_fields:
+            raise ValueError("KDA source lowering requires complete explicit compiler facts without defaults")
+        parent = {name: first.attributes[name] for name in parent_fields}
+        caller = {name: first.attributes[name] for name in caller_fields}
+        if any(caller[name] != facts[name] for name in ("source_norm_backend", "source_metadata_state")):
+            raise ValueError("KDA compiler facts disagree with the actual prepared source caller")
+        views = _validate_kda_chunk_source_ports(sources, ports)
+        source_hardware = tuple(item for item in hardware_by_id.values()
+            if HWSpec.source_contract_supported("h200_partial_source_programs", item.hardware_id))
+        if len(source_hardware) != 1:
+            raise ValueError("KDA source calls require one declared source hardware profile")
+        hardware, = source_hardware
+        from src.kernel.launch_config.select_launch_config import source_launch_function
+        select_kda_chunk_stage_launch = source_launch_function(hardware.hardware_id, "select_kda_chunk_stage_launch")
+        _, rows, heads, dim = views["q"].shape
+        shape = dict(rows=rows, heads=heads, head_dim=dim, element_count=rows*heads*dim)
+        for index, source in enumerate(sources):
+            attrs = source.attributes
+            role = attrs["source_stage_role"]
+            if (source.kind is not WorkloadKind.VECTOR or source.variant != "kda_chunk_" + role
+                    or any(attrs[name] != value for name, value in (*parent.items(), *caller.items()))
+                    or attrs["source_parent_variant"] != first.attributes["source_parent_variant"]
+                    or attrs["source_query_start_view_id"] != views["query_start"].view_id
+                    or index > 0 and sources[index-1].node_id not in source.predecessors):
+                raise ValueError("KDA child changed its source operation, parent, metadata identity or ready order")
+            spec_attrs = {**parent, **caller, **facts, "source_component": "vllm_0_30_kimi_k3_triton_chunk",
+                "source_stage": role, "source_input_layout": "contiguous_qkv_gate_initial", "source_initial_state_dtype": "fp32"}
+            hardware = require_hardware(hardware.hardware_id, hardware_by_id)
+            variant = attrs["source_parent_variant"]
+            launch = select_kda_chunk_stage_launch(shape, "bf16", variant, spec_attrs, hardware)
+            spec = KernelSpec(KernelKind.VECTOR, hardware.hardware_id, shape, dtype="bf16", variant=variant,
+                attributes=spec_attrs, launch=launch, execution_support="unsupported", unsupported_reason="typed_service_unavailable")
+            calls.append(context.bind_call(KernelCall(source.node_id, spec, source.pool_name, source.rank, "compute",
+                (source.node_id,), source.predecessors)))
+    return tuple(calls)
+
+
+
+def _validate_kda_chunk_source_ports(sources, ports):
+    """Exact mixed-precision roles/aliases of the existing nine-stage emitter."""
+    aliases = {"cumulative_gate_log2": "gate", "sigmoid_beta": "beta", "output_original_v": "v"}
+    views, writers, external = {}, {}, {}
+    for source in sources:
+        reads, writes = ports[source.attributes["source_stage_role"]]
+        if (source.attributes["memory_input_roles"] != reads or source.attributes["memory_output_roles"] != writes
+                or len(source.inputs) != len(reads) or len(source.outputs) != len(writes)):
+            raise ValueError("KDA source ports must preserve every declared input/output role")
+        for name, view in zip((*reads, *writes), (*source.inputs, *source.outputs), strict=True):
+            role = aliases[name] if name in aliases else name
+            if role in views and views[role] != view:
+                raise ValueError("KDA source stage changed a shared intermediate or original-V alias")
+            views[role] = view
+        for name, producer in zip(reads, source.input_producers, strict=True):
+            role = aliases[name] if name in aliases else name
+            if producer is not None and producer not in source.predecessors:
+                raise ValueError("KDA source input lost its actual external or intermediate ready edge")
+            if role in writers:
+                if producer != writers[role] or producer not in source.predecessors:
+                    raise ValueError("KDA source intermediate lost its actual producer or ready edge")
+            elif role in external and external[role] != producer:
+                raise ValueError("KDA source input changed its external producer readiness")
+            else:
+                external[role] = producer
+        for name in writes:
+            writers[aliases[name] if name in aliases else name] = source.node_id
+    if len(views["q"].shape) != 4 or views["q"].shape[0] != 1:
+        raise ValueError("KDA source requires its actual packed batch-one Q geometry")
+    dense = views["q"].shape
+    _, rows, heads, dim = dense
+    starts = sources[0].attributes["query_start_loc"]
+    sequences = len(starts)-1
+    chunks = sum((b-a+63)//64 for a, b in zip(starts, starts[1:]))
+    layouts = {name: (dense, "bf16") for name in ("q", "k", "v", "raw_gate", "q_normalized", "k_normalized", "w", "u", "kg", "v_new")}
+    layouts.update(raw_beta=((1, rows, heads), "bf16"), gate=(dense, "fp32"), beta=((1, rows, heads), "fp32"),
+        initial_state=((sequences, heads, dim, dim), "fp32"), final_state=((sequences, heads, dim, dim), "fp32"),
+        chunk_h=((1, chunks, heads, dim, dim), "bf16"), Aqk=((1, rows, heads, 64), "bf16"),
+        Akk=((1, rows, heads, 64), "bf16"), Akkd=((1, rows, heads, 16), "fp32"),
+        query_start=((sequences+1,), "int32"), chunk_indices=((chunks, 2), "int32"),
+        chunk_offsets=((sequences+1,), "int64"), A_log=((heads,), "fp32"), dt_bias=((heads*dim,), "fp32"))
+    for name, (shape, dtype) in layouts.items():
+        view = views[name]
+        if view.shape != shape or view.dtype != dtype:
+            raise ValueError("KDA source role changed its actual shape or mixed-precision dtype: " + name)
+        if name != "raw_beta":
+            stride = view.element_bytes
+            for size, actual in zip(reversed(shape), reversed(view.strides_bytes), strict=True):
+                if size > 1 and actual != stride:
+                    raise ValueError("KDA source requires contiguous prepared role: " + name)
+                stride *= size
+    if any(views["v"].allocation_id == view.allocation_id for name, view in views.items() if name != "v"):
+        raise ValueError("KDA original V output must retain its independent source backing")
+    if any(views["final_state"].allocation_id == view.allocation_id for name, view in views.items() if name != "final_state"):
+        raise ValueError("KDA final state must retain its fresh separate FP32 target")
+    return views

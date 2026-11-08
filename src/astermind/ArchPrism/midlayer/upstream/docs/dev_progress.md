@@ -34,7 +34,7 @@
 
 | Feature | 状态 | 当前范围与缺口 |
 |---|---|---|
-| ProtoBridge 通信仿真器接入 | 🟡 部分闭合 | 已接入 SHA 锁定的上游 white-box surrogate 与 FullMesh；C500 FC2→FullMesh、C500 Tree→Tree、910B Mesh→FullMesh 已由 versioned selector 校验并接入 development-only profile。尚无作者提供的 A800/C500/910B production profile，因此结果仍不可用于精度、发布、硬件比较或 DSE 结论 |
+| ProtoBridge 通信仿真器接入 | 🟡 部分闭合 | 已接入 SHA 锁定的上游 white-box surrogate 与 FullMesh，上游源码以 `third_party/protobridge` submodule 链接（`upstream.py` 内容寻址校验、fail-closed）；C500 FC2→FullMesh、C500 Tree→Tree、910B Mesh→FullMesh 已由 versioned selector 校验并接入 development-only profile。尚无作者提供的 A800/C500/910B production profile，因此结果仍不可用于精度、发布、硬件比较或 DSE 结论 |
 | Collective 通信 | 🟡 部分闭合 | all-reduce、all-gather、all-to-all 已进入统一 workload/timeline；拓扑和硬件验证仍有限 |
 | P2P 通信 | 🟡 部分闭合 | pipeline、activation、KV transfer 可表达为 P2P；跨硬件链路合同仍不完整 |
 | 通信竞争与计算重叠 | 🟡 部分闭合 | 由依赖和资源身份决定重叠；更多 topology/fabric contention 仍需验证 |
@@ -45,7 +45,7 @@
 | Feature | 状态 | 当前范围与缺口 |
 |---|---|---|
 | Ramulator Host DRAM 性能仿真 | ⬜ 未完成 | 尚未接入生产时间线 |
-| Host DRAM KV cache offload | 🟡 部分闭合 | 已有 LOAD/EVICT、容量账本、PCIe interval、completion 与 isolated `L + bytes/B` Host DRAM service-demand backend；该 backend 尚未接入统一 ExecutionTimeline，仍缺原生 victim/LRU、prefetch、Host DRAM 排队/竞争和完整重叠 |
+| Host DRAM KV cache offload | 🟡 部分闭合 | 固定比例 Trace 命中已按整块 HBM/Host 分层并经 H2D 完成后复用；vLLM 0.30 SimpleCPU eager connector 在受控短请求中已接通真实 store、跨请求 CPU hit/load、CPU slot 替换、请求结束后延迟 store、纯传输尾步、逐 rank PCIe interval 与容量账本。仍缺原生 victim/LRU 的广泛等价验证、prefetch、Host DRAM 排队/竞争和完整重叠；isolated `L + bytes/B` Host DRAM service-demand backend 尚未接入统一 ExecutionTimeline，已验收短输出功能与选定原长窗口，剩余原样 debug 全集经用户豁免；长 decode 的 CPU 仿真成本仍高。 |
 
 ### Serving 框架与 Trace
 
@@ -54,7 +54,7 @@
 | Serving 接入框架优化重写 | ✅ 已完成 | 请求、Scheduler、logical workload、Kernel lowering、timeline 与 metrics 已按 owner 分层 |
 | vLLM Scheduler 正式接入 | ✅ 已完成 | 锁定版本的 CPU-only Scheduler 已进入主链 |
 | vLLM Scheduler 接入后调度结果对齐 | 🟡 部分闭合 | continuous batching、chunked prefill、KV、finish、preemption/recompute 有明确验证切片；不代表任意配置 |
-| vLLM Scheduler CPU 开销建模 | 🟡 部分闭合 | SchedulerHostProfile 已按 plan/update 分别建模，并经 `device_plus_launch_plus_scheduler` 模式进入 single/multi pool engine 与标准 Serving 报告；A800/C500/910B 与 H200（vLLM 0.11/0.30）均有 profile，参数来自独立 host 机制测量，Serving 实测时间只用于归因与 evaluation；H200 部分 host 线借用 0.11 实测并以 substitution 注明，更细粒度归因未闭合 |
+| vLLM Scheduler CPU 开销建模 | 🟡 部分闭合 | SchedulerHostProfile 已按 plan/update 分别建模，并经 `device_plus_launch_plus_scheduler` 模式进入 single/multi pool engine 与标准 Serving 报告；A800/C500/910B 与 H200（vLLM 0.11/0.30）均有现存 profile；H200 Scheduler plan/update 的 mixed/decode 截距和每请求斜率由 QPS Serving candidate 分段时长回归，违反当前 Forward 零拟合来源边界，0.30 prefill 还借用 0.11 线；已登记为 open，待同版本独立 Host 机制微基准替换，现存标准 H200 报告不作为零拟合验收 |
 | Synthetic Trace | ✅ 已完成 | 可生成与回放合成请求流 |
 | Production Trace 接入并根据信息合成 | 🟡 部分闭合 | allowlist reader、确定性 replay、request-safe aggregate 和 strict raw-to-compact converter 已接入；8 个 Production 请求 case 已发布到 Git LFS，两个 debug_workload_1s 附带 status available 的 prefill/decode rank 0 alignment_steps；因缺少模型与运行 setting 不发布 source metrics alignment，MoE/MTP 动态输入仍缺真实证据 |
 | Prefix cache 不同命中率分析 | 🟡 部分闭合 | 支持逻辑命中长度与 block 语义；缺少 cache identity、真实淘汰和实例 affinity |
@@ -92,7 +92,7 @@
 
 ### 模型支持
 
-当前模型支持包括 GLM-5.2、Kimi-K2.6，以及 DeepSeek-V4 Flash/Pro 的受限 H200 离线执行路径；各自未闭合范围见下表，后续模型记录在第二部分。
+当前模型支持包括 GLM-5.2、Kimi-K2.6、Kimi-K3，以及 DeepSeek-V4 Flash/Pro 的受限 H200 离线执行路径；各自未闭合范围见下表，后续模型记录在第二部分。
 
 | Feature | 状态 | 当前范围与缺口 |
 |---|---|---|
@@ -102,6 +102,7 @@
 | MoE 模型投稿级验证 | 🟡 部分闭合 | MTP、复杂 routing 和跨硬件生产实验仍需补齐 |
 | GLM-5.2 Serving 支持 | 🟡 部分闭合 | 固定配置与固定执行语义下的 tiny 验证与 production trace→TP=EP/PP→KernelSpec→解析预测→时间线主链已闭合，DSA/indexer/压缩 KV/MoE/MTP proposer-verifier、placement、layer partition、stage-local residency、节点内 collective 与跨节点 PP P2P 显式建模，假设类参数显式配置并标记为 projected assumption；新增 kernel 仅有零拟合、未校准的 A800 projected analytical 结果，vLLM GPU execution 和三硬件实机精度仍 unsupported |
 | Kimi-K2.6 Serving 支持 | 🟡 部分闭合 | 固定配置与固定执行语义下的 tiny 验证与 production trace→TP=EP/PP MLA/压缩 KV/INT4 routed-MoE→KernelSpec→解析预测→时间线主链已闭合，placement、stage-local 容量、节点内 collective 与跨节点 PP P2P 显式建模；MLA、BF16 router 和 symmetric INT4 W4A16 Marlin 路径仅有零拟合、未校准的 A800 projected analytical 结果，vLLM GPU execution 和三硬件实机精度仍 unsupported |
+| Kimi-K3 Serving 支持 | 🟡 部分闭合 | text-only、普通 CPU0.30 Scheduler 请求与逐 layer KDA/MLA 状态已接入，PP16 完整93层图、P2P 与原生容量已验证，512/513/640 输入及两请求混合批有切片；公共 K3 算子价格、完整请求性能、masked 尾部精细服务和实机精度仍待闭合，TP1 仅数学主链，多模态/MTP/其他并行组合 fail-closed |
 | DeepSeek-V4 Flash/Pro Serving 支持 | 🟡 部分闭合 | text-only、eager、H200 colocated 的 Flash TP4 / Pro TP8、PP1/EP1 已接入真实模型配置、C4/C128 Attention、MHC、FP8/MXFP4 MoE 与异构 cache lifecycle，经公共 predict 跑通 prefill/decode；独立 Kernel 使用已有 H200 观测离线评估，Serving 仍为分析投影；MTP、DSpark、多模态及其他部署组合 fail-closed，Marlin 速率、Attention cache/pipeline 精度与真实 allocator 对齐仍有缺口 |
 
 ### 精度支持
@@ -156,7 +157,7 @@
 
 ### 后续模型支持
 
-DeepSeek-V4-Flash/Pro 的基础离线路径已进入第一部分；扩展其执行域与精度需要独立证据。Kimi-K3 仍是后续模型目标。
+DeepSeek-V4-Flash/Pro 的基础离线路径已进入第一部分；扩展其执行域与精度需要独立证据。Kimi-K3 文本主链已进入第一部分，后续多模态、MTP 和完整性能精度仍需独立证据。
 
 | 后续模型 | 预计需要新增或扩展的能力 |
 |---|---|

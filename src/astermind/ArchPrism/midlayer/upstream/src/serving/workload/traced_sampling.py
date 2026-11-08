@@ -23,15 +23,23 @@ class MTPSourceOps(SymbolicOperator):
     """Versioned metadata-only eager Tensor operations for target/proposer.
 
     Layouts come from real virtual ports, never computed token values.
-    The kernel owner prices the explicit useful typed-payload program;
-    backend temporaries, instruction issue and actual launches stay unbound.
+    The kernel owner prices the explicit useful typed-payload program.
+    An explicit source geometry profile can bind contiguous materialization
+    descriptors beside that cost model; backend temporaries, instruction
+    issue and deployed/provider identity remain independent.
     """
 
-    def __init__(self, trace, name, pool_name, *, model_execution_version="vllm_0_11_0"):
+    def __init__(self, trace, name, pool_name, *, model_execution_version="vllm_0_11_0",
+                 source_geometry_program=None):
         if model_execution_version not in ("vllm_0_11_0", "vllm_0_27_1", "vllm_0_30_0"):
             raise NotImplementedError("MTP eager primitives require an explicit supported source version")
         super().__init__(trace, name, pool_name)
         self.model_execution_version = model_execution_version
+        if source_geometry_program is not None and (
+                source_geometry_program != "vllm_0_30_torch_2_13_cuda_source"
+                or model_execution_version != "vllm_0_30_0"):
+            raise ValueError("MTP source geometry requires its exact declared0.30/Torch2.13 source")
+        self.source_geometry_program = source_geometry_program
 
     def _node(self, operation, *, rows, width, source_rows, dtype, attributes=None):
         return self.node(WorkloadKind.VECTOR, {"elements": rows * width, "rows": rows,
@@ -45,6 +53,11 @@ class MTPSourceOps(SymbolicOperator):
 
     def _call(self, operation, inputs, *, rows, width, source_rows, dtype, shape, output_dtype,
               out=None, attributes=None):
+        attributes = {} if attributes is None else dict(attributes)
+        if self.source_geometry_program is not None and operation in ("copy", "cast_ids", "cast_fp32", "fill", "argmax"):
+            attributes.update({"source_geometry_program": self.source_geometry_program,
+                "source_geometry_input_contiguous": tuple(value.is_contiguous for value in inputs),
+                "source_geometry_output_contiguous": out is None or out.is_contiguous})
         node = self._node(operation, rows=rows, width=width, source_rows=source_rows,
             dtype=dtype, attributes=attributes)
         return self.trace.call(node, inputs, shape=shape, dtype=output_dtype, out=out)
@@ -253,8 +266,14 @@ class MTPSourceOps(SymbolicOperator):
             source_rows=draft.shape[0], dtype="int32", shape=out.shape, output_dtype="int32", out=out,
             attributes={"verified_tokens": verified, "accepted_tokens": accepted})
 
-    def h2d(self, out):
-        node = self.node(WorkloadKind.MEMCPY, {}, None, None, {"algorithm": "dma", "direction": "h2d",
+    def h2d(self, out, *, host_memory_kind=None):
+        if host_memory_kind is None:
+            algorithm = "dma"
+        elif self.model_execution_version == "vllm_0_27_1" and host_memory_kind == "pinned":
+            algorithm = "stream_copy_pinned"
+        else:
+            raise ValueError("MTP host copy requires the explicit0.27.1 pinned CUDA source scenario")
+        node = self.node(WorkloadKind.MEMCPY, {}, None, None, {"algorithm": algorithm, "direction": "h2d",
             "link": "pcie", "bytes": prod(out.shape) * out.view.element_bytes})
         return self.trace.call(node, (), shape=out.shape, dtype=out.dtype, out=out)
 
@@ -1223,3 +1242,1028 @@ def glm_gpu_v2_mtp_storage_work(model, requests, runtime, *, prefill_context_par
             "normal_gpu_v2_workload_remains_unsupported_until_launch_binding",
         ),
     }
+
+
+def vllm030_v2_greedy_rejection_forward(trace, logits, *, input_ids, positions, logits_indices,
+        cu_num_logits, idx_mapping, expanded_idx_mapping, expanded_local_pos, temperature, seeds,
+        seq_lens, prefill_len, logits_per_request, selected_indices, request_state_indices,
+        accepted_tokens, sequence_lengths, prompt_lengths, num_speculative_tokens,
+        source_profile, pool_name, name):
+    """V2 plain-greedy verifier, with declared acceptance and real partial writes.
+
+    This source profile has no sampling-parameter transforms, draft logits,
+    logprobs, NaN scan, adaptive/block verification, synthetic rates or watermark.
+    It records the native fixed launches; it computes neither IDs nor acceptance.
+    The short-request profile binds one native verification chunk explicitly.
+    Core trace dependencies remain allocation-level, not initialization proofs.
+    """
+    from .workload_graph import WorkloadEdge
+    profile='vllm_0_30_V2_plain_allgreedy_no_sampling_params'
+    if source_profile!=profile or not isinstance(trace,ForwardTrace):
+        raise NotImplementedError('V2 rejection source requires its explicit plain all-greedy profile')
+    if trace._recorded_graph is not None:
+        raise ValueError('V2 rejection requires an open forward trace')
+    for port in (logits,input_ids,positions,logits_indices,cu_num_logits,idx_mapping,expanded_idx_mapping,
+            expanded_local_pos,temperature,seeds,seq_lens,prefill_len):
+        trace._check_tensor(port)
+    if len(input_ids.shape)!=1 or len(temperature.shape)!=1:
+        raise ValueError('V2 rejection requires vector input IDs and temperature request state')
+    if (type(num_speculative_tokens) is not int or num_speculative_tokens<1
+            or type(logits_per_request) is not tuple or not logits_per_request
+            or any(type(q) is not int or not 1<=q<=num_speculative_tokens+1 for q in logits_per_request)):
+        raise ValueError('V2 rejection requires explicit positive bounded request logit extents')
+    batch=len(logits_per_request);rows=sum(logits_per_request)
+    if (logits.dtype!='bf16' or len(logits.shape)!=2 or logits.shape[0]!=rows or logits.shape[1]<1
+            or not logits.is_contiguous or type(name) is not str or not name or type(pool_name) is not str or not pool_name):
+        raise ValueError('V2 rejection requires its complete dense BF16 target logits and source names')
+    vocab=logits.shape[1]
+    if rows>max(1,2**30//(vocab*4)):
+        raise NotImplementedError('V2 rejection multi-chunk source remains separate from this short-request profile')
+    declarations=(selected_indices,request_state_indices,accepted_tokens,sequence_lengths,prompt_lengths)
+    if any(type(values) is not tuple for values in declarations):
+        raise TypeError('V2 rejection source declarations must be explicit tuples')
+    if (len(selected_indices)!=rows or any(type(row) is not int or not 0<=row<input_ids.shape[0] for row in selected_indices)
+            or len(set(selected_indices))!=rows
+            or any(len(values)!=batch for values in declarations[1:])
+            or any(type(a) is not int or not 0<=a<q for a,q in zip(accepted_tokens,logits_per_request,strict=True))
+            or any(type(n) is not int or n<0 for values in (sequence_lengths,prompt_lengths) for n in values)):
+        raise ValueError('V2 rejection requires distinct selected rows and explicit bounded acceptance/length declarations')
+    states=temperature.shape[0]
+    layouts=((input_ids,(input_ids.shape[0],),'int32'),(positions,input_ids.shape,'int64'),
+        (logits_indices,(rows,),'int64'),(cu_num_logits,(batch+1,),'int32'),(idx_mapping,(batch,),'int64'),
+        (expanded_idx_mapping,(rows,),'int64'),(expanded_local_pos,(rows,),'int32'),
+        (temperature,(states,),'fp32'),(seeds,(states,),'int64'),(seq_lens,(batch,),'int32'),(prefill_len,(states,),'int32'))
+    for tensor,shape,dtype in ((logits,logits.shape,'bf16'),*layouts):
+        trace._check_tensor(tensor)
+        if tensor.shape!=shape or tensor.dtype!=dtype or not tensor.is_contiguous:
+            raise ValueError('V2 rejection input ports disagree with native dtype/extent/owner')
+    if (len(input_ids.shape)!=1 or states<batch or len(set(request_state_indices))!=batch
+            or any(type(index) is not int or not 0<=index<states for index in request_state_indices)):
+        raise ValueError('V2 rejection request state indices must name distinct existing native states')
+    ops=SymbolicOperator(trace,name,pool_name);previous=None;launches=[]
+    def node(operation,shape,dtype='bf16',**attributes):
+        return ops.node(WorkloadKind.VECTOR,shape,dtype,'vllm_gpu_v2_greedy_rejection',{
+            'source_component':'vllm_0_30_gpu_V2_rejection_sampler','source_operation':operation,
+            'source_profile':profile,'model_execution_version':'vllm_0_30_0','source_projection_only':True,
+            'acceptance_scope':'caller-declared branch scenario; no numerical verification',
+            'accepted_prefix_tokens':accepted_tokens,'logits_per_request':logits_per_request,
+            'num_speculative_tokens':num_speculative_tokens,'workspace_and_valid_regions_declared':True,
+            'native_launch_selected':False,'complete_priced_request':False,**attributes})
+    def effect(operation,inputs,writes,shape,*,dtype='bf16',**attributes):
+        nonlocal previous
+        current=trace.call_effect(node(operation,shape,dtype,**attributes),tuple(inputs),writes=tuple(writes))
+        if previous is not None:
+            edge=WorkloadEdge(previous,current,'barrier')
+            if edge not in trace._edges:trace._edges.append(edge)
+        previous=current;launches.append(current)
+        return current
+    def tensor(role,shape,dtype):return trace.tensor(trace.unique_name(name+'.'+role),shape,dtype)
+    def state_regions(port):return tuple(port.narrow(0,index,1) for index in request_state_indices)
+    def row_region(port,start,count):return port.narrow(0,start,count)
+    def sample_region(port,row,column,count):return port.narrow(0,row,1).narrow(1,column,count)
+    offsets=[];cursor=0
+    for q in logits_per_request:offsets.append(cursor);cursor+=q
+    # Native advanced-index gathers use INT64 logits_indices twice.
+    gather_attributes={'gather_factor':1,'index_count':rows,'index_bytes':8,'scattered':True,
+        'materialized_output':True,'selected_indices':selected_indices,
+        'source_component':'vllm_0_30_V2_rejection_sampler_advanced_index'}
+    gathered=[]
+    old_nodes=set(trace._nodes)
+    frontier=old_nodes-{edge.source for edge in trace._edges if edge.source in old_nodes and edge.destination in old_nodes}
+    for role,port in (('draft-sampled',input_ids),('selected-positions',positions)):
+        op=SymbolicOperator(trace,name+':'+role,pool_name)
+        gather=op.node(WorkloadKind.GATHER,{'elements':rows,'rows':rows,'hidden':1},port.dtype,'gather',gather_attributes)
+        result=trace.call(gather,(port,logits_indices),shape=(rows,),dtype=port.dtype)
+        current=trace._writers[result.view.allocation_id]
+        for source in sorted(frontier if previous is None else (previous,)):
+            edge=WorkloadEdge(source,current,'barrier')
+            if edge not in trace._edges:trace._edges.append(edge)
+        previous=current
+        gathered.append(result)
+    draft_sampled,pos=gathered
+    # Even the single chunk materializes cu_num_logits - 0.
+    chunk_cu=tensor('chunk-cu-num-logits',(batch+1,),'int32')
+    effect('chunk_cu_subtract',(cu_num_logits,),(chunk_cu,),{'elements':batch+1,'rows':batch+1},
+        dtype='int32',source_scalar=0,fixed_kernel_launch=False)
+    c8=-(-vocab//8192);c1=-(-vocab//1024)
+    argmax=tensor('target-local-argmax',(rows,c8),'int64')
+    maximum=tensor('target-local-max',(rows,c8),'fp32')
+    untouched=tuple(tensor(role,(rows,c8),'fp32') for role in
+        ('target-local-sumexp','draft-local-max','draft-local-sumexp'))
+    stat_inputs=[expanded_local_pos,*state_regions(temperature)];stat_writes=[]
+    valid_stats=[]
+    for offset,q in zip(offsets,logits_per_request,strict=True):
+        valid=min(q,num_speculative_tokens);valid_stats.append((offset,valid))
+        stat_inputs.extend((row_region(logits,offset,valid),row_region(expanded_idx_mapping,offset,valid)))
+        stat_writes.extend((row_region(argmax,offset,valid),row_region(maximum,offset,valid)))
+    effect('local_stats',stat_inputs,stat_writes,{'elements':sum(n for _,n in valid_stats)*vocab,'rows':rows,'vocab':vocab},
+        grid=(rows,c8),vocab_block_size=8192,stats_written_row_spans=tuple(valid_stats),
+        untouched_statistics=tuple(value.view.allocation_id for value in untouched),fixed_kernel_launch=True)
+    sampled=tensor('sampled',(batch,num_speculative_tokens+1),'int64')
+    count=tensor('num-sampled',(batch,),'int32')
+    target_lse=tensor('target-rejected-lse',(batch,),'fp32')
+    draft_lse=tensor('draft-rejected-lse',(batch,),'fp32')
+    reject_inputs=[idx_mapping,chunk_cu,*state_regions(temperature),*state_regions(seeds)]
+    reject_writes=[count,target_lse,draft_lse];written_prefix=[]
+    for row,(offset,q,a) in enumerate(zip(offsets,logits_per_request,accepted_tokens,strict=True)):
+        d=q-1;visited=min(a+1,d);written=d if a==d else a+1;written_prefix.append(written)
+        if d:reject_inputs.append(row_region(draft_sampled,offset+1,d))
+        if visited:reject_inputs.extend(row_region(value,offset,visited) for value in (pos,argmax,maximum))
+        if written:reject_writes.append(sample_region(sampled,row,0,written))
+    effect('rejection',reject_inputs,reject_writes,{'elements':sum(q-1 for q in logits_per_request),'rows':batch,'vocab':vocab},
+        grid=(batch,),num_warps=1,sampled_written_prefixes=tuple(written_prefix),
+        lse_stores=(0.0,0.0),fixed_kernel_launch=True)
+    local_argmax=tensor('resampled-local-argmax',(batch,c1),'int64')
+    local_max=tensor('resampled-local-max',(batch,c1),'fp32')
+    bonus=tuple(row for row,(q,a) in enumerate(zip(logits_per_request,accepted_tokens,strict=True)) if a==q-1)
+    resample_inputs=[count,chunk_cu,*state_regions(temperature)];resample_writes=[]
+    for row,(offset,a) in enumerate(zip(offsets,accepted_tokens,strict=True)):
+        resample_inputs.append(row_region(expanded_idx_mapping,offset+a,1))
+        if row in bonus:
+            resample_inputs.extend((row_region(logits,offset+a,1),row_region(pos,offset+a,1),seeds.narrow(0,request_state_indices[row],1)))
+            resample_writes.extend((row_region(local_argmax,row,1),row_region(local_max,row,1)))
+    effect('resample',resample_inputs,resample_writes,{'elements':len(bonus)*vocab,'rows':batch,'vocab':vocab},
+        grid=(batch,c1),vocab_block_size=1024,resampled_written_requests=bonus,
+        zero_write_launch=not bonus,fixed_kernel_launch=True)
+    insert_inputs=[count,chunk_cu,*state_regions(temperature)];insert_writes=[count]
+    for row,(offset,a) in enumerate(zip(offsets,accepted_tokens,strict=True)):
+        insert_inputs.append(row_region(expanded_idx_mapping,offset+a,1))
+        if row in bonus:
+            insert_inputs.extend((row_region(local_argmax,row,1),row_region(local_max,row,1)))
+            insert_writes.append(sample_region(sampled,row,logits_per_request[row]-1,1))
+    effect('insert',insert_inputs,insert_writes,{'elements':len(bonus)*c1,'rows':batch},dtype='int64',
+        grid=(batch,),bonus_written_requests=bonus,counts_before_final_mask=tuple(a+1 for a in accepted_tokens),
+        fixed_kernel_launch=True)
+    # rejection_sample returns before the outer input_batch count kernel.
+    # Release its true scratch AND our alias/input lists at that boundary.
+    del stat_inputs,stat_writes,reject_inputs,reject_writes,resample_inputs,resample_writes,insert_inputs,insert_writes
+    del argmax,maximum,untouched,target_lse,draft_lse,local_argmax,local_max
+    rejected=tensor('num-rejected',(batch,),'int32')
+    counts=tuple(0 if seq<prompt else a+1 for seq,prompt,a in zip(sequence_lengths,prompt_lengths,accepted_tokens,strict=True))
+    rejections=tuple(0 if seq<prompt else q-count for seq,prompt,q,count in
+        zip(sequence_lengths,prompt_lengths,logits_per_request,counts,strict=True))
+    effect('sampled_rejected_counts',(count,seq_lens,cu_num_logits,idx_mapping,*state_regions(prefill_len)),(count,rejected),
+        {'elements':batch,'rows':batch},dtype='int32',grid=(batch,),
+        declared_num_sampled=counts,declared_num_rejected=rejections,fixed_kernel_launch=True)
+    # Retain only real returned buffers; all unused/partially initialized
+    # scratch follows the native function lifetime and is never fabricated.
+    return {'sampled_token_ids':sampled,'num_sampled':count,'num_rejected':rejected,
+        'sampler_dispatch':'rejection',
+        'declared_num_sampled':counts,'declared_num_rejected':rejections,'launch_nodes':tuple(launches),
+        'source_profile':profile,'values_computed':False,'normal_capacity_accepted':False,
+        'complete_priced_request':False,'scratch_initialization_scope':'explicit partial regions only; no core element-level initialization tracking'}
+
+
+def vllm030_v2_plain_greedy_forward(trace, logits, *, input_ids, positions, logits_indices,
+        cu_num_logits, idx_mapping, expanded_idx_mapping, expanded_local_pos, temperature, seeds,
+        seq_lens, prefill_len, logits_per_request, selected_indices, request_state_indices,
+        accepted_tokens, sequence_lengths, prompt_lengths, num_speculative_tokens,
+        source_profile, pool_name, name):
+    """Native ordinary V2 Sampler branch for a batch with no draft tokens.
+
+    All-greedy/no-logit-processing/no-top-k-p/no-logprobs/no-NaNs/no-watermark,
+    no trace replay/sampling mask/grammar/batch sharder, FP32 reduction
+    (use_fp64=False). Outputs [B,1], not rejection's [B,N+1].
+    Inputs and sampled values remain virtual; phase decisions are source facts.
+    """
+    from .workload_graph import WorkloadEdge
+    profile='vllm_0_30_V2_plain_allgreedy_no_sampling_params'
+    if not isinstance(trace,ForwardTrace) or source_profile!=profile:
+        raise NotImplementedError('V2 ordinary sampler requires its explicit plain all-greedy profile')
+    if trace._recorded_graph is not None:
+        raise ValueError('V2 ordinary sampler requires an open forward trace')
+    if (type(logits_per_request) is not tuple or not logits_per_request or any(q!=1 or type(q) is not int for q in logits_per_request)
+            or type(accepted_tokens) is not tuple or accepted_tokens!=(0,)*len(logits_per_request)
+            or any(type(a) is not int for a in accepted_tokens)
+            or type(num_speculative_tokens) is not int or num_speculative_tokens<1):
+        raise ValueError('V2 ordinary sampler requires a complete batch without draft logits rows')
+    for port in (logits,input_ids,positions,logits_indices,cu_num_logits,idx_mapping,expanded_idx_mapping,
+            expanded_local_pos,temperature,seeds,seq_lens,prefill_len):trace._check_tensor(port)
+    batch=len(logits_per_request)
+    if len(logits.shape)!=2 or logits.shape[0]!=batch or logits.dtype!='bf16' or len(temperature.shape)!=1 or len(input_ids.shape)!=1:
+        raise ValueError('V2 ordinary sampler requires BF16 per-request logits and vector metadata')
+    states=temperature.shape[0];vocab=logits.shape[1]
+    layouts=((logits,logits.shape,'bf16'),(input_ids,input_ids.shape,'int32'),(positions,input_ids.shape,'int64'),
+        (logits_indices,(batch,),'int64'),(cu_num_logits,(batch+1,),'int32'),(idx_mapping,(batch,),'int64'),
+        (expanded_idx_mapping,(batch,),'int64'),(expanded_local_pos,(batch,),'int32'),
+        (temperature,(states,),'fp32'),(seeds,(states,),'int64'),(seq_lens,(batch,),'int32'),(prefill_len,(states,),'int32'))
+    if any(port.shape!=shape or port.dtype!=dtype or not port.is_contiguous for port,shape,dtype in layouts):
+        raise ValueError('V2 ordinary sampler native ports have inconsistent extent/dtype/layout')
+    if (any(type(values) is not tuple or len(values)!=batch for values in
+                (selected_indices,request_state_indices,sequence_lengths,prompt_lengths))
+            or len(set(selected_indices))!=batch or any(type(index) is not int or not 0<=index<input_ids.shape[0] for index in selected_indices)
+            or len(set(request_state_indices))!=batch or any(type(index) is not int or not 0<=index<states for index in request_state_indices)
+            or any(type(n) is not int or n<0 for values in (sequence_lengths,prompt_lengths) for n in values)
+            or type(pool_name) is not str or not pool_name or type(name) is not str or not name):
+        raise ValueError('V2 ordinary sampler declarations must bind actual selected rows, request states and lengths')
+    ops=SymbolicOperator(trace,name,pool_name);previous=None;launches=[]
+    old=set(trace._nodes);frontier=old-{edge.source for edge in trace._edges if edge.source in old and edge.destination in old}
+    def link(current):
+        nonlocal previous
+        for source in sorted(frontier if previous is None else (previous,)):
+            edge=WorkloadEdge(source,current,'barrier')
+            if edge not in trace._edges:trace._edges.append(edge)
+        previous=current
+    def fresh(role,shape,dtype):return trace.tensor(trace.unique_name(name+'.'+role),shape,dtype)
+    gathered=[]
+    # Sampler.__call__ gathers positions first, input IDs second.
+    for role,port in (('selected-positions',positions),('selected-input-ids',input_ids)):
+        op=SymbolicOperator(trace,name+':'+role,pool_name)
+        node=op.node(WorkloadKind.GATHER,{'elements':batch,'rows':batch,'hidden':1},port.dtype,'gather',{
+            'gather_factor':1,'index_count':batch,'index_bytes':8,'scattered':True,'materialized_output':True,
+            'selected_indices':selected_indices,'source_component':'vllm_0_30_V2_plain_sampler_advanced_index'})
+        value=trace.call(node,(port,logits_indices),shape=(batch,),dtype=port.dtype)
+        link(trace._writers[value.view.allocation_id]);gathered.append(value)
+    pos,unused_input_ids=gathered
+    def effect(operation,inputs,writes,shape,dtype,**attributes):
+        node=ops.node(WorkloadKind.VECTOR,shape,dtype,'vllm_gpu_v2_greedy_sampler',{
+            'source_component':'vllm_0_30_gpu_V2_plain_sampler','source_operation':operation,'source_profile':profile,
+            'model_execution_version':'vllm_0_30_0','source_projection_only':True,
+            'source_operator_call':True,'fixed_kernel_launch':operation in ('gumbel_block_argmax','sampled_rejected_counts'),
+            'ATen_internal_launch_and_workspace_bound':False,
+            'native_launch_selected':False,'values_computed':False,'complete_priced_request':False,**attributes})
+        current=trace.call_effect(node,tuple(inputs),writes=tuple(writes));link(current);launches.append(current)
+    c1=-(-vocab//1024)
+    local_argmax=fresh('local-argmax',(batch,c1),'int64');local_max=fresh('local-max',(batch,c1),'fp32')
+    state_ports=tuple(port.narrow(0,index,1) for port in (temperature,seeds) for index in request_state_indices)
+    effect('gumbel_block_argmax',(logits,expanded_idx_mapping,pos,*state_ports),(local_argmax,local_max),
+        {'elements':batch*vocab,'rows':batch,'vocab':vocab},'bf16',grid=(batch,c1),vocab_block_size=1024,
+        is_drafting=False,apply_temperature=False,all_greedy=True)
+    blocks=fresh('max-block-idx',(batch,1),'int64')
+    effect('gumbel_reduce_argmax',(local_max,),(blocks,),{'elements':batch*c1,'rows':batch},'fp32',axis=1,keepdim=True)
+    sampled=fresh('sampled',(batch,1),'int64')
+    effect('gumbel_gather',(local_argmax,blocks),(sampled,),{'elements':batch,'rows':batch},'int64',
+        axis=1,dynamic_index=True,index_count=batch,index_bytes=8,source_columns=c1)
+    # gumbel_sample returns before Sampler creates new_ones and calls counts.
+    del local_argmax,local_max,blocks
+    count=fresh('num-sampled',(batch,),'int32')
+    effect('seed_num_sampled_ones',(),(count,),{'elements':batch,'rows':batch},'int32',source_constant=1)
+    rejected=fresh('num-rejected',(batch,),'int32')
+    prefill_ports=tuple(prefill_len.narrow(0,index,1) for index in request_state_indices)
+    counts=tuple(int(seq>=prompt) for seq,prompt in zip(sequence_lengths,prompt_lengths,strict=True))
+    effect('sampled_rejected_counts',(count,seq_lens,cu_num_logits,idx_mapping,*prefill_ports),(count,rejected),
+        {'elements':batch,'rows':batch},'int32',grid=(batch,),declared_num_sampled=counts,declared_num_rejected=(0,)*batch)
+    return {'sampled_token_ids':sampled,'num_sampled':count,'num_rejected':rejected,'sampler_dispatch':'plain',
+        'declared_num_sampled':counts,'declared_num_rejected':(0,)*batch,'launch_nodes':tuple(launches),
+        'source_profile':profile,'values_computed':False,'normal_capacity_accepted':False,'complete_priced_request':False}
+
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class _VLLM030PostUpdateState:
+    trace: object
+    request_ids: tuple
+    state_indices: tuple
+    limits: tuple
+    all_token_ids_storage: str
+    step_ids: tuple
+    total_lengths: tuple
+    computed_lengths: tuple
+    num_computed: object
+    last_sampled: object
+    all_token_ids: object
+    total_len: object
+    output_bin_counts: object
+    next_prefill_tokens: object
+    declared_sampled_ids: tuple
+    finished_request_ids: tuple = ()
+    last_sampled_values: tuple = ()
+
+
+def validate_vllm030_last_sampled_constructor(trace,port,max_requests):
+    trace._check_tensor(port)
+    writer=trace._writers[port.view.allocation_id]
+    if (port.shape!=(max_requests,1) or port.dtype!='int64' or not port.is_contiguous
+            or port.view.allocation_id not in trace._persistent_ids
+            or trace._allocations[port.view.allocation_id].freed_event is not None
+            or writer is None or writer not in trace._nodes
+            or 'source_component' not in trace._nodes[writer].attributes
+            or trace._nodes[writer].attributes['source_component']!='vllm_0_30_RequestState_SamplingStates_constructor'
+            or port.view.view_id not in trace._nodes[writer].attributes['symbolic_tensor_outputs']):
+        raise ValueError('V2 initial last-sampled alias needs its unchanged source constructor-zero backing')
+
+
+def vllm030_v2_post_update_forward(trace, sampler_output, *, request_ids, state_indices,
+        query_lengths, computed_before, sampled_token_ids, initial_total_lengths, max_requests,
+        max_model_len, vocab_size, all_token_ids_storage, idx_mapping, query_start_loc,
+        step_id, pool_name, prior_state=None, _preflight_only=False, finished_request_ids=(),initialize_last_sampled=False,
+        admitted_requests=(),admission_input_ids=None,initial_last_sampled=None):
+    """Native last-PP post_update with declared sampled IDs, no model execution.
+
+    The optional last-sampled zero constructor is source bound. Other resident
+    initialization and request staged writes remain external declarations.
+    Explicit UVA uses logical worker-owned DDR;
+    physical host identity, pointer mapping and PCIe traffic remain unbound.
+    GPU fallback is a separate explicit storage choice, never inferred.
+    """
+    if not isinstance(trace,ForwardTrace) or trace._recorded_graph is not None:
+        raise ValueError('V2 post_update requires its open source trace')
+    if type(_preflight_only) is not bool:
+        raise TypeError('V2 post_update preflight flag must be boolean')
+    if type(initialize_last_sampled) is not bool or initialize_last_sampled and prior_state is not None:
+        raise ValueError('V2 last-sampled constructor initialization belongs only to the first resident revision')
+    if initial_last_sampled is not None:
+        if prior_state is not None or initialize_last_sampled:
+            raise ValueError('V2 initial last-sampled alias cannot replace or reinitialize a live request state')
+        validate_vllm030_last_sampled_constructor(trace,initial_last_sampled,max_requests)
+    if (prior_state is None and '_v2_post_update_state' in vars(trace)
+            or prior_state is not None and ('_v2_post_update_state' not in vars(trace)
+                or trace._v2_post_update_state is not prior_state)):
+        raise ValueError('V2 post_update requires its current unconsumed request-state revision')
+    if (type(request_ids) is not tuple or not request_ids or len(set(request_ids))!=len(request_ids)
+            or any(type(key) is not str or not key for key in request_ids)
+            or any(type(n) is not int or n<1 for n in (max_requests,max_model_len,vocab_size))
+            or all_token_ids_storage not in ('declared_uva_host','declared_gpu_fallback')
+            or type(step_id) is not str or not step_id or type(pool_name) is not str or not pool_name):
+        raise ValueError('V2 post_update requires explicit request owners, limits and resident storage branch')
+    batch=len(request_ids)
+    if (type(admitted_requests) is not tuple
+            or any(type(row) is not tuple or len(row)!=3 or type(row[0]) is not str
+                or type(row[1]) is not int or type(row[2]) is not tuple for row in admitted_requests)
+            or len({row[0] for row in admitted_requests})!=len(admitted_requests)):
+        raise ValueError('V2 request admission requires distinct (ID, resident row, prompt IDs) declarations')
+    if (type(finished_request_ids) is not tuple or len(set(finished_request_ids))!=len(finished_request_ids)
+            or any(type(key) is not str or key not in request_ids for key in finished_request_ids)):
+        raise ValueError('V2 post_update finished IDs must belong to the current sampled batch')
+    if (batch>max_requests or any(type(values) is not tuple or len(values)!=batch for values in
+                (state_indices,query_lengths,computed_before,sampled_token_ids))
+            or len(set(state_indices))!=batch or any(type(i) is not int or not 0<=i<max_requests for i in state_indices)
+            or any(type(q) is not int or q<1 for q in query_lengths)
+            or any(type(n) is not int or n<0 for n in computed_before)):
+        raise ValueError('V2 post_update requires per-request distinct state indices, query lengths and declared old context')
+    current_indices=dict(zip(request_ids,state_indices,strict=True));query_by_id=dict(zip(request_ids,query_lengths,strict=True))
+    computed_by_id=dict(zip(request_ids,computed_before,strict=True))
+    if (any(key not in current_indices or current_indices[key]!=index or computed_by_id[key]!=0
+                or not tokens or len(tokens)!=query_by_id[key]
+                or any(type(token) is not int or not 0<=token<vocab_size for token in tokens)
+                for key,index,tokens in admitted_requests)
+            or bool(admitted_requests)!=(admission_input_ids is not None)):
+        raise ValueError('V2 admitted requests must bind their exact fresh whole prompt and current resident row')
+    if admitted_requests:
+        trace._check_tensor(admission_input_ids)
+        if admission_input_ids.shape!=(sum(query_lengths),) or admission_input_ids.dtype!='int32' or not admission_input_ids.is_contiguous:
+            raise ValueError('V2 request admission requires the actual packed target input-ID port')
+    if type(sampler_output) is not dict or any(key not in sampler_output for key in
+            ('sampled_token_ids','num_sampled','num_rejected','declared_num_sampled','declared_num_rejected')):
+        raise ValueError('V2 post_update requires the complete actual sampler output owner')
+    sampled=sampler_output['sampled_token_ids'];counts=sampler_output['num_sampled'];rejected=sampler_output['num_rejected']
+    for port in (sampled,counts,rejected,idx_mapping,query_start_loc):trace._check_tensor(port)
+    if len(sampled.shape)!=2:
+        raise ValueError('V2 post_update sampled rows must be the actual 2D output')
+    lengths=sampler_output['declared_num_sampled'];rejects=sampler_output['declared_num_rejected']
+    if (type(lengths) is not tuple or type(rejects) is not tuple or len(lengths)!=batch or len(rejects)!=batch
+            or any(type(n) is not int or n<0 for values in (lengths,rejects) for n in values)
+            or any(type(ids) is not tuple or len(ids)!=count or any(type(i) is not int or not 0<=i<vocab_size for i in ids)
+                for ids,count in zip(sampled_token_ids,lengths,strict=True))):
+        raise ValueError('V2 post_update needs explicit valid sampled-ID prefixes, not shape-inferred values')
+    ports=((sampled,(batch,sampled.shape[-1]),'int64'),(counts,(batch,),'int32'),(rejected,(batch,),'int32'),
+        (idx_mapping,(batch,),'int64'),(query_start_loc,(batch+1,),'int32'))
+    for port,shape,dtype in ports:
+        trace._check_tensor(port)
+        if port.shape!=shape or port.dtype!=dtype or not port.is_contiguous:
+            raise ValueError('V2 post_update actual input extent/dtype/trace differs from native source')
+    if any(count>sampled.shape[1] or reject>q for count,reject,q in zip(lengths,rejects,query_lengths,strict=True)):
+        raise ValueError('V2 post_update cannot read an unwritten sampled tail or reject beyond its query')
+    producer=trace._writers[counts.view.allocation_id]
+    token_producer=trace._writers[sampled.view.allocation_id]
+    if (producer is None or producer!=trace._writers[rejected.view.allocation_id] or token_producer is None
+            or producer not in trace._nodes or token_producer not in trace._nodes):
+        raise ValueError('V2 post_update requires actual produced sampled/count ports')
+    counter_node=trace._nodes[producer];token_node=trace._nodes[token_producer]
+    components=('vllm_0_30_gpu_V2_plain_sampler','vllm_0_30_gpu_V2_rejection_sampler')
+    if (any(key not in counter_node.attributes for key in ('source_component','source_operation','declared_num_sampled','declared_num_rejected'))
+            or counter_node.attributes['source_component'] not in components or counter_node.attributes['source_operation']!='sampled_rejected_counts'
+            or counter_node.attributes['declared_num_sampled']!=lengths or counter_node.attributes['declared_num_rejected']!=rejects
+            or idx_mapping.view.view_id not in counter_node.attributes['symbolic_tensor_inputs']
+            or 'source_component' not in token_node.attributes or token_node.attributes['source_component'] not in components):
+        raise ValueError('V2 post_update sampler ports differ from their current source producer or declared feedback')
+    limits=(max_requests,max_model_len,vocab_size)
+    admission_indices={key:index for key,index,_ in admitted_requests}
+    admission_totals={key:len(tokens) for key,_,tokens in admitted_requests}
+    if prior_state is not None:
+        if type(prior_state) is not _VLLM030PostUpdateState or prior_state.trace is not trace:
+            raise ValueError('V2 admission requires its original request-state owner')
+        retained_indices={key:index for key,index in zip(prior_state.request_ids,prior_state.state_indices,strict=True)
+            if key not in prior_state.finished_request_ids}
+        retained_computed={key:count for key,count in zip(prior_state.request_ids,prior_state.computed_lengths,strict=True)
+            if key not in prior_state.finished_request_ids}
+        if (type(prior_state) is not _VLLM030PostUpdateState or prior_state.trace is not trace
+                or set(retained_indices).intersection(admission_indices)
+                or set(retained_indices.values()).intersection(admission_indices.values())
+                or {**retained_indices,**admission_indices}!=current_indices
+                or prior_state.limits!=limits or prior_state.all_token_ids_storage!=all_token_ids_storage
+                or {**retained_computed,**{key:0 for key in admission_indices}}!=computed_by_id
+                or step_id in prior_state.step_ids
+                or initial_total_lengths is not None):
+            raise ValueError('V2 post_update continuation changed current request state, owner, limits or step revision')
+        total_by_id={**dict(zip(prior_state.request_ids,prior_state.total_lengths,strict=True)),**admission_totals}
+        totals=tuple(total_by_id[key] for key in request_ids)
+        last_values=prior_state.last_sampled_values
+        if (type(last_values) is not tuple or len(last_values)!=max_requests
+                or any(value is not None and (type(value) is not int or not 0<=value<vocab_size) for value in last_values)):
+            raise ValueError('V2 post_update lost its resident last-sampled value declarations')
+        resident=(prior_state.num_computed,prior_state.last_sampled,prior_state.all_token_ids,
+            prior_state.total_len,prior_state.output_bin_counts,prior_state.next_prefill_tokens)
+        for port in resident:
+            trace._check_tensor(port)
+            if port.view.allocation_id not in trace._persistent_ids or trace._allocations[port.view.allocation_id].freed_event is not None:
+                raise ValueError('V2 post_update lost its original live persistent state backing')
+    else:
+        if (type(initial_total_lengths) is not tuple or len(initial_total_lengths)!=batch
+                or any(type(n) is not int or n<0 for n in initial_total_lengths)):
+            raise ValueError('V2 post_update first entry requires explicit resident initial total lengths')
+        totals=initial_total_lengths
+        if any(totals[request_ids.index(key)]!=count for key,count in admission_totals.items()):
+            raise ValueError('V2 admission prompt length differs from initial resident total length')
+        last_values=(0,)*max_requests if initialize_last_sampled or initial_last_sampled is not None else (None,)*max_requests
+    after_total=tuple(old+count for old,count in zip(totals,lengths,strict=True))
+    after_computed=tuple(old+q-r for old,q,r in zip(computed_before,query_lengths,rejects,strict=True))
+    if any(not 0<=computed<=total<=max_model_len for computed,total in zip(after_computed,after_total,strict=True)):
+        raise ValueError('V2 post_update declared history/computed extents exceed the resident request state')
+    if admitted_requests and '_v2_resident_draft_tokens' in vars(trace):
+        drafts,_=trace._v2_resident_draft_tokens
+        trace._check_tensor(drafts)
+        if (drafts.shape!=(max_requests,5) or drafts.dtype!='int64' or not drafts.is_contiguous
+                or drafts.view.allocation_id not in trace._persistent_ids
+                or trace._allocations[drafts.view.allocation_id].freed_event is not None
+                or trace._writers[drafts.view.allocation_id] is None):
+            raise ValueError('V2 admission cannot replace its original resident draft table')
+    if _preflight_only:
+        return after_total,after_computed
+    if prior_state is None:
+        def resident_port(role,shape,dtype,domain='dram'):
+            return trace.tensor(trace.unique_name('V2-reqstate.'+role),shape,dtype,persistent=True,memory_domain=domain)
+        resident=(resident_port('num-computed',(max_requests,),'int32'),
+            resident_port('last-sampled',(max_requests,1),'int64') if initial_last_sampled is None else initial_last_sampled,
+            resident_port('all-token-ids',(max_requests,max_model_len),'int32',
+                'ddr' if all_token_ids_storage=='declared_uva_host' else 'dram'),
+            resident_port('total-len',(max_requests,),'int32'),resident_port('output-bin-counts',(max_requests,vocab_size),'int32'),
+            resident_port('next-prefill-tokens',(1,max_requests),'int32'))
+    computed,last,history,total,bins,next_prefill=resident
+    if initialize_last_sampled:
+        from .traced_operators import SymbolicFillZero
+        SymbolicFillZero(trace,'V2-last-sampled-constructor',pool_name)(last)
+        writer=trace._writers[last.view.allocation_id];node=trace._nodes[writer]
+        trace._nodes[writer]=node.with_attributes({**node.attributes,
+            'source_component':'vllm_0_30_RequestState_last_sampled_constructor','source_operation':'torch_zeros',
+            'source_projection_only':True,'normal_capacity_accepted':False})
+    last_values=list(last_values)
+    if admitted_requests:
+        op=SymbolicOperator(trace,'V2-stage-requests',pool_name)
+        node=op.node(WorkloadKind.VECTOR,{'rows':len(admitted_requests),'elements':sum(admission_totals.values())+2*len(admitted_requests)},
+            'int32','vllm_gpu_v2_stage_requests',{
+            'source_component':'vllm_0_30_RequestState_add_request','source_operation':'project_staged_writes',
+            'admitted_request_ids':tuple(key for key,_,_ in admitted_requests),
+            'request_state_indices':tuple(index for _,index,_ in admitted_requests),
+            'declared_prompt_ids':tuple(tokens for _,_,tokens in admitted_requests),
+            'last_sampled_cleared':False,'history_tail_cleared':False,'penalty_bins_cleared':False,
+            'staging_scope':'resident writes consumed by post_update/draft; earlier native input preparation remains declared',
+            'source_projection_only':True,'internal_launch_bound':False,'normal_capacity_accepted':False})
+        starts={key:sum(query_lengths[:row]) for row,key in enumerate(request_ids)}
+        reads=tuple(admission_input_ids.narrow(0,starts[key],len(tokens)) for key,_,tokens in admitted_requests)
+        staged=tuple(port for key,index,tokens in admitted_requests for port in (
+            total.narrow(0,index,1),computed.narrow(0,index,1),history.narrow(0,index,1).narrow(1,0,len(tokens))))
+        trace.call_effect(node,reads,writes=staged)
+        if '_v2_resident_draft_tokens' in vars(trace):
+            drafts,_=trace._v2_resident_draft_tokens
+            trace._check_tensor(drafts)
+            reset=op.node(WorkloadKind.ELEMENTWISE,{'elements':5*len(admitted_requests)},'int64','elementwise',{
+                'operation':'fill','reads':0,'writes':1,'source_constant':0,
+                'source_component':'vllm_0_30_RequestState_add_request','source_operation':'draft_row_zero',
+                'request_state_indices':tuple(index for _,index,_ in admitted_requests),'source_projection_only':True})
+            trace.call_effect(reset,(),writes=tuple(drafts.narrow(0,index,1) for _,index,_ in admitted_requests))
+    inputs=[idx_mapping,counts,rejected,query_start_loc];writes=[];increments=[]
+    for row,(state,old,count,q,reject,ids) in enumerate(zip(state_indices,totals,lengths,query_lengths,rejects,sampled_token_ids,strict=True)):
+        total_cell=total.narrow(0,state,1);inputs.append(total_cell)
+        if count:
+            last_values[state]=ids[-1]
+            inputs.append(sampled.narrow(0,row,1).narrow(1,0,count))
+            writes.extend((last.narrow(0,state,1),total_cell,history.narrow(0,state,1).narrow(1,old,count)))
+            for token in sorted(set(ids)):
+                cell=bins.narrow(0,state,1).narrow(1,token,1)
+                inputs.append(cell);writes.append(cell);increments.append((state,token,ids.count(token)))
+        if q-reject:
+            cell=computed.narrow(0,state,1);inputs.append(cell);writes.append(cell)
+    op=SymbolicOperator(trace,'V2-post-update',pool_name)
+    node=op.node(WorkloadKind.VECTOR,{'rows':batch,'elements':sum(lengths)},'int32','vllm_gpu_v2_post_update',{
+        'source_component':'vllm_0_30_gpu_post_update','source_operation':'post_update','grid':(batch,),'num_warps':1,
+        'source_projection_only':True,'fixed_kernel_launch':True,'native_launch_selected':False,
+        'request_state_indices':state_indices,'declared_sampled_ids':sampled_token_ids,'declared_bin_increments':tuple(increments),
+        'finished_request_ids_after_current_round':finished_request_ids,
+        'computed_before':computed_before,'computed_after':after_computed,'total_before':totals,'total_after':after_total,
+        'all_token_ids_storage':all_token_ids_storage,'initialization_scope':
+            'explicit last-sampled zero constructor; remaining staged writes unbound' if initialize_last_sampled else
+            'retained or declared resident state; remaining constructor/staged writes unbound',
+        'host_device_pointer_mapping_and_PCIe_bound':False,'values_computed':False,'normal_capacity_accepted':False})
+    trace.call_effect(node,tuple(inputs),writes=tuple(writes))
+    state=_VLLM030PostUpdateState(trace,request_ids,state_indices,limits,all_token_ids_storage,
+        (step_id,) if prior_state is None else (*prior_state.step_ids,step_id),after_total,after_computed,*resident,sampled_token_ids,
+        finished_request_ids,tuple(last_values))
+    trace._v2_post_update_state=state
+    return state
+
+
+def vllm030_store_draft_tokens_forward(trace, draft_tokens, *, request_state, step_id, pool_name):
+    """GPUModelRunner's indexed assignment into resident RequestState drafts.
+
+    The proposer output is batch ordered. PPHandler packs from the resident
+    state table using idx_mapping; it cannot gather state rows from that
+    smaller batch-ordered proposer output.
+    """
+    if (type(request_state) is not _VLLM030PostUpdateState or request_state.trace is not trace
+            or '_v2_post_update_state' not in vars(trace) or trace._v2_post_update_state is not request_state
+            or request_state.step_ids[-1]!=step_id or type(pool_name) is not str or not pool_name):
+        raise ValueError('V2 draft storage requires its current request-state revision')
+    trace._check_tensor(draft_tokens)
+    batch=len(request_state.request_ids);capacity=request_state.limits[0]
+    if (draft_tokens.shape!=(batch,5) or draft_tokens.dtype!='int64' or not draft_tokens.is_contiguous
+            or trace._writers[draft_tokens.view.allocation_id] is None):
+        raise ValueError('V2 draft storage requires the produced complete N5 proposer output')
+    if '_v2_resident_draft_tokens' in vars(trace):
+        resident,steps=trace._v2_resident_draft_tokens
+        trace._check_tensor(resident)
+        if (step_id in steps or resident.shape!=(capacity,5) or resident.dtype!='int64'
+                or resident.view.allocation_id not in trace._persistent_ids
+                or trace._allocations[resident.view.allocation_id].freed_event is not None
+                or trace._writers[resident.view.allocation_id] is None):
+            raise ValueError('V2 draft storage lost its original resident backing or step revision')
+    else:
+        resident=trace.tensor(trace.unique_name('V2-reqstate.draft-tokens'),(capacity,5),'int64',persistent=True)
+        from .traced_operators import SymbolicFillZero
+        SymbolicFillZero(trace,'V2-request-drafts-constructor',pool_name)(resident)
+        writer=trace._writers[resident.view.allocation_id];node=trace._nodes[writer]
+        trace._nodes[writer]=node.with_attributes({**node.attributes,
+            'source_component':'vllm_0_30_RequestState_draft_constructor','source_operation':'torch_zeros',
+            'source_projection_only':True,'normal_capacity_accepted':False})
+        steps=()
+    op=SymbolicOperator(trace,'V2-store-drafts',pool_name)
+    node=op.node(WorkloadKind.VECTOR,{'elements':batch*5,'rows':batch},'int64','vllm_gpu_v2_store_drafts',{
+        'source_component':'vllm_0_30_RequestState_drafts','source_operation':'indexed_assignment',
+        'request_ids':request_state.request_ids,'request_state_indices':request_state.state_indices,
+        'batch_rows':batch,'resident_capacity':capacity,'source_step_id':step_id,
+        'source_projection_only':True,'internal_launch_bound':False,'values_computed':False,
+        'normal_capacity_accepted':False})
+    trace.call_effect(node,(draft_tokens,),writes=tuple(resident.narrow(0,index,1) for index in request_state.state_indices))
+    trace._v2_resident_draft_tokens=(resident,(*steps,step_id))
+    return resident
+
+
+def dspark_prepare_input_plan(*, target_query_lengths, target_positions, rejected_counts,
+        group_ids, layer_group_indices, kernel_block_sizes, block_table_ids,
+        max_requests, max_tokens, max_model_len, cache_capacity_tokens, num_query_per_request,dummy_run=False):
+    """Pure CP1/no-eviction/no-clamp plan for source prepare_dflash_inputs.
+
+    Tables and cache groups are explicit declarations; no native page receipt
+    is inferred from token positions. One prepare invocation per UNIQUE group.
+    """
+    if (type(target_query_lengths) is not tuple or not target_query_lengths
+            or any(type(q) is not int or q<1 for q in target_query_lengths)
+            or type(rejected_counts) is not tuple or len(rejected_counts)!=len(target_query_lengths)
+            or any(type(r) is not int or not 0<=r<q for q,r in zip(target_query_lengths,rejected_counts,strict=True))):
+        raise ValueError('DSpark prepare needs physical target query spans and an accepted context row per request')
+    batch=len(target_query_lengths);physical=sum(target_query_lengths)
+    if (type(dummy_run) is not bool or dummy_run and (target_query_lengths!=(6,) or rejected_counts!=(0,)
+            or target_positions!=(0,)*6 or num_query_per_request!=5)):
+        raise ValueError('DSpark dummy prepare requires its actual six zero-position target rows and zero rejection')
+    if (any(type(n) is not int or n<1 for n in (max_requests,max_tokens,max_model_len,cache_capacity_tokens,num_query_per_request))
+            or batch>max_requests or max(physical,batch*num_query_per_request)>max_tokens
+            or type(target_positions) is not tuple or len(target_positions)!=physical
+            or any(type(pos) is not int or not 0<=pos<max_model_len for pos in target_positions)):
+        raise ValueError('DSpark prepare target/query extents and positions must fit declared source buffers')
+    if (type(group_ids) is not tuple or not group_ids or any(type(g) is not int or g<0 for g in group_ids)
+            or tuple(sorted(set(group_ids)))!=group_ids or type(layer_group_indices) is not tuple or len(layer_group_indices)!=3
+            or any(type(g) is not int or not 0<=g<len(group_ids) for g in layer_group_indices)
+            or set(layer_group_indices)!=set(range(len(group_ids)))
+            or type(kernel_block_sizes) is not tuple or len(kernel_block_sizes)!=len(group_ids)
+            or any(type(size) is not int or size<1 for size in kernel_block_sizes)
+            or type(block_table_ids) is not tuple or len(block_table_ids)!=len(group_ids)):
+        raise ValueError('DSpark prepare requires its actual unique groups, three-layer mapping and per-group kernel block sizes')
+    valid=tuple(q-r for q,r in zip(target_query_lengths,rejected_counts,strict=True))
+    starts=[];cursor=0;contexts=[];ctx_positions=[];query_positions=[]
+    for q,count in zip(target_query_lengths,valid,strict=True):
+        starts.append(cursor);span=target_positions[cursor:cursor+q]
+        if not dummy_run and span!=tuple(range(span[0],span[0]+q)):
+            raise ValueError('DSpark prepare requires original contiguous target rows in request order')
+        context=span[count-1]+1
+        if context+num_query_per_request>max_model_len:
+            raise NotImplementedError('DSpark prepare clamped-query source remains unbound; reject before any writes')
+        contexts.append(context);ctx_positions.extend((*span[:count],*((0,)*(q-count))))
+        query_positions.extend(range(context,context+num_query_per_request));cursor+=q
+    cslots=[];qslots=[];full_context=[]
+    for size,table in zip(kernel_block_sizes,block_table_ids,strict=True):
+        if (type(table) is not tuple or len(table)!=batch or any(type(row) is not tuple or not row for row in table)
+                or len({len(row) for row in table})!=1 or any(type(block) is not int or block<0 for row in table for block in row)):
+            raise ValueError('DSpark prepare requires a rectangular actual request-packed block table per group')
+        if dummy_run and any(block!=0 for row in table for block in row):
+            raise ValueError('DSpark dummy tables must clear every column to the native null block')
+        group_context=[];group_query=[];group_full=[]
+        for index,(context,q,count,start) in enumerate(zip(contexts,target_query_lengths,valid,starts,strict=True)):
+            row=table[index]
+            if len(row)*size<context+num_query_per_request:
+                raise ValueError('DSpark prepare table cannot silently clamp a missing block column')
+            def slot(pos):
+                block=row[pos//size]
+                if block==0:
+                    if dummy_run:return -1
+                    raise NotImplementedError('DSpark declared no-eviction/all-valid profile cannot use native null-block slots')
+                if dummy_run:raise ValueError('DSpark dummy block tables must be entirely null')
+                result=block*size+pos%size
+                if result>=cache_capacity_tokens:
+                    raise ValueError('DSpark prepare table projects beyond its actual source cache capacity')
+                return result
+            group_full.extend(slot(pos) for pos in range(context))
+            group_context.extend((*tuple(slot(pos) for pos in target_positions[start:start+count]),*((-1,)*(q-count))))
+            group_query.extend(slot(pos) for pos in range(context,context+num_query_per_request))
+        if not dummy_run and len(set((*group_full,*group_query)))!=len(group_full)+len(group_query):
+            raise ValueError('DSpark prepare cannot alias distinct same-group request context/query slots')
+        cslots.append(tuple(group_context));qslots.append(tuple(group_query));full_context.append(tuple(group_full))
+    longest=max(target_query_lengths)+num_query_per_request
+    block=min(256,1<<(max(1,longest)-1).bit_length())
+    return {'dummy_run':dummy_run,'group_ids':group_ids,'layer_group_indices':layer_group_indices,'kernel_block_sizes':kernel_block_sizes,
+        'block_table_ids':block_table_ids,'target_query_lengths':target_query_lengths,'target_positions':target_positions,
+        'rejected_counts':rejected_counts,'contexts':tuple(contexts),'context_positions':tuple(ctx_positions),'query_positions':tuple(query_positions),
+        'context_slots_by_group':tuple(cslots),'query_slots_by_group':tuple(qslots),'full_context_slots_by_group':tuple(full_context),
+        'limits':(max_requests,max_tokens,max_model_len,cache_capacity_tokens,num_query_per_request),
+        'source_grid':(batch,-(-longest//block)),'source_BLOCK_SIZE':block,'source_scope':'declared CP1 noCG/no-eviction/no-clamp source tables; native physical pages unbound'}
+
+
+@dataclass(frozen=True)
+class _DSparkPrepareBuffers:
+    trace: object
+    limits: tuple
+    hidden_size: int
+    group_ids: tuple
+    layer_group_indices: tuple
+    kernel_block_sizes: tuple
+    shared: tuple
+    context_slots: tuple
+    query_slots: tuple
+    table_ports: tuple
+    step_ids: tuple
+    attention_ports: tuple
+    input_token_values: tuple
+    position_values: tuple
+
+
+def dspark_input_buffer_values(buffers, *, physical_rows, vocab_size):
+    """Known source values require live constructor/preparation-owned storage."""
+    if (type(buffers) is not _DSparkPrepareBuffers or type(physical_rows) is not int
+            or not 0<physical_rows<=buffers.limits[1] or type(vocab_size) is not int or vocab_size<1
+            or '_dspark_prepare_buffers' not in vars(buffers.trace)
+            or buffers.trace._dspark_prepare_buffers is not buffers
+            or type(buffers.input_token_values) is not tuple or len(buffers.input_token_values)!=buffers.limits[1]
+            or any(type(token) is not int or not 0<=token<vocab_size for token in buffers.input_token_values[:physical_rows])
+            or type(buffers.position_values) is not tuple or len(buffers.position_values)!=buffers.limits[1]
+            or any(type(pos) is not int or not 0<=pos<buffers.limits[2] for pos in buffers.position_values)):
+        raise ValueError('DSpark physical input values require their actual constructor/prepare history')
+    for role in ('input_ids','positions'):
+        port=dict(buffers.shared)[role];buffers.trace._check_tensor(port)
+        writer=buffers.trace._writers[port.view.allocation_id]
+        if (port.view.allocation_id not in buffers.trace._persistent_ids or writer is None
+                or writer not in buffers.trace._nodes
+                or 'source_component' not in buffers.trace._nodes[writer].attributes
+                or buffers.trace._nodes[writer].attributes['source_component'] not in (
+                    'vllm_0_30_InputBuffers_constructor','vllm_0_30_prepare_dflash_inputs')):
+            raise ValueError('DSpark input history lost its actual constructor/prepare writer')
+    return buffers.input_token_values[:physical_rows],buffers.position_values[:physical_rows]
+
+
+def validate_dspark_prepare_ports(trace, plan, *, state_indices, target_positions,
+        target_query_start_loc, idx_mapping, temperature, seeds, hidden_size, noise_token_id,
+        step_id, pool_name, prior_buffers):
+    """Pure whole-program checks used before any post_update or group writes."""
+    if (not isinstance(trace,ForwardTrace) or trace._recorded_graph is not None or type(plan) is not dict
+            or type(hidden_size) is not int or hidden_size<1 or type(noise_token_id) is not int or noise_token_id<0
+            or type(step_id) is not str or not step_id or type(pool_name) is not str or not pool_name):
+        raise ValueError('DSpark prepare requires an open owner and valid source dimensions')
+    plan_fields=('dummy_run','target_query_lengths','target_positions','rejected_counts','group_ids','layer_group_indices',
+        'kernel_block_sizes','block_table_ids','limits')
+    if any(key not in plan for key in plan_fields) or type(plan['limits']) is not tuple or len(plan['limits'])!=5:
+        raise ValueError('DSpark prepare input plan is incomplete')
+    expected=dspark_prepare_input_plan(**{key:plan[key] for key in plan_fields if key!='limits'},
+        max_requests=plan['limits'][0],max_tokens=plan['limits'][1],max_model_len=plan['limits'][2],
+        cache_capacity_tokens=plan['limits'][3],num_query_per_request=plan['limits'][4])
+    if plan!=expected:
+        raise ValueError('DSpark prepare plan differs from its fully validated source projection')
+    max_requests,max_tokens,max_len,capacity,N=plan['limits'];batch=len(plan['target_query_lengths']);physical=sum(plan['target_query_lengths'])
+    for port in (target_positions,target_query_start_loc,idx_mapping,temperature,seeds):
+        trace._check_tensor(port)
+    if (target_positions.shape!=(physical,) or target_positions.dtype!='int64'
+            or target_query_start_loc.shape!=(batch+1,) or target_query_start_loc.dtype!='int32'
+            or idx_mapping.shape!=(batch,) or idx_mapping.dtype!='int64'
+            or temperature.dtype!='fp32' or len(temperature.shape)!=1 or seeds.shape!=temperature.shape or seeds.dtype!='int64'
+            or any(state>=temperature.shape[0] for state in state_indices)):
+        raise ValueError('DSpark prepare target metadata ports differ from physical query/state extents')
+    if prior_buffers is not None:
+        if (type(prior_buffers) is not _DSparkPrepareBuffers or prior_buffers.trace is not trace
+                or '_dspark_prepare_buffers' not in vars(trace) or trace._dspark_prepare_buffers is not prior_buffers
+                or prior_buffers.limits!=plan['limits'] or prior_buffers.hidden_size!=hidden_size
+                or prior_buffers.group_ids!=plan['group_ids'] or prior_buffers.layer_group_indices!=plan['layer_group_indices']
+                or prior_buffers.kernel_block_sizes!=plan['kernel_block_sizes'] or step_id in prior_buffers.step_ids
+                or any(port.shape!=(max_requests,len(table[0])) for port,table in zip(prior_buffers.table_ports,plan['block_table_ids'],strict=True))):
+            raise ValueError('DSpark prepare must retain its current original group/metadata backing and limits')
+        if (len(prior_buffers.attention_ports)!=len(plan['group_ids'])
+                or any(type(pair) is not tuple or len(pair)!=2 for pair in prior_buffers.attention_ports)):
+            raise ValueError('DSpark prepare requires its original per-group attention metadata buffers')
+        if (type(prior_buffers.input_token_values) is not tuple or len(prior_buffers.input_token_values)!=max_tokens
+                or any(value is not None and (type(value) is not int or value<0) for value in prior_buffers.input_token_values)
+                or type(prior_buffers.position_values) is not tuple or len(prior_buffers.position_values)!=max_tokens
+                or any(type(value) is not int or not 0<=value<max_len for value in prior_buffers.position_values)):
+            raise ValueError('DSpark prepare lost its constructor and retained input-value history')
+        for pair in prior_buffers.attention_ports:
+            for port,dtype in zip(pair,('int32','bool'),strict=True):
+                trace._check_tensor(port)
+                if (port.shape!=(max_tokens,) or port.dtype!=dtype or not port.is_contiguous
+                        or port.view.allocation_id not in trace._persistent_ids
+                        or trace._allocations[port.view.allocation_id].freed_event is not None):
+                    raise ValueError('DSpark attention metadata lost its live persistent backing')
+    elif '_dspark_prepare_buffers' in vars(trace):
+        raise ValueError('DSpark prepare cannot replace live source buffers with a new owner')
+    return None
+
+
+def _dspark_prepare_storage(trace,plan,hidden_size,pool_name,prior_buffers):
+    max_requests,max_tokens,max_len,capacity,N=plan['limits']
+    if prior_buffers is None:
+        def buf(role,shape,dtype):return trace.tensor(trace.unique_name('DFlash.'+role),shape,dtype,persistent=True)
+        shared=tuple((role,buf(role,shape,dtype)) for role,shape,dtype in (
+            ('input_ids',(max_tokens,),'int32'),('positions',(max_tokens,),'int64'),('query_start',(max_requests+1,),'int32'),
+            ('seq_lens',(max_requests,),'int32'),('context_positions',(max_tokens,),'int64'),
+            ('sample_indices',(max_requests*N,),'int64'),('sample_pos',(max_requests*N,),'int64'),
+            ('sample_idx_mapping',(max_requests*N,),'int32'),('temperature',(max_requests,),'fp32'),
+            ('seeds',(max_requests,),'int64'),('hidden_states',(max_tokens,hidden_size),'bf16'),('anchor_indices',(max_requests,),'int64')))
+        context_slots=tuple(buf(f'group-{gid}.context-slots',(max_tokens,),'int64') for gid in plan['group_ids'])
+        query_slots=tuple(buf(f'group-{gid}.query-slots',(max_tokens,),'int64') for gid in plan['group_ids'])
+        tables=tuple(buf(f'group-{gid}.block-table',(max_requests,len(table[0])),'int32') for gid,table in zip(plan['group_ids'],plan['block_table_ids'],strict=True))
+        attention_ports=tuple((buf(f'group-{gid}.token-to-request',(max_tokens,),'int32'),
+            buf(f'group-{gid}.is-valid-token',(max_tokens,),'bool')) for gid in plan['group_ids'])
+        # Native InputBuffers.__init__ uses torch.zeros for both full buffers.
+        # Bind these writes before retaining a zero-valued tail; prepare never
+        # clears that tail on subsequent rounds.
+        from .traced_operators import SymbolicFillZero
+        for role in ('input_ids','positions'):
+            port=dict(shared)[role]
+            SymbolicFillZero(trace,'DFlash-constructor-zero-'+role,pool_name)(port)
+            writer=trace._writers[port.view.allocation_id];node=trace._nodes[writer]
+            trace._nodes[writer]=node.with_attributes({**node.attributes,
+                'source_component':'vllm_0_30_InputBuffers_constructor','source_operation':'torch_zeros',
+                'input_buffer_role':role,'source_projection_only':True,
+                'full_constructor_bound':False,'normal_capacity_accepted':False})
+        input_values=(0,)*max_tokens;position_values=(0,)*max_tokens
+        if plan['dummy_run']:
+            for role,shape,dtype in (('dummy-last-sampled',(max_requests,1),'int64'),
+                    ('dummy-temperature',(max_requests,),'fp32'),('dummy-seeds',(max_requests,),'int64')):
+                port=buf(role,shape,dtype);shared=(*shared,(role,port))
+                SymbolicFillZero(trace,'DFlash-dummy-constructor-'+role,pool_name)(port)
+                writer=trace._writers[port.view.allocation_id];node=trace._nodes[writer]
+                trace._nodes[writer]=node.with_attributes({**node.attributes,
+                    'source_component':'vllm_0_30_RequestState_SamplingStates_constructor','source_dummy_run':True,
+                    'source_operation':'torch_zeros','physical_UVA_mapping_bound':False})
+    else:
+        shared=prior_buffers.shared;context_slots=prior_buffers.context_slots;query_slots=prior_buffers.query_slots;tables=prior_buffers.table_ports
+        attention_ports=prior_buffers.attention_ports
+        input_values=prior_buffers.input_token_values;position_values=prior_buffers.position_values
+    return shared,context_slots,query_slots,tables,attention_ports,input_values,position_values
+
+
+def dspark_prepare_inputs_forward(trace, plan, *, request_state, sampler_output, target_positions,
+        target_query_start_loc, idx_mapping, temperature, seeds, hidden_size, noise_token_id,
+        step_id, pool_name, prior_buffers=None, _preflight_only=False, _allocate_only=False):
+    """Actual shared prepare buffers, one kernel per declared cache group.
+
+    Input ID/position constructor zeros are explicit. The rest of constructor
+    setup and block-table staging remain external. Buffers retain genuine
+    active/padding write regions; no CG replay is claimed.
+    """
+    if (type(_preflight_only) is not bool or type(_allocate_only) is not bool or _allocate_only and _preflight_only
+            or type(request_state) is not _VLLM030PostUpdateState or request_state.trace is not trace):
+        raise ValueError('DSpark prepare requires its actual post_update state and preflight mode')
+    validate_dspark_prepare_ports(trace,plan,state_indices=request_state.state_indices,target_positions=target_positions,
+        target_query_start_loc=target_query_start_loc,idx_mapping=idx_mapping,temperature=temperature,seeds=seeds,
+        hidden_size=hidden_size,noise_token_id=noise_token_id,step_id=step_id,pool_name=pool_name,prior_buffers=prior_buffers)
+    max_requests,max_tokens,max_len,capacity,N=plan['limits'];batch=len(plan['target_query_lengths']);physical=sum(plan['target_query_lengths'])
+    if ('_v2_post_update_state' not in vars(trace) or trace._v2_post_update_state is not request_state
+            or request_state.computed_lengths!=plan['contexts'] or request_state.limits[0]!=max_requests
+            or request_state.limits[1]!=max_len or sampler_output['declared_num_rejected']!=plan['rejected_counts']
+            or len(request_state.request_ids)!=batch):
+        raise ValueError('DSpark prepare contexts must match actual current post_update and sampler feedback')
+    if _preflight_only:return None
+    shared,context_slots,query_slots,tables,attention_ports,input_values,position_values=\
+        _dspark_prepare_storage(trace,plan,hidden_size,pool_name,prior_buffers)
+    if _allocate_only:
+        if prior_buffers is not None:return prior_buffers
+        state=_DSparkPrepareBuffers(trace,plan['limits'],hidden_size,plan['group_ids'],plan['layer_group_indices'],
+            plan['kernel_block_sizes'],shared,context_slots,query_slots,tables,(),attention_ports,input_values,position_values)
+        trace._dspark_prepare_buffers=state
+        return state
+    ports=dict(shared);query_rows=batch*N;op=SymbolicOperator(trace,'DFlash-prepare-inputs',pool_name)
+    # Values below describe the declared addresses/IDs of the symbolic program,
+    # never numerically inferred sampler outputs. A no-sample prefill anchor
+    # stays unknown until its actual staged input values are represented.
+    active_ids=tuple(token for row,ids in enumerate(request_state.declared_sampled_ids)
+        for token in ((ids[-1] if sampler_output['declared_num_sampled'][row] else None),*((noise_token_id,)*(N-1))))
+    input_values=(*active_ids,*input_values[query_rows:])
+    position_values=(*plan['query_positions'],*position_values[query_rows:])
+    for group,gid in enumerate(plan['group_ids']):
+        inputs=[target_positions,target_query_start_loc,idx_mapping,sampler_output['num_sampled'],sampler_output['num_rejected']]
+        for row,state in enumerate(request_state.state_indices):
+            if sampler_output['declared_num_sampled'][row]>0:inputs.append(request_state.last_sampled.narrow(0,state,1))
+            else:inputs.append(request_state.next_prefill_tokens.narrow(1,state,1))
+            inputs.extend((temperature.narrow(0,state,1),seeds.narrow(0,state,1)))
+            # Only valid context/query columns are read. Null/short columns
+            # were rejected by the pure no-eviction/no-clamp plan.
+            start=sum(plan['target_query_lengths'][:row]);valid=plan['target_query_lengths'][row]-plan['rejected_counts'][row]
+            accessed=sorted({pos//plan['kernel_block_sizes'][group] for pos in
+                (*plan['target_positions'][start:start+valid],*range(plan['contexts'][row],plan['contexts'][row]+N))})
+            inputs.extend(tables[group].narrow(0,row,1).narrow(1,column,1) for column in accessed)
+        writes=[ports['input_ids'].narrow(0,0,query_rows),ports['positions'].narrow(0,0,query_rows),
+            ports['query_start'],ports['seq_lens'],context_slots[group].narrow(0,0,physical),
+            ports['context_positions'].narrow(0,0,physical),query_slots[group],
+            ports['sample_indices'],ports['sample_pos'],ports['sample_idx_mapping']]
+        writes.extend(port.narrow(0,state,1) for port in (ports['temperature'],ports['seeds']) for state in request_state.state_indices)
+        node=op.node(WorkloadKind.VECTOR,{'rows':batch,'elements':physical+query_rows},'int32','dspark_prepare_inputs',{
+            'source_component':'vllm_0_30_prepare_dflash_inputs','source_operation':'prepare_inputs','source_projection_only':True,
+            'group_id':gid,'group_ordinal':group,'kernel_block_size':plan['kernel_block_sizes'][group],
+            'layer_group_indices':plan['layer_group_indices'],'grid':plan['source_grid'],'BLOCK_SIZE':plan['source_BLOCK_SIZE'],
+            'sample_from_anchor':True,'num_query_per_request':N,'CP_SIZE':1,'no_CG':True,
+            'context_positions':plan['context_positions'],'query_positions':plan['query_positions'],
+            'declared_query_input_ids':active_ids,'retained_input_tail_start':query_rows,
+            'input_ID_position_constructor_bound':True,
+            'context_slots':plan['context_slots_by_group'][group],'query_slots':plan['query_slots_by_group'][group],
+            'query_slot_padding':(query_rows,max_tokens,-1),'sample_padding':(query_rows,max_requests*N,0,0,-1),
+            'seq_lens_padding':(batch,max_requests,0),'query_start_padding':(batch,max_requests+1,query_rows),
+            'sample_position_rule':'raw_query_pos+1','sample_idx_mapping_dtype':'int32',
+            'slot_mapping_scope':'explicit source block-table projection; native physical pages unbound',
+            'source_constructor_and_table_staging_bound':False,'normal_capacity_accepted':False,'values_computed':False})
+        trace.call_effect(node,tuple(inputs),writes=tuple(writes))
+    state=_DSparkPrepareBuffers(trace,plan['limits'],hidden_size,plan['group_ids'],plan['layer_group_indices'],
+        plan['kernel_block_sizes'],shared,context_slots,query_slots,tables,
+        (step_id,) if prior_buffers is None else (*prior_buffers.step_ids,step_id),attention_ports,input_values,position_values)
+    trace._dspark_prepare_buffers=state
+    return state
+
+
+def validate_dspark_idle_request_state(trace,state,temperature,seeds):
+    if (type(state) is not _VLLM030PostUpdateState or state.trace is not trace
+            or '_v2_post_update_state' not in vars(trace) or trace._v2_post_update_state is not state
+            or set(state.request_ids)!=set(state.finished_request_ids)
+            or len(state.last_sampled_values)!=state.limits[0]
+            or type(state.last_sampled_values[0]) is not int or not 0<=state.last_sampled_values[0]<state.limits[2]):
+        raise ValueError('DSpark idle requires finished retained state with known last-sampled row0')
+    for port,shape,dtype in ((state.last_sampled,(state.limits[0],1),'int64'),
+            (temperature,(state.limits[0],),'fp32'),(seeds,(state.limits[0],),'int64')):
+        trace._check_tensor(port)
+        if port.shape!=shape or port.dtype!=dtype or not port.is_contiguous:
+            raise ValueError('DSpark retained idle state/sampling ports changed their native capacity or dtype')
+    if (state.last_sampled.view.allocation_id not in trace._persistent_ids
+            or trace._allocations[state.last_sampled.view.allocation_id].freed_event is not None
+            or trace._writers[state.last_sampled.view.allocation_id] is None):
+        raise ValueError('DSpark retained idle last-sampled backing is no longer live')
+    return state.last_sampled_values[0]
+
+
+def dspark_dummy_prepare_inputs_forward(trace,plan,*,target_positions,target_query_start_loc,idx_mapping,
+        hidden_size,noise_token_id,step_id,pool_name,prior_buffers=None,_allocate_only=False,
+        request_state=None,temperature=None,seeds=None):
+    """Real dummy propose counters/prepare; it does not call post_update.
+
+    Never-admitted workers read constructor cells. Admitted workers read the
+    original request/sampling state row0, including historical nonzero IDs.
+    """
+    if (type(plan) is not dict or 'dummy_run' not in plan or plan['dummy_run'] is not True
+            or type(_allocate_only) is not bool or type(noise_token_id) is not int or noise_token_id<0):
+        raise ValueError('DSpark dummy preparation requires its explicit null-table zero-state source plan')
+    for port,shape,dtype in ((target_positions,(6,),'int64'),(target_query_start_loc,(2,),'int32'),(idx_mapping,(1,),'int64')):
+        trace._check_tensor(port)
+        if port.shape!=shape or port.dtype!=dtype:
+            raise ValueError('DSpark dummy target input metadata differs from its actual six-row source')
+    maximum,tokens,length,capacity,N=plan['limits']
+    if request_state is None:
+        if temperature is not None or seeds is not None:
+            raise ValueError('DSpark idle sampling ports require their explicit retained request state')
+        anchor=0
+    else:
+        if prior_buffers is None or request_state.limits[0]!=maximum:
+            raise ValueError('DSpark admitted idle cannot replace its original preparation buffers or capacity')
+        anchor=validate_dspark_idle_request_state(trace,request_state,temperature,seeds)
+    shared,cslots,qslots,tables,attention,input_values,position_values=\
+        _dspark_prepare_storage(trace,plan,hidden_size,pool_name,prior_buffers)
+    ports=dict(shared)
+    if request_state is None:
+        if any(role not in ports for role in ('dummy-last-sampled','dummy-temperature','dummy-seeds')):
+            raise ValueError('DSpark admitted idle cannot invent replacement constructor-zero request state')
+        last=ports['dummy-last-sampled'];temperature=ports['dummy-temperature'];seeds=ports['dummy-seeds']
+    else:last=request_state.last_sampled
+    validate_dspark_prepare_ports(trace,plan,state_indices=(0,),target_positions=target_positions,
+        target_query_start_loc=target_query_start_loc,idx_mapping=idx_mapping,temperature=temperature,
+        seeds=seeds,hidden_size=hidden_size,noise_token_id=noise_token_id,step_id=step_id,
+        pool_name=pool_name,prior_buffers=prior_buffers)
+    if _allocate_only and prior_buffers is not None:return prior_buffers
+    steps=() if prior_buffers is None else prior_buffers.step_ids
+    if not _allocate_only:
+        op=SymbolicOperator(trace,'DSpark-dummy-propose',pool_name)
+        counters=[]
+        for role,value in (('sampled',1),('rejected',0)):
+            port=trace.tensor(trace.unique_name('dummy-'+role),(1,),'int32')
+            node=op.node(WorkloadKind.ELEMENTWISE,{'elements':1},'int32','elementwise',{
+                'operation':'fill','reads':0,'writes':1,'source_constant':value,
+                'source_component':'vllm_0_30_dummy_propose_counters','source_dummy_run':True})
+            trace.call(node,(),shape=(1,),dtype='int32',out=port);counters.append(port)
+        for group,gid in enumerate(plan['group_ids']):
+            zero=SymbolicOperator(trace,f'DSpark-dummy-table-{gid}',pool_name)
+            active_table=tables[group].narrow(0,0,1)
+            node=zero.node(WorkloadKind.ELEMENTWISE,{'elements':tables[group].shape[1]},'int32','elementwise',{
+                'operation':'fill','reads':0,'writes':1,'source_constant':0,'source_dummy_run':True,
+                'source_component':'vllm_0_30_dummy_BlockTables'})
+            trace.call(node,(),shape=active_table.shape,dtype='int32',out=active_table)
+            writes=(ports['input_ids'].narrow(0,0,N),ports['positions'].narrow(0,0,N),ports['query_start'],
+                ports['seq_lens'],cslots[group].narrow(0,0,6),ports['context_positions'].narrow(0,0,6),qslots[group],
+                ports['sample_indices'],ports['sample_pos'],ports['sample_idx_mapping'],
+                ports['temperature'].narrow(0,0,1),ports['seeds'].narrow(0,0,1))
+            node=op.node(WorkloadKind.VECTOR,{'rows':1,'elements':6+N},'int32','dspark_prepare_inputs',{
+                'source_component':'vllm_0_30_prepare_dflash_inputs','source_operation':'prepare_inputs',
+                'source_dummy_run':True,'group_id':gid,'group_ordinal':group,'grid':plan['source_grid'],
+                'BLOCK_SIZE':plan['source_BLOCK_SIZE'],'num_query_per_request':N,'sample_from_anchor':True,
+                'query_positions':plan['query_positions'],'context_positions':plan['context_positions'],
+                'declared_query_input_ids':(anchor,*((noise_token_id,)*(N-1))),
+                'idle_request_state_source':'never_admitted_constructor' if request_state is None else 'retained_request_state',
+                'context_slots':plan['context_slots_by_group'][group],'query_slots':plan['query_slots_by_group'][group],
+                'query_slot_padding':(N,tokens,-1),'native_request_post_update_called':False,
+                'normal_capacity_accepted':False,'source_projection_only':True})
+            trace.call_effect(node,(target_positions,target_query_start_loc,idx_mapping,*counters,last.narrow(0,0,1),
+                temperature.narrow(0,0,1),seeds.narrow(0,0,1),tables[group]),writes=writes)
+        input_values=(anchor,*((noise_token_id,)*(N-1)),*input_values[N:])
+        position_values=(*plan['query_positions'],*position_values[N:]);steps=(*steps,step_id)
+    buffers=_DSparkPrepareBuffers(trace,plan['limits'],hidden_size,plan['group_ids'],plan['layer_group_indices'],
+        plan['kernel_block_sizes'],shared,cslots,qslots,tables,steps,attention,input_values,position_values)
+    trace._dspark_prepare_buffers=buffers
+    return buffers
+
+
+def dspark_attention_metadata_forward(trace, buffers, plan, *, step_id, pool_name):
+    """Build active sparse-SWA request mapping and validity on owned buffers.
+
+    The no-CG profile has no attention-token padding. Constructor initialization,
+    native metadata-builder selection and ATen internal workspace remain unbound.
+    """
+    from .workload_graph import WorkloadEdge
+    if (not isinstance(trace,ForwardTrace) or trace._recorded_graph is not None
+            or type(buffers) is not _DSparkPrepareBuffers or buffers.trace is not trace
+            or '_dspark_prepare_buffers' not in vars(trace) or trace._dspark_prepare_buffers is not buffers
+            or type(step_id) is not str or not step_id or not buffers.step_ids or buffers.step_ids[-1]!=step_id
+            or type(pool_name) is not str or not pool_name or type(plan) is not dict):
+        raise ValueError('DSpark attention metadata requires its current completed prepare revision')
+    fields=('dummy_run','target_query_lengths','target_positions','rejected_counts','group_ids','layer_group_indices',
+        'kernel_block_sizes','block_table_ids','limits')
+    if any(key not in plan for key in fields) or type(plan['limits']) is not tuple or len(plan['limits'])!=5:
+        raise ValueError('DSpark attention metadata requires its complete validated prepare plan')
+    maximum,tokens,length,capacity,N=plan['limits']
+    expected=dspark_prepare_input_plan(**{key:plan[key] for key in fields if key!='limits'},
+        max_requests=maximum,max_tokens=tokens,max_model_len=length,cache_capacity_tokens=capacity,num_query_per_request=N)
+    if (plan!=expected or buffers.limits!=plan['limits'] or buffers.group_ids!=plan['group_ids']
+            or buffers.layer_group_indices!=plan['layer_group_indices'] or buffers.kernel_block_sizes!=plan['kernel_block_sizes']
+            or len(buffers.attention_ports)!=len(buffers.group_ids) or len(buffers.query_slots)!=len(buffers.group_ids)):
+        raise ValueError('DSpark attention metadata differs from its current prepare groups and limits')
+    batch=len(plan['target_query_lengths']);rows=batch*N;ports=dict(buffers.shared)
+    starts=ports['query_start']
+    for port,shape,dtype in ((starts,(maximum+1,),'int32'),
+            *((slot,(tokens,),'int64') for slot in buffers.query_slots),
+            *((port,(tokens,),dtype) for pair in buffers.attention_ports for port,dtype in zip(pair,('int32','bool'),strict=True))):
+        trace._check_tensor(port)
+        if (port.shape!=shape or port.dtype!=dtype or not port.is_contiguous
+                or port.view.allocation_id not in trace._persistent_ids
+                or trace._allocations[port.view.allocation_id].freed_event is not None):
+            raise ValueError('DSpark attention metadata requires its live typed persistent buffers')
+    for slot,pair in zip(buffers.query_slots,buffers.attention_ports,strict=True):
+        writer=trace._writers[slot.view.allocation_id]
+        if writer is None or trace._nodes[writer].attributes['source_component']!='vllm_0_30_prepare_dflash_inputs':
+            raise ValueError('DSpark attention metadata requires actual prepared query slots')
+        for port in pair:
+            writer=trace._writers[port.view.allocation_id]
+            if writer is not None and trace._nodes[writer].attributes['source_step_id']==step_id:
+                raise ValueError('DSpark attention metadata was already built for this prepare step')
+    op=SymbolicOperator(trace,'DSpark-attention-metadata',pool_name);result=[];previous=None
+    for gid,slot,(mapping,validity) in zip(buffers.group_ids,buffers.query_slots,buffers.attention_ports,strict=True):
+        active_mapping=mapping.narrow(0,0,rows);active_validity=validity.narrow(0,0,rows)
+        attrs={'source_component':'vllm_0_30_dspark_attention_metadata','source_step_id':step_id,
+            'group_id':gid,'source_projection_only':True,'native_provider_bound':False,
+            'source_constructor_bound':False,'normal_capacity_accepted':False,'values_computed':False}
+        node=op.node(WorkloadKind.VECTOR,{'elements':rows,'rows':rows},'int32','dspark_token_request_mapping',{
+            **attrs,'source_operation':'token_request_mapping','grid':(-(-rows//256),),'BLOCK_SIZE':256,
+            'num_warps':4,'num_requests':batch,'num_mapped_tokens':rows,'num_output_tokens':rows,
+            'boundary_search':'device_query_start_loc','fixed_kernel_launch':True})
+        current=trace.call_effect(node,(starts.narrow(0,0,batch+1),),writes=(active_mapping,))
+        if previous is not None:trace._edges.append(WorkloadEdge(previous,current,'barrier'))
+        node=op.node(WorkloadKind.VECTOR,{'elements':rows,'rows':rows},'int64','dspark_slot_validity',{
+            **attrs,'source_operation':'slot_mapping_ge_zero','source_scalar':0,'fixed_kernel_launch':False,
+            'ATen_internal_launch_and_workspace_bound':False})
+        predicate=trace.call(node,(slot.narrow(0,0,rows),),shape=(rows,),dtype='bool',controls=(active_mapping,))
+        node=op.node(WorkloadKind.VECTOR,{'elements':rows,'rows':rows},'bool','dspark_validity_copy',{
+            **attrs,'source_operation':'validity_copy','fixed_kernel_launch':False,
+            'ATen_internal_launch_and_workspace_bound':False})
+        previous=trace.call_effect(node,(predicate,),writes=(active_validity,))
+        del predicate
+        result.append((active_mapping,active_validity))
+    return tuple(result)

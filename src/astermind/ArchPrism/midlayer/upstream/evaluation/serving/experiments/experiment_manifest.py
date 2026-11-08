@@ -8,6 +8,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 from typing import Any
 
 import yaml
@@ -117,7 +118,7 @@ class ManifestValidationError(ValueError):
 @dataclass(frozen=True)
 class ExperimentManifest:
     version: int
-    cells: list["ExperimentCell | ProductionTraceSweepCell"]
+    cells: list["ExperimentCell | ProductionTraceSweepCell | SimulationCell"]
     path: Path
     source_sha256: str
     case_manifest_path: Path | None
@@ -175,6 +176,14 @@ class ProductionTraceSweepCell:
     analysis: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class SimulationCell:
+    """A CPU simulation using the existing simulator's option contract."""
+
+    id: str
+    options: dict[str, Any]
+
+
 def load_experiment_manifest(
     path: str | Path,
     project_root: str | Path | None = None,
@@ -210,8 +219,49 @@ def load_experiment_manifest(
     if version in (2, 3, 4, 5, 6, 7, 8):
         return _load_production_trace_experiment_manifest(
             raw, manifest_path, source_sha256, project_root_path, version)
+    if version == 9:
+        return _load_simulation_experiment_manifest(raw, manifest_path, source_sha256)
     raise ManifestValidationError(
-        "version must be 1, 2, 3, 4, 5, 6, 7, or 8")
+        "version must be 1, 2, 3, 4, 5, 6, 7, 8, or 9")
+
+
+def _load_simulation_experiment_manifest(
+    raw: dict[str, Any], manifest_path: Path, source_sha256: str,
+) -> ExperimentManifest:
+    _require_exact_fields(raw, {"version", "cells"}, "manifest v9")
+    raw_cells = raw["cells"]
+    if not isinstance(raw_cells, list) or not raw_cells:
+        raise ManifestValidationError("manifest v9 cells must be a non-empty list")
+    cells = []
+    for index, item in enumerate(raw_cells):
+        label = f"manifest v9 cells[{index}]"
+        if not isinstance(item, dict):
+            raise ManifestValidationError(f"{label} must be an object")
+        _require_exact_fields(item, {"id", "simulation"}, label)
+        cell_id = _require_non_empty_str(item, "id", label)
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", cell_id) is None:
+            raise ManifestValidationError(f"{label}.id must be a safe path component")
+        options = item["simulation"]
+        if not isinstance(options, dict) or not options:
+            raise ManifestValidationError(f"{label}.simulation must be a non-empty object")
+        for key in options:
+            if key.startswith("no-") and key[3:] in options:
+                raise ManifestValidationError(
+                    f"{label}: conflicting options {key!r} and {key[3:]!r}")
+        for key, value in options.items():
+            if re.fullmatch(r"[a-z][a-z0-9-]*", key) is None or key in ("output", "settings-summary", "quiet"):
+                raise ManifestValidationError(f"{label}: invalid or reserved option {key!r}")
+            if value is None:
+                continue
+            if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+                continue
+            if (isinstance(value, list) and value
+                    and all(isinstance(v, (str, int, float)) and not isinstance(v, bool) for v in value)):
+                continue
+            raise ManifestValidationError(f"{label}: option {key!r} requires a scalar, non-empty scalar list, or null flag")
+        cells.append(SimulationCell(cell_id, dict(options)))
+    _validate_unique_cells(cells)
+    return ExperimentManifest(9, cells, manifest_path, source_sha256, None)
 
 
 def _load_v1_experiment_manifest(
@@ -1835,7 +1885,7 @@ def _hardware_config_path(hardware_id: Any, project_root: Path) -> Path:
 
 
 def _validate_unique_cells(
-    cells: list[ExperimentCell | ProductionTraceSweepCell],
+    cells: list[ExperimentCell | ProductionTraceSweepCell | SimulationCell],
 ) -> None:
     seen_ids: set[str] = set()
     for cell in cells:

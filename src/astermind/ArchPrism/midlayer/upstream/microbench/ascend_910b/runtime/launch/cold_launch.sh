@@ -7,7 +7,7 @@
 # launch.  Each invocation below contributes one cold launch followed by
 # warm repeats of the identical cell, so the pair is measured at fixed
 # geometry, element count and iteration count.
-BIN=/mnt/gpfs/midlayer_yxh/round8_icache/build/vector_opcode_bench
+BIN=${MIDLAYER_ASCEND_VECTOR_OPCODE_BIN:?set MIDLAYER_ASCEND_VECTOR_OPCODE_BIN}
 for i in $(seq 1 20); do
   $BIN --batch 21 1024 48 1 21 1024 48 1 21 1024 48 1 > /dev/null 2>&1 || true
 done

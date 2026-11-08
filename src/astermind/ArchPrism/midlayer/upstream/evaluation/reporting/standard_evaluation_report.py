@@ -61,6 +61,8 @@ MIDLAYER_WALL_TIME_PHASES = (
 def write_kernel_evaluation_report(
     output_path: str | Path,
     state_value: Mapping[str, object],
+    *,
+    with_html: bool = False,
 ) -> float:
     """Validate and write the standalone Kernel evaluation report."""
 
@@ -91,11 +93,16 @@ def write_kernel_evaluation_report(
     lines = _render_kernel_markdown(
         output, state, kernel, kernel_payload, traffic_payload,
         report_assembly_wall_time_s=0.0,
+        with_html=with_html,
     )
+    if with_html:
+        from evaluation.reporting.kernel_overview import write_kernel_matrix_overview
+        write_kernel_matrix_overview(kernel_payload, {"state": state, "kernel": kernel}, output.with_suffix(".html"))
     assembly_wall = time.perf_counter() - started
     lines = _render_kernel_markdown(
         output, state, kernel, kernel_payload, traffic_payload,
         report_assembly_wall_time_s=assembly_wall,
+        with_html=with_html,
     )
     _write_markdown_atomic(output, lines)
     return time.perf_counter() - started
@@ -109,15 +116,30 @@ def write_serving_evaluation_report(
     refresh_latency_plots: bool = False,
 ) -> float:
     """Validate and write the standalone full-only Serving report."""
-
     started = time.perf_counter()
+    state = _validate_state(state_value)
+    serving = _validate_component(state["serving"], "serving")
+    payload = json.loads(Path(str(serving["result_path"])).read_text())
+    return _write_serving_evaluation_report_payload(output_path, state_value, payload,
+        started=started, llmservingsim_results=llmservingsim_results,
+        refresh_latency_plots=refresh_latency_plots)
+
+
+def _write_serving_evaluation_report_payload(
+    output_path: str | Path,
+    state_value: Mapping[str, object],
+    serving_payload: Mapping[str, object],
+    *,
+    started: float,
+    llmservingsim_results: Path | None = None,
+    refresh_latency_plots: bool = False,
+) -> float:
+    """Validate and write the standalone full-only Serving report."""
+
     output = Path(output_path).resolve()
     state = _validate_state(state_value)
     serving = _validate_component(state["serving"], "serving")
-    serving_payload = _mapping(
-        json.loads(Path(str(serving["result_path"])).read_text()),
-        "Serving result",
-    )
+    serving_payload = _mapping(serving_payload, "Serving result")
     cells = _sequence(serving_payload["cells"], "Serving cells")
     if not cells:
         raise ValueError("standard report requires at least one Serving cell")
@@ -292,10 +314,19 @@ def _render_kernel_markdown(
     traffic_payload: Mapping[str, object],
     *,
     report_assembly_wall_time_s: float,
+    with_html: bool = False,
 ) -> list[str]:
-    return [
+    header = [
         "# Midlayer Single-kernel Forward 标准评估报告",
         "",
+    ]
+    if with_html:
+        header += [
+            "离线 Kernel 概要：[HTML](" + str(output.with_suffix(".html")) + ")",
+            "",
+        ]
+    return [
+        *header,
         f"生成时间：`{state['generated_at']}`；Kernel 结果时间：`{kernel['generated_at']}`；源码 commit：`{kernel['source_commit']}`。",
         "",
         "## Kernel dataset 运行时间",
@@ -325,8 +356,14 @@ def _render_kernel_markdown(
         "",
         *_kernel_traffic_exclusion_note(traffic_payload),
         *_kernel_launch_only_traffic_note(kernel_payload),
-        f"![三硬件 L2 与 HBM memory traffic 预测-实测散点]({_relative(output, kernel['traffic_plot_path'])})",
-        "",
+        *(
+            [f"![三硬件 L2 与 HBM memory traffic 预测-实测散点]({_relative(output, kernel['traffic_plot_path'])})",
+             ""]
+            if Path(str(kernel["traffic_plot_path"])).is_file() else
+            ["本报告为 report-only 重建，输入 semantic artifact 未保留 per-kernel L2/HBM counter "
+             "mechanisms，traffic 图需要 `capture_mechanisms=True` 的原始采集运行，本次不生成该图。",
+             ""]
+        ),
         "## 可复核产物",
         "",
         f"- Kernel 结构化结果：`{kernel['result_path']}`",
@@ -377,7 +414,7 @@ def _render_serving_markdown(
         "",
         *_serving_summary_table(normalized_cells),
         "",
-        "Dev-only 列统计 completed 中 `accuracy_claim_status=unsupported_development_only` 的 case：collective 计时模型本身是生产 ProtoBridge 解析模型，但三硬件的通信 profile 是显式 non-production 的 development 参数（语义映射 gap 清单见 `profiler_output/collective/protobridge_mapping_gaps_20260827.json`），精度解释因此受限；Failed 列为执行失败的 case，Unsupported 列仅统计明确不支持的 case；两者均不进入精度指标。",
+        "Scored / completed 是精度汇总的实际分母：全部 completed case 都参与统计，各 case 的逐请求配对 MAPE 等权平均。采集差异超过 5% 仅作诊断标签，不阻止运行、不排除 case；历史采集校验结论保留，不改写真值或原 passed 标记。Dev-only 列统计 completed 中 `accuracy_claim_status=unsupported_development_only` 的 case：collective 计时模型本身是生产 ProtoBridge 解析模型，但三硬件的通信 profile 是显式 non-production 的 development 参数（语义映射 gap 清单见 `profiler_output/collective/protobridge_mapping_gaps_20260827.json`），精度解释因此受限；Failed 列为执行失败的 case，Unsupported 列仅统计明确不支持的 case；两者均不进入精度指标。",
         "",
         f"![三硬件 full Serving 总览]({_relative(output, serving_root / 'plots/three_hardware_serving_overview.png')})",
         "",
@@ -386,6 +423,14 @@ def _render_serving_markdown(
         *_wall_time_table(normalized_cells),
         "",
     ]
+    links = []
+    for cell in normalized_cells:
+        if "interactive_report" in cell:
+            receipt = cell["interactive_report"]
+            if "path" in receipt:
+                links.append("| " + str(cell["cell_id"]) + " | [HTML](" + _relative(output, Path(str(receipt["path"]))) + ") |")
+    if links:
+        lines.extend(["## 离线交互报告", "", "| Case | Report |", "|---|---|", *links, ""])
     if baseline_statuses is not None:
         available = sum(entry["status"] == "available" for entry in baseline_statuses.values())
         lines.extend((
@@ -658,8 +703,9 @@ def _kernel_launch_only_traffic_note(
         return []
     return [
         "、".join(present)
-        + " 的 kernel 记录只有 NSYS launch 事实（无 Nsight Compute L2/HBM "
-        "counter），没有可比较的实测 traffic，因此不出现在本表与本图中。",
+        + " 的 kernel 记录以 NSYS launch 事实为基础，部分记录已附 "
+        "Nsight Compute counter sidecar。当前 standard traffic evaluation "
+        "尚未消费这些 sidecar，因此暂不出现在本表与本图中。",
         "",
     ]
 
@@ -673,8 +719,8 @@ def _serving_prediction_status(cell: Mapping[str, object]) -> str:
 
 def _serving_summary_table(cells: Sequence[Mapping[str, object]]) -> list[str]:
     lines = [
-        "| Hardware | Completed / total | Dev-only | Failed | Unsupported | Req/s MAPE | TTFT paired MAPE | TPOT paired MAPE |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|",
+        "| Hardware | Completed / total | Scored / completed | Observer Δ>5% | Dev-only | Failed | Unsupported | Req/s MAPE | TTFT paired MAPE | TPOT paired MAPE |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for hardware_id in SERVING_HARDWARE_ORDER:
         selected = [cell for cell in cells if cell["hardware_id"] == hardware_id]
@@ -682,6 +728,8 @@ def _serving_summary_table(cells: Sequence[Mapping[str, object]]) -> list[str]:
             continue
         statuses = [_serving_prediction_status(cell) for cell in selected]
         completed = [cell for cell in selected if cell["prediction_status"] == "completed"]
+        scored = completed
+        provisional = sum(bool(_observer_delta_metrics(cell)) for cell in completed)
         dev_only = sum(
             1
             for cell in completed
@@ -692,12 +740,12 @@ def _serving_summary_table(cells: Sequence[Mapping[str, object]]) -> list[str]:
         if not completed:
             lines.append(
                 f"| {HARDWARE_LABELS[hardware_id]} | 0 / {len(selected)} | "
-                f"0 | {failed} | {unsupported} | Err | Err | Err |"
+                f"0 / 0 | 0 | 0 | {failed} | {unsupported} | Err | Err | Err |"
             )
             continue
         throughput_errors = []
         latency_errors = {"ttft_ms": [], "tpot_ms": []}
-        for cell in completed:
+        for cell in scored:
             metrics = _mapping(cell["metrics"], "Serving metrics")
             throughput = _mapping(metrics["throughput"], "Serving throughput")
             request_rate = _mapping(
@@ -714,7 +762,8 @@ def _serving_summary_table(cells: Sequence[Mapping[str, object]]) -> list[str]:
                 ))
         lines.append(
             f"| {HARDWARE_LABELS[hardware_id]} | {len(completed)} / "
-            f"{len(selected)} | {dev_only} | {failed} | {unsupported} | "
+            f"{len(selected)} | {len(scored)} / {len(completed)} | "
+            f"{provisional} | {dev_only} | {failed} | {unsupported} | "
             f"{fmean(throughput_errors):.2f}% | "
             f"{fmean(latency_errors['ttft_ms']):.2f}% | "
             f"{fmean(latency_errors['tpot_ms']):.2f}% |"
@@ -768,8 +817,20 @@ _ACCURACY_CLAIM_LABELS = {
     "supported_for_accuracy_interpretation": "OK",
     "unsupported_development_only": "Dev-only",
     "debug_capacity_not_for_accuracy": "Debug-capacity",
+    "provisional_observer_effect": "Observer diagnostic",
 }
 _CAPTURE_DELTA_OMITTED_FIELDS = frozenset({"source_commit"})
+
+
+def _observer_delta_metrics(cell: Mapping[str, object]) -> tuple[str, ...] | None:
+    if "observation_quality" not in cell:
+        return None
+    quality = _mapping(cell["observation_quality"], "Serving observation quality")
+    if "metric_delta_percent" not in quality or quality["metric_delta_percent"] is None:
+        return None
+    deltas = _mapping(quality["metric_delta_percent"], "observer effect deltas")
+    return tuple(sorted(name for name, value in deltas.items()
+                        if _finite(value, f"observer delta {name}") > 5.0))
 
 
 def _capture_delta(cell: Mapping[str, object]) -> str:
@@ -788,8 +849,8 @@ def _capture_delta(cell: Mapping[str, object]) -> str:
 
 def _serving_case_table(cells: Sequence[Mapping[str, object]]) -> list[str]:
     lines = [
-        "| Model / case | Status | Req/s pred/measured | TTFT signed error | TPOT signed error | TTFT paired MAPE | TPOT paired MAPE | Capture Δ |",
-        "|---|---|---:|---:|---:|---:|---:|---|",
+        "| Model / case | Status | Observer Δ (5% label) | Req/s pred/measured | TTFT signed error | TPOT signed error | TTFT paired MAPE | TPOT paired MAPE | Capture Δ |",
+        "|---|---|---|---:|---:|---:|---:|---:|---|",
     ]
     for cell in cells:
         prediction_status = _serving_prediction_status(cell)
@@ -798,13 +859,19 @@ def _serving_case_table(cells: Sequence[Mapping[str, object]]) -> list[str]:
             label = "Failed" if prediction_status == "failed" else "Unsupported"
             lines.append(
                 f"| `{cell['model_id']} / {cell['case_id']}` | "
-                f"{label}: {reason} | Err | Err | Err | Err | Err | — |"
+                f"{label}: {reason} | — | Err | Err | Err | Err | Err | — |"
             )
             continue
         claim = str(cell["accuracy_claim_status"])
         if claim not in _ACCURACY_CLAIM_LABELS:
             raise ValueError(f"unknown accuracy claim status: {claim!r}")
         status = _ACCURACY_CLAIM_LABELS[claim]
+        observer_metrics = _observer_delta_metrics(cell)
+        quality_text = (
+            "legacy" if observer_metrics is None
+            else "Δ≤5%" if not observer_metrics
+            else "Δ>5%: " + ", ".join(observer_metrics)
+        )
         capture_delta = _capture_delta(cell)
         metrics = _mapping(cell["metrics"], "Serving metrics")
         throughput = _mapping(
@@ -834,7 +901,7 @@ def _serving_case_table(cells: Sequence[Mapping[str, object]]) -> list[str]:
             "TPOT MAPE",
         )
         lines.append(
-            f"| `{cell['model_id']} / {cell['case_id']}` | {status} | "
+            f"| `{cell['model_id']} / {cell['case_id']}` | {status} | {quality_text} | "
             f"{req_ratio:.3f}× | "
             f"{values[0]:+.2f}% | {values[1]:+.2f}% | "
             f"{ttft_mape:.2f}% | {tpot_mape:.2f}% | {capture_delta} |"

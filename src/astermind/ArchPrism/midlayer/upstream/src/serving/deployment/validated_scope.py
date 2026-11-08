@@ -48,7 +48,147 @@ from src.serving.workload.model_config import (
     is_validated_qwen3_moe_ep2_model_scope,
     is_validated_llama_tp2_model_scope,
     is_validated_qwen3_tp2_host_kv_model_scope,
+    is_dense_parallel_model_scope,
+    is_qwen3_moe_source_model_scope,
+    is_kimi_k2_parallel_model_scope,
 )
+
+
+def is_deepseek_parallel_source_scope(pool, model, *, model_execution_version, symbolic_forward_source, graph_enabled):
+    """Versioned complete V3/V4 target TP/DP/EP/PP source geometry only.
+
+    This admits source construction, without accepting operator prices,
+    native GPU workers, normal memory budgets or model accuracy.
+    """
+    from src.serving.workload.model_config import (is_deepseek_v3_parallel_model_scope,
+        is_deepseek_v3_data_parallel_model_scope, is_deepseek_v4_parallel_model_scope,
+        is_deepseek_v4_data_parallel_model_scope)
+    if not isinstance(model, ModelConfig) or type(graph_enabled) is not bool:
+        return False
+    config = pool.parallel_plan.config
+    if (graph_enabled or pool.hardware_id != "nvidia_h200" or pool.role != "colocated"
+            or len(pool.ranks) != config.worker_count or config.context_parallel_size != 1
+            or config.sequence_parallel_size != 1):
+        return False
+    if model.model_type == "deepseek_v3":
+        if model_execution_version != "vllm_0_27_1" or symbolic_forward_source != "vllm_0_27_1_deepseek_v3_sync_fp8":
+            return False
+        local, distributed = is_deepseek_v3_parallel_model_scope, is_deepseek_v3_data_parallel_model_scope
+    elif model.model_type == "deepseek_v4":
+        if model_execution_version != "vllm_0_30_0" or symbolic_forward_source != "vllm_0_30_v4_sync_fp8_ds_mla":
+            return False
+        local, distributed = is_deepseek_v4_parallel_model_scope, is_deepseek_v4_data_parallel_model_scope
+    else:
+        return False
+    return (distributed(model, config) if config.data_parallel_size > 1 else
+        local(model, config.tensor_parallel_size, config.pipeline_parallel_size, expert_parallel=config.enable_expert_parallel))
+
+
+def is_kimi_k3_runtime_source_scope(pool, model, runtime_inputs):
+    """K3 ordinary source geometry and explicit tier, not GPU acceptance."""
+    from src.serving.workload.runtime_inputs import RuntimeInputs
+    from src.serving.workload.model_config import is_kimi_k3_parallel_model_scope, is_kimi_k3_data_parallel_model_scope
+    if not isinstance(runtime_inputs, RuntimeInputs) or not isinstance(model, ModelConfig):
+        return False
+    config = pool.parallel_plan.config
+    if (model.model_type!='kimi_linear' or model.kimi_k3_semantics is None
+            or pool.hardware_id != "nvidia_h200" or pool.role != "colocated" or len(pool.ranks) != config.worker_count
+            or config.context_parallel_size != 1 or config.sequence_parallel_size != 1
+            or pool.parallel_plan.num_layers != model.num_hidden_layers or pool.parallel_plan.num_experts != model.num_experts
+            or len(pool.parallel_plan.layer_to_pipeline_stage) != model.num_hidden_layers
+            or pool.parallel_plan.layer_to_pipeline_stage != tuple(sorted(pool.parallel_plan.layer_to_pipeline_stage))
+            or set(pool.parallel_plan.layer_to_pipeline_stage) != set(range(config.pipeline_parallel_size))
+            or runtime_inputs.model_execution_version != "vllm_0_30_0"
+            or runtime_inputs.symbolic_forward_source != "vllm_0_30_k3_mxfp4_sync"
+            or runtime_inputs.k3_kda_decode_backend=='native' and model.kimi_k3_semantics.kda_num_heads//config.tensor_parallel_size not in (12,24,48,96)
+            or runtime_inputs.graph_execution.enabled or runtime_inputs.mtp_draft_sampling_source is not None
+            or runtime_inputs.mtp_proposer_execution_source is not None):
+        return False
+    if config.data_parallel_size > 1:
+        return (is_kimi_k3_data_parallel_model_scope(model, config)
+            and (runtime_inputs.k3_latent_tail_tier is None if config.enable_expert_parallel
+                else runtime_inputs.k3_latent_tail_tier == "ALLREDUCE_OVERLAP"))
+    return (is_kimi_k3_parallel_model_scope(model, config.tensor_parallel_size, config.pipeline_parallel_size,
+                expert_parallel=config.enable_expert_parallel)
+        and (runtime_inputs.k3_latent_tail_tier is None if config.enable_expert_parallel or config.tensor_parallel_size == 1
+            else runtime_inputs.k3_latent_tail_tier in ("ALLREDUCE_OVERLAP", "COLUMN_PARALLEL")))
+
+
+def is_dspark_runtime_source_scope(pool, model, runtime_inputs):
+    from src.serving.workload.model_config import is_deepseek_v4_parallel_model_scope, is_deepseek_v4_data_parallel_model_scope
+    config = pool.parallel_plan.config
+    mapping = pool.parallel_plan.layer_to_pipeline_stage
+    return (pool.hardware_id == "nvidia_h200" and pool.role == "colocated"
+        and runtime_inputs.symbolic_forward_source == "vllm_0_30_v4_dspark"
+        and not runtime_inputs.graph_execution.enabled and config.context_parallel_size == config.sequence_parallel_size == 1
+        and len(pool.ranks) == config.worker_count and pool.parallel_plan.num_layers == len(mapping) == model.num_hidden_layers
+        and pool.parallel_plan.num_experts == model.num_experts and mapping == tuple(sorted(mapping))
+        and set(mapping) == set(range(config.pipeline_parallel_size))
+        and (is_deepseek_v4_data_parallel_model_scope(model, config) if config.data_parallel_size > 1 else
+            is_deepseek_v4_parallel_model_scope(model, config.tensor_parallel_size, config.pipeline_parallel_size,
+                expert_parallel=config.enable_expert_parallel)))
+
+
+def is_dense_parallel_source_scope(pool, model, *, model_execution_version,
+                                   symbolic_forward_source, graph_enabled):
+    """General eager CUDA0.30 16-bit dense source; no provider acceptance.
+
+    TP/PP are checked by source geometry rather than a topology allowlist.
+    DP replicas are routed as separate pools by the existing deployment owner.
+    Captured and other vendor/version programs keep their existing gates.
+    """
+    config = pool.parallel_plan.config
+    return (model_execution_version == "vllm_0_30_0"
+        and symbolic_forward_source == "cuda_eager_inplace" and not graph_enabled
+        and pool.hardware_id in ("nvidia_a800", "nvidia_h200") and pool.role == "colocated"
+        and config.is_rank_local and not config.enable_expert_parallel
+        and len(pool.ranks) == config.worker_count
+        and model.compute_dtype == model.weight_dtype and model.compute_dtype in ("bf16", "fp16")
+        and is_dense_parallel_model_scope(model, config.tensor_parallel_size, config.pipeline_parallel_size))
+
+
+def is_kimi_k2_rank_local_source_scope(pool, model):
+    """Eager H200 K2 text source geometry; GPU provider remains unvalidated."""
+    config = pool.parallel_plan.config
+    pd_pool = (pool.role in ("prefill", "decode")
+        and config.tensor_parallel_size == config.expert_parallel_size == 8
+        and config.pipeline_parallel_size == 1 and config.enable_expert_parallel)
+    return (pool.hardware_id == "nvidia_h200" and (pool.role == "colocated" or pd_pool)
+        and config.is_rank_local and len(pool.ranks) == config.worker_count
+        and is_kimi_k2_parallel_model_scope(model, config.tensor_parallel_size,
+            config.pipeline_parallel_size, expert_parallel=config.enable_expert_parallel))
+
+
+
+def is_kimi_k2_data_parallel_source_scope(pool, model, *, model_execution_version, symbolic_forward_source, graph_enabled):
+    """Versioned eager K2 DP source geometry, separate from all pricing gates."""
+    from src.serving.workload.model_config import is_kimi_k2_data_parallel_model_scope
+    config = pool.parallel_plan.config
+    mapping = pool.parallel_plan.layer_to_pipeline_stage
+    return (type(graph_enabled) is bool and not graph_enabled
+        and model_execution_version == "vllm_0_30_0"
+        and symbolic_forward_source == "vllm_0_30_k2_6_int4_sync_explicit_allreduce"
+        and pool.hardware_id == "nvidia_h200" and pool.role == "colocated"
+        and len(pool.ranks) == config.worker_count and len(mapping) == model.num_hidden_layers
+        and mapping == tuple(sorted(mapping)) and set(mapping) == set(range(config.pipeline_parallel_size))
+        and is_kimi_k2_data_parallel_model_scope(model, config))
+
+def is_qwen3_moe_rank_local_source_scope(pool, model, *, model_execution_version,
+                                        symbolic_forward_source, graph_enabled):
+    """Ordinary CUDA0.30 expert TP or stage-local EP, with actual PP owners."""
+    from src.serving.parallelism.tp import validate_gqa_parallelism
+    config = pool.parallel_plan.config
+    if (model_execution_version != "vllm_0_30_0" or symbolic_forward_source != "cuda_eager_inplace"
+            or graph_enabled or not is_qwen3_moe_source_model_scope(model)
+            or pool.hardware_id not in ("nvidia_a800", "nvidia_h200") or pool.role != "colocated"
+            or config.tensor_parallel_size > model.num_experts
+            or not config.is_rank_local or len(pool.ranks) != config.worker_count):
+        return False
+    try:
+        validate_gqa_parallelism(model, config)
+    except ValueError:
+        return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -657,6 +797,153 @@ def is_validated_target_scheduler_scope(
     return False
 
 
+
+def is_glm_fp8_mtp_rank_local_source_scope(pool, model):
+    """Whole-block stage EP cache/source geometry for the declared MTP program."""
+    from src.serving.workload.model_config import is_glm_mtp_tensor_model_scope
+    config = pool.parallel_plan.config
+    mapping = pool.parallel_plan.layer_to_pipeline_stage
+    return (pool.hardware_id == "nvidia_h200" and pool.role == "colocated" and config.is_rank_local
+        and config.enable_expert_parallel and model.weight_dtype == "fp8"
+        and len(pool.ranks) == config.worker_count and pool.parallel_plan.num_experts == model.num_experts
+        and pool.parallel_plan.num_layers == model.num_hidden_layers == len(mapping)
+        and mapping == tuple(sorted(mapping)) and set(mapping) == set(range(config.pipeline_parallel_size))
+        and is_glm_mtp_tensor_model_scope(model, config.tensor_parallel_size, expert_parallel=True))
+
+
+def is_glm_fp8_rank_local_source_scope(pool, model: ModelConfig) -> bool:
+    """Ordinary FP8 TP/PP source, with whole quantization blocks and no EP."""
+    from src.serving.workload.model_config import is_glm_fp8_tensor_model_scope
+    config = pool.parallel_plan.config
+    mapping = pool.parallel_plan.layer_to_pipeline_stage
+    return (is_glm_fp8_tensor_model_scope(model, config.tensor_parallel_size)
+        and pool.hardware_id == "nvidia_h200" and config.is_rank_local and not config.enable_expert_parallel
+        and len(pool.ranks) == config.worker_count and len(mapping) == model.num_hidden_layers
+        and config.pipeline_parallel_size <= model.num_hidden_layers
+        and mapping == tuple(sorted(mapping)) and set(mapping) == set(range(config.pipeline_parallel_size)))
+
+
+def is_glm_fp8_data_parallel_source_scope(pool, model: ModelConfig) -> bool:
+    """Exact ordinary FP8 target DP placement; source/provider gates remain."""
+    from src.serving.workload.model_config import is_glm_fp8_data_parallel_model_scope
+    config = pool.parallel_plan.config
+    mapping = pool.parallel_plan.layer_to_pipeline_stage
+    return (pool.hardware_id == "nvidia_h200" and pool.role == "colocated"
+        and is_glm_fp8_data_parallel_model_scope(model, config)
+        and len(pool.ranks) == config.worker_count and pool.parallel_plan.num_experts == model.num_experts
+        and pool.parallel_plan.num_layers == len(mapping) == model.num_hidden_layers
+        and mapping == tuple(sorted(mapping)) and set(mapping) == set(range(config.pipeline_parallel_size)))
+
+
+def is_glm_bf16_tensor_source_scope(pool, model: ModelConfig) -> bool:
+    """Ordinary BF16 GLM source geometry, independent of a TP whitelist."""
+    config = pool.parallel_plan.config
+    return (model.model_type == "glm_moe_dsa" and model.compute_dtype == model.weight_dtype == "bf16"
+        and pool.hardware_id in ("nvidia_a800", "nvidia_h200")
+        and len(pool.ranks) == config.tensor_parallel_size and config.pipeline_parallel_size == 1
+        and config.is_rank_local
+        and not model.num_attention_heads % config.tensor_parallel_size
+        and not model.hidden_size % config.tensor_parallel_size
+        and not model.intermediate_size % config.tensor_parallel_size
+        and (config.enable_expert_parallel or not model.moe_intermediate_size % config.tensor_parallel_size))
+
+
+def is_glm_bf16_pipeline_source_scope(pool, model: ModelConfig) -> bool:
+    """Static placement domain; current attention-program dependencies are runtime checks."""
+    config = pool.parallel_plan.config
+    if (model.model_type != "glm_moe_dsa" or model.compute_dtype != model.weight_dtype or model.weight_dtype != "bf16"
+            or pool.hardware_id not in ("nvidia_a800", "nvidia_h200") or config.pipeline_parallel_size <= 1
+            or config.context_parallel_size != 1 or len(pool.ranks) != config.worker_count
+            or model.num_attention_heads % config.tensor_parallel_size or model.hidden_size % config.tensor_parallel_size
+            or model.intermediate_size % config.tensor_parallel_size
+            or (not config.enable_expert_parallel and model.moe_intermediate_size % (config.tensor_parallel_size * config.data_parallel_size))
+            or config.sequence_parallel_size not in ((1, config.tensor_parallel_size)
+                if config.enable_expert_parallel and config.data_parallel_size > 1 else (1,))):
+        return False
+    assignments = pool.parallel_plan.layer_to_pipeline_stage
+    for stage in range(config.pipeline_parallel_size):
+        layers = tuple(index for index, owner in enumerate(assignments) if owner == stage)
+        if not layers or layers != tuple(range(layers[0], layers[-1] + 1)):
+            return False
+    return True
+
+
+def is_glm_pcp_source_scope(pool, model: ModelConfig) -> bool:
+    return pool.parallel_plan.config.context_parallel_size > 1 and is_glm_distributed_source_scope(pool, model)
+
+
+def is_glm_distributed_source_scope(pool, model: ModelConfig) -> bool:
+    """Source-backed BF16 MLA PCP topology; no provider/runtime claim."""
+    config = pool.parallel_plan.config
+    return (model.model_type == "glm_moe_dsa" and model.attention_layout == "dsa_mla"
+        and model.compute_dtype == model.weight_dtype == "bf16"
+        and pool.hardware_id in ("nvidia_a800", "nvidia_h200")
+        and (config.context_parallel_size > 1 or config.data_parallel_size > 1)
+        and config.pipeline_parallel_size == 1
+        and (config.sequence_parallel_size == 1 and (not config.enable_expert_parallel or config.data_parallel_size == 1)
+            or config.enable_expert_parallel and config.data_parallel_size > 1
+                and config.sequence_parallel_size in (1, config.tensor_parallel_size))
+        and not model.num_attention_heads % config.tensor_parallel_size
+        and (config.enable_expert_parallel
+            or not model.moe_intermediate_size % (config.tensor_parallel_size * config.context_parallel_size * config.data_parallel_size))
+        and len(pool.ranks) == config.worker_count)
+
+
+def is_qwen3_moe_dp_sp_source_scope(pool, model: ModelConfig) -> bool:
+    """Ordinary0.30 DP source derives internal MoE SP from TP/DP/EP.
+
+    SP1 declares no independent sequence axis; the original explicit SP=TP
+    declaration is also supported. Partial SP subgroups are not this source.
+    """
+    config = pool.parallel_plan.config
+    tp, dp = config.tensor_parallel_size, config.data_parallel_size
+    return (model.model_type == "qwen3_moe" and model.attention_layout == "standard_gqa"
+        and model.compute_dtype == model.weight_dtype == "bf16" and model.num_shared_experts == model.num_dense_layers == 0
+        and model.num_mtp_layers == 0 and model.rope_scaling_type == "default" and model.hidden_act == "silu"
+        and dp > 1 and config.sequence_parallel_size in ((1, tp) if config.enable_expert_parallel else (1,))
+        and ((config.enable_expert_parallel and model.num_experts > 0)
+            or (not config.enable_expert_parallel and model.moe_intermediate_size % (tp * dp) == 0)) and config.context_parallel_size == 1
+        and config.pipeline_parallel_size <= model.num_hidden_layers
+        and len(pool.ranks) == config.worker_count
+        and model.num_attention_heads % tp == model.hidden_size % tp == 0
+        and (model.num_key_value_heads % tp == 0 or tp % model.num_key_value_heads == 0)
+        and pool.hardware_id in ("nvidia_a800", "nvidia_h200"))
+
+def is_gqa_pd_source_scope(deployment: DeploymentPlan, model: ModelConfig) -> bool:
+    """Independent GQA source geometry at both PD endpoints.
+
+    Computation uses the shared rank-local Qwen modules and PP coordinator;
+    transport mapping is validated separately, without a pair whitelist.
+    """
+    if (deployment.mode != "pd_disagg" or model.model_type not in ("qwen3", "qwen3_moe")
+            or model.attention_layout != "standard_gqa"
+            or model.compute_dtype != "bf16" or model.weight_dtype != "bf16"):
+        return False
+    if {worker_role_phase(pool.role) for pool in deployment.worker_pools.values()} != {"prefill", "decode"}:
+        return False
+    for pool in deployment.worker_pools.values():
+        config = pool.parallel_plan.config
+        tp = config.tensor_parallel_size
+        if is_qwen3_moe_dp_sp_source_scope(pool, model):
+            continue
+        if (pool.hardware_id not in ("nvidia_a800", "nvidia_h200")
+                or not config.is_rank_local
+                or len(pool.ranks) != config.worker_count
+                or config.pipeline_parallel_size > model.num_hidden_layers
+                or model.num_attention_heads % tp or model.hidden_size % tp
+                or model.intermediate_size % tp
+                or (model.num_key_value_heads % tp and tp % model.num_key_value_heads)):
+            return False
+        if config.enable_expert_parallel and (
+                model.model_type != "qwen3_moe" or model.num_experts < 1):
+            return False
+        if model.model_type == "qwen3_moe" and (
+                model.num_shared_experts
+                or (not config.enable_expert_parallel and model.moe_intermediate_size % tp)):
+            return False
+    return True
+
+
 def is_validated_tp1_tp2_multi_pool_scope(
     deployment: DeploymentPlan,
     model: ModelConfig,
@@ -684,8 +971,6 @@ def is_validated_tp1_tp2_multi_pool_scope(
         for route in kv_routes:
             source = deployment.worker_pools[route.source_pool]
             destination = deployment.worker_pools[route.destination_pool]
-            if source.hardware_id != destination.hardware_id:
-                return False
             source_tp = source.parallel_plan.config.tensor_parallel_size
             destination_tp = (
                 destination.parallel_plan.config.tensor_parallel_size)

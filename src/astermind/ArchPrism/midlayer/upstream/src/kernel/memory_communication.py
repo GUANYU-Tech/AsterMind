@@ -3,7 +3,7 @@ from src.kernel.kernel_spec import KernelKind
 from src.kernel.memory_access import (
     AccessScope, AddressLevel, Coverage, EventKind, EventRef, Granularity,
     MemoryAccess, MemoryAccessProgram, MemoryAllocation, Operation, Ordering,
-    ProgramEvent, Semantics, TensorView, LogicalSelectionView, unique_by,TileAxis,TileAccessTemplate,TileDependency,TileProgram,
+    ProgramEvent, Semantics, TensorView, LogicalSelectionView, unique_by,TileAxis,TileAccessTemplate,TileDependency,TileProgram,TilePartition,
 )
 
 
@@ -16,6 +16,12 @@ def communication_operand_layouts(kernel):
     transfer = kernel.transfer
     if transfer.operation == "send_recv":
         reads, writes = (transfer.source_rank,), (transfer.destination_rank,)
+    elif transfer.operation == "all_gatherv":
+        return (tuple((rank, size) for rank, size in zip(transfer.participants, transfer.partition_bytes, strict=True) if size),
+            tuple((rank, transfer.bytes) for rank in transfer.participants))
+    elif transfer.operation == "reduce_scatterv":
+        return (tuple((rank, transfer.bytes) for rank in transfer.participants),
+            tuple((rank, size) for rank, size in zip(transfer.participants, transfer.partition_bytes, strict=True) if size))
     elif transfer.operation in ("all_reduce", "all_gather", "all_to_all"):
         reads = writes = transfer.participants
     else:
@@ -59,6 +65,8 @@ def build_communication_interface(kernel, hardware, bindings, granularity, *, pr
         raise ValueError("collective participant operand/readiness count mismatch")
     views, allocations = unique_by(bindings.views, "view_id"), unique_by(bindings.allocations, "allocation_id")
     all_views = tuple(views[name] for name in (*bindings.read_views, *bindings.write_views))
+    if kernel.transfer.operation in ("all_gatherv", "reduce_scatterv"):
+        return build_variable_collective_tiles(kernel, bindings, inputs, outputs, all_views, program_id=program_id)
     numeric = kernel.transfer.operation == 'all_reduce' and any(view.dtype != 'uint8' for view in all_views)
     if numeric:
         return build_numeric_all_reduce_tiles(kernel,bindings,inputs,outputs,all_views,program_id=program_id)
@@ -230,6 +238,82 @@ def build_collective_copy_tiles(kernel,bindings,inputs,outputs,read_views,write_
             'Participant rank scopes/devices survive expansion; no all-rank data barrier for independent copies.',
             'All-reduce arithmetic requires an independently declared numeric element ABI before its full tile migration.')),
         bindings.allocations,tuple(views),(),bindings.events,(),(family,))
+    from src.kernel.memory_path_solver import collective_source_work
+    collective_source_work(program)
+    return program
+
+
+def build_variable_collective_tiles(kernel, bindings, inputs, outputs, operands, *, program_id):
+    """Ordered variable gather or scalar-sum scatter with no empty allocations.
+
+    Each positive segment owns its own compressed coordinate loop. Zero-size
+    ranks still belong to the communication group but have no payload operand
+    on that side. A byte-only sum retains an unknown word partition.
+    """
+    from src.kernel.kernel_spec import DTYPE_BYTES
+    transfer = kernel.transfer
+    gather = transfer.operation == "all_gatherv"
+    dtype = operands[0].dtype
+    if dtype not in ("uint8", "bf16", "fp16", "fp32", "int8", "int32", "int64"):
+        raise NotImplementedError("variable collective requires an explicit scalar storage ABI")
+    width = DTYPE_BYTES[dtype]
+    if any(size % width for size in transfer.partition_bytes):
+        raise ValueError("collective partitions must contain complete scalar elements")
+    for view, (_, size) in zip(operands, (*inputs, *outputs), strict=True):
+        if (not isinstance(view, TensorView) or view.shape != (size // width,)
+                or (view.dtype, view.element_bytes, view.strides_bytes) != (dtype, width, (width,))):
+            raise ValueError("variable collective must bind exact contiguous participant operands")
+    reads, writes = operands[:len(inputs)], operands[len(inputs):]
+    if len({view.allocation_id for view in operands}) != len(operands):
+        raise NotImplementedError("variable collective aliases require an explicit participant storage lifecycle")
+    read_by_rank = dict(zip((rank for rank, _ in inputs), reads, strict=True))
+    write_by_rank = dict(zip((rank for rank, _ in outputs), writes, strict=True))
+    ready_by_rank = dict(zip((rank for rank, _ in inputs), bindings.input_ready, strict=True))
+    ranks, sizes = transfer.participants, transfer.partition_bytes
+    header = ("communication", transfer.operation, "partitioned", str(len(ranks)),
+        *(str(rank) for rank in ranks), *(str(size) for size in sizes))
+    axis = "byte" if dtype == "uint8" else "element"
+    unknown_sum = not gather and dtype == "uint8"
+    evidence = ("Ordered participant segment sizes come from the current collective inputs, independently of duration.",
+        "Gather preserves source segments; scatter sum requires the corresponding segment from every input rank.",
+        "Zero segments own no allocation; native protocol, scratch and reduction arithmetic cost remain separate.")
+    views, families, prefix = list(bindings.views), [], 0
+    for index, size in enumerate(sizes):
+        if not size:
+            continue
+        accesses = []
+        sources = (ranks[index],) if gather else ranks
+        destinations = ranks if gather else (ranks[index],)
+        for rank in sources:
+            parent = read_by_rank[rank]
+            view = TensorView(f"{parent.view_id}.partition{index}", parent.allocation_id,
+                parent.offset_bytes + (0 if gather else prefix), (size // width,), (width,), dtype, width)
+            views.append(view)
+            scope = AccessScope(f"{program_id}.partition{index}.rank{rank}.input",
+                ("communication", transfer.operation, "input"), bindings.call_id, (), rank, bindings.stream,
+                "participant-variable-collective")
+            accesses.append(TileAccessTemplate(f"read.rank{rank}", view.view_id, Operation.READ, (axis,), (axis,),
+                (ready_by_rank[rank],), (), evidence, scope=scope))
+        dependencies = tuple(TileDependency(access.access_id, EventKind.READ_READY,
+            (axis,) if unknown_sum else (), partition_axis=axis if unknown_sum else None) for access in accesses)
+        for rank in destinations:
+            parent = write_by_rank[rank]
+            view = TensorView(f"{parent.view_id}.partition{index}", parent.allocation_id,
+                parent.offset_bytes + (prefix if gather else 0), (size // width,), (width,), dtype, width)
+            views.append(view)
+            scope = AccessScope(f"{program_id}.partition{index}.rank{rank}.output",
+                ("communication", transfer.operation, "output"), bindings.call_id, (), rank, bindings.stream,
+                "participant-variable-collective")
+            accesses.append(TileAccessTemplate(f"write.rank{rank}", view.view_id, Operation.WRITE, (axis,), (axis,),
+                (), dependencies, evidence, scope=scope))
+        scope = AccessScope(f"{program_id}.partition{index}", (*header, str(index)), bindings.call_id, (),
+            bindings.rank, bindings.stream, "variable-collective-segments")
+        families.append(TileProgram(scope.scope_id, scope, (TileAxis(axis, size // width, 1),), tuple(accesses),
+            bindings.visibility_domain, evidence, partitions=(TilePartition(axis),) if unknown_sum else ()))
+        prefix += size
+    program = MemoryAccessProgram("midlayer.memory-access.v1", program_id, kernel.hardware_id, bindings.binding_id,
+        Coverage(Granularity.TILE, Semantics.LOGICAL, Ordering.PARTIAL, not unknown_sum, evidence),
+        bindings.allocations, tuple(views), (), bindings.events, (), tuple(families))
     from src.kernel.memory_path_solver import collective_source_work
     collective_source_work(program)
     return program

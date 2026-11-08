@@ -5,7 +5,7 @@
 # steps are CPU-timing sensitive, so ALL 8 GPUs' kernel queues are stopped at a window boundary
 # (same live-queue record/resume as lend_fusion2048.sh), the profile script runs on <gpuA>+<gpuB> with our
 # reservations holding the locks (NO_FLOCK=1), then every recorded queue is re-run unchanged.
-K=/mnt/public/yangxinhao/h200_microbench/kcampaign; cd $K
+K=${MIDLAYER_H200_PUBLIC_ROOT:?set MIDLAYER_H200_PUBLIC_ROOT}/h200_microbench/kcampaign; cd $K
 SNAPSHOT=$1; VLLM_ENV=$2; GA=$3; GB=$4; TAG=hostprof_${VLLM_ENV}_$(date +%m%d_%H%M)  # fresh state dir per run
 case "$GA$GB" in ([0-7][0-7]) ;; (*) echo "usage: lend_hostprof.sh <snapshot> <vllm env> <gpuA> <gpuB>"; exit 2;; esac
 [ -f $SNAPSHOT/SOURCE_COMMIT ] || { echo "no snapshot $SNAPSHOT"; exit 2; }

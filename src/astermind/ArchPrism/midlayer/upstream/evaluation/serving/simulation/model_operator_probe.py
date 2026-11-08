@@ -13,6 +13,9 @@ import shlex
 import subprocess
 import sys
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+H200_HARDWARE_CONFIG = REPOSITORY_ROOT / "configs/hardware/nvidia_h200.yaml"
+
 from src.kernel.hardware_spec import HWSpec
 from src.kernel.kernel_base import create_predictor, predict
 from src.kernel.kernel_spec import KernelKind
@@ -289,7 +292,7 @@ def _write_kimi_k3_source_chain(model_path, source_root, output, component, *, b
 
     model = load_model_config(model_path)
     identity = vllm030_source_identity(Path(source_root))
-    hardware = HWSpec("configs/hardware/nvidia_h200.yaml")
+    hardware = HWSpec(H200_HARDWARE_CONFIG)
     deployment = build_deployment_plan(
         DeploymentConfig("colocated", (WorkerPoolConfig("main", "colocated", "nvidia_h200"),)),
         num_layers=model.num_hidden_layers, num_experts=model.num_experts)
@@ -705,7 +708,7 @@ def write_kimi_k3_source_components(model_path, source_root, output):
     if model.attention_layout != "hybrid_kda_mla":
         raise ValueError("K3 source components require an exact hybrid config")
     identity = vllm030_source_identity(Path(source_root))
-    hardware = HWSpec("configs/hardware/nvidia_h200.yaml")
+    hardware = HWSpec(H200_HARDWARE_CONFIG)
     deployment = build_deployment_plan(
         DeploymentConfig("colocated", (WorkerPoolConfig("main", "colocated", "nvidia_h200"),)),
         num_layers=model.num_hidden_layers, num_experts=model.num_experts)
@@ -850,7 +853,7 @@ def _weight_residency_case(args):
     if model.model_type != "glm_moe_dsa" and (
             model_execution_version is not None or mtp_mode is not None):
         raise ValueError("versioned MTP residency diagnostic currently requires GLM")
-    capacity = HWSpec("configs/hardware/nvidia_h200.yaml").resource_by_role("dram").size_bytes
+    capacity = HWSpec(H200_HARDWARE_CONFIG).resource_by_role("dram").size_bytes
     if model.model_type == "kimi_k2":
         if vision_tensor_parallel_mode is None:
             raise ValueError("Kimi outer diagnostic requires explicit vision tensor parallel mode")
@@ -1592,7 +1595,7 @@ def build_model_operator_probe(
     """
     if isinstance(prefill_tokens, bool) or not isinstance(prefill_tokens, int) or prefill_tokens < 1:
         raise ValueError("static probe prefill_tokens must be a positive integer")
-    hardware = HWSpec("configs/hardware/nvidia_h200.yaml")
+    hardware = HWSpec(H200_HARDWARE_CONFIG)
     model = load_model_config(model_path)
     if not isinstance(source_graph_only, bool):
         raise TypeError("source_graph_only must be boolean")
@@ -1986,14 +1989,14 @@ def build_model_operator_probe(
                     pass
                 else:
                     raise ValueError("unknown kernel execution support")
-                if kernel.execution_support == "unsupported":
-                    pass  # Logical pricing and physical launch support are separate contracts.
-                elif (kernel.kind is KernelKind.SPARSE_ATTN_INDEXER
+                if (kernel.kind is KernelKind.SPARSE_ATTN_INDEXER
                       and kernel.variant == "dsa_index_reuse"):
                     resource = {
                         "status": "logical_buffer_alias_no_kernel_work",
                         "demand": None, "limitations": (),
                     }
+                elif kernel.execution_support == "unsupported":
+                    pass  # Logical pricing and physical launch support are separate contracts.
                 elif kernel.kind in (
                         KernelKind.COMMUNICATION, KernelKind.MEMCPY,
                         KernelKind.KV_OFFLOAD):
@@ -2753,8 +2756,8 @@ def write_memory_ownership_handoff(output: Path) -> None:
         "failed_gates": [f"W{i}" for i in range(1, 8)],
         "validation_scope": "ownership-only checkpoint; reuse original snapshot-bound results; "
                             "no full tests, GPU, merge, rebase or push",
-        "regenerate_command": "PYTHONDONTWRITEBYTECODE=1 "
-            "/home/yangxinhao/miniconda3/envs/r2r_qwen3_next/bin/python "
+        "regenerate_command":
+            f"PYTHONDONTWRITEBYTECODE=1 {shlex.quote(sys.executable)} "
             "scripts/evaluation/serving/report_operator_support_checkpoint.py "
             f"--output {shlex.quote(str(output))} --memory-ownership-handoff-only",
     }
@@ -3486,7 +3489,8 @@ def write_operator_support_checkpoint(
     native_rows = []
     native_records = []
     for model in models:
-        config = Path("configs/model") / f"{model}.json"
+        relative_config = Path("configs/model") / f"{model}.json"
+        config = REPOSITORY_ROOT / relative_config
         if not config.is_file():
             alignment.append({"model": model, "status": "missing_exact_config"})
             rows.append(f"| {model} | 未执行 | 缺准确 checkpoint/config |")
@@ -3504,7 +3508,7 @@ def write_operator_support_checkpoint(
             alignment.append({"model": model, "status": "historical_identity_excluded", "artifact": str(artifact)})
             rows.append(f"| {model} | 历史身份结果排除 | 不作为当前官方 checkpoint 验收 |")
             continue
-        if Path(probe["model_config_path"]) != config or probe["mtp"] != "off":
+        if Path(probe["model_config_path"]) != relative_config or probe["mtp"] != "off":
             raise ValueError("static probe model/mode binding disagrees")
         phases = []
         for step in probe["steps"]:

@@ -2,10 +2,12 @@
 
 import os
 from pathlib import Path
+import sys
 
 ROOT = Path(__file__).resolve().parents[3]
+PYTHON = Path(sys.executable)
 
-COMMAND_START = ['/home/yangxinhao/miniconda3/envs/r2r_qwen3_next/bin/python',
+COMMAND_START = [str(PYTHON),
  '{root}/scripts/evaluation/serving/simulation_runner_entrypoint.py',
  '--canonical-requests',
  '{csv_path}',
@@ -18,7 +20,7 @@ PROFILES = {
         "binding_scope": {'colocated': 'first', 'pd': 'all'},
         "workers_environment": None,
         "constants": {
-            'PYTHON': Path('/home/yangxinhao/miniconda3/envs/r2r_qwen3_next/bin/python'),
+            'PYTHON': PYTHON,
             'CONCURRENCIES': (1, 2, 4, 8),
             'GROUPS': ('colocated_mtp_off', 'colocated_mtp_on', 'pd_mtp_off', 'pd_mtp_on'),
             'OUTDIR': ROOT / 'experiment_logs/inferencex_style_dsv3_1k128_closedloop_tp8_ep1',
@@ -31,7 +33,7 @@ PROFILES = {
             'PROPOSAL_DEPTH': 1,
             'MEAN_ACCEPTANCE_RATE': '0.87',
             'ACCEPTANCE_SOURCE': 'dsv3-top1-depth1-mean0.87-v1',
-            'MAX_WORKERS': 4,
+            'MAX_WORKERS': os.cpu_count() or 1,
         },
         'manifest_common': {'schema_version': 1,
  'model': 'DeepSeek-V3 (official FP8 release)',
@@ -244,7 +246,7 @@ PROFILES = {
         "binding_scope": {'colocated': 'first', 'pd': 'all'},
         "workers_environment": None,
         "constants": {
-            'PYTHON': Path('/home/yangxinhao/miniconda3/envs/r2r_qwen3_next/bin/python'),
+            'PYTHON': PYTHON,
             'CONCURRENCIES': (1, 2, 4, 8, 16, 32, 64, 128),
             'GROUPS': ('colocated_mtp_off', 'colocated_mtp_on', 'pd_mtp_off', 'pd_mtp_on'),
             'OUTDIR': ROOT / 'experiment_logs/inferencex_style_glm_1k128_mtp5_closedloop_tp8_ep1',
@@ -257,7 +259,7 @@ PROFILES = {
             'PROPOSAL_DEPTH': 5,
             'MEAN_ACCEPTANCE_RATE': '0.82',
             'ACCEPTANCE_SOURCE': 'glm5-top1-depth5-mean4.1-v1',
-            'MAX_WORKERS': 16,
+            'MAX_WORKERS': os.cpu_count() or 1,
         },
         'manifest_common': {'schema_version': 1,
  'model': 'GLM-5.2-FP8',
@@ -452,7 +454,7 @@ PROFILES = {
         "binding_scope": {'colocated': 'first', 'pd': 'all'},
         "workers_environment": None,
         "constants": {
-            'PYTHON': Path('/home/yangxinhao/miniconda3/envs/r2r_qwen3_next/bin/python'),
+            'PYTHON': PYTHON,
             'CONCURRENCIES': (1, 2, 4, 8, 16, 32, 64, 128),
             'GROUPS': ('colocated_mtp_off', 'colocated_mtp_on', 'pd_mtp_off', 'pd_mtp_on'),
             'OUTDIR': ROOT / 'experiment_logs/inferencex_style_glm_1k128_mtp5_pd_tp8_ep1',
@@ -464,7 +466,7 @@ PROFILES = {
             'PROPOSAL_DEPTH': 5,
             'MEAN_ACCEPTANCE_RATE': '0.82',
             'ACCEPTANCE_SOURCE': 'glm5-top1-depth5-mean4.1-v1',
-            'MAX_WORKERS': 16,
+            'MAX_WORKERS': os.cpu_count() or 1,
         },
         'manifest_common': {'schema_version': 1,
  'model': 'GLM-5.2-FP8',
@@ -655,7 +657,7 @@ PROFILES = {
         "binding_scope": {'colocated': 'first', 'pd': 'all'},
         "workers_environment": None,
         "constants": {
-            'PYTHON': Path('/home/yangxinhao/miniconda3/envs/r2r_qwen3_next/bin/python'),
+            'PYTHON': PYTHON,
             'CONCURRENCIES': (1, 2, 4, 8, 16, 32, 64, 128),
             'PD_GROUPS': ('pd_mtp_off', 'pd_mtp_on'),
             'OUTDIR': ROOT / 'experiment_logs/inferencex_style_glm_1k128_mtp5_pd_tp8_ep1_scaleout_roce',
@@ -668,7 +670,7 @@ PROFILES = {
             'PROPOSAL_DEPTH': 5,
             'MEAN_ACCEPTANCE_RATE': '0.82',
             'ACCEPTANCE_SOURCE': 'glm5-top1-depth5-mean4.1-v1',
-            'MAX_WORKERS': 16,
+            'MAX_WORKERS': os.cpu_count() or 1,
         },
         'manifest_common': {'schema_version': 1,
  'model': 'GLM-5.2-FP8',
@@ -810,7 +812,7 @@ PROFILES = {
         "binding_scope": {'colocated': 'first', 'pd': 'all'},
         "workers_environment": 'SWEEP_WORKERS',
         "constants": {
-            'PYTHON': Path('/home/yangxinhao/miniconda3/envs/r2r_qwen3_next/bin/python'),
+            'PYTHON': PYTHON,
             'CONCURRENCIES': (1, 2, 4, 8, 16, 32, 64, 128),
             'GROUPS': ('colocated_mtp_off', 'colocated_mtp_on', 'pd_mtp_off', 'pd_mtp_on'),
             'OUTDIR': ROOT / 'experiment_logs/inferencex_style_glm_8k1024_mtp5_closedloop_tp8_ep1',
@@ -825,7 +827,7 @@ PROFILES = {
             'ACCEPTANCE_SOURCE': 'glm5-top1-depth5-mean4.1-v1',
             'TARGET_INPUT_TOKENS': 8192,
             'TARGET_OUTPUT_TOKENS': 1024,
-            'MAX_WORKERS': 4,
+            'MAX_WORKERS': os.cpu_count() or 1,
         },
         'manifest_common': {'schema_version': 1,
  'model': 'GLM-5.2-FP8',
@@ -1020,7 +1022,7 @@ PROFILES = {
         "binding_scope": {'colocated': 'all', 'pd': 'all'},
         "workers_environment": None,
         "constants": {
-            'PYTHON': Path('/home/yangxinhao/miniconda3/envs/r2r_qwen3_next/bin/python'),
+            'PYTHON': PYTHON,
             'GROUPS': ('colocated_mtp_off', 'pd_mtp_off'),
             'OUTDIR': ROOT / 'experiment_logs/inferencex_style_kimi_1k128_closedloop_tp8_ep8',
             'DATA_ROOT': ROOT / 'serving_dataset/synthetic/inferencex_style/kimi_k2_6_h200_1k128_closedloop_tp8_ep8',
@@ -1168,7 +1170,7 @@ PROFILES = {
         "binding_scope": {'colocated': 'all', 'pd': 'all'},
         "workers_environment": None,
         "constants": {
-            'PYTHON': Path('/home/yangxinhao/miniconda3/envs/r2r_qwen3_next/bin/python'),
+            'PYTHON': PYTHON,
             'GROUPS': ('colocated_mtp_off', 'pd_mtp_off'),
             'OUTDIR': ROOT / 'experiment_logs/inferencex_style_kimi_8k1024_closedloop_tp8_ep8',
             'DATA_ROOT': ROOT / 'serving_dataset/synthetic/inferencex_style/kimi_k2_6_h200_8k1024_closedloop_tp8_ep8',

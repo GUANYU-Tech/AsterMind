@@ -1,0 +1,794 @@
+{
+  "physical": {
+    "cells": [
+      {
+        "id": "ground-resources",
+        "satellites": [
+          "ground"
+        ]
+      },
+      {
+        "id": "cell-glm-5.2",
+        "satellites": [
+          "sat-0-0",
+          "sat-0-1",
+          "sat-0-2",
+          "sat-0-3"
+        ]
+      }
+    ],
+    "satellites": [
+      {
+        "id": "ground"
+      },
+      {
+        "id": "sat-0-0"
+      },
+      {
+        "id": "sat-0-1"
+      },
+      {
+        "id": "sat-0-2"
+      },
+      {
+        "id": "sat-0-3"
+      }
+    ],
+    "devices": [
+      {
+        "id": "user",
+        "satellite": "ground",
+        "kind": "terminal",
+        "external_access": true,
+        "capacity_gbps": 1,
+        "max_external_links": 1
+      },
+      {
+        "id": "fabric-0-0",
+        "satellite": "sat-0-0",
+        "kind": "switch",
+        "capacity_gbps": 4000
+      },
+      {
+        "id": "terminal-0-0",
+        "satellite": "sat-0-0",
+        "kind": "terminal",
+        "external_access": true,
+        "max_external_links": 2
+      },
+      {
+        "id": "gpu-0-0-0",
+        "satellite": "sat-0-0",
+        "kind": "gpu"
+      },
+      {
+        "id": "gpu-0-0-1",
+        "satellite": "sat-0-0",
+        "kind": "gpu"
+      },
+      {
+        "id": "gpu-0-0-2",
+        "satellite": "sat-0-0",
+        "kind": "gpu"
+      },
+      {
+        "id": "gpu-0-0-3",
+        "satellite": "sat-0-0",
+        "kind": "gpu"
+      },
+      {
+        "id": "gpu-0-0-4",
+        "satellite": "sat-0-0",
+        "kind": "gpu"
+      },
+      {
+        "id": "gpu-0-0-5",
+        "satellite": "sat-0-0",
+        "kind": "gpu"
+      },
+      {
+        "id": "gpu-0-0-6",
+        "satellite": "sat-0-0",
+        "kind": "gpu"
+      },
+      {
+        "id": "gpu-0-0-7",
+        "satellite": "sat-0-0",
+        "kind": "gpu"
+      },
+      {
+        "id": "fabric-0-1",
+        "satellite": "sat-0-1",
+        "kind": "switch",
+        "capacity_gbps": 4000
+      },
+      {
+        "id": "terminal-0-1",
+        "satellite": "sat-0-1",
+        "kind": "terminal",
+        "external_access": true,
+        "max_external_links": 2
+      },
+      {
+        "id": "gpu-0-1-0",
+        "satellite": "sat-0-1",
+        "kind": "gpu"
+      },
+      {
+        "id": "gpu-0-1-1",
+        "satellite": "sat-0-1",
+        "kind": "gpu"
+      },
+      {
+        "id": "gpu-0-1-2",
+        "satellite": "sat-0-1",
+        "kind": "gpu"
+      },
+      {
+        "id": "gpu-0-1-3",
+        "satellite": "sat-0-1",
+        "kind": "gpu"
+      },
+      {
+        "id": "gpu-0-1-4",
+        "satellite": "sat-0-1",
+        "kind": "gpu"
+      },
+      {
+        "id": "gpu-0-1-5",
+        "satellite": "sat-0-1",
+        "kind": "gpu"
+      },
+      {
+        "id": "gpu-0-1-6",
+        "satellite": "sat-0-1",
+        "kind": "gpu"
+      },
+      {
+        "id": "gpu-0-1-7",
+        "satellite": "sat-0-1",
+        "kind": "gpu"
+      },
+      {
+        "id": "fabric-0-2",
+        "satellite": "sat-0-2",
+        "kind": "switch",
+        "capacity_gbps": 4000
+      },
+      {
+        "id": "terminal-0-2",
+        "satellite": "sat-0-2",
+        "kind": "terminal",
+        "external_access": true,
+        "max_external_links": 2
+      },
+      {
+        "id": "gpu-0-2-0",
+        "satellite": "sat-0-2",
+        "kind": "gpu"
+      },
+      {
+        "id": "gpu-0-2-1",
+        "satellite": "sat-0-2",
+        "kind": "gpu"
+      },
+      {
+        "id": "gpu-0-2-2",
+        "satellite": "sat-0-2",
+        "kind": "gpu"
+      },
+      {
+        "id": "gpu-0-2-3",
+        "satellite": "sat-0-2",
+        "kind": "gpu"
+      },
+      {
+        "id": "gpu-0-2-4",
+        "satellite": "sat-0-2",
+        "kind": "gpu"
+      },
+      {
+        "id": "gpu-0-2-5",
+        "satellite": "sat-0-2",
+        "kind": "gpu"
+      },
+      {
+        "id": "gpu-0-2-6",
+        "satellite": "sat-0-2",
+        "kind": "gpu"
+      },
+      {
+        "id": "gpu-0-2-7",
+        "satellite": "sat-0-2",
+        "kind": "gpu"
+      },
+      {
+        "id": "fabric-0-3",
+        "satellite": "sat-0-3",
+        "kind": "switch",
+        "capacity_gbps": 4000
+      },
+      {
+        "id": "terminal-0-3",
+        "satellite": "sat-0-3",
+        "kind": "terminal",
+        "external_access": true,
+        "max_external_links": 1
+      },
+      {
+        "id": "gpu-0-3-0",
+        "satellite": "sat-0-3",
+        "kind": "gpu"
+      },
+      {
+        "id": "gpu-0-3-1",
+        "satellite": "sat-0-3",
+        "kind": "gpu"
+      },
+      {
+        "id": "gpu-0-3-2",
+        "satellite": "sat-0-3",
+        "kind": "gpu"
+      },
+      {
+        "id": "gpu-0-3-3",
+        "satellite": "sat-0-3",
+        "kind": "gpu"
+      },
+      {
+        "id": "gpu-0-3-4",
+        "satellite": "sat-0-3",
+        "kind": "gpu"
+      },
+      {
+        "id": "gpu-0-3-5",
+        "satellite": "sat-0-3",
+        "kind": "gpu"
+      },
+      {
+        "id": "gpu-0-3-6",
+        "satellite": "sat-0-3",
+        "kind": "gpu"
+      },
+      {
+        "id": "gpu-0-3-7",
+        "satellite": "sat-0-3",
+        "kind": "gpu"
+      }
+    ],
+    "links": [
+      {
+        "id": "terminal-local-0-0",
+        "source": "fabric-0-0",
+        "target": "terminal-0-0",
+        "bandwidth_gbps": 50
+      },
+      {
+        "id": "local-0-0-0",
+        "source": "gpu-0-0-0",
+        "target": "fabric-0-0",
+        "bandwidth_gbps": 1000,
+        "latency_ns": 100
+      },
+      {
+        "id": "local-0-0-1",
+        "source": "gpu-0-0-1",
+        "target": "fabric-0-0",
+        "bandwidth_gbps": 1000,
+        "latency_ns": 100
+      },
+      {
+        "id": "local-0-0-2",
+        "source": "gpu-0-0-2",
+        "target": "fabric-0-0",
+        "bandwidth_gbps": 1000,
+        "latency_ns": 100
+      },
+      {
+        "id": "local-0-0-3",
+        "source": "gpu-0-0-3",
+        "target": "fabric-0-0",
+        "bandwidth_gbps": 1000,
+        "latency_ns": 100
+      },
+      {
+        "id": "local-0-0-4",
+        "source": "gpu-0-0-4",
+        "target": "fabric-0-0",
+        "bandwidth_gbps": 1000,
+        "latency_ns": 100
+      },
+      {
+        "id": "local-0-0-5",
+        "source": "gpu-0-0-5",
+        "target": "fabric-0-0",
+        "bandwidth_gbps": 1000,
+        "latency_ns": 100
+      },
+      {
+        "id": "local-0-0-6",
+        "source": "gpu-0-0-6",
+        "target": "fabric-0-0",
+        "bandwidth_gbps": 1000,
+        "latency_ns": 100
+      },
+      {
+        "id": "local-0-0-7",
+        "source": "gpu-0-0-7",
+        "target": "fabric-0-0",
+        "bandwidth_gbps": 1000,
+        "latency_ns": 100
+      },
+      {
+        "id": "terminal-local-0-1",
+        "source": "fabric-0-1",
+        "target": "terminal-0-1",
+        "bandwidth_gbps": 50
+      },
+      {
+        "id": "local-0-1-0",
+        "source": "gpu-0-1-0",
+        "target": "fabric-0-1",
+        "bandwidth_gbps": 1000,
+        "latency_ns": 100
+      },
+      {
+        "id": "local-0-1-1",
+        "source": "gpu-0-1-1",
+        "target": "fabric-0-1",
+        "bandwidth_gbps": 1000,
+        "latency_ns": 100
+      },
+      {
+        "id": "local-0-1-2",
+        "source": "gpu-0-1-2",
+        "target": "fabric-0-1",
+        "bandwidth_gbps": 1000,
+        "latency_ns": 100
+      },
+      {
+        "id": "local-0-1-3",
+        "source": "gpu-0-1-3",
+        "target": "fabric-0-1",
+        "bandwidth_gbps": 1000,
+        "latency_ns": 100
+      },
+      {
+        "id": "local-0-1-4",
+        "source": "gpu-0-1-4",
+        "target": "fabric-0-1",
+        "bandwidth_gbps": 1000,
+        "latency_ns": 100
+      },
+      {
+        "id": "local-0-1-5",
+        "source": "gpu-0-1-5",
+        "target": "fabric-0-1",
+        "bandwidth_gbps": 1000,
+        "latency_ns": 100
+      },
+      {
+        "id": "local-0-1-6",
+        "source": "gpu-0-1-6",
+        "target": "fabric-0-1",
+        "bandwidth_gbps": 1000,
+        "latency_ns": 100
+      },
+      {
+        "id": "local-0-1-7",
+        "source": "gpu-0-1-7",
+        "target": "fabric-0-1",
+        "bandwidth_gbps": 1000,
+        "latency_ns": 100
+      },
+      {
+        "id": "isl-0-1",
+        "source": "terminal-0-0",
+        "target": "terminal-0-1",
+        "bandwidth_gbps": 10,
+        "latency_ns": 100000
+      },
+      {
+        "id": "ground-link-0",
+        "source": "user",
+        "target": "terminal-0-0",
+        "bandwidth_gbps": 1,
+        "latency_ns": 150000
+      },
+      {
+        "id": "terminal-local-0-2",
+        "source": "fabric-0-2",
+        "target": "terminal-0-2",
+        "bandwidth_gbps": 50
+      },
+      {
+        "id": "isl-0-2",
+        "source": "terminal-0-1",
+        "target": "terminal-0-2",
+        "bandwidth_gbps": 10,
+        "latency_ns": 100000
+      },
+      {
+        "id": "local-0-2-0",
+        "source": "gpu-0-2-0",
+        "target": "fabric-0-2",
+        "bandwidth_gbps": 1000,
+        "latency_ns": 100
+      },
+      {
+        "id": "local-0-2-1",
+        "source": "gpu-0-2-1",
+        "target": "fabric-0-2",
+        "bandwidth_gbps": 1000,
+        "latency_ns": 100
+      },
+      {
+        "id": "local-0-2-2",
+        "source": "gpu-0-2-2",
+        "target": "fabric-0-2",
+        "bandwidth_gbps": 1000,
+        "latency_ns": 100
+      },
+      {
+        "id": "local-0-2-3",
+        "source": "gpu-0-2-3",
+        "target": "fabric-0-2",
+        "bandwidth_gbps": 1000,
+        "latency_ns": 100
+      },
+      {
+        "id": "local-0-2-4",
+        "source": "gpu-0-2-4",
+        "target": "fabric-0-2",
+        "bandwidth_gbps": 1000,
+        "latency_ns": 100
+      },
+      {
+        "id": "local-0-2-5",
+        "source": "gpu-0-2-5",
+        "target": "fabric-0-2",
+        "bandwidth_gbps": 1000,
+        "latency_ns": 100
+      },
+      {
+        "id": "local-0-2-6",
+        "source": "gpu-0-2-6",
+        "target": "fabric-0-2",
+        "bandwidth_gbps": 1000,
+        "latency_ns": 100
+      },
+      {
+        "id": "local-0-2-7",
+        "source": "gpu-0-2-7",
+        "target": "fabric-0-2",
+        "bandwidth_gbps": 1000,
+        "latency_ns": 100
+      },
+      {
+        "id": "terminal-local-0-3",
+        "source": "fabric-0-3",
+        "target": "terminal-0-3",
+        "bandwidth_gbps": 50
+      },
+      {
+        "id": "isl-0-3",
+        "source": "terminal-0-2",
+        "target": "terminal-0-3",
+        "bandwidth_gbps": 10,
+        "latency_ns": 100000
+      },
+      {
+        "id": "local-0-3-0",
+        "source": "gpu-0-3-0",
+        "target": "fabric-0-3",
+        "bandwidth_gbps": 1000,
+        "latency_ns": 100
+      },
+      {
+        "id": "local-0-3-1",
+        "source": "gpu-0-3-1",
+        "target": "fabric-0-3",
+        "bandwidth_gbps": 1000,
+        "latency_ns": 100
+      },
+      {
+        "id": "local-0-3-2",
+        "source": "gpu-0-3-2",
+        "target": "fabric-0-3",
+        "bandwidth_gbps": 1000,
+        "latency_ns": 100
+      },
+      {
+        "id": "local-0-3-3",
+        "source": "gpu-0-3-3",
+        "target": "fabric-0-3",
+        "bandwidth_gbps": 1000,
+        "latency_ns": 100
+      },
+      {
+        "id": "local-0-3-4",
+        "source": "gpu-0-3-4",
+        "target": "fabric-0-3",
+        "bandwidth_gbps": 1000,
+        "latency_ns": 100
+      },
+      {
+        "id": "local-0-3-5",
+        "source": "gpu-0-3-5",
+        "target": "fabric-0-3",
+        "bandwidth_gbps": 1000,
+        "latency_ns": 100
+      },
+      {
+        "id": "local-0-3-6",
+        "source": "gpu-0-3-6",
+        "target": "fabric-0-3",
+        "bandwidth_gbps": 1000,
+        "latency_ns": 100
+      },
+      {
+        "id": "local-0-3-7",
+        "source": "gpu-0-3-7",
+        "target": "fabric-0-3",
+        "bandwidth_gbps": 1000,
+        "latency_ns": 100
+      }
+    ]
+  },
+  "ground_owners": [
+    "ground"
+  ],
+  "satellite_roles": {
+    "sat-0-0": "mixed",
+    "sat-0-1": "mixed",
+    "sat-0-2": "mixed",
+    "sat-0-3": "mixed"
+  },
+  "cells": [
+    {
+      "id": "cell-glm-5.2",
+      "model": "configs/model/glm-5.2.json",
+      "hardware": "configs/hardware/nvidia_a800.yaml",
+      "hardware_id": "nvidia_a800",
+      "parallel": {
+        "tp": 8,
+        "pp": 4,
+        "ep": 8
+      },
+      "expert_routing_seed": 42,
+      "deployment": "colocated",
+      "placements": [
+        {
+          "rank": 0,
+          "device": "gpu-0-0-0",
+          "pool": "main"
+        },
+        {
+          "rank": 1,
+          "device": "gpu-0-0-1",
+          "pool": "main"
+        },
+        {
+          "rank": 2,
+          "device": "gpu-0-0-2",
+          "pool": "main"
+        },
+        {
+          "rank": 3,
+          "device": "gpu-0-0-3",
+          "pool": "main"
+        },
+        {
+          "rank": 4,
+          "device": "gpu-0-0-4",
+          "pool": "main"
+        },
+        {
+          "rank": 5,
+          "device": "gpu-0-0-5",
+          "pool": "main"
+        },
+        {
+          "rank": 6,
+          "device": "gpu-0-0-6",
+          "pool": "main"
+        },
+        {
+          "rank": 7,
+          "device": "gpu-0-0-7",
+          "pool": "main"
+        },
+        {
+          "rank": 8,
+          "device": "gpu-0-1-0",
+          "pool": "main"
+        },
+        {
+          "rank": 9,
+          "device": "gpu-0-1-1",
+          "pool": "main"
+        },
+        {
+          "rank": 10,
+          "device": "gpu-0-1-2",
+          "pool": "main"
+        },
+        {
+          "rank": 11,
+          "device": "gpu-0-1-3",
+          "pool": "main"
+        },
+        {
+          "rank": 12,
+          "device": "gpu-0-1-4",
+          "pool": "main"
+        },
+        {
+          "rank": 13,
+          "device": "gpu-0-1-5",
+          "pool": "main"
+        },
+        {
+          "rank": 14,
+          "device": "gpu-0-1-6",
+          "pool": "main"
+        },
+        {
+          "rank": 15,
+          "device": "gpu-0-1-7",
+          "pool": "main"
+        },
+        {
+          "rank": 16,
+          "device": "gpu-0-2-0",
+          "pool": "main"
+        },
+        {
+          "rank": 17,
+          "device": "gpu-0-2-1",
+          "pool": "main"
+        },
+        {
+          "rank": 18,
+          "device": "gpu-0-2-2",
+          "pool": "main"
+        },
+        {
+          "rank": 19,
+          "device": "gpu-0-2-3",
+          "pool": "main"
+        },
+        {
+          "rank": 20,
+          "device": "gpu-0-2-4",
+          "pool": "main"
+        },
+        {
+          "rank": 21,
+          "device": "gpu-0-2-5",
+          "pool": "main"
+        },
+        {
+          "rank": 22,
+          "device": "gpu-0-2-6",
+          "pool": "main"
+        },
+        {
+          "rank": 23,
+          "device": "gpu-0-2-7",
+          "pool": "main"
+        },
+        {
+          "rank": 24,
+          "device": "gpu-0-3-0",
+          "pool": "main"
+        },
+        {
+          "rank": 25,
+          "device": "gpu-0-3-1",
+          "pool": "main"
+        },
+        {
+          "rank": 26,
+          "device": "gpu-0-3-2",
+          "pool": "main"
+        },
+        {
+          "rank": 27,
+          "device": "gpu-0-3-3",
+          "pool": "main"
+        },
+        {
+          "rank": 28,
+          "device": "gpu-0-3-4",
+          "pool": "main"
+        },
+        {
+          "rank": 29,
+          "device": "gpu-0-3-5",
+          "pool": "main"
+        },
+        {
+          "rank": 30,
+          "device": "gpu-0-3-6",
+          "pool": "main"
+        },
+        {
+          "rank": 31,
+          "device": "gpu-0-3-7",
+          "pool": "main"
+        }
+      ],
+      "ingress_device": "gpu-0-0-0",
+      "output_device": "gpu-0-3-0",
+      "external_terminals": [
+        "terminal-0-0"
+      ],
+      "max_batched_tokens": 64,
+      "max_requests": 4
+    }
+  ],
+  "requests": [
+    {
+      "id": "R1",
+      "cell": "cell-glm-5.2",
+      "arrival_ns": 0,
+      "user_device": "user",
+      "input_tokens": 8,
+      "output_tokens": 4,
+      "input_bytes": 10000,
+      "output_bytes_per_token": 1000
+    },
+    {
+      "id": "R2",
+      "cell": "cell-glm-5.2",
+      "arrival_ns": 4000000,
+      "user_device": "user",
+      "input_tokens": 13,
+      "output_tokens": 3,
+      "input_bytes": 10000,
+      "output_bytes_per_token": 1000
+    },
+    {
+      "id": "R3",
+      "cell": "cell-glm-5.2",
+      "arrival_ns": 8000000,
+      "user_device": "user",
+      "input_tokens": 23,
+      "output_tokens": 2,
+      "input_bytes": 10000,
+      "output_bytes_per_token": 1000
+    },
+    {
+      "id": "R4",
+      "cell": "cell-glm-5.2",
+      "arrival_ns": 14000000,
+      "user_device": "user",
+      "input_tokens": 9,
+      "output_tokens": 3,
+      "input_bytes": 10000,
+      "output_bytes_per_token": 1000
+    },
+    {
+      "id": "R5",
+      "cell": "cell-glm-5.2",
+      "arrival_ns": 25000000,
+      "user_device": "user",
+      "input_tokens": 16,
+      "output_tokens": 2,
+      "input_bytes": 10000,
+      "output_bytes_per_token": 1000
+    },
+    {
+      "id": "R6",
+      "cell": "cell-glm-5.2",
+      "arrival_ns": 41000000,
+      "user_device": "user",
+      "input_tokens": 12,
+      "output_tokens": 2,
+      "input_bytes": 10000,
+      "output_bytes_per_token": 1000
+    }
+  ],
+  "horizon_ns": 10000000000
+}

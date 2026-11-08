@@ -25,8 +25,16 @@ _METRICS = (
 def compare_scheduler_trace_observer_effect(
     trace_off_path: str | Path,
     trace_on_path: str | Path,
+    *,
+    threshold_percent: float = _THRESHOLD_PERCENT,
 ) -> Mapping[str, object]:
-    """Compare paired no-profiler runs and enforce the three-percent gate."""
+    """Classify paired no-profiler runs at an explicit evaluation threshold.
+
+    The historical default remains three percent. A diagnostic may request
+    another threshold without editing the capture or its published verdict.
+    """
+
+    threshold = _positive(threshold_percent, "observer-effect threshold percent")
 
     off_path = Path(trace_off_path).resolve(strict=True)
     on_path = Path(trace_on_path).resolve(strict=True)
@@ -55,7 +63,7 @@ def compare_scheduler_trace_observer_effect(
         delta = abs(on_value - off_value) / off_value * 100.0
         deltas[name] = delta
         values[name] = {"trace_off": off_value, "trace_on": on_value}
-    passed = all(delta <= _THRESHOLD_PERCENT for delta in deltas.values())
+    passed = all(delta <= threshold for delta in deltas.values())
     identity = _mapping(
         _mapping(on["workload"], "trace-on workload")["identity"],
         "trace-on identity",
@@ -77,7 +85,7 @@ def compare_scheduler_trace_observer_effect(
             "path": str(on_path),
             "sha256": _sha256(on_path),
         },
-        "threshold_percent": _THRESHOLD_PERCENT,
+        "threshold_percent": threshold,
         "metric_values": values,
         "metric_delta_percent": deltas,
         "passed": passed,
@@ -95,7 +103,7 @@ def require_observer_effect_passed(
             payload["metric_delta_percent"], "observer-effect metric deltas"
         )
         raise RuntimeError(
-            "Scheduler trace observer effect exceeds 3%: "
+            f"Scheduler trace observer effect exceeds {payload['threshold_percent']:g}%: "
             + ", ".join(
                 f"{name}={float(deltas[name]):.3f}%" for name, _, _ in _METRICS
             )

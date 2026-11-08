@@ -30,13 +30,14 @@ import os
 from pathlib import Path
 import statistics
 import subprocess
+import shutil
 import sys
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parents[1] / 'compute'))
 import clock_gated_capture as gate  # noqa: E402
 
-NSYS = Path('/mnt/public/yangxinhao/tools/nsys_2025.6.1/bin/nsys')
+NSYS = Path(shutil.which('nsys') or 'nsys')
 TMA_SOURCE = HERE / 'fp8_tma_operand_stream.cu'
 WGMMA_SOURCE = HERE / 'fp8_wgmma_kblock_issue.cu'
 LAUNCHES_PER_CONFIG = 120
@@ -201,7 +202,10 @@ def main():
     args = parser.parse_args()
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
-    os.environ['HOME'] = '/mnt/public/yangxinhao/h200_microbench/home'
+    os.environ['HOME'] = (
+        os.environ['MIDLAYER_H200_HOME']
+        if 'MIDLAYER_H200_HOME' in os.environ else str(Path.home())
+    )
     identity = gate.device_identity(args.device)
     build_dir = out / 'build'
     tma_build = build_sm90a(TMA_SOURCE, build_dir / 'fp8_tma_operand_stream')

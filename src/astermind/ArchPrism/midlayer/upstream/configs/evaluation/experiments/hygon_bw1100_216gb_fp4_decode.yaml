@@ -1,0 +1,50 @@
+# User-authorized analytical scenario; original hardware configuration remains separately versioned.
+hardware_id: hygon_bw1100
+clock_domains: {}
+components:
+- name: tensor_bf16
+  count: 1
+  type: compute
+  role: compute_tensor
+  scope: shared
+  capacity_per_second: 177000000000000.0
+- name: tensor_fp16
+  count: 1
+  type: compute
+  role: compute_tensor_fp16
+  scope: shared
+  capacity_per_second: 177000000000000.0
+- name: tensor_fp8
+  count: 1
+  type: compute
+  role: compute_tensor_fp8
+  scope: shared
+  capacity_per_second: 354000000000000.0
+- name: tensor_int8
+  count: 1
+  type: compute
+  role: compute_tensor_int8
+  scope: shared
+  capacity_per_second: 354000000000000.0
+- name: dram
+  count: 1
+  type: memory
+  role: dram
+  scope: shared
+  capacity_per_second: 4000000000000.0
+  size_bytes: 216000000000
+resource_groups: []
+memory_subsystem: {}
+scheduling: {}
+interconnect:
+  roce_unidir_bw_GB_s: 50
+  roce_devices_per_nic: 2
+  roce_switch_topology: fully_connected
+  roce_signal_latency_ns: null
+  roce_collective_startup_ns: 50000
+  parameter_source: user_20261104_direct_switch_collective_startup_50us
+features:
+  kernel_memory_model: roofline
+  kernel_dtype: bf16
+  parameter_source: user_20261104_all_matrix_FP4_BW_FP8_compute50_bandwidth50
+  gpu_vector_memory_only: true

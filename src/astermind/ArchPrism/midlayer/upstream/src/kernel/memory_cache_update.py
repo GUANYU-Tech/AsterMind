@@ -1,5 +1,5 @@
 """Untimed paged KV copy source with honestly unresolved slot/page addresses."""
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from src.kernel.memory_access import (
     AccessScope, AddressLevel, Coverage, EventKind, EventRef, Granularity, Indirect, Indirection,
@@ -50,6 +50,10 @@ def paged_kv_source_index_type(kernel):
         slot_read_passes(kernel)  # Validate the supported ReshapeAndCache key.
         return "int32", 4
     if kernel.launch.algorithm in ("kv_cache", "kvcache", "paged_kv_cache"):
+        return "int64", 8
+    if (kernel.hardware_id == "nvidia_h200" and kernel.launch.algorithm in (
+            "vllm_0_27_sm90_source_kv_cache", "vllm_0_27_sm90_source_kvcache",
+            "vllm_0_30_sm90_source_kv_cache", "vllm_0_30_sm90_source_kvcache")):
         return "int64", 8
     return None
 
@@ -632,6 +636,64 @@ def _standalone_c4_finish_bindings(kernel, *, call_id,binding_id):
     return ElementwiseBindings(binding_id,call_id,tuple(allocations),tuple(views),tuple(events),
         tuple(row[0] for row in operands if not row[-1]),tuple(row[0] for row in operands if row[-1]),tuple(ready),
         0,'offline','c4-finish-visible')
+
+
+def dsv4_c128_stage_bindings(aggregate_kernel, stage_kernel, bindings):
+    from src.kernel.memory_access_builder import ElementwiseBindings
+    if not isinstance(bindings, ElementwiseBindings):
+        raise TypeError("C128 stage projection requires typed aggregate bindings")
+    if (aggregate_kernel.variant != "dsv4_compressed_state_cache"
+            or aggregate_kernel.attributes["finish_stage"] is not None
+            or stage_kernel.variant != aggregate_kernel.variant
+            or stage_kernel.attributes["finish_stage"] not in ("compress", "store")):
+        raise ValueError("C128 stage bindings require an aggregate-to-stage source transition")
+    aggregate_header = _compressed_finish_header(aggregate_kernel)
+    aggregate_operands, _, _ = _compressed_finish_layout(aggregate_header)
+    aggregate_reads = tuple(row[0] for row in aggregate_operands if not row[-1])
+    aggregate_writes = tuple(row[0] for row in aggregate_operands if row[-1])
+    if (bindings.read_views, bindings.write_views, len(bindings.input_ready)) != (
+            aggregate_reads, aggregate_writes, len(aggregate_reads)):
+        raise ValueError("C128 aggregate bindings do not match their actual kernel")
+    aggregate_views = unique_by(bindings.views, "view_id")
+    _validate_finish_views(aggregate_header, aggregate_views)
+    expected = _standalone_c4_finish_bindings(stage_kernel,
+        call_id=bindings.call_id, binding_id=bindings.binding_id)
+    expected_views = unique_by(expected.views, "view_id")
+    views = []
+    for role, expected_view in expected_views.items():
+        view = aggregate_views[role]
+        if (view.shape, view.dtype, view.element_bytes) != (
+                expected_view.shape, expected_view.dtype, expected_view.element_bytes):
+            raise ValueError("C128 stage projection changed an actual typed view")
+        if isinstance(expected_view, LogicalSelectionView):
+            if not isinstance(view, LogicalSelectionView):
+                raise TypeError("C128 logical stage selection lost its actual view type")
+            view = replace(view, selection_id=expected_view.selection_id)
+        views.append(view)
+    stage_views = unique_by(views, "view_id")
+    allocations = unique_by(bindings.allocations, "allocation_id")
+    ready_by_role = dict(zip(bindings.read_views, bindings.input_ready, strict=True))
+    events = list(bindings.events)
+    input_ready = []
+    for role in expected.read_views:
+        if stage_kernel.attributes["finish_stage"] == "store" and role.endswith(".scratch"):
+            view = stage_views[role]
+            event_id = f"{bindings.binding_id}.{role}.compress_initialized"
+            event = ProgramEvent(event_id, EventKind.INITIALIZED, view.allocation_id,
+                view.region(), bindings.visibility_domain,
+                (EventRef(allocations[view.allocation_id].allocated_event, EventKind.ALLOCATED),))
+            events.append(event)
+            input_ready.append(EventRef(event.event_id, event.kind))
+        else:
+            ready = ready_by_role[role]
+            for index, existing in enumerate(events):
+                if existing.event_id == ready.node_id:
+                    events[index] = replace(existing, region=stage_views[role].region())
+            input_ready.append(ready)
+    return ElementwiseBindings(bindings.binding_id, bindings.call_id,
+        bindings.allocations, tuple(views), tuple(events), expected.read_views,
+        expected.write_views, tuple(input_ready), bindings.rank, bindings.stream,
+        bindings.visibility_domain)
 
 
 def _validate_finish_views(header,views):

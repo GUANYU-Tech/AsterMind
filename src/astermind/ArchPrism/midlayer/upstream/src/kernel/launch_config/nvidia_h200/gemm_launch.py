@@ -1,4 +1,4 @@
-"""NVIDIA H200 launch selection for FP8 block-scaled dense GEMMs.
+"""NVIDIA H200 launch selection for observed dense and FP8 block GEMMs.
 
 vLLM 0.24.0 prices a DeepSeek-V3 FP8 linear (128x128 e4m3 weight blocks,
 dynamic 1x128 activation groups, BF16 output) through
@@ -22,12 +22,13 @@ dispatches on the token count M with ``torch.cond(M < 32, ...)``:
 Both heuristics are reproduced here as static source facts; nothing is
 fitted.  ``owns_select_gemm_launch`` declares this module's request domain
 (a GEMM whose lowering declares block-FP8 ``weight_quantization``); the
-dispatcher sends every other GEMM to the projected package, so no projected
-rule is restated here.
+dispatcher also routes ordinary injected BF16/FP16 GEMMs to the observed
+H200 cuBLASLt table. Analytical ordinary GEMMs remain projected.
 """
 
 from dataclasses import dataclass
 from functools import lru_cache
+import math
 from typing import Mapping, Optional
 
 import numpy as np
@@ -45,6 +46,7 @@ from src.kernel.launch_config.gemm_launch_selection import (
 )
 from src.kernel.launch_config.gemm_workload import (
     analytical_cublas_tiling,
+    gemm_launch_selection_key,
     cublaslt_main_block_threads,
 )
 from src.kernel.launch_config.launch_program import GpuCtaRasterProgram
@@ -269,10 +271,13 @@ def owns_select_gemm_launch(
         shape: Mapping[str, int], dtype: Optional[str],
         variant: Optional[str], attributes: Mapping[str, object],
         hardware) -> bool:
-    """Whether this package selects the GEMM: a declared block-FP8 linear."""
+    """Own block-FP8 linears and ordinary injected dense observations."""
 
+    if "bf16_gemm_model" in attributes:
+        return True
     if "weight_quantization" not in attributes:
-        return False
+        return (variant in ("gemm", "gemv")
+                and launch_policy(attributes) == "injected_launch")
     if attributes["weight_quantization"] != BLOCK_FP8_WEIGHT_QUANTIZATION:
         raise ValueError(
             "unsupported weight_quantization "
@@ -286,19 +291,118 @@ def _require_block_fp8_output_storage(attributes):
         raise ValueError("known packed block-FP8 GEMM launch requires BF16 output storage")
 
 
+def _require_real_fp16_runtime(shape, dtype, variant, attributes, hardware):
+    # KernelSpec already checks hardware_id before its no-HWSpec geometry
+    # replay. The exact source profile, dtype and shape checks below still
+    # apply; None does not choose another device or relax program scope.
+    if hardware is not None:
+        if hardware.hardware_id != "nvidia_h200":
+            raise ValueError("real FP16 GemmEx geometry requires H200 HWSpec")
+        if hardware.num_compute_units != 132:
+            raise NotImplementedError("real FP16 GemmEx binds the 132-SM H200")
+    require_dtype(dtype, ("fp16",))
+    require_variant(variant, ("gemm", "gemv"), "real FP16 single-kernel GemmEx")
+    b, m, n, k = require_shape(shape, ("b", "m", "n", "k"))
+    if variant == "gemv" and m != 1:
+        raise ValueError("real FP16 gemv requires one logical input row")
+    required = {"model_execution_version", "source_gemm_runtime", "launch_policy"}
+    if not required.issubset(attributes):
+        raise ValueError("real FP16 GemmEx requires explicit source_launch_inputs runtime facts")
+    if (attributes["model_execution_version"] != "vllm_0_30_0"
+            or attributes["source_gemm_runtime"] != "vllm_0_30_torch_2_13_cu130_cublas13_1_1_fp16_unquantized"
+            or attributes["launch_policy"] != "injected_launch"
+            or "weight_quantization" in attributes):
+        raise NotImplementedError("real FP16 GemmEx source/runtime identity is not bound")
+    return b, m, n, k
+
+
+def select_real_fp16_single_gemm_launch(shape, dtype, variant, attributes, hardware):
+    """Observed GemmEx13.1.1 -> LtHSH geometry, nominal-math partial only.
+
+    The explicit source runtime marker binds the ordinary unquantized
+    FP16 F.linear caller and its contiguous MK/NK -> MN public interface.
+    It is prebound by the consumer, never guessed from the environment.
+    Internal CTA/K mapping and workspace meaning remain unobserved.
+    """
+    b, m, n, k = _require_real_fp16_runtime(shape, dtype, variant, attributes, hardware)
+    if b == 1 and k == 5120 and n == 51200 and m in (1, 4):
+        grid, cluster, dynamic = (4, 25, 1), (4, 1, 1), 216220
+    elif (b, m, n, k) == (1, 1, 151936, 5120):
+        grid, cluster, dynamic = (2, 66, 1), (2, 1, 1), 217268
+    else:
+        raise NotImplementedError("real FP16 GemmEx single-call geometry is unobserved or external-reducer semantics are unbound")
+    parameters = dict.fromkeys(("compulsory_traffic", "weight_tile_rows", "mte2_tile_bytes", "aiv_mixed",
+        "n_major_traffic", "split_k_partial_bytes_per_element", "split_k_partial_dram_bytes_per_element"), 0.0)
+    parameters.update(registers_per_thread=168.0, dynamic_shared_bytes=float(dynamic))
+    return LaunchConfig("h200_vllm030_torch213_fp16_observed_gemm", grid, (384, 1, 1),
+        cluster=cluster, parameters=parameters, execution_variant="gemm")
+
+
+def select_real_fp16_external_gemm_launch(shape, dtype, variant, attributes, hardware, *, reducer=False):
+    """Six exact observed launches with an explicit aggregate reduction model.
+
+    Configured 2/5/10 FP32 contributors are a lightweight model assumption
+    (the selected API configuration requests these split counts, compute32F), not an observation of
+    effective K partitions, buffer layout or binary instructions. Consumers
+    must label the estimate partial and retain both physical launches.
+    """
+    b, m, n, k = _require_real_fp16_runtime(shape, dtype, variant, attributes, hardware)
+    if b != 1 or m not in (1, 4):
+        raise NotImplementedError("real FP16 external aggregate shape is unobserved")
+    if (n, k) == (10240, 5120):
+        main_grid, dynamic, reducer_grid, modeled_splits = (4, 28, 1), 221444, (320, 1, 1), 2
+    elif (n, k) == (5120, 8192):
+        main_grid, dynamic, reducer_grid, modeled_splits = (4, 25, 1), 219348, (160, 1, 1), 5
+    elif (n, k) == (5120, 25600):
+        main_grid, dynamic, reducer_grid, modeled_splits = (4, 30, 1), 216204, (160, 1, 1), 10
+    else:
+        raise NotImplementedError("real FP16 external aggregate shape is unobserved")
+    model = {"modeled_split_k": float(modeled_splits), "modeled_partial_bytes_per_element": 4.0,
+             "split_k_count_observed": 0.0}
+    if reducer:
+        return LaunchConfig("h200_vllm030_torch213_fp16_external_aggregate_reduce",
+            reducer_grid, (32, 16, 1), parameters={**model, "registers_per_thread": 32.0},
+            execution_variant="gemm_reduce")
+    parameters = dict.fromkeys(("compulsory_traffic", "weight_tile_rows", "mte2_tile_bytes", "aiv_mixed",
+        "n_major_traffic", "split_k_partial_bytes_per_element", "split_k_partial_dram_bytes_per_element"), 0.0)
+    parameters.update(model, registers_per_thread=168.0, dynamic_shared_bytes=float(dynamic))
+    return LaunchConfig("h200_vllm030_torch213_fp16_external_aggregate_gemm", main_grid, (384, 1, 1),
+        cluster=(4, 1, 1), parameters=parameters, execution_variant="gemm")
+
+
 def select_gemm_launch(
         shape: Mapping[str, int], dtype: Optional[str],
         variant: Optional[str], attributes: Mapping[str, object],
         hardware) -> LaunchConfig:
-    """Select the H200 vLLM 0.24 launch of one block-FP8 dense linear.
+    """Select an observed dense launch or the vLLM 0.24 block-FP8 launch.
 
     Outside ``owns_select_gemm_launch`` this selector has no rule and fails.
     """
 
+    if "bf16_gemm_model" in attributes:
+        if (attributes["bf16_gemm_model"] != "tiled_reference"
+                or launch_policy(attributes) != "analytical_launch"
+                or dtype != "bf16" or variant not in ("gemm", "gemv")
+                or attributes["weight_dtype"] != "bf16"
+                or attributes["weight_group_size"] != 0
+                or attributes["has_bias"] is not False
+                or "weight_quantization" in attributes
+                or ("output_dtype" in attributes and attributes["output_dtype"] not in (None, "bf16"))):
+            raise ValueError("tiled BF16 reference requires an analytical homogeneous unbiased GEMM")
+        b, m, n, k = require_shape(shape, ("b", "m", "n", "k"))
+        if b != 1:
+            raise ValueError("ordinary tiled BF16 reference requires b=1")
+        return _analytical_bf16_launch(b, m, n, k, "gemm")
     if not owns_select_gemm_launch(
             shape, dtype, variant, attributes, hardware):
         raise ValueError(
-            "H200 GEMM selector only owns declared block-FP8 linears")
+            "H200 GEMM selector owns block-FP8 or injected ordinary linears")
+    if "source_gemm_runtime" in attributes:
+        if (shape["n"], shape["k"]) in ((10240, 5120), (5120, 8192), (5120, 25600)):
+            return select_real_fp16_external_gemm_launch(shape, dtype, variant, attributes, hardware)
+        return select_real_fp16_single_gemm_launch(shape, dtype, variant, attributes, hardware)
+    if "weight_quantization" not in attributes:
+        return _select_dense_observed_launch(shape, dtype, variant, attributes)
     _require_block_fp8_output_storage(attributes)
     b, m, n, k = require_shape(shape, ("b", "m", "n", "k"))
     require_variant(variant, ("gemm",), "H200 block-FP8 GEMM")
@@ -429,6 +533,291 @@ def _observed_launch_lut():
         "nvidia_h200", software_revision=_OBSERVED_ROUTER_SOFTWARE_REVISION)
 
 
+H200_DENSE_OBSERVED_ALGORITHM = "h200_cublaslt129_injected_gemm"
+
+
+def _h200_v6_beta_text(beta) -> str:
+    """Project one schema-normalized beta onto its v6 typed-key text.
+
+    The producer stores an omitted beta as "" and the capture runner
+    normalizes numeric 0 to ""; only those spellings are the ordinary
+    identity.  Integer-valued betas project through ``str(int)`` so the
+    typed key stores a canonical decimal (``1``, never ``1.0``).  A
+    non-zero, non-integer, or non-numeric beta is a distinct typed fact
+    and must not alias the beta=0 row.
+    """
+
+    if beta is None or beta == "" or beta == "0" or beta == 0:
+        return ""
+    if isinstance(beta, bool):
+        # The KernelSpec boundary rejects bool; a direct selector caller
+        # that bypassed the boundary must not silently treat False as the
+        # ordinary identity (False == 0 in Python).
+        raise ValueError("H200 v6 typed beta must not be bool")
+    if isinstance(beta, int):
+        return str(beta)
+    if isinstance(beta, float):
+        if not math.isfinite(beta) or beta < 0:
+            raise ValueError(
+                "H200 v6 typed beta must be a non-negative finite number")
+        if beta.is_integer():
+            return str(int(beta))
+        return format(beta, "g")
+    # A string that survived the boundary (e.g. a direct caller passing a
+    # decimal string) parses through the same canonical-decimal rule.
+    try:
+        value = float(beta)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"H200 v6 typed beta is not a non-negative finite number: "
+            f"{beta!r}") from None
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(
+            "H200 v6 typed beta must be a non-negative finite number")
+    if value.is_integer():
+        return str(int(value))
+    return format(value, "g")
+
+
+def _h200_v6_output_dtype_text(out_dtype, dtype_name: str) -> str:
+    """Project one schema-normalized output_dtype onto its v6 typed-key text.
+
+    None or "" is the homogeneous-output ordinary identity.  An explicit
+    output_dtype equal to the input dtype is the same homogeneous fact and
+    projects to "" so a typed row cannot be requested under two spellings.
+    """
+
+    if out_dtype is None or out_dtype == "":
+        return ""
+    out_text = str(out_dtype)
+    if out_text == dtype_name:
+        return ""
+    return out_text
+
+
+def _h200_v6_key_suffix_from_public(shape, attributes, dtype_name) -> tuple:
+    """Project the canonical public KernelSpec GEMM fields onto the v6 suffix.
+
+    The public contract reuses the existing KernelSpec fields: ``shape.b``
+    for batch count, the three ``*_batch_stride_elements`` attributes for
+    strided calls, ``output_dtype`` for mixed-output, and a schema-defined
+    ``beta`` attribute whose ordinary value is 0.  No parallel public
+    ``batch`` or ``strides`` payload is introduced.  The private v6 suffix
+    is formed from these canonical fields; unknown keys fail closed at the
+    attribute layer, not here.
+
+    ``beta`` and ``output_dtype`` are schema-normalized at the KernelSpec
+    boundary: an absent ``beta`` means the ordinary value 0 and an absent
+    ``output_dtype`` means the homogeneous output.  The projection encodes
+    that schema contract directly (the boundary is the single source of
+    truth for the default) so a direct selector caller that bypassed the
+    boundary still resolves to the ordinary identity rather than being
+    rejected mid-projection.  ``dtype_name`` is the canonical input dtype
+    so an explicit output_dtype equal to the input dtype projects to the
+    homogeneous ("") suffix.
+    """
+    if "beta" in attributes:
+        beta = attributes["beta"]
+    else:
+        beta = 0
+    beta_text = _h200_v6_beta_text(beta)
+    if "output_dtype" in attributes:
+        out_dtype = attributes["output_dtype"]
+    else:
+        out_dtype = None
+    out_dtype_text = _h200_v6_output_dtype_text(out_dtype, dtype_name)
+    batch_value = int(shape["b"])
+    if batch_value > 1:
+        stride_a = attributes["a_batch_stride_elements"]
+        stride_b = attributes["b_batch_stride_elements"]
+        stride_c = attributes["c_batch_stride_elements"]
+        stride_values = (int(stride_a), int(stride_b), int(stride_c))
+    else:
+        stride_values = (None, None, None)
+    return (beta_text, out_dtype_text, batch_value, *stride_values)
+
+
+def _dense_observed_row(shape, dtype, variant, attributes):
+    dtype_name = require_dtype(dtype, ("bf16", "fp16"))
+    key = gemm_launch_selection_key(shape, dtype_name, variant, attributes)
+    # Typed-call rows must not silently alias an ordinary v5 row: a typed
+    # identity (beta/output dtype/batch/strides) requires an exact v6 row;
+    # a missing typed row is an explicit observability gap.  Ordinary calls
+    # keep the published 13-field key.
+    lut = _observed_launch_lut()
+    # A typed fact is any non-ordinary value of the canonical public fields:
+    # beta (ordinary 0), output_dtype (ordinary None), or a batched call
+    # (shape.b > 1).  Ordinary calls carry beta=0, output_dtype=None, b=1.
+    # The membership test encodes the schema contract directly: the
+    # KernelSpec boundary always populates these fields, and a direct
+    # selector caller that omitted them resolves to the schema default
+    # (beta 0, output_dtype None) rather than inventing a parallel source.
+    if "beta" in attributes:
+        beta = attributes["beta"]
+    else:
+        beta = 0
+    if "output_dtype" in attributes:
+        out_dtype = attributes["output_dtype"]
+    else:
+        out_dtype = None
+    batch = int(shape["b"])
+    beta_is_typed = (_h200_v6_beta_text(beta) != "")
+    out_dtype_is_typed = (
+        _h200_v6_output_dtype_text(out_dtype, dtype_name) != "")
+    typed_requested = beta_is_typed or out_dtype_is_typed or batch > 1
+    if typed_requested:
+        # A typed request must fully characterize its typed identity: a
+        # non-ordinary beta must state its output_dtype (None means the
+        # caller did not state it, not the homogeneous identity), and a
+        # batched call must state its strides.  An output_dtype-only
+        # request is complete because None already means homogeneous
+        # output per the schema boundary; an output_dtype equal to the
+        # input dtype is likewise the homogeneous fact and completes a
+        # beta-only request.
+        missing_typed = []
+        if batch > 1:
+            for name in ("a_batch_stride_elements",
+                         "b_batch_stride_elements",
+                         "c_batch_stride_elements"):
+                if name not in attributes or attributes[name] is None:
+                    missing_typed.append(name)
+        if missing_typed:
+            raise NotImplementedError(
+                f"partial typed identity without full v6 typed key fields: "
+                f"{missing_typed}")
+        # The typed request is fully characterised; form the v6 suffix.
+        suffix = _h200_v6_key_suffix_from_public(shape, attributes, dtype_name)
+        typed_key = (*key, *suffix)
+        if typed_key in lut:
+            return _require_tiled_grid(lut[typed_key], typed_key)
+        # Every typed fact is ordinary (beta 0, output dtype None,
+        # batch 1, strides None) but the caller explicitly supplied them;
+        # fall through to the ordinary alias below rather than treating this
+        # as a typed miss.
+        if suffix == ("", "", 1, None, None, None):
+            ordinary_key = key
+            if ordinary_key not in lut:
+                ordinary_key = typed_key
+            if ordinary_key in lut:
+                return _require_tiled_grid(lut[ordinary_key], ordinary_key)
+        raise NotImplementedError(
+            f"uncharacterized NVIDIA H200 typed GEMM launch key "
+            f"(beta={suffix[0]!r}, output_dtype={suffix[1]!r}, "
+            f"batch={suffix[2]}, strides={suffix[3:]}) "
+            f"for typed request {typed_key}")
+    # A v6 LUT keys every ordinary call by its 19-field typed identity
+    # (beta "", output dtype "", batch 1, strides null); the plain
+    # 13-field request matches that alias when its typed facts are all
+    # ordinary.  The M=1 output-head call is labelled "gemv" by the
+    # serving stack but captured under the "gemm" variant because
+    # cuBLASLt receives the same physical GEMM descriptor; the selector
+    # resolves the alias only when the physical shape (b=1, m=1) and
+    # all other key fields are identical.
+    gemm_key = key
+    if variant == "gemv" and int(shape["m"]) == 1 and batch == 1:
+        gemm_key = (dtype_name, "gemm", *key[2:])
+    for lookup_key in (key, gemm_key, (*key, "", "", 1, None, None, None),
+                       (*gemm_key, "", "", 1, None, None, None)):
+        if lookup_key in lut:
+            return _require_tiled_grid(lut[lookup_key], lookup_key)
+    raise NotImplementedError(f"uncharacterized NVIDIA H200 GEMM launch key {key}")
+
+
+def _require_tiled_grid(row, key):
+    if row.observed_grid is None:
+        raise NotImplementedError("H200 dense GEMM requires an observed launch row")
+    return row
+
+
+def select_legacy_bf16_external_aggregate_launch(shape, dtype, variant, attributes, hardware, *, reducer=False):
+    """Replay the released exact CUDA12.9 rows, with modeled3/2 FP32 partials."""
+    if hardware is not None:
+        if hardware.hardware_id != "nvidia_h200" or hardware.num_compute_units != 132:
+            raise ValueError("legacy BF16 aggregate requires the132-SM H200 source profile")
+    require_dtype(dtype, ("bf16",))
+    require_variant(variant, ("gemm", "gemv"), "legacy BF16 aggregate")
+    if "weight_quantization" in attributes or "source_gemm_runtime" in attributes:
+        raise ValueError("legacy BF16 aggregate cannot borrow a quantized or Torch13 runtime")
+    if attributes["launch_policy"] != "injected_launch":
+        raise NotImplementedError("legacy BF16 aggregate requires the published injected source")
+    row = _dense_observed_row(shape, dtype, variant, attributes)
+    model = _legacy_bf16_external_aggregate_parameters(shape, dtype, attributes, row)
+    if model is None:
+        raise NotImplementedError("legacy BF16 aggregate is confined to released published source shapes")
+    if reducer:
+        return select_gemm_reducer_launch(shape, dtype, variant, attributes, hardware)
+    return _select_dense_observed_launch(shape, dtype, variant, attributes)
+
+
+
+
+def _legacy_bf16_external_aggregate_parameters(shape, dtype, attributes, row):
+    """Configured split count as an explicit lightweight model, not K mapping."""
+    b, m, n, k = require_shape(shape, ("b", "m", "n", "k"))
+    if dtype != "bf16" or b != 1:
+        return None
+    if "beta" in attributes and attributes["beta"] not in (None, "", "0", 0):
+        return None
+    if "output_dtype" in attributes and attributes["output_dtype"] not in (None, "bf16"):
+        return None
+    if (m, n, k) == (12, 4608, 7168):
+        modeled_splits = 3
+    elif k == 7168 and n == 20480 and m in (1, 2, 4, 6, 8):
+        modeled_splits = 2
+    elif (m, n, k) in ((1, 2560, 4096), (1, 4096, 4096)):
+        modeled_splits = 2
+    elif (m, n, k) in ((1, 5120, 8192), (1, 2560, 9728), (1, 5120, 25600)):
+        modeled_splits = 5
+    elif (m, n, k) in ((1, 4096, 12288), (1, 4096, 14336)):
+        modeled_splits = 3
+    else:
+        return None
+    if (row.reduction != "fp32_external" or row.observed_grid is None
+            or row.observed_grid.observability != "grid_block_only"):
+        raise ValueError("legacy BF16 aggregate requires its published grid-only FP32 external row")
+    return {"modeled_split_k": float(modeled_splits),
+            "modeled_partial_bytes_per_element": 4.0,
+            "split_k_count_observed": 0.0}
+
+
+def _select_dense_observed_launch(shape, dtype, variant, attributes):
+    row = _dense_observed_row(shape, dtype, variant, attributes)
+    observation = row.observed_grid
+    partial_bytes = 4.0 if row.reduction == "fp32_external" else 0.0
+    if row.reduction not in ("none", "fp32_external"):
+        raise NotImplementedError("H200 dense reducer kind is unsupported")
+    if observation.observability == "tiled_grid":
+        # Only a tiled-grid observation may carry tile/pipeline facts;
+        # grid-block-only rows keep them unknown rather than invented.
+        tiling = TilingSpec(
+            tile_shape={"m": row.tile_m, "n": row.tile_n, "k": row.tile_k},
+            pipeline_depth=row.pipeline_depth, split_k=row.split_k)
+    else:
+        # A grid-block-only observation (the v6 candidate rows) records the
+        # true main/reducer geometry but not the tile/pipeline/split facts.
+        # The split count, tile, and pipeline depth stay unknown (None); the
+        # partial traffic is declared at its observed FP32-external width.
+        # The public prediction bridge for these rows is Goal 05's delivered
+        # no-tile path (commit 99bff0446); this selector keeps the real
+        # unknown values rather than fabricating a placeholder tile.
+        tiling = None
+    model = _legacy_bf16_external_aggregate_parameters(shape, dtype, attributes, row)
+    return LaunchConfig(
+        algorithm=(H200_DENSE_OBSERVED_ALGORITHM if model is None else
+                   "h200_cublaslt129_bf16_external_aggregate_gemm"),
+        grid=observation.grid, block=(observation.block_threads, 1, 1),
+        tiling=tiling,
+        parameters={
+            "compulsory_traffic": 0.0, "weight_tile_rows": 0.0,
+            "mte2_tile_bytes": 0.0, "aiv_mixed": 0.0, "n_major_traffic": 0.0,
+            "split_k_partial_bytes_per_element": partial_bytes,
+            "split_k_partial_dram_bytes_per_element": 0.0,
+            **({} if model is None else model),
+        },
+        execution_variant="gemm",
+    )
+
+
 def _observed_sglang_router_launch(
         shape: Mapping[str, int], attributes: Mapping[str, object],
         ) -> ObservedGridLaunchSelection | None:
@@ -454,9 +843,18 @@ def _observed_sglang_router_launch(
     key = ("bf16", "gemm", 1, b * m, n, k, "row_major", "row_major",
            "row_major", False, True, "none", False)
     lut = _observed_launch_lut()
-    if key not in lut:
+    # The canonical v5 artifact stores router rows under the plain 13-field
+    # key with output_dtype="fp32" recorded in the launch fields.  A v6
+    # artifact stores them under the 19-field typed key with
+    # output_dtype_key="fp32".  Try the v6 key first, then fall back to the
+    # v5 13-field key so both eras remain loadable.
+    v6_router_key = (*key, "", "fp32", 1, None, None, None)
+    if v6_router_key in lut:
+        selection = lut[v6_router_key].observed_grid
+    elif key in lut:
+        selection = lut[key].observed_grid
+    else:
         return None
-    selection = lut[key].observed_grid
     if selection is None or selection.output_dtype != "fp32":
         raise ValueError(
             "H200 router launch row must be an FP32-output observed grid")
@@ -489,19 +887,43 @@ def owns_select_gemm_reducer_launch(
         shape: Mapping[str, int], dtype: Optional[str],
         variant: Optional[str], attributes: Mapping[str, object],
         hardware) -> bool:
-    """Whether the reducer belongs to an observed SGLang router launch."""
+    """Own reducers for observed dense linears and SGLang routers."""
 
-    return (variant == "moe_router"
-            and _observed_sglang_router_launch(shape, attributes)
-            is not None)
+    return ((variant in ("gemm", "gemv")
+             and "weight_quantization" not in attributes
+             and launch_policy(attributes) == "injected_launch")
+            or (variant == "moe_router"
+                and _observed_sglang_router_launch(shape, attributes) is not None))
 
 
 def select_gemm_reducer_launch(
         shape: Mapping[str, int], dtype: Optional[str],
         variant: Optional[str], attributes: Mapping[str, object],
-        hardware) -> LaunchConfig:
+        hardware) -> LaunchConfig | None:
     """Return the observed ``cublasLt::splitKreduce_kernel`` launch."""
 
+    if "source_gemm_runtime" in attributes:
+        if (shape["n"], shape["k"]) in ((10240, 5120), (5120, 8192), (5120, 25600)):
+            return select_real_fp16_external_gemm_launch(shape, dtype, variant, attributes, hardware, reducer=True)
+        select_real_fp16_single_gemm_launch(shape, dtype, variant, attributes, hardware)
+        return None
+    if variant in ("gemm", "gemv"):
+        row = _dense_observed_row(shape, dtype, variant, attributes)
+        if row.reduction == "none":
+            return None
+        observation = row.observed_grid
+        if row.reduction != "fp32_external" or observation.reducer_grid is None:
+            raise ValueError("H200 dense launch lost its FP32 reducer")
+        model = _legacy_bf16_external_aggregate_parameters(shape, dtype, attributes, row)
+        return LaunchConfig(
+            algorithm=("logical_gemm_aux:gemm_reduce" if model is None else
+                       "h200_cublaslt129_bf16_external_aggregate_reduce"),
+            grid=(*observation.reducer_grid, 1),
+            block=(*observation.reducer_block, 1),
+            parameters={"split_k_partial_bytes_per_element": 4.0,
+                        "split_k_partial_dram_bytes_per_element": 0.0,
+                        **({} if model is None else model)},
+            execution_variant="gemm_reduce")
     selection = (
         _observed_sglang_router_launch(shape, attributes)
         if variant == "moe_router" else None)
@@ -616,9 +1038,18 @@ def select_target_gemm_launch(
             source_program=GpuCtaRasterProgram("none", 0, False, 1),
         )
     require_dtype(dtype, ("bf16",))
+    return _analytical_bf16_launch(b, m, n, k, "batched_gemm")
+
+
+def _analytical_bf16_launch(b, m, n, k, variant):
+    """Frozen analytical tile program; no vendor geometry or split claim.
+
+    Ordinary and strided-batched references share the existing static tiler.
+    Every problem keeps its real rows and a separate batch grid axis.
+    """
     tile_m, tile_n, tile_k, depth = analytical_cublas_tiling(m, n, k)
     return LaunchConfig(
-        algorithm="cublas_analytical_gemm:batched_gemm",
+        algorithm=f"cublas_analytical_gemm:{variant}",
         grid=(ceil_div(m, tile_m) * ceil_div(n, tile_n), b, 1),
         block=(cublaslt_main_block_threads(tile_m, tile_n), 1, 1),
         tiling=TilingSpec(
@@ -635,7 +1066,7 @@ def select_target_gemm_launch(
             "split_k_partial_bytes_per_element": 0.0,
             "split_k_partial_dram_bytes_per_element": 0.0,
         },
-        execution_variant="batched_gemm",
+        execution_variant=variant,
         # No vendor raster map was captured: the traffic model rasters each
         # batch problem's tile grid directly.
         source_program=GpuCtaRasterProgram("none", 0, False, 1),

@@ -29,10 +29,10 @@ Launch derivation follows the installed source
   ``num_warps * 32`` threads; ``BLOCK_SIZE_K`` is clamped to the 128 block.
 * W2 multiplies the router weight (``MUL_ROUTED_WEIGHT=True``), W1 does not.
 
-``owns_select_fused_moe_launch`` declares that enumerated domain; the
-dispatcher routes every other request (other dtypes, experts, widths, expert
-parallelism and the INT4 ``routed_experts`` aggregate) to the projected A800
-package, so this module restates no A800 rule.
+The explicitly versioned0.30 source path additionally selects unquantized
+and block-FP8 configurations from this hardware's own runtime sources.
+Requests outside the bound domains remain explicit gaps. The dispatcher
+never projects another hardware package.
 """
 
 from typing import Mapping, Optional
@@ -50,6 +50,27 @@ from src.kernel.launch_config.selection_primitives import (
 from src.kernel.model_contract import (
     SOURCE_FUSED_MOE_W2_ROUTED_WEIGHT_PROGRAM_PARAMETER,
 )
+from src.kernel.launch_config.nvidia_h200.moe_source_launch import (
+    select_source_moe_launch, select_source_moe_recipe)
+
+
+def select_fused_moe_recipe(shape, hardware, attributes=None):
+    """Select the declared source sequence, never a hardware-only runtime."""
+    if attributes is None or "model_execution_version" not in attributes:
+        raise NotImplementedError("H200 MoE recipe requires explicit runtime/config source facts")
+    return select_source_moe_recipe(shape, attributes, hardware)
+
+
+def select_fused_moe_cast_roles(shape, hardware, attributes=None):
+    # The CUDA recipes use named router casts, not the NPU moe_cast ABI.
+    select_fused_moe_recipe(shape, hardware, attributes)
+    return ()
+
+
+def select_fused_moe_reduce_work_fractions(shape, hardware, attributes=None):
+    recipe = select_fused_moe_recipe(shape, hardware, attributes)
+    # The0.11 Torch sum consumes the complete routed output once.
+    return (1.0,) if recipe.count("moe_reduce") == 1 else ()
 
 
 H200_TUNED_CONFIG_EVIDENCE_REFERENCE = (
@@ -523,7 +544,8 @@ def owns_select_fused_moe_launch(shape: Mapping[str, int],
     """Whether the request is in an H200-owned fused-MoE domain."""
 
     del hardware
-    return (_fp8_block_domain(shape, dtype, variant, attributes)
+    return (variant in ("w1", "w2") and "model_execution_version" in attributes
+            or _fp8_block_domain(shape, dtype, variant, attributes)
             or _dsv4_mxfp4_domain(shape, dtype, variant, attributes))
 
 
@@ -531,6 +553,8 @@ def select_fused_moe_launch(shape: Mapping[str, int], dtype: Optional[str],
                             variant: Optional[str],
                             attributes: Mapping[str, object],
                             hardware) -> LaunchConfig:
+    if variant in ("w1", "w2") and "model_execution_version" in attributes:
+        return select_source_moe_launch(shape, dtype, variant, attributes, hardware)
     if _sglang_domain(shape, dtype, variant, attributes):
         return _select_sglang_fp8_block_launch(
             shape, variant, attributes, hardware)
@@ -538,8 +562,7 @@ def select_fused_moe_launch(shape: Mapping[str, int], dtype: Optional[str],
         return _select_dsv4_mxfp4_launch(shape, attributes, hardware)
     del hardware
     if not _fp8_block_domain(shape, dtype, variant, attributes):
-        raise ValueError(
-            "H200 FUSED_MOE selector owns only the vLLM 0.24 FP8 block and "
-            "the DeepSeek-V4 MXFP4 MARLIN aggregate domains; the dispatcher "
-            "routes other requests to the projected package")
+        raise NotImplementedError(
+            "H200 FUSED_MOE requires a bound runtime/config for its unquantized, "
+            "FP8 block or MXFP4 MARLIN source program")
     return _select_fp8_block_launch(shape, variant)

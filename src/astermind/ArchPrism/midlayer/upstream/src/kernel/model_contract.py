@@ -2740,7 +2740,9 @@ class PipelineStageDemand:
     nodes whose
     completion releases a source-local dependency while later path nodes
     continue to drain; every node remains conserved and priced as an aggregate
-    resource lower bound.  Per-worker bytes may occur asymmetrically in a
+    resource lower bound. A fractional memory capacity stage may select the
+    same completion nodes without repeating first-request latency; its full
+    downstream work fraction remains conserved. Per-worker bytes may occur asymmetrically in a
     repeated source program.  A launch-shared stage must still occur
     identically and exactly once on every worker.  The formula prices these
     demands on one physical worker and verifies conservation against the
@@ -3008,12 +3010,15 @@ class PipelineStageDemand:
                 raise ValueError(
                     "PipelineStageDemand.completion_resource_roles cannot "
                     "be empty")
-            if not (
-                    self.memory_node_demands
-                    or self.launch_shared_memory_node_demands):
+            has_node_demands = bool(
+                self.memory_node_demands or self.launch_shared_memory_node_demands)
+            if not has_node_demands and not (
+                    self.service.startswith("memory:")
+                    and self.work_fraction is not None
+                    and not self.include_first_request_latency):
                 raise ValueError(
-                    "PipelineStageDemand completion roles require memory "
-                    "node demands")
+                    "PipelineStageDemand completion roles require memory node "
+                    "demands or a fractional memory capacity stage")
             normalized_completion_roles = tuple(
                 _require_name(
                     "PipelineStageDemand.completion_resource_roles", role)
@@ -3031,7 +3036,7 @@ class PipelineStageDemand:
             }
             unknown_completion_roles = (
                 set(normalized_completion_roles) - available_memory_roles)
-            if unknown_completion_roles:
+            if has_node_demands and unknown_completion_roles:
                 raise ValueError(
                     "PipelineStageDemand completion roles must belong to "
                     "the stage memory path: "
@@ -3169,7 +3174,8 @@ class PipelineStageDemand:
                     "pipeline-stage memory nodes must belong to service path "
                     f"{path_name!r}, got {sorted(mismatched_paths)}")
         else:
-            if self.completion_resource_roles is not None:
+            if (self.completion_resource_roles is not None
+                    and not self.service.startswith("memory:")):
                 raise ValueError(
                     "PipelineStageDemand completion roles require memory "
                     "node demands")
@@ -5852,7 +5858,9 @@ class FiaSplitFuseWorkPlan:
                                 "SplitFuse Vec1 row tile is empty")
                         exp_invocations += math.ceil(rows / row_tile)
                     vector_services["generic"][worker] += (
-                        repeat_count * (4 * scores + outputs))
+                        repeat_count * (4 * scores + outputs
+                            + 2 * outputs * (math.ceil(
+                                attended_kv / self.kv_stack_ceiling) - 1)))
                     vector_services["exp"][worker] += (
                         repeat_count * scores)
                     vector_services["div"][worker] += (

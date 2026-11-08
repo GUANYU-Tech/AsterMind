@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import time
 
 from functools import partial
@@ -23,7 +24,7 @@ from evaluation.serving.experiments.inferencex_comparison import sha256, write_r
 write_requests = partial(write_requests, input_tokens=1024, output_tokens=128)
 
 ROOT = Path(__file__).resolve().parents[3]
-PYTHON = Path('/home/yangxinhao/miniconda3/envs/r2r_qwen3_next/bin/python')
+PYTHON = Path(sys.executable)
 CONCURRENCIES = (1, 2, 4, 8, 16, 32, 64, 128)
 OUTDIR = ROOT / 'experiment_logs/inferencex_style_1k128_mtp_sweep'
 DATA_ROOT = ROOT / 'serving_dataset/synthetic/inferencex_style/glm_5_2_h200_1k128_mtp_sweep'

@@ -4,6 +4,23 @@ import math
 from typing import Optional
 
 
+def fused_moe_output_relayout_sources():
+    """Source modules whose discrete output-layout facts affect prediction."""
+    from src.kernel.launch_config.nvidia_h200 import moe_source_launch
+    return (moe_source_launch,)
+
+
+def observed_fused_moe_output_relayout_bytes(kernel, hardware):
+    """Resolve optional compiled output-layout facts in the launch owner."""
+    if hardware.hardware_id != "nvidia_h200":
+        return None
+    source, = fused_moe_output_relayout_sources()
+    parameters = kernel.launch.parameters
+    return source.observed_output_relayout_bytes(kernel.dtype, kernel.launch.tiling,
+        kernel.launch.block_size, parameters["dynamic_shared_memory_bytes"],
+        parameters["registers_per_thread"], parameters["static_shared_bytes"])
+
+
 # CANN 8.5.1 TCubeTiling payloads.  These are discrete source-program facts,
 # not duration-derived parameters.  They live in the shared launch owner so
 # launch selection and the generic predictor validate the same contract
@@ -23,15 +40,23 @@ CANN_GROUPED_MATMUL_K_PROGRAM_PARAMETER_NAMES = (
     "cann_db_l0a", "cann_db_l0b", "cann_db_l0c",
 )
 
-# Both retained M48 captures use exactly 40 routed rows.  Nearby dynamic-M
-# variants remain unsupported until their own source payload is captured.
-_CANN_GROUPED_MATMUL_K_PROGRAM_M48_ROWS_40 = (
-    40, 8, 20, 4, 1, 1, 2, 2, 1)
+# Exact physical-input-row payloads supplement the original base-M table.
+# Both W1/W2 and E64/H2048/I768 versus E512/H4096/I1024 agree. Uncaptured
+# dynamic rows remain unbound; these tuples contain no timing information.
+# Evidence: grouped_matmul_ep_input_rows_cann_8_5_1.json.
+_CANN_GROUPED_MATMUL_K_PROGRAM_BY_EXACT_ROWS = {
+    (48, 40): (40, 8, 20, 4, 1, 1, 2, 2, 1),
+    (48, 48): (40, 8, 20, 4, 1, 1, 2, 2, 1),
+    (96, 88): (16, 8, 8, 4, 1, 1, 2, 2, 1),
+    (96, 96): (16, 8, 8, 4, 1, 1, 2, 2, 1),
+    (112, 104): (16, 8, 8, 4, 1, 1, 2, 2, 1),
+    (112, 112): (16, 8, 8, 4, 1, 1, 2, 2, 1),
+}
 
 
 def cann_grouped_matmul_k_program(
         base_m: int, routed_rows: int) -> Optional[tuple[int, ...]]:
-    """Return the captured CANN K program for one launch geometry."""
+    """Return the captured K program for physical input descriptor rows."""
 
     if isinstance(base_m, bool) or not isinstance(base_m, int):
         raise TypeError("base_m must be an integer")
@@ -39,8 +64,9 @@ def cann_grouped_matmul_k_program(
         raise TypeError("routed_rows must be an integer")
     if base_m <= 0 or routed_rows <= 0:
         raise ValueError("base_m and routed_rows must be positive")
-    if base_m == 48 and routed_rows == 40:
-        return _CANN_GROUPED_MATMUL_K_PROGRAM_M48_ROWS_40
+    key = (base_m, routed_rows)
+    if key in _CANN_GROUPED_MATMUL_K_PROGRAM_BY_EXACT_ROWS:
+        return _CANN_GROUPED_MATMUL_K_PROGRAM_BY_EXACT_ROWS[key]
     if base_m in _CANN_GROUPED_MATMUL_K_PROGRAM_BY_BASE_M:
         return _CANN_GROUPED_MATMUL_K_PROGRAM_BY_BASE_M[base_m]
     return None

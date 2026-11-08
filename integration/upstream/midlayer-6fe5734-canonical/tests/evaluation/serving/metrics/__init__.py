@@ -1,1 +1,0 @@
-"""Serving metric evaluation tests."""

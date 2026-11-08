@@ -288,6 +288,7 @@ def run_multi_pool_schedule(
     on_step_complete: Callable[[BackendStep, float], None] | None = None,
     timing_mode: str = "device_only",
     closed_loop: ClosedLoopClients | None = None,
+    on_transfer_complete: Callable[[str, str, float], None] | None = None,
 ) -> ScheduleTrace:
     if not backends:
         raise ValueError("multi-pool schedule requires at least one backend")
@@ -620,15 +621,17 @@ def run_multi_pool_schedule(
                             _TRANSFER_COMPLETION_PRIORITY,
                             sequence,
                             "transfer_completion",
-                            (destination, admitted_request),
+                            (destination, admitted_request, pool_name),
                         ))
                         sequence += 1
                 inject_closed_loop_successors(pool_name, step, completion_time)
             elif event_kind == "transfer_completion":
-                destination, request = payload
+                destination, request, source = payload
                 if destination not in backends:
                     raise ValueError(
                         f"transfer completed for unknown pool {destination!r}")
+                if on_transfer_complete is not None:
+                    on_transfer_complete(source, request.request_id, now)
                 backends[destination].add_request(request)
                 last_admission_at[destination] = now
             elif event_kind == "route_dispatch":

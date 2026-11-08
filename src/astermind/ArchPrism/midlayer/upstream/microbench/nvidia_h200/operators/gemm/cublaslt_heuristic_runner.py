@@ -62,7 +62,10 @@ IDLE_MAX_MEMORY_MIB = 16
 HEURISTIC_RESULT_CAPACITY = 64
 POSTFLIGHT_IDLE_ATTEMPTS = 31
 POSTFLIGHT_IDLE_INTERVAL_SECONDS = 1.0
-DEFAULT_CUDA_ROOT = Path("/mnt/public/yangxinhao/tools/cuda-12.9")
+DEFAULT_CUDA_ROOT = (
+    Path(os.environ["CUDA_HOME"])
+    if "CUDA_HOME" in os.environ else Path("/usr/local/cuda")
+)
 ALGORITHM_FIELDS = frozenset({
     "rank", "algorithm_id", "tile_id", "stages_id", "cluster_shape_id",
     "inner_shape_id", "split_k", "reduction_scheme", "cta_swizzle",

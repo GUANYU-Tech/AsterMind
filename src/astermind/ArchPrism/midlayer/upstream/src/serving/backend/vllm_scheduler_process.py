@@ -59,7 +59,7 @@ _PINNED_PACKAGE_PYTHON_MANIFEST_SHA256 = (
     "49a6f51a5e375a3eabb2dee2042c05efa78d7b03c89235787932c94cc0904bdb"
 )
 # OrbitServe also verifies the official v0.11.0 Linux x86-64 release wheel.
-# Its 945-file manifest is distinct, with the same pinned control-plane files.
+# The same per-file Scheduler checks below apply to both package builds.
 _PYPI_X86_64_PACKAGE_PYTHON_MANIFEST_SHA256 = (
     "bbdb44417f74916986eb0ab4e24998bb6a222c6c2ef57db8a662d77bb14d7aea"
 )
@@ -314,6 +314,7 @@ class VLLMSchedulerProcess:
                 "vLLM scheduler model must be a JSON config file or a local "
                 "directory containing config.json")
         scheduler_config = replace(scheduler_config, model=str(model_path))
+        self.scheduler_config = scheduler_config
 
         context = multiprocessing.get_context("spawn")
         parent_connection, child_connection = context.Pipe(duplex=True)
@@ -351,6 +352,15 @@ class VLLMSchedulerProcess:
     def plan_step(self, virtual_time_s: float) -> Any:
         return self._rpc(("plan_step", virtual_time_s))
 
+    def enable_modeled_simple_cpu_offload(self) -> None:
+        self._rpc(("enable_modeled_simple_cpu_offload",))
+
+    def take_modeled_simple_cpu_releases(self) -> tuple[Any, ...]:
+        return self._rpc(("take_modeled_simple_cpu_releases",))
+
+    def probe_simple_cpu_connector(self, requests: tuple[Any, ...]) -> Any:
+        return self._rpc(("probe_simple_cpu_connector", requests))
+
     def drain_steps(self, max_steps: int) -> Any:
         return self._rpc(("drain_steps", max_steps))
 
@@ -379,20 +389,34 @@ class VLLMSchedulerProcess:
         requests_per_batch: int,
         prompt_tokens: int,
         output_tokens: int,
+        include_step_records: bool = False,
     ) -> dict[str, tuple[int, ...]]:
-        return self._rpc((
-            "measure_scheduler_service",
-            sample_count,
-            requests_per_batch,
-            prompt_tokens,
-            output_tokens,
-        ))
+        if type(include_step_records) is not bool:
+            raise TypeError("include_step_records must be boolean")
+        command = ("measure_scheduler_service", sample_count, requests_per_batch,
+            prompt_tokens, output_tokens)
+        if not include_step_records:
+            return self._rpc(command)
+        response = self._rpc((*command, True))
+        if not isinstance(response, dict) or set(response) != {"samples", "source"}:
+            raise TypeError("Scheduler measurement source envelope is malformed")
+        self.runtime_info["scheduler_measurement_source"] = response["source"]
+        return response["samples"]
 
     def has_work(self) -> bool:
         result = self._rpc(("has_work",))
         if not isinstance(result, bool):
             raise TypeError("vLLM scheduler process has_work must return boolean")
         return result
+
+    def retain_pd_kv(self, request_id):
+        return self._rpc(("retain_pd_kv", request_id))
+
+    def release_pd_kv(self, request_id):
+        return self._rpc(("release_pd_kv", request_id))
+
+    def reserve_pd_destination(self, request):
+        return self._rpc(("reserve_pd_destination", request))
 
     def close(self) -> None:
         if self._closed:
@@ -513,21 +537,39 @@ class VLLM030SchedulerProcess(VLLMSchedulerProcess):
         if (not isinstance(scheduler_config, VLLMSchedulerConfig)
                 or scheduler_config.scheduler_version != "0.30.0"):
             raise ValueError("isolated 0.30 process requires explicit 0.30 Scheduler config")
+        if scheduler_config.context_parallel_size != 1 or scheduler_config.data_parallel_size != 1:
+            raise NotImplementedError("native CPU0.30 process requires CP1; use VLLMBackend's explicit PCP cache projection")
         if (scheduler_config.max_model_len is None
                 or (scheduler_config.pipeline_parallel_size != 1 and role != "colocated")
-                or scheduler_config.async_scheduling
-                or scheduler_config.enable_prefix_caching
-                or scheduler_config.dtype != "bfloat16"):
-            raise NotImplementedError("isolated 0.30 path requires explicit length, BF16 synchronous/MTP-off without prefix caching; PP pools must be colocated")
+                or (scheduler_config.async_scheduling and (role != "colocated"
+                    or scheduler_config.tensor_parallel_size not in (1, 2)
+                    or scheduler_config.pipeline_parallel_size != 1
+                    or (scheduler_config.enable_expert_parallel and scheduler_config.tensor_parallel_size != 2)
+                    or scheduler_config.mtp_num_speculative_tokens != 0))
+                or (scheduler_config.enable_prefix_caching
+                    and scheduler_config.prefix_cache_mode != "trace_no_hit"
+                    and scheduler_config.simple_cpu_offload_bytes_per_rank is None)
+                or scheduler_config.dtype not in ("bfloat16", "float16")):
+            raise NotImplementedError("isolated 0.30 path requires explicit length, declared 16-bit dtype, and ordinary TP1/TP2 for async, with only bounded trace_no_hit prefix caching; PP pools must be colocated")
         if scheduler_config.mtp_num_speculative_tokens:
-            from src.serving.workload.model_config import load_model_config
+            from src.serving.workload.model_config import load_model_config, is_glm_mtp_tensor_model_scope
             mtp_model = load_model_config(scheduler_config.model)
-            if (mtp_model.model_type != "glm_moe_dsa" or mtp_model.mtp_architecture != "glm_moe_dsa_mtp"
+            if scheduler_config.speculative_method == "dspark":
+                from src.serving.workload.model_config import is_deepseek_v4_parallel_model_scope
+                draft = load_model_config(scheduler_config.dspark_draft_model)
+                if (not draft.is_dspark_draft or draft.model_id != mtp_model.model_id + "-DSpark"
+                        or role != "colocated" or not is_deepseek_v4_parallel_model_scope(mtp_model,
+                            scheduler_config.tensor_parallel_size, scheduler_config.pipeline_parallel_size,
+                            expert_parallel=scheduler_config.enable_expert_parallel)):
+                    raise NotImplementedError("DSpark CPU Scheduler requires its exact V4 target/draft and legal TP/PP geometry")
+            elif (mtp_model.model_type != "glm_moe_dsa" or mtp_model.mtp_architecture != "glm_moe_dsa_mtp"
                     or mtp_model.num_mtp_layers != 1 or scheduler_config.mtp_num_speculative_tokens != 2
-                    or scheduler_config.tensor_parallel_size not in (1, 8) or scheduler_config.pipeline_parallel_size != 1
-                    or scheduler_config.enable_expert_parallel or role != "colocated"
+                    or not is_glm_mtp_tensor_model_scope(mtp_model, scheduler_config.tensor_parallel_size,
+                        expert_parallel=scheduler_config.enable_expert_parallel)
+                    or scheduler_config.pipeline_parallel_size > mtp_model.num_hidden_layers
+                    or role != "colocated"
                     or scheduler_config.mtp_acceptance_policy != "fixed_count"):
-                raise NotImplementedError("isolated 0.30 MTP requires exact colocated GLM depth2 TP1/TP8 EP-off fixed-count source")
+                raise NotImplementedError("isolated 0.30 MTP requires exact colocated GLM depth2 whole-shard TP/nonempty PP EP-off or BF16 stage-local EP fixed-count source")
         if not isinstance(pool_name, str) or not pool_name:
             raise ValueError("0.30 process requires a non-empty pool name")
         if role not in ("colocated", "prefill", "decode") and worker_role_operator_group(role) != "attention":
@@ -543,15 +585,42 @@ class VLLM030SchedulerProcess(VLLMSchedulerProcess):
         config_file = configured if configured.is_file() else configured / "config.json"
         if not config_file.is_file() or config_file.suffix != ".json":
             raise ValueError("0.30 process requires a real local model config.json")
+        startup_request = (scheduler_config, python_executable, source_root, pool_name,
+            max_batched_tokens, max_requests, kv_block_size_tokens, available_memory_by_rank,
+            supported_layouts_by_rank, role)
+        startup_model = hashlib.sha256(config_file.read_bytes()).hexdigest()
         if scheduler_config.enable_expert_parallel:
             from src.serving.workload.model_config import load_model_config
             from src.serving.kv_cache.vllm_allocation import vllm030_supports_expert_parallel_cache
             if not vllm030_supports_expert_parallel_cache(
                     load_model_config(config_file), scheduler_config.tensor_parallel_size):
                 raise NotImplementedError("0.30 CPU expert placement requires Qwen3MoE EP2 or GLM/K2.6 EP8 cache scope")
+        from src.serving.workload.model_config import load_model_config
+        from src.serving.parallelism.pp import pipeline_layer_ranges, pipeline_layer_ranges_for_model
+        source_model = load_model_config(config_file)
+        from src.serving.backend.vllm import _validate_vllm030_dtype_scope
+        _validate_vllm030_dtype_scope(source_model, scheduler_config, role)
+        declared_partition = scheduler_config.pipeline_layer_partition
+        pipeline_partition_value = None
+        if declared_partition is not None:
+            pipeline_layer_ranges(source_model.num_hidden_layers, scheduler_config.pipeline_parallel_size, declared_partition)
+            pipeline_partition_value = ",".join(map(str, declared_partition))
+        elif source_model.model_type == "glm_moe_dsa" and scheduler_config.pipeline_parallel_size > 1:
+            ranges = pipeline_layer_ranges_for_model(source_model, scheduler_config.pipeline_parallel_size)
+            pipeline_partition_value = ",".join(str(end - first) for first, end in ranges)
         temporary = tempfile.TemporaryDirectory(prefix="midlayer-vllm030-model-")
         model_root = Path(temporary.name)
         (model_root / "config.json").write_bytes(config_file.read_bytes())
+        if scheduler_config.speculative_method == "dspark":
+            draft_path = Path(scheduler_config.dspark_draft_model).resolve()
+            draft_file = draft_path if draft_path.is_file() else draft_path / "config.json"
+            if not draft_file.is_file() or draft_file.suffix != ".json":
+                temporary.cleanup()
+                raise ValueError("DSpark CPU Scheduler requires a real local draft config.json")
+            draft_root = model_root / "draft"
+            draft_root.mkdir()
+            (draft_root / "config.json").write_bytes(draft_file.read_bytes())
+            scheduler_config = replace(scheduler_config, dspark_draft_model=str(draft_root))
         scheduler_config = replace(scheduler_config, model=str(model_root))
         parent, child = multiprocessing.get_context("spawn").Pipe(duplex=True)
         environment = dict(os.environ)
@@ -561,11 +630,18 @@ class VLLM030SchedulerProcess(VLLMSchedulerProcess):
             VLLM_NO_USAGE_STATS="1", VLLM_CACHE_ROOT=str(model_root / "cache"),
             PYTHONPATH=str(source_root) + os.pathsep + str(Path(__file__).resolve().parents[3]),
         )
-        entry = ("import sys; from src.serving.backend.vllm_scheduler_process "
+        if scheduler_config.dspark_draft_model is not None:
+            environment["VLLM_USE_V2_MODEL_RUNNER"]="1"
+        if "VLLM_PP_LAYER_PARTITION" in environment:
+            del environment["VLLM_PP_LAYER_PARTITION"]
+        if pipeline_partition_value is not None:
+            environment["VLLM_PP_LAYER_PARTITION"] = pipeline_partition_value
+        entry = ("import sys; sys.path.insert(0, sys.argv[2]); "
+                 "from src.serving.backend.vllm_scheduler_process "
                  "import _vllm030_pipe_worker; _vllm030_pipe_worker(int(sys.argv[1]))")
         try:
             process = subprocess.Popen(
-                [str(python_executable), "-c", entry, str(child.fileno())],
+                [str(python_executable), "-c", entry, str(child.fileno()), str(Path(__file__).resolve().parents[3])],
                 env=environment, pass_fds=(child.fileno(),))
         except BaseException:
             parent.close()
@@ -584,9 +660,43 @@ class VLLM030SchedulerProcess(VLLMSchedulerProcess):
                          max_requests, kv_block_size_tokens, available_memory_by_rank,
                          supported_layouts_by_rank, role))
             self.runtime_info = self._parse_ready(self._receive(_STARTUP_TIMEOUT_S))
+            self._startup_request = startup_request
+            self._startup_model_sha256 = startup_model
+            self._startup_available = True
         except BaseException:
             self._force_close()
             raise
+
+    def _rpc(self, command):
+        self._startup_available = False
+        return super()._rpc(command)
+
+    def claim_initial_state(self, scheduler_config, *, python_executable, source_root, pool_name,
+            max_batched_tokens, max_requests, kv_block_size_tokens, available_memory_by_rank,
+            supported_layouts_by_rank, role):
+        """Transfer the allocator's untouched native Scheduler to its backend.
+
+        The same startup request and model bytes must still apply, and no RPC
+        may have admitted a request or advanced native state in the meantime.
+        """
+        if (self._closed or not self._startup_available or not self._process.is_alive()
+                or any(type(value) is not int or value <= 0
+                    for value in (max_batched_tokens, max_requests, kv_block_size_tokens))
+                or type(available_memory_by_rank) is not tuple
+                or any(type(value) is not int or value <= 0 for value in available_memory_by_rank)
+                or type(supported_layouts_by_rank) is not tuple
+                or any(type(row) is not tuple or any(type(value) is not str for value in row)
+                    for row in supported_layouts_by_rank)):
+            raise ValueError("allocator Scheduler handoff requires untouched live native state and exact limits")
+        request = (scheduler_config, Path(python_executable).absolute(), Path(source_root).resolve(), pool_name,
+            max_batched_tokens, max_requests, kv_block_size_tokens, available_memory_by_rank,
+            supported_layouts_by_rank, role)
+        configured = Path(scheduler_config.model).resolve()
+        config_file = configured if configured.is_file() else configured / "config.json"
+        if (request != self._startup_request
+                or hashlib.sha256(config_file.read_bytes()).hexdigest() != self._startup_model_sha256):
+            raise ValueError("allocator Scheduler handoff differs from its original native configuration")
+        self._startup_available = False
 
     def _parse_ready(self, response: tuple[Any, ...]) -> dict[str, Any]:
         from src.serving.schedule.backend_protocol import BackendConfig
@@ -1061,8 +1171,11 @@ def _runtime_info(
         effective_prefix_caching=effective_cache.enable_prefix_caching,
         requested_async_scheduling=scheduler_config.async_scheduling,
         effective_async_scheduling=effective_scheduler.async_scheduling,
-        prefix_oracle_mode=("native_token_ids_v1" if scheduler_config.prefix_cache_mode == "token_ids"
-                            else "trace_length_private_nonshared_v1"),
+        prefix_oracle_mode=(
+            "native_token_ids_v1" if scheduler_config.prefix_cache_mode == "token_ids"
+            else "trace_no_hit_distinct_first_block_v1"
+            if scheduler_config.prefix_cache_mode == "trace_no_hit"
+            else "trace_length_private_nonshared_v1"),
         speculative_method=speculative_method,
         mtp_num_speculative_tokens=(
             scheduler_config.mtp_num_speculative_tokens),
@@ -1333,6 +1446,7 @@ def _vllm030_pipe_worker(fd: int) -> None:
         from vllm.config import (
             CacheConfig, DeviceConfig, ModelConfig, ParallelConfig, SchedulerConfig, SpeculativeConfig, VllmConfig,
         )
+        from vllm.config.kv_transfer import KVTransferConfig
         from vllm.v1.core.sched.scheduler import Scheduler
         from vllm.v1.structured_output import StructuredOutputManager
         model = load_model_config(requested.model)
@@ -1343,10 +1457,29 @@ def _vllm030_pipe_worker(fd: int) -> None:
         target_parallel = ParallelConfig(tensor_parallel_size=requested.tensor_parallel_size,
             pipeline_parallel_size=requested.pipeline_parallel_size, enable_expert_parallel=requested.enable_expert_parallel)
         speculative = (None if not requested.mtp_num_speculative_tokens else SpeculativeConfig(
-            method="mtp", num_speculative_tokens=requested.mtp_num_speculative_tokens,
+            method=requested.speculative_method, num_speculative_tokens=requested.mtp_num_speculative_tokens,
+            **({"model": requested.dspark_draft_model} if requested.speculative_method == "dspark" else {}),
             target_model_config=target_model, target_parallel_config=target_parallel,
             parallel_drafting=False, disable_padded_drafter_batch=False,
             use_local_argmax_reduction=False, draft_sample_method="greedy"))
+        cache_config = CacheConfig(
+            block_size=block_size, gpu_memory_utilization=requested.gpu_memory_utilization,
+            cache_dtype="fp8_ds_mla" if model.model_type == "deepseek_v4" else "auto",
+            enable_prefix_caching=requested.enable_prefix_caching,
+            **({"mamba_block_size": requested.max_model_len} if model.model_id == "moonshotai/Kimi-K3" else {}))
+        simple_cpu_bytes = requested.simple_cpu_offload_bytes_per_rank
+        if simple_cpu_bytes is None:
+            kv_transfer = None
+        else:
+            kv_transfer = KVTransferConfig(
+                kv_connector="SimpleCPUOffloadConnector", kv_role="kv_both",
+                kv_buffer_device="cpu", kv_load_failure_policy="fail",
+                kv_connector_extra_config={
+                    "cpu_bytes_to_use": simple_cpu_bytes * target_parallel.world_size,
+                    "cpu_bytes_to_use_per_rank": simple_cpu_bytes,
+                    "lazy_offload": False,
+                    "kv_offload_backend": "cpu",
+                })
         native = VllmConfig(
             model_config=target_model,
             scheduler_config=SchedulerConfig(
@@ -1354,43 +1487,62 @@ def _vllm030_pipe_worker(fd: int) -> None:
                 max_num_batched_tokens=max_batch, max_num_seqs=max_requests,
                 enable_chunked_prefill=requested.enable_chunked_prefill,
                 async_scheduling=requested.async_scheduling),
-            cache_config=CacheConfig(block_size=block_size,
-                                     gpu_memory_utilization=requested.gpu_memory_utilization,
-                                     cache_dtype="fp8_ds_mla" if model.model_type == "deepseek_v4" else "auto",
-                                     enable_prefix_caching=requested.enable_prefix_caching),
+            cache_config=cache_config,
             device_config=DeviceConfig(device="cpu"),
             parallel_config=target_parallel,
-            speculative_config=speculative,
+            speculative_config=None if requested.speculative_method == "dspark" else speculative,
+            kv_transfer_config=kv_transfer,
         )
+        if requested.speculative_method == "dspark":
+            # The CPU SDK cannot construct the full V2/Triton runner config.
+            # Attach the independently native-validated SpeculativeConfig only
+            # for allocator/Scheduler control-plane projection, as in its SDK
+            # reference test. This does not bind a runner or model execution.
+            native.speculative_config = speculative
+        if requested.async_scheduling:
+            # CpuPlatform disables async because CPU model execution does not
+            # need it. This guarded process executes no model; restore the
+            # target GPU Scheduler control-plane mode before construction.
+            native.scheduler_config.async_scheduling = True
         workers, scheduler_cache = allocate_vllm030_model_cache(
             native, model, MidlayerParallel(tensor_parallel_size=requested.tensor_parallel_size,
                 pipeline_parallel_size=requested.pipeline_parallel_size,
                 enable_expert_parallel=requested.enable_expert_parallel),
             budgets, source_root=source_root, supported_layouts_by_rank=layouts)
         native.cache_config.num_gpu_blocks = scheduler_cache.num_blocks
-        scheduler = Scheduler(native, scheduler_cache, StructuredOutputManager(native),
-                              block_size=native.cache_config.block_size)
+        scheduler_block_size = (requested.max_model_len if model.model_id == "moonshotai/Kimi-K3"
+                                else native.cache_config.block_size)
+        from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+        scheduler_class = AsyncScheduler if requested.async_scheduling else Scheduler
+        scheduler = scheduler_class(native, scheduler_cache, StructuredOutputManager(native),
+                              block_size=scheduler_block_size)
         # A plain FullAttentionSpec is per layer even when its group owns
         # many layers. UniformTypeKVCacheSpecs already sums its members.
         # Count source leaves once rather than treating both group forms alike.
-        page_bytes = sum(spec.page_size_bytes for spec in vllm030_worker_cache_specs(native, model)[0].values())
+        all_worker_specs = vllm030_worker_cache_specs(native, model)
+        page_bytes = max(sum(spec.page_size_bytes for spec in specs.values()) for specs in all_worker_specs)
         if model.model_type == "deepseek_v4":
             rate = model.kv_bytes_per_token_per_parallel_rank(requested.tensor_parallel_size, 1)
             reporting_bytes_per_token = -(-rate.numerator // rate.denominator)
+        elif model.model_id == "moonshotai/Kimi-K3":
+            reporting_bytes_per_token = 0
         else:
-            reporting_bytes_per_token = page_bytes // native.cache_config.block_size
+            reporting_bytes_per_token = page_bytes // scheduler_block_size
         effective = BackendConfig(
             pool_name, role, scheduler.max_num_scheduled_tokens,
             native.scheduler_config.max_num_seqs, scheduler_cache.num_blocks,
-            kv_block_size_tokens=native.cache_config.block_size,
+            kv_block_size_tokens=scheduler_block_size,
             kv_bytes_per_token=reporting_bytes_per_token,
-            scheduler_pipeline_depth=1)
+            scheduler_pipeline_depth=2 if requested.async_scheduling else 1)
         backend = VLLMBackend.from_vllm030_scheduler(
             effective, requested, scheduler, source_root=source_root,
             worker_kv_configs=tuple(workers))
         control = backend._control_plane
         control.runtime_info.update(
             source_identity=identity, worker_pid=os.getpid(),
+            requested_async_scheduling=requested.async_scheduling,
+            effective_async_scheduling=native.scheduler_config.async_scheduling,
+            scheduler_class=type(scheduler).__name__,
             bootstrap="explicit SDK Python subprocess; guarded CpuPlatform",
             device_guard="CpuPlatform forced; CUDA availability hidden; CUDA/NVML APIs blocked",
             requested_max_num_batched_tokens=max_batch, requested_cache_block_size=block_size,
@@ -1398,6 +1550,12 @@ def _vllm030_pipe_worker(fd: int) -> None:
             capacity_input_source="caller-declared byte budgets, not measured/normal available KV",
             layout_capabilities_source="caller declaration, not worker report",
             gpu_worker_processes_started=0, weights_loaded=False, model_executed=False,
+            full_speculative_vllm_config_constructed=(requested.speculative_method != "dspark"),
+            explicit_speculative_control_plane_projection=(requested.speculative_method == "dspark"),
+            kv_connector=(None if simple_cpu_bytes is None else "SimpleCPUOffloadConnector"),
+            kv_connector_role=(None if simple_cpu_bytes is None else "kv_both"),
+            simple_cpu_offload_bytes_per_rank=simple_cpu_bytes,
+            simple_cpu_offload_mode=(None if simple_cpu_bytes is None else "eager_cpu"),
         )
         _verify_no_accelerator_access(baseline)
         connection.send(("ready", effective, control.runtime_info))
@@ -1436,13 +1594,30 @@ def _serve_scheduler_commands(connection: Connection, control_plane: Any,
             result = control_plane.plan_step(command[1])
             if result is not None:
                 pending_steps.append(result)
+        elif name == "enable_modeled_simple_cpu_offload":
+            if len(command) != 1 or pending_steps:
+                raise ValueError("SimpleCPU modeling requires an unused Scheduler")
+            control_plane.enable_modeled_simple_cpu_offload()
+            result = None
+        elif name == "take_modeled_simple_cpu_releases":
+            if len(command) != 1 or pending_steps:
+                raise ValueError("SimpleCPU release query requires no pending steps")
+            result = control_plane.take_modeled_simple_cpu_releases()
+        elif name == "probe_simple_cpu_connector":
+            if len(command) != 2 or pending_steps:
+                raise ValueError("SimpleCPU probe requires requests and no pending steps")
+            result = control_plane.probe_simple_cpu_connector(command[1])
         elif name == "drain_steps":
             if len(command) != 2:
                 raise ValueError("drain_steps command has invalid arity")
-            if pending_steps:
-                raise RuntimeError(
-                    "complete pending vLLM steps before draining tail")
             result = control_plane.drain_steps(command[1])
+            steps_by_id = {step.schedule.step_id: step
+                for step in (*pending_steps, *result[0])}
+            pending_ids = control_plane.pending_step_ids()
+            if len(steps_by_id) != len(pending_steps) + len(result[0]):
+                raise RuntimeError("vLLM drain returned a duplicate step ID")
+            pending_steps.clear()
+            pending_steps.extend(steps_by_id[step_id] for step_id in pending_ids)
         elif name == "complete_step":
             if len(command) != 6:
                 raise ValueError("complete_step command has invalid arity")
@@ -1460,23 +1635,64 @@ def _serve_scheduler_commands(connection: Connection, control_plane: Any,
                 sample_tokens=command[5],
             )
             pending_steps.popleft()
+        elif name in ("retain_pd_kv", "release_pd_kv", "reserve_pd_destination"):
+            if len(command) != 2:
+                raise ValueError("PD cache command has invalid arity")
+            if name == "retain_pd_kv":
+                result = control_plane.retain_pd_kv(command[1])
+            elif name == "release_pd_kv":
+                result = control_plane.release_pd_kv(command[1])
+            else:
+                result = control_plane.reserve_pd_destination(command[1])
         elif name == "has_work":
             if len(command) != 1:
                 raise ValueError("has_work command has invalid arity")
             result = control_plane.has_work()
         elif name == "measure_scheduler_service":
-            if len(command) != 5:
+            if len(command) not in (5, 6):
                 raise ValueError(
                     "Scheduler service measurement command has invalid arity")
             if pending_steps:
                 raise RuntimeError(
                     "Scheduler service measurement requires no pending steps")
-            result = control_plane.measure_scheduler_service(
-                sample_count=command[1],
-                requests_per_batch=command[2],
-                prompt_tokens=command[3],
-                output_tokens=command[4],
-            )
+            arguments = dict(sample_count=command[1], requests_per_batch=command[2],
+                prompt_tokens=command[3], output_tokens=command[4])
+            include_step_records = len(command) == 6
+            if include_step_records:
+                if command[5] is not True or control_plane.scheduler_config.scheduler_version != "0.30.0":
+                    raise ValueError("source-bound Scheduler step measurements require explicit0.30 opt-in")
+                import inspect
+                scheduler_type = type(control_plane.scheduler)
+                source_root = Path(control_plane.runtime_info["source_identity"]["source_root"]).resolve()
+                source_files = []
+                for parent in scheduler_type.__mro__:
+                    if not parent.__module__.startswith("vllm.v1.core.sched."):
+                        continue
+                    source_file = inspect.getsourcefile(parent)
+                    if source_file is None:
+                        raise RuntimeError("actual Scheduler class has no source file")
+                    source_path = Path(source_file).resolve()
+                    relative = source_path.relative_to(source_root)
+                    source_files.append({"class": parent.__module__ + "." + parent.__name__,
+                        "path": str(source_path), "relative_path": str(relative),
+                        "sha256": hashlib.sha256(source_path.read_bytes()).hexdigest()})
+                if not source_files:
+                    raise RuntimeError("actual Scheduler class source is outside the pinned checkout")
+                source = {"source_identity": control_plane.runtime_info["source_identity"],
+                    "scheduler_class": scheduler_type.__name__,
+                    "scheduler_constructor": scheduler_type.__module__ + "." + scheduler_type.__name__,
+                    "scheduler_source_files": source_files, "worker_pid": os.getpid(),
+                    "control_workload": {"platform": "cpu",
+                        "enable_prefix_caching": control_plane.scheduler.cache_config.enable_prefix_caching,
+                        "log_stats": control_plane.scheduler.log_stats,
+                        "admission_batch_sizes": [command[2]]}}
+                arguments["include_step_records"] = True
+            result = control_plane.measure_scheduler_service(**arguments)
+            if include_step_records:
+                for entry in source_files:
+                    if hashlib.sha256(Path(entry["path"]).read_bytes()).hexdigest() != entry["sha256"]:
+                        raise RuntimeError("Scheduler source changed during the measurement")
+                result = {"samples": result, "source": source}
         elif name == "close":
             if len(command) != 1:
                 raise ValueError("close command has invalid arity")

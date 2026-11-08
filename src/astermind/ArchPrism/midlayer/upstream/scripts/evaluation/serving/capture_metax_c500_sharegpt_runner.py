@@ -68,7 +68,7 @@ def _sample_prompts(model: str, dataset: str, seed: int, expected_inputs: list[i
     return [sample.prompt for sample in samples]
 
 
-def _engine(model: str, tp: int, ep: int):
+def _engine(model: str, tp: int, ep: int, *, graph_execution: bool, seed: int):
     from vllm.engine.arg_utils import AsyncEngineArgs
     from vllm.engine.async_llm_engine import AsyncLLMEngine
 
@@ -76,7 +76,7 @@ def _engine(model: str, tp: int, ep: int):
         "model": model,
         "dtype": "bfloat16",
         "gpu_memory_utilization": 0.8,
-        "enforce_eager": True,
+        "enforce_eager": not graph_execution,
         "max_model_len": 8192,
         "tensor_parallel_size": tp,
         "pipeline_parallel_size": 1,
@@ -84,6 +84,19 @@ def _engine(model: str, tp: int, ep: int):
         "enable_chunked_prefill": True,
         "max_num_batched_tokens": 8192,
     }
+    if graph_execution:
+        arguments.update({
+            "async_scheduling": True,
+            "cudagraph_metrics": True,
+            "enable_prefix_caching": True,
+            "block_size": 16,
+            "max_num_seqs": 256,
+            "scheduling_policy": "fcfs",
+            "safetensors_load_strategy": "prefetch",
+            "safetensors_prefetch_num_threads": 1,
+            "seed": seed,
+            "compilation_config": {"mode": 3},
+        })
     if ep == 2:
         arguments["enable_expert_parallel"] = True
     elif ep != 1:
@@ -163,6 +176,9 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--tensor-parallel-size", type=int, required=True)
     parser.add_argument("--expert-parallel-size", type=int, required=True)
+    parser.add_argument("--graph-execution", action="store_true")
+    parser.add_argument("--request-count", type=int, default=128)
+    parser.add_argument("--output-token-cap", type=int)
     parser.add_argument("--timeout-seconds", type=int, default=7200)
     return parser.parse_args()
 
@@ -173,6 +189,10 @@ def main() -> int:
         raise ValueError("target QPS must be positive")
     if args.tensor_parallel_size not in (1, 2):
         raise ValueError("tensor parallel size must be one or two")
+    if not 1 <= args.request_count <= 128:
+        raise ValueError("request count must be between one and 128")
+    if args.output_token_cap is not None and args.output_token_cap < 2:
+        raise ValueError("output token cap must be at least two")
     if not args.case_dir.is_dir():
         raise FileNotFoundError(f"case directory is absent: {args.case_dir}")
     if not args.dataset.is_file() or not args.requests.is_file():
@@ -181,8 +201,18 @@ def main() -> int:
     prompts = _sample_prompts(
         args.model, str(args.dataset), args.seed, input_lengths, output_lengths
     )
+    arrivals = arrivals[:args.request_count]
+    prompts = prompts[:args.request_count]
+    input_lengths = input_lengths[:args.request_count]
+    output_lengths = output_lengths[:args.request_count]
+    if args.output_token_cap is not None:
+        output_lengths = [
+            min(length, args.output_token_cap) for length in output_lengths
+        ]
     engine, engine_arguments = _engine(
-        args.model, args.tensor_parallel_size, args.expert_parallel_size
+        args.model, args.tensor_parallel_size, args.expert_parallel_size,
+        graph_execution=args.graph_execution,
+        seed=args.seed,
     )
     try:
         results, wall_seconds = asyncio.run(
@@ -237,7 +267,7 @@ def main() -> int:
             "expert_parallel_size": args.expert_parallel_size,
             "runtime_version": importlib.metadata.version("vllm"),
             "engine_kwargs": engine_arguments,
-            "enforce_eager": True,
+            "enforce_eager": not args.graph_execution,
             "MACA_VLLM_ENABLE_MCTLASS_FUSED_MOE": os.environ[
                 "MACA_VLLM_ENABLE_MCTLASS_FUSED_MOE"
             ],

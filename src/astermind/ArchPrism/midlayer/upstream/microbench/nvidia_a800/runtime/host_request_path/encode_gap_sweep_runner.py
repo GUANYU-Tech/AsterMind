@@ -23,6 +23,7 @@ Usage (A800 host, no device):
 Each cell records the encoded token count of the prompts it timed.
 """
 import json
+import os
 import statistics
 import sys
 import time
@@ -31,7 +32,9 @@ GAPS_MS = (0, 1, 3, 10, 30, 100, 250)
 LENGTHS = (16, 128, 512)
 TRIALS = 40
 WARMUP = 5
-DATASET = "/share_data/public_data/ShareGPT_V3_unfiltered_cleaned_split.json"
+if "MIDLAYER_SHAREGPT_DATASET" not in os.environ:
+    raise SystemExit("MIDLAYER_SHAREGPT_DATASET must name the ShareGPT JSON input")
+DATASET = os.environ["MIDLAYER_SHAREGPT_DATASET"]
 HELD_OUT_FROM = 60000
 
 

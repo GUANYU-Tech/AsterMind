@@ -16,11 +16,13 @@ import json
 import os
 import statistics
 import subprocess
+import shutil
 import time
 from pathlib import Path
 
 BOOST_MHZ = 1980
 DEVICE_NAME = "NVIDIA H200"
+NVCC = Path(shutil.which("nvcc") or "nvcc")
 
 
 def sha256(path):

@@ -25,8 +25,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 REPOSITORY_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))))
-UNINDP_ROOT = os.environ.get(
-    "UNINDP_ROOT", "/share_data/yangxinhao/chip_modeling/UniNDP")
+if "UNINDP_ROOT" not in os.environ:
+    raise SystemExit("UNINDP_ROOT must name the external UniNDP checkout")
+UNINDP_ROOT = os.environ["UNINDP_ROOT"]
 # compile.py resolves -WS against its own cwd, so the simulator scratch is
 # addressed relative to the UniNDP checkout but lands in this repository's
 # profiler_output/, never inside the external checkout.
@@ -62,7 +63,7 @@ def run_one(record):
 
 def main():
     plan_path, out_path = sys.argv[1], sys.argv[2]
-    jobs = int(sys.argv[3]) if len(sys.argv) > 3 else 24
+    jobs = int(sys.argv[3]) if len(sys.argv) > 3 else (os.cpu_count() or 1)
     with open(plan_path) as stream:
         plan = json.load(stream)
     os.makedirs(WORKSPACE, exist_ok=True)

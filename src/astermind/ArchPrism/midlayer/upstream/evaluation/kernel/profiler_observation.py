@@ -13,9 +13,9 @@ from evaluation.kernel.observation_parser import parse_complete_gemm_tile
 # Kernel-record kind per hardware.  ``ncu_sections``: Nsight-Compute-shaped
 # counter sections (NCU itself, or the MetaX/Ascend/synthetic adapters that
 # emit the same schema).  ``nsys_launch_only``: the device has no kernel
-# counter profiler (the H200 container has no Nsight Compute), so records
-# carry only NSYS/CUPTI launch facts and every counter-derived method is
-# unsupported for that hardware.
+# counter profiler in the original campaign. H200 records carry NSYS/CUPTI
+# launch facts; selected records may additionally carry duration-free NCU
+# counters. Counter-derived prediction methods remain unsupported.
 KERNEL_RECORD_KIND = {
     "nvidia_a800": "ncu_sections",
     "nvidia_h200": "nsys_launch_only",
@@ -35,6 +35,59 @@ _NSYS_LAUNCH_STATISTICS_FIELDS = {
     "Static Shared Memory Per Block [byte/block]",
     "Threads [thread]",
 }
+_H200_NCU_METRIC_UNITS = {
+    "lts__t_sectors_op_read.sum": "sector",
+    "lts__t_sectors_op_write.sum": "sector",
+    "dram__bytes_read.sum": "byte",
+    "dram__bytes_write.sum": "byte",
+    "smsp__warps_eligible.avg.per_cycle_active": "warp",
+    "smsp__warps_active.avg.per_cycle_active": "warp",
+    "smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct": "%",
+    "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active": "%",
+    "sm__cycles_active.avg": "cycle",
+    "sm__cycles_elapsed.avg": "cycle",
+}
+_H200_NCU_BASE_METRIC_UNITS = {
+    name: unit for name, unit in _H200_NCU_METRIC_UNITS.items()
+    if name not in ("sm__cycles_active.avg", "sm__cycles_elapsed.avg")}
+
+
+def _validate_h200_ncu_counters(counters):
+    if not isinstance(counters, dict) or set(counters) != {
+            "Schema Version", "Source", "Metrics", "Units", "Provenance"}:
+        raise ValueError("H200 NCU counter section has invalid fields")
+    if counters["Schema Version"] != 1 or counters["Source"] != "ncu_raw_page":
+        raise ValueError("H200 NCU counter source/version changed")
+    if counters["Units"] not in (
+            _H200_NCU_BASE_METRIC_UNITS, _H200_NCU_METRIC_UNITS):
+        raise ValueError("H200 NCU counter units changed")
+    metrics = counters["Metrics"]
+    if not isinstance(metrics, dict) or set(metrics) != set(counters["Units"]):
+        raise ValueError("H200 NCU metrics are incomplete")
+    for name, value in metrics.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError(f"H200 NCU metric {name} must be numeric")
+        if not 0 <= value < float("inf"):
+            raise ValueError(f"H200 NCU metric {name} is invalid")
+    if "sm__cycles_active.avg" in metrics:
+        if not 0 < metrics["sm__cycles_active.avg"] <= (
+                metrics["sm__cycles_elapsed.avg"]):
+            raise ValueError("H200 NCU active/elapsed cycles are invalid")
+    provenance = counters["Provenance"]
+    if not isinstance(provenance, dict) or set(provenance) != {
+            "campaign", "case_id", "kernel_index", "ncu_kernel_name",
+            "csv_sha256", "report_sha256", "report_name", "app_id",
+            "ncu_version"}:
+        raise ValueError("H200 NCU provenance fields are invalid")
+    for name in ("campaign", "case_id", "ncu_kernel_name", "report_name",
+                 "app_id", "ncu_version"):
+        if not isinstance(provenance[name], str) or not provenance[name]:
+            raise ValueError(f"H200 NCU provenance {name} is empty")
+    if type(provenance["kernel_index"]) is not int or provenance["kernel_index"] < 0:
+        raise ValueError("H200 NCU kernel index is invalid")
+    for name in ("csv_sha256", "report_sha256"):
+        if re.fullmatch(r"[0-9a-f]{64}", provenance[name]) is None:
+            raise ValueError(f"H200 NCU provenance {name} is invalid")
 
 
 def require_hardware_kernel_record_kind(metrics, hardware_id):
@@ -64,13 +117,16 @@ def _dimensions(text, context):
 
 
 def _extract_nsys_launch_metrics(kdata):
-    """Launch facts of one NSYS/CUPTI record; no counter keys exist."""
+    """Launch facts of one NSYS/CUPTI record, with an optional NCU sidecar."""
     meta = kdata["Metadata"]
     sections = kdata["Sections"]
-    if set(sections) != {"Launch Statistics"}:
+    if set(sections) not in ({"Launch Statistics"},
+                            {"Launch Statistics", "NCU Counters"}):
         raise ValueError(
-            "NSYS launch-only record must carry only Launch Statistics, got "
+            "NSYS launch record has invalid sections: "
             f"{sorted(sections)}")
+    if "NCU Counters" in sections:
+        _validate_h200_ncu_counters(sections["NCU Counters"])
     header = sections["Launch Statistics"]["Header"]
     if set(header) != _NSYS_LAUNCH_STATISTICS_FIELDS:
         raise ValueError(

@@ -48,9 +48,6 @@ from evaluation.serving.metrics.compact_case_evaluation import (
 )
 
 
-_MAX_CASE_JOBS = 64
-
-
 def run_official_metrics_evaluation(
     repository_root: str | Path,
     run_id: str,
@@ -546,6 +543,9 @@ def _persist_phase1_evaluation(
         "alignment_stage_ran": alignment_stage_ran,
         "alignment_checked": alignment_checked,
         "formal_conclusion_allowed": formal_conclusion_allowed,
+        "provisional_observer_case_count": sum(
+            result["observation_quality"]["status"] == "provisional"
+            for result in results),
         "artifact_paths": {
             name: str(path.relative_to(root)) for name, path in paths.items()
         },
@@ -781,6 +781,14 @@ def write_phase1_results(
         if cell["execution_mode"] != execution_mode:
             raise ValueError(
                 "persisted cell execution_mode disagrees with run mode")
+    quality_counts = {
+        status: sum(cell["observation_quality"]["status"] == status
+                    for cell in cells)
+        for status in ("accepted", "provisional", "legacy_contract")
+    }
+    if sum(quality_counts.values()) != len(cells):
+        raise ValueError("unknown observation quality status")
+    scored_count = sum(cell["prediction_status"] == "completed" for cell in cells)
     result = {
         "schema_version": 1,
         "suite_id": config.suite_id,
@@ -790,6 +798,8 @@ def write_phase1_results(
         "execution_mode": execution_mode,
         "evaluation_wall_time_seconds": evaluation_wall_time_seconds,
         "cell_count": len(cells),
+        "observation_quality_counts": quality_counts,
+        "formal_observation_denominator": scored_count,
         "alignment_stage_ran": alignment_stage_ran,
         "alignment_checked": alignment_checked,
         "formal_conclusion_allowed": formal_conclusion_allowed,
@@ -817,6 +827,8 @@ def write_phase1_results(
         "alignment_stage_ran": alignment_stage_ran,
         "alignment_checked": alignment_checked,
         "formal_conclusion_allowed": formal_conclusion_allowed,
+        "observation_quality_counts": quality_counts,
+        "formal_observation_denominator": scored_count,
         "prediction_contract": dict(config.prediction.values),
         "model_mappings": [
             {
@@ -870,6 +882,8 @@ def _write_csv(path: Path, cells: Sequence[Mapping[str, object]]) -> None:
         "prediction_status",
         "performance_timing_status",
         "accuracy_claim_status",
+        "observer_quality_status",
+        "observer_failed_metrics",
         "capture_contract_status",
         "metric",
         "statistic",
@@ -960,6 +974,9 @@ def _csv_row(
         "prediction_status": cell["prediction_status"],
         "performance_timing_status": cell["performance_timing_status"],
         "accuracy_claim_status": cell["accuracy_claim_status"],
+        "observer_quality_status": cell["observation_quality"]["status"],
+        "observer_failed_metrics": ",".join(
+            cell["observation_quality"]["failed_metrics"]),
         "capture_contract_status": cell["capture_contract_status"],
         "metric": metric,
         "statistic": statistic,
@@ -991,6 +1008,9 @@ def _paired_csv_row(
         "prediction_status": cell["prediction_status"],
         "performance_timing_status": cell["performance_timing_status"],
         "accuracy_claim_status": cell["accuracy_claim_status"],
+        "observer_quality_status": cell["observation_quality"]["status"],
+        "observer_failed_metrics": ",".join(
+            cell["observation_quality"]["failed_metrics"]),
         "capture_contract_status": cell["capture_contract_status"],
         "metric": metric,
         "statistic": statistic,
@@ -1005,7 +1025,7 @@ def _paired_csv_row(
 
 def _render_markdown(result: Mapping[str, object]) -> str:
     if result["formal_conclusion_allowed"] is True:
-        conclusion = "FORMAL: every required compact alignment sample matched."
+        conclusion = "FORMAL: alignment and observer quality gates passed."
     elif result["alignment_stage_ran"] is False:
         conclusion = (
             "NON-FORMAL DEBUG OUTPUT: the mandatory compact alignment stage "
@@ -1013,8 +1033,7 @@ def _render_markdown(result: Mapping[str, object]) -> str:
         )
     else:
         conclusion = (
-            "NON-FORMAL OUTPUT: at least one required compact alignment "
-            "sample was mismatched or unsupported."
+            "NON-FORMAL OUTPUT: alignment or observer quality gate failed."
         )
     lines = [
         "# ShareGPT compact-suite evaluation",
@@ -1024,9 +1043,10 @@ def _render_markdown(result: Mapping[str, object]) -> str:
         "This report compares historical compact observations with the current pinned vLLM prediction contract; it is not capture-exact replay.",
         "",
         f"Execution mode: `{result['execution_mode']}`. Evaluation wall time: {float(result['evaluation_wall_time_seconds']):.6f} s.",
+        f"Formal observation denominator: {result['formal_observation_denominator']}/{result['cell_count']}; capture differences above 5% are diagnostic labels only ({result['observation_quality_counts']['provisional']} cases).",
         "",
-        "| Cell | Prediction | Timing status | Accuracy claim | Capture contract | TTFT MAPE | TPOT MAPE | E2E MAPE |",
-        "|---|---|---|---|---|---:|---:|---:|",
+        "| Cell | Prediction | Timing status | Accuracy claim | Observer quality | Failed metrics | Capture contract | TTFT MAPE | TPOT MAPE | E2E MAPE |",
+        "|---|---|---|---|---|---|---|---:|---:|---:|",
     ]
     for cell_value in _sequence(result["cells"], "result cells"):
         cell = _mapping(cell_value, "result cell")
@@ -1044,6 +1064,8 @@ def _render_markdown(result: Mapping[str, object]) -> str:
             f"| {cell['cell_id']} | {cell['prediction_status']} | "
             f"{cell['performance_timing_status']} | "
             f"{cell['accuracy_claim_status']} | "
+            f"{cell['observation_quality']['status']} | "
+            f"{', '.join(cell['observation_quality']['failed_metrics']) or '—'} | "
             f"{cell['capture_contract_status']} | "
             f"{' | '.join(mape_values)} |"
         )
@@ -1057,8 +1079,8 @@ def _write_json(path: Path, payload: object) -> None:
 def _validate_jobs(jobs: int) -> None:
     if type(jobs) is not int:
         raise TypeError("jobs must be an exact integer")
-    if jobs < 1 or jobs > _MAX_CASE_JOBS:
-        raise ValueError(f"jobs must be between 1 and {_MAX_CASE_JOBS}")
+    if jobs < 1:
+        raise ValueError("jobs must be a positive integer")
 
 
 def run_virtual_forward_report(

@@ -39,6 +39,7 @@ import os
 from pathlib import Path
 import statistics
 import subprocess
+import shutil
 import time
 
 
@@ -47,10 +48,8 @@ SOURCE = Path(__file__).with_name("staged_ldgsts_l2.cu")
 RUNNER = Path(__file__).resolve()
 OUTPUT_ROOT = ROOT / "profiler_output/microbench/nvidia_h200"
 REFERENCE_ROOT = ROOT / "microbench/nvidia_h200/references"
-NVCC = Path("/mnt/public/yangxinhao/tools/cuda-12.9/bin/nvcc")
-CUOBJDUMP = Path(
-    "/mnt/public/yangxinhao/envs/vllm024/lib/python3.12/site-packages/"
-    "triton/backends/nvidia/bin/cuobjdump")
+NVCC = Path(shutil.which("nvcc") or "nvcc")
+CUOBJDUMP = Path(shutil.which("cuobjdump") or "cuobjdump")
 DEVICE_NAME = "NVIDIA H200"
 ALLOWED_DEVICES = (2,)
 BOOST_SM_CLOCK_MHZ = 1980

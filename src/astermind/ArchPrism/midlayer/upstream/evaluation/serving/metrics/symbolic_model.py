@@ -4,10 +4,15 @@ import ast
 from collections import Counter
 from dataclasses import fields, is_dataclass
 from enum import Enum
+from functools import partial
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
+import sys
+import tempfile
+import threading
 from time import perf_counter
 from collections.abc import Mapping
 from concurrent.futures import ProcessPoolExecutor
@@ -494,7 +499,8 @@ def evaluate_symbolic_model(model_path, query_lengths, context_lengths, *, upstr
                 "HCCS ring bytes use the retained independent two-rank broadcast bandwidth as ideal link capacity, not observed collective service"]
     elif dsv3_source:
         from src.serving.workload.traced_deepseek_v3 import trace_deepseek_v3_decode, trace_deepseek_v3_mtp_forward
-        if (tensor_parallel_size != 8 or expert_routing is None
+        l32_tp4 = model.num_hidden_layers == 32 and tensor_parallel_size == 4
+        if ((tensor_parallel_size != 8 and not l32_tp4) or expert_routing is None
                 or source_max_model_len is None or max_batched_tokens is None
                 or any(value is not None for value in (
                     upstream_root, source_use_deep_gemm, indexer_selection_source,
@@ -520,7 +526,8 @@ def evaluate_symbolic_model(model_path, query_lengths, context_lengths, *, upstr
         if dsv3_mtp:
             execution_scope = "complete_target_verify_and_two_drafts"
         model_limitations = [
-            "official DeepSeek-V3 vLLM0.27.1 synchronous TP8 EP-off source projection, not a0.30 runtime binding",
+            ("registered local32-layer DeepSeek-V3 variant using the same0.27.1 make_layers(config.num_hidden_layers) source"
+                if model.num_hidden_layers == 32 else "official DeepSeek-V3 vLLM0.27.1 synchronous TP8 EP-off source projection, not a0.30 runtime binding"),
             "scheduled metadata and expert routing are declared synthetic inputs, not observed checkpoint outputs",
             "MLA attention, block-FP8 projections, routing and greedy use useful mathematical FLOPs and public-role bytes",
             "library/provider launches, internal scratch and normal capacity remain unbound",
@@ -533,13 +540,17 @@ def evaluate_symbolic_model(model_path, query_lengths, context_lengths, *, upstr
             raise ValueError("K3 source requires TP1/plain greedy and does not consume other model-source options")
         trace = traced_models.trace_kimi_k3_forward(model, step, deployment.worker_pools["main"],
             expert_routing, input_ids=(1,) * tokens, positions=positions, slot_mapping=tuple(slots),
-            cache_capacity_tokens=offset, state_indices=k3_state_indices, state_pool_slots=k3_state_pool_slots,
-            prefill_output_source=k3_prefill_output_source)
+            cache_capacity_tokens=offset,
+            state_indices_by_layer=tuple(
+                k3_state_indices if kind == "kda" else ()
+                for kind in model.kimi_k3_semantics.layer_attention_types),
+            state_pool_slots=k3_state_pool_slots, source_max_model_len=offset,
+            max_batched_tokens=tokens, prefill_output_source=k3_prefill_output_source)
         graph, traces = trace.graph, (trace,)
-        model_limitations = ["single-token decode, one fresh T>=512 full64-chunk prefill or decode-first/fresh mixed; context/MTP are not migrated",
+        model_limitations = ["single-token decode, one fresh T>=512 full/tail64-chunk prefill or decode-first/fresh mixed; context/MTP are not migrated",
             "fresh prefill requires an explicit backend supports_out declaration; no actual prefill launch/provider is selected",
             "KDA Triton, BF16 NoPE MLA and modular Marlin are source declarations, not runtime dispatch",
-            "grouped routing, SiTU, expert internals and output-gate services retain explicit pricing refusals",
+            "grouped routing, SiTU, expert internals and output-gate use analytical source prices; native instruction and provider services remain unbound",
             "automatic public-storage lifetimes do not cover unknown callee scratch, streams or normal capacity",
             "no independent whole-model source or native/runtime equivalence acceptance"]
     elif source_profile == "vllm_0_30_v4_sync_fp8_ds_mla":
@@ -793,11 +804,73 @@ def evaluate_symbolic_model(model_path, query_lengths, context_lengths, *, upstr
     return result
 
 
-def write_symbolic_model_report(model_path, query_lengths, context_lengths, output, *, upstream_root=None, **source_inputs):
-    result = evaluate_symbolic_model(model_path, query_lengths, context_lengths, upstream_root=upstream_root, **source_inputs)
+def write_symbolic_model_report(model_path, query_lengths, context_lengths, output, *, upstream_root=None,
+        report=False, **source_inputs):
+    from evaluation.reporting.serving_interactive import write_status_report, default_report_path
+    from evaluation.reporting.serving_viewer_ui import configuration_file_snapshots, _configuration_metadata
+    if type(report) is not bool:
+        raise TypeError("report must be boolean")
+    started = perf_counter()
+    files, missing = (configuration_file_snapshots(model_path,
+        [source_inputs["hardware_config"]] if "hardware_config" in source_inputs else []) if report else ([], []))
+    try:
+        result = evaluate_symbolic_model(model_path, query_lengths, context_lengths, upstream_root=upstream_root, **source_inputs)
+    except Exception as error:
+        if report:
+            write_status_report({"main_chain_status": {
+                "status": "unsupported" if isinstance(error, NotImplementedError) else "failed",
+                "reason": type(error).__name__ + ": static evaluation did not complete; see process log"},
+                "request_source": {"model_path": str(model_path), "query_lengths": query_lengths, "context_lengths": context_lengths},
+                "visualization_configuration_files": files, "visualization_configuration_snapshot_missing": missing},
+                default_report_path(output))
+        raise
     output.parent.mkdir(parents=True, exist_ok=True)
+    cost_path = output.with_suffix(".report.json")
+    if report:
+        options = dict(source_inputs)
+        if "expert_routing" in options and options["expert_routing"] is not None:
+            options["expert_routing"] = options["expert_routing"].manifest()
+        status = "complete" if result["full_model_graph_complete"] and not result["unpriced_calls"] else "partial"
+        payload = {"report_links": [{"label": "Cost receipt", "path": str(cost_path)}],
+            "main_chain_status": {"status": status,
+                "reason": "仅为静态模型源码投影；Serving、正常容量和实际 runtime 尚未验收。"},
+            "report_facts": [{"label": "模型", "value": result["model"]},
+                {"label": "硬件", "value": result["hardware_id"]},
+                {"label": "完整模型图", "value": result["full_model_graph_complete"]},
+                {"label": "算子调用数", "value": result["kernel_calls"]},
+                {"label": "未计价调用", "value": len(result["unpriced_calls"])},
+                {"label": "串行预测耗时（秒）", "value": result["serial_roofline_seconds"]}],
+            "model_config_provenance": {"model_id": result["model"], "config_sha256": result["model_config_sha256"]},
+            "deployment": "static_source_projection",
+            "deployment_plan": {"tensor_parallel_size": result["tensor_parallel_size"], "expert_parallel_size": result["expert_parallel_size"]},
+            "visualization_hardware": {result["hardware_id"]: {}},
+            "request_source": {"scope": "static source inputs, not scheduled Serving requests",
+                "query_lengths": query_lengths, "context_lengths": context_lengths,
+                "requested_source_options": _configuration_metadata(options), "upstream_root": upstream_root},
+            "visualization_configuration_files": files, "visualization_configuration_snapshot_missing": missing}
+        result["interactive_report"] = write_status_report(payload, default_report_path(output))
+        result["interactive_report"]["cost_receipt_path"] = str(cost_path)
+    else:
+        result["interactive_report"] = {"status": "disabled", "reason": "offline HTML report not requested"}
     output.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n")
     write_symbolic_summary(result, output.with_suffix(".md"))
+    result["report_output_costs"] = {"total_wall_s": perf_counter() - started,
+        "scope": "static evaluation plus HTML/projection/result JSON/Markdown; final receipt writing is separate"}
+    if report:
+        from evaluation.reporting.serving_viewer_ui import attach_report_costs
+        costs = result["report_output_costs"]
+        costs["cost_metadata_write_s"] = attach_report_costs(result["interactive_report"], {
+            "html_generation_s": result["interactive_report"]["page_generation_s"],
+            "total_wall_through_result_write_s": costs["total_wall_s"],
+            "scope": "static evaluation and initial HTML/projection/JSON/Markdown writes; final metadata/receipt writes are separately measured"})
+    refresh_started = perf_counter()
+    output.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n")
+    result["report_output_costs"]["final_result_refresh_s"] = perf_counter() - refresh_started
+    result["report_output_costs"]["total_wall_s"] = perf_counter() - started
+    receipt_started = perf_counter()
+    cost_path.write_text(json.dumps({"report": result["interactive_report"], "costs": result["report_output_costs"]}, indent=2) + "\n")
+    result["report_output_costs"]["cost_receipt_write_s"] = perf_counter() - receipt_started
+    result["report_output_costs"]["total_wall_s"] = perf_counter() - started
     return result
 
 
@@ -933,14 +1006,18 @@ def write_symbolic_summary(result, output):
             lines.extend(["本场景没有scored prefill调用，indexer gather存储比较不适用；不能用零分母声明这项验收通过。", ""])
     lines.extend(["剩余边界：", "", *("- " + item for item in result["limitations"]), "",
         "请求仿真、正常容量与可比启动日志10%检查分别验收；静态全部计价不能替代这些验收。", ""])
+    if "interactive_report" in result and "path" in result["interactive_report"]:
+        lines.extend(["同风格离线概要：[HTML](" + result["interactive_report"]["path"] + ")，静态实验没有 Serving 时间线。", ""])
     output.write_text("\n".join(lines))
 
 
-def write_symbolic_serving_report(result_path: Path, output: Path):
+def write_symbolic_serving_report(result_path: Path, output: Path, *, interactive_report=None):
     """Render a completed virtual-forward CLI result without rerunning it."""
     if output.suffix != ".md" or output.resolve() == result_path.resolve():
         raise ValueError("Serving summary needs a separate Markdown output")
     result = json.loads(result_path.read_text())
+    if interactive_report is not None:
+        result["interactive_report"] = interactive_report
     source = result["execution_provenance"]["runtime_inputs"]["symbolic_forward_source"]
     if (not isinstance(source, str) or not source or result["backend"] != "vllm"
             or result["prediction_method"] not in ("roofline", "midlayer")
@@ -1034,6 +1111,12 @@ def write_symbolic_serving_report(result_path: Path, output: Path):
         f"请求流经过真实vLLM{scheduler_version} CPU Scheduler、完整虚拟forward、既有lowering、{result['prediction_method']}预测和全局时间线。每步执行必须覆盖其KernelPlan中的全部调用，流式执行在覆盖校验后保留计数与结果内容摘要；本次完整执行成功。仿真不创建真实模型Tensor、不加载权重、不执行数值forward，不生成真实模型token。", "",
         "容量依据JSON中明确列出的runtime memory policy或显式测试块预算；activation来源及其策略证据等级见上表。测试块数不证明模型能正常装入显存；显式源码策略也不升级为已观测点估计。表中的吞吐和完成时间是声明源码场景的预测结果；normal容量、实际设备/provider和性能精度仍未验收。", "",
         "剩余工作：补齐可比执行配置的启动存储、持久状态、workspace与10%日志核对，再验收生产激活预算；扩展尚未支持的模型和模式。", ""]
+    if ("interactive_report" not in result or "path" not in result["interactive_report"]
+            or not Path(result["interactive_report"]["path"]).is_file()):
+        result["interactive_report"] = _regenerate_saved_serving_report(result, result_path, output.with_suffix(".html"))
+    if "interactive_report" in result and "path" in result["interactive_report"]:
+        lines.extend(["离线交互报告：[Timeline HTML](" + result["interactive_report"]["path"] + ") · [可再生数据](" +
+            result["interactive_report"]["data_path"] + ")" + (" · [完整成本记录](" + result["interactive_report"]["cost_receipt_path"] + ")" if "cost_receipt_path" in result["interactive_report"] else ""), ""])
     output.parent.mkdir(parents=True, exist_ok=True)
     if result["deployment"] in ("af_disagg", "pd_af_disagg"):
         lines.extend(["AF传输按既有attention/FFN服务契约计价；本次没有执行实际AF runtime或provider。FFN池的同次forward存储单独列出，完整FFN容量不由attention Scheduler的KV预算证明。", ""])
@@ -1055,8 +1138,34 @@ def write_symbolic_serving_report(result_path: Path, output: Path):
         "runtime_acceptance": scheduler_version == "0.30.0" and all(runtime["runtime_acceptance"] for runtime in runtimes)}
 
 
+def _ascend_910b_executor_backend(case):
+    """Bind the captured runtime's discrete executor choice, not its times."""
+    manifest = case.manifest
+    if (manifest["identity"]["hardware_id"] != "ascend_910b"
+            or manifest["runtime"]["runtime_version"] != "0.18.0"):
+        return None
+    executor_class = manifest["runtime"]["scheduler_pipeline_depth_evidence"]["executor_class"]
+    classes = {
+        "vllm.v1.executor.uniproc_executor.UniProcExecutor": "uni",
+        "vllm.v1.executor.multiproc_executor.MultiprocExecutor": "mp",
+    }
+    if executor_class not in classes:
+        raise ValueError(f"unsupported 910B vLLM executor class: {executor_class!r}")
+    return classes[executor_class]
+
+
+def _validate_virtual_execution_workers(execution_workers):
+    if (isinstance(execution_workers, bool)
+            or not isinstance(execution_workers, int) or execution_workers < 0):
+        raise ValueError(
+            "virtual Serving execution_workers must be a non-negative integer; "
+            "0 selects the CPU-aware default"
+        )
+
+
 def prepare_virtual_serving_case(root, config, cell, case, directory, sdk_python, source_root,
-        *, serving_timing_mode="device_only"):
+        *, serving_timing_mode="device_only", execution_mode="accelerated", state_audit=False,
+        execution_workers=1, h200_scenario=None):
     """Keep the official execution contract and require a migrated source."""
     from . import sharegpt_compact_evaluation as compact
     from evaluation.serving.simulation.simulation_runner import _parse_args
@@ -1067,6 +1176,8 @@ def prepare_virtual_serving_case(root, config, cell, case, directory, sdk_python
     from src.serving.host_timing import validate_serving_timing_mode
 
     validate_serving_timing_mode(serving_timing_mode)
+    if h200_scenario not in (None, "analytical_bf16_v1"):
+        raise ValueError("unknown H200 Serving scenario")
     launch_path = scheduler_path = None
     hardware_id = cell.hardware.hardware_id
     if serving_timing_mode != "device_only":
@@ -1086,41 +1197,107 @@ def prepare_virtual_serving_case(root, config, cell, case, directory, sdk_python
                     raise NotImplementedError(f"no canonical Scheduler Host profile for {hardware_id}")
                 scheduler_path = scheduler_profiles[hardware_id]
     argv = compact.build_simulation_argv(root, config, cell, case,
-        serving_timing_mode=serving_timing_mode, host_launch_profile_path=launch_path,
-        scheduler_host_profile_path=scheduler_path)
+        execution_mode=execution_mode, serving_timing_mode=serving_timing_mode,
+        host_launch_profile_path=launch_path, scheduler_host_profile_path=scheduler_path)
+    executor_backend = _ascend_910b_executor_backend(case)
+    if executor_backend is not None:
+        argv += ["--vllm-executor-backend", executor_backend]
     model_path = compact._model_config_path(root, cell.model.simulation_model_path)
     model = load_model_config(model_path)
     prediction = config.prediction.values
     policy_path = Path(compact._expand_runtime_memory_policy_path(root, config, cell, cell.model.dataset_model_id))
     directory.mkdir(parents=True, exist_ok=True)
     requests = case.manifest["requests"]
+    _validate_virtual_execution_workers(execution_workers)
+    # Emit the declared value verbatim: 0 keeps the CLI's unified "auto"
+    # semantics so the child both normalizes its pool and installs the
+    # adaptive coordinator callback; positive values stay manual overrides.
     argv += [
         "--canonical-requests-sha256", requests["sha256"],
-        "--vllm-scheduler-version", prediction["scheduler_version"], "--execution-workers", "1",
+        "--execution-workers", str(execution_workers),
         "--step-retention", "streaming_aggregate", "--output", str(directory / "result.json"),
     ]
+    if type(state_audit) is not bool:
+        raise TypeError("virtual Serving state_audit must be boolean")
+    if state_audit:
+        argv += ["--state-audit-output", str(directory / "state_audit.json")]
+    explicit_model_execution_version = None
     if prediction["scheduler_version"] == "0.30.0":
+        # The existing ordinary H200 async source is an explicit CLI domain;
+        # the synchronous default-source normalizer cannot select it. Preserve
+        # the case's graph/depth/cache settings and let the CLI enforce them.
+        from src.serving.workload.model_config import is_validated_qwen3_moe_ep2_model_scope
+        ordinary_dense = (model.model_type in ("qwen3", "llama") and model.num_experts == 0
+            and prediction["tensor_parallel_size"] in (1, 2) and prediction["expert_parallel_size"] == 1)
+        ordinary_moe = (is_validated_qwen3_moe_ep2_model_scope(model)
+            and prediction["tensor_parallel_size"] == prediction["expert_parallel_size"] == 2)
+        if (hardware_id == "nvidia_h200" and (ordinary_dense or ordinary_moe)
+                and model.compute_dtype == model.weight_dtype == "bf16"
+                and prediction["pipeline_parallel_size"] == 1
+                and prediction["mtp_num_speculative_tokens"] == 0):
+            if prediction["enable_prefix_caching"]:
+                # Canonical validation binds observed or independently proved
+                # scheduler-equivalent counts. Unknown hits remain None and
+                # must never be promoted to a zero-hit request stream.
+                if any(request.cached_hit_tokens != 0 for request in case.requests):
+                    raise NotImplementedError("ordinary H2000.30 source requires canonical zero-hit evidence for every request")
+                argv += ["--prefix-cache-mode", "trace_no_hit"]
+            argv += ["--symbolic-forward-source", "cuda_eager_inplace",
+                "--target-sampling-source", "vllm_0_30_plain_greedy_bf16"]
+            explicit_model_execution_version = "vllm_0_30_0"
         if sdk_python is None or source_root is None:
             raise NotImplementedError("the original0.30 Scheduler contract requires explicit genuine SDK/source inputs")
         argv += ["--vllm-sdk-python", str(sdk_python), "--vllm-source-root", str(source_root),
             "--vllm-cache-layout", "BLHNC"]
+    if h200_scenario is not None and hardware_id == "nvidia_h200":
+        if explicit_model_execution_version != "vllm_0_30_0":
+            raise NotImplementedError("H200 analytical BF16 scenario requires the ordinary 0.30 source")
+        # The scenario is an explicit analytical input, not a change to the
+        # captured case or a certification of its native provider/content.
+        overrides = {"--launch-policy": "analytical_launch",
+            "--norm-source-batch-invariant": "disabled", "--bf16-gemm-model": "tiled_reference"}
+        if serving_timing_mode != "device_only":
+            overrides.update({"--host-launch-profile": str(root / "configs/host_timing/host_launch_profiles/nvidia_h200_vllm030.json"),
+                "--host-request-path-profile": str(root / "configs/host_timing/host_request_path_profiles/nvidia_h200_vllm030.json"),
+                "--host-runtime-prepare-profile": str(root / "configs/host_timing/host_runtime_prepare_profiles/nvidia_h200_vllm030_v2_input.json")})
+            if serving_timing_mode == "device_plus_launch_plus_scheduler":
+                overrides["--scheduler-host-profile"] = str(root / "configs/host_timing/scheduler_host_profiles/nvidia_h200_vllm030_native_cpu.json")
+        if prediction["tensor_parallel_size"] == 2:
+            overrides.update({"--collective-backend": "analytical_roofline_v1",
+                "--dense-source-input-policy": "declared_zero_tp2"})
+            for flag in ("--tensor-all-reduce-profile-sha256", "--tensor-all-gather-profile-sha256"):
+                if flag in argv:
+                    index = argv.index(flag)
+                    del argv[index:index + 2]
+        for flag, value in overrides.items():
+            if flag in argv:
+                argv[argv.index(flag) + 1] = value
+            else:
+                argv += [flag, value]
     try:
         parsed = _parse_args(argv)
     except SystemExit as error:
-        raise NotImplementedError("the original case contract is rejected by the source CLI; no legacy execution") from error
+        raise NotImplementedError(
+            f"prediction Scheduler {prediction['scheduler_version']} source CLI rejects "
+            f"the declared {serving_timing_mode} case contract; no legacy execution") from error
     source_profile = parsed.symbolic_forward_source
     routing = compact._expected_expert_routing(root, cell)
     contract = {"workload_path": "virtual_tensor", "prediction_method": parsed.prediction_method,
-        "launch_policy": parsed.launch_policy,
+        "execution_mode": parsed.execution_mode, "launch_policy": parsed.launch_policy,
         "rotary_source_program": vllm_rope_program(cell.hardware.hardware_id, model.rope_scaling_type),
         "hardware_config_sha256": hashlib.sha256((root / cell.hardware.hardware_config_path).read_bytes()).hexdigest(),
         "captured_hardware_config_sha256": cell.hardware.hardware_config_sha256,
         "symbolic_forward_source": source_profile,
-        "model_execution_version": (None if source_profile is None else
+        "model_execution_version": (explicit_model_execution_version
+            if explicit_model_execution_version is not None else
+            None if source_profile is None else
             parsed.model_source_normalization["model_execution_version"]),
         "target_sampling_source": parsed.target_sampling_source,
         "collective_backend": parsed.collective_backend,
-        "scheduler_version": parsed.vllm_scheduler_version, "serving_timing_mode": parsed.serving_timing_mode,
+        "scheduler_version": parsed.vllm_scheduler_version,
+        "scheduler_source_commit": prediction["scheduler_source_commit"],
+        "captured_runtime_version": case.manifest["runtime"]["runtime_version"],
+        "serving_timing_mode": parsed.serving_timing_mode,
         "graph_mode": parsed.graph_mode, "graph_capture_sizes": list(parsed.graph_execution_config.capture_sizes),
         "graph_piecewise_eager_workload_kinds": list(parsed.graph_execution_config.piecewise_eager_workload_kinds),
         "graph_uniform_decode_query_len": parsed.graph_uniform_decode_query_len,
@@ -1134,6 +1311,14 @@ def prepare_virtual_serving_case(root, config, cell, case, directory, sdk_python
         "source_selection_status": "unsupported" if source_profile is None else "selected",
         "source_selection_reason": ("no migrated shared forward for the original method/launch/graph/Scheduler contract; legacy fallback is forbidden"
             if source_profile is None else None)}
+    if h200_scenario is not None and hardware_id == "nvidia_h200":
+        contract["h200_serving_scenario"] = h200_scenario
+        contract["norm_source_batch_invariant"] = parsed.norm_source_batch_invariant
+        contract["bf16_gemm_model"] = parsed.bf16_gemm_model
+        contract["dense_source_input_policy"] = parsed.dense_source_input_policy
+        contract["scenario_scope"] = ("analytical launch; Norm default explicitly disabled; tiled BF16 reference; "
+            "TP2 analytical collectives and declared zero unknown IDs/graph tails with approximate embedding locality; "
+            "known backend IDs retained; no observed content or native provider certification")
     return argv, contract
 
 
@@ -1167,6 +1352,12 @@ def run_paired_virtual_case(argv, case, comparison_output):
     """
     from evaluation.serving.simulation.simulation_runner import run_cli_args
     from . import sharegpt_compact_evaluation as compact
+
+    executor_backend = _ascend_910b_executor_backend(case)
+    if executor_backend is not None:
+        if (argv.count("--vllm-executor-backend") != 1
+                or argv[argv.index("--vllm-executor-backend") + 1] != executor_backend):
+            raise ValueError("virtual case executor backend differs from captured runtime")
 
     if argv.count("--output") != 1:
         raise ValueError("paired virtual case requires exactly one persisted simulation output")
@@ -1276,27 +1467,195 @@ def _virtual_reuse_execution_commit(previous_cell):
     return repository["git_commit"]
 
 
-def _run_virtual_serving_case(spec):
+
+def _recorded_latency_mean(result, field):
+    """Use recorded requests or an exact empirical CDF, never quantile guesses."""
+    metrics = result["metrics"]
+    if "requests" in metrics:
+        values = [row[field] for row in metrics["requests"].values() if field in row and row[field] is not None]
+        if any(type(value) not in (int, float) or not math.isfinite(value) or value < 0 for value in values):
+            raise ValueError("recorded latency values must be finite nonnegative seconds")
+        return math.fsum(values) / len(values) if values else None
+    if "latency_distributions" not in metrics or field not in metrics["latency_distributions"]:
+        return None
+    distribution = metrics["latency_distributions"][field]
+    if distribution["availability"] == "unavailable_no_eligible_requests":
+        return None
+    if distribution["availability"] != "available":
+        raise ValueError("unknown recorded latency availability")
+    if "empirical_cdf" not in distribution:
+        return None  # Old quantiles alone do not determine an exact mean.
+    cdf = distribution["empirical_cdf"]
+    values, probabilities = cdf["values_s"], cdf["cumulative_probabilities"]
+    if not values or len(values) != len(probabilities):
+        raise ValueError("recorded empirical CDF must contain aligned points")
+    if any(type(value) not in (int, float) or not math.isfinite(value) or value < 0 for value in values):
+        raise ValueError("recorded CDF values must be finite nonnegative seconds")
+    if list(values) != sorted(values):
+        raise ValueError("recorded CDF values must be sorted")
+    prior, weighted = 0.0, []
+    for value, probability in zip(values, probabilities):
+        if type(probability) not in (int, float) or not math.isfinite(probability) or not prior < probability <= 1:
+            raise ValueError("recorded CDF probabilities must increase to one")
+        weighted.append(value * (probability - prior))
+        prior = probability
+    if prior != 1:
+        raise ValueError("recorded CDF probabilities must end at one")
+    return math.fsum(weighted)
+
+def _regenerate_saved_serving_report(result, result_path, output):
+    from evaluation.reporting.serving_interactive import write_status_report, regenerate_report
+    receipt = result["interactive_report"] if "interactive_report" in result else {}
+    projection_path = Path(receipt["data_path"]) if "data_path" in receipt else result_path.with_suffix(".visualization.json")
+    if not projection_path.is_file():
+        projection_path = result_path.with_suffix(".visualization.json")
+    if projection_path.is_file():
+        return regenerate_report(json.loads(projection_path.read_text()), output)
+    return write_status_report({**result,
+        "main_chain_status": {"status": "partial", "reason": "历史结果没有保留可视化投影；仅展示已记录的指标与配置，活动区间不可用。"},
+        "report_facts": [{"label": "完成请求", "value": result["scheduler_progress"]["summary"]["completed_requests"]},
+            {"label": "Forward 总数", "value": result["num_steps"]},
+            {"label": "算子调用数", "value": result["num_kernel_calls"]},
+            {"label": "平均首字延迟 TTFT（秒）", "value": _recorded_latency_mean(result, "ttft_s")},
+            {"label": "平均每 token 延迟 TPOT（秒）", "value": _recorded_latency_mean(result, "tpot_s")}]}, output)
+
+
+def _adaptive_tail_workers_for(case_directory):
+    """Resolve the late-tail inner-worker grant for this batch boundary.
+
+    Called by the serving simulation at every parallel-tail boundary so a
+    case that is already running can widen its inner pool when enough
+    sibling cases have finished.  Returns None when the adaptive
+    coordinator is not active for this run (manual override, reuse, or a
+    single-case selection), letting the simulation fall back to the static
+    CLI value.  The grant is a plain function of (host CPUs, selected-case
+    count, currently-active case count) read from the shared run file; it
+    never uses case identity, hardware name, or predicted/observed
+    durations, and it never exceeds the host CPU headroom left by the
+    outer one-worker-per-case pool.
+    """
+    state_path = Path(case_directory) / "adaptive_case_state.json"
+    if not state_path.is_file():
+        return None
+    state = json.loads(state_path.read_text())
+    spec_count = state["spec_count"]
+    logical_cpus = state["logical_cpus"]
+    active_cases = len(state["active_cases"])
+    if active_cases <= 0 or spec_count <= 1:
+        return None
+    budget = max(0, logical_cpus - spec_count)
+    if budget <= 0:
+        return None
+    # Promote as soon as every survivor can take at least one extra worker;
+    # the spare budget is unused while cases run serially, so grant early.
+    threshold = max(2, budget // 8)
+    if active_cases > threshold:
+        return None
+    return max(2, min(16, budget // active_cases))
+
+
+def _run_virtual_serving_case(spec, *, h200_scenario=None):
     from . import sharegpt_compact_evaluation as compact
     import subprocess
-    (root, config, cell, case, directory, python, sdk, source, reuse_completed,
-     serving_timing_mode, previous_cell) = spec
+    execution_workers = 1
+    adaptive_state = None
+    adaptive_index = None
+    adaptive_auto = False
+    interactive_report = False
+    if len(spec) == 11:
+        (root, config, cell, case, directory, python, sdk, source, reuse_completed,
+         serving_timing_mode, previous_cell) = spec
+        execution_mode = "accelerated"
+        state_audit = False
+    elif len(spec) == 12 and type(spec[11]) is bool:
+        (root, config, cell, case, directory, python, sdk, source, reuse_completed,
+         serving_timing_mode, previous_cell, interactive_report) = spec
+        execution_mode = "accelerated"
+        state_audit = False
+    elif len(spec) == 12:
+        (root, config, cell, case, directory, python, sdk, source, reuse_completed,
+         serving_timing_mode, execution_mode, previous_cell) = spec
+        state_audit = False
+    elif len(spec) == 13:
+        (root, config, cell, case, directory, python, sdk, source, reuse_completed,
+         serving_timing_mode, execution_mode, state_audit, previous_cell) = spec
+    elif len(spec) == 14:
+        (root, config, cell, case, directory, python, sdk, source, reuse_completed,
+         serving_timing_mode, execution_mode, state_audit, execution_workers, previous_cell) = spec
+    elif len(spec) == 15:
+        (root, config, cell, case, directory, python, sdk, source, reuse_completed,
+         serving_timing_mode, execution_mode, state_audit, execution_workers, previous_cell,
+         adaptive_state) = spec
+    elif len(spec) == 16:
+        (root, config, cell, case, directory, python, sdk, source, reuse_completed,
+         serving_timing_mode, execution_mode, state_audit, execution_workers, previous_cell,
+         adaptive_state, adaptive_index) = spec
+    elif len(spec) == 17:
+        (root, config, cell, case, directory, python, sdk, source, reuse_completed,
+         serving_timing_mode, execution_mode, state_audit, execution_workers, previous_cell,
+         adaptive_state, adaptive_index, adaptive_auto) = spec
+    elif len(spec) == 18:
+        (root, config, cell, case, directory, python, sdk, source, reuse_completed,
+         serving_timing_mode, execution_mode, state_audit, execution_workers, previous_cell,
+         adaptive_state, adaptive_index, adaptive_auto, interactive_report) = spec
+    else:
+        raise ValueError("virtual Serving case spec has an invalid arity")
+    if execution_mode not in ("accelerated", "fast", "reference"):
+        raise ValueError("virtual Serving execution_mode is invalid: " + repr(execution_mode))
+    if any(type(flag) is not bool for flag in (state_audit, adaptive_auto, interactive_report)):
+        raise ValueError("virtual Serving audit/adaptive/report flags must be boolean")
+    if type(execution_workers) is not int or execution_workers < 0:
+        raise ValueError("virtual Serving execution_workers must be a nonnegative integer")
+    # The spec carries the run-level resolved inner-worker count.  A value
+    # of 0 means "auto" (CPU-aware default for the host and selection size).
+    if execution_workers == 0:
+        execution_workers = min(4, (os.cpu_count() or 1) // 2)
+    if adaptive_state is not None and not reuse_completed:
+        # Seed this case's coordination record before the subprocess starts
+        # so the serving simulation can re-read the current active-case
+        # grant at every legal parallel-tail boundary.
+        from evaluation.serving.metrics import symbolic_model as _self_module
+        if "started_cases" in adaptive_state:
+            seed_active = list(adaptive_state["started_cases"])
+        elif "active_cases" in adaptive_state:
+            seed_active = list(adaptive_state["active_cases"])
+        else:
+            raise ValueError("adaptive coordinator state is missing its case list")
+        seed_state = {"spec_count": adaptive_state["spec_count"],
+            "logical_cpus": adaptive_state["logical_cpus"],
+            "active_cases": seed_active}
+        _self_module._write_adaptive_case_state(directory, seed_state, adaptive_index)
     record = {"cell_id": cell.cell_id, "hardware_id": cell.hardware.hardware_id,
         "model_id": cell.model.dataset_model_id, "case_id": cell.case_id, "target_qps": cell.qps,
         "request_count": len(case.requests), "captured_prediction_contract": dict(config.prediction.values),
         "captured_runtime": dict(case.manifest["runtime"]), "workload_path": "virtual_tensor",
         "equivalence_accepted": False, "normal_capacity_accepted": False}
+    interactive_enabled = bool(interactive_report)
+
+    def status_report(status, reason):
+        if not interactive_enabled:
+            return {"status": "disabled", "reason": "offline HTML report not requested"}
+        from evaluation.reporting.serving_interactive import write_status_report
+        return write_status_report({"main_chain_status": {"status": status, "reason": reason},
+            "model_config_provenance": {"model_id": cell.model.dataset_model_id},
+            "hardware_ids": [cell.hardware.hardware_id], "request_source": {"case": record}}, directory / ("reuse-status.html" if reuse_completed else "result.html"))
+
     try:
         argv, contract = prepare_virtual_serving_case(root, config, cell, case, directory, sdk, source,
-            serving_timing_mode=serving_timing_mode)
+            serving_timing_mode=serving_timing_mode, execution_mode=execution_mode, state_audit=state_audit,
+            execution_workers=0 if adaptive_auto else execution_workers,
+            **({"h200_scenario": h200_scenario} if h200_scenario is not None else {}))
     except NotImplementedError as error:
-        return {**record, "prediction_status": "unsupported", "prediction_reason": str(error)}
+        return {**record, "prediction_status": "unsupported", "prediction_reason": str(error),
+            "interactive_report": status_report("unsupported", str(error))}
+    if interactive_enabled:
+        argv = [*argv, "--interactive-report"]
     legacy_command = [str(python), "scripts/run_serving_simulation.py", *argv]
     command = legacy_command
     if contract["symbolic_forward_source"] is None:
         return {**record, "effective_prediction_contract": contract, "command": command,
             "prediction_status": "unsupported", "prediction_reason": contract["source_selection_reason"],
-            "subprocess_started": False}
+            "subprocess_started": False, "interactive_report": status_report("unsupported", contract["source_selection_reason"])}
     comparison_path = directory / "comparison.json"
     command = [str(python), "scripts/evaluation/serving/run_paired_virtual_case.py",
         "--case-path", str(compact.compact_case_path(root, config, cell)),
@@ -1314,13 +1673,22 @@ def _run_virtual_serving_case(spec):
         _validate_virtual_reuse_command(saved_command, requested_command, root, snapshot_commit)
         command = saved_command
         status = previous_cell["prediction_status"]
-        if status not in ("completed", "failed"):
+        if status not in ("completed", "failed", "unsupported"):
             raise ValueError(f"unknown executed virtual Serving status: {status!r}")
         returncode = previous_cell["exit_code"]
         if type(returncode) is not int or (status == "completed") != (returncode == 0):
             raise ValueError("saved virtual Serving status and exit code disagree")
     else:
         (directory / "command.json").write_text(json.dumps(command, indent=2) + "\n")
+        from evaluation.reporting.serving_interactive import default_report_path
+        if interactive_enabled:
+            report_override = argv[argv.index("--interactive-output") + 1] if "--interactive-output" in argv else None
+            runtime_report_path = default_report_path(directory / "result.json", report_override)
+            runtime_projection = runtime_report_path.with_suffix(".visualization.json")
+        else:
+            runtime_report_path = None
+            runtime_projection = directory / "disabled.visualization.json"
+        prior_projection_stamp = runtime_projection.stat().st_mtime_ns if runtime_projection.is_file() else None
         with (directory / "run.log").open("w") as log:
             environment = dict(os.environ)
             environment["PYTHONHASHSEED"] = "0"
@@ -1336,11 +1704,23 @@ def _run_virtual_serving_case(spec):
                     "reuse_input_validation": ("historical_failure_only_inputs_not_revalidated"
                         if snapshot_commit is None else "matched_recorded_execution_commit"),
                     "report_regeneration_wall_time_seconds": perf_counter() - started}
-        return {**record, "prediction_status": "failed", "prediction_reason": str(directory / "run.log")}
+        if runtime_projection.is_file() and runtime_projection.stat().st_mtime_ns != prior_projection_stamp:
+            runtime_status = json.loads(runtime_projection.read_text())
+            if (runtime_status["visualization_view"] == "status"
+                    and runtime_status["main_chain_status"]["status"] in ("unsupported", "failed")):
+                status = runtime_status["main_chain_status"]
+                return {**record, "prediction_status": status["status"], "prediction_reason": status["reason"],
+                    "interactive_report": ({"status": status["status"], "path": str(runtime_report_path), "data_path": str(runtime_projection)}
+                        if interactive_enabled else {"status": "disabled", "reason": "offline HTML report not requested"})}
+        return {**record, "prediction_status": "failed", "prediction_reason": str(directory / "run.log"),
+            "interactive_report": status_report("failed", "Virtual Serving subprocess failed; see run.log")}
     result_path = directory / "result.json"
-    receipt = write_symbolic_serving_report(result_path, directory / "report.md")
     result = json.loads(result_path.read_text())
     progress = result["scheduler_progress"]["summary"]
+    if "execution_mode" not in result and not reuse_completed:
+        raise ValueError("new virtual Serving result omitted its execution mode")
+    if "execution_mode" in result and result["execution_mode"] != execution_mode:
+        raise ValueError("virtual Serving result differs from the requested execution mode")
     if progress["request_count"] != len(case.requests):
         raise ValueError("virtual Serving did not execute the full selected request stream")
     if result["execution_provenance"]["runtime_inputs"]["symbolic_forward_source"] != contract["symbolic_forward_source"]:
@@ -1354,6 +1734,12 @@ def _run_virtual_serving_case(spec):
         comparison = compare_virtual_serving_aggregate(compact._observed_metrics(case), result, result_path, len(case.requests))
     else:
         comparison = _load_virtual_case_comparison(comparison_path, result_path, cell.requests_sha256)
+    from .compact_case_evaluation import _observation_quality
+    observation_quality = _observation_quality(case.manifest)
+    accuracy_claim_status = (
+        "provisional_observer_effect"
+        if observation_quality["status"] == "provisional"
+        else "source_projected_unvalidated")
     report_context = {}
     if not legacy_result:
         from .compact_case_evaluation import _cell_context
@@ -1382,29 +1768,254 @@ def _run_virtual_serving_case(spec):
                 or previous_cell["predicted_metrics"] != result["metrics"]
                 or previous_cell["metrics"] != comparison):
             raise ValueError("saved result/comparison differs from the previous campaign")
-        return {**previous_cell, "reused_simulation_result": True, "result_path": str(result_path),
+        if interactive_enabled:
+            reused_report = _regenerate_saved_serving_report(result, result_path, directory / "reused-report.html")
+        else:
+            reused_report = {"status": "disabled", "reason": "offline HTML report not requested"}
+        write_symbolic_serving_report(result_path, directory / "report.md", interactive_report=reused_report)
+        return {**previous_cell, **report_context,
+                "manifest_sha256": cell.manifest_sha256,
+                "requests_sha256": cell.requests_sha256,
+                "captured_runtime": dict(case.manifest["runtime"]),
+                "capture_contract_status": f"schema_v{case.manifest['schema_version']}_validated",
+                "observation_quality": observation_quality,
+                "accuracy_claim_status": accuracy_claim_status,
+                "reused_simulation_result": True, "result_path": str(result_path),
+                "interactive_report": reused_report,
                 "report_regeneration_wall_time_seconds": perf_counter() - started}
+    receipt = write_symbolic_serving_report(result_path, directory / "report.md")
     return {**record, **report_context, "prediction_status": "completed", "prediction_reason": None,
         "performance_timing_status": result["performance_timing_status"],
-        "accuracy_claim_status": "source_projected_unvalidated",
+        "observation_quality": observation_quality,
+        "accuracy_claim_status": accuracy_claim_status,
         "process_peak_rss_bytes": result["process_peak_rss_bytes"],
         "result_path": str(result_path), "receipt": receipt,
+        **{key: result[key] for key in ("interactive_report", "report_output_costs") if key in result},
         "execution_provenance": result["execution_provenance"],
         "metrics": comparison,
         "predicted_metrics": result["metrics"], "schedule_end_time_s": result["schedule_end_time_s"]}
 
 
+def _simulation_batch_timing(cells):
+    rows = []
+    for cell in cells:
+        if cell["prediction_status"] != "completed":
+            continue
+        result = json.loads(Path(cell["result_path"]).read_text())
+        if ("simulation_started_monotonic_s" not in result
+                or "simulation_finished_monotonic_s" not in result):
+            return {"schema_version": 1,
+                "availability": "legacy_absolute_case_boundaries_unavailable",
+                "case_count": 0, "cases": []}
+        started = result["simulation_started_monotonic_s"]
+        finished = result["simulation_finished_monotonic_s"]
+        wall = result["simulation_wall_time_s"]
+        if (not isinstance(started, (int, float)) or isinstance(started, bool)
+                or not isinstance(finished, (int, float)) or isinstance(finished, bool)
+                or not isinstance(wall, (int, float)) or isinstance(wall, bool)
+                or started < 0.0 or finished < started or wall < 0.0
+                or abs(finished - started - wall) > max(1e-9, wall * 1e-9)):
+            raise ValueError(f"invalid simulation timing for {cell['cell_id']}")
+        rows.append({"cell_id": cell["cell_id"], "started_monotonic_s": started,
+            "finished_monotonic_s": finished, "simulation_wall_time_s": wall})
+    if not rows:
+        return {"schema_version": 1, "availability": "no_completed_simulation",
+            "case_count": 0, "cases": []}
+    started = min(row["started_monotonic_s"] for row in rows)
+    finished = max(row["finished_monotonic_s"] for row in rows)
+    return {"schema_version": 1, "availability": "available",
+        "scope": "earliest_case_simulation_start_to_latest_case_simulation_finish",
+        "postprocessing": "outside_this_boundary_may_overlap_earlier_case_simulation",
+        "started_monotonic_s": started, "finished_monotonic_s": finished,
+        "wall_time_s": finished - started, "case_count": len(rows), "cases": rows}
+
+
+def _initial_inner_workers(spec_count, logical_cpus):
+    """Resolve the per-case inner execution-worker count for this run.
+
+    Positive overrides are honored by the caller; here 0 selects the
+    CPU-aware automatic default.  A single selected case gets a wider
+    inner pool because no other outer worker shares the host.  Small
+    subsets get a modest fixed pool.  The full matrix starts from the
+    historical single-worker default so every selected case owns exactly
+    one outer driver process; late survivors then coordinate through
+    the shared filesystem-backed promotion protocol.  The result is a
+    plain function of selected-case count and host CPU facts, never of
+    case identity, hardware name, or predicted/observed durations.
+    """
+    if spec_count <= 1:
+        return min(4, logical_cpus // 2)
+    if spec_count <= 8:
+        return 2
+    return 1
+
+
+def _adaptive_inner_pool_facts(spec_count, logical_cpus):
+    """Shared budget and promotion threshold for the late-tail pool."""
+    if spec_count <= 1:
+        return 0, 0
+    budget = max(0, logical_cpus - spec_count)
+    # Promote as soon as every survivor can take at least one extra worker;
+    # the spare budget is unused while cases run serially, so grant early.
+    threshold = max(2, budget // 8)
+    return budget, threshold
+
+
+def _write_json_atomic(path, payload):
+    """Publish JSON atomically so concurrent readers never see a torn file."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".",
+        suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as stream:
+            stream.write(json.dumps(payload, indent=2) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _adaptive_locked_update(path, epoch, coordination_state, update):
+    """Single-writer update of the shared run file under an exclusive lock.
+
+    The parent coordinator and the case children all funnel their
+    read-modify-write of adaptive_started_cases.json through this one
+    locked helper, so updates cannot overwrite each other and a stale
+    epoch fails closed instead of silently corrupting the run state.
+    """
+    import fcntl
+    path = Path(path)
+    lock_path = path.with_suffix(".lock")
+    with open(lock_path, "w") as lock_stream:
+        fcntl.flock(lock_stream, fcntl.LOCK_EX)
+        try:
+            state = json.loads(path.read_text())
+            if "epoch" not in state or state["epoch"] != epoch:
+                raise ValueError("adaptive inner-worker state is missing or belongs to a different run")
+            for field, expected_value in coordination_state.items():
+                if state[field] != expected_value:
+                    raise ValueError("adaptive inner-worker state is inconsistent with this run")
+            started_cases = update(set(state["started_cases"]))
+            next_state = {**coordination_state, "epoch": epoch,
+                "started_cases": sorted(started_cases)}
+            _write_json_atomic(path, next_state)
+            return next_state
+        finally:
+            fcntl.flock(lock_stream, fcntl.LOCK_UN)
+
+
+_completion_update_hook_for_testing = None
+
+
+def _read_adaptive_started(path):
+    try:
+        return json.loads(Path(path).read_text())
+    except json.JSONDecodeError:
+        raise ValueError("adaptive inner-worker state is being updated; retry the read")
+
+
+def _write_adaptive_case_state(case_directory, state, index):
+    """Record this case's live coordination state for the serving simulation.
+
+    The serving simulation re-reads this file at every parallel-tail
+    batch boundary (via _adaptive_tail_workers_for) so an already-running
+    case can widen its inner pool when enough sibling cases have finished.
+    """
+    path = Path(case_directory) / "adaptive_case_state.json"
+    _write_json_atomic(path, {"spec_count": state["spec_count"], "logical_cpus": state["logical_cpus"],
+        "active_cases": sorted(state["active_cases"]), "index": index})
+
+
+def _mark_adaptive_case_finished(case_directory):
+    """Signal that this case has finished so siblings can be promoted."""
+    path = Path(case_directory) / "adaptive_case_finished.json"
+    _write_json_atomic(path, {"finished": True})
+
+
+def _run_virtual_serving_case_with_promotion(args, *, h200_scenario=None):
+    """Track this case in the coordinator and run it (top-level for pickling).
+
+    The adaptive coordinator in run_virtual_serving_evaluation owns the
+    shared state; this worker-side helper records its own start in the
+    shared run file, seeds its per-case coordination record, and marks
+    itself finished when done.  The serving simulation reads the per-case
+    record at every parallel-tail boundary and grants extra inner workers
+    when the active-case count drops to the promotion threshold.
+    """
+    (spec_index, spec, submission_order, spec_count, extra_pool_budget,
+     promotion_threshold, started_path, epoch, coordination_state) = args
+    state = _adaptive_locked_update(started_path, epoch, coordination_state,
+        lambda started_cases: started_cases | {spec_index})
+    started_cases = set(state["started_cases"])
+    (root_, config_, cell_, case_, directory_, python_, sdk_, source_, reuse_,
+     timing_, mode_, audit_, _inner, previous_, adaptive_state,
+     adaptive_index, _auto_flag, interactive_report) = spec
+    child_state = {**coordination_state, "started_cases": sorted(started_cases)}
+    adaptive_spec = (root_, config_, cell_, case_, directory_, python_, sdk_, source_, reuse_,
+        timing_, mode_, audit_, 0, previous_, child_state, spec_index, True, interactive_report)
+    try:
+        cell = _run_virtual_serving_case(adaptive_spec,
+            **({"h200_scenario": h200_scenario} if h200_scenario is not None else {}))
+        result_path = directory_ / "result.json"
+        observed_grants = []
+        if result_path.is_file():
+            result_payload = json.loads(result_path.read_text())
+            if "adaptive_tail_worker_grants" in result_payload:
+                raw = result_payload["adaptive_tail_worker_grants"]
+                if (isinstance(raw, list)
+                        and all(isinstance(v, int) and not isinstance(v, bool) and v >= 1 for v in raw)):
+                    observed_grants = raw
+                else:
+                    raise ValueError("adaptive_tail_worker_grants has an invalid schema")
+        # Only count genuinely promoted cases: a grant strictly above the
+        # static resolved inner count.  When no adaptive grant fired the
+        # observed list is empty and the run's static inner count is
+        # reported unchanged, so telemetry distinguishes "no observation"
+        # from "observed the baseline".
+        granted_workers = max(observed_grants) if observed_grants else None
+        return spec_index, granted_workers, cell
+    finally:
+        _mark_adaptive_case_finished(directory_)
+
+
 def run_virtual_serving_evaluation(root, directory, selected_ids, jobs, python, sdk, source,
         load_validated_case, *, h200_version="0.30.0", h200_dataset_root=None, reuse_completed=False,
-        serving_timing_mode="device_only"):
-    """Run every selected canonical request, keeping unsupported cells visible."""
+        serving_timing_mode="device_only", execution_mode="accelerated", state_audit=False,
+        execution_workers=1, interactive_report=False, h200_scenario=None):
+    """Run every selected canonical request, keeping unsupported cells visible.
+
+    ``interactive_report`` is explicit opt-in: only when true do cases add
+    ``--interactive-report`` to the simulation argv and produce HTML pages
+    plus visualization projections.
+    """
     from . import sharegpt_compact_evaluation as compact
-    if type(jobs) is not int or jobs < 1:
-        raise ValueError("virtual Serving jobs must be a positive integer")
+    from .compact_case_contract import validate_case_data_pins
+    if type(interactive_report) is not bool:
+        raise TypeError("virtual Serving interactive_report must be boolean")
+    if h200_scenario not in (None, "analytical_bf16_v1"):
+        raise ValueError("unknown H200 Serving scenario")
+    case_worker = _run_virtual_serving_case
+    promotion_worker = _run_virtual_serving_case_with_promotion
+    if h200_scenario is not None:
+        case_worker = partial(case_worker, h200_scenario=h200_scenario)
+        promotion_worker = partial(promotion_worker, h200_scenario=h200_scenario)
+    if type(state_audit) is not bool:
+        raise TypeError("virtual Serving state_audit must be boolean")
+    _validate_virtual_execution_workers(execution_workers)
+    if type(jobs) is not int or jobs < 0:
+        raise ValueError("virtual Serving jobs must be a nonnegative integer; 0 uses one worker per selected case")
     if h200_version not in ("0.30.0", None):
         raise ValueError("virtual Serving currently requires captured H200 vLLM0.30 scenarios")
     if h200_dataset_root is not None:
         raise ValueError("virtual Serving candidate dataset roots are not yet supported")
+    if execution_mode not in ("accelerated", "fast"):
+        raise ValueError("virtual Serving execution mode must be accelerated or fast")
     all_cells = {cell.cell_id: (config, cell) for config, cells in compact.official_metrics_suite_runs(
         root, nvidia_h200_vllm_version=h200_version) for cell in cells}
     if len(selected_ids) != len(set(selected_ids)) or set(selected_ids) - set(all_cells):
@@ -1412,6 +2023,23 @@ def run_virtual_serving_evaluation(root, directory, selected_ids, jobs, python, 
     selected = tuple(selected_ids) if selected_ids else tuple(all_cells)
     if type(reuse_completed) is not bool:
         raise TypeError("virtual Serving reuse must be an explicit boolean")
+    # Keep the explicit per-case execution_workers override contract intact:
+    # callers that pass a positive value retain full control.  A value of 0
+    # selects the CPU-aware default.  One outer driver process is started
+    # for every selected case by default (jobs==0); cases that cannot use
+    # the colocated parallel tail (H200 v0.30 source models with 8 ranks)
+    # receive a bounded static inner pool, while tail-eligible cases start
+    # at the historical single-worker default and promote late survivors
+    # through the shared filesystem coordinator below.
+    spec_count = len(selected_ids) if selected_ids else len(all_cells)
+    logical_cpus = os.cpu_count() or 1
+    automatic_inner = execution_workers == 0
+    if not automatic_inner:
+        # Explicit override always wins, preserving the existing contract.
+        initial_inner_workers = execution_workers
+    else:
+        initial_inner_workers = _initial_inner_workers(spec_count, logical_cpus)
+    extra_pool_budget, promotion_threshold = _adaptive_inner_pool_facts(spec_count, logical_cpus)
     directory.mkdir(parents=True, exist_ok=reuse_completed)
     previous = None
     if reuse_completed:
@@ -1430,19 +2058,167 @@ def run_virtual_serving_evaluation(root, directory, selected_ids, jobs, python, 
         hardware_dataset_roots[hardware_id] = dataset_root
         case = load_validated_case(compact.compact_case_path(root, config, cell))
         compact._validate_case_binding(config, cell, case)
-        specs.append((root, config, cell, case, directory / key.replace("/", "__"), python, sdk, source, reuse_completed, serving_timing_mode,
-                      None if previous is None else old_cells[key]))
+        validate_case_data_pins(cell, case)
+        per_case_inner = initial_inner_workers
+        specs.append((root, config, cell, case, directory / key.replace("/", "__"), python, sdk, source, reuse_completed,
+                      serving_timing_mode, execution_mode, state_audit, per_case_inner,
+                      None if previous is None else old_cells[key], None, None, False, interactive_report))
     started = perf_counter()
-    with ProcessPoolExecutor(max_workers=min(jobs, len(specs))) as executor:
-        cells = list(executor.map(_run_virtual_serving_case, specs))
+    # Low arrival rates expose longer serial decode sequences. Start those
+    # cases first so later hardware groups do not wait behind short cases;
+    # keep the requested order in the report and never use measured durations.
+    submission_order = sorted(range(len(specs)), key=lambda index: specs[index][2].qps)
+    worker_count = len(specs) if jobs == 0 else min(jobs, len(specs))
+    coordination_state = None
+    started_path = None
+    if automatic_inner and extra_pool_budget > 0 and not reuse_completed:
+        # Late-tail promotion: the serving simulation re-reads the shared
+        # run state at every parallel-tail boundary.  When the number of
+        # cases that have not yet signalled completion drops to the
+        # promotion threshold, each surviving case's next tail batch is
+        # granted extra inner workers.  The budget, threshold and grant
+        # size are plain functions of the selected-case count and host CPU
+        # facts, never of case identity, hardware name, or
+        # predicted/observed durations.
+        #
+        # Coordination channel: a shared run file inside the report
+        # directory tracks which cases have started; each case also owns a
+        # per-case file recording the currently-active set, refreshed by
+        # the parent every time any case finishes.  The per-case file is
+        # the only channel the serving simulation reads.
+        epoch = hex(int.from_bytes(os.urandom(8), "big"))[2:]
+        coordination_state = {"spec_count": spec_count, "logical_cpus": logical_cpus,
+            "extra_pool_budget": extra_pool_budget, "promotion_threshold": promotion_threshold}
+        started_path = directory / "adaptive_started_cases.json"
+        _write_json_atomic(started_path, {**coordination_state, "epoch": epoch, "started_cases": []})
+        adaptive_index_to_dir = {index: specs[index][4] for index in submission_order}
+
+        def note_started(spec_index):
+            _adaptive_locked_update(started_path, epoch, coordination_state,
+                lambda started_cases: started_cases | {spec_index})
+
+        def remove_finished(index_set):
+            finished = set()
+            for index in index_set:
+                flag = adaptive_index_to_dir[index] / "adaptive_case_finished.json"
+                if flag.is_file():
+                    finished.add(index)
+            return index_set - finished
+
+        def prune_finished(active_cases):
+            for index in list(active_cases):
+                if (adaptive_index_to_dir[index] / "adaptive_case_finished.json").is_file():
+                    active_cases.discard(index)
+
+        def write_active_snapshot(active_cases):
+            snapshot = {"spec_count": spec_count, "logical_cpus": logical_cpus,
+                "active_cases": active_cases}
+            for index in submission_order:
+                _write_adaptive_case_state(adaptive_index_to_dir[index], snapshot, index)
+
+        def refresh_active_cases(changed_index=None):
+            state = _read_adaptive_started(started_path)
+            started_cases = set(state["started_cases"])
+            active_cases = remove_finished(started_cases)
+            if changed_index is not None and changed_index not in active_cases:
+                active_cases = active_cases | {changed_index}
+            write_active_snapshot(active_cases)
+            return active_cases
+
+        # The parent's early call to note_started seeds the record with the
+        # first batch so a very fast first finisher cannot shrink the
+        # observed active count to zero before any other case launches.
+        for spec_index in submission_order[:worker_count]:
+            note_started(spec_index)
+        active_cases = refresh_active_cases()
+        futures = {}
+        with ProcessPoolExecutor(max_workers=worker_count) as executor:
+            for spec_index in submission_order:
+                if spec_index not in submission_order[:worker_count]:
+                    note_started(spec_index)
+                    active_cases = refresh_active_cases(spec_index)
+                future = executor.submit(promotion_worker,
+                    (spec_index, specs[spec_index], submission_order, spec_count, extra_pool_budget,
+                     promotion_threshold, started_path, epoch, coordination_state))
+                futures[future] = spec_index
+
+            coordination_lock = threading.Lock()
+            completion_update_errors = []
+
+            def refresh_on_completion(future):
+                completed_index = futures[future]
+                try:
+                    with coordination_lock:
+                        active_cases.discard(completed_index)
+                        prune_finished(active_cases)
+                        write_active_snapshot(active_cases)
+                        if _completion_update_hook_for_testing is not None:
+                            _completion_update_hook_for_testing(set(active_cases))
+                except BaseException as error:
+                    completion_update_errors.append(error)
+
+            for future in futures:
+                future.add_done_callback(refresh_on_completion)
+            cells_by_index = {}
+            actual_grants = {}
+            coordination_errors = []
+            for future in futures:
+                try:
+                    finished_index, granted_workers, cell = future.result()
+                except BaseException as error:
+                    coordination_errors.append(error)
+                    continue
+                cells_by_index[finished_index] = cell
+                actual_grants[finished_index] = granted_workers
+                with coordination_lock:
+                    active_cases.discard(finished_index)
+                    prune_finished(active_cases)
+                    write_active_snapshot(active_cases)
+            executor.shutdown(wait=True, cancel_futures=True)
+            # Done-callback exceptions are only logged by concurrent.futures;
+            # they must surface here even when every worker itself succeeded.
+            if completion_update_errors:
+                raise RuntimeError(f"adaptive completion update failed for {len(completion_update_errors)} case(s)") from completion_update_errors[0]
+            if coordination_errors:
+                raise RuntimeError(f"adaptive case coordination failed for {len(coordination_errors)} case(s)") from coordination_errors[0]
+            if len(cells_by_index) != len(specs):
+                raise RuntimeError(f"adaptive case coordination lost results: {len(cells_by_index)} of {len(specs)} cases returned")
+    else:
+        with ProcessPoolExecutor(max_workers=worker_count) as executor:
+            completed = executor.map(case_worker,
+                (specs[index] for index in submission_order))
+            cells_by_index = dict(zip(submission_order, completed, strict=True))
+        actual_grants = {}
+    if coordination_state is not None and started_path is not None and started_path.is_file():
+        started_path.unlink()
+    if coordination_state is not None and started_path is not None:
+        lock_path = started_path.with_suffix(".lock")
+        if lock_path.is_file():
+            lock_path.unlink()
+    cells = [cells_by_index[index] for index in range(len(specs))]
     import subprocess
     commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root,
         check=True, capture_output=True, text=True).stdout.strip()
+    # Only cases with a genuine adaptive grant observation contribute to the
+    # grant histogram; runs where the coordinator stayed silent report an
+    # empty observation set rather than back-filling the static baseline.
+    observed_grants = [grant for grant in actual_grants.values() if grant is not None]
+    grant_counts = Counter(observed_grants) if observed_grants else Counter()
     payload = {"schema_version": 1, "workload_path": "virtual_tensor", "source_commit": commit,
         "simulation_snapshots": sorted({cell["execution_provenance"]["repository"]["git_commit"]
             for cell in cells if cell["prediction_status"] == "completed"}),
         "hardware_dataset_roots": hardware_dataset_roots,
         "cell_count": len(cells), "evaluation_wall_time_seconds": perf_counter() - started,
+        "serving_execution_mode": execution_mode,
+        "serving_execution_workers": initial_inner_workers,
+        "serving_execution_workers_auto": automatic_inner,
+        "serving_initial_inner_workers": initial_inner_workers,
+        "serving_extra_pool_budget": extra_pool_budget,
+        "serving_promotion_threshold": promotion_threshold,
+        "serving_promoted_cases": sum(1 for grant in observed_grants if grant > initial_inner_workers),
+        "serving_worker_grant_counts": dict(sorted(grant_counts.items())),
+        "serving_state_audit": state_audit,
+        "simulation_batch_timing": _simulation_batch_timing(cells),
         "cells": cells, "goal_complete": False}
     if previous is not None:
         payload["report_regeneration_wall_time_seconds"] = payload["evaluation_wall_time_seconds"]

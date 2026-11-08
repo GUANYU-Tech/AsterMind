@@ -1,6 +1,8 @@
 """Untimed production memory access generation and explicit object bindings."""
 from __future__ import annotations
 
+from src.kernel.prediction_cache import runtime_lru_cache
+
 from dataclasses import dataclass
 from functools import cached_property, lru_cache
 from collections import OrderedDict
@@ -1032,6 +1034,13 @@ def _live_memory_prediction_source_epoch():
                         signature.append((module_name,
                             f"{name}.{method_name}", method, function,
                             function.__code__))
+    # The paged-KV builder is imported above but called through this module's
+    # binding. Tracking only its defining module misses a replaced dispatch
+    # alias and could return an old exact or numeric price without validation.
+    if not isinstance(build_paged_kv_update, FunctionType):
+        raise TypeError('Paged KV source builder must retain its Python source callable')
+    signature.append((__name__, 'build_paged_kv_update', build_paged_kv_update,
+                      build_paged_kv_update.__code__))
     global _source_recipe_signature, _source_recipe_epoch
     signature = tuple(signature)
     if signature != _source_recipe_signature:
@@ -1688,6 +1697,8 @@ def _build_memory_access_program(kernel, hardware, bindings,
                          "cublas_analytical_gemm:batched_gemm", "nvidia_cublaslt_gemm:batched_gemm",
                          "cublas_analytical_gemm:moe_router", "nvidia_cublaslt_gemm:moe_router"},
         "nvidia_h200": {"nvidia_cublaslt_gemm", "nvidia_cublas_gemv",
+                         "h200_cublaslt129_injected_gemm",
+                         "h200_vllm030_torch213_fp16_observed_gemm",
                          "cublas_analytical_gemm", "cublas_analytical_gemv",
                          "cublas_analytical_gemm:batched_gemm", "nvidia_cublaslt_gemm:batched_gemm",
                          "cublas_analytical_gemm:moe_router", "nvidia_cublaslt_gemm:moe_router"},
@@ -2281,7 +2292,7 @@ def _scalar_coordinate_views(kernel,views,reads,writes):
     return (*views,*extra),tuple(view.view_id for view in extra)
 
 
-@lru_cache(maxsize=64)
+@runtime_lru_cache(maxsize=64)
 def _scalar_access_patterns(names,reads,writes,input_ranks,reducer):
     accesses=[];dependencies=[]
     for index,(name,rank) in enumerate(zip(reads,input_ranks,strict=True)):
@@ -2343,7 +2354,8 @@ def has_scalar_analytical_work(kernel):
     return (kernel.kind is KernelKind.VECTOR and kernel.execution_support == 'supported'
         and kernel.variant in ('elementwise','elementwise_pytorch_vec4','activation','silu',
             'moe_act_and_mul','moe_swiglu','gemm_reduce','gemm_elementwise')
-        and not has_observed_router_reducer_abi(kernel))
+        and not has_observed_router_reducer_abi(kernel)
+        and not _has_external_aggregate_interface(kernel))
 
 
 def scalar_prediction_work(kernel, hardware, bindings=None):
@@ -2769,7 +2781,10 @@ def _memory_execution_kernel(kernel, hardware):
         kernel=cann_split_execution_kernel(kernel)
     if (kernel.kind is KernelKind.GEMM and kernel.variant in ("gemm","moe_router","batched_gemm")
             and (has_gpu_nonsplit_gemm_source(kernel, hardware) or has_block_fp8_source(kernel)
-                 or has_gpu_split_gemm_source(kernel, hardware))
+                 or has_gpu_split_gemm_source(kernel, hardware)
+                 or (kernel.hardware_id == "nvidia_h200"
+                     and kernel.launch is not None
+                     and kernel.launch.algorithm == "h200_cublaslt129_injected_gemm"))
             and "model_input_shape" in kernel.attributes
             and kernel.attributes["graph_runtime_mode"] in ("FULL", "PIECEWISE")
             and kernel.attributes["graph_logical_tokens"] < kernel.attributes["graph_model_input_tokens"]):
@@ -3132,13 +3147,14 @@ def prediction_memory_numeric_projection(kernel, hardware, program):
 def bound_prediction_numeric_reuse_key(kernel, hardware, bindings, method):
     """Validate this caller before sharing an existing declared numeric result.
 
-    Only the existing GPU matrix, normalization and scalar source projections
-    participate. Complete operand geometry, actor labels, aliases and event
-    topology remain in the key; opaque object/event names are alpha-renamed.
-    A fresh actual program is validated before every new binding can reuse it.
+    Only explicitly declared source projections participate. A fresh actual
+    program is validated before every new binding can reuse a price. Matrix,
+    normalization and scalar keys also retain the alpha-renamed caller
+    structure. Paged KV consumes only its validated payload/index byte counts
+    after source validation; its exact KernelSpec/HWSpec are keyed by the memo.
     """
     if (method not in ('midlayer','roofline','roofline_span_floor')
-            or type(bindings) not in (MemoryBindings,ElementwiseBindings)):
+            or type(bindings) not in (MemoryBindings,ElementwiseBindings,CacheUpdateBindings)):
         return None
     execution = memory_execution_kernel(kernel,hardware)
     from src.kernel.kernel_spec import KernelKind
@@ -3147,7 +3163,10 @@ def bound_prediction_numeric_reuse_key(kernel, hardware, bindings, method):
             or has_scalar_analytical_work(kernel)))
     if not (has_gpu_nonsplit_gemm_source(execution,hardware)
             or has_gpu_normalization_source(execution,hardware)
-            or has_scalar_analytical_work(execution) or logical):
+            or has_scalar_analytical_work(execution) or logical
+            or (type(bindings) is CacheUpdateBindings
+                and has_paged_kv_source(execution,hardware)
+                and not has_target_cache_source(execution))):
         return None
     program = bound_prediction_memory_program(kernel,hardware,bindings,method)
     projection = prediction_memory_numeric_projection(kernel,hardware,program)
@@ -3157,6 +3176,12 @@ def bound_prediction_numeric_reuse_key(kernel, hardware, bindings, method):
             program,expected_kernel=kernel,hardware=hardware))
     if projection is None:
         return None
+    if type(bindings) is CacheUpdateBindings:
+        # The paged-KV predictor reads this source only through these three
+        # byte quantities. Layout, launch and services remain in KernelSpec
+        # and HWSpec. The builder above checked this caller's own storage,
+        # mapping, aliases and readiness; no source program is shared here.
+        return _immutable_work_value(projection)
     pools = tuple(tuple(getattr(item,field) for item in records) for records,field in (
         (bindings.allocations,'allocation_id'),(bindings.views,'view_id'),(bindings.events,'event_id')))
     if any(len(set(pool)) != len(pool) for pool in pools):
@@ -3589,6 +3614,21 @@ def prediction_memory_input_scope():
             yield
 
 
+@contextmanager
+def _standalone_resource_input_scope(kernel):
+    """Own implicit operands for one otherwise unbound resource export.
+
+    A caller's bindings (including an intentional empty context) stay in
+    charge. Only a standalone call establishes its own existing analytical
+    scopes, and both scopes are restored when construction raises or returns.
+    """
+    if _PREDICTION_MEMORY_BINDINGS in copy_context():
+        yield
+    else:
+        with prediction_memory_bindings(kernel, None, 'roofline'), prediction_memory_input_scope():
+            yield
+
+
 def _own_implicit_memory_source(kernel, actual):
     context = copy_context()
     if _PREDICTION_MEMORY_BINDINGS not in context:
@@ -3682,7 +3722,23 @@ def _prediction_bindings(kernel, bindings):
     if _PREDICTION_MEMORY_BINDINGS not in context:
         return None, None
     invocation = context[_PREDICTION_MEMORY_BINDINGS]
-    if invocation is None or invocation.bindings is None:
+    if invocation is None:
+        return None, None
+    from src.kernel.kernel_spec import KernelKind
+    if (kernel.kind is KernelKind.KV_CACHE
+            and kernel.variant == "dsv4_compressed_state_cache"
+            and invocation.kernel.variant == kernel.variant
+            and invocation.kernel.attributes["finish_stage"] is None
+            and kernel.attributes["finish_stage"] in ("compress", "store")):
+        from src.kernel.memory_cache_update import (
+            dsv4_c128_stage_bindings, standalone_target_cache_bindings)
+        if invocation.bindings is None:
+            invocation.bindings = standalone_target_cache_bindings(
+                invocation.kernel, call_id="c128.aggregate", binding_id="c128.aggregate")
+        actual = dsv4_c128_stage_bindings(invocation.kernel, kernel, invocation.bindings)
+        invocation.consumed = True
+        return actual, actual.call_id
+    if invocation.bindings is None:
         return None, None
     if (kernel.kind, kernel.hardware_id, kernel.variant) != (
             invocation.kernel.kind, invocation.kernel.hardware_id, invocation.kernel.variant):
@@ -3916,6 +3972,14 @@ def fa3_prefill_memory_access_program(kernel,hardware):
     return build_memory_access_program(kernel,hardware,None,Granularity.KERNEL,program_id='flash_attention.fa3_prefill')
 
 
+def fa3_prefill_prediction_work(kernel,hardware,bindings=None):
+    from src.kernel.memory_flash_attention import fa3_prefill_prediction_work as evaluate
+    actual,_=_prediction_bindings(kernel,bindings)
+    if actual is None:
+        actual=standalone_fa3_prefill_bindings(kernel,call_id='fa3.prefill',binding_id='fa3.prefill')
+    return _source_prediction_work(kernel,hardware,actual,evaluate,with_hardware=True)
+
+
 def moe_alignment_memory_access_program(kernel,hardware):
     return build_memory_access_program(kernel,hardware,None,Granularity.TILE,program_id="vector.moe_alignment")
 
@@ -4004,10 +4068,23 @@ def has_public_tensor_gemm_source(kernel,hardware=None):
             has_cann_deterministic_gemm_source(kernel),has_block_fp8_source(kernel))))
 
 
+def _has_external_aggregate_interface(kernel):
+    """Explicit modeled storage; no native partial-buffer ABI is asserted."""
+    from src.kernel.kernel_spec import KernelKind
+    return (kernel.execution_support == 'supported' and kernel.launch is not None
+        and kernel.hardware_id == 'nvidia_h200'
+        and (kernel.kind, kernel.variant, kernel.dtype, kernel.launch.algorithm) in (
+            (KernelKind.GEMM, 'gemm', 'fp16', 'h200_vllm030_torch213_fp16_external_aggregate_gemm'),
+            (KernelKind.VECTOR, 'gemm_reduce', 'fp16', 'h200_vllm030_torch213_fp16_external_aggregate_reduce'),
+            (KernelKind.GEMM, 'gemm', 'bf16', 'h200_cublaslt129_bf16_external_aggregate_gemm'),
+            (KernelKind.VECTOR, 'gemm_reduce', 'bf16', 'h200_cublaslt129_bf16_external_aggregate_reduce')))
+
+
 def has_logical_interface_source(kernel,hardware=None):
     """Explicit mathematical interfaces; independent of native/pricing admission."""
     from src.kernel.kernel_spec import KernelKind
     if kernel.execution_support!='supported':return False
+    if _has_external_aggregate_interface(kernel):return True
     if has_public_tensor_gemm_source(kernel,hardware):return True
     if has_public_attention_source(kernel):return True
     if kernel.kind is KernelKind.VECTOR and kernel.variant in _LOGICAL_MOE_VARIANTS:
@@ -4064,6 +4141,14 @@ def _logical_interface_layouts(kernel,hardware=None):
     from src.kernel.kernel_spec import KernelKind
     s=kernel.shape;dtype=kernel.dtype;width=s['dtype_bytes'];v=kernel.variant
     if not has_logical_interface_source(kernel,hardware):raise ValueError('No declared logical interface for this kernel')
+    if _has_external_aggregate_interface(kernel):
+        physical = kernel.shape if kernel.kind is KernelKind.GEMM else kernel.attributes['source_gemm_shape']
+        b,m,n,k = (physical[name] for name in ('b','m','n','k'))
+        splits = int(kernel.launch.parameters['modeled_split_k'])
+        partial = ('modeled_partials',(splits,b,m,n),'fp32',4)
+        if kernel.kind is KernelKind.GEMM:
+            return (('A',(b,m,k),dtype,width),('B',(k,n),dtype,width)),(partial,)
+        return (partial,),(('logical_result',(b,m,n),dtype,width),)
     if kernel.kind is KernelKind.GEMM:
         b,m,n,k=(s[name] for name in ('b','m','n','k'))
         # Only mathematical index sets are known for opaque launches. In
@@ -4073,9 +4158,14 @@ def _logical_interface_layouts(kernel,hardware=None):
         writes=(('logical_result',(b,m,n),dtype,width),)
         partial=kernel.launch.parameters['split_k_partial_bytes_per_element']
         if partial:
-            splits=kernel.launch.tiling.split_k
-            if splits is None or partial!=int(partial):raise ValueError('Declared GEMM partial storage needs integral dimensions')
-            writes+=(('partials',(splits,b*m*n,int(partial)),'uint8',1),)
+            if partial!=int(partial):raise ValueError('Declared GEMM partial storage needs integral dimensions')
+            if kernel.launch.tiling is not None:
+                splits=kernel.launch.tiling.split_k
+                if splits is None:raise ValueError('Declared GEMM partial storage needs integral dimensions')
+                writes+=(('partials',(splits,b*m*n,int(partial)),'uint8',1),)
+            # Without retained split dimensions this interface cannot create
+            # a scratch extent. The obligation remains explicitly unbound;
+            # logical_result is already a mathematical, not physical C, role.
         return reads,writes
     if kernel.kind is KernelKind.FLASH_ATTN:
         if has_public_attention_source(kernel):
@@ -4425,7 +4515,7 @@ def _validate_logical_invocation(invocation):
             raise ValueError('Logical selection cannot acquire an unproved physical layout or lifetime')
 
 
-@lru_cache(maxsize=128)
+@runtime_lru_cache(maxsize=128)
 def _logical_access_patterns(reads,writes):
     """Static role/rank and dependency metadata; no dimensions or byte values."""
     accesses=[]
@@ -4508,9 +4598,15 @@ def build_logical_interface(kernel,bindings,granularity,*,program_id,hardware=No
         'Opaque metadata/position encodings and index membership remain unknown; no native padding/scratch or exact traffic claim.',
         'Read-to-write dependencies describe the whole mathematical call; this is not an executable scheduling model.',
         'Known typed roles may feed the common byte projection; opaque roles require a declared pricing projection.')
-    if kernel.kind is KernelKind.GEMM:
+    if _has_external_aggregate_interface(kernel):
+        limitations+=('Partial count and FP32 partial encoding are explicit aggregate model assumptions, not observed effective K partitions or native buffer layout.',
+            'Main owns modeled partial writes only; reducer owns modeled partial reads and one final result write in the declared input/output dtype.',
+            'No physical partial-buffer allocation, native alias or source ABI is established by these modeled selections.')
+    elif kernel.kind is KernelKind.GEMM:
         limitations+=('A/B storage encodings, scales and native scratch are unbound. Logical result is the mathematical GEMM result, not a claim that this launch publishes final C.',
             'Existing nominal-width GEMM pricing is conditional model work, not requested bytes of the opaque input selections.')
+        if kernel.launch.tiling is None and kernel.launch.parameters['split_k_partial_bytes_per_element']:
+            limitations+=('Observed partial output has unknown split count, K intervals and scratch extent; no partial allocation or zero-scratch claim is made.',)
     if kernel.variant in ('moe_align_opt_128','moe_enable_if'):
         limitations+=('INT32 expert state and two-word route records are the portable logical reference representation; native packed/compacted metadata widths and membership are not established by this summary.',)
     return MemoryAccessProgram('midlayer.memory-access.v1',program_id,kernel.hardware_id,bindings.binding_id,
@@ -4537,7 +4633,7 @@ def has_mathematical_gemm_source(kernel):
         and kernel.execution_support == 'unsupported' and kernel.launch is None
         and 'mathematical_program' in kernel.attributes
         and kernel.attributes['mathematical_program'] in ('unquantized_fp32_flops_bytes_v1',
-            'unquantized_fp16_flops_bytes_v1'))
+            'unquantized_fp16_flops_bytes_v1', 'unquantized_bf16_flops_bytes_v1'))
 
 
 def has_mathematical_memory_source(kernel):
@@ -4545,11 +4641,14 @@ def has_mathematical_memory_source(kernel):
     from src.kernel.kernel_spec import KernelKind
     if kernel.execution_support != 'unsupported' or kernel.launch is not None:
         return False
+    if (kernel.hardware_id == 'nvidia_h200' and kernel.kind is KernelKind.VECTOR
+            and kernel.variant == 'silu' and kernel.attributes['swiglu_limit'] is not None):
+        return True
     if 'mathematical_program' not in kernel.attributes:
         return False
     program = kernel.attributes['mathematical_program']
-    if kernel.kind is KernelKind.VECTOR and program == 'dense_fp16_source_flops_bytes_v1':
-        return kernel.variant in ('rmsnorm','add_rmsnorm','silu')
+    if kernel.kind is KernelKind.VECTOR and program in ('dense_fp16_source_flops_bytes_v1', 'dense_bf16_source_flops_bytes_v1'):
+        return kernel.variant in ('rmsnorm','add_rmsnorm','silu','elementwise')
     if kernel.kind is KernelKind.FLASH_ATTN:
         return program in ('gqa_softmax_v1', 'bf16_mla_decode_softmax_v1',
             'bf16_mla_causal_empty_rows_softmax_v1', 'bf16_mla_absorbed_prefill_softmax_v1')
@@ -4605,7 +4704,7 @@ def standalone_mathematical_bindings(kernel, *, call_id, binding_id, rank=0,
                                       stream='offline', device_id='logical-local-device'):
     from math import prod
     from src.kernel.kernel_spec import DTYPE_BYTES
-    if kernel.kind.value == 'VECTOR' and kernel.variant == 'silu':
+    if kernel.kind.value == 'VECTOR' and kernel.variant in ('silu', 'elementwise'):
         return standalone_elementwise_bindings(kernel,call_id=call_id,binding_id=binding_id,
             rank=rank,stream=stream,device_id=device_id)
     reads, writes = mathematical_operand_layouts(kernel)
@@ -4636,15 +4735,15 @@ def standalone_mathematical_bindings(kernel, *, call_id, binding_id, rank=0,
 def build_mathematical_memory_source(kernel, hardware, bindings, granularity, *, program_id):
     from math import prod
     from src.kernel.kernel_spec import DTYPE_BYTES
-    if kernel.kind.value == 'VECTOR' and kernel.variant == 'silu':
+    if kernel.kind.value == 'VECTOR' and kernel.variant in ('silu', 'elementwise'):
         if not has_mathematical_memory_source(kernel):
-            raise ValueError('No mathematical SiLU source for this program')
+            raise ValueError('No mathematical elementwise source for this program')
         if bindings is None:
             bindings = standalone_mathematical_bindings(kernel,call_id=program_id,binding_id=program_id)
         from dataclasses import replace
         program = build_logical_elementwise(kernel,bindings,granularity,program_id=program_id)
         return replace(program,coverage=replace(program.coverage,executable=False,
-            limitations=(*program.coverage.limitations,'Mathematical FP16 scalar roles; native launch and issue service unbound.')))
+            limitations=(*program.coverage.limitations,'Mathematical typed scalar roles; native launch and issue service unbound.')))
     reads, writes = mathematical_operand_layouts(kernel)
     if granularity not in (Granularity.OP, Granularity.KERNEL, Granularity.TILE):
         raise ValueError('Mathematical source has no native instruction granularity')

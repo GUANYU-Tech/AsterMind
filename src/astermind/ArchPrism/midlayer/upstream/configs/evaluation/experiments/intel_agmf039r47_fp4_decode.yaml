@@ -1,0 +1,76 @@
+# User-authorized analytical scenario; original hardware configuration remains separately versioned.
+hardware_id: intel_agmf039r47
+clock_domains: {}
+components:
+- name: mm_bf16
+  count: 1
+  type: compute
+  role: compute_tensor
+  scope: shared
+  capacity_per_second: 13107200000000
+- name: mm_fp16
+  count: 1
+  type: compute
+  role: compute_tensor_fp16
+  scope: shared
+  capacity_per_second: 13107200000000
+- name: mm_fp8
+  count: 1
+  type: compute
+  role: compute_tensor_fp8
+  scope: shared
+  capacity_per_second: 13107200000000
+- name: vector
+  count: 1
+  type: compute
+  role: compute_vector
+  scope: shared
+  capacity_per_second: 12800000000
+- name: hbm
+  count: 1
+  type: memory
+  role: dram
+  scope: shared
+  capacity_per_second: 430080000000.0
+  size_bytes: 32000000000
+- name: ddr
+  count: 1
+  type: memory
+  role: ddr
+  scope: shared
+  capacity_per_second: 7680000000.0
+  size_bytes: 16000000000
+resource_groups: []
+memory_subsystem: {}
+scheduling: {}
+interconnect:
+  roce_unidir_bw_GB_s: 50
+  roce_devices_per_nic: 1
+  roce_switch_topology: fully_connected
+  roce_signal_latency_ns: null
+  roce_collective_startup_ns: 50000
+  parameter_source: user_20261104_direct_switch_collective_startup_50us
+features:
+  kernel_memory_model: roofline
+  kernel_dtype: bf16
+  parameter_source: user_20261104_all_matrix_FP4_FPGA_compute100_localbandwidth60
+  fpga_execution:
+    device_scope: fpga_chip
+    chips_per_card: 2
+    clock_hz: 400000000
+    mm_m_parallel: 4
+    mm_k_parallel: 64
+    mm_n_parallel: 64
+    vector_elements_per_cycle: 32
+    vector_latency_cycles: 35
+    hbm_latency_ns: 250
+    receive_compute_send_overlap: true
+    ddr_usage: communication_staging_only
+    ddr_reference:
+      source_url: https://www.micron.com/products/memory/dram-components/ddr4-sdram/part-catalog/part-detail/mt40a2g8jc-062e-e
+      reference_kind: ddr4_3200_cl22_22_22_device_only
+      clock_hz: 1600000000
+      cas_cycles: 22
+      rcd_cycles: 22
+      rp_cycles: 22
+      controller_latency_ns: null

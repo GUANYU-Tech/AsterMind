@@ -1,17 +1,21 @@
 """Source-work analytical prediction for typed device-cache writes."""
 
+from dataclasses import replace
+
 from src.kernel.formula import PerformanceFormula
 from src.kernel.hardware_spec import HWSpec
 from src.kernel.kernel_base import KernelPredictor
 from src.kernel.kernel_spec import KernelKind, KernelSpec
+from src.kernel.launch_config.dsv4_c128 import dsv4_c128_stage_launches
 from src.kernel.predictors.common import (
     build_aggregate_gpu_input,
     build_forward_demand,
     prediction_from_ns,
     roofline_ns,
+    sum_serial_kernel_predictions,
 )
 from src.kernel.predictors.vector import (
-    dense_fp16_source_logical_work,
+    dense_fp16_source_logical_work, dense_bf16_source_logical_work,
     forward_analytical_resource_input,
     paged_kv_cache_resource_input,
 )
@@ -22,18 +26,24 @@ def dsv4_swa_insert_tensor_objects(kernel: KernelSpec):
     if kernel.kind is not KernelKind.KV_CACHE or kernel.variant != "dsv4_qnorm_rope_kv_insert":
         raise ValueError("V4 SWA insert objects require their typed KV_CACHE contract")
     rows, heads, padded = (kernel.shape[name] for name in ("seq_len", "num_query_heads", "padded_query_heads"))
-    return {"program": "vllm_0_30_packed_swa_insert_objects",
-        "condition": "eager dict metadata, BF16 Q/KV, uint8 fp8_ds_mla cache, no DP padding, all slots nonnegative",
+    partial = ("mathematical_program" in kernel.attributes and kernel.attributes["mathematical_program"]
+        == "vllm_0_30_dspark_partial_context_insert_v1")
+    valid = kernel.attributes["valid_token_count"] if partial else rows
+    return {"program": "vllm_0_30_dspark_partial_context_insert_v1" if partial else "vllm_0_30_packed_swa_insert_objects",
+        "condition": ("eager BF16 full six Q/KV rows; slots[0:S]>=0 and slots[S:6]=-1; only cache writes masked"
+            if partial else "eager dict metadata, BF16 Q/KV, uint8 fp8_ds_mla cache, no DP padding, all slots nonnegative"),
         "q_input": {"dtype": "bf16", "shape": [rows, heads, 512], "read_only": True},
         "kv_input": {"dtype": "bf16", "shape": [rows, 512], "read_only": True},
         "metadata": {"positions": {"dtype": "int64", "shape": [rows]},
-            "slots": {"dtype": "int64", "shape": [rows], "nonnegative": True},
+            "slots": {"dtype": "int64", "shape": [rows], "nonnegative": valid == rows,
+                **({"valid_prefix_rows": valid, "invalid_tail_rows": [valid, rows], "invalid_tail_value": -1,
+                    "actual_slot_values_bound": False} if partial else {})},
             "cos_sin": {"dtype": "fp32", "row_width": 64}},
         "q_output": {"dtype": "bf16", "shape": [rows, padded, 512], "strides_elements": [padded * 512, 512, 1],
             "fresh": True, "aliases_inputs_or_cache": False, "every_element_written": True,
             "zero_padding_heads": [heads, padded], "allocation_initialization_bytes": 0},
         "cache": {"dtype": "uint8", "existing_storage": True, "wrapper_view_allocates": False,
-            "wrapper_view": "[num_blocks, -1]", "read_payload_bytes": 0, "write_payload_bytes": rows * 584,
+            "wrapper_view": "[num_blocks, -1]", "read_payload_bytes": 0, "write_payload_bytes": valid * 584,
             "block_base_bytes": "(slot // B) * S", "data_offset_bytes": "(slot % B) * 576",
             "rope_offset_bytes": "(slot % B) * 576 + 448",
             "scale_offset_bytes": "B * 576 + (slot % B) * 8", "B": "cache_block_size", "S": "cache.stride(0) in bytes",
@@ -53,20 +63,24 @@ def dsv4_swa_insert_source_work(kernel: KernelSpec):
     if kernel.dtype != "bf16" or (dim, rope, kernel.shape["cache_token_bytes"]) != (512, 64, 584):
         raise ValueError("V4 SWA source arithmetic requires BF16/512/64 and packed584 records")
     values = tokens * heads * dim
+    valid = kernel.attributes["valid_token_count"] if ("mathematical_program" in kernel.attributes
+        and kernel.attributes["mathematical_program"] == "vllm_0_30_dspark_partial_context_insert_v1") else tokens
+    # All N Q and KV inputs are decoded and RoPE'd before the slot guard.
+    # Only valid KV rows execute the post-RoPE BF16 roundtrip/quant/store.
     # Q warpSum adds are floating-point additions. KV fmaxf is a typed
     # comparison, and the encoded exponent has28 FP32 +127 expressions.
     fma = (3 * values + 2 * tokens * heads + 160 * tokens * heads
-        + 3 * tokens * (heads + 1) * rope + tokens * (448 + 32 + 28))
+        + 3 * tokens * (heads + 1) * rope + valid * (448 + 32 + 28))
     return {"objects": objects,
         "demand": {"compute_tensor": 0, "compute_reduction": 0, "compute_fma": fma,
-            "compute_alu": 0, "compute_sfu": tokens * heads + 64 * tokens},
-        "typed_actions": {"bf16_to_fp32": values + 1024 * tokens,
-            "fp32_to_bf16": values + 576 * tokens, "fp32_to_fp8": 448 * tokens,
-            "fp32_to_uint8": 7 * tokens, "fp32_abs": 512 * tokens,
-            "fp32_maximum": 1084 * tokens, "fp32_minimum": 476 * tokens,
-            "fp32_ceil": 32 * tokens, "fp32_negate": 32 * tokens},
+            "compute_alu": 0, "compute_sfu": tokens * heads + 64 * valid},
+        "typed_actions": {"bf16_to_fp32": values + 512 * tokens + 512 * valid,
+            "fp32_to_bf16": values + 576 * valid, "fp32_to_fp8": 448 * valid,
+            "fp32_to_uint8": 7 * valid, "fp32_abs": 512 * valid,
+            "fp32_maximum": 1084 * valid, "fp32_minimum": 476 * valid,
+            "fp32_ceil": 32 * valid, "fp32_negate": 32 * valid},
         "read_write_bytes": {"read": 2 * tokens * (heads + 1) * dim + 16 * tokens + 4 * tokens * rope,
-            "write": 2 * tokens * padded * dim + 584 * tokens},
+            "write": 2 * tokens * padded * dim + 584 * valid},
         "unpriced": ("typed conversions, abs/min/max/ceil/negate and address/control instructions",
             "Q RMS scalar lane replication beyond logical per-head mean/epsilon/rsqrt",
             "native compiler/provider, physical cache/DRAM and allocator"),
@@ -483,35 +497,90 @@ def _model(kernel: KernelSpec, hardware):
     return _target_cache_input(kernel, hardware)
 
 
+def _dsv4_c128_stage_fields(kernel: KernelSpec):
+    if (kernel.variant != "dsv4_compressed_state_cache"
+            or kernel.shape["compress_ratio"] != 128
+            or kernel.attributes["finish_stage"] is not None):
+        return None
+    states = sum(new // 128 - old // 128 for old, new in zip(
+        kernel.attributes["state_old_lens"], kernel.attributes["state_new_lens"], strict=True))
+    fields = []
+    for stage in ("compress", "store"):
+        shape = ({**kernel.shape, "element_count": states * 512, "dtype_bytes": 4}
+            if stage == "compress" else dict(kernel.shape))
+        dtype = "fp32" if stage == "compress" else kernel.dtype
+        attributes = {**kernel.attributes, "finish_stage": stage}
+        fields.append((stage, shape, dtype, attributes))
+    return tuple(fields)
+
+
+def _dsv4_c128_stage_kernels(kernel: KernelSpec):
+    fields = _dsv4_c128_stage_fields(kernel)
+    if fields is None:
+        return None
+    launches = dict(dsv4_c128_stage_launches(kernel.launch))
+    return tuple((stage, replace(kernel, shape=shape, dtype=dtype,
+        attributes=attributes, launch=launches[stage]))
+        for stage, shape, dtype, attributes in fields)
+
+
+def _dsv4_c128_without_launch_stage_kernels(kernel: KernelSpec):
+    fields = _dsv4_c128_stage_fields(kernel)
+    if fields is None:
+        return None
+    return tuple((stage, replace(kernel, shape=shape, dtype=dtype,
+        attributes=attributes, launch=None, execution_support="unsupported",
+        unsupported_reason="launch_selector_unavailable"))
+        for stage, shape, dtype, attributes in fields)
+
+
 class KVCacheUpdatePredictor(KernelPredictor):
     kind = KernelKind.KV_CACHE
 
+    def analytical_without_launch(self, kernel: KernelSpec, hardware):
+        if (kernel.variant == "dsv4_qnorm_rope_kv_insert" and "mathematical_program" in kernel.attributes
+                and kernel.attributes["mathematical_program"] == "vllm_0_30_dspark_partial_context_insert_v1"):
+            return replace(self.roofline_without_launch(kernel, hardware),
+                bottleneck_group="analytical_partial_context_insert")
+        if ("mathematical_program" in kernel.attributes
+                and kernel.attributes["mathematical_program"] == "dense_bf16_source_flops_bytes_v1"):
+            return self.roofline_without_launch(kernel, hardware)
+        return super().analytical_without_launch(kernel, hardware)
+
     def resource_input(self, kernel: KernelSpec, hardware):
+        if (kernel.variant == "dsv4_qnorm_rope_kv_insert" and "mathematical_program" in kernel.attributes
+                and kernel.attributes["mathematical_program"] == "vllm_0_30_dspark_partial_context_insert_v1"):
+            raise NotImplementedError("DSpark partial context insert native provider and physical slot services are unbound")
         return _model(kernel, hardware)
 
     def midlayer(self, kernel: KernelSpec, hardware):
         if ("mathematical_program" in kernel.attributes
-                and kernel.attributes["mathematical_program"] == "dense_fp16_source_flops_bytes_v1"):
+                and kernel.attributes["mathematical_program"] in ("dense_fp16_source_flops_bytes_v1", "dense_bf16_source_flops_bytes_v1")):
             raise NotImplementedError("dense FP16 mathematical work has no native launch")
-        if kernel.variant == "dsv4_compressed_state_cache":
-            raise NotImplementedError("DSV4 compressor finish supports Roofline only")
-        if kernel.variant == "dsv4_qnorm_rope_kv_insert":
-            raise NotImplementedError(
-                "DSV4 fused QNorm/RoPE/KV insert supports Roofline only; "
-                "no independent pipeline model is available")
+        stage_kernels = _dsv4_c128_stage_kernels(kernel)
+        if stage_kernels is not None:
+            formula = PerformanceFormula(hardware)
+            return sum_serial_kernel_predictions((stage, formula.predict_kernel(
+                self.resource_input(stage_kernel, hardware)[0])) for stage, stage_kernel in stage_kernels)
         if kernel.variant == "paged_kv_cache":
             inp, _ = forward_analytical_resource_input(kernel, hardware)
-        elif kernel.variant in {
-                "mla_kv_cache", "dsa_fp8_index_cache",
-                "dsv4_compressed_state_cache",
-                "dsv4_compressor_state_cache"}:
-            inp, _ = self.resource_input(kernel, hardware)
         else:
-            raise ValueError(
-                f"unknown KV_CACHE variant: {kernel.variant!r}")
+            inp, _ = self.resource_input(kernel, hardware)
         return PerformanceFormula(hardware).predict_kernel(inp)
 
     def roofline_without_launch(self, kernel: KernelSpec, hardware):
+        if (kernel.variant == "dsv4_qnorm_rope_kv_insert" and "mathematical_program" in kernel.attributes
+                and kernel.attributes["mathematical_program"] == "vllm_0_30_dspark_partial_context_insert_v1"):
+            work = target_cache_logical_work(kernel)
+            demand = {role: 0 for role in ("compute_tensor", "compute_vector", "compute_reduction",
+                "compute_fma", "compute_sfu", "compute_alu")}
+            demand.update(work["demand"])
+            return prediction_from_ns(roofline_ns(demand, hardware,
+                work["read_bytes"] + work["write_bytes"]), "roofline")
+        stage_kernels = _dsv4_c128_without_launch_stage_kernels(kernel)
+        if stage_kernels is not None:
+            return prediction_from_ns(1e9 * sum(self.roofline_without_launch(
+                stage_kernel, hardware).t_total_s for _, stage_kernel in stage_kernels), "roofline")
         if HWSpec.source_contract_supported("aggregate_gpu_source_roofline", hardware.hardware_id) and kernel.variant in (
                 "dsv4_qnorm_rope_kv_insert", "dsv4_compressor_state_cache", "dsv4_compressed_state_cache"):
             work = target_cache_logical_work(kernel)
@@ -528,12 +597,16 @@ class KVCacheUpdatePredictor(KernelPredictor):
             return prediction_from_ns(roofline_ns(demand, hardware,
                 work["read_bytes"] + work["write_bytes"]), "roofline")
         if ("mathematical_program" in kernel.attributes
-                and kernel.attributes["mathematical_program"] == "dense_fp16_source_flops_bytes_v1"):
-            work = dense_fp16_source_logical_work(kernel)
+                and kernel.attributes["mathematical_program"] in ("dense_fp16_source_flops_bytes_v1", "dense_bf16_source_flops_bytes_v1")):
+            work = {"fp16": dense_fp16_source_logical_work, "bf16": dense_bf16_source_logical_work}[kernel.dtype](kernel)
             return prediction_from_ns(roofline_ns(work["demand"], hardware, work["logical_bytes"]), "roofline")
         return super().roofline_without_launch(kernel, hardware)
 
     def roofline(self, kernel: KernelSpec, hardware):
+        stage_kernels = _dsv4_c128_stage_kernels(kernel)
+        if stage_kernels is not None:
+            return prediction_from_ns(1e9 * sum(self.roofline(
+                stage_kernel, hardware).t_total_s for _, stage_kernel in stage_kernels), "roofline")
         inp, compulsory = self.resource_input(kernel, hardware)
         return prediction_from_ns(
             roofline_ns(inp.demand_per_resource, hardware, compulsory),

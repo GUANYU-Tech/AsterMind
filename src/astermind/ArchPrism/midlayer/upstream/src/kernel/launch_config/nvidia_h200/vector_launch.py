@@ -13,15 +13,36 @@ flashmla.py``).  The non-duration launch facts below come from the
 * prefill main kernel launches grid ``(q_len * HQ // 64, 1, 1)`` with block
   ``(384, 1, 1)``.
 
-``owns_select_sparse_attn_launch`` claims only the ``dsv4_`` variants; the
-DSA sparse variants keep routing to the projected A800 package.
+DSA sparse variants require their own source binding; they cannot project
+another hardware package's analytical geometry.
 """
 
 from typing import Mapping, Optional
 
+
+def moe_count_sort_source_program():
+    """Name the independently bound CUDA auxiliary argument/dataflow ABI.
+
+    vLLM0.30 moe_align_sum_kernels.cu's public non-LoRA wrapper passes a
+    null token mask to _count_and_sort_expert_tokens: an INT32 atomic rank
+    in cumsum selects each routed item's sorted-token output. The existing
+    memory owner separately checks the exact observed algorithms, geometry
+    and routing context before using this ABI. This is no compiler-resource
+    or cross-runtime launch declaration.
+    """
+    return "cuda_moe_count_sort_int32_unmasked"
+
+
 from src.kernel.launch_config import LaunchConfig
 from src.kernel.launch_config.selection_primitives import (
     require_dtype, require_shape, require_variant)
+from src.kernel.launch_config.nvidia_h200.source_vector_launch import (
+    SOURCE_VECTOR_VARIANTS, select_kimi_k3_situ_launch, select_mla_rope_launch,
+    select_source_vector_launch, select_torch_vector_launch)
+from src.kernel.launch_config.nvidia_h200.cache_launch import CACHE_VARIANTS, select_cache_launch
+from src.kernel.launch_config.nvidia_h200.moe_aux_launch import (
+    SOURCE_MOE_AUX_VARIANTS, select_source_moe_aux_launch)
+from src.kernel.launch_config.nvidia_h200.kda_launch import select_kda_decode_launch, select_kda_prefill_launch
 
 
 _DSV4_SPARSE_VARIANTS = ("dsv4_sparse_prefill", "dsv4_sparse_decode")
@@ -29,6 +50,26 @@ _MHC_TILELANG_VARIANTS = (
     "mhc_post_prenorm", "mhc_pre_norm", "mhc_pre_norm_broadcast",
     "mhc_post", "hc_head",
 )
+
+
+def select_sparse_attn_indexer_launch(shape, dtype, variant, attributes, hardware):
+    """Preserve the public zero-work alias descriptor, with no CUDA work.
+
+    The singleton LaunchConfig is the existing Core representation of an
+    alias, not an observed or predicted one-thread GPU launch. The indexer
+    predictor validates alias storage and returns zero work for it. A real
+    indexer instead requires its complete prepared multi-stage recipe.
+    """
+    if hardware.hardware_id != "nvidia_h200":
+        raise ValueError("H200 index reuse requires H200 hardware")
+    if variant != "dsa_index_reuse":
+        raise NotImplementedError("H200 indexer requires its complete prepared source recipe")
+    require_dtype(dtype, ("int32",))
+    require_shape(shape, ("element_count",))
+    if attributes["reuse_semantics"] != "alias":
+        raise ValueError("index reuse must alias its current producer without copying")
+    return LaunchConfig("dsa_index_alias", (1, 1, 1), (1, 1, 1),
+        execution_variant="dsa_index_reuse")
 
 
 def pytorch_int32_int64_cast_launch(elements, variant):
@@ -129,6 +170,15 @@ def pytorch_argmax_source_launch(shape, dtype, attributes):
 
 def owns_select_vector_launch(shape, dtype, variant, attributes, hardware):
     del shape, dtype, hardware
+    if "source_moe_router_stage" in attributes:
+        return True
+    if variant in ("kimi_k3_kda_decode", "kimi_k3_situ", "kimi_k3_kda_prefill",
+                   "kimi_k3_kda_mixed", "kimi_k3_kda_context_prefill"):
+        return True
+    if variant in (SOURCE_VECTOR_VARIANTS | SOURCE_MOE_AUX_VARIANTS) and "model_execution_version" in attributes:
+        return True
+    if variant == "elementwise" and "tensor_iterator_source" in attributes:
+        return True
     return (variant in ("vllm_embedding_id_widen", "vllm_logits_row_select", "vllm_logits_fp32_cast")
         or variant == "vllm_plain_greedy_sample" and (attributes["stage"] == "output_int32"
             or "source_num_compute_units" in attributes)
@@ -140,6 +190,35 @@ def owns_select_vector_launch(shape, dtype, variant, attributes, hardware):
 def select_vector_launch(shape, dtype, variant, attributes, hardware):
     if hardware is not None and hardware.hardware_id != "nvidia_h200":
         raise ValueError("SM90 vector source requires H200 hardware")
+    if "source_moe_router_stage" in attributes:
+        from src.kernel.launch_config.nvidia_h200.moe_router_launch import select_legacy_router_stage
+        return select_legacy_router_stage(shape, dtype, variant, attributes, hardware)
+    if variant == "kimi_k3_kda_decode":
+        return select_kda_decode_launch(shape, dtype, variant, attributes, hardware)
+    if variant in ("kimi_k3_kda_prefill", "kimi_k3_kda_mixed", "kimi_k3_kda_context_prefill"):
+        return select_kda_prefill_launch(shape, dtype, variant, attributes, hardware)
+    if variant == "kimi_k3_situ":
+        return select_kimi_k3_situ_launch(shape, dtype, variant, attributes, hardware)
+    if variant in SOURCE_MOE_AUX_VARIANTS and "model_execution_version" in attributes:
+        return select_source_moe_aux_launch(shape, dtype, variant, attributes, hardware)
+    if variant in SOURCE_VECTOR_VARIANTS and "model_execution_version" in attributes:
+        return select_source_vector_launch(shape, dtype, variant, attributes, hardware)
+    if variant in SOURCE_VECTOR_VARIANTS:
+        raise NotImplementedError(
+            "H200 vector launch requires an explicit bound model_execution_version")
+    if (variant == "elementwise" and "tensor_iterator_source" in attributes
+            and attributes["operation"] != "cast_int32_int64"):
+        if attributes["tensor_iterator_source"] == "pytorch_2_13_sm90":
+            if attributes["operation"] != "fill":
+                raise NotImplementedError("Torch2.13 public vector dispatch binds only the explicit fill program")
+            if (type(attributes["reads"]) is not int or attributes["reads"] != 0
+                    or type(attributes["writes"]) is not int or attributes["writes"] != 1):
+                raise ValueError("Torch2.13 fill requires zero reads and one write")
+            from dataclasses import replace
+            from src.kernel.launch_config.nvidia_h200.torch_vector_launch import select_torch213_fill_launch
+            return replace(select_torch213_fill_launch(shape, dtype, attributes, hardware),
+                execution_variant=variant)
+        return select_torch_vector_launch(shape, dtype, variant, attributes, hardware)
     if variant == "vllm_logits_fp32_cast":
         return pytorch_logits_cast_launch(shape, dtype, attributes)
     if variant == "vllm_plain_greedy_sample":
@@ -169,6 +248,19 @@ def select_vector_launch(shape, dtype, variant, attributes, hardware):
         from src.kernel.launch_config.selection_primitives import pytorch_2_8_row_gather_launch
         return pytorch_2_8_row_gather_launch(rows, hidden, variant, "sm90",
             small_index=variant == "gather" and rows <= 16)
+    if variant == "elementwise" and attributes["operation"] == "fill":
+        # The accepted FA3 source emits exactly one INT32 semaphore Fill.
+        # Other fills need their own explicit TensorIterator source contract.
+        require_dtype(dtype, ("int32",))
+        if (set(attributes) != {"operation", "reads", "writes"}
+                or type(attributes["reads"]) is not int or attributes["reads"] != 0
+                or type(attributes["writes"]) is not int or attributes["writes"] != 1):
+            raise ValueError("FA3 semaphore Fill requires zero reads and one write")
+        elements, = require_shape(shape, ("element_count",))
+        if elements != 1:
+            raise NotImplementedError("unqualified H200 Fill requires the single-INT32 FA3 semaphore source")
+        return LaunchConfig("elementwise", (1, 1, 1), (128, 1, 1),
+            execution_variant="elementwise")
     require_dtype(dtype, ("int32",))
     elements, = require_shape(shape, ("element_count",))
     if variant == "vllm_embedding_id_widen":
@@ -186,16 +278,8 @@ def select_vector_launch(shape, dtype, variant, attributes, hardware):
 
 def mhc_post_prenorm_config(tokens: int, hidden: int, hc_mult: int):
     """Translate vLLM 0.30 mhc_fused_post_pre_split_config, without timing."""
-    if tokens > 32 or hidden % 128:
-        return None
-    tile_n = 2 if tokens < 16 else 6
-    splits = 8
-    mix_size = hc_mult * (hc_mult + 2)
-    while tile_n > 1 and mix_size % tile_n:
-        tile_n -= 1
-    while splits > 1 and hidden % (splits * 128):
-        splits //= 2
-    return tile_n, splits
+    from src.kernel.launch_config.nvidia_h200.mhc_launch import mhc_fused_source_config
+    return mhc_fused_source_config(tokens, hidden, hc_mult)
 
 
 def mhc_prenorm_splits(tokens: int, input_size: int, hardware) -> int:
@@ -204,13 +288,14 @@ def mhc_prenorm_splits(tokens: int, input_size: int, hardware) -> int:
     tilelang.py _hc_prenorm_gemm_outputs and tilelang_kernels.py
     compute_num_split(64, K, ceil(T/64)) on the H200 supported path.
     """
-    rows = -(-tokens // 64)
-    k_blocks = -(-input_size // 64)
-    return max(min(int(hardware.num_compute_units) // rows, k_blocks // 4), 1)
+    from src.kernel.launch_config.nvidia_h200.mhc_launch import compute_mhc_prenorm_splits
+    return compute_mhc_prenorm_splits(tokens, input_size, int(hardware.num_compute_units))
 
 
 def select_mhc_stage_launches(shape, dtype, variant, attributes, hardware):
     """Select the source stages, including unbound DeepGEMM calls as None."""
+    if hardware.hardware_id != "nvidia_h200":
+        raise ValueError("mHC stages require H200 HWSpec")
     require_dtype(dtype, ("bf16",))
     require_variant(variant, ("mhc_pre", "mhc_post_pre", "mhc_post", "hc_head"), "mHC")
     elements, hidden, hc_mult = require_shape(shape, ("element_count", "hidden", "hc_mult"))
@@ -238,8 +323,11 @@ def select_mhc_stage_launches(shape, dtype, variant, attributes, hardware):
         return (stage, {**shape, "n_splits": splits}, None), splits
 
     if variant == "mhc_pre":
-        projection, splits = prenorm(True)
-        return (projection, selected("mhc_pre_norm_broadcast", {
+        broadcast = attributes["source_mhc_broadcast"] if "source_mhc_broadcast" in attributes else True
+        if type(broadcast) is not bool:
+            raise TypeError("mHC pre broadcast branch must be a boolean")
+        projection, splits = prenorm(broadcast)
+        return (projection, selected("mhc_pre_norm_broadcast" if broadcast else "mhc_pre_norm", {
             "n_splits": splits, "sinkhorn_iters": attributes["sinkhorn_iters"]}))
     if variant == "mhc_post_pre":
         config = mhc_post_prenorm_config(tokens, hidden, hc_mult)
@@ -261,7 +349,7 @@ def owns_select_target_vector_launch(
         variant: Optional[str], attributes: Mapping[str, object],
         hardware) -> bool:
     del shape, dtype, attributes, hardware
-    return variant in ("dsv4_moe_route", "dsv4_inv_rope_fp8_quant", "dsv4_short_context_topk", "dsv4_q_kv_rmsnorm", "dsv32_fused_norm_rope", "dsv32_fused_q", "dsv32_eh_norm", "dsv32_embed_eh_norm", "dsv32_embed_norm") or variant in _MHC_TILELANG_VARIANTS
+    return variant in ("mla_rope", "layernorm", "dsv4_moe_route", "dsv4_inv_rope_fp8_quant", "dsv4_short_context_topk", "dsv4_q_kv_rmsnorm", "dsv32_fused_norm_rope", "dsv32_fused_q", "dsv32_eh_norm", "dsv32_embed_eh_norm", "dsv32_embed_norm") or variant in _MHC_TILELANG_VARIANTS
 
 
 def select_target_vector_launch(
@@ -269,7 +357,12 @@ def select_target_vector_launch(
         variant: Optional[str], attributes: Mapping[str, object],
         hardware) -> LaunchConfig:
     """vLLM FusedQKVRMSNormKernel: token x two independent reductions."""
-    del hardware
+    if hardware is not None and hardware.hardware_id != "nvidia_h200":
+        raise ValueError("H200 target vector source requires H200 hardware")
+    if variant == "mla_rope":
+        return select_mla_rope_launch(shape, dtype, attributes, hardware)
+    if variant == "layernorm":
+        raise NotImplementedError("H200 LayerNorm requires its complete FP32 cast/native-layernorm/cast source recipe")
     if variant == "dsv4_moe_route":
         require_dtype(dtype, ("fp32",))
         rows, experts, topk = require_shape(shape, ("rows", "experts", "topk"))
@@ -309,8 +402,22 @@ def select_target_vector_launch(
     require_dtype(dtype, ("bf16",))
     if variant == "dsv32_fused_norm_rope":
         rows, = require_shape(shape, ("rows",))
+        if type(attributes["has_indexer"]) is not bool:
+            raise TypeError("DSA norm/RoPE requires its explicit indexer branch")
+        if (attributes["mla_cache_dtype"] != "bf16"
+                or attributes["cache_slot_scope"] not in (
+                    "all_rows_valid_slots_projection", "outputs_only_no_cache_slots")
+                or attributes["index_rope_interleave"] is not True):
+            raise NotImplementedError("DSA norm/RoPE source requires its BF16 cache and interleaved index RoPE")
+        # common/kernels.py::fused_norm_rope fixes grid=(num_tokens,4),
+        # including idle pid0/3 in shared-indexer layers. The compiler's
+        # non-autotuned four-warp default is independently bound to H200
+        # by all68 kc_dsa_fused_norm_rope__v030 window_01 observations
+        # (IDX0/IDX1,34 each), rather than the local Triton3.4 install.
+        # Block equality with those same records is consistency only;
+        # registers/shared resources remain separately unbound for0.30.
         return LaunchConfig(
-            algorithm="vllm_v32_norm_rope_local_triton_3_4_default_projection",
+            algorithm="vllm_0_30_sm90_dsa_fused_norm_rope",
             grid=(rows, 4, 1), block=(128, 1, 1), execution_variant=variant)
     if variant == "dsv32_fused_q":
         rows, heads, index_heads = require_shape(shape, ("rows", "q_heads", "index_heads"))
@@ -378,7 +485,7 @@ def owns_select_kv_cache_update_launch(
         variant: Optional[str], attributes: Mapping[str, object],
         hardware) -> bool:
     del shape, dtype, attributes, hardware
-    return variant == "dsv4_qnorm_rope_kv_insert"
+    return variant == "dsv4_qnorm_rope_kv_insert" or variant in CACHE_VARIANTS
 
 
 def select_kv_cache_update_launch(
@@ -392,7 +499,8 @@ def select_kv_cache_update_launch(
     NUM_TOKEN_CUTOFF=1024 each warp owns one padded Q/KV head slot.
     At/above the cutoff a CTA loops over the slots of one token.
     """
-    del attributes, hardware
+    if variant in CACHE_VARIANTS:
+        return select_cache_launch(shape, dtype, variant, attributes, hardware)
     require_dtype(dtype, ("bf16",))
     execution_variant = require_variant(
         variant, ("dsv4_qnorm_rope_kv_insert",), "H200 KV_CACHE")

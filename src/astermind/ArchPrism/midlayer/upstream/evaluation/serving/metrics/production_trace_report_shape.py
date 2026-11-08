@@ -71,6 +71,10 @@ _AGGREGATE_RESULT_FIELDS = {
     "metrics",
     "request_source",
 }
+_AGGREGATE_RESULT_TIMING_FIELDS = frozenset({
+    "simulation_started_monotonic_s",
+    "simulation_finished_monotonic_s",
+})
 _POINT_FIELDS = {
     "arrival_rate_scale",
     "request_stream_sha256",

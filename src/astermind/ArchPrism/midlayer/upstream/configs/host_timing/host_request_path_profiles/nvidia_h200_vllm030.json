@@ -15,7 +15,7 @@
     "time_unit": "seconds"
   },
   "runtime": {
-    "source_identity": "vllm.utils.AsyncMicrobatchTokenizer(batch_wait_timeout_s=0.002,max_batch_size=32)",
+    "source_identity": "measured_vllm=0.11.0;shared_encoder_as_vllm030_renderer_proxy;batching_wrapper_omitted_by_source",
     "version": "0.11.0"
   },
   "schema_version": 1,
@@ -27,10 +27,11 @@
     "input_processor_intercept": 3.822638888888889e-05,
     "input_processor_per_token": 9.881944444444447e-09,
     "output_delivery_per_output": 3.699416935483871e-05,
-    "tokenizer_async_call": 0.002191019,
-    "tokenizer_encode_intercept": 2.1611692913385825e-05,
-    "tokenizer_encode_per_token": 1.6387379429133858e-06,
-    "tokenizer_render_region_intercept": null,
-    "tokenizer_render_region_per_token": null
-  }
+    "tokenizer_async_call": null,
+    "tokenizer_encode_intercept": null,
+    "tokenizer_encode_per_token": null,
+    "tokenizer_render_region_intercept": 2.1611692913385825e-05,
+    "tokenizer_render_region_per_token": 1.6387379429133858e-06
+  },
+  "shared_cpu_timing_target": "0.30.0"
 }

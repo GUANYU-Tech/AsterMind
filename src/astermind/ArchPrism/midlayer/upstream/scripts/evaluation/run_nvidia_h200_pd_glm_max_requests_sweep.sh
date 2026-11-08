@@ -4,5 +4,5 @@ set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$root"
-exec /home/yangxinhao/miniconda3/envs/r2r_qwen3_next/bin/python \
+exec "${MIDLAYER_PYTHON:-python}" \
   scripts/evaluation/serving/run_nvidia_h200_pd_sweep.py --models glm "$@"

@@ -41,6 +41,13 @@ DEVELOPMENT_PROTOBRIDGE_INPUTS = {
     "spray_chunk_bytes": 512 * 1024,
     "t_min_switch_us": 1.1,
     "wire_efficiency": 1.0,
+    # The independent two-rank HCCL 8/16 MiB back-to-back AllReduce sweep gives
+    # (16-8) MiB / (940.3892-487.4020) us = 18,518.42 B/us. The 4/8/16 MiB
+    # points form one linear large-payload region; retain the 28,000 B/us
+    # physical peer path and apply its measured efficiency only to two ranks.
+    # Source: hccl_fullmesh_collective_startup_cann_8_5_1.json, not Serving.
+    "large_message_min_bytes": 4 * 1024 * 1024,
+    "large_message_wire_efficiency": 0.6613722040206498,
     "provenance_note": "",
     "bisection_bw_bytes_per_us": 28_000.0,
     "hop_count": 1.0,

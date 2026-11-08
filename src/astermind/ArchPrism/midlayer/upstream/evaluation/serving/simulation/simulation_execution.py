@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from evaluation.serving.simulation.interactive_recording import run_recorded_simulation
+
 from contextlib import ExitStack
 from copy import copy
 from dataclasses import asdict
@@ -24,15 +26,15 @@ from src.kernel.hardware_spec import HWSpec
 from src.serving.backend.vllm import VLLMBackend, VLLMSchedulerConfig, mtp_scenario_manifest
 from src.serving.backend.vllm_scheduler_process import vllm_scheduler_runtime_sha256
 from src.serving.backend.mtp_acceptance_replay import PD_DECODE_MTP_REPLAY_ADAPTER_CONTRACT, closed_loop_admission_contract_sha256, pd_decode_admission_contract_sha256
-from src.serving.backend.sglang_scheduler_mirror import SGLangSchedulerMirrorBackend, SGLangSchedulerMirrorConfig
 from src.serving.backend.mtp_acceptance_assumption import MTPAcceptanceAssumption
 from src.serving.deployment.af_disagg import build_af_disagg_plan
 from src.serving.deployment.colocated import build_colocated_plan
 from src.serving.deployment.deployment_config import DeploymentConfig, RouteConfig, RouterConfig, WorkerPoolConfig
 from src.serving.deployment.deployment_plan import deployment_plan_manifest
 from src.serving.deployment.pd_disagg import build_pd_disagg_plan
-from src.serving.kv_cache.kv_capacity import kv_capacity_manifest, load_runtime_memory_policy, resolve_analytical_kv_capacity_plan, resolve_debug_kv_capacity_plan
+from src.serving.kv_cache.kv_capacity import kv_capacity_manifest, load_runtime_memory_policy, resolve_analytical_kv_capacity_plan, resolve_debug_kv_capacity_plan, resolve_debug_vllm030_byte_budget_capacity_plan
 from src.serving.kv_cache.kv_cache_events import KVCacheAction
+from src.serving.kv_cache.model_residency import kimi_k3_source_workspace_bytes
 from src.serving.host_timing import load_host_launch_profile, load_host_runtime_prepare_profile, load_host_request_path_profile, load_scheduler_host_profile, load_engine_core_host_round_profile
 from src.serving.metrics.serving_metrics import engine_clock_first_schedule_start_s
 from src.serving.runtime_prepare import runtime_prepare_events
@@ -76,11 +78,15 @@ from evaluation.serving.simulation.simulation_configuration import (
     protobridge_p2p_profile,
     require_expected_sha256,
     tensor_collective_configs,
+    moe_data_collective_configs,
     uses_development_protobridge,
+    gqa_pd_cli_scope,
+    mla_pcp_pd_cli_scope,
+    glm_bf16_cli_source_scope,
 )
 from src.serving.kv_cache.kv_cache_config import KVCacheConfig
 from src.serving.kv_cache.kv_cache_config import KVCacheTierConfig
-from src.serving.kv_cache.vllm_allocation import allocate_vllm030_kv_cache
+from src.serving.kv_cache.vllm_allocation import VLLMKVAllocation, allocate_vllm030_kv_cache
 from src.serving.kv_cache.vllm_allocation import allocate_vllm_kv_cache
 from dataclasses import replace
 from evaluation.serving.simulation.simulation_artifacts import repository_provenance
@@ -220,6 +226,7 @@ def run(args) -> dict:
 
 
 def run_arrival_rate_sweep(args) -> dict:
+    sweep_started = time.perf_counter()
     if args.production_trace is None:
         raise ValueError("arrival-rate sweep requires --production-trace")
     if args.trace_arrival_rate_scales is None:
@@ -257,13 +264,24 @@ def run_arrival_rate_sweep(args) -> dict:
     trace_manifest = production_trace_manifest(trace)
     points = []
     shared_execution_provenance = None
-    for replay in replays:
+    for point_index, replay in enumerate(replays):
         point_args = copy(args)
         point_args.trace_replay_mode = "arrival_rate_scale"
         point_args.trace_arrival_rate_scale = replay.arrival_rate_scale
         point_args.trace_arrival_rate_scales = None
         point_args.interactivity_tgs_config = None
         point_args.output = None
+        if args.state_audit_output is not None:
+            audit_root = Path(args.state_audit_output)
+            point_args.state_audit_output = str(audit_root.parent / (audit_root.stem + ".points") /
+                (f"point-{point_index:04d}.json"))
+        if args.interactive_report:
+            report_root = (Path(args.interactive_output) if args.interactive_output is not None else
+                Path(args.output).with_suffix(".html") if args.output else
+                Path("experiment_logs") / "serving_reports" / str(time.time_ns()) / "sweep.html")
+            point_args.interactive_report = True
+            point_args.interactive_output = str(report_root.parent / (report_root.stem + ".points") /
+                (f"point-{point_index:04d}-scale-" + str(replay.arrival_rate_scale) + ".html"))
         result = run_single(point_args)
         request_source = result["request_source"]
         if request_source["kind"] != "production_trace":
@@ -286,6 +304,7 @@ def run_arrival_rate_sweep(args) -> dict:
         aggregate_result = production_trace_aggregate_result(result)
         points.append({
             "arrival_rate_scale": replay.arrival_rate_scale,
+            "state_audit_output": point_args.state_audit_output,
             "request_stream_sha256": replay.request_stream_sha256,
             "validation_status": {
                 "trace_replay": "validated_conservation",
@@ -340,10 +359,37 @@ def run_arrival_rate_sweep(args) -> dict:
         },
         "points": points,
     }
+    if not args.interactive_report:
+        payload["interactive_report"] = {"status": "disabled", "reason": "offline HTML report not requested"}
+    else:
+        from evaluation.reporting.serving_interactive import default_report_path, write_status_report
+        links = [{"label": "Point " + str(index) + " / arrival scale " + str(point["arrival_rate_scale"]),
+            "path": point["result"]["interactive_report"]["path"]}
+            for index, point in enumerate(points)]
+        sweep_report_path = default_report_path(args.output, args.interactive_output)
+        links.append({"label": "Sweep cost receipt", "path": str(sweep_report_path.with_suffix(".report.json"))})
+        payload["interactive_report"] = write_status_report({
+            "main_chain_status": {"status": "complete", "reason": "Sweep complete; open the per-point reports for timelines and effective configurations"},
+            "report_links": links, "request_source": {"source_trace": trace_manifest,
+                "arrival_rate_scales": payload["arrival_rate_scales"]}},
+            sweep_report_path)
+        payload["interactive_report"]["cost_receipt_path"] = str(sweep_report_path.with_suffix(".report.json"))
+    payload["report_output_costs"] = {"sweep_wall_s": time.perf_counter() - sweep_started,
+        "scope": "includes all point simulations, recording and outputs plus sweep overview; point wall times are nested"}
     if args.output:
         path = Path(args.output)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    payload["report_output_costs"]["sweep_total_wall_s"] = time.perf_counter() - sweep_started
+    payload["report_output_costs"]["persisted_boundary"] = "sweep total through initial aggregate write; refresh and sidecar write excluded from persisted total"
+    if args.output:
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    if args.interactive_report:
+        receipt_started = time.perf_counter()
+        Path(payload["interactive_report"]["cost_receipt_path"]).write_text(json.dumps({
+            "costs": payload["report_output_costs"], "report": payload["interactive_report"]}, indent=2) + "\n")
+        payload["report_output_costs"]["cost_receipt_write_s"] = time.perf_counter() - receipt_started
+        payload["report_output_costs"]["sweep_total_wall_s"] = time.perf_counter() - sweep_started
     return payload
 
 
@@ -467,7 +513,10 @@ def use_streaming_step_retention(args, request_source) -> bool:
 
 
 def run_single(args) -> dict:
+    report_total_started = time.perf_counter()
     repository_at_start = repository_provenance()
+    adaptive_tail_workers = None
+    adaptive_tail_worker_grants = None
     if args.slo_config is None:
         slo_contract = None
     elif isinstance(args.slo_config, str) and args.slo_config:
@@ -524,18 +573,21 @@ def run_single(args) -> dict:
             raise NotImplementedError(
                 "KV lifecycle replay currently requires dense BF16 Qwen3 "
                 "or BF16 GLM4-MoE with one dense MTP layer and standard GQA")
-    target_model = model.model_type in (
+    k3_model = (model.model_type == "kimi_linear"
+        and args.symbolic_forward_source == "vllm_0_30_k3_mxfp4_sync")
+    target_model = k3_model or model.model_type in (
         "kimi_k2", "glm_moe_dsa", "deepseek_v3", "deepseek_v4")
     if target_model:
         if args.attention_kv_layout != "mla":
             raise ValueError(
-                "Kimi-K2.6, GLM-5.2, DeepSeek-V3, and DeepSeek-V4 require "
+                "Kimi-K3, Kimi-K2.6, GLM-5.2, DeepSeek-V3, and DeepSeek-V4 require "
                 "--attention-kv-layout mla")
-        if model.model_type in ("deepseek_v3", "deepseek_v4"):
+        if model.model_type in ("deepseek_v3", "deepseek_v4") or k3_model:
             # DeepSeek-V3 has no source-backed PP production layout in
             # this repository; the H200 TP8/PP1/EP1 predicates below are
             # its only validated target topologies.  DeepSeek-V4 likewise
-            # admits only its pinned H200 colocated rows below.
+            # admits only its pinned H200 colocated rows below. K3 uses its
+            # explicit TP1/PP1 or TP1/PP16 source scope instead.
             target_parallelism = None
         else:
             target_parallelism = {
@@ -550,9 +602,9 @@ def run_single(args) -> dict:
         )
         target_colocated_parallelism = (
             args.deployment == "colocated"
-            and target_parallelism is not None
-            and (args.prefill_tp_size, args.prefill_pp_size)
-            == target_parallelism
+            and ((k3_model and (args.prefill_tp_size, args.prefill_pp_size) in ((1, 1), (1, 16)))
+                or (not k3_model and target_parallelism is not None
+                    and (args.prefill_tp_size, args.prefill_pp_size) == target_parallelism))
         )
         # InferenceX-style aggregate GLM-5.2 serving uses one TP8 pool with
         # EP=1 and PP=1.  It is distinct from the source-backed PP4/EP8
@@ -613,13 +665,13 @@ def run_single(args) -> dict:
             and not args.enable_expert_parallel
             and not args.additional_colocated_hardware_config
         )
-        if args.glm_mtp_step_inputs is None and ((not target_pd_parallelism and not target_colocated_parallelism
+        if args.glm_mtp_step_inputs is None and not glm_bf16_cli_source_scope(args) and ((not target_pd_parallelism and not target_colocated_parallelism
              and not target_h200_aggregate_parallelism
              and not target_kimi_h200_colocated_parallelism
              and not target_dsv3_h200_aggregate_parallelism
              and not target_dsv3_h200_pd_ep1_parallelism
              and not target_dsv4_h200_colocated_parallelism)
-                or (not target_h200_aggregate_parallelism
+                or (not k3_model and not target_h200_aggregate_parallelism
                     and not target_h200_pd_ep1_parallelism
                     and not target_dsv3_h200_aggregate_parallelism
                     and not target_dsv3_h200_pd_ep1_parallelism
@@ -627,7 +679,7 @@ def run_single(args) -> dict:
                     and not args.enable_expert_parallel)
                 or args.additional_colocated_hardware_config):
             raise NotImplementedError(
-                "target production traces require the named target scope: "
+                "target source scopes require K3 H200 TP1/PP1 or TP1/PP16, "
                 "one colocated TP=EP=8 Scheduler pool (Kimi-K2.6 PP2 or "
                 "GLM-5.2 PP4), the PD TP8/PP1 deployment, GLM-5.2 "
                 "H200 aggregate TP8/PP1/EP1, GLM-5.2 H200 PD "
@@ -638,9 +690,10 @@ def run_single(args) -> dict:
         if (args.deployment == "colocated"
                 # PP1 has no pipeline links or inter-stage placement.
                 and args.prefill_pp_size > 1
+                and not glm_bf16_cli_source_scope(args)
                 and args.pipeline_ranks_per_node != 8):
             raise NotImplementedError(
-                "target production traces require the explicit A800 "
+                "target source pipelines require explicit eight-GPU-node "
                 "placement --pipeline-ranks-per-node 8")
         if args.kv_lifecycle_replay is not None:
             raise NotImplementedError(
@@ -665,8 +718,8 @@ def run_single(args) -> dict:
                 "the production runner supports quantized weights only for "
                 "the fixed Kimi-K2.6 contract")
     prefill_hardware = HWSpec(args.hardware_config)
-    # Resolve provenance dependencies before any scheduler work. H200 uses
-    # the source-backed A800 launch package, not an H200 observation dataset.
+    # Resolve each hardware's own launch-data provenance before scheduler
+    # work, including H200's observed LUT despite shared analytical code.
     provenance_hardware_ids = {prefill_hardware.hardware_id}
     if args.decode_hardware_config is not None:
         provenance_hardware_ids.add(
@@ -746,29 +799,32 @@ def run_single(args) -> dict:
             runtime_prepare_event_builder = partial(
                 runtime_prepare_events,
                 enabled_mechanisms=enabled_mechanisms,
+                **({"ascend_compilation_mode": args.graph_mode}
+                   if prefill_hardware.hardware_id == "ascend_910b" else {}),
             )
     target_h200_scope = (
-        model.model_type in ("kimi_k2", "glm_moe_dsa")
+        (k3_model or model.model_type in ("kimi_k2", "glm_moe_dsa"))
         and prefill_hardware.hardware_id == "nvidia_h200"
         and args.deployment in ("colocated", "pd_disagg"))
     if (args.prefill_pp_size > 1
             and prefill_hardware.hardware_id != "nvidia_a800"
-            and not target_h200_scope):
+            and not target_h200_scope and not gqa_pd_cli_scope(args)):
         raise NotImplementedError(
             "pipeline parallel Serving path requires nvidia_a800 or the "
             "explicit H200 target deployment scope")
-    if (args.prefill_tp_size, args.prefill_pp_size) == (2, 2) and (
+    if ((args.prefill_tp_size, args.prefill_pp_size) == (2, 2)
+            and not gqa_pd_cli_scope(args) and not glm_bf16_cli_source_scope(args) and (
             model.model_type != "qwen3"
             or model.num_experts != 0
             or model.attention_layout != "standard_gqa"
             or model.compute_dtype != "bf16"
-            or model.weight_dtype != "bf16"):
+            or model.weight_dtype != "bf16")):
         raise NotImplementedError(
             "the validated TP=2, PP=2 Serving slice requires dense BF16 "
             "Qwen3 with standard GQA")
     if (not target_model
             and args.prefill_tp_size == 1
-            and args.prefill_pp_size > 1) and (
+            and args.prefill_pp_size > 1 and not gqa_pd_cli_scope(args)) and (
             args.prefill_tp_size != 1
             or model.model_type != "qwen3"
             or model.num_experts != 0
@@ -788,10 +844,33 @@ def run_single(args) -> dict:
         request_source,
         result_version,
     ) = load_request_source(args)
+    if (args.prefix_cache_mode == "trace_no_hit"
+            and any(request.prefix_hit_tokens != 0 for request in requests)):
+        raise ValueError("trace_no_hit requires a recorded zero prefix hit for every request")
     use_streaming_aggregate = use_streaming_step_retention(
         args, request_source)
+    from evaluation.reporting.serving_interactive import default_report_path
+    interactive_report_path = (default_report_path(args.output, args.interactive_output)
+        if args.interactive_report else None)
+    interactive_recording = None
+    configuration_files, configuration_missing = [], []
+    if interactive_report_path is not None:
+        from evaluation.reporting.serving_viewer_ui import configuration_file_snapshots
+        configuration_files, configuration_missing = configuration_file_snapshots(args.model,
+            [args.hardware_config] + ([args.decode_hardware_config] if args.decode_hardware_config is not None else []))
+        from evaluation.serving.simulation.interactive_recording import InteractiveRecording, CompactInteractiveRecording
+        recording_hardware = {prefill_hardware.hardware_id: prefill_hardware}
+        if args.decode_hardware_config is not None:
+            recording_decode = HWSpec(args.decode_hardware_config)
+            recording_hardware[recording_decode.hardware_id] = recording_decode
+        if args.interactive_detail_mode == "all" and args.interactive_view != "swimlanes":
+            raise ValueError("all iteration details require --interactive-view swimlanes")
+        archive_dir = Path(interactive_report_path).with_suffix(".iterations") if args.interactive_detail_mode == "all" else None
+        interactive_recording = (CompactInteractiveRecording(recording_hardware)
+            if args.interactive_detail_mode == "summary" else InteractiveRecording(recording_hardware,
+                max_detail_events=args.interactive_max_events, detail_archive_dir=archive_dir))
     streaming_artifact = (
-        StreamingExecutionArtifactAccumulator()
+        (StreamingExecutionArtifactAccumulator() if interactive_recording is None else interactive_recording)
         if use_streaming_aggregate else None
     )
     progress_callback = serving_progress_reporter(len(requests.requests))
@@ -952,8 +1031,7 @@ def run_single(args) -> dict:
         attention_kv_layout=args.attention_kv_layout,
         attention_kv_distribution=args.attention_kv_distribution,
         graph_execution=args.graph_execution_config,
-        serving_framework=(
-            "sglang" if args.backend == "sglang_mirror" else "vllm"),
+        serving_framework="vllm",
         model_execution_version=("sglang_0_5_19" if args.symbolic_forward_source in (
             "sglang_0_5_19_deepseek_v3_target_fp8", "sglang_0_5_19_deepseek_v3_target_fp8_flashinfer_ar_norm") else
             "vllm_0_27_1" if args.symbolic_forward_source == "vllm_0_27_1_deepseek_v3_sync_fp8" else
@@ -973,13 +1051,18 @@ def run_single(args) -> dict:
         mtp_draft_sampling_source=("vllm_0_30_legacy_full_logits_greedy" if args.glm_mtp_step_inputs is not None else "vllm_0_11_eager_full_logits_greedy"
             if args.symbolic_forward_source == "vllm_0_11_glm4_sync" and args.mtp_num_speculative_tokens else None),
         symbolic_forward_source=args.symbolic_forward_source,
+        norm_source_batch_invariant=(None if args.norm_source_batch_invariant is None else False),
+        bf16_gemm_model=args.bf16_gemm_model,
+        dense_source_input_policy=args.dense_source_input_policy,
+        dense_source_capture_limits=((args.max_requests, args.max_model_len)
+            if args.dense_source_input_policy is not None else None),
         symbolic_source_max_model_len=(args.max_model_len if args.symbolic_forward_source in (
             "vllm_0_30_v32_bf16_sync_explicit_allreduce", "vllm_0_30_v32_fp8_sync_explicit_allreduce",
-            "vllm_0_30_k2_6_int4_sync_explicit_allreduce", "vllm_0_27_1_deepseek_v3_sync_fp8") or (
+            "vllm_0_30_k2_6_int4_sync_explicit_allreduce", "vllm_0_30_k3_mxfp4_sync", "vllm_0_27_1_deepseek_v3_sync_fp8") or (
             args.symbolic_forward_source == "vllm_0_11_glm4_sync" and args.mtp_num_speculative_tokens) else None),
         symbolic_source_max_batched_tokens=(args.max_batched_tokens if args.symbolic_forward_source in (
             "vllm_0_30_v32_bf16_sync_explicit_allreduce", "vllm_0_30_v32_fp8_sync_explicit_allreduce",
-            "vllm_0_30_k2_6_int4_sync_explicit_allreduce", "vllm_0_27_1_deepseek_v3_sync_fp8") or (
+            "vllm_0_30_k2_6_int4_sync_explicit_allreduce", "vllm_0_30_k3_mxfp4_sync", "vllm_0_27_1_deepseek_v3_sync_fp8") or (
             args.symbolic_forward_source == "vllm_0_11_glm4_sync" and args.mtp_num_speculative_tokens) else None),
         symbolic_source_max_requests=(args.max_requests
             if (args.symbolic_forward_source == "vllm_0_11_glm4_sync" and args.mtp_num_speculative_tokens)
@@ -991,6 +1074,11 @@ def run_single(args) -> dict:
         model_source_inputs=(None if args.glm_mtp_step_inputs is None else args.glm_mtp_step_inputs["main:vllm:0"]),
         embedding_token_ids=(None if args.glm_mtp_initial_target_token_ids is None else tuple(args.glm_mtp_initial_target_token_ids)),
     )
+    if (args.vllm_async_terminal_guard_source is not None
+            and runtime_inputs.model_execution_version != "vllm_0_18_0"):
+        raise ValueError(
+            "vLLM async terminal guard diagnostic requires vLLM 0.18 "
+            "model execution source")
 
     if model.compute_dtype == "bf16":
         scheduler_dtype = "bfloat16"
@@ -1008,24 +1096,78 @@ def run_single(args) -> dict:
         if pool_name in kv_capacity_plans:
             raise RuntimeError(
                 f"scheduler backend {pool_name!r} was constructed twice")
-        parallelism = ParallelConfig(
-            tensor_parallel_size=tp_size,
-            pipeline_parallel_size=pp_size,
-            enable_expert_parallel=args.enable_expert_parallel,
-        )
+        parallelism = deployment.worker_pools[pool_name].parallel_plan.config
+        if (parallelism.tensor_parallel_size, parallelism.pipeline_parallel_size) != (tp_size, pp_size):
+            raise ValueError("native backend constructor disagrees with its deployment TP/PP geometry")
+        enabled_ep = parallelism.enable_expert_parallel and (tp_size > 1 or parallelism.context_parallel_size > 1
+            or model.model_type == "glm_moe_dsa" and parallelism.data_parallel_size > 1)
+        layer_partition = (args.decode_pp_layer_partition if role == "decode" else args.prefill_pp_layer_partition)
+        if args.serving_timing_mode == "device_plus_launch_plus_scheduler":
+            if scheduler_host_profiles is None:
+                raise AssertionError("Scheduler Host profiles were not loaded")
+            if hardware.hardware_id not in scheduler_host_profiles:
+                raise ValueError(
+                    "Scheduler Host profiles do not cover hardware: "
+                    f"{hardware.hardware_id}")
+            scheduler_host_profile = scheduler_host_profiles[
+                hardware.hardware_id]
+            if hardware.hardware_id in ENGINE_CORE_HOST_ROUND_PROFILE_BY_HARDWARE:
+                engine_core_host_round_profile = load_engine_core_host_round_profile(
+                    ENGINE_CORE_HOST_ROUND_PROFILE_BY_HARDWARE[
+                        hardware.hardware_id])
+                if (engine_core_host_round_profile.hardware_id
+                        != hardware.hardware_id):
+                    raise ValueError(
+                        "EngineCore host-round profile hardware disagrees "
+                        "with model")
+            else:
+                engine_core_host_round_profile = None
+        else:
+            scheduler_host_profile = None
+            engine_core_host_round_profile = None
         if args.vllm_scheduler_version == "0.30.0":
             if runtime_memory_policy is None:
-                raise ValueError("0.30 Serving requires a normal runtime memory policy; debug capacity is not accepted")
+                if not k3_model or (tp_size, pp_size) != (1, 1):
+                    raise ValueError("0.30 Serving requires a normal runtime memory policy outside mathematical K3 TP1")
+                settings = vllm030_cli_scheduler_settings(args, tp_size=tp_size, pp_size=pp_size,
+                    scheduler_dtype=scheduler_dtype, gpu_memory_utilization=0.9,
+                    request_stream_identity=actual_request_stream_sha256,
+                    scheduler_host_profile=scheduler_host_profile,
+                    engine_core_host_round_profile=engine_core_host_round_profile)
+                backend = VLLMBackend.from_vllm030_byte_budget(settings,
+                    python_executable=args.vllm_sdk_python, source_root=args.vllm_source_root,
+                    pool_name=pool_name, max_batched_tokens=args.max_batched_tokens, max_requests=args.max_requests,
+                    kv_block_size_tokens=args.kv_block_size_tokens, available_memory_by_rank=(2 * 1024**3,),
+                    supported_layouts_by_rank=((args.vllm_cache_layout,),))
+                kv_capacity_plans[pool_name] = resolve_debug_vllm030_byte_budget_capacity_plan(pool_name,
+                    native_allocation=VLLMKVAllocation(**backend.runtime_info["native_allocation"]))
+                return backend
             policy = runtime_memory_policy.policy_for_pool(pool_name)
             settings = vllm030_cli_scheduler_settings(args, tp_size=tp_size, pp_size=pp_size,
                 scheduler_dtype=scheduler_dtype,
                 gpu_memory_utilization=policy.gpu_memory_utilization_numerator / policy.gpu_memory_utilization_denominator,
-                request_stream_identity=actual_request_stream_sha256)
+                request_stream_identity=actual_request_stream_sha256, enable_expert_parallel=enabled_ep,
+                cp_size=parallelism.context_parallel_size,
+                dp_size=parallelism.data_parallel_size if model.model_type == "glm_moe_dsa" else 1,
+                pipeline_layer_partition=layer_partition,
+                scheduler_host_profile=scheduler_host_profile,
+                engine_core_host_round_profile=engine_core_host_round_profile)
             layouts = ((args.vllm_cache_layout,),) * parallelism.worker_count
+            prepared_processes = []
+            def retain_allocator_process(control):
+                if prepared_processes:
+                    raise RuntimeError("one native allocator Scheduler was already retained for this pool")
+                construction_lifecycle.callback(control.close)
+                prepared_processes.append(control)
+            retain_startup = (args.activation_source_profile is None and role == "colocated"
+                and args.deployment == "colocated" and model.attention_layout == "standard_gqa"
+                and tp_size in (1, 2) and pp_size == parallelism.context_parallel_size == parallelism.data_parallel_size == 1
+                and args.mtp_num_speculative_tokens == 0)
             allocator = partial(allocate_vllm030_kv_cache, scheduler_config=settings,
                 python_executable=args.vllm_sdk_python, source_root=args.vllm_source_root,
                 max_batched_tokens=args.max_batched_tokens, max_requests=args.max_requests,
-                supported_layouts_by_rank=layouts)
+                supported_layouts_by_rank=layouts[:tp_size * pp_size * parallelism.context_parallel_size],
+                **({"pool_name": pool_name, "process_consumer": retain_allocator_process} if retain_startup else {}))
             if args.activation_source_profile is not None:
                 validate_activation_source_policy_binding(args, policy, hardware, model, pool_name, role, parallelism)
                 projected, plan, source_report = resolve_symbolic_kv_capacity_plan(policy,
@@ -1035,7 +1177,7 @@ def run_single(args) -> dict:
                     model_execution_version=runtime_inputs.model_execution_version,
                     source_lifetime_policy=args.activation_source_lifetime_policy,
                     source_compilation_options=args.activation_source_compilation_options,
-                    collective_configs=tensor_collective_configs(pool_name, tp_size, hardware.hardware_id,
+                    collective_configs=tensor_collective_configs(pool_name, max(tp_size, parallelism.context_parallel_size), hardware.hardware_id,
                         args.collective_backend, args.tensor_all_reduce_profile_sha256, args.tensor_all_gather_profile_sha256))
                 runtime_memory_policy = replace(runtime_memory_policy,
                     policies={**runtime_memory_policy.policies, pool_name: projected})
@@ -1049,12 +1191,14 @@ def run_single(args) -> dict:
                     kv_block_size_tokens=args.kv_block_size_tokens, max_model_len=args.max_model_len,
                     max_batched_tokens=args.max_batched_tokens, max_requests=args.max_requests, policy=policy,
                     allocator=allocator, scheduler_version="0.30.0", v4_weight_storage_profile=args.v4_weight_storage_profile,
+                    pipeline_layer_partition=layer_partition,
                     include_mtp=args.mtp_num_speculative_tokens > 0)
             kv_capacity_plans[pool_name] = plan
             return VLLMBackend.from_vllm030_capacity_plan(plan, settings,
                 python_executable=args.vllm_sdk_python, source_root=args.vllm_source_root,
                 max_batched_tokens=args.max_batched_tokens, max_requests=args.max_requests,
-                supported_layouts_by_rank=layouts)
+                supported_layouts_by_rank=layouts,
+                **({"prepared_process": prepared_processes[0]} if prepared_processes else {}))
         if runtime_memory_policy is None:
             kv_bytes_per_token = (
                 model.kv_bytes_per_token_per_parallel_rank(tp_size, pp_size))
@@ -1125,29 +1269,6 @@ def run_single(args) -> dict:
             kv_bytes_per_token=kv_bytes_per_token,
             scheduler_pipeline_depth=args.scheduler_pipeline_depth,
         )
-        if args.serving_timing_mode == "device_plus_launch_plus_scheduler":
-            if scheduler_host_profiles is None:
-                raise AssertionError("Scheduler Host profiles were not loaded")
-            if hardware.hardware_id not in scheduler_host_profiles:
-                raise ValueError(
-                    "Scheduler Host profiles do not cover hardware: "
-                    f"{hardware.hardware_id}")
-            scheduler_host_profile = scheduler_host_profiles[
-                hardware.hardware_id]
-            if hardware.hardware_id in ENGINE_CORE_HOST_ROUND_PROFILE_BY_HARDWARE:
-                engine_core_host_round_profile = load_engine_core_host_round_profile(
-                    ENGINE_CORE_HOST_ROUND_PROFILE_BY_HARDWARE[
-                        hardware.hardware_id])
-                if (engine_core_host_round_profile.hardware_id
-                        != hardware.hardware_id):
-                    raise ValueError(
-                        "EngineCore host-round profile hardware disagrees "
-                        "with model")
-            else:
-                engine_core_host_round_profile = None
-        else:
-            scheduler_host_profile = None
-            engine_core_host_round_profile = None
         if (args.deployment in ("pd_disagg", "pd_af_disagg")
                 and config.is_prefill_only):
             mtp_num_speculative_tokens = 0
@@ -1204,6 +1325,7 @@ def run_single(args) -> dict:
                     mtp_draft_token_ids_by_step=(args.mtp_draft_token_ids_by_step
                         if mtp_num_speculative_tokens else None),
                     async_scheduling=args.vllm_async_scheduling,
+                    async_terminal_guard_source=args.vllm_async_terminal_guard_source,
                     mtp_num_speculative_tokens=(
                         mtp_num_speculative_tokens),
                     mtp_acceptance_policy=mtp_acceptance_policy,
@@ -1226,29 +1348,10 @@ def run_single(args) -> dict:
                     engine_core_host_round_profile=(
                         engine_core_host_round_profile),
                 ),
+                in_process=args.execution_mode == "fast",
             )
         elif args.backend == "conformance":
             return ConformanceBackend(config)
-        elif args.backend == "sglang_mirror":
-            return SGLangSchedulerMirrorBackend(
-                config,
-                SGLangSchedulerMirrorConfig(
-                    source_version=args.sglang_source_version,
-                    max_total_num_tokens=args.sglang_max_total_num_tokens,
-                    max_total_num_tokens_source=(
-                        args.sglang_max_total_num_tokens_source),
-                    chunked_prefill_size=args.max_batched_tokens,
-                    max_prefill_tokens=args.max_batched_tokens,
-                    max_running_requests=args.sglang_max_running_requests,
-                    schedule_conservativeness=1.0,
-                    mtp_num_speculative_tokens=mtp_num_speculative_tokens,
-                    mtp_acceptance_assumption=mtp_acceptance_assumption,
-                    mtp_acceptance_source_id=mtp_acceptance_source_id,
-                ),
-                request_token_transcripts=args.sglang_request_token_transcripts,
-                token_transcript_source_id=args.sglang_token_transcript_source_id,
-                model_source_inputs_by_step=args.sglang_step_inputs,
-            )
         else:
             raise ValueError(f"unknown serving backend: {args.backend!r}")
 
@@ -1348,19 +1451,16 @@ def run_single(args) -> dict:
                     })
                 elif args.backend == "conformance":
                     pass
-                elif args.backend == "sglang_mirror":
-                    scheduler_runtime.update({
-                        pool_name: backend.runtime_info
-                        for pool_name, backend in backends.items()
-                    })
                 else:
                     raise ValueError(
                         f"unknown serving backend: {args.backend!r}")
-                result = MultiSimulation(
+                result = run_recorded_simulation(MultiSimulation(
                     SimulationConfig(
                         model, deployment, requests, args.launch_policy,
                         args.prediction_method, runtime_inputs,
                         execution_mode=args.execution_mode,
+                        collect_source_state=args.state_audit_output is not None,
+                        record_execution_timeline=interactive_recording is not None and not interactive_recording.compact_mode,
                         timing_mode=args.serving_timing_mode,
                         host_launch_profiles=host_launch_profiles,
                         host_runtime_prepare_profiles=host_runtime_prepare_profiles,
@@ -1370,7 +1470,7 @@ def run_single(args) -> dict:
                     backends,
                     hardware_by_id,
                     progress_callback=progress_callback,
-                ).run()
+                ), interactive_recording)
                 construction_lifecycle.pop_all()
         else:
             deployment = build_colocated_plan(
@@ -1383,15 +1483,22 @@ def run_single(args) -> dict:
                         ParallelConfig(
                             tensor_parallel_size=args.prefill_tp_size,
                             pipeline_parallel_size=args.prefill_pp_size,
+                            data_parallel_size=args.prefill_dp_size,
+                            context_parallel_size=args.prefill_cp_size,
+                            sequence_parallel_size=(args.prefill_tp_size if model.num_experts
+                                and args.enable_expert_parallel and args.prefill_dp_size > 1 else 1),
                             enable_expert_parallel=(
                                 args.enable_expert_parallel),
                         ),
                         collectives=tensor_collective_configs(
-                            "main", args.prefill_tp_size,
+                            "main", max(args.prefill_tp_size, args.prefill_cp_size),
                             prefill_hardware.hardware_id,
                             args.collective_backend,
                             args.tensor_all_reduce_profile_sha256,
-                            args.tensor_all_gather_profile_sha256),
+                            args.tensor_all_gather_profile_sha256)
+                            + moe_data_collective_configs("main", prefill_hardware.hardware_id,
+                                args.prefill_dp_size * args.prefill_cp_size, args.collective_backend, model=model),
+                        pipeline_layer_partition=args.prefill_pp_layer_partition,
                         pipeline_p2p=pipeline_p2p_configs(
                             "main", args.prefill_pp_size,
                             hardware_id=prefill_hardware.hardware_id,
@@ -1408,13 +1515,13 @@ def run_single(args) -> dict:
                 ),
                 num_layers=model.num_hidden_layers,
                 num_experts=model.num_experts,
-                pipeline_layer_partition=tuple(
+                pipeline_layer_partition=(args.prefill_pp_layer_partition if args.prefill_pp_layer_partition is not None else tuple(
                     layer_end - layer_start
                     for layer_start, layer_end in (
                         pipeline_layer_ranges_for_model(
                             model, args.prefill_pp_size)
                     )
-                ),
+                )),
             )
             hardware_by_id = {prefill_hardware.hardware_id: prefill_hardware}
             validate_capacity_pools(("main",))
@@ -1452,18 +1559,28 @@ def run_single(args) -> dict:
                         runtime_inputs = replace(runtime_inputs, expert_routing=expert_routing)
                 elif args.backend == "conformance":
                     pass
-                elif args.backend == "sglang_mirror":
-                    scheduler_runtime["main"] = backend.runtime_info
                 else:
                     raise ValueError(
                         f"unknown serving backend: {args.backend!r}")
                 deployment = bind_symbolic_mtp_cache(deployment, runtime_inputs, kv_capacity_plans)
+                if args.execution_workers == 0 and args.output is not None:
+                    from evaluation.serving.metrics.symbolic_model import (
+                        _adaptive_tail_workers_for)
+                    _adaptive_case_dir = Path(args.output).parent
+
+                    def _adaptive_tail_workers(_dir=_adaptive_case_dir):
+                        return _adaptive_tail_workers_for(_dir)
+
+                    adaptive_tail_workers = _adaptive_tail_workers
                 simulation = Simulation(
                     SimulationConfig(
                         model, deployment, requests, args.launch_policy,
                         args.prediction_method, runtime_inputs,
-                        model_source_inputs_by_step=args.glm_mtp_step_inputs,
+                        model_source_inputs_by_step=(args.vllm_step_inputs if args.vllm_step_inputs is not None
+                            else args.glm_mtp_step_inputs),
                         execution_mode=args.execution_mode,
+                        collect_source_state=args.state_audit_output is not None,
+                        record_execution_timeline=interactive_recording is not None and not interactive_recording.compact_mode,
                         step_retention=(
                             "streaming_aggregate"
                             if use_streaming_aggregate else "full"),
@@ -1473,7 +1590,8 @@ def run_single(args) -> dict:
                         host_runtime_prepare_profiles=host_runtime_prepare_profiles,
                         host_request_path_profiles=host_request_path_profiles,
                         runtime_prepare_event_builder=runtime_prepare_event_builder,
-                        closed_loop_client_count=args.closed_loop_client_count),
+                        closed_loop_client_count=args.closed_loop_client_count,
+                        vllm_executor_backend=args.vllm_executor_backend),
                     backend,
                     hardware_by_id,
                     kv_cache_tier_manager=(
@@ -1496,17 +1614,21 @@ def run_single(args) -> dict:
                     ),
                     streaming_step_projector=(
                         None
-                        if streaming_artifact is None
-                        else streaming_artifact.execution_contract_digest
+                        if streaming_artifact is None or (interactive_recording is not None and not interactive_recording.compact_mode)
+                        else (interactive_recording.project_step if interactive_recording is not None and interactive_recording.compact_mode else
+                            streaming_artifact.execution_contract_digest)
                     ),
                     streaming_prehashed_step_consumer=(
                         None
-                        if streaming_artifact is None
+                        if streaming_artifact is None or (interactive_recording is not None and not interactive_recording.compact_mode)
                         else streaming_artifact.consume_prehashed
                     ),
+                    adaptive_tail_workers=adaptive_tail_workers,
                 )
                 construction_lifecycle.pop_all()
-            result = simulation.run()
+            result = run_recorded_simulation(simulation, interactive_recording)
+            if adaptive_tail_workers is not None:
+                adaptive_tail_worker_grants = sorted(set(simulation._adaptive_tail_grants))
     elif args.deployment == "af_disagg":
         if args.collective_backend == "protobridge":
             _activation_profile, activation_profile_sha256 = protobridge_p2p_profile(
@@ -1611,6 +1733,8 @@ def run_single(args) -> dict:
             model, deployment, requests, args.launch_policy,
             args.prediction_method, runtime_inputs,
             execution_mode=args.execution_mode,
+                        collect_source_state=args.state_audit_output is not None,
+                        record_execution_timeline=interactive_recording is not None and not interactive_recording.compact_mode,
             step_retention=(
                 "streaming_aggregate" if use_streaming_aggregate else "full"),
             timing_mode=args.serving_timing_mode,
@@ -1645,7 +1769,7 @@ def run_single(args) -> dict:
                     f"unknown serving backend: {args.backend!r}")
             deployment = bind_symbolic_mtp_cache(deployment, runtime_inputs, kv_capacity_plans)
             simulation_config = replace(simulation_config, deployment=deployment)
-            result = MultiSimulation(
+            result = run_recorded_simulation(MultiSimulation(
                 simulation_config,
                 {"attention": backend},
                 hardware_by_id,
@@ -1666,7 +1790,7 @@ def run_single(args) -> dict:
                 enable_standalone_af_mtp_preemption=(
                     af_mtp_preemption),
                 progress_callback=progress_callback,
-            ).run()
+            ), interactive_recording)
             construction_lifecycle.pop_all()
     elif args.deployment == "pd_af_disagg":
         if args.collective_backend == "protobridge":
@@ -1803,6 +1927,8 @@ def run_single(args) -> dict:
             model, deployment, requests, args.launch_policy,
             args.prediction_method, runtime_inputs,
             execution_mode=args.execution_mode,
+                        collect_source_state=args.state_audit_output is not None,
+                        record_execution_timeline=interactive_recording is not None and not interactive_recording.compact_mode,
             timing_mode=args.serving_timing_mode,
             host_launch_profiles=host_launch_profiles,
             host_runtime_prepare_profiles=host_runtime_prepare_profiles,
@@ -1834,7 +1960,7 @@ def run_single(args) -> dict:
                     f"unknown serving backend: {args.backend!r}")
             deployment = bind_symbolic_mtp_cache(deployment, runtime_inputs, kv_capacity_plans)
             simulation_config = replace(simulation_config, deployment=deployment)
-            result = MultiSimulation(
+            result = run_recorded_simulation(MultiSimulation(
                 simulation_config,
                 backends,
                 hardware_by_id,
@@ -1852,21 +1978,25 @@ def run_single(args) -> dict:
                 ),
                 streaming_step_projector=(
                     None
-                    if streaming_artifact is None
-                    else streaming_artifact.execution_contract_digest
+                    if streaming_artifact is None or (interactive_recording is not None and not interactive_recording.compact_mode)
+                    else (interactive_recording.project_step if interactive_recording is not None and interactive_recording.compact_mode else
+                        streaming_artifact.execution_contract_digest)
                 ),
                 streaming_prehashed_step_consumer=(
                     None
-                    if streaming_artifact is None
+                    if streaming_artifact is None or (interactive_recording is not None and not interactive_recording.compact_mode)
                     else streaming_artifact.consume_prehashed
                 ),
-            ).run()
+            ), interactive_recording)
             construction_lifecycle.pop_all()
     elif args.deployment == "pd_disagg":
-        _kv_profile, kv_profile_sha256 = protobridge_p2p_profile(
-            prefill_hardware.hardware_id,
-            args.transfer_link,
-        )
+        if args.kv_transfer_backend == "protobridge":
+            _kv_profile, kv_profile_sha256 = protobridge_p2p_profile(
+                prefill_hardware.hardware_id, args.transfer_link)
+        elif args.kv_transfer_backend == "analytical_roofline_v1":
+            kv_profile_sha256 = None
+        else:
+            raise ValueError("unknown KV transfer backend")
         if (not isinstance(args.decode_hardware_config, str)
                 or not args.decode_hardware_config):
             raise ValueError(
@@ -1895,50 +2025,70 @@ def run_single(args) -> dict:
         for pool_name in prefill_names:
             ranks = tuple(range(
                 next_rank,
-                next_rank + args.prefill_tp_size,
+                next_rank + args.prefill_tp_size * args.prefill_pp_size * args.prefill_dp_size * args.prefill_cp_size,
             ))
-            next_rank += args.prefill_tp_size
+            next_rank += args.prefill_tp_size * args.prefill_pp_size * args.prefill_dp_size * args.prefill_cp_size
             pool_configs.append(WorkerPoolConfig(
                 pool_name,
                 "prefill",
                 prefill_hardware.hardware_id,
                 ParallelConfig(
                     tensor_parallel_size=args.prefill_tp_size,
-                    enable_expert_parallel=args.enable_expert_parallel,
+                    pipeline_parallel_size=args.prefill_pp_size,
+                    data_parallel_size=args.prefill_dp_size,
+                    context_parallel_size=args.prefill_cp_size,
+                    sequence_parallel_size=(args.prefill_tp_size if model.num_experts and args.prefill_expert_parallel and args.prefill_dp_size > 1 else 1),
+                    enable_expert_parallel=args.prefill_expert_parallel,
                 ),
                 ranks,
                 collectives=tensor_collective_configs(
                     pool_name,
-                    args.prefill_tp_size,
+                    max(args.prefill_tp_size, args.prefill_cp_size),
                     prefill_hardware.hardware_id,
                     args.collective_backend,
                     args.tensor_all_reduce_profile_sha256,
                     args.tensor_all_gather_profile_sha256,
-                ),
+                ) + moe_data_collective_configs(pool_name, prefill_hardware.hardware_id, args.prefill_dp_size * args.prefill_cp_size,
+                    args.collective_backend, model=model),
+                kv_transfer_layout=args.vllm_cache_layout,
+                pipeline_layer_partition=args.prefill_pp_layer_partition,
+                pipeline_p2p=pipeline_p2p_configs(pool_name, args.prefill_pp_size,
+                    hardware_id=prefill_hardware.hardware_id, backend=args.collective_backend,
+                    tensor_parallel_size=args.prefill_tp_size, ranks_per_node=args.pipeline_ranks_per_node),
             ))
         for pool_name in decode_names:
             ranks = tuple(range(
                 next_rank,
-                next_rank + args.decode_tp_size,
+                next_rank + args.decode_tp_size * args.decode_pp_size * args.decode_dp_size * args.decode_cp_size,
             ))
-            next_rank += args.decode_tp_size
+            next_rank += args.decode_tp_size * args.decode_pp_size * args.decode_dp_size * args.decode_cp_size
             pool_configs.append(WorkerPoolConfig(
                 pool_name,
                 "decode",
                 decode_hardware.hardware_id,
                 ParallelConfig(
                     tensor_parallel_size=args.decode_tp_size,
-                    enable_expert_parallel=args.enable_expert_parallel,
+                    pipeline_parallel_size=args.decode_pp_size,
+                    data_parallel_size=args.decode_dp_size,
+                    context_parallel_size=args.decode_cp_size,
+                    sequence_parallel_size=(args.decode_tp_size if model.num_experts and args.decode_expert_parallel and args.decode_dp_size > 1 else 1),
+                    enable_expert_parallel=args.decode_expert_parallel,
                 ),
                 ranks,
                 collectives=tensor_collective_configs(
                     pool_name,
-                    args.decode_tp_size,
+                    max(args.decode_tp_size, args.decode_cp_size),
                     decode_hardware.hardware_id,
                     args.collective_backend,
                     args.tensor_all_reduce_profile_sha256,
                     args.tensor_all_gather_profile_sha256,
-                ),
+                ) + moe_data_collective_configs(pool_name, decode_hardware.hardware_id, args.decode_dp_size * args.decode_cp_size,
+                    args.collective_backend, model=model),
+                kv_transfer_layout=args.vllm_cache_layout,
+                pipeline_layer_partition=args.decode_pp_layer_partition,
+                pipeline_p2p=pipeline_p2p_configs(pool_name, args.decode_pp_size,
+                    hardware_id=decode_hardware.hardware_id, backend=args.collective_backend,
+                    tensor_parallel_size=args.decode_tp_size, ranks_per_node=args.pipeline_ranks_per_node),
             ))
         routes = tuple(
             RouteConfig(
@@ -1953,7 +2103,7 @@ def run_single(args) -> dict:
                     source,
                     destination,
                 ),
-                backend="protobridge",
+                backend=args.kv_transfer_backend,
                 backend_config_sha256=kv_profile_sha256,
             )
             for source in prefill_names
@@ -1973,6 +2123,8 @@ def run_single(args) -> dict:
             prefill_hardware.hardware_id: prefill_hardware,
             decode_hardware.hardware_id: decode_hardware,
         }
+        prefill_names = tuple(pool.name for pool in deployment.worker_pools.values() if pool.role == "prefill")
+        decode_names = tuple(pool.name for pool in deployment.worker_pools.values() if pool.role == "decode")
         validate_capacity_pools(prefill_names + decode_names)
         backends = {}
         with ExitStack() as construction_lifecycle:
@@ -1980,14 +2132,14 @@ def run_single(args) -> dict:
                 backend = make_backend(
                     pool_name, "prefill", prefill_hardware,
                     args.hardware_config,
-                    args.prefill_tp_size)
+                    args.prefill_tp_size, pp_size=args.prefill_pp_size)
                 construction_lifecycle.callback(backend.close)
                 backends[pool_name] = backend
             for pool_name in decode_names:
                 backend = make_backend(
                     pool_name, "decode", decode_hardware,
                     args.decode_hardware_config,
-                    args.decode_tp_size)
+                    args.decode_tp_size, pp_size=args.decode_pp_size)
                 construction_lifecycle.callback(backend.close)
                 backends[pool_name] = backend
             if args.backend == "vllm":
@@ -2002,7 +2154,7 @@ def run_single(args) -> dict:
                 raise ValueError(
                     f"unknown serving backend: {args.backend!r}")
             deployment = bind_symbolic_mtp_cache(deployment, runtime_inputs, kv_capacity_plans)
-            result = MultiSimulation(
+            result = run_recorded_simulation(MultiSimulation(
                 SimulationConfig(
                     model, deployment, requests, args.launch_policy,
                     args.prediction_method, runtime_inputs,
@@ -2010,6 +2162,8 @@ def run_single(args) -> dict:
                         is_glm_h200_pd_mtp_target_scope(args, True)
                         or is_dsv3_h200_pd_mtp_target_scope(args)),
                     execution_mode=args.execution_mode,
+                        collect_source_state=args.state_audit_output is not None,
+                        record_execution_timeline=interactive_recording is not None and not interactive_recording.compact_mode,
                     step_retention=(
                         "streaming_aggregate"
                         if use_streaming_aggregate else "full"),
@@ -2029,19 +2183,21 @@ def run_single(args) -> dict:
                 ),
                 streaming_step_projector=(
                     None
-                    if streaming_artifact is None
-                    else streaming_artifact.execution_contract_digest
+                    if streaming_artifact is None or (interactive_recording is not None and not interactive_recording.compact_mode)
+                    else (interactive_recording.project_step if interactive_recording is not None and interactive_recording.compact_mode else
+                        streaming_artifact.execution_contract_digest)
                 ),
                 streaming_prehashed_step_consumer=(
                     None
-                    if streaming_artifact is None
+                    if streaming_artifact is None or (interactive_recording is not None and not interactive_recording.compact_mode)
                     else streaming_artifact.consume_prehashed
                 ),
-            ).run()
+            ), interactive_recording)
             construction_lifecycle.pop_all()
     else:
         raise ValueError(f"unknown deployment mode: {args.deployment!r}")
-    simulation_wall_time_s = time.perf_counter() - simulation_wall_started
+    simulation_wall_finished = time.perf_counter()
+    simulation_wall_time_s = simulation_wall_finished - simulation_wall_started
     if (request_source is not None
             and request_source["kind"] == "production_trace"):
         request_source["prefix_alignment"] = prefix_alignment_manifest(
@@ -2102,7 +2258,7 @@ def run_single(args) -> dict:
         )
         streaming_chain_field = (
             "ordered_step_execution_contract_chain_sha256"
-            if execution_artifact["schema_version"] in (10, 11, 12, 13, 14)
+            if execution_artifact["schema_version"] in (10, 11, 12, 13, 14, 16)
             else "ordered_step_manifest_chain_sha256"
         )
         analysis_status = {
@@ -2142,6 +2298,16 @@ def run_single(args) -> dict:
             result,
             performance_timing_status=timing_status,
         )
+    if args.state_audit_output is not None:
+        if streaming_artifact is None:
+            raise ValueError("state audit output requires streaming aggregate retention")
+        state_audit_path = Path(args.state_audit_output)
+        if args.output is not None and state_audit_path.resolve() == Path(args.output).resolve():
+            raise ValueError("state audit output must differ from the simulation result path")
+        state_audit_path.parent.mkdir(parents=True, exist_ok=True)
+        state_audit_path.write_text(json.dumps(
+            streaming_artifact.state_audit_manifest(result),
+            indent=2, sort_keys=True) + "\n")
     mtp_pd_handoff = mtp_pd_handoff_contract(
         args,
         requests,
@@ -2181,9 +2347,18 @@ def run_single(args) -> dict:
         "route_decision_version": 2,
         "transfer_trace_version": 2,
         "kv_handoff_mode": kv_handoff_mode,
-        "kv_capacity": {**kv_capacity_manifest(kv_capacity_plans.values(), runtime_memory_policy),
+        "pd_kv_lifecycle": result.pd_kv_lifecycle,
+        "kv_capacity": {**kv_capacity_manifest(kv_capacity_plans.values(), runtime_memory_policy,
+            models_by_pool=None if runtime_memory_policy is None else {name: model for name in kv_capacity_plans}),
             "source_activation_reconciliation": source_activation_capacity_manifest(
-                result.source_activation_memory, kv_capacity_plans, runtime_memory_policy, deployment, model, hardware_by_id),
+                result.source_activation_memory, kv_capacity_plans, runtime_memory_policy, deployment, model, hardware_by_id,
+                source_workspace_budget=(None if not k3_model or runtime_memory_policy is None
+                    else kimi_k3_source_workspace_bytes(model,
+                        deployment.worker_pools['main'].parallel_plan.config,
+                        max_batched_tokens=args.max_batched_tokens, max_requests=args.max_requests,
+                        source_multiprocessors=prefill_hardware.num_compute_units,
+                        pipeline_layer_partition=tuple(deployment.worker_pools['main'].parallel_plan.layer_to_pipeline_stage.count(stage)
+                            for stage in range(deployment.worker_pools['main'].parallel_plan.config.pipeline_parallel_size))))),
             **({"source_lifetime_projection": source_capacity_reports} if source_capacity_reports else {})},
         "kv_lifecycle_replay": (
             None
@@ -2233,9 +2408,13 @@ def run_single(args) -> dict:
             scheduler_version=args.vllm_scheduler_version,
             tensor_parallel_size=args.prefill_tp_size,
             pipeline_parallel_size=args.prefill_pp_size,
+            context_parallel_size=args.prefill_cp_size,
+            data_parallel_size=(args.prefill_dp_size if model.model_type == "glm_moe_dsa" else 1),
+            pipeline_layer_partition=args.prefill_pp_layer_partition,
             enable_chunked_prefill=args.enable_chunked_prefill,
             enable_prefix_caching=args.enable_prefix_caching,
             prefix_cache_mode=args.prefix_cache_mode,
+            async_scheduling=args.vllm_async_scheduling,
             mtp_draft_token_ids_by_step=args.mtp_draft_token_ids_by_step,
             mtp_num_speculative_tokens=args.mtp_num_speculative_tokens,
             mtp_acceptance_policy=args.mtp_acceptance_policy,
@@ -2292,6 +2471,8 @@ def run_single(args) -> dict:
         ),
         "schedule_end_time_s": result.schedule_trace.end_time_s,
         "simulation_wall_time_s": simulation_wall_time_s,
+        "simulation_started_monotonic_s": simulation_wall_started,
+        "simulation_finished_monotonic_s": simulation_wall_finished,
         "evaluation_wall_time_breakdown_s": {
             **result.execution_performance_stats["phase_wall_time_s"],
             "artifact_generation": (
@@ -2351,12 +2532,86 @@ def run_single(args) -> dict:
     if request_source is not None:
         payload["request_source"] = request_source
     progress_callback.stop()
+    report_finalize_started = time.perf_counter()
+    if interactive_recording is not None:
+        from evaluation.reporting.serving_interactive import write_interactive_report
+        interactive_recording.hardware.update(hardware_by_id)
+        if not isinstance(result, StreamingSimulationResult):
+            entries = {entry.backend_step.schedule.step_id: entry for entry in result.schedule_trace.entries}
+            for step in result.steps:
+                entry = entries[step.backend_step.schedule.step_id]
+                if interactive_recording.compact_mode:
+                    # execution_artifact_manifest above already validated the
+                    # full step contract; avoid a discarded streaming digest.
+                    interactive_recording._record_after_artifact_validation(step, entry)
+                else:
+                    interactive_recording.record(step, entry)
+        visual_payload = interactive_recording.visualization_payload(payload, result)
+        visual_payload["visualization_configuration_files"] = configuration_files
+        visual_payload["visualization_configuration_snapshot_missing"] = configuration_missing
+        visual_payload["visualization_cost_receipt_path"] = Path(interactive_report_path).with_suffix(".report.json").name
+        if args.interactive_view == "swimlanes":
+            from evaluation.reporting.serving_swimlanes import write_swimlane_report
+            report = write_swimlane_report(visual_payload, interactive_report_path)
+        elif args.interactive_view == "breakdown":
+            report = write_interactive_report(visual_payload, interactive_report_path)
+        else:
+            raise ValueError("unknown interactive report view")
+        payload["interactive_report"] = {**report, **visual_payload["visualization_coverage"]}
+    if not args.interactive_report:
+        payload["interactive_report"] = {"status": "disabled", "reason": "offline HTML report not requested"}
+    if adaptive_tail_worker_grants is not None:
+        payload["adaptive_tail_worker_grants"] = adaptive_tail_worker_grants
+    payload["report_output_costs"] = {"recording_projection_s": (interactive_recording.recording_wall_s
+        if interactive_recording is not None else 0.0),
+        "output_pipeline_wall_s": time.perf_counter() - report_total_started,
+        "scope": "wall clock includes simulation and report finalization; recording is nested and may be parallel; do not add phase times"}
+    if interactive_recording is not None:
+        payload["interactive_report"]["cost_receipt_path"] = str(Path(interactive_report_path).with_suffix(".report.json"))
+    result_write_started = time.perf_counter()
     if args.output:
         path = Path(args.output)
         path.parent.mkdir(parents=True, exist_ok=True)
         persisted_payload = persistence_projection(payload)
         path.write_text(
             json.dumps(persisted_payload, indent=2, sort_keys=True) + "\n")
+    payload["report_output_costs"].update({
+        "result_json_projection_write_s": time.perf_counter() - result_write_started,
+        "finalization_wall_s": time.perf_counter() - report_finalize_started,
+        "total_wall_s": time.perf_counter() - report_total_started,
+        "simulation_wall_s": simulation_wall_time_s,
+        "scope": "total wall includes setup, simulation, recording, finalization and persisted result write; nested/parallel phases are not additive"})
+    if interactive_recording is not None:
+        receipt_path = Path(interactive_report_path).with_suffix(".report.json")
+        if args.interactive_view == "swimlanes":
+            from evaluation.reporting.serving_viewer_ui import attach_report_costs
+            costs = payload["report_output_costs"]
+            costs["cost_metadata_write_s"] = attach_report_costs(payload["interactive_report"], {
+                "html_generation_s": report["page_generation_s"],
+                "total_wall_through_result_write_s": costs["total_wall_s"],
+                "simulation_wall_s": simulation_wall_time_s,
+                "recording_projection_s": costs["recording_projection_s"],
+                "finalization_wall_s": costs["finalization_wall_s"],
+                "result_json_projection_write_s": costs["result_json_projection_write_s"],
+                "scope": "producer wall through result JSON write; recording nested/parallel; cost metadata and final receipt writes measured separately"})
+            costs["total_wall_s"] = time.perf_counter() - report_total_started
+    receipt_path = (Path(interactive_report_path).with_suffix(".report.json") if interactive_recording is not None
+        else Path(args.output).with_suffix(".costs.json") if args.output else None)
+    payload["report_output_costs"]["cost_receipt_path"] = str(receipt_path) if receipt_path is not None else None
+    payload["report_output_costs"]["persisted_boundary"] = "result includes costs through initial result write and optional metadata attachment; sidecar includes final refresh; returned total includes sidecar write"
+    final_result_write_started = time.perf_counter()
+    if args.output:
+        path.write_text(json.dumps(persistence_projection(payload), indent=2, sort_keys=True) + "\n")
+    payload["report_output_costs"]["final_result_refresh_s"] = time.perf_counter() - final_result_write_started
+    payload["report_output_costs"]["total_wall_s"] = time.perf_counter() - report_total_started
+    receipt_started = time.perf_counter()
+    if receipt_path is not None:
+        receipt_path.write_text(json.dumps({"report": payload["interactive_report"],
+        "costs": payload["report_output_costs"]}, indent=2) + "\n")
+    payload["report_output_costs"]["cost_receipt_write_s"] = time.perf_counter() - receipt_started
+    payload["report_output_costs"]["total_wall_s"] = time.perf_counter() - report_total_started
+    if interactive_recording is not None:
+        payload["interactive_report"]["cost_receipt_path"] = str(receipt_path)
     return payload
 
 
@@ -2395,10 +2650,13 @@ def validate_activation_source_policy_binding(args, policy, hardware, model, poo
     binding = policy.binding
     actual = (binding.hardware_id, binding.model_config_sha256, policy.pool_name, binding.deployment,
         binding.worker_role, binding.tensor_parallel_size, binding.pipeline_parallel_size,
-        binding.expert_parallel_size, binding.max_model_len, binding.max_batched_tokens,
+        binding.expert_parallel_size, binding.data_parallel_size, binding.context_parallel_size, binding.pipeline_layer_partition,
+        binding.max_model_len, binding.max_batched_tokens,
         binding.max_requests, binding.kv_block_size_tokens)
     expected = (hardware.hardware_id, model.config_sha256, pool_name, args.deployment, role,
         parallelism.tensor_parallel_size, parallelism.pipeline_parallel_size, parallelism.expert_parallel_size,
+        parallelism.data_parallel_size, parallelism.context_parallel_size,
+        (args.decode_pp_layer_partition if role == "decode" else args.prefill_pp_layer_partition),
         args.max_model_len, args.max_batched_tokens, args.max_requests, args.kv_block_size_tokens)
     if actual != expected:
         raise ValueError("activation source policy binding must match the CLI identities, parallelism and constructor limits")

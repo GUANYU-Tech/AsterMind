@@ -1,10 +1,8 @@
 import unittest
 
-from simulator.bootstrap import activate
 from simulator.config import SimulationConfig, Migration
 from simulator.examples.make_examples import example
 from simulator.migration import NetworkKVMigration
-from simulator.transport import shared_executor
 from network_sim import CommunicationRuntime, PhysicalTopology, Scenario
 
 
@@ -43,8 +41,8 @@ class NativeBlockFixture:
 
 
 class MigrationTests(unittest.TestCase):
-    def run_case(self, failure):
-        activate()
+    def run_case(self, failure, *, wait_for_boundaries=False):
+        from orbitserve.runtime.engine.network_events import NetworkEventDriver
         from orbitserve.runtime.engine.cell_events import CellEventLoop
         config = example()
         if failure:
@@ -55,17 +53,27 @@ class MigrationTests(unittest.TestCase):
         loop = CellEventLoop()
         source, target = NativeBlockFixture("cellA"), NativeBlockFixture("cellB")
         with CommunicationRuntime(topology) as network:
-            executor = shared_executor(loop, network, ())
-            migration = NetworkKVMigration(loop, executor, dict(cellA="gpu0", cellB="gpu1"))
+            transport = NetworkEventDriver(loop, network)
+            migration = NetworkKVMigration(transport, dict(cellA="gpu0", cellB="gpu1"))
             spec = Migration(id="copy", after_request="r0", source_cell="cellA", target_cell="cellB",
                              session_id="s", context_id="c")
+            if wait_for_boundaries:
+                source._inflight = target._inflight = object()
             record = migration.start(spec, source, target, {})
+            if wait_for_boundaries:
+                self.assertEqual(record["state"], "waiting_for_batch_boundary")
+                source._inflight = None
+                migration.on_batch_boundary()
+                self.assertFalse(target.reserved)
+                target._inflight = None
+                migration.on_batch_boundary()
             loop.run(until_s=0)
             self.assertTrue(target.reserved)
             self.assertFalse(target.committed)
             while record["state"] in ("transferring", "waiting_for_batch_boundary"):
-                self.assertTrue(loop._events)
-                loop.run(until_s=loop._events[0][0])
+                at = loop.next_event_time_s
+                self.assertIsNotNone(at)
+                loop.run(until_s=at)
             self.assertIsNone(source.paused)
             self.assertIsNone(target.paused)
             self.assertEqual(target.committed, not failure)
@@ -78,8 +86,11 @@ class MigrationTests(unittest.TestCase):
     def test_link_failure_rolls_back_native_reservation(self):
         self.run_case(True)
 
+    def test_migration_waits_for_both_cell_boundaries(self):
+        self.run_case(False, wait_for_boundaries=True)
+
     def multiple_rank_case(self, failure):
-        activate()
+        from orbitserve.runtime.engine.network_events import NetworkEventDriver
         from orbitserve.runtime.engine.cell_events import CellEventLoop
         raw = dict(cells=[dict(id="cellA", satellites=["a"]), dict(id="cellB", satellites=["b"])],
                    satellites=[dict(id=i) for i in "ab"], devices=[], links=[])
@@ -99,8 +110,8 @@ class MigrationTests(unittest.TestCase):
         loop = CellEventLoop()
         source, target = NativeBlockFixture("cellA"), NativeBlockFixture("cellB")
         with CommunicationRuntime(PhysicalTopology(Scenario.model_validate(raw))) as network:
-            executor = shared_executor(loop, network, ())
-            migration = NetworkKVMigration(loop, executor,
+            transport = NetworkEventDriver(loop, network)
+            migration = NetworkKVMigration(transport,
                 dict(cellA={0: "ga0", 1: "ga1"}, cellB={0: "gb0", 1: "gb1"}))
             record = migration.start(Migration(id="multi", after_request="r", source_cell="cellA",
                 target_cell="cellB", session_id="s", context_id="c"), source, target, {})

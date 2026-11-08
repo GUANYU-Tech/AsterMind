@@ -608,14 +608,16 @@ def select_vector_launch(
             and (elements_per_token // 8) % hardware.parallel_width == 0
         )
         if source_bound_kv_cache:
-            # Read-producer geometry of the pinned flash-layout source.  The
-            # canonical observation binds the vLLM-MetaX 0.8.5 ABI10
+            # Read-producer geometry of the historical flash-layout source.
+            # The vLLM-MetaX 0.8.5 ABI10
             # reshape_and_cache_flash_kernel (csrc/cache_kernels.cu, SHA256
             # 04d4d6c399240279470c16f0a5d55aac3cdd86b040afbe52a20ffb086b99163c),
-            # identified by its exact 15-parameter signature -- the later
-            # build carries a sixteenth kv_scale_stride argument and a
-            # different body, so the two programs are not interchangeable
-            # here.  That body is one block-strided scalar loop
+            # has the observed 15-parameter signature.  The vLLM 0.24
+            # sdist has a sixteenth kv_scale_stride argument.  Public
+            # mcoplib 0.4.9 source also has 15 arguments but uses a different
+            # vectorized body; the installed g8b5bd8b build is not bound to
+            # either source body by this ABI.  The old body is one
+            # block-strided scalar loop
             #
             #     for (int i = threadIdx.x; i < n; i += blockDim.x) {
             #       scalar_t tgt_key   = key[src_key_idx];

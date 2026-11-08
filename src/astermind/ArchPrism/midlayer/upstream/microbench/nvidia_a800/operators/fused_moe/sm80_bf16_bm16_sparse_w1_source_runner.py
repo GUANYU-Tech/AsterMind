@@ -4,6 +4,7 @@
 import argparse
 import hashlib
 import math
+import os
 from pathlib import Path
 import statistics
 
@@ -16,9 +17,10 @@ BLOCK_N = 32
 BLOCK_K = 64
 GROUP_SIZE_M = 1
 POLLUTER_BYTES = 128 * 1024 * 1024
-VLLM_SOURCE = Path(
-    "/share_data/yangxinhao/chip_modeling/vllm_src_3ver/a800/vllm/"
-    "model_executor/layers/fused_moe/fused_moe.py")
+VLLM_SOURCE = (
+    Path(os.environ["MIDLAYER_A800_VLLM_SOURCE"])
+    / "model_executor/layers/fused_moe/fused_moe.py"
+)
 SOURCE_SNIPPETS = (
     "num_pid_in_group = GROUP_SIZE_M * num_pid_n",
     "offs_token[:, None] // top_k * stride_am",

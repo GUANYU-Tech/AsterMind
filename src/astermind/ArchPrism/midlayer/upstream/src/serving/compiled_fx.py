@@ -164,8 +164,10 @@ def ascend_910b_compiled_fx_reshape_events(
     require_compiled_fx_plan(plan, "compiled-FX reshape descriptor")
     repeat_indices = repeat_indices_from_plan(plan)
     has_moe = any(":moe:" in call.call_id for call in plan.calls)
+    has_source_moe = any(call.kernel_spec.variant == "moe_topk"
+        and call.kernel_spec.attributes["source_program"] == "vllm_0_18_bf16_softmax_topk" for call in plan.calls)
     anchor_definitions = (
-        _MOE_RESHAPE_ANCHORS if has_moe else _DENSE_RESHAPE_ANCHORS)
+        _MOE_RESHAPE_ANCHORS if has_moe or has_source_moe else _DENSE_RESHAPE_ANCHORS)
     # Endpoint-only plans (for example a transfer boundary without a decoder
     # body) have no generated FX metadata anchors.  They consume no metadata
     # service; decoder-shaped plans are validated strictly below.

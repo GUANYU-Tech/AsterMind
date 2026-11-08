@@ -24,9 +24,12 @@ REPORT = Path(__file__).with_name("silu_scalar_round_768_report.py")
 GATES = Path(__file__).with_name("silu_scalar_round_768_gates.json")
 OUTPUT_ROOT = ROOT / "profiler_output/microbench/nvidia_a800"
 NVCC = Path("/usr/local/cuda-12.2/bin/nvcc")
-CUOBJDUMP = Path("/share_data/yangxinhao/miniconda_yxh/envs/r2r_qwen3_next/lib/python3.10/site-packages/triton/backends/nvidia/bin/cuobjdump")
+CUOBJDUMP = Path(shutil.which("cuobjdump") or "cuobjdump")
 NVIDIA_SMI = Path("/usr/bin/nvidia-smi")
-PRODUCTION_BINARY = Path("/share_data/yangxinhao/miniconda_yxh/envs/r2r_qwen3_next/lib/python3.10/site-packages/vllm/_C.abi3.so")
+PRODUCTION_BINARY = (
+    Path(os.environ["MIDLAYER_A800_VLLM_BINARY"])
+    if "MIDLAYER_A800_VLLM_BINARY" in os.environ else None
+)
 PRODUCTION_SYMBOL = "_ZN4vllm18act_and_mul_kernelIN3c108BFloat16EXadL_ZNS_11silu_kernelIS2_EET_RKS4_EELb0EEEvPS4_PS5_i"
 EXPECTED_DEVICE = "NVIDIA A800-SXM4-80GB"
 EXPECTED_CC = "8.0"
@@ -219,6 +222,8 @@ def main():
     parser.add_argument("--owner", required=True)
     parser.add_argument("--device", type=int, required=True)
     args = parser.parse_args()
+    if PRODUCTION_BINARY is None:
+        parser.error("MIDLAYER_A800_VLLM_BINARY is required")
     if args.device != 7 or re.fullmatch(r"[A-Za-z0-9._-]{1,64}", args.owner) is None:
         parser.error("only device 7 and a safe owner are accepted")
     if any(not path.is_file() for path in (NVCC, CUOBJDUMP, NVIDIA_SMI, PRODUCTION_BINARY, SOURCE, REPORT, GATES)):

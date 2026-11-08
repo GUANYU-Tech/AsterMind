@@ -5,8 +5,9 @@ Private arrays describe logical versions, not simultaneous native UB residency.
 The separately retained installed CANN source is an algorithm reference, not
 an assertion of byte identity with the existing ATB production-source pin.
 """
+
+from src.kernel.prediction_cache import runtime_lru_cache
 from dataclasses import replace
-from functools import lru_cache
 from math import prod
 
 from src.kernel.kernel_spec import KernelKind
@@ -121,7 +122,7 @@ def _recipe(g,parents,ready,scope,visibility):
     return _bound_recipe(g,tuple(sorted(parents.items())),tuple(sorted(ready.items())),scope,visibility)
 
 
-@lru_cache(maxsize=8)
+@runtime_lru_cache(maxsize=8)
 def _bound_recipe(g,parent_items,ready_items,scope,visibility):
     parents=dict(parent_items);ready=dict(ready_items)
     # Private value dataflow depends on geometry, not caller names. Share that
@@ -151,7 +152,7 @@ def _bound_recipe(g,parent_items,ready_items,scope,visibility):
         visibility_domain=visibility,accesses=accesses),)
 
 
-@lru_cache(maxsize=8)
+@runtime_lru_cache(maxsize=8)
 def _cached_recipe(g,parent_items,ready_items,scope,visibility):
     parents=dict(parent_items);ready=dict(ready_items)
     t,q,k,d,slice_elements,workers,gworkers,key=g
@@ -346,7 +347,7 @@ def cann_rotary_source_demands(program, *, expected_kernel=None):
     return {**work,'totals':dict(work['totals'])}
 
 
-@lru_cache(maxsize=8)
+@runtime_lru_cache(maxsize=8)
 def _cann_rotary_source_demands(program):
     program.__post_init__()
     if program.accesses or len(program.scopes)!=1 or len(program.tile_programs)!=1:raise ValueError('CANN rotary requires its complete compressed source')

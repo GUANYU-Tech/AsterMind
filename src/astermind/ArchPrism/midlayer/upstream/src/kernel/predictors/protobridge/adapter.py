@@ -1,4 +1,4 @@
-"""Strict Midlayer contract adapter for the vendored ProtoBridge surrogate."""
+"""Strict Midlayer contract adapter for the ProtoBridge upstream surrogate."""
 
 from dataclasses import dataclass
 import hashlib
@@ -18,7 +18,11 @@ from src.kernel.launch_config.select_launch_config import (
 )
 from src.kernel.predictors.common import prediction_from_ns
 
-from .whitebox_surrogate_v2 import TheoryDerivedSurrogate, Topology
+from .upstream import load_upstream_module_and_verify_license as _load_upstream
+
+_upstream = _load_upstream()
+TheoryDerivedSurrogate = _upstream.TheoryDerivedSurrogate
+Topology = _upstream.Topology
 
 
 _AUTHOR_PROFILE_SOURCE_KIND = "author_profile"
@@ -195,6 +199,8 @@ class ProtoBridgeProtocolPolicy:
     ll128_phase_fixed_us: float
     simple_phase_fixed_us: float
     simple_allreduce_ring_bw_by_participant: Tuple[Tuple[int, float], ...] = ()
+    large_message_min_bytes: Optional[int] = None
+    large_message_wire_efficiency: Optional[float] = None
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -255,6 +261,20 @@ class ProtoBridgeProtocolPolicy:
             "simple_allreduce_ring_bw_by_participant",
             tuple(sorted(normalized_bandwidths)),
         )
+        minimum = self.large_message_min_bytes
+        efficiency = self.large_message_wire_efficiency
+        if (minimum is None) != (efficiency is None):
+            raise ValueError("large-message threshold and efficiency must be paired")
+        if minimum is not None:
+            if (isinstance(minimum, bool) or not isinstance(minimum, int)
+                    or minimum <= 0):
+                raise ValueError("large-message threshold must be positive integer")
+            if (isinstance(efficiency, bool)
+                    or not isinstance(efficiency, (int, float))
+                    or not math.isfinite(efficiency)
+                    or not 0 < efficiency <= 1):
+                raise ValueError("large-message wire efficiency must be in (0, 1]")
+            object.__setattr__(self, "large_message_wire_efficiency", float(efficiency))
 
     def select(self, message_bytes: int) -> Tuple[str, float]:
         if isinstance(message_bytes, bool) or not isinstance(message_bytes, int):
@@ -350,6 +370,11 @@ def _profile_content_sha256(profile: "ProtoBridgeProfile") -> str:
             profile.timeline_contention_contract),
         "topology": profile.topology,
     }
+    if profile.protocol_policy.large_message_min_bytes is not None:
+        payload["protocol_policy"]["large_message_min_bytes"] = (
+            profile.protocol_policy.large_message_min_bytes)
+        payload["protocol_policy"]["large_message_wire_efficiency"] = (
+            profile.protocol_policy.large_message_wire_efficiency)
     serialized = json.dumps(
         payload,
         allow_nan=False,
@@ -563,6 +588,8 @@ def _development_profile(
     spray_chunk_bytes: int,
     t_min_switch_us: float,
     wire_efficiency: float,
+    large_message_min_bytes: Optional[int],
+    large_message_wire_efficiency: Optional[float],
     provenance_note: str,
     selector_provenance: str,
     surrogate_topology: Optional[ProtoBridgeTopology],
@@ -629,6 +656,8 @@ def _development_profile(
             ll128_phase_fixed_us,
             simple_phase_fixed_us,
             simple_allreduce_ring_bw_by_participant,
+            large_message_min_bytes,
+            large_message_wire_efficiency,
         ),
         surrogate_topology=surrogate_topology,
     )
@@ -639,6 +668,15 @@ def _profile_from_hardware_inputs(
     operation: str,
     algorithm: str,
 ) -> ProtoBridgeProfile:
+    if ("large_message_min_bytes" in hardware) != (
+            "large_message_wire_efficiency" in hardware):
+        raise ValueError("large-message hardware inputs must be paired")
+    if operation == "all_reduce" and "large_message_min_bytes" in hardware:
+        large_message_min_bytes = hardware["large_message_min_bytes"]
+        large_message_wire_efficiency = hardware["large_message_wire_efficiency"]
+    else:
+        large_message_min_bytes = None
+        large_message_wire_efficiency = None
     bisection = hardware["bisection_bw_bytes_per_us"]
     if bisection is None:
         topology = None
@@ -664,6 +702,8 @@ def _profile_from_hardware_inputs(
         spray_chunk_bytes=int(hardware["spray_chunk_bytes"]),
         t_min_switch_us=float(hardware["t_min_switch_us"]),
         wire_efficiency=float(hardware["wire_efficiency"]),
+        large_message_min_bytes=large_message_min_bytes,
+        large_message_wire_efficiency=large_message_wire_efficiency,
         provenance_note=str(hardware["provenance_note"]),
         selector_provenance=(
             f"{hardware['communication_library']} "
@@ -911,7 +951,13 @@ def _predict_with_profile(
             f"unhandled ProtoBridge operation: {transfer.operation!r}")
     protocol = _selected_vendor_protocol(transfer, profile)
     model_parameters = dict(profile.model_parameters)
-    # The vendored surrogate exposes one fixed per-phase latency.  Selecting
+    if (profile.protocol_policy.large_message_min_bytes is not None
+            and transfer.operation == "all_reduce"
+            and len(transfer.participants) == 2
+            and transfer.bytes >= profile.protocol_policy.large_message_min_bytes):
+        model_parameters["wire_efficiency"] = (
+            profile.protocol_policy.large_message_wire_efficiency)
+    # The upstream surrogate exposes one fixed per-phase latency.  Selecting
     # it here keeps that vendor detail inside the adapter: Serving and kernel
     # callers still provide only a physical collective.
     model_parameters["link_latency_us"] = (

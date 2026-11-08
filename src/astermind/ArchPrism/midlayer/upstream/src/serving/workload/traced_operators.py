@@ -5,18 +5,20 @@ in-place residual/RoPE and a source SiluAndMul output. It does not select an
 actual provider, compiler, allocator or library workspace implementation.
 """
 
+from src.kernel.prediction_cache import runtime_lru_cache
+
 from dataclasses import replace
-from functools import lru_cache
 from math import isfinite, prod
 from types import MappingProxyType
 
-from src.kernel.kernel_spec import PAGED_KV_CACHE_ATTRIBUTES
+from src.kernel.kernel_spec import PAGED_KV_CACHE_ATTRIBUTES, linear_expert_partition
 from src.kernel.launch_config.block_fp8_gemm import BLOCK_FP8_WEIGHT_QUANTIZATION
 from src.kernel.launch_config.select_launch_config import select_mhc_stage_launches
 from src.serving.deployment.deployment_config import CollectiveConfig
-from .traced_forward import ForwardCollectiveGroup, ForwardWorkspace
+from .traced_forward import ForwardCollectiveGroup, ForwardTrace, ForwardWorkspace
 from .workload_graph import WorkloadKind, WorkloadNode
 from .rope_dispatch import ROPE_PROGRAM_FUSED, ROPE_PROGRAM_NATIVE_COMPOSITE
+from .model_config import is_glm_fp8_tensor_model_scope, is_deepseek_v4_parallel_model_scope
 
 
 def _maca_native_copy_dispatch(tensor, runtime_source):
@@ -36,7 +38,7 @@ def _maca_native_copy_dispatch(tensor, runtime_source):
             "input_alignment_bytes": 4, "output_alignment_bytes": 4}
 
 
-@lru_cache(maxsize=2048)
+@runtime_lru_cache(maxsize=2048)
 def _node_geometry_template(kind, pool, items, dtype, variant, rank):
     # Only native immutable key values reach this cache. The constructor owns
     # all validation; failed constructions never populate a proof template.
@@ -98,13 +100,22 @@ class SymbolicLinear(SymbolicOperator):
             if x.is_contiguous else {})
         node = self.node(self.kind, {"b": 1, "m": rows,
             "n": self.out_features, "k": self.in_features}, x.dtype, variant,
-            {"has_bias": self.bias, **layout,
+            {"has_bias": self.bias, "weight_dtype": x.dtype, "weight_group_size": 0, **layout,
                 **({"source_component": "symbolic_fp32_linear"} if x.dtype == "fp32" else {}),
-                **({"output_dtype": dtype,
-                "weight_dtype": x.dtype, "weight_group_size": 0}
+                **({"output_dtype": dtype}
                 if self.output_dtype is not None else {})})
         weight = self.trace.parameter_view(self.name + ":weight",
             (self.out_features, self.in_features), x.dtype)
+        if x.dtype == "fp16":
+            # Publish the actual source views; a runtime label alone cannot
+            # establish BLAS operand strides or alignment of an alias.
+            node = node.with_attributes({**node.attributes,
+                "source_gemm_input_shape": tuple(x.shape),
+                "source_gemm_input_strides_bytes": tuple(x.view.strides_bytes),
+                "source_gemm_input_offset_bytes": x.view.offset_bytes,
+                "source_gemm_weight_shape": tuple(weight.shape),
+                "source_gemm_weight_strides_bytes": tuple(weight.strides_bytes),
+                "source_gemm_weight_offset_bytes": weight.offset_bytes})
         return self.trace.call(node, (x,), shape=(*x.shape[:-1], self.out_features),
             dtype=dtype, parameters=(weight,)), None
 
@@ -173,14 +184,23 @@ class SymbolicConcat(SymbolicOperator):
 class SymbolicFloat32Cast(SymbolicOperator):
     """Aten BF16->FP32 materialization; FP32 inputs keep their backing."""
 
-    def __call__(self, x):
+    def __call__(self, x, *, vllm011_router_topk=None):
         self.trace._check_tensor(x)
         if x.dtype == "fp32":
             return x
         if x.dtype != "bf16":
             raise NotImplementedError("symbolic float32 cast requires BF16 or FP32 input")
-        node = self.node(WorkloadKind.ELEMENTWISE, {"elements": prod(x.shape)}, "bf16", "elementwise",
-            {"operation": "cast_bf16_float32", "reads": 1, "writes": 1})
+        attributes = {"operation": "cast_bf16_float32", "reads": 1, "writes": 1}
+        if vllm011_router_topk is not None:
+            if (len(x.shape) != 2 or type(vllm011_router_topk) is not int
+                    or not 1 <= vllm011_router_topk <= x.shape[1]):
+                raise ValueError("0.11 router cast requires its actual logits matrix and topk")
+            attributes.update(source_component="vllm_0_11_symbolic_router_logits_cast",
+                model_execution_version="vllm_0_11_0",
+                source_moe_router_shape=(*x.shape, vllm011_router_topk),
+                source_input_layout=("contiguous_aligned_16"
+                    if x.is_contiguous and x.view.offset_bytes % 16 == 0 else "unbound"))
+        node = self.node(WorkloadKind.ELEMENTWISE, {"elements": prod(x.shape)}, "bf16", "elementwise", attributes)
         return self.trace.call(node, (x,), shape=x.shape, dtype="fp32")
 
 
@@ -217,12 +237,15 @@ class SymbolicV32EHNorm(SymbolicOperator):
     mask, norm or concatenation allocation/launch is invented.
     """
 
-    def __init__(self, trace, name, pool_name, width, epsilon):
+    def __init__(self, trace, name, pool_name, width, epsilon, *, legacy_dummy_retained_inputs=False):
         super().__init__(trace, name, pool_name)
         if (type(width) is not int or width <= 0 or type(epsilon) not in (int, float)
                 or not isfinite(epsilon) or epsilon <= 0):
             raise ValueError("V32 fused EH requires positive width and finite source epsilon")
         self.width, self.epsilon = width, epsilon
+        if type(legacy_dummy_retained_inputs) is not bool:
+            raise TypeError("V32 EH retained-input source must be explicit")
+        self.legacy_dummy_retained_inputs = legacy_dummy_retained_inputs
         self.enorm = trace.tensor(name + ":enorm.weight", (width,), "bf16", persistent=True)
         self.hnorm = trace.tensor(name + ":hnorm.weight", (width,), "bf16", persistent=True)
 
@@ -233,8 +256,9 @@ class SymbolicV32EHNorm(SymbolicOperator):
         if (positions.shape != (rows,) or positions.dtype != "int64"
                 or previous_hidden.shape != (rows, self.width) or previous_hidden.dtype != "bf16"
                 or previous_hidden.view.strides_bytes[-1] != 2
-                or not isinstance(position_values, tuple) or len(position_values) != rows
-                or any(type(p) is not int or p < 0 for p in position_values)):
+                or (position_values is not None if self.legacy_dummy_retained_inputs else
+                    not isinstance(position_values, tuple) or len(position_values) != rows
+                    or any(type(p) is not int or p < 0 for p in position_values))):
             raise ValueError("V32 fused EH requires INT64 positions, explicit values and BF16 hidden rows")
         return rows
 
@@ -244,7 +268,9 @@ class SymbolicV32EHNorm(SymbolicOperator):
             "bf16", "dsv32_embed_eh_norm" if embedded else "dsv32_eh_norm", {
                 "source_component": "vllm_0_30_symbolic_v32_eh_norm",
                 "model_execution_version": "vllm_0_30_0", "epsilon": self.epsilon,
-                "masked_rows": position_values.count(0), "symbolic_workspace_complete": False,
+                "masked_rows": None if self.legacy_dummy_retained_inputs else position_values.count(0),
+                **({"input_values_source": "legacy_dummy_retained_buffer"} if self.legacy_dummy_retained_inputs else {}),
+                "symbolic_workspace_complete": False,
                 "input_roles": (("positions", "input_ids", "embedding_table", "previous_hidden", "enorm_weight", "hnorm_weight")
                     if embedded else ("positions", "inputs_embeds", "previous_hidden", "enorm_weight", "hnorm_weight"))})
         return self.trace.call(node, inputs, shape=(rows, 2 * self.width), dtype="bf16")
@@ -262,10 +288,10 @@ class SymbolicV32EHNorm(SymbolicOperator):
 class SymbolicV32EmbedEHNorm(SymbolicV32EHNorm):
     """TP1 full-vocabulary gather folded into the same EH source operation."""
 
-    def __init__(self, trace, name, pool_name, width, vocab, epsilon):
+    def __init__(self, trace, name, pool_name, width, vocab, epsilon, *, legacy_dummy_retained_inputs=False):
         if type(vocab) is not int or vocab <= 0:
             raise ValueError("V32 fused embedding EH requires a positive full vocabulary")
-        super().__init__(trace, name, pool_name, width, epsilon)
+        super().__init__(trace, name, pool_name, width, epsilon, legacy_dummy_retained_inputs=legacy_dummy_retained_inputs)
         self.vocab = vocab
         self.embedding_table = trace.tensor(name + ":embed_tokens.weight", (vocab, width), "bf16", persistent=True)
 
@@ -273,8 +299,9 @@ class SymbolicV32EmbedEHNorm(SymbolicV32EHNorm):
         rows = self._positions(positions, previous_hidden, position_values)
         self.trace._check_tensor(input_ids)
         if (input_ids.shape != (rows,) or input_ids.dtype != "int32"
-                or not isinstance(input_token_ids, tuple) or len(input_token_ids) != rows
-                or any(type(token) is not int or not 0 <= token < self.vocab for token in input_token_ids)):
+                or (input_token_ids is not None if self.legacy_dummy_retained_inputs else
+                    not isinstance(input_token_ids, tuple) or len(input_token_ids) != rows
+                    or any(type(token) is not int or not 0 <= token < self.vocab for token in input_token_ids))):
             raise ValueError("V32 fused embedding EH requires explicit in-vocabulary INT32 token IDs")
         return self._fused((positions, input_ids, self.embedding_table, previous_hidden, self.enorm, self.hnorm),
             rows, position_values, embedded=True)
@@ -329,17 +356,32 @@ class SymbolicCopy(SymbolicOperator):
         node = self.node(WorkloadKind.GATHER,
             {"elements": prod(source.shape), "rows": source.shape[0], "hidden": prod(source.shape[1:])},
             source.dtype, "gather", {"gather_factor": 1, "index_count": 0,
-                "index_bytes": 8, "scattered": False, "materialized_output": True})
+                "index_bytes": 8, "scattered": False, "materialized_output": True,
+                "symbolic_tensor_input_allocations": (source.view.allocation_id,),
+                "symbolic_tensor_output_allocations": (destination.view.allocation_id,)})
         return self.trace.call(node, (source,), shape=destination.shape, dtype=destination.dtype, out=destination)
 
 
+
+class SymbolicFillZero(SymbolicOperator):
+    """Typed zero writes into an existing source-owned view."""
+    def __call__(self, destination, *, controls=()):
+        self.trace._check_tensor(destination)
+        node = self.node(WorkloadKind.ELEMENTWISE, {"elements": prod(destination.shape)}, destination.dtype,
+            "elementwise", {"operation": "fill", "reads": 0, "writes": 1, "source_constant": 0})
+        return self.trace.call(node, (), shape=destination.shape, dtype=destination.dtype, out=destination, controls=controls)
+
 class SymbolicSiluAndMul(SymbolicOperator):
-    def __init__(self, trace, name, pool_name, *, swiglu_limit=None):
+    def __init__(self, trace, name, pool_name, *, swiglu_limit=None, model_execution_version=None):
         super().__init__(trace, name, pool_name)
         if swiglu_limit is not None and (type(swiglu_limit) not in (int, float)
                 or not isfinite(swiglu_limit) or swiglu_limit <= 0):
             raise ValueError("symbolic SwiGLU clamp must be finite and positive")
         self.swiglu_limit = swiglu_limit
+        if model_execution_version is not None and model_execution_version not in (
+                "vllm_0_11_0", "vllm_0_18_0", "vllm_0_24_0", "vllm_0_27_1", "vllm_0_30_0"):
+            raise ValueError("symbolic SiLU requires its declared model source version")
+        self.model_execution_version = model_execution_version
 
     def __call__(self, x):
         if x.shape[-1] % 2:
@@ -347,7 +389,10 @@ class SymbolicSiluAndMul(SymbolicOperator):
         width, rows = x.shape[-1] // 2, prod(x.shape[:-1])
         node = self.node(WorkloadKind.ACTIVATION,
             {"elements": rows * width, "tok": rows, "intermediate": width}, x.dtype, "silu",
-            {} if self.swiglu_limit is None else {"swiglu_limit": self.swiglu_limit})
+            {**({} if self.swiglu_limit is None else {"swiglu_limit": self.swiglu_limit}),
+             **({"model_execution_version": self.model_execution_version}
+                 if self.model_execution_version is not None else {}),
+             **({"source_input_layout": "contiguous"} if x.is_contiguous else {})})
         return self.trace.call(node, (x,), shape=(*x.shape[:-1], width), dtype=x.dtype)
 
 
@@ -461,10 +506,14 @@ class SymbolicRowParallelLinear:
         return output, bias
 
 
+VLLM030_GPU_MODEL_RUNNER_TOPK_CONTEXT = "vllm_0_30_gpu_model_runner_set_forward_context"
+
+
 class SymbolicSoftmaxTopK(SymbolicOperator):
     """vLLM FusedTopKRouter public tensors; no routing values are computed."""
 
-    def __init__(self, trace, name, pool_name, model, *, model_execution_version="vllm_0_30_0"):
+    def __init__(self, trace, name, pool_name, model, *, model_execution_version="vllm_0_30_0",
+                 source_forward_context=None):
         super().__init__(trace, name, pool_name)
         if model.model_type != "qwen3_moe" or type(model.moe_normalize_topk_probability) is not bool:
             raise ValueError("softmax top-k requires explicit Qwen3 MoE normalization semantics")
@@ -472,6 +521,10 @@ class SymbolicSoftmaxTopK(SymbolicOperator):
             raise NotImplementedError("softmax top-k requires its version-bound source program")
         self.model = model
         self.model_execution_version = model_execution_version
+        if source_forward_context is not None and (model_execution_version != "vllm_0_30_0"
+                or source_forward_context != VLLM030_GPU_MODEL_RUNNER_TOPK_CONTEXT):
+            raise ValueError("TopK padding context requires its exact version-bound runner source")
+        self.source_forward_context = source_forward_context
 
     def __call__(self, x, logits):
         model, rows = self.model, x.shape[0]
@@ -482,7 +535,15 @@ class SymbolicSoftmaxTopK(SymbolicOperator):
         source024 = self.model_execution_version == "vllm_0_24_0"
         source018 = self.model_execution_version == "vllm_0_18_0"
         if fp32_source:
-            logits = SymbolicFloat32Cast(self.trace, self.name + ":logits-float", self.pool_name)(logits)
+            logits = SymbolicFloat32Cast(self.trace, self.name + ":logits-float", self.pool_name)(
+                logits, vllm011_router_topk=model.num_experts_per_tok)
+        # GPUModelRunner.execute_model omits is_padding when setting the
+        # forward context; set_forward_context's source default is None.
+        # This is distinct from GPU-v2's gpu/model_runner.py row mask, and
+        # does not depend on the VLLM_MOE_SKIP_PADDING environment value.
+        context_inputs = ({} if self.source_forward_context is None else {
+            "source_topk_padding_mask_program": self.source_forward_context,
+            "source_topk_padding_mask": None})
         node = self.node(WorkloadKind.VECTOR, {"tokens": rows, "experts": model.num_experts,
             "topk": model.num_experts_per_tok, "hidden": model.hidden_size,
             "intermediate": model.moe_intermediate_size}, "fp32" if fp32_source else "bf16", "moe_topk", {
@@ -490,6 +551,7 @@ class SymbolicSoftmaxTopK(SymbolicOperator):
                 "source_program": "vllm_0_11_fp32_softmax_topk" if fp32_source else "vllm_0_18_bf16_softmax_topk" if source018 else "vllm_0_24_bf16_softmax_topk" if source024 else "vllm_0_30_bf16_softmax_topk",
                 "mathematical_program": "fp32_softmax_topk_flops_bytes_v1" if fp32_source else "bf16_softmax_topk_public_math_v1" if source024 or source018 else "bf16_softmax_topk_flops_bytes_v1",
                 "normalize_topk_probability": model.moe_normalize_topk_probability,
+                **context_inputs,
                 **({"stage": "route", "discarded_score_output_allocation_known": False} if source018 else {}),
                 **({"symbolic_workspace_complete": False} if source024 or source018 else {})})
         # fused_topk returns three allocations; _compute_routing discards the
@@ -545,10 +607,11 @@ class SymbolicExpertOwnerMask(SymbolicOperator):
 class SymbolicK3AttentionResidual(SymbolicOperator):
     """AttnRes's fresh output, prefix mutation and block-buffer alias."""
 
-    def __init__(self, trace, name, pool, model, *, blocks, write=-1, output_norm=True):
+    def __init__(self, trace, name, pool, model, *, blocks, write=-1, output_norm=True, capacity=None):
         super().__init__(trace, name, pool)
         self.width = model.hidden_size
-        self.capacity = -(-model.num_hidden_layers // model.kimi_k3_semantics.attention_residual_block_size)
+        self.capacity = (-(-model.num_hidden_layers // model.kimi_k3_semantics.attention_residual_block_size)
+            if capacity is None else capacity)
         self.blocks, self.write, self.output_norm = blocks, write, output_norm
 
     def __call__(self, prefix, delta, blocks):
@@ -557,7 +620,9 @@ class SymbolicK3AttentionResidual(SymbolicOperator):
                 or blocks.shape != (rows, self.capacity, self.width) or blocks.dtype != "bf16"
                 or not 0 <= self.blocks <= self.capacity or not -1 <= self.write < self.capacity
                 or (delta is not None and (delta.shape != prefix.shape or delta.dtype != prefix.dtype))):
-            raise ValueError("K3 AttnRes requires matching BF16 prefix/delta and block backing")
+            raise ValueError("K3 AttnRes requires matching BF16 prefix/delta and block backing: "
+                f"prefix={prefix.shape}/{prefix.dtype}, blocks={blocks.shape}/{blocks.dtype}, "
+                f"capacity={self.capacity}, num_blocks={self.blocks}, write={self.write}")
         node = self.node(WorkloadKind.VECTOR, {"rows": rows, "hidden": self.width,
             "elements": rows * self.width}, "bf16", "kimi_k3_attn_res", {
                 "source_component": "vllm_0_30_kimi_k3_attention_residual",
@@ -614,12 +679,34 @@ class SymbolicK3Routing(SymbolicOperator):
 
 
 class SymbolicK3Experts(SymbolicOperator):
-    def __init__(self, trace, name, pool, model, *, resolution, invocation_id, layer_index):
+    def __init__(self, trace, name, pool, model, *, resolution, invocation_id, layer_index,
+                 tp_size=1, tensor_rank=0, expert_parallel_size=1, data_parallel_size=1, data_rank=0):
         super().__init__(trace, name, pool)
         self.model, self.resolution, self.invocation_id = model, resolution, invocation_id
         self.module = f"language_model.model.layers.{layer_index}.block_sparse_moe.experts"
         if model.weight_dtype_for_module(self.module, "RoutedExperts") != "mxfp4":
             raise NotImplementedError("K3 symbolic experts require the checkpoint MXFP4 source branch")
+        if (type(tp_size) is not int or tp_size < 1 or model.moe_intermediate_size % tp_size
+                or type(tensor_rank) is not int or not 0 <= tensor_rank < tp_size
+                or type(data_parallel_size) is not int or data_parallel_size < 1
+                or type(data_rank) is not int or not 0 <= data_rank < data_parallel_size
+                or type(expert_parallel_size) is not int or expert_parallel_size not in (1, tp_size * data_parallel_size)
+                or model.num_experts % expert_parallel_size):
+            raise ValueError("K3 experts require whole logical TP intermediate shards and a valid lane")
+        from .shape_inference import infer_gemm_dimensions
+        self.intermediate = infer_gemm_dimensions(model, "experts.w2_weight", 1,
+            tp_size=tp_size if expert_parallel_size == 1 else 1)[2]
+        expert_tp = tp_size * data_parallel_size if expert_parallel_size == 1 else 1
+        if expert_parallel_size == 1:
+            if (model.moe_intermediate_size % expert_tp or self.intermediate % data_parallel_size
+                    or self.intermediate // data_parallel_size % 64):
+                raise ValueError("K3 DP experts require whole logical and physical intermediate shards")
+            self.intermediate //= data_parallel_size
+        self.tp_size, self.tensor_rank = tp_size, tensor_rank
+        self.data_size, self.data_rank, self.expert_tp = data_parallel_size, data_rank, expert_tp
+        self.ep_size = expert_parallel_size
+        self.expert_rank = 0 if expert_parallel_size == 1 else data_rank * tp_size + tensor_rank
+        self.owned = linear_expert_partition(model.num_experts, expert_parallel_size, self.expert_rank)
 
     def __call__(self, x, weights, ids):
         model, source, rows = self.model, self.model.kimi_k3_semantics, x.shape[0]
@@ -631,14 +718,23 @@ class SymbolicK3Experts(SymbolicOperator):
             raise ValueError("K3 experts require the latent, typed route outputs and a conserved explicit histogram")
         node = self.node(WorkloadKind.FUSED_MOE, {"tokens": rows, "experts": model.num_experts,
             "topk": model.num_experts_per_tok, "hidden": source.routed_expert_hidden_size,
-            "intermediate": model.moe_intermediate_size}, "bf16", "full", {
+            "intermediate": self.intermediate}, "bf16", "full", {
                 "source_component": "vllm_0_30_kimi_k3_marlin_experts", "module_path": self.module,
                 "moe_invocation_id": self.invocation_id, "routing_provenance": dict(self.resolution.routing_provenance),
-                "tokens_per_expert": counts, "local_tokens_per_expert": counts,
-                "expert_parallel_size": 1, "expert_rank": 0, "owned_experts": tuple(range(model.num_experts)),
+                "tokens_per_expert": counts,
+                "local_tokens_per_expert": tuple(count if expert in self.owned else 0 for expert, count in enumerate(counts)),
+                "expert_parallel_size": self.ep_size, "expert_rank": self.expert_rank, "owned_experts": self.owned,
                 "expert_weight_tile_rows": None, "activation_beta": source.activation_situ_beta,
                 "activation_linear_beta": source.activation_situ_linear_beta,
-                "routed_scaling_factor": model.routed_scaling_factor, "symbolic_workspace_complete": False})
+                "routed_scaling_factor": model.routed_scaling_factor, "symbolic_workspace_complete": False,
+                **({"tensor_parallel_size": self.tp_size,
+                    "source_tensor_parallel_rank": self.tensor_rank,
+                    "expert_tensor_parallel_size": self.expert_tp,
+                    "expert_tensor_rank": 0 if self.ep_size > 1 else self.data_rank * self.tp_size + self.tensor_rank,
+                    "logical_intermediate": model.moe_intermediate_size // self.expert_tp,
+                    "expert_output_is_reduced": False} if self.tp_size > 1 or self.data_size > 1 else {}),
+                **({"source_data_parallel_size": self.data_size, "source_data_parallel_rank": self.data_rank}
+                    if self.data_size > 1 else {})})
         return self.trace.call(node, (x, weights, ids), shape=x.shape, dtype=x.dtype)
 
 
@@ -661,23 +757,139 @@ class SymbolicK3Stage(SymbolicOperator):
             for role, layout, dt in workspace)
         return self.trace.call(node, inputs, shape=shape, dtype=dtype, out=out, writes=(*writes, *scratch), controls=controls)
 
+    def trace_vllm030_chunk_source_body(self, q, k, v, raw_gate, raw_beta, initial_state,
+            query_start, chunk_indices, chunk_offsets, final_state, *, source_spec, source_attributes):
+        """Explicit nine-submission KDA source storage; no automatic lowering.
+
+        Caller supplies actual cached metadata and the existing fresh final
+        target. Its earlier caller allocation is retained; this is not an
+        assertion of upstream allocator timing, compiler scratch or native ABI.
+        """
+        from src.kernel.kernel_spec import KernelSpec, KernelKind
+        from src.kernel.predictors.vector import (kimi_k3_kda_prefill_logical_work,
+            kimi_k3_kda_mixed_logical_work, kimi_k3_kda_context_prefill_logical_work)
+        owners = {"kimi_k3_kda_prefill": kimi_k3_kda_prefill_logical_work,
+            "kimi_k3_kda_mixed": kimi_k3_kda_mixed_logical_work,
+            "kimi_k3_kda_context_prefill": kimi_k3_kda_context_prefill_logical_work}
+        if (type(source_spec) is not KernelSpec or source_spec.kind is not KernelKind.VECTOR
+                or source_spec.hardware_id != "nvidia_h200" or source_spec.dtype != "bf16"
+                or source_spec.launch is not None or source_spec.variant not in owners
+                or source_spec.variant != self.variant or source_spec.attributes["stage"] != "chunk"
+                or any(source_spec.shape[name] != self.shape[name] for name in ("rows", "heads", "head_dim"))
+                or any(source_spec.attributes[name] != self.attributes[name] for name in
+                    ("stage", "state_indices", "state_pool_slots", "query_start_loc", "has_initial_state", "gate_lower_bound"))):
+            raise ValueError("KDA source body requires its exact existing unbound parent and caller")
+        logical = owners[source_spec.variant](source_spec)
+        rows, heads, dim = (source_spec.shape[name] for name in ("rows", "heads", "head_dim"))
+        lengths, chunks = logical["query_lengths"], logical["chunks"]
+        tensors = (q, k, v, raw_gate, raw_beta, initial_state, query_start, chunk_indices, chunk_offsets, final_state)
+        for tensor in tensors:
+            self.trace._check_tensor(tensor)
+        expected_indices = tuple((sequence, chunk) for sequence, length in enumerate(lengths)
+            for chunk in range((length + 63) // 64))
+        offsets = [0]
+        for length in lengths:
+            offsets.append(offsets[-1] + (length + 63) // 64)
+        expected = {"model_execution_version": "vllm_0_30_0",
+            "source_norm_backend": "l2norm_fwd_kernel2", "source_use_qk_l2norm_in_kernel": True,
+            "source_output_final_state": True, "source_out": "original_v",
+            "source_metadata_state": "cached_actual_cu_seqlens_identity",
+            "source_query_start_view_id": query_start.view.view_id,
+            "source_chunk_indices": expected_indices, "source_chunk_offsets": tuple(offsets)}
+        if (type(source_attributes) not in (dict, MappingProxyType) or set(source_attributes) != set(expected)
+                or any(type(source_attributes[name]) is not type(value) or source_attributes[name] != value
+                    for name, value in expected.items()) or source_spec.attributes["gate_lower_bound"] != -5):
+            raise ValueError("KDA source body requires explicit prepared safe-gate/norm/metadata caller facts")
+        dense = (1, rows, heads, dim)
+        if (any(tensor.shape != dense or tensor.dtype != "bf16" or not tensor.is_contiguous
+                for tensor in (q, k, v, raw_gate))
+                or raw_beta.shape != (1, rows, heads) or raw_beta.dtype != "bf16"
+                or initial_state.shape != (len(lengths), heads, dim, dim) or initial_state.dtype != "fp32"
+                or not initial_state.is_contiguous or final_state.shape != initial_state.shape
+                or final_state.dtype != "fp32" or not final_state.is_contiguous
+                or query_start.shape != (len(lengths) + 1,) or query_start.dtype != "int32"
+                or chunk_indices.shape != (chunks, 2) or chunk_indices.dtype != "int32"
+                or chunk_offsets.shape != (len(lengths) + 1,) or chunk_offsets.dtype != "int64"
+                or any(not tensor.is_contiguous for tensor in (query_start, chunk_indices, chunk_offsets))
+                or v.view.allocation_id in {tensor.view.allocation_id for tensor in tensors if tensor is not v}
+                or final_state.view.allocation_id in {tensor.view.allocation_id for tensor in tensors[:-1]}
+                or self.trace._writers[final_state.view.allocation_id] is not None
+                or self.trace._readers[final_state.view.allocation_id]):
+            raise ValueError("KDA source body requires exact dense source ports, cached typed metadata and fresh FP32 final target")
+        parent = {name: source_spec.attributes[name] for name in source_spec.attributes}
+        dynamic = {**parent, **source_attributes, "source_component": "symbolic_vllm030_kda_chunk_stage",
+            "source_parent_variant": self.variant, "source_parent_name": self.name,
+            "symbolic_workspace_complete": False, "source_native_memory_ABI_bound": False,
+            "source_compiler_resources_bound": False, "source_complete_worker_peak": False}
+
+        def node(role, dtype, reads, writes):
+            operator = SymbolicOperator(self.trace, self.name + ":" + role, self.pool_name)
+            regions = {"intra_sub_chunk": "Aqk_diagonal16_blocks_and_FP32_Akkd_live_rows",
+                "inter_solve": "Aqk_lower_off_diagonal16_blocks_and_Akk_lower_block_triangle"}
+            return operator.node(WorkloadKind.VECTOR, self.shape, dtype, "kda_chunk_" + role,
+                {**dynamic, "source_stage_role": role, "memory_input_roles": reads, "memory_output_roles": writes,
+                    **({"source_partial_write_regions": regions[role]} if role in regions else {})})
+
+        qn = self.trace.call(node("q_l2norm", "bf16", ("q",), ("q_normalized",)),
+            (q,), shape=dense, dtype="bf16")
+        kn = self.trace.call(node("k_l2norm", "bf16", ("k",), ("k_normalized",)),
+            (k,), shape=dense, dtype="bf16", controls=(qn,))
+        parameters = (self.trace.parameter_view(self.name + ":A_log", (heads,), "fp32"),
+            self.trace.parameter_view(self.name + ":dt_bias", (heads * dim,), "fp32"))
+        gate, beta = self.trace.call_outputs(node("gate_cumsum_beta", "fp32",
+            ("raw_gate", "raw_beta", "query_start", "chunk_indices", "A_log", "dt_bias"),
+            ("cumulative_gate_log2", "sigmoid_beta")), (raw_gate, raw_beta, query_start, chunk_indices),
+            outputs=(("gate", dense, "fp32"), ("beta", (1, rows, heads), "fp32")),
+            controls=(kn,), parameters=parameters)
+        Aqk = self.trace.tensor(self.trace.unique_name(self.name + ":Aqk"), (1, rows, heads, 64), "bf16")
+        Akk = self.trace.tensor(self.trace.unique_name(self.name + ":Akk"), Aqk.shape, "bf16")
+        Akkd = self.trace.tensor(self.trace.unique_name(self.name + ":Akkd"), (1, rows, heads, 16), "fp32")
+        self.trace.call(node("zero_Akk", "bf16", (), ("Akk",)), (),
+            shape=Akk.shape, dtype="bf16", out=Akk, controls=(gate, beta))
+        self.trace.call(node("intra_sub_chunk", "fp32",
+            ("q_normalized", "k_normalized", "gate", "beta", "query_start", "chunk_indices"), ("Akkd", "Aqk")),
+            (qn, kn, gate, beta, query_start, chunk_indices), shape=Akkd.shape, dtype="fp32",
+            out=Akkd, writes=(Aqk,), controls=(Akk,))
+        self.trace.call(node("inter_solve", "bf16",
+            ("q_normalized", "k_normalized", "gate", "beta", "Akkd", "query_start", "chunk_indices"), ("Akk", "Aqk")),
+            (qn, kn, gate, beta, Akkd, query_start, chunk_indices), shape=Akk.shape, dtype="bf16", out=Akk, writes=(Aqk,))
+        del Akkd
+        w, u, kg = self.trace.call_outputs(node("recompute_w_u", "bf16",
+            ("k_normalized", "v", "beta", "Akk", "gate", "query_start", "chunk_indices"), ("w", "u", "kg")),
+            (kn, v, beta, Akk, gate, query_start, chunk_indices),
+            outputs=(("w", dense, "bf16"), ("u", dense, "bf16"), ("kg", dense, "bf16")))
+        del Akk
+        h = self.trace.tensor(self.trace.unique_name(self.name + ":chunk_h"), (1, chunks, heads, dim, dim), "bf16")
+        v_new = self.trace.tensor(self.trace.unique_name(self.name + ":v_new"), dense, "bf16")
+        self.trace.call(node("state", "bf16",
+            ("kg", "w", "u", "gate", "initial_state", "query_start", "chunk_offsets"), ("chunk_h", "v_new", "final_state")),
+            (kg, w, u, gate, initial_state, query_start, chunk_offsets), shape=h.shape, dtype="bf16",
+            out=h, writes=(v_new, final_state))
+        del w, u, kg
+        output = self.trace.call(node("output", "bf16",
+            ("q_normalized", "v_new", "gate", "chunk_h", "Aqk", "query_start", "chunk_indices"), ("output_original_v",)),
+            (qn, v_new, gate, h, Aqk, query_start, chunk_indices), shape=dense, dtype="bf16", out=v)
+        return output, final_state
+
+
 
 def unquantized_expert_source_metadata(model, resolution, invocation_id, *, rows,
         expert_parallel_size, expert_rank):
     """Pure current histogram/placement metadata shared by source and binder."""
     from .runtime_inputs import ExpertRoutingResolution
     if (not isinstance(resolution, ExpertRoutingResolution) or type(rows) is not int or rows <= 0
-            or type(expert_parallel_size) is not int or expert_parallel_size not in (1, 2)
-            or type(expert_rank) is not int or not 0 <= expert_rank < expert_parallel_size
-            or model.num_experts % expert_parallel_size):
+            or type(expert_parallel_size) is not int or expert_parallel_size < 1
+            or type(expert_rank) is not int or not 0 <= expert_rank < expert_parallel_size):
         raise ValueError("expert source metadata requires its typed routing and placement")
     counts = resolution.tokens_per_expert
     if len(counts) != model.num_experts or sum(counts) != rows * model.num_experts_per_tok:
-        raise ValueError("expert histogram must conserve every top-k assignment")
+        raise ValueError("expert histogram must conserve every top-k assignment: "
+            f"invocation={invocation_id!r}, rows={rows}, topk={model.num_experts_per_tok}, "
+            f"experts={len(counts)}, assignments={sum(counts)}, "
+            f"provenance={dict(resolution.routing_provenance)!r}")
     placement = {}
     if expert_parallel_size > 1:
-        per_rank = model.num_experts // expert_parallel_size
-        owned = tuple(range(expert_rank * per_rank, (expert_rank + 1) * per_rank))
+        owned = linear_expert_partition(model.num_experts, expert_parallel_size, expert_rank)
         local_counts = [0] * len(counts)
         for expert in owned:
             local_counts[expert] = counts[expert]
@@ -696,10 +908,9 @@ class SymbolicUnquantizedExperts(SymbolicOperator):
         super().__init__(trace, name, pool_name)
         if (model.compute_dtype != "bf16" or model.weight_dtype != "bf16"
                 or type(tp_size) is not int or tp_size < 1
-                or type(expert_parallel_size) is not int or expert_parallel_size not in (1, 2)
+                or type(expert_parallel_size) is not int or expert_parallel_size < 1
                 or (expert_parallel_size > 1 and expert_parallel_size != tp_size)
                 or model.moe_intermediate_size * expert_parallel_size % tp_size
-                or model.num_experts % expert_parallel_size
                 or type(expert_rank) is not int or not 0 <= expert_rank < expert_parallel_size
                 or not isinstance(resolution, ExpertRoutingResolution) or type(inplace) is not bool
                 or routing_weight_dtype not in ("bf16", "fp32")):
@@ -707,6 +918,8 @@ class SymbolicUnquantizedExperts(SymbolicOperator):
         if model_execution_version not in ("vllm_0_11_0", "vllm_0_18_0", "vllm_0_24_0", "vllm_0_30_0"):
             raise ValueError("unquantized expert parameter source requires its execution version")
         self.model_execution_version = model_execution_version
+        if model_execution_version != "vllm_0_30_0" and (expert_parallel_size not in (1, 2) or model.num_experts % expert_parallel_size):
+            raise NotImplementedError("other model versions retain their existing EP1/EP2 source domain")
         self.model, self.tp_size, self.resolution, self.invocation_id = model, tp_size, resolution, invocation_id
         self.ep_size, self.ep_rank = expert_parallel_size, expert_rank
         self.inplace = inplace
@@ -734,7 +947,12 @@ class SymbolicUnquantizedExperts(SymbolicOperator):
         # UnquantizedFusedMoEMethod.create_weights declares these persistent
         # public parameters. A backend-formatted representation is a separate
         # callee fact; this trace does not infer one or invent its workspace.
-        local_experts = model.num_experts // self.ep_size
+        local_experts = len(linear_expert_partition(model.num_experts, self.ep_size, self.ep_rank))
+        if not local_experts:
+            node = node.with_attributes({**node.attributes,
+                "memory_input_roles": ("hidden_states", "routing_weights", "expert_ids"),
+                "symbolic_zero_extent_parameter_roles": ("w13_weight", "w2_weight")})
+            return self.trace.call(node, (x, weights, ids), shape=x.shape, dtype=x.dtype)
         intermediate = model.moe_intermediate_size * self.ep_size // self.tp_size
         parameters = (
             self.trace.parameter_view(self.name + ":w13_weight",
@@ -793,31 +1011,45 @@ class SymbolicRoutedExperts(SymbolicOperator):
     """
 
     def __init__(self, trace, name, pool_name, model, *, layer_index, tp_size, resolution, invocation_id, routing_source_stage,
-                 expert_parallel_size=1, expert_rank=0):
+                 expert_parallel_size=1, expert_rank=0, pcp_source=False, expert_tp_size=None):
         from .runtime_inputs import ExpertRoutingResolution
         super().__init__(trace, name, pool_name)
         stage = {"glm_moe_dsa": "dsv32_moe_route", "kimi_k2": "kimi_moe_route"}
         if (model.model_type not in stage or model.compute_dtype != "bf16" or type(tp_size) is not int
-                or tp_size <= 0 or model.moe_intermediate_size % tp_size
+                or tp_size <= 0 or (expert_parallel_size == 1 and model.moe_intermediate_size % tp_size)
                 or routing_source_stage != stage[model.model_type]):
             raise NotImplementedError("symbolic grouped experts require BF16-compute TP shards and explicit grouped routing")
+        expert_tp = (tp_size if expert_parallel_size == 1 else 1) if expert_tp_size is None else expert_tp_size
+        if (type(expert_tp) is not int or expert_tp < 1 or model.moe_intermediate_size % expert_tp
+                or (expert_parallel_size > 1 and expert_tp != 1)
+                or (expert_tp_size is not None and model.model_type != "kimi_k2")
+                or (model.model_type == "kimi_k2" and model.moe_intermediate_size // expert_tp % model.weight_group_size)):
+            raise ValueError("expert tensor shards must preserve the exact checkpoint quantization groups")
         ordinary = type(layer_index) is int and 0 <= layer_index < model.num_hidden_layers and model.layer_uses_moe(layer_index)
         appended_glm = (type(layer_index) is int and layer_index == model.num_hidden_layers
             and model.model_type == "glm_moe_dsa" and model.mtp_architecture == "glm_moe_dsa_mtp"
             and model.num_mtp_layers == 1 and model.mtp_layer_uses_moe(0))
         if not ordinary and not appended_glm:
             raise ValueError("symbolic experts require an accurate checkpoint MoE layer")
+        if type(pcp_source) is not bool or (pcp_source and model.model_type != "glm_moe_dsa"):
+            raise ValueError("PCP routed expert source requires an explicit GLM source")
         if (type(expert_parallel_size) is not int or type(expert_rank) is not int
-                or expert_parallel_size not in (1, 8) or not 0 <= expert_rank < expert_parallel_size
-                or (expert_parallel_size == 8 and (model.model_type not in ("kimi_k2", "glm_moe_dsa") or tp_size != 8))
-                or model.num_experts % expert_parallel_size):
+                or expert_parallel_size < 1 or not 0 <= expert_rank < expert_parallel_size
+                or (not pcp_source and not (model.model_type == "glm_moe_dsa" and (model.weight_dtype == "bf16"
+                        or model.weight_dtype == "fp8" and model.num_experts % expert_parallel_size == 0))
+                    and not (model.model_type == "kimi_k2" and (expert_parallel_size in (1, tp_size) or expert_tp_size is not None)
+                        and model.num_experts % expert_parallel_size == 0)
+                    and (expert_parallel_size not in (1, 8)
+                    or (expert_parallel_size == 8 and (model.model_type not in ("kimi_k2", "glm_moe_dsa") or tp_size != 8))
+                    or model.num_experts % expert_parallel_size))):
             raise ValueError("symbolic experts require EP1 or GLM/K2.6 TP=EP8 with linear expert ownership")
         if not isinstance(resolution, ExpertRoutingResolution) or not isinstance(invocation_id, str) or not invocation_id:
             raise ValueError("symbolic grouped experts require explicit normalized routing and invocation identity")
         self.model, self.tp_size, self.resolution = model, tp_size, resolution
+        self.expert_tp_size = expert_tp
         self.expert_parallel_size, self.expert_rank = expert_parallel_size, expert_rank
-        owned_count = model.num_experts // expert_parallel_size
-        self.owned_experts = tuple(range(expert_rank * owned_count, (expert_rank + 1) * owned_count))
+        from src.kernel.kernel_spec import linear_expert_partition
+        self.owned_experts = linear_expert_partition(model.num_experts, expert_parallel_size, expert_rank)
         root = "language_model.model" if model.model_type == "kimi_k2" else "model"
         self.weight_dtype = model.weight_dtype_for_module(f"{root}.layers.{layer_index}.mlp.experts.0.gate_proj", "Linear")
         if self.weight_dtype not in ("bf16", "fp8", "int4"):
@@ -825,41 +1057,80 @@ class SymbolicRoutedExperts(SymbolicOperator):
         self.group_size = model.weight_group_size if self.weight_dtype == "int4" else 0
         self.invocation_id, self.routing_source_stage = invocation_id, routing_source_stage
 
+    def routing_metadata(self, rows):
+        """Current physical routing fields, also consumed by source binding."""
+        counts, model = self.resolution.tokens_per_expert, self.model
+        if len(counts) != model.num_experts or sum(counts) != rows * model.num_experts_per_tok:
+            raise ValueError("expert histogram must conserve all token/top-k assignments")
+        return {"tokens_per_expert": counts,
+            "local_tokens_per_expert": (counts if self.expert_parallel_size == 1 else
+                tuple(count if expert in self.owned_experts else 0 for expert, count in enumerate(counts))),
+            "moe_invocation_id": self.invocation_id,
+            "routing_provenance": dict(self.resolution.routing_provenance)}
+
     def __call__(self, x, weights, ids):
         model, rows = self.model, x.shape[0]
         if (x.shape != (rows, model.hidden_size) or x.dtype != "bf16"
                 or weights.shape != (rows, model.num_experts_per_tok) or weights.dtype != "fp32"
                 or ids.shape != weights.shape or ids.dtype != "int32"):
             raise ValueError("modular experts require BF16 hidden, FP32 weights and INT32 IDs")
-        counts = self.resolution.tokens_per_expert
-        if len(counts) != model.num_experts or sum(counts) != rows * model.num_experts_per_tok:
-            raise ValueError("expert histogram must conserve all token/top-k assignments")
+        routing = self.routing_metadata(rows)
         node = self.node(WorkloadKind.FUSED_MOE, {"tokens": rows, "experts": model.num_experts,
             "topk": model.num_experts_per_tok, "hidden": model.hidden_size,
-            "intermediate": model.moe_intermediate_size // (self.tp_size if self.expert_parallel_size == 1 else 1)}, "bf16", "full", {
+            "intermediate": model.moe_intermediate_size // self.expert_tp_size}, "bf16", "full", {
                 "source_component": "symbolic_grouped_routed_experts", "expert_parallel_size": self.expert_parallel_size, "expert_rank": self.expert_rank,
-                "owned_experts": self.owned_experts, "tokens_per_expert": counts,
-                "local_tokens_per_expert": tuple(count if expert in self.owned_experts else 0
-                    for expert, count in enumerate(counts)), "expert_placement_strategy": "linear",
-                "moe_invocation_id": self.invocation_id, "output_is_reduced": False,
+                "owned_experts": self.owned_experts, **routing, "expert_placement_strategy": "linear",
+                "output_is_reduced": False,
                 "routed_scaling_factor": 1.0 if model.model_type == "kimi_k2" else model.routed_scaling_factor,
                 "routed_weight_dtype": self.weight_dtype,
                 "checkpoint_weight_dtype": self.weight_dtype,
                 "weight_group_size": self.group_size, "routing_source_stage": self.routing_source_stage,
-                "routing_provenance": dict(self.resolution.routing_provenance), "symbolic_workspace_complete": False})
+                "symbolic_workspace_complete": False})
+        if not self.owned_experts:
+            # An empty linear EP owner still participates in the real routed
+            # combine. Reuse the public zero-contribution contract: there are
+            # no parameter allocations, and lowering prices an output fill.
+            if self.weight_dtype != "bf16":
+                raise NotImplementedError("empty grouped expert source requires the BF16 public parameter layout")
+            node = node.with_attributes({**node.attributes,
+                "model_execution_version": "vllm_0_30_0",
+                "memory_input_roles": ("hidden_states", "routing_weights", "expert_ids"),
+                "memory_output_roles": ("output",),
+                "expert_parameter_layout": "unquantized_checkpoint_expert_major_nk",
+                "symbolic_zero_extent_parameter_roles": ("w13_weight", "w2_weight")})
         return self.trace.call(node, (x, weights, ids), shape=x.shape, dtype=x.dtype)
+
+
+def _v4_source_block_geometry(model, tp_size, *, expert_parallel):
+    """Low-level shared blocks admit the separate, validated draft geometry."""
+    from .model_config import ModelConfig
+    if not isinstance(model, ModelConfig):
+        return False
+    if model.is_dspark_draft:
+        from src.serving.parallelism.parallel_config import ParallelConfig
+        from src.serving.parallelism.tp import validate_dspark_parallelism
+        # Shared/insert callers ask about full-expert geometry even for TP1;
+        # the enclosing standalone entry separately validates its actual EP flag.
+        validate_dspark_parallelism(model, ParallelConfig(tensor_parallel_size=tp_size,
+            enable_expert_parallel=expert_parallel and tp_size > 1))
+        return True
+    return is_deepseek_v4_parallel_model_scope(model, tp_size, 1, expert_parallel=expert_parallel)
 
 
 class SymbolicV4Routing(SymbolicOperator):
     """Pure-text modular top6 source; no logits or hash table are evaluated."""
 
-    def __init__(self, trace, name, pool_name, model, *, layer_index):
+    def __init__(self, trace, name, pool_name, model, *, layer_index, valid_rows=None):
         super().__init__(trace, name, pool_name)
         if model.model_type != "deepseek_v4" or model.num_experts_per_tok != 6:
             raise NotImplementedError("symbolic V4 routing requires the checkpoint pure-text top6 source")
-        if type(layer_index) is not int or not 0 <= layer_index < model.num_hidden_layers:
-            raise ValueError("symbolic routing layer must belong to the target model")
+        layers = model.dspark_layer_indices if model.is_dspark_draft else range(model.num_hidden_layers)
+        if type(layer_index) is not int or layer_index not in layers:
+            raise ValueError("symbolic routing layer must belong to its actual target or draft model")
         self.model, self.layer_index = model, layer_index
+        if valid_rows is not None and (type(valid_rows) is not int or valid_rows < 0 or layer_index >= model.num_hash_layers):
+            raise ValueError("V4 padding-mask source is restricted to hash routing with an explicit valid-row prefix")
+        self.valid_rows = valid_rows
 
     def __call__(self, hidden_states, router_logits, input_ids):
         model, rows = self.model, hidden_states.shape[0]
@@ -872,13 +1143,23 @@ class SymbolicV4Routing(SymbolicOperator):
                 or input_ids is None or input_ids.shape != (rows,) or input_ids.dtype != "int32"):
             raise ValueError("V4 modular routing requires BF16 hidden, FP32 logits and INT32 token IDs")
         hashed = self.layer_index < model.num_hash_layers
+        padding = None
+        if self.valid_rows is not None:
+            if self.valid_rows > rows:
+                raise ValueError("V4 valid routing rows cannot exceed the physical SP shard")
+            padding = self.trace.tensor(self.trace.unique_name(self.name + ":padding-mask"), (rows,), "bool")
         node = self.node(WorkloadKind.VECTOR, {"elements": rows * model.num_experts,
             "rows": rows, "experts": model.num_experts, "topk": 6}, "fp32", "dsv4_moe_route", {
                 "source_component": "vllm_0_30_symbolic_v4_routing",
                 "expert_id_selection": "hash_table" if hashed else "score_topk",
                 "routed_scaling_factor": model.routed_scaling_factor,
+                **({"symbolic_padding_valid_prefix": self.valid_rows,
+                    "source_padding_expert_ids": -1, "source_padding_weights": 0} if padding is not None else {}),
                 "routing_source": "vllm_0_30_cuda_hash_top6_pure_text" if hashed else "vllm_0_30_triton_top6_pure_text"})
-        return self.trace.call_outputs(node, (router_logits, input_ids) if hashed else (router_logits,), outputs=(
+        inputs = (router_logits, input_ids) if hashed else (router_logits,)
+        if padding is not None:
+            inputs += (padding,)
+        return self.trace.call_outputs(node, inputs, outputs=(
             ("topk_weights", (rows, 6), "fp32"), ("topk_ids", (rows, 6), "int32")),
             workspace=(("token_expert_indices", (rows, 6), "int32"),) if hashed else ())
 
@@ -892,19 +1173,26 @@ class SymbolicDSANormRope(SymbolicOperator):
     """
 
     def __init__(self, trace, name, pool_name, model, *, has_indexer, cache, index_cache,
-                 topk_buffer, rotary_cache, index_rotary_cache, slot_mapping):
+                 topk_buffer, rotary_cache, index_rotary_cache, slot_mapping, outputs_only=False, no_metadata=False):
         super().__init__(trace, name, pool_name)
         if model.model_type != "glm_moe_dsa" or type(has_indexer) is not bool:
             raise NotImplementedError("symbolic DSA fused norm requires GLM and an explicit indexer branch")
-        if has_indexer != (index_cache is not None):
+        if type(outputs_only) is not bool:
+            raise TypeError("DSA outputs-only mode must be an explicit boolean")
+        if type(no_metadata) is not bool or no_metadata and not outputs_only:
+            raise ValueError("DSA metadata=None must explicitly omit all cache and slot pointers")
+        self.no_metadata = no_metadata
+        if outputs_only and any(value is not None for value in (cache, index_cache, slot_mapping)):
+            raise ValueError("PCP norm outputs-only branch must not receive cache or slot pointers")
+        if not outputs_only and has_indexer != (index_cache is not None):
             raise ValueError("DSA full indexer requires its cache and shared layers must not insert into it")
-        for tensor in (cache, topk_buffer, rotary_cache, index_rotary_cache, slot_mapping):
+        for tensor in (topk_buffer, rotary_cache, index_rotary_cache, *((cache, slot_mapping) if not outputs_only else ())):
             trace._check_tensor(tensor)
-        if (len(cache.shape) != 2 or cache.dtype != "bf16"
+        if ((not outputs_only and (len(cache.shape) != 2 or cache.dtype != "bf16"
                 or cache.shape[-1] != model.kv_lora_rank + model.qk_rope_head_dim
+                or len(slot_mapping.shape) != 1 or slot_mapping.dtype != "int64"))
                 or len(topk_buffer.shape) != 2 or topk_buffer.dtype != "int32"
                 or topk_buffer.shape[-1] != model.index_topk
-                or len(slot_mapping.shape) != 1 or slot_mapping.dtype != "int64"
                 or any(len(table.shape) != 2 or table.dtype != "bf16"
                     or table.shape[-1] != model.qk_rope_head_dim for table in (rotary_cache, index_rotary_cache))):
             raise ValueError("DSA fused norm requires typed MLA cache, top-k, RoPE and slot metadata")
@@ -914,27 +1202,39 @@ class SymbolicDSANormRope(SymbolicOperator):
                     or index_cache.shape[-1] != model.index_head_dim + model.index_head_dim // 128 * 4):
                 raise ValueError("DSA index cache requires FP8 values and per-group FP32 scale backing")
         self.model, self.has_indexer = model, has_indexer
+        self.outputs_only = outputs_only
         self.cache, self.index_cache, self.topk_buffer = cache, index_cache, topk_buffer
         self.rotary_cache, self.index_rotary_cache, self.slot_mapping = rotary_cache, index_rotary_cache, slot_mapping
 
-    def __call__(self, positions, q_c, kv_c, k_pe, index_k, *, kv_c_out, k_pe_out):
+    def __call__(self, positions, q_c, kv_c, k_pe, index_k, *, kv_c_out, k_pe_out, index_k_out=None):
         model, rows = self.model, positions.shape[0]
         if ((q_c.shape, kv_c.shape, k_pe.shape) != ((rows, model.q_lora_rank),
                 (rows, model.kv_lora_rank), (rows, model.qk_rope_head_dim))
                 or any(x.dtype != "bf16" for x in (q_c, kv_c, k_pe, kv_c_out, k_pe_out))
                 or kv_c_out.shape != kv_c.shape or k_pe_out.shape != k_pe.shape
-                or positions.dtype != "int64" or self.slot_mapping.shape != (rows,)
-                or self.slot_mapping.dtype != "int64" or self.topk_buffer.shape[0] < rows):
+                or positions.dtype != "int64" or (not self.outputs_only and self.slot_mapping.shape != (rows,))
+                or self.topk_buffer.shape[0] < rows):
             raise ValueError("DSA fused norm inputs/outputs disagree with the declared BF16 source")
-        inputs = (positions, q_c, kv_c, k_pe, self.rotary_cache, self.slot_mapping)
-        writes = (kv_c_out, k_pe_out, self.cache)
+        inputs = (positions, q_c, kv_c, k_pe, self.rotary_cache, *((self.slot_mapping,) if not self.outputs_only else ()))
+        writes = (kv_c_out, k_pe_out, *((self.cache,) if not self.outputs_only else ()))
         if self.has_indexer:
             if index_k is None or index_k.shape != (rows, model.index_head_dim) or index_k.dtype != "bf16":
                 raise ValueError("DSA full indexer requires BF16 index K")
             inputs += (index_k, self.index_rotary_cache)
-            writes += (self.index_cache, self.topk_buffer)
+            if self.outputs_only:
+                if self.no_metadata and index_k_out is not None:
+                    raise ValueError("CP1 metadata=None norm cannot invent a PCP index-K output")
+                if not self.no_metadata and (index_k_out is None or index_k_out.shape != index_k.shape or index_k_out.dtype != "bf16"):
+                    raise ValueError("PCP indexer normalization requires its real BF16 gathered-key output")
+                writes += ((self.topk_buffer.narrow(0, 0, rows),) if self.no_metadata else (index_k_out, self.topk_buffer))
+            else:
+                if index_k_out is not None:
+                    raise ValueError("cache-writing norm cannot invent a separate index-K output")
+                writes += (self.index_cache, self.topk_buffer)
         elif index_k is not None:
             raise ValueError("shared DSA layer must not run indexer K norm/cache insertion")
+        elif index_k_out is not None:
+            raise ValueError("shared DSA layer must not invent an index-K output")
         node = self.node(WorkloadKind.VECTOR, {"rows": rows, "q_hidden": model.q_lora_rank,
             "kv_hidden": model.kv_lora_rank, "rope_dim": model.qk_rope_head_dim,
             "index_dim": model.index_head_dim, "topk": model.index_topk, "dtype_bytes": 2,
@@ -942,7 +1242,11 @@ class SymbolicDSANormRope(SymbolicOperator):
             "bf16", "dsv32_fused_norm_rope", {
                 "source_component": "vllm_0_30_symbolic_dsa", "has_indexer": self.has_indexer,
                 "index_rope_interleave": model.target_semantics.indexer_rope_layout == "interleaved",
-                "mla_cache_dtype": "bf16", "cache_slot_scope": "all_rows_valid_slots_projection"})
+                "mla_cache_dtype": "bf16", "cache_slot_scope": (
+                    "no_metadata_no_cache_slots" if self.no_metadata else
+                    "outputs_only_no_cache_slots" if self.outputs_only else "all_rows_valid_slots_projection"),
+                **({"source_no_attention_metadata": True, "index_k_output_present": False,
+                    "topk_active_fill": -1 if self.has_indexer else None} if self.no_metadata else {})})
         return self.trace.call(node, inputs, shape=q_c.shape, dtype="bf16", writes=writes)
 
 
@@ -1175,18 +1479,29 @@ class SymbolicMLACacheUpdate(SymbolicOperator):
         super().__init__(trace, name, pool)
         trace._check_tensor(cache)
         trace._check_tensor(slot_mapping)
+        # Native tuples with native integer elements cannot change after the
+        # first successful constructor. Identity avoids bool/float equality
+        # collisions; capacity and dummy-tail policy remain part of the proof.
+        cacheable = (type(trace) is ForwardTrace and type(slots) is tuple and len(slots) > 1
+            and type(sglang_dummy_rows) is int and len(cache.shape) == 2
+            and type(cache.shape[0]) is int)
+        proved = (cacheable and trace._has_mla_slot_proof(
+            slots, cache.shape[0], sglang_dummy_rows))
         if (any(type(width) is not int or width <= 0 for width in (latent_dim, rope_dim))
                 or cache.dtype != "bf16" or len(cache.shape) != 2 or cache.shape[-1] != latent_dim + rope_dim
                 or not isinstance(slots, tuple) or not slots
-                or any(type(slot) is not int or not 0 <= slot < cache.shape[0] for slot in slots)
+                or (not proved and any(type(slot) is not int or not 0 <= slot < cache.shape[0] for slot in slots))
                 or slot_mapping.shape != (len(slots),) or slot_mapping.dtype != "int64"):
             raise ValueError("MLA cache update requires BF16 latent/RoPE storage and distinct declared INT64 slots")
         if type(sglang_dummy_rows) is not int or not 0 <= sglang_dummy_rows < len(slots):
             raise ValueError("SGLang graph cache update requires a bounded explicit dummy-row count")
-        active = slots[:-sglang_dummy_rows] if sglang_dummy_rows else slots
-        if (len(set(active)) != len(active) or (sglang_dummy_rows and (
-                slots[-sglang_dummy_rows:] != (0,) * sglang_dummy_rows or 0 in active))):
-            raise ValueError("MLA cache slots must be distinct except declared SGLang dummy tail writes to reserved0")
+        if not proved:
+            active = slots[:-sglang_dummy_rows] if sglang_dummy_rows else slots
+            if (len(set(active)) != len(active) or (sglang_dummy_rows and (
+                    slots[-sglang_dummy_rows:] != (0,) * sglang_dummy_rows or 0 in active))):
+                raise ValueError("MLA cache slots must be distinct except declared SGLang dummy tail writes to reserved0")
+            if cacheable:
+                trace._remember_mla_slot_proof(slots, cache.shape[0], sglang_dummy_rows)
         self.cache, self.slot_mapping, self.slots = cache, slot_mapping, slots
         self.sglang_dummy_rows = sglang_dummy_rows
         self.latent_dim, self.rope_dim = latent_dim, rope_dim
@@ -1208,6 +1523,34 @@ class SymbolicMLACacheUpdate(SymbolicOperator):
                     if self.sglang_dummy_rows else {}),
                 "slot_mapping_scope": "declared_logical_pool_not_native_pages"})
         self.trace.call(node, (latent, rope, self.slot_mapping), shape=self.cache.shape, dtype="bf16", out=self.cache)
+
+
+class SymbolicDSAIndexCacheUpdate(SymbolicOperator):
+    """PCP's separate BF16 index K quantize/cache insert, with real slots."""
+
+    def __init__(self, trace, name, pool, cache, slot_mapping, *, slots, key_dim=128):
+        super().__init__(trace, name, pool)
+        for tensor in (cache, slot_mapping):
+            trace._check_tensor(tensor)
+        if (key_dim != 128 or cache.dtype != "uint8" or len(cache.shape) != 2 or cache.shape[1] != 132
+                or not isinstance(slots, tuple) or not slots or len(set(slots)) != len(slots)
+                or any(type(slot) is not int or not 0 <= slot < cache.shape[0] for slot in slots)
+                or slot_mapping.dtype != "int64" or slot_mapping.shape != (len(slots),)):
+            raise ValueError("PCP index-cache insert requires actual BF16-128 keys and distinct valid slots")
+        self.cache, self.slot_mapping, self.slots, self.key_dim = cache, slot_mapping, slots, key_dim
+
+    def __call__(self, key):
+        rows = len(self.slots)
+        self.trace._check_tensor(key)
+        if key.shape != (rows, self.key_dim) or key.dtype != "bf16":
+            raise ValueError("PCP index insert requires matching normalized BF16 rows")
+        node = self.node(WorkloadKind.KV_UPDATE,
+            {"elements": rows * 132, "seq_len": rows, "key_dim": self.key_dim, "scale_bytes_per_token": 4},
+            "uint8", "dsa_fp8_index_cache", {"source_component": "symbolic_dsa_index_cache_update",
+                "cache_layout": "paged_mla_indexer", "cache_write_semantics": "append",
+                "quantization": "fp8_e4m3_with_ue8m0_scale", "symbolic_slot_mapping": self.slots,
+                "slot_mapping_scope": "declared_logical_pool_not_native_pages"})
+        self.trace.call(node, (key, self.slot_mapping), shape=self.cache.shape, dtype="uint8", out=self.cache)
 
 
 class SymbolicMLALatentDecode(SymbolicOperator):
@@ -1255,6 +1598,11 @@ class SymbolicMLALatentDecode(SymbolicOperator):
             raise ValueError("MLA cache backing must cover active contexts and any reserved dummy slot0")
         self.heads, self.kv_lens, self.cache, self.q_lens = heads, kv_lens, cache, queries
         self.sglang_dummy_rows = sglang_dummy_rows
+        self.launch_source_identity = {
+            "vllm_0_27_1_causal_flashmla_bf16_source": ("vllm_0_27_1", "vllm_0_27_1_cmake_pin"),
+            "vllm_0_30_causal_flashmla_bf16_source": ("vllm_0_30_0", "vllm_0_30_cmake_pin"),
+        }[source_profile] if source_profile in (
+            "vllm_0_27_1_causal_flashmla_bf16_source", "vllm_0_30_causal_flashmla_bf16_source") else None
 
     def __call__(self, query, *, public_output_rows=None):
         self.trace._check_tensor(query)
@@ -1268,6 +1616,10 @@ class SymbolicMLALatentDecode(SymbolicOperator):
             "kv_len": max(self.kv_lens), "num_query_heads": self.heads,
             "qk_head_dim": 576, "v_head_dim": 512, "kv_lora_rank": 512}, "bf16", "mla_decode", {
                 "source_component": "symbolic_mla_decode_mathematical", "causal": True,
+                "source_query_dtype": query.dtype, "source_cache_dtype": self.cache.dtype,
+                "source_query_shape": query.shape, "source_cache_shape": self.cache.shape,
+                **({"source_flashmla_launch_identity": self.launch_source_identity}
+                    if self.launch_source_identity is not None else {}),
                 "kv_layout": "mla", "kv_dist": "uniform", "q_lens": self.q_lens, "kv_lens": self.kv_lens,
                 "full_cuda_graphs": False, "max_cudagraph_capture_size": 0,
                 **({"source_graph_padding_program": "vllm_0_30_full_mla",
@@ -1301,7 +1653,7 @@ class SymbolicDSASparseAttention(SymbolicOperator):
 
     def __init__(self, trace, name, pool_name, model, *, tp_size, q_lens, kv_lens, request_phases,
                  cache, topk_buffer, indexer_type, selection_source, prefill_attention_source=None,
-                 num_speculative_tokens=0, reused_selection_kv_lens=None):
+                 num_speculative_tokens=0, reused_selection_kv_lens=None, pcp_source=False):
         super().__init__(trace, name, pool_name)
         self.phase = _dsa_source_phase(q_lens, kv_lens, request_phases, prefill_attention_source, num_speculative_tokens)
         self.phases = request_phases
@@ -1313,7 +1665,13 @@ class SymbolicDSASparseAttention(SymbolicOperator):
                     for old, current in zip(reused_selection_kv_lens, kv_lens))):
             raise ValueError("DSA reused selection requires shared q1 and explicit prior causal KV lengths")
         self.reused_selection_kv_lens = reused_selection_kv_lens
-        if (model.model_type != "glm_moe_dsa" or type(tp_size) is not int or tp_size not in (1, 8) or indexer_type not in ("full", "shared")
+        if type(pcp_source) is not bool:
+            raise TypeError("PCP sparse source flag must be boolean")
+        if (model.model_type != "glm_moe_dsa" or type(tp_size) is not int or tp_size < 1
+                or model.num_attention_heads % tp_size
+                or (tp_size not in (1, 8) and not pcp_source and model.weight_dtype != "bf16"
+                    and not is_glm_fp8_tensor_model_scope(model, tp_size))
+                or indexer_type not in ("full", "shared")
                 or selection_source != "declared_causal_topk"):
             raise NotImplementedError("DSA sparse source requires GLM TP1/TP8 and explicit selected-cardinality applicability")
         if not isinstance(kv_lens, tuple) or not kv_lens or any(type(length) is not int or length <= 0 for length in kv_lens):
@@ -1362,6 +1720,8 @@ class SymbolicDSASparseAttention(SymbolicOperator):
             "num_query_heads": self.heads, "qk_head_dim": width, "v_head_dim": model.kv_lora_rank,
             "dtype_bytes": 2, "topk": max(selected)}, "bf16", "dsa_sparse_" + phase, {
                 "source_component": "vllm_0_30_symbolic_dsa_sparse", "causal": True,
+                "source_query_strides_bytes": query.view.strides_bytes,
+                "source_query_offset_bytes": query.view.offset_bytes,
                 "indexer_type": self.indexer_type, "kv_layout": "mla", "kv_dist": "uniform",
                 "q_lens": q_lens, "kv_lens": kv_lens,
                 "selected_kv_lens": selected,
@@ -1375,6 +1735,9 @@ class SymbolicDSASparseAttention(SymbolicOperator):
                     if phase != "decode" else {}),
                 "backend_index_conversion_bound": False, "backend_ignored_return_bound": False})
         topk = self.topk_buffer if self.topk_buffer.shape[0] == rows and offset == 0 else self.topk_buffer.narrow(0, offset, rows)
+        node = node.with_attributes({**node.attributes,
+            "source_topk_allocation_id": topk.view.allocation_id,
+            "source_topk_input_writer": self.trace._writers[topk.view.allocation_id]})
         if output is not None:
             self.trace.call(node, (query, self.cache, topk), shape=output.shape, dtype=output.dtype,
                 out=output, writes=(lse,))
@@ -1414,9 +1777,8 @@ class SymbolicV4InverseRope(SymbolicOperator):
 
     def __init__(self, trace, name, pool_name, model, *, tp_size):
         super().__init__(trace, name, pool_name)
-        if (model.model_type != "deepseek_v4" or model.weight_dtype != "fp8"
-                or tp_size not in (1, 4, 8) or model.o_groups % tp_size):
-            raise NotImplementedError("V4 inverse-RoPE source requires TP4/8 SM90 groups")
+        if not _v4_source_block_geometry(model, tp_size, expert_parallel=True):
+            raise NotImplementedError("V4 inverse-RoPE source requires whole SM90 output groups")
         self.model, self.tp_size = model, tp_size
 
     def __call__(self, o, positions, rotary_cache):
@@ -1450,9 +1812,8 @@ class SymbolicV4GroupedOutput(SymbolicOperator):
 
     def __init__(self, trace, name, pool_name, model, *, tp_size):
         super().__init__(trace, name, pool_name)
-        if (model.model_type != "deepseek_v4" or model.weight_dtype != "fp8"
-                or tp_size not in (1, 4, 8) or model.o_groups % tp_size):
-            raise NotImplementedError("V4 FP8 grouped output source requires TP4/8 SM90 groups")
+        if not _v4_source_block_geometry(model, tp_size, expert_parallel=True):
+            raise NotImplementedError("V4 FP8 grouped output source requires whole SM90 output groups")
         self.model, self.tp_size = model, tp_size
 
     def __call__(self, values, scales):
@@ -1473,7 +1834,7 @@ class SymbolicV4GroupedOutput(SymbolicOperator):
 
 
 class SymbolicV4RoutedExperts(SymbolicOperator):
-    """EP-off BF16/MXFP4 modular expert call with explicit routing metadata.
+    """BF16/MXFP4 modular expert call with explicit routing and ownership.
 
     The existing owner prices its logical Marlin program. An explicit workspace
     binds the BF16 arena; a declared SM count also describes alignment, locks
@@ -1482,14 +1843,29 @@ class SymbolicV4RoutedExperts(SymbolicOperator):
     """
 
     def __init__(self, trace, name, pool_name, model, *, tp_size, resolution, invocation_id, workspace=None,
-                 source_multiprocessors=None):
+                 source_multiprocessors=None, expert_parallel_size=1, expert_rank=0, expert_tp_size=None, valid_tokens=None):
         from .traced_forward import ForwardWorkspace
         from .runtime_inputs import ExpertRoutingResolution
         super().__init__(trace, name, pool_name)
-        if (model.model_type != "deepseek_v4" or tp_size not in (4, 8)
-                or model.moe_intermediate_size % tp_size or not isinstance(resolution, ExpertRoutingResolution)):
-            raise NotImplementedError("symbolic V4 routed experts require EP-off TP4/8 and explicit normalized routing")
+        if (not _v4_source_block_geometry(model, tp_size, expert_parallel=expert_parallel_size > 1)
+                or not isinstance(resolution, ExpertRoutingResolution)):
+            raise NotImplementedError("symbolic V4 routed experts require whole-block TP/EP and explicit normalized routing")
+        expert_tp = (1 if expert_parallel_size > 1 else tp_size) if expert_tp_size is None else expert_tp_size
+        if (type(expert_parallel_size) is not int or expert_parallel_size < 1
+                or type(expert_rank) is not int or not 0 <= expert_rank < expert_parallel_size
+                or model.num_experts % expert_parallel_size or type(expert_tp) is not int or expert_tp < 1
+                or expert_parallel_size > 1 and expert_tp != 1
+                or model.moe_intermediate_size % expert_tp or model.moe_intermediate_size // expert_tp % 32):
+            raise ValueError("V4 expert source requires whole intermediate shards and uniform linear EP ownership")
         self.model, self.tp_size, self.resolution, self.invocation_id = model, tp_size, resolution, invocation_id
+        self.expert_parallel_size, self.expert_rank, self.expert_tp_size = expert_parallel_size, expert_rank, expert_tp
+        self.logical_intermediate = model.moe_intermediate_size // expert_tp
+        # Mxfp4MoEMethod.maybe_roundup_sizes delegates to the Marlin oracle:
+        # local intermediate rounds to128; checkpoint scale groups stay32.
+        self.intermediate = -(-self.logical_intermediate // 128) * 128
+        if valid_tokens is not None and (type(valid_tokens) is not int or valid_tokens < 0):
+            raise ValueError("V4 expert valid tokens require an explicit nonnegative count")
+        self.valid_tokens = valid_tokens
         if workspace is not None and (not isinstance(workspace, ForwardWorkspace) or workspace.trace is not trace):
             raise ValueError("V4 expert workspace must belong to this physical-rank source trace")
         self.workspace = workspace
@@ -1548,13 +1924,21 @@ class SymbolicV4RoutedExperts(SymbolicOperator):
                 or topk_ids.shape != (rows, 6) or topk_ids.dtype != "int32"):
             raise ValueError("modular Marlin expert inputs disagree with the typed source contract")
         counts = self.resolution.tokens_per_expert
-        if len(counts) != model.num_experts or sum(counts) != rows * 6:
+        valid = rows if self.valid_tokens is None else self.valid_tokens
+        if valid > rows or len(counts) != model.num_experts or sum(counts) != valid * 6:
             raise ValueError("explicit routing histogram must conserve all top6 assignments")
+        owned_count = model.num_experts // self.expert_parallel_size
+        owned = tuple(range(self.expert_rank * owned_count, (self.expert_rank + 1) * owned_count))
         node = self.node(WorkloadKind.FUSED_MOE, {"tokens": rows, "experts": model.num_experts,
-            "topk": 6, "hidden": model.hidden_size, "intermediate": model.moe_intermediate_size // self.tp_size},
+            "topk": 6, "hidden": model.hidden_size, "intermediate": self.intermediate},
             "bf16", "full", {"source_component": "vllm_0_30_symbolic_v4_marlin",
-                "expert_parallel_size": 1, "expert_rank": 0, "owned_experts": tuple(range(model.num_experts)),
-                "tokens_per_expert": counts, "local_tokens_per_expert": counts,
+                "expert_parallel_size": self.expert_parallel_size, "expert_rank": self.expert_rank, "owned_experts": owned,
+                "tokens_per_expert": counts, "local_tokens_per_expert": tuple(counts[index] for index in owned),
+                "source_expert_tensor_parallel_size": self.expert_tp_size,
+                "source_logical_intermediate": self.logical_intermediate,
+                "source_marlin_padding_columns": self.intermediate - self.logical_intermediate,
+                **({"source_valid_tokens": valid, "source_padding_routing": "hash_topk_masked_ids_minus_one"}
+                    if self.valid_tokens is not None else {}),
                 "expert_placement_strategy": "linear", "moe_invocation_id": self.invocation_id,
                 "output_is_reduced": False, "routed_scaling_factor": model.routed_scaling_factor,
                 "routed_weight_dtype": "mxfp4", "weight_group_size": 32, "swiglu_limit": model.swiglu_limit,
@@ -1565,7 +1949,7 @@ class SymbolicV4RoutedExperts(SymbolicOperator):
         # FusedMoEKernel.apply allocates output before _prepare/_allocate_buffers.
         output = self.trace.tensor(node.node_id, x.shape, x.dtype)
         scratch = ()
-        h, n = model.hidden_size, model.moe_intermediate_size // self.tp_size
+        h, n = model.hidden_size, self.intermediate
         if self.workspace is not None:
             common = max(rows * 6 * max(n, h), rows * h)
             scratch = self.workspace.get_simultaneous(((common,), "bf16"),
@@ -1574,8 +1958,9 @@ class SymbolicV4RoutedExperts(SymbolicOperator):
         cache_view_ids = ()
         if self.source_multiprocessors is not None:
             block = 64
+            estimated_rows = -(-(rows * owned_count) // model.num_experts)
             for candidate in (8, 16, 32, 48, 64):
-                if rows * 6 / model.num_experts / candidate < 0.9:
+                if estimated_rows * 6 / owned_count / candidate < 0.9:
                     block = candidate
                     break
             aligned, capacity = self._alignment_storage(node, rows * 6, model.num_experts, block)
@@ -1600,7 +1985,7 @@ class SymbolicV4Compressor(SymbolicOperator):
     """
 
     def __init__(self, trace, name, pool_name, *, head_dim, compress_ratio, q_lens, kv_lens,
-                 state_cache, kv_cache, graph_runtime_mode, slot_mapping):
+                 state_cache, kv_cache, graph_runtime_mode, slot_mapping, dummy_run=False):
         super().__init__(trace, name, pool_name)
         if (head_dim, compress_ratio) not in ((512, 4), (512, 128), (128, 4)):
             raise NotImplementedError("symbolic V4 compressor requires the main C4/C128 or indexer C4 source")
@@ -1618,9 +2003,12 @@ class SymbolicV4Compressor(SymbolicOperator):
         if (state_cache.dtype != "fp32" or state_cache.shape[-1] != 2 * coff * head_dim
                 or kv_cache.dtype != "uint8" or kv_cache.shape[-1] != record_bytes):
             raise ValueError("compressor requires its FP32 partial and UINT8 compressed cache layouts")
+        if type(dummy_run) is not bool:
+            raise TypeError('V4 dummy compressor requires an explicit boolean')
         if (not isinstance(slot_mapping, tuple) or len(slot_mapping) != sum(q_lens)
-                or any(type(slot) is not int or not 0 <= slot < prod(state_cache.shape[:-1]) for slot in slot_mapping)):
+                or any(type(slot) is not int or (slot!=-1 if dummy_run else not 0<=slot<prod(state_cache.shape[:-1])) for slot in slot_mapping)):
             raise NotImplementedError("symbolic compressor requires explicit valid partial-state slots")
+        self.dummy_run=dummy_run
         self.head_dim, self.ratio, self.coff = head_dim, compress_ratio, coff
         self.q_lens, self.kv_lens = q_lens, kv_lens
         self.state_cache, self.kv_cache = state_cache, kv_cache
@@ -1642,15 +2030,30 @@ class SymbolicV4Compressor(SymbolicOperator):
             {"elements": rows * partial_bytes, "seq_len": rows,
              "state_bytes": partial_bytes, "dtype_bytes": 4}, "fp32", "dsv4_compressor_state_cache", {
                 "source_component": "vllm_0_30_symbolic_v4_compressor",
-                "cache_layout": "paged_dsv4_compressor_state", "cache_write_semantics": "append",
+                "cache_layout": "paged_dsv4_compressor_state", "cache_write_semantics": "all_PAD_no_store" if self.dummy_run else "append",
                 "symbolic_slot_mapping": self.slot_mapping,
+                "source_dummy_run":self.dummy_run,"cache_write_valid_rows":0 if self.dummy_run else rows,
                 "slot_mapping_scope": "declared_logical_pool_not_native_physical_pages"})
-        self.trace.call(node, (kv, score, positions), shape=self.state_cache.shape, dtype="fp32", out=self.state_cache)
+        if self.dummy_run:
+            self.trace.call_effect(node,(kv,score,positions))
+        else:
+            self.trace.call(node, (kv, score, positions), shape=self.state_cache.shape, dtype="fp32", out=self.state_cache)
         old_lens = tuple(kv - q for q, kv in zip(self.q_lens, self.kv_lens, strict=True))
         # _get_c128_boundary: any(start %128 + query >=128). CPU lengths
         # are explicit here, so this source branch never guesses a boundary.
         states = sum(new // self.ratio - old // self.ratio for old, new in zip(old_lens, self.kv_lens, strict=True))
         if self.ratio == 128 and self.graph_runtime_mode != "FULL" and states == 0:
+            return None
+        if self.dummy_run:
+            # Dummy positions are all zero and partial slots all PAD. C4's
+            # finish launch still occurs, but no lane reads/writes cache.
+            if self.ratio==128:
+                raise NotImplementedError('V4 dummy C128 boundary execution needs its explicit positions')
+            node=self.finish.node(WorkloadKind.KV_UPDATE,{'elements':0,'seq_len':rows,'compress_ratio':self.ratio,
+                'state_bytes':584 if self.head_dim==512 else 132,'dtype_bytes':1},'uint8','dsv4_compressed_state_cache',{
+                'source_component':'vllm_0_30_symbolic_v4_compressor','source_dummy_run':True,
+                'cache_write_valid_rows':0,'cache_write_semantics':'all_PAD_no_store'})
+            self.trace.call_effect(node,(positions,rotary_cache))
             return None
         record_bytes = 584 if self.head_dim == 512 else 132
         node = self.finish.node(WorkloadKind.KV_UPDATE,
@@ -1682,24 +2085,40 @@ class SymbolicV4Compressor(SymbolicOperator):
 class SymbolicV4KVInsert(SymbolicOperator):
     """Fused query norm/RoPE and UINT8 SWA insert, fresh padded BF16 Q."""
 
-    def __init__(self, trace, name, pool_name, model, *, tp_size, cache, slot_mapping, slot_tensor=None):
+    def __init__(self, trace, name, pool_name, model, *, tp_size, cache, slot_mapping, slot_tensor=None,
+            masked_dspark_context=False, physical_query_rows=None, dummy_run=False):
         super().__init__(trace, name, pool_name)
         trace._check_tensor(cache)
-        if (model.model_type != "deepseek_v4" or tp_size not in (1, 4, 8)
+        if (not _v4_source_block_geometry(model, tp_size, expert_parallel=True)
                 or cache.dtype != "uint8" or cache.shape[-1] != 584):
-            raise NotImplementedError("symbolic V4 insert requires TP4/8 and the fp8_ds_mla SWA cache")
+            raise NotImplementedError("symbolic V4 insert requires legal TP and the fp8_ds_mla SWA cache")
+        if (type(masked_dspark_context) is not bool or masked_dspark_context and not model.is_dspark_draft):
+            raise ValueError("masked context insert is restricted to explicit DSpark context updates")
+        if type(dummy_run) is not bool:
+            raise TypeError('V4 dummy Q/KV insert requires an explicit boolean')
         if (not isinstance(slot_mapping, tuple) or not slot_mapping
-                or any(type(slot) is not int or not 0 <= slot < prod(cache.shape[:-1]) for slot in slot_mapping)):
+                or dummy_run and any(slot!=-1 for slot in slot_mapping)
+                or any(type(slot) is not int or not (-1 if masked_dspark_context or dummy_run else 0) <= slot < prod(cache.shape[:-1])
+                    for slot in slot_mapping)):
             raise NotImplementedError("symbolic V4 insert requires explicit valid SWA slots")
+        self.masked_dspark_context = masked_dspark_context
+        self.dummy_run=dummy_run
         if slot_tensor is not None:
             trace._check_tensor(slot_tensor)
             if slot_tensor.shape != (len(slot_mapping),) or slot_tensor.dtype != "int64":
                 raise ValueError("V4 insert slot port requires the actual INT64 metadata tensor")
         self.slot_tensor = slot_tensor
+        if physical_query_rows is None:
+            physical_query_rows = len(slot_mapping)
+        if (type(physical_query_rows) is not int or physical_query_rows < len(slot_mapping)
+                or physical_query_rows != len(slot_mapping)
+                and (not model.is_dspark_draft or slot_tensor is None or masked_dspark_context)):
+            raise ValueError("DP-padded Q requires DSpark's actual active slot port and explicit physical rows")
+        self.query_rows = physical_query_rows
         self.model, self.tp_size, self.cache, self.slots = model, tp_size, cache, slot_mapping
 
     def __call__(self, q, kv, positions, rotary_cache):
-        model, rows = self.model, len(self.slots)
+        model, rows = self.model, self.query_rows
         heads = model.num_attention_heads // self.tp_size
         padded = 64 if heads <= 64 else 128
         if (q.shape != (rows, heads, model.head_dim) or q.dtype != "bf16"
@@ -1708,20 +2127,26 @@ class SymbolicV4KVInsert(SymbolicOperator):
                 or len(rotary_cache.shape) != 2 or rotary_cache.shape[-1] != model.qk_rope_head_dim
                 or rotary_cache.dtype != "fp32"):
             raise ValueError("V4 insert requires source Q/KV, INT64 positions and FP32 RoPE cache")
-        node = self.node(WorkloadKind.KV_UPDATE, {"elements": rows * (heads + 1) * model.head_dim,
+        node = self.node(WorkloadKind.KV_UPDATE, {"elements": (rows * heads + (0 if self.dummy_run else len(self.slots))) * model.head_dim,
             "seq_len": rows, "num_query_heads": heads, "padded_query_heads": padded,
             "head_dim": model.head_dim, "rope_dim": model.qk_rope_head_dim, "cache_token_bytes": 584},
             "bf16", "dsv4_qnorm_rope_kv_insert", {
                 "source_component": "vllm_0_30_symbolic_v4_swa_insert",
-                "cache_layout": "paged_dsv4_swa", "cache_write_semantics": "append",
-                "quantization": "fp8_ds_mla", "slot_mapping_all_valid": True,
+                "cache_layout": "paged_dsv4_swa", "cache_write_semantics": ("all_PAD_no_store" if self.dummy_run else
+                    "masked_target_context_overwrite" if self.masked_dspark_context else "append"),
+                "quantization": "fp8_ds_mla", "slot_mapping_all_valid": -1 not in self.slots,
+                "masked_dspark_context": self.masked_dspark_context,
+                "source_dummy_run":self.dummy_run,
+                "query_physical_rows": rows, "cache_insert_rows": len(self.slots),
+                "dp_padding_KV_insert_skipped": rows > len(self.slots),
+                "cache_write_valid_rows": sum(slot >= 0 for slot in self.slots),
                 "symbolic_slot_mapping": self.slots,
                 "slot_mapping_scope": "declared_logical_pool_not_native_physical_pages"})
         inputs = (q, kv, positions, rotary_cache)
         if self.slot_tensor is not None:
             inputs += (self.slot_tensor,)
         return self.trace.call(node, inputs,
-            shape=(rows, padded, model.head_dim), dtype="bf16", writes=(self.cache,))
+            shape=(rows, padded, model.head_dim), dtype="bf16", writes=() if self.dummy_run else (self.cache,))
 
 
 class SymbolicV4ShortTopK(SymbolicOperator):
@@ -1822,6 +2247,9 @@ class SymbolicV4ScoredTopK(SymbolicOperator):
         # chunk views) alive through the subsequent decode branch. Locals,
         # rather than module attributes, release them at this call's return.
         gather_views, scale_fp32 = (), None
+        shared_clear = None
+        shared_prefix = (self.buffer.narrow(0, 0, rows)
+            if decode_rows and decode_rows < rows else None)
         for phase in ("prefill", "decode"):
             indices = tuple(i for i, value in enumerate(self.phases) if value == phase)
             if not indices:
@@ -1849,6 +2277,12 @@ class SymbolicV4ScoredTopK(SymbolicOperator):
                     "symbolic_workspace_complete": False, "score_backing_bound": False,
                     "symbolic_prefill_gather_workspace": gather_request,
                     "selection_cardinality_source": "declared_causal_topk"})
+            if shared_prefix is not None and phase == "prefill":
+                shared_clear = {"owner_node_id": node.node_id,
+                    "view_id": shared_prefix.view.view_id, "rows": rows}
+            node = node.with_attributes({**node.attributes,
+                "symbolic_shared_topk_clear": shared_clear,
+                "symbolic_topk_token_range": (offset, offset + count)})
             empty = phase == "prefill" and all(length // 4 == 0 for length in lengths)
             selector_views, selector_request = (), None
             if phase == "decode" and self.workspace is not None and model.index_topk in (512, 1024, 2048):
@@ -1867,7 +2301,8 @@ class SymbolicV4ScoredTopK(SymbolicOperator):
             inputs = (() if empty else
                 (q.narrow(0, offset, count), weights.narrow(0, offset, count), self.cache))
             self.trace.call(node, inputs, shape=output.shape, dtype="int32", out=output,
-                writes=(gather_views if phase == "prefill" and not empty else ()) + selector_views,
+                writes=((shared_prefix,) if shared_prefix is not None and phase == "prefill" else ())
+                    + (gather_views if phase == "prefill" and not empty else ()) + selector_views,
                 controls=(*controls, q, weights, self.cache) if empty else controls)
         return None
 
@@ -1882,7 +2317,7 @@ class SymbolicV4SparseAttention(SymbolicOperator):
 
     def __init__(self, trace, name, pool_name, model, *, compress_ratio, q_lens, kv_lens,
                  request_phases, swa_cache, compressed_cache, topk_buffer, c128_indices,
-                 source_max_model_len, indexer_selection_source=None, workspace=None, source_max_batched_tokens=None):
+                 source_max_model_len, indexer_selection_source=None, workspace=None, source_max_batched_tokens=None,dummy_run=False):
         super().__init__(trace, name, pool_name)
         if compress_ratio not in (1, 4, 128):
             raise ValueError("V4 sparse source requires SWA, C4 or C128")
@@ -1925,6 +2360,10 @@ class SymbolicV4SparseAttention(SymbolicOperator):
         else:
             capacity = model.index_topk
         self.model, self.ratio, self.capacity = model, compress_ratio, capacity
+        if type(dummy_run) is not bool or dummy_run and (len(q_lens)!=1 or q_lens[0] not in ((5,) if model.is_dspark_draft else (1,6))
+                or kv_lens!=tuple(q+1 if model.is_dspark_draft else q for q in q_lens) or request_phases!=('decode',)):
+            raise ValueError('V4 dummy attention requires one declared uniform decode batch with no context')
+        self.dummy_run=dummy_run
         self.q_lens, self.kv_lens, self.phases = q_lens, kv_lens, request_phases
         self.swa_cache, self.compressed_cache = swa_cache, compressed_cache
         self.topk_buffer, self.c128_indices = topk_buffer, c128_indices
@@ -1990,6 +2429,22 @@ class SymbolicV4SparseAttention(SymbolicOperator):
                 or out.shape != q.shape or out.dtype != "bf16"
                 or positions.shape != (rows,) or positions.dtype != "int64"):
             raise ValueError("V4 sparse source requires padded BF16 Q/output and INT64 positions")
+        if self.dummy_run:
+            # The real metadata marks every PAD slot invalid. Its indexer
+            # clears indices/lens, and FlashMLA launches with empty KV lists.
+            index=self.node(WorkloadKind.VECTOR,{'elements':rows*self.model.window_size,'rows':rows},'int32',
+                'dsv4_dummy_swa_indices',{'source_component':'vllm_0_30_symbolic_v4_sparse',
+                    'source_dummy_run':True,'all_slot_mapping_PAD':True,'indices_fill':-1,'used_lengths_fill':0})
+            indices,lengths=self.trace.call_outputs(index,(positions,),outputs=(
+                ('indices',(rows,1,self.model.window_size),'int32'),('used_lengths',(rows,),'int32')))
+            node=self.node(WorkloadKind.EAGER_ATTN,{'batch':1,'q_len':rows,'kv_len':rows,
+                'num_query_heads':q.shape[1],'qk_head_dim':model.head_dim,'v_head_dim':model.head_dim,
+                'topk':0,'window_size':model.window_size,'compress_ratio':self.ratio,'dtype_bytes':2},'bf16','dsv4_sparse_decode',{
+                    'source_component':'vllm_0_30_symbolic_v4_sparse','source_dummy_run':True,
+                    'all_slot_mapping_PAD':True,'effective_KV_rows':0,'cache_read_bytes':0,
+                    'output_value':0,'native_provider_bound':False,'complete_priced_request':False})
+            self.trace.call(node,(q,indices,lengths),shape=out.shape,dtype='bf16',out=out,controls=controls)
+            return None
         decode_rows = sum(n for n, phase in zip(self.q_lens, self.phases, strict=True) if phase == "decode")
         for phase in ("prefill", "decode"):
             indices = tuple(i for i, p in enumerate(self.phases) if p == phase)
@@ -2046,6 +2501,119 @@ class SymbolicV4SparseAttention(SymbolicOperator):
             self.trace.call(node, inputs, shape=output.shape, dtype="bf16", out=output,
                 writes=(*workspace_views, *decode_buffers), controls=controls)
         return None
+
+
+class SymbolicDSparkNoncausalSWA(SymbolicOperator):
+    """Block-anchored prefix window plus every query, including future rows.
+
+    Adapt sparse_swa.py ComputeDSparkNoncausalSWAIndicesKernel; logical slots
+    are explicit declarations, not native block-table or provider evidence.
+    """
+    def __init__(self, trace, name, pool_name, model, *, q_lens, context_lens, cache,
+            context_slots, query_slots, prepared_metadata=None,dummy_run=False):
+        super().__init__(trace, name, pool_name)
+        trace._check_tensor(cache)
+        if (not model.is_dspark_draft or type(q_lens) is not tuple or type(context_lens) is not tuple
+                or len(q_lens) != len(context_lens) or not q_lens
+                or any(type(q) is not int or q != model.dspark_block_size for q in q_lens)
+                or any(type(c) is not int or c < 1 for c in context_lens)
+                or any(c + q > model.max_position_embeddings for c, q in zip(context_lens, q_lens, strict=True))
+                or cache.dtype != "uint8" or len(cache.shape) != 2 or cache.shape[-1] != 584
+                or cache.shape[0] < 128 or cache.shape[0] % 8):
+            raise ValueError("DSpark attention requires complete all-valid query blocks and positive fresh context")
+        if type(dummy_run) is not bool:
+            raise TypeError('DSpark dummy SWA requires an explicit boolean')
+        if (type(context_slots) is not tuple or type(query_slots) is not tuple
+                or len(context_slots) != sum(context_lens) or len(query_slots) != sum(q_lens)
+                or any(type(slot) is not int or (slot!=-1 if dummy_run else not 0<=slot<cache.shape[0]) for slot in context_slots + query_slots)
+                or not dummy_run and len(set(context_slots + query_slots)) != len(context_slots) + len(query_slots)):
+            raise ValueError("DSpark attention requires every distinct explicit valid context and query slot")
+        self.dummy_run=dummy_run
+        self.model, self.q_lens, self.context_lens, self.cache = model, q_lens, context_lens, cache
+        self.index_width = -(-(model.window_size + model.dspark_block_size) // 64) * 64
+        visible, cbase, qbase = [], 0, 0
+        for context, query in zip(context_lens, q_lens, strict=True):
+            visible.append(() if dummy_run else context_slots[cbase + max(context - model.window_size, 0):cbase + context]
+                + query_slots[qbase:qbase + query])
+            cbase += context
+            qbase += query
+        self.visible_slots = tuple(visible)
+        self.prepared_metadata = () if prepared_metadata is None else prepared_metadata
+        if dummy_run and (prepared_metadata is None or len(prepared_metadata)!=5):
+            raise ValueError('DSpark dummy SWA requires actual prepared slot-validity metadata')
+        if prepared_metadata is not None:
+            if type(prepared_metadata) is not tuple or len(prepared_metadata) not in (3, 5):
+                raise ValueError("DSpark prepared attention requires starts, lengths, table and optional mapping/validity pair")
+            starts, lengths, table = prepared_metadata[:3]
+            for value in prepared_metadata:
+                trace._check_tensor(value)
+            if (starts.shape != (len(q_lens) + 1,) or starts.dtype != "int32"
+                    or lengths.shape != (len(q_lens),) or lengths.dtype != "int32"
+                    or len(table.shape) != 2 or table.shape[0] != len(q_lens) or table.dtype != "int32"):
+                raise ValueError("DSpark prepared attention metadata differs from its current request rows")
+            if len(prepared_metadata) == 5:
+                mapping, validity = prepared_metadata[3:]
+                if (mapping.shape != (sum(q_lens),) or mapping.dtype != "int32"
+                        or validity.shape != mapping.shape or validity.dtype != "bool"
+                        or not mapping.is_contiguous or not validity.is_contiguous):
+                    raise ValueError("DSpark prepared attention requires active INT32 request mapping and bool validity")
+
+    def __call__(self, q, positions, output, *, controls=()):
+        rows, model = sum(self.q_lens), self.model
+        for value in (q, positions, output):
+            self.trace._check_tensor(value)
+        if (len(q.shape) != 3 or q.shape != output.shape or q.shape[0] < rows or q.shape[1] not in (64, 128)
+                or q.dtype != "bf16" or output.dtype != "bf16"
+                or q.shape[-1] != model.head_dim or positions.shape != (q.shape[0],) or positions.dtype != "int64"
+                or q.shape[0] > rows and len(self.prepared_metadata) != 5
+                or controls):
+            raise ValueError("DSpark SWA requires padded BF16 queries/output and no compressed tier")
+        physical_rows = q.shape[0]
+        # FlashMLA consumes metadata.num_actual_tokens only. torch.empty's
+        # DP tail remains unwritten, although the following O projection reads it.
+        if physical_rows > rows:
+            q, positions, output = q.narrow(0, 0, rows), positions.narrow(0, 0, rows), output.narrow(0, 0, rows)
+        lengths = tuple(len(slots) for slots in self.visible_slots)
+        attributes = {"source_component": "vllm_0_30_dspark_noncausal_swa",
+            "causal": False, "q_lens": self.q_lens, "prefix_lens": self.context_lens,
+            "visible_kv_lens": lengths, "visible_logical_slot_ids_by_request": self.visible_slots,
+            "index_capacity": self.index_width, "future_query_keys_visible": True,
+            "invalid_index_fill": -1, "slot_mapping_scope": "declared_logical_pool_not_native_physical_pages",
+            "native_provider_bound": False, "prepared_query_lengths_and_table_bound": bool(self.prepared_metadata),
+            "source_dummy_run":self.dummy_run,"effective_KV_rows":max(lengths),
+            "dummy_output_zero":self.dummy_run,
+            "physical_output_rows": physical_rows, "active_output_rows": rows,
+            "unwritten_output_tail_rows": physical_rows - rows,
+            "output_tail_initialization": "unwritten_torch_empty",
+            "token_to_request_and_validity_metadata_bound": len(self.prepared_metadata) == 5}
+        index_node = self.node(WorkloadKind.VECTOR, {"elements": rows * self.index_width,
+            "rows": rows, "index_width": self.index_width}, "int32", "dspark_noncausal_swa_indices", attributes)
+        indices, used = self.trace.call_outputs(index_node, (positions, *self.prepared_metadata), outputs=(
+            ("indices", (rows, 1, self.index_width), "int32"), ("used_lens", (rows,), "int32")))
+        node = self.node(WorkloadKind.EAGER_ATTN, {"batch": len(self.q_lens), "q_len": max(self.q_lens),
+            "kv_len": max(c + n for c, n in zip(self.context_lens, self.q_lens, strict=True)),
+            "num_query_heads": q.shape[1], "num_kv_heads": 1, "qk_head_dim": model.head_dim,
+            "v_head_dim": model.head_dim, "window_size": model.window_size, "dtype_bytes": 2},
+            "bf16", "dspark_noncausal_swa", attributes)
+        self.trace.call(node, (q, indices, used) if self.dummy_run else (q, self.cache, indices, used),
+            shape=output.shape, dtype="bf16", out=output)
+        return None
+
+
+class SymbolicV4AuxHiddenMean(SymbolicOperator):
+    """Actual target auxiliary port: mhc_post(...).mean(dim=1), BF16."""
+
+    def __call__(self, expanded):
+        if expanded.dtype != "bf16" or len(expanded.shape) != 3 or not expanded.is_contiguous:
+            raise ValueError("V4 auxiliary mean requires contiguous BF16 [rows,hc,hidden]")
+        rows, streams, hidden = expanded.shape
+        if rows <= 0 or streams <= 1 or hidden <= 0:
+            raise ValueError("V4 auxiliary mean requires positive rows/hidden and multiple streams")
+        node = self.node(WorkloadKind.VECTOR, {"elements": rows * streams * hidden,
+            "rows": rows, "streams": streams, "hidden": hidden}, "bf16", "v4_aux_hidden_mean",
+            {"operation": "torch_mean", "reduction_axis": 1, "output_elements": rows * hidden,
+             "source_component": "vllm_0_30_v4_target_aux_mhc_mean", "source_projection_only": True})
+        return self.trace.call(node, (expanded,), shape=(rows, hidden), dtype="bf16")
 
 
 class SymbolicMHC(SymbolicOperator):
@@ -2125,12 +2693,54 @@ class SymbolicMHC(SymbolicOperator):
             ("prenorm_sqrsum", (splits, rows), "fp32")))
 
 
+class SymbolicMHCPipelineInput:
+    """V4 nonbroadcast stage-entry mhc_pre_tilelang, optional fallback branch.
+
+    The expanded input itself is the residual; only mixes and layer input are
+    fresh. The explicit env-disabled TileLang source uses one partial. GPU
+    provider selection remains unbound, as for the existing prenorm stages.
+    """
+
+    def __init__(self, trace, name, pool, model, *, source_use_deep_gemm, source_context="pipeline"):
+        if source_context not in ("pipeline", "dspark") or source_context == "dspark" and not model.is_dspark_draft:
+            raise ValueError("nonbroadcast mHC requires its actual pipeline or DSpark source context")
+        self.source_context = source_context
+        if model.model_type != "deepseek_v4" or source_use_deep_gemm is not False:
+            raise NotImplementedError("V4 PP entry currently requires its declared optional TileLang prenorm branch")
+        self.trace, self.model = trace, model
+        self.prenorm = SymbolicOperator(trace, name + ":prenorm", pool)
+        self.normalize = SymbolicOperator(trace, name + ":normalize", pool)
+
+    def __call__(self, x):
+        self.trace._check_tensor(x)
+        rows, c, h = x.shape[0], self.model.hc_mult, self.model.hidden_size
+        if x.shape != (rows, c, h) or x.dtype != "bf16" or not x.is_contiguous:
+            raise ValueError("V4 PP prenorm requires its contiguous expanded BF16 hidden tensor")
+        shape = {"elements": rows * c * h, "hidden": h, "hc_mult": c, "dtype_bytes": 2, "n_splits": 1}
+        attrs = {"source_component": "vllm_0_30_symbolic_v4_" + self.source_context + "_prenorm",
+            "source_use_deep_gemm": False}
+        projection = self.prenorm.node(WorkloadKind.VECTOR, shape, "bf16", "mhc_prenorm", attrs)
+        mixes, squared = self.trace.call_outputs(projection, (x,), outputs=(
+            ("prenorm_mixes", (1, rows, c * (c + 2)), "fp32"),
+            ("prenorm_sqrsum", (1, rows), "fp32")))
+        normalize = self.normalize.node(WorkloadKind.VECTOR,
+            {**shape, "sinkhorn_iters": self.model.hc_sinkhorn_iters}, "bf16", "mhc_pre_norm", attrs)
+        post_mix, res_mix, layer_input = self.trace.call_outputs(normalize, (x, mixes, squared), outputs=(
+            ("post_mix", (rows, c, 1), "fp32"), ("res_mix", (rows, c, c), "fp32"),
+            ("layer_input", (rows, h), "bf16")))
+        return x, post_mix, res_mix, layer_input
+
+
 class SymbolicGather(SymbolicOperator):
-    def __call__(self, x, rows, *, indices=None, source_operation=None):
+    def __call__(self, x, rows, *, indices=None, source_operation=None, indices_tensor=None):
         if source_operation is not None and (source_operation != "cat_last_dim" or indices is not None):
             raise ValueError("source cat materialization requires an unindexed copy")
         if indices is not None and (len(indices) != rows or any(type(i) is not int or not 0 <= i < x.shape[0] for i in indices)):
             raise ValueError("symbolic gather row indices are invalid")
+        if indices_tensor is not None:
+            self.trace._check_tensor(indices_tensor)
+            if indices is None or indices_tensor.shape != (rows,) or indices_tensor.dtype != "int64":
+                raise ValueError("symbolic gather requires an actual INT64 index port and its declared row projection")
         shape = x.shape if indices is None else (rows, *x.shape[1:])
         width = prod(shape[1:])
         node = self.node(WorkloadKind.GATHER,
@@ -2138,7 +2748,7 @@ class SymbolicGather(SymbolicOperator):
             {"gather_factor": 1, "index_count": 0 if indices is None else rows,
              "index_bytes": 8, "scattered": indices is not None, "materialized_output": True,
              **({"source_operation": source_operation} if source_operation is not None else {})})
-        return self.trace.call(node, (x,), shape=shape, dtype=x.dtype)
+        return self.trace.call(node, (x,) if indices_tensor is None else (x, indices_tensor), shape=shape, dtype=x.dtype)
 
 
 class SymbolicRMSNorm(SymbolicOperator):
@@ -2148,7 +2758,8 @@ class SymbolicRMSNorm(SymbolicOperator):
     wrapper first materializes every noncontiguous input. Output allocation
     precedes either copy. Fused residual updates are in-place.
     """
-    def __init__(self, trace, name, pool_name, width, epsilon, *, storage_program="vllm_c_cuda"):
+    def __init__(self, trace, name, pool_name, width, epsilon, *, storage_program="vllm_c_cuda",
+                 model_execution_version=None):
         super().__init__(trace, name, pool_name)
         if epsilon is None or epsilon <= 0:
             raise ValueError("symbolic RMSNorm requires checkpoint epsilon")
@@ -2156,6 +2767,12 @@ class SymbolicRMSNorm(SymbolicOperator):
             raise ValueError("symbolic RMSNorm requires a supported source storage program")
         self.width, self.epsilon = width, epsilon
         self.storage_program = storage_program
+        if model_execution_version is not None:
+            if model_execution_version not in ("vllm_0_11_0", "vllm_0_18_0", "vllm_0_24_0", "vllm_0_27_1", "vllm_0_30_0"):
+                raise ValueError("symbolic RMSNorm requires its declared model source version")
+            if storage_program == "vllm_c_cuda_0_11" and model_execution_version != "vllm_0_11_0":
+                raise ValueError("symbolic RMSNorm source version disagrees with its storage program")
+        self.model_execution_version = model_execution_version
         self.materialize = SymbolicGather(trace, name + ":input-contiguous", pool_name)
 
     def __call__(self, x, residual=None):
@@ -2166,8 +2783,11 @@ class SymbolicRMSNorm(SymbolicOperator):
             raise ValueError("symbolic RMSNorm normalized width disagrees with input")
         node = self.node(WorkloadKind.NORM, {"rows": prod(x.shape[:-1]), "hidden": self.width},
             x.dtype, "rmsnorm" if residual is None else "add_rmsnorm", {"epsilon": self.epsilon,
-                "source_storage_profile": "vllm_0_30_vllm_c_cuda" if self.storage_program == "vllm_c_cuda"
-                    else self.storage_program})
+                "source_storage_profile": "vllm_0_30_vllm_c_cuda" if (self.storage_program == "vllm_c_cuda"
+                    and self.model_execution_version in (None, "vllm_0_30_0"))
+                    else self.storage_program,
+                **({"model_execution_version": self.model_execution_version}
+                    if self.model_execution_version is not None else {})})
         if residual is not None:
             self.trace._check_tensor(residual)
             if residual.shape != x.shape or residual.dtype != x.dtype:
@@ -2189,6 +2809,10 @@ class SymbolicRMSNorm(SymbolicOperator):
             results = self.trace.call_outputs(node, inputs, outputs=outputs, parameters=(weight,))
             return results[0] if residual is None else (results[0], results[2])
         if residual is not None:
+            # The symbolic view proves strides, not allocator alignment or
+            # the runtime's batch-invariant branch. Keep those facts explicit.
+            if x.is_contiguous and residual.is_contiguous:
+                node = node.with_attributes({**node.attributes, "source_input_layout": "contiguous"})
             self.trace.call(node, (x, residual), shape=x.shape, dtype=x.dtype, out=x, writes=(residual,), parameters=(weight,))
             return x, residual
         # kernels/vllm_c.py's flatten/reshape branch is ROCm-only. CUDA's
@@ -2206,6 +2830,7 @@ class SymbolicRMSNorm(SymbolicOperator):
             copy = self.materialize.node(WorkloadKind.ELEMENTWISE,
                 {"elements": prod(x.shape)}, x.dtype, "elementwise",
                 {"reads": 1, "writes": 1, "operation": "copy",
+                 "model_execution_version": "vllm_0_11_0",
                  "input_materialization": "grouped_strided_to_contiguous",
                  "input_outer_groups": groups, "input_rows_per_group": rows,
                  "input_group_stride_elements": x.view.strides_bytes[0] // x.view.element_bytes,
@@ -2213,6 +2838,8 @@ class SymbolicRMSNorm(SymbolicOperator):
             contiguous = self.trace.call(copy, (x,), shape=x.shape, dtype=x.dtype)
         else:
             contiguous = self.materialize(x, x.shape[0]) if x.view.strides_bytes[-1] != x.view.element_bytes else x
+        node = node.with_attributes({**node.attributes, "source_input_layout": (
+            "contiguous" if self.storage_program == "vllm_c_cuda_0_11" else "unit_final_stride")})
         return self.trace.call(node, (contiguous,), shape=x.shape, dtype=x.dtype, out=output, parameters=(weight,))
 
 
@@ -2253,8 +2880,8 @@ class SymbolicEmbedding(SymbolicOperator):
         if vocab_size is not None and (type(vocab_size) is not int or vocab_size <= 0):
             raise ValueError("embedding vocabulary size must be a positive integer")
         if source_rows is not None and (type(source_rows) is not int or source_rows <= 0
-                or vocab_size is not None or self.source not in ("vllm_0_11", "vllm_0_24")):
-            raise ValueError("explicit embedding table rows require a positive0.11/0.24 physical extent, separate from global vocabulary")
+                or vocab_size is not None or self.source not in ("vllm_0_11", "vllm_0_24", "vllm_0_27_1")):
+            raise ValueError("explicit embedding table rows require a positive0.11/0.24/0.27.1 physical extent, separate from global vocabulary")
         self.vocab_size = vocab_size
         # A TP shard is divided AFTER global padding. Re-padding a local
         # shard (e.g.192/2=96) would invent table rows and change addressing.
@@ -2292,7 +2919,9 @@ class SymbolicEmbedding(SymbolicOperator):
         node = self.node(WorkloadKind.GATHER,
             {"elements": rows * self.width, "rows": rows, "hidden": self.width,
              **({"source_rows": self.source_rows}
-                if self.source in ("vllm_0_11", "vllm_0_24") and self.source_rows is not None else {})}, self.dtype, "embedding",
+                if (self.source in ("vllm_0_11", "vllm_0_24") or self.source == "vllm_0_27_1" and self.sharded_table
+                    or self.source == "vllm_0_30" and self.dtype in ("bf16", "fp16") and len(ids.shape) == 1)
+                and self.source_rows is not None else {})}, self.dtype, "embedding",
             {"gather_factor": 1, "index_count": rows, "index_bytes": ids.view.element_bytes,
              "scattered": True, "materialized_output": True,
              **({"index_select_source": "vllm_0_11_embedding"}
@@ -2300,6 +2929,15 @@ class SymbolicEmbedding(SymbolicOperator):
              **({"embedding_source": "vllm_0_24_unquantized_index_select",
                  "source_operation": "index_select_dim0"}
                 if self.source == "vllm_0_24" else {}),
+             **({"embedding_source": "vllm_0_30_unquantized_tp1",
+                 "model_execution_version": "vllm_0_30_0", "source_operation": "embedding"}
+                if self.source == "vllm_0_30" and self.dtype in ("bf16", "fp16")
+                and len(ids.shape) == 1 and self.source_rows is not None else {}),
+             **({"source_component": "vllm_0_27_1_symbolic_masked_embedding_gather",
+                 "model_execution_version": "vllm_0_27_1",
+                 "embedding_source": "vllm_0_27_1_masked_index_select",
+                 "source_operation": "index_select_dim0"}
+                if self.source == "vllm_0_27_1" and self.sharded_table else {}),
              **({"symbolic_model_input_order": self.model_input_order} if self.model_input_order is not None else {})})
         return self.trace.call(node, (ids,), shape=(rows, self.width), dtype=self.dtype)
 
@@ -2318,7 +2956,7 @@ class SymbolicVocabParallelEmbedding(SymbolicOperator):
 
     def __init__(self, trace, name, pool_name, width, vocab, group, config, *, token_ids, model_input_order=None,
                  fused=True, mask_program="vllm_0_30", dtype="bf16", model_execution_version=None,
-                 reduction_inplace=False):
+                 reduction_inplace=False, input_values_source=None):
         super().__init__(trace, name, pool_name)
         if not isinstance(group, ForwardCollectiveGroup) or not isinstance(config, CollectiveConfig):
             raise TypeError("TP embedding requires a virtual collective group and canonical config")
@@ -2332,23 +2970,33 @@ class SymbolicVocabParallelEmbedding(SymbolicOperator):
             raise ValueError("Ascend0.18 TP embedding requires its ordinary BF16 masked source")
         if type(reduction_inplace) is not bool:
             raise TypeError("embedding reduction alias requires an explicit boolean")
+        if mask_program == "vllm_0_27_1" and (
+                model_execution_version != "vllm_0_27_1" or fused
+                or dtype != "bf16" or len(group.traces) not in (4, 8)):
+            raise ValueError("vLLM0.27.1 TP embedding requires its BF16 TP4/8 masked source")
         self.ascend018, self.reduction_inplace = ascend018, reduction_inplace
         unknown_masked_ids = (token_ids is None and fused is False and (mask_program in ("vllm_0_11", "vllm_0_24", "vllm_0_30") or ascend018)
             and len(group.traces) == 2)
-        if not unknown_masked_ids and (not isinstance(token_ids, tuple) or not token_ids
+        if input_values_source not in (None, "legacy_dummy_retained_buffer") or (
+                input_values_source is not None and (token_ids is not None or not fused or mask_program != "vllm_0_30")):
+            raise ValueError("unknown fused embedding IDs require the explicit retained legacy dummy buffer source")
+        unknown_dummy_ids = input_values_source == "legacy_dummy_retained_buffer"
+        if not (unknown_masked_ids or unknown_dummy_ids) and (not isinstance(token_ids, tuple) or not token_ids
                 or any(type(token) is not int or not 0 <= token < vocab for token in token_ids)):
             raise ValueError("TP embedding requires explicit valid scheduled INT32 token IDs")
         if dtype not in ("bf16", "fp16"):
             raise ValueError("unquantized TP embedding requires BF16 or FP16 weights")
         self.width, self.vocab, self.token_ids, self.dtype = width, vocab, token_ids, dtype
+        self.shared_weight = None
         self.group, self.config = group, config
         self.model_input_order = model_input_order
+        self.input_values_source = input_values_source
         if type(fused) is not bool:
             raise TypeError("TP embedding source branch must be an explicit boolean")
         self.fused = fused
-        if mask_program not in ("vllm_0_11", "vllm_0_24", "vllm_0_30", "vllm_ascend_no_added_vocab"):
+        if mask_program not in ("vllm_0_11", "vllm_0_24", "vllm_0_27_1", "vllm_0_30", "vllm_ascend_no_added_vocab"):
             raise ValueError("TP embedding requires its supported source mask program")
-        if mask_program in ("vllm_0_11", "vllm_0_24", "vllm_ascend_no_added_vocab") and fused:
+        if mask_program in ("vllm_0_11", "vllm_0_24", "vllm_0_27_1", "vllm_ascend_no_added_vocab") and fused:
             raise ValueError("this masked embedding source cannot select the CUDA fused branch")
         self.mask_program = mask_program
 
@@ -2364,9 +3012,11 @@ class SymbolicVocabParallelEmbedding(SymbolicOperator):
         attributes = {"source_component": ("vllm_0_18_symbolic_masked_embedding" if self.ascend018
             else "vllm_0_11_symbolic_masked_embedding" if self.mask_program == "vllm_0_11"
             else "vllm_0_24_symbolic_masked_embedding" if self.mask_program == "vllm_0_24"
+            else "vllm_0_27_1_symbolic_masked_embedding" if self.mask_program == "vllm_0_27_1"
             else "vllm_0_30_symbolic_masked_embedding"),
             "vocab_size": self.vocab, "tensor_parallel_size": tp, "tensor_parallel_rank": logical_rank,
-            "mask_program": self.mask_program}
+            "mask_program": self.mask_program,
+            **({"model_execution_version": "vllm_0_27_1"} if self.mask_program == "vllm_0_27_1" else {})}
         mask = SymbolicOperator(self.trace, self.name + ":mask-ids", self.pool_name)
         node = mask.node(WorkloadKind.VECTOR, {"rows": rows, "hidden": self.width, "elements": rows},
             "int32", "vllm_masked_embedding", {**attributes, "stage": "mask_ids"})
@@ -2377,9 +3027,10 @@ class SymbolicVocabParallelEmbedding(SymbolicOperator):
             self.width, self.dtype, model_execution_version=("vllm_0_18_0" if self.ascend018
                 else "vllm_0_11_0" if self.mask_program == "vllm_0_11"
                 else "vllm_0_24_0" if self.mask_program == "vllm_0_24"
+                else "vllm_0_27_1" if self.mask_program == "vllm_0_27_1"
                 else "vllm_0_30_0"),
             source_rows=(-(-self.vocab // 64) * 64 // tp
-                if self.mask_program in ("vllm_0_11", "vllm_0_24") else None))(masked_ids)
+                if self.mask_program in ("vllm_0_11", "vllm_0_24", "vllm_0_27_1") else None))(masked_ids)
         fill = SymbolicOperator(self.trace, self.name + ":mask-output", self.pool_name)
         node = fill.node(WorkloadKind.VECTOR,
             {"rows": rows, "hidden": self.width, "elements": rows * self.width}, self.dtype,
@@ -2404,10 +3055,13 @@ class SymbolicVocabParallelEmbedding(SymbolicOperator):
                 "embedding_source": "vllm_0_30_cuda_unquantized_tp",
                 "tensor_parallel_size": len(self.group.traces), "vocab_size": self.vocab,
                 "embedding_token_ids": self.token_ids, "index_bytes": 4,
+                **({"embedding_input_values_source": self.input_values_source,
+                    "value_dependent_shard_traffic_bound": False} if self.input_values_source is not None else {}),
                 "index_count": rows, "gather_factor": 1, "scattered": True,
                 "materialized_output": True,
                 **({"symbolic_model_input_order": self.model_input_order} if self.model_input_order is not None else {})})
-        output_parallel = self.trace.call(node, (ids,), shape=(rows, self.width), dtype=self.dtype)
+        output_parallel = self.trace.call(node, (ids,), shape=(rows, self.width), dtype=self.dtype,
+            parameters=() if self.shared_weight is None else (self.shared_weight,))
         # GroupCoordinator.all_reduce explicitly returns an out-of-place result
         # for TP>1. Internal communicator buffers remain a separate boundary.
         return self.group.call(self.name + ":all-reduce", output_parallel,
@@ -2416,7 +3070,7 @@ class SymbolicVocabParallelEmbedding(SymbolicOperator):
 
 class SymbolicRotary(SymbolicOperator):
     def __init__(self, trace, name, pool_name, heads, kv_heads, head_dim, cache, *, program=ROPE_PROGRAM_FUSED,
-                 operand_semantics="aten_tensor_iterator", rotary_dim=None):
+                 operand_semantics="aten_tensor_iterator", rotary_dim=None, model_execution_version=None):
         super().__init__(trace, name, pool_name)
         self.heads, self.kv_heads, self.head_dim, self.cache = heads, kv_heads, head_dim, cache
         self.rotary_dim = head_dim if rotary_dim is None else rotary_dim
@@ -2430,6 +3084,10 @@ class SymbolicRotary(SymbolicOperator):
         if operand_semantics not in ("aten_tensor_iterator", "aclnn_materialized_operands"):
             raise ValueError("symbolic rotary requires supported source operand semantics")
         self.program = program
+        if model_execution_version is not None and model_execution_version not in (
+                "vllm_0_11_0", "vllm_0_18_0", "vllm_0_24_0", "vllm_0_27_1", "vllm_0_30_0"):
+            raise ValueError("symbolic rotary requires its declared model source version")
+        self.model_execution_version = model_execution_version
         self.operand_semantics = operand_semantics
         self.materialize = SymbolicGather(trace, name + ":input-contiguous", pool_name)
 
@@ -2527,13 +3185,25 @@ class SymbolicRotary(SymbolicOperator):
             query = self.materialize(query, query.shape[0]) if not query.is_contiguous else query
             key = self.materialize(key, key.shape[0]) if not key.is_contiguous else key
         rows = query.shape[0]
+        layout = ({"source_input_layout": "contiguous"} if query.is_contiguous and key.is_contiguous
+            else {"source_input_layout": "unit_final_stride"}
+                if all(tensor.view.strides_bytes[-1] == tensor.view.element_bytes for tensor in (query, key)) else {})
+        if (positions.shape != (rows,) or positions.dtype != "int64"
+                or not positions.is_contiguous or not self.cache.is_contiguous):
+            # The CUDA scalar helper indexes these two ports densely. Q/K
+            # row/head gaps do not prove the positions/cache ABI.
+            layout = {}
         node = self.node(WorkloadKind.ROTARY,
             {"elements": rows * (self.heads + self.kv_heads) * self.rotary_dim,
              "seq_len": rows, "num_query_heads": self.heads, "num_kv_heads": self.kv_heads,
              "head_dim": self.head_dim, **({"rotary_dim": self.rotary_dim}
                  if self.rotary_dim != self.head_dim else {})}, query.dtype,
             "rope" if self.rotary_dim != self.head_dim else "rotary",
-            {"key_present": True, "is_neox": True} if self.rotary_dim != self.head_dim else {})
+            {**({"key_present": True, "is_neox": True} if self.rotary_dim != self.head_dim else {}),
+             "source_rope_program": "vllm_fused_rotary",
+             **({"model_execution_version": self.model_execution_version}
+                 if self.model_execution_version is not None else {}),
+             **layout})
         self.trace.call(node, (positions, query, key, self.cache), shape=query.shape,
             dtype=query.dtype, out=query, writes=(key,))
         return query, key
@@ -2557,13 +3227,17 @@ def gqa_full_source_metadata(q_lens, kv_lens, slot_mapping, token_shape):
 
 class SymbolicAttention(SymbolicOperator):
     def __init__(self, trace, name, pool_name, heads, kv_heads, head_dim, cache, q_lens, kv_lens, slot_mapping,
-                 *, profile_no_metadata=False, model_execution_version="vllm_0_30_0"):
+                 *, profile_no_metadata=False, model_execution_version="vllm_0_30_0", legacy_dummy_run=False):
         super().__init__(trace, name, pool_name)
         if model_execution_version not in ("vllm_0_11_0", "vllm_0_18_0", "vllm_0_24_0", "vllm_0_30_0"):
             raise ValueError("attention source requires a supported model execution version")
         self.model_execution_version = model_execution_version
         if type(profile_no_metadata) is not bool or ((cache is None) != profile_no_metadata):
             raise ValueError("attention profiling must explicitly omit the unused KV arena")
+        if type(legacy_dummy_run) is not bool or legacy_dummy_run and (
+                not profile_no_metadata or model_execution_version != "vllm_0_30_0"):
+            raise ValueError("legacy dummy attention requires its0.30 metadata=None source")
+        self.legacy_dummy_run = legacy_dummy_run
         self.heads, self.kv_heads, self.head_dim, self.cache = heads, kv_heads, head_dim, cache
         self.q_lens, self.kv_lens = q_lens, kv_lens
         self.slot_mapping = slot_mapping
@@ -2571,6 +3245,7 @@ class SymbolicAttention(SymbolicOperator):
         self.profile_no_metadata = profile_no_metadata
         self.graph_token_shape = None
         self.graph_attention_source = "cuda_graph_v1"
+        self.fa3_full_aot = None
         self.update = SymbolicOperator(trace, name + ":kv-update", pool_name)
 
     def __call__(self, q, k, v):
@@ -2622,6 +3297,11 @@ class SymbolicAttention(SymbolicOperator):
                 (physical_rows, self.heads * self.head_dim), q.dtype)
             q, k, v = (value.narrow(0, 0, rows) for value in (q, k, v))
         if self.profile_no_metadata:
+            if self.legacy_dummy_run:
+                output = self.trace.tensor(self.trace.unique_name(self.name + ":dummy-output"),
+                    (rows, self.heads * self.head_dim), q.dtype)
+                return SymbolicFillZero(self.trace, self.name + ":dummy-output-zero", self.pool_name)(
+                    output, controls=(q, k, v))
             # Attention.forward allocates output; FlashAttentionImpl.forward
             # fills it when attn_metadata is None. The dummy runner's -1 slots
             # skip KV writes. This allocation trace has no timing contract.
@@ -2641,6 +3321,13 @@ class SymbolicAttention(SymbolicOperator):
             {"elements": rows * self.kv_heads * self.head_dim,
              "seq_len": rows, "num_kv_heads": self.kv_heads, "head_dim": self.head_dim},
             q.dtype, "paged_kv_cache", {**PAGED_KV_CACHE_ATTRIBUTES,
+                "model_execution_version": self.model_execution_version,
+                **({"source_input_layout": "contiguous"} if k.is_contiguous and v.is_contiguous else
+                    {"source_input_layout": "unit_final_stride"} if all(
+                        tensor.view.strides_bytes[-1] == tensor.view.element_bytes
+                        and (len(tensor.shape) == 2 or len(tensor.shape) == 3
+                            and tensor.view.strides_bytes[-2] == self.head_dim * tensor.view.element_bytes)
+                        for tensor in (k, v)) else {}),
                 "symbolic_slot_mapping": (self.slot_mapping if dynamic_metadata is None else dynamic_metadata["slot_mapping"]),
                 "slot_mapping_scope": "declared_logical_pool_not_native_physical_pages",
                 **({"symbolic_physical_token_extent": physical_rows, "graph_padding_slot": -1}
@@ -2690,6 +3377,18 @@ class SymbolicAttention(SymbolicOperator):
                     **({"source_attention_program": "ascend_0_18_piecewise_fia"} if ascend_piecewise else {})})
             copied = self.trace.call(copy_node, (result,), shape=output.shape, dtype=q.dtype, out=output)
             return full_output if ascend_piecewise and full_output is not None else copied
+        if self.fa3_full_aot is not None:
+            metadata,semaphore,cu,seq,layout,prepare_id,copy_id,clear_id=self.fa3_full_aot
+            operands=(q,k,v,self.cache,cu,seq,metadata)
+            node=node.with_attributes({**node.attributes,"fa3_full_aot_prepare_node":prepare_id,
+                "fa3_full_aot_copy_node":copy_id,"fa3_full_aot_clear_node":clear_id,
+                "fa3_full_aot_layout":layout,"fa3_full_aot_group":metadata.view.allocation_id,
+                "fa3_full_aot_input_producers":tuple(self.trace._writers[t.view.allocation_id] for t in operands)})
+            if full_output is None:
+                raise ValueError("FA3 native AOT metadata requires its full captured output parent")
+            self.trace.call(node,operands,shape=(rows,self.heads*self.head_dim),dtype=q.dtype,
+                out=full_output.narrow(0,0,rows),writes=(semaphore,))
+            return full_output
         if full_output is None:
             return self.trace.call(node, (q, k, v, self.cache), shape=(rows, self.heads * self.head_dim), dtype=q.dtype)
         self.trace.call(node, (q, k, v, self.cache), shape=(rows, self.heads * self.head_dim), dtype=q.dtype,
@@ -2854,3 +3553,55 @@ _NODE_GEOMETRY_VALIDATION = (
         None if function.__kwdefaults__ is None else dict(function.__kwdefaults__))
         for function in (WorkloadNode.__init__, WorkloadNode.__post_init__, WorkloadNode.with_attributes)),
     WorkloadNode.__post_init__.__globals__, dict(WorkloadNode.__post_init__.__globals__))
+
+
+"""Append this class to traced_operators.py; original SymbolicV4KVInsert stays unchanged."""
+
+
+class SymbolicDSparkPartialContextInsert(SymbolicV4KVInsert):
+    """Full six-row DSpark context insert with a declared valid cache prefix.
+
+    Actual Q/KV/positions/RoPE and INT64 slot-tensor ports are preserved.
+    Logical slots declare the prefix scenario; native physical pages are unbound.
+    """
+
+    def __init__(self, trace, name, pool_name, model, *, tp_size, cache,
+                 slot_mapping, slot_tensor, valid_token_count):
+        if (type(valid_token_count) is not int or not 1 <= valid_token_count <= 6
+                or type(tp_size) is not int or tp_size != 8
+                or model.num_attention_heads % tp_size
+                or model.num_attention_heads // tp_size not in (8, 16)
+                or model.head_dim != 512 or model.qk_rope_head_dim != 64):
+            raise NotImplementedError("DSpark partial context insert requires TP8, localheads8/16,512/64 and prefix1..6")
+        if (not isinstance(slot_mapping, tuple) or len(slot_mapping) != 6
+                or any(type(slot) is not int for slot in slot_mapping)
+                or any(slot < 0 for slot in slot_mapping[:valid_token_count])
+                or any(slot != -1 for slot in slot_mapping[valid_token_count:])):
+            raise ValueError("DSpark context slots require six rows: valid prefix then exact -1 tail")
+        trace._check_tensor(slot_tensor)
+        if slot_tensor.shape != (6,) or slot_tensor.dtype != "int64":
+            raise ValueError("DSpark partial context insert requires its actual INT64 six-slot tensor")
+        # Reuse the unchanged ordinary owner's cache/model/slot-bound checks.
+        # Only the valid prefix is passed to that all-valid constructor; its
+        # runtime call below still sees and validates the complete six rows.
+        super().__init__(trace, name, pool_name, model, tp_size=tp_size,
+            cache=cache, slot_mapping=slot_mapping[:valid_token_count], slot_tensor=None)
+        self.slots = slot_mapping
+        self.slot_tensor = slot_tensor
+        self.valid_token_count = valid_token_count
+
+    def node(self, kind, shape, dtype, variant, attributes=None):
+        if (kind is not WorkloadKind.KV_UPDATE or variant != "dsv4_qnorm_rope_kv_insert"
+                or dtype != "bf16" or shape["seq_len"] != 6
+                or attributes is None
+                or attributes["source_component"] != "vllm_0_30_symbolic_v4_swa_insert"):
+            raise ValueError("DSpark partial writer must retain the original six-row fused source operation")
+        return super().node(kind, shape, dtype, variant, {
+            **attributes,
+            "mathematical_program": "vllm_0_30_dspark_partial_context_insert_v1",
+            "valid_token_count": self.valid_token_count,
+            "slot_mapping_all_valid": self.valid_token_count == 6,
+            "symbolic_slot_mapping": self.slots,
+            "symbolic_valid_cache_write_slots": self.slots[:self.valid_token_count],
+            "slot_mapping_scope": "declared_logical_valid_prefix_not_native_physical_pages",
+        })

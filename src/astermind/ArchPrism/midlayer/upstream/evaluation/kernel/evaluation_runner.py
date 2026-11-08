@@ -1047,7 +1047,7 @@ def _process_op(task_key, entry, hw_config_path, run_oracle, run_forward,
 
         if metrics["grid_z"] > 1:
             has_gz = True
-        if op_type == "GEMM" and executed_gemm_split_k > 1:
+        if op_type == "GEMM" and executed_gemm_split_k is not None and executed_gemm_split_k > 1:
             # Hopper nvjet splits K without a grid-z axis.
             has_gz = True
 
@@ -2186,6 +2186,9 @@ def main():
         help=(
             "Write one worker-local timing and work-count record per Kernel "
             "case. The timed region is _process_op and excludes queue wait."))
+    parser.add_argument("--report-output", type=Path, help="Offline Kernel HTML output (only with --interactive-report)")
+    parser.add_argument("--interactive-report", action="store_true", help="Write the offline Kernel HTML report plus its projections")
+    parser.add_argument("--no-report", dest="interactive_report", action="store_false", help=argparse.SUPPRESS)
     parser.add_argument(
         "--semantic-output", type=Path, default=None,
         help=(
@@ -2206,6 +2209,30 @@ def main():
         "--forward-timing-warmups", type=int, default=1,
         help="Unmeasured pure-Forward warmups (default: 1).")
     args = parser.parse_args()
+    if args.report_output is not None and not args.interactive_report:
+        parser.error("--report-output requires --interactive-report")
+    from evaluation.reporting.kernel_overview import default_kernel_report_path, write_kernel_overview
+    report_output = (args.report_output if args.report_output is not None else default_kernel_report_path()) if args.interactive_report else None
+    if report_output is not None:
+        if report_output.suffix != ".html":
+            parser.error("--report-output must end in .html")
+        report_files = {report_output.resolve(), report_output.with_suffix(".visualization.json").resolve(), report_output.with_suffix(".report.json").resolve(), report_output.with_suffix(".semantic.json").resolve()}
+        for artifact_output in (args.semantic_output, args.forward_timing_output, args.case_timing_output):
+            if artifact_output is not None and artifact_output.resolve() in report_files:
+                parser.error("report and evaluation artifact paths must be separate")
+    started = time.perf_counter()
+    try:
+        _run_evaluation(args, report_output, started)
+    except Exception as error:
+        if report_output is not None:
+            receipt = write_kernel_overview(None, {}, vars(args), report_output,
+                elapsed_s=time.perf_counter() - started,
+                failure={"type": type(error).__name__, "message": str(error)})
+            print("Kernel HTML report: " + receipt["path"])
+        raise
+
+
+def _run_evaluation(args, report_output, started):
     run_oracle = args.mode in ("oracle", "both", "standard", "all")
     run_forward = args.mode in ("forward", "both", "standard", "all")
     run_roofline = args.mode in ("roofline", "standard", "all")
@@ -2352,7 +2379,7 @@ def main():
             op_pairs_pipeweave[task_key] = pipeweave_pair
         kernel_results.extend(krs)
 
-    if args.semantic_output is not None:
+    if args.semantic_output is not None or report_output is not None:
         semantic_artifact = _build_semantic_artifact(
             hardware_id=hardware_id,
             mode=args.mode,
@@ -2363,7 +2390,8 @@ def main():
             hardware_config_sha256=file_sha256(Path(hw_config_path)),
             results=results,
         )
-        _write_semantic_artifact(args.semantic_output, semantic_artifact)
+        if args.semantic_output is not None:
+            _write_semantic_artifact(args.semantic_output, semantic_artifact)
 
     # Print table
     subsets = define_subsets(op_meta)
@@ -2732,3 +2760,17 @@ def main():
                 dist = "  ".join(f"{k}={v}" for k, v in bn_items)
                 label = f"  {ot} {cat}"
                 print(f"  {label:<24} n={len(ks):>4}  {dist}")
+
+    if report_output is not None:
+        from evaluation.reporting.kernel_overview import write_kernel_overview
+        content = Path(hw_config_path).read_text()
+        snapshot = {"kind": "hardware_config", "path": str(Path(hw_config_path).resolve()),
+            "content": content, "sha256": hashlib.sha256(content.encode()).hexdigest()}
+        pairs = {"oracle": op_pairs_oracle, "forward": op_pairs_forward,
+            "roofline": op_pairs_roofline, "pipeweave": op_pairs_pipeweave}
+        metrics = {method: compute_metrics(list(values.values()), exclude_unsupported=method in ("forward", "roofline"))
+            for method, values in pairs.items()}
+        receipt = write_kernel_overview(semantic_artifact, metrics, {**vars(args), "effective_jobs": n_workers},
+            report_output, elapsed_s=time.perf_counter() - started, hardware_snapshot=snapshot)
+        print("Kernel HTML report: " + receipt["path"])
+        print("Kernel output cost receipt: " + receipt["cost_receipt_path"])

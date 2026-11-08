@@ -15,19 +15,14 @@ import time
 
 HERE = Path(__file__).resolve().parent
 REPOSITORY_ROOT = HERE.parents[3]
-MODEL = Path("/share_data/public_models/Qwen3-8B")
 OWNER_CONFIG = REPOSITORY_ROOT / "configs/model/qwen3-8b.json"
-SUPPORT = Path(
-    "/share_data/yangxinhao/chip_modeling/"
-    "midlayer-wt-operator-support-20261014"
-)
 CAMPAIGN_RAW = (
-    SUPPORT
+    REPOSITORY_ROOT
     / "profiler_output/serving/nvidia_a800/"
     "startup_native_memory_20261026"
 )
 EXPECTED_REPORT = (
-    SUPPORT
+    REPOSITORY_ROOT
     / "experiment_logs/evaluation/operator_support/"
     "analytical_performance_closure/normal_acceptance/a800"
 )
@@ -51,7 +46,7 @@ REQUIRED_PHASES = {
 }
 
 
-def command_for(port):
+def command_for(model, port):
     compilation = json.dumps(
         {
             "level": 3,
@@ -66,7 +61,7 @@ def command_for(port):
         "-c",
         "from vllm.entrypoints.cli.main import main; main()",
         "serve",
-        str(MODEL),
+        str(model),
         "--host",
         "127.0.0.1",
         "--port",
@@ -126,6 +121,7 @@ def observations(raw):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--raw-output", type=Path, required=True)
     parser.add_argument("--report-output", type=Path, required=True)
     parser.add_argument("--device-index", type=int, required=True)
@@ -148,7 +144,7 @@ def main():
         raise ValueError("Explicit unprivileged port required")
     if not 1 <= args.startup_timeout_seconds <= 900:
         raise ValueError("Startup timeout must be in [1, 900] seconds")
-    command = command_for(args.port)
+    command = command_for(args.model, args.port)
     plan = {
         "mode": "plan_only_no_model_or_device_import",
         "command": command,
@@ -173,7 +169,7 @@ def main():
         print(json.dumps(plan, indent=2))
         return 0
 
-    model_config = MODEL / "config.json"
+    model_config = args.model / "config.json"
     if not model_config.is_file():
         raise FileNotFoundError(model_config)
     if not OWNER_CONFIG.is_file():
@@ -188,7 +184,7 @@ def main():
     raw.mkdir(parents=True)
     report.mkdir(parents=True, exist_ok=True)
     identity = {
-        "model": str(MODEL),
+        "model": str(args.model),
         "model_config_path": str(model_config),
         "owner_config_path": str(OWNER_CONFIG),
         "config_sha256": config_sha256,

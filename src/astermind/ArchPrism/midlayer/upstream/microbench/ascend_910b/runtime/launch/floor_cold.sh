@@ -8,7 +8,7 @@
 # process keeps exactly one cold launch; the warm launches of the same process
 # reproduce the published regime as the control.
 set -u
-BASE=/mnt/gpfs/midlayer_yxh/r8floor
+BASE=${MIDLAYER_ASCEND_FLOOR_ROOT:?set MIDLAYER_ASCEND_FLOOR_ROOT}
 BIN=$BASE/build/aiv_memory_task_floor_bench
 OUT=$BASE/caps
 mkdir -p "$OUT"

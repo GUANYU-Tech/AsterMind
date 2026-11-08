@@ -1,60 +1,10 @@
 {
+  "schema_version": 1,
   "hardware_id": "nvidia_h200",
-  "max_scheduled_request_count": 83,
-  "measurement": {
-    "artifacts": [
-      {
-        "path": "microbench/nvidia_h200/runtime/scheduler_host/references/vllm030/nvidia_h200/llama-3.1-8b/tp1_qps4/scheduler_steps.jsonl.zst",
-        "sha256": "883b36636269c83eeba24ea8f65fdd3697b7dcb6eee82f0b64f95c7202f559cd"
-      },
-      {
-        "path": "microbench/nvidia_h200/runtime/scheduler_host/references/vllm030/nvidia_h200/llama-3.1-8b/tp1_qps64/scheduler_steps.jsonl.zst",
-        "sha256": "1ccf686e3df4f54e5276f4dbef945214add319d810212dc4b55997b987fc4635"
-      },
-      {
-        "path": "microbench/nvidia_h200/runtime/scheduler_host/references/vllm030/nvidia_h200/qwen3-30b-a3b/tp2_ep2_qps1/scheduler_steps.jsonl.zst",
-        "sha256": "8fed980d32838d67879b999598e7b5cced5dc7f9c611007caea2a42afb101d9e"
-      },
-      {
-        "path": "microbench/nvidia_h200/runtime/scheduler_host/references/vllm030/nvidia_h200/qwen3-30b-a3b/tp2_ep2_qps4/scheduler_steps.jsonl.zst",
-        "sha256": "bcf568f59321a17d6aee3a1e15b16908e1fe07a0338f0e6bc07c1d3e42782813"
-      },
-      {
-        "path": "microbench/nvidia_h200/runtime/scheduler_host/references/vllm030/nvidia_h200/qwen3-32b/tp2_ep1_qps1/scheduler_steps.jsonl.zst",
-        "sha256": "34b6d7f7c7b62a098717ddc24b742b2ab714fab5b39d4ee735de1c1f3f4c10da"
-      },
-      {
-        "path": "microbench/nvidia_h200/runtime/scheduler_host/references/vllm030/nvidia_h200/qwen3-32b/tp2_ep1_qps4/scheduler_steps.jsonl.zst",
-        "sha256": "2189ca492a25240222284bd137a2923e4af6458d12b41d0e50b0ad92f67c429c"
-      },
-      {
-        "path": "microbench/nvidia_h200/runtime/scheduler_host/references/vllm030/nvidia_h200/qwen3-4b/tp1_qps4/scheduler_steps.jsonl.zst",
-        "sha256": "55185bcb6e64b538a3988a4cb21489f44de63307fb941360801a6a6df96afe0e"
-      },
-      {
-        "path": "microbench/nvidia_h200/runtime/scheduler_host/references/vllm030/nvidia_h200/qwen3-4b/tp1_qps64/scheduler_steps.jsonl.zst",
-        "sha256": "f826fbae58ec73710c068ea1b289b87a4f18cc8aad920b3609d460c3c815d973"
-      },
-      {
-        "path": "microbench/nvidia_h200/runtime/scheduler_host/references/vllm030/nvidia_h200/qwen3-8b/tp1_qps4/scheduler_steps.jsonl.zst",
-        "sha256": "d40155adec04143d720eace7a6c802248ba388e59ab1362fa9ed1ec3161a827e"
-      },
-      {
-        "path": "microbench/nvidia_h200/runtime/scheduler_host/references/vllm030/nvidia_h200/qwen3-8b/tp1_qps64/scheduler_steps.jsonl.zst",
-        "sha256": "8b68d17db29079566c200689d80a03da200be0f15ee6fe74ee0fc814604a96b8"
-      },
-      {
-        "path": "configs/host_timing/scheduler_host_profiles/nvidia_h200_vllm011.json",
-        "sha256": "05c81b4efc819c1c7d019507a0d14671c8cf1e43100edbf5abe0265ad6cb3cca"
-      }
-    ],
-    "boundary": "vllm_scheduler_trace_host_monotonic_plan_and_update",
-    "time_unit": "seconds",
-    "training_selection": {
-      "eligible_step_rule": "nonzero_scheduled_request_count_with_positive_plan_and_update",
-      "excluded_target_qps": 16,
-      "minimum_samples_per_phase": 32
-    }
+  "shared_cpu_timing_target": "0.30.0",
+  "scheduler": {
+    "vllm_version": "0.11.0",
+    "source_identity": "vllm=0.11.0;independent_cpu_mechanism=true;source_files_sha256=0108b3dac13a043d60dead9b33849c7420bae3e5b35ac2969f1b344bd7c6dccb"
   },
   "model": {
     "kind": "scheduled_request_count_affine",
@@ -63,34 +13,45 @@
     ],
     "statistic": "median_of_count_medians_theil_sen"
   },
-  "scheduler": {
-    "source_identity": "vllm=0.30.0;source_identities=vllm=0.30.0;source_commit=not_recorded;prefill_line_substitute=vllm=0.11.0:configs/host_timing/scheduler_host_profiles/nvidia_h200_vllm011.json",
-    "vllm_version": "0.30.0"
-  },
-  "schema_version": 1,
-  "service_time_s": {
-    "plan": {
-      "intercept": 6.255727777777781e-05,
-      "per_request": 8.309513888888888e-06
-    },
-    "prefill": {
-      "plan": {
-        "intercept": 3.191060714285714e-05,
-        "per_request": 5.645242857142857e-05
-      },
-      "update": {
-        "intercept": 1.2316785714285714e-05,
-        "per_request": 3.3096428571428567e-06
-      }
-    },
-    "update": {
-      "intercept": 4.8986e-05,
-      "per_request": 5.2548e-06
-    }
-  },
+  "max_scheduled_request_count": 32,
   "supported_phases": [
     "prefill",
     "mixed",
     "decode"
-  ]
+  ],
+  "service_time_s": {
+    "plan": {
+      "intercept": 1.6506677419354838e-05,
+      "per_request": 1.8096822580645164e-05
+    },
+    "update": {
+      "intercept": 1.2975854838709696e-05,
+      "per_request": 8.518145161290322e-06
+    },
+    "prefill": {
+      "plan": {
+        "intercept": 4.86928870967743e-05,
+        "per_request": 3.9077612903225804e-05
+      },
+      "update": {
+        "intercept": 2.5807483870967744e-05,
+        "per_request": 7.809516129032258e-06
+      }
+    }
+  },
+  "measurement": {
+    "boundary": "vllm_scheduler_trace_host_monotonic_plan_and_update",
+    "time_unit": "seconds",
+    "training_selection": {
+      "excluded_target_qps": 16,
+      "minimum_samples_per_phase": 32,
+      "eligible_step_rule": "nonzero_scheduled_request_count_with_positive_plan_and_update"
+    },
+    "artifacts": [
+      {
+        "path": "microbench/nvidia_a800/runtime/scheduler_host/references/independent_state_vllm011.json.zst",
+        "sha256": "1298940cb4729b9a2e8668323606b1f0abcb3cf9ef0ce6502c591ef47a67f1a4"
+      }
+    ]
+  }
 }

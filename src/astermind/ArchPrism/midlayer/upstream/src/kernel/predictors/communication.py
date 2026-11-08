@@ -1,6 +1,7 @@
 """Zero-fit analytical communication Roofline and backend dispatch."""
 
 from collections import Counter
+import math
 
 from src.kernel.kernel_base import KernelPredictor
 from src.kernel.kernel_spec import KernelKind, KernelSpec
@@ -8,11 +9,45 @@ from src.kernel.predictors.common import prediction_from_ns
 from src.kernel.predictors.protobridge.adapter import predict_protobridge
 
 
+def direct_switch_collective_logical_work(kernel: KernelSpec):
+    """Endpoint byte loads of an explicitly routed, nonblocking switch call.
+
+    Two GPUs sharing one NIC share its physical TX/RX capacity. Even traffic
+    between those GPUs follows the declared switch program; no unbound fast
+    local path is inserted. Full-duplex TX and RX are independent services.
+    """
+    transfer = kernel.transfer
+    if kernel.kind is not KernelKind.COMMUNICATION or transfer is None or not transfer.traffic_matrix_bytes:
+        raise ValueError("direct-switch work requires its explicit traffic-matrix collective")
+    tx = Counter({nic: 0 for nic in transfer.participant_nic_ids})
+    rx = Counter({nic: 0 for nic in transfer.participant_nic_ids})
+    matrix = transfer.traffic_matrix_bytes
+    for source, nic in enumerate(transfer.participant_nic_ids):
+        tx[nic] += sum(matrix[source])
+        rx[nic] += sum(row[source] for row in matrix)
+    return {"payload_bytes": transfer.bytes, "nic_tx_bytes": dict(tx), "nic_rx_bytes": dict(rx),
+        "max_nic_load_bytes": max((*tx.values(), *rx.values())),
+        "limitations": ("declared_direct_switch_traffic_not_a_discovered_collective_library_algorithm",
+            "endpoint_capacity_lower_bound_nonblocking_switch_no_protocol_efficiency_inferred",
+            "one_collective_startup_separate_from_bandwidth_service_not_per_rank_or_packet")}
+
+
 class CommunicationPredictor(KernelPredictor):
     kind = KernelKind.COMMUNICATION
 
     def _analytical_roofline(self, kernel: KernelSpec, hardware):
         transfer = kernel.transfer
+        if transfer.traffic_matrix_bytes:
+            if not hardware.roofline_only:
+                raise NotImplementedError("direct-switch traffic requires its declared aggregate hardware profile")
+            work = direct_switch_collective_logical_work(kernel)
+            startup_ns = hardware.interconnect["roce_collective_startup_ns"]
+            if (isinstance(startup_ns, bool) or not isinstance(startup_ns, (int, float))
+                    or not math.isfinite(startup_ns) or startup_ns < 0):
+                raise ValueError("direct-switch collective requires an explicit nonnegative startup latency")
+            bandwidth = hardware.analytical_link_bandwidth_bytes_s(transfer.link)
+            return prediction_from_ns(startup_ns + work["max_nic_load_bytes"] / bandwidth * 1e9,
+                "direct_switch_collective")
         from src.kernel.memory_communication import has_communication_source
         if has_communication_source(kernel):
             from src.kernel.memory_access_builder import communication_memory_access_program
@@ -26,11 +61,29 @@ class CommunicationPredictor(KernelPredictor):
             # this source domain; preserve its existing support.
             payload, ranks = transfer.bytes, len(transfer.participants)
         bandwidth = hardware.analytical_link_bandwidth_bytes_s(transfer.link)
+        if transfer.destination_hardware_id is not None:
+            pcie = hardware.interconnect["pcie_bw_bytes_s"]
+            if pcie is None:
+                raise ValueError("bilateral transport requires sender PCIe bandwidth")
+            # Streaming GPUDirect path: HBM read -> PCIe -> network ->
+            # receiver PCIe -> HBM write. Stages pipeline; do not add the
+            # same payload's bandwidth service six times. Startup is unbound,
+            # so this backend deliberately reports a bandwidth lower bound.
+            bandwidth = min(bandwidth, pcie,
+                hardware.resource_by_role("dram").capacity,
+                transfer.destination_bandwidth_bytes_s)
         if transfer.operation == "all_reduce":
             network_bytes = (
                 2.0 * (ranks - 1) / ranks * payload)
         elif transfer.operation == "all_gather":
             network_bytes = (ranks - 1) * payload
+        elif transfer.operation in ("all_gatherv", "reduce_scatterv"):
+            # Explicit direct pairwise broadcast/reduce scenario. Each root
+            # sends its segment to N-1 peers (or receives N-1 contributions).
+            # Full-duplex endpoint load is the maximum TX or RX byte demand;
+            # no equal-size padding or all-reduce/broadcast phase is invented.
+            sizes = transfer.partition_bytes
+            network_bytes = max((ranks - 1) * max(sizes), payload - min(sizes))
         elif transfer.operation == "send_recv":
             network_bytes = payload
         elif transfer.operation == "all_to_all":

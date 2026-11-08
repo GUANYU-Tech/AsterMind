@@ -7,6 +7,8 @@ builder. Device compiler scratch is outside these Python wrapper requests.
 from collections import defaultdict
 from math import prod
 
+from src.kernel.memory_access import region_end
+
 
 # Tensor API storage of the declared source primitives. None means that the
 # caller supplies the written backing; these are not zero-cost operations.
@@ -134,11 +136,11 @@ def compare_v4_wrapper_storage(reference, observation, traces, graph):
     if len(expected) != len(reference):
         raise ValueError("source wrapper storage repeats an invocation")
     nodes = {node.node_id: node for node in graph.nodes}
-    trace_by_rank = {trace.rank: trace for trace in traces}
     storage_by_rank = {trace.rank: (
         {view.view_id: view for view in trace.views},
         {a.allocation_id: a for a in trace.allocations},
-        {event: i for i, event in enumerate(trace.event_order)}) for trace in traces}
+        {event: i for i, event in enumerate(trace.event_order)},
+        trace.parameter_allocation_ids) for trace in traces}
     actual = {}
     for index, row in enumerate(observation.calls.rows):
         key = row["rank"], row["role"], row["ordinal"]
@@ -152,8 +154,8 @@ def compare_v4_wrapper_storage(reference, observation, traces, graph):
             actual[key] = {"error": "wrapper must map to exactly one compound graph node", "nodes": names}
             continue
         (graph_name, name), = names
-        trace, node = trace_by_rank[row["rank"]], nodes[graph_name]
-        views, allocations, order = storage_by_rank[row["rank"]]
+        node = nodes[graph_name]
+        views, allocations, order, parameters = storage_by_rank[row["rank"]]
         end = [i for event, i in order.items() if event.endswith("return:" + name)]
         if len(end) != 1:
             raise ValueError("wrapper node needs one recorded source call interval")
@@ -162,6 +164,10 @@ def compare_v4_wrapper_storage(reference, observation, traces, graph):
         objects = []
         intervals, storage_ids = {}, []
         for storage, allocation in allocations.items():
+            # Explicit readonly parameter ports belong to the weight ledger;
+            # their node-prefixed names do not make them wrapper temporaries.
+            if storage in parameters:
+                continue
             if storage == name:
                 role = "output"
             elif storage.startswith(name + ":"):
@@ -186,6 +192,15 @@ def compare_v4_wrapper_storage(reference, observation, traces, graph):
         lifetime_valid = all(intervals[obj["role"]][0] < end[0] and (
             intervals[obj["role"]][1] is None and obj["returned"] or
             intervals[obj["role"]][1] is not None and intervals[obj["role"]][1] > end[0]) for obj in objects)
+        lifetime_valid = lifetime_valid and all(order[allocations[storage].allocated_event] < end[0]
+            and (allocations[storage].freed_event is None or order[allocations[storage].freed_event] > end[0])
+            for storage in inputs.intersection(parameters))
+        # Borrowed weights need backing for every public read view, even
+        # though their allocations are outside the wrapper's fresh locals.
+        lifetime_valid = lifetime_valid and all(
+            region_end(views[view_id].region()) <= allocations[views[view_id].allocation_id].size_bytes
+            for view_id in node.attributes["symbolic_tensor_inputs"]
+            if view_id in views and views[view_id].allocation_id in parameters)
         output_roles = [obj["role"] for obj in objects if obj["returned"]]
         if len(set(storage_ids)) != len(storage_ids) or inputs.intersection(storage_ids):
             lifetime_valid = False

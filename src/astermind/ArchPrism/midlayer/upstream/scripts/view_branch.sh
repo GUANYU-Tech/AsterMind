@@ -1,6 +1,53 @@
 #!/bin/bash
-# Show local branches with their worktree, ahead/behind and dirty state.
+# Compare branches with a selected base (default: current checkout).
 set -euo pipefail
+
+usage() {
+    printf 'Usage: %s [BRANCH | --base BRANCH]\n' "${0##*/}"
+    printf 'Compare with BRANCH; default: current branch (HEAD when detached).\n'
+}
+
+base_arg=""
+case $# in
+    0) ;;
+    1)
+        case "$1" in
+            -h|--help) usage; exit 0 ;;
+            --base=*) base_arg=${1#--base=} ;;
+            -*) usage >&2; exit 2 ;;
+            *) base_arg=$1 ;;
+        esac
+        [[ -n "$base_arg" ]] || { usage >&2; exit 2; }
+        ;;
+    2)
+        [[ "$1" == "--base" || "$1" == "-b" ]] || { usage >&2; exit 2; }
+        base_arg=$2
+        [[ -n "$base_arg" ]] || { usage >&2; exit 2; }
+        ;;
+    *) usage >&2; exit 2 ;;
+esac
+
+current_branch=$(git branch --show-current)
+if [[ -n "$current_branch" ]]; then
+    current_ref=$current_branch
+else
+    current_ref=HEAD
+fi
+
+# Freeze the resolved base so every row uses the same commit.
+if [[ -z "$base_arg" || "$base_arg" == "HEAD" ]]; then
+    base_ref=$current_ref
+    comparison_commit=$(git rev-parse --verify HEAD)
+elif git show-ref --verify --quiet "refs/heads/$base_arg"; then
+    base_ref=$base_arg
+    comparison_commit=$(git rev-parse --verify "refs/heads/${base_arg}^{commit}")
+elif git show-ref --verify --quiet "refs/remotes/$base_arg"; then
+    base_ref=$base_arg
+    comparison_commit=$(git rev-parse --verify "refs/remotes/${base_arg}^{commit}")
+else
+    printf 'Unknown branch: %s\n' "$base_arg" >&2
+    exit 2
+fi
 
 
 # 颜色
@@ -14,6 +61,9 @@ NC='\033[0m'
 
 # 获取所有分支（本地+远程）
 branches=$(git branch -a --format='%(refname:short)' | grep -v 'HEAD' | sort)
+if [[ -z "$current_branch" && "$base_ref" != HEAD ]]; then
+    branches=$(printf '%s\nHEAD\n' "$branches" | sort)
+fi
 
 # 获取 worktree 信息
 worktree_info=$(git worktree list --porcelain)
@@ -23,6 +73,10 @@ current_wt=$(git rev-parse --show-toplevel 2>/dev/null)
 get_worktree() {
     local branch=$1
     local path=""
+    if [[ -z "$current_branch" && "$branch" == "HEAD" ]]; then
+        echo "$current_wt"
+        return
+    fi
     while IFS= read -r line; do
         if [[ "$line" == "worktree "* ]]; then
             path="${line#worktree }"
@@ -91,6 +145,7 @@ total_len=$((max_branch_len + max_wt_len + ahead_len + behind_len + date_len * 2
 separator=$(printf '%*s' "$total_len" '' | tr ' ' '-')
 
 # 显示表头
+printf 'Base: %s (%s)\n' "$base_ref" "${comparison_commit:0:12}"
 printf "%-${max_branch_len}s  %-${max_wt_len}s  %-${ahead_len}s  %-${behind_len}s  %-${date_len}s  %-${date_len}s  %-${commit_id_len}s\n" \
     "BRANCH" "WORKTREE" "AHEAD" "BEHIND" "FORK" "COMMIT" "ID"
 echo "$separator"
@@ -103,17 +158,18 @@ print_branch() {
     last_commit_date=$(get_last_commit_time "$branch")
     last_commit_id=$(get_last_commit_id "$branch")
 
-    if [[ "$branch" == "main" ]]; then
+    if [[ "$branch" == "$base_ref" ]]; then
         ahead=0
         behind=0
         fork_date="-"
     else
-        ahead=$(git rev-list --count "main..${branch}" 2>/dev/null)
-        behind=$(git rev-list --count "${branch}..main" 2>/dev/null)
-        merge_base=$(git merge-base main "$branch" 2>/dev/null)
-        if [[ -n "$merge_base" ]]; then
+        ahead=$(git rev-list --count "${comparison_commit}..${branch}" 2>/dev/null)
+        behind=$(git rev-list --count "${branch}..${comparison_commit}" 2>/dev/null)
+        if merge_base=$(git merge-base "$comparison_commit" "$branch"); then
             fork_date=$(git show -s --format='%ci' "$merge_base" | cut -d' ' -f1,2 | cut -d':' -f1,2)
         else
+            status=$?
+            [[ $status -eq 1 ]] || return "$status"
             fork_date="-"
         fi
     fi
@@ -134,13 +190,13 @@ print_branch() {
         "$fork_date" "$last_commit_date" "$last_commit_id"
 }
 
-# 显示 main
-print_branch "main"
+# 显示基准分支（默认当前分支或 detached HEAD）
+print_branch "$base_ref"
 echo "$separator"
 
 # 显示本地分支
 for branch in $branches; do
-    [[ "$branch" == "main" ]] && continue
+    [[ "$branch" == "$base_ref" ]] && continue
     [[ "$branch" == origin/* ]] && continue
     print_branch "$branch"
 done
@@ -149,6 +205,7 @@ echo "$separator"
 
 # 显示远程分支
 for branch in $branches; do
+    [[ "$branch" == "$base_ref" ]] && continue
     [[ "$branch" == origin/* ]] || continue
     print_branch "$branch"
 done

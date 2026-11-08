@@ -6,7 +6,7 @@
 # verify q_len 3).  Remote copy: /mnt/public/yangxinhao/h200_microbench/dsr1_mtpoff/bin/.
 # Usage: MODEL=<dir> TP=<n> MTP=<0|k> PORT=<port> nvidia_h200_serve_deepseek_r1.sh [extra vllm serve args]
 set -euo pipefail
-B=/mnt/public/yangxinhao
+B=${MIDLAYER_H200_PUBLIC_ROOT:?set MIDLAYER_H200_PUBLIC_ROOT}
 export HOME=$B/h200_microbench/home XDG_CACHE_HOME=$B/cache/xdg HF_HOME=$B/cache/hf \
        VLLM_CACHE_ROOT=$B/cache/vllm_dsr1 TRITON_CACHE_DIR=$B/cache/triton_dsr1 \
        TORCHINDUCTOR_CACHE_DIR=$B/cache/inductor_dsr1 HF_HUB_OFFLINE=1 VLLM_NO_USAGE_STATS=1 \

@@ -92,8 +92,11 @@ def _run_window(plan, window, args, output_root, lock_path, print_lock):
     for stale in (telemetry_path, report_path, sqlite_path):
         if stale.exists():
             stale.unlink()
+    profile_args = list(_NSYS_PROFILE_ARGS)
+    if args.gpu_metrics_devices is not None:
+        profile_args.append(f"--gpu-metrics-devices={args.gpu_metrics_devices}")
     command = [
-        args.nsys, *_NSYS_PROFILE_ARGS, "--output", str(stem),
+        args.nsys, *profile_args, "--output", str(stem),
         args.python, str(ROOT / plan["runner_relpath"]),
         *plan["runner_args"],
         "--h200-gpu-lock", str(lock_path),
@@ -131,7 +134,7 @@ def _run_window(plan, window, args, output_root, lock_path, print_lock):
         "marker": plan["marker"],
         "runner_relpath": plan["runner_relpath"],
         "runner_args": plan["runner_args"],
-        "nsys_arguments": list(_NSYS_PROFILE_ARGS),
+        "nsys_arguments": profile_args,
         "launches": _launch_facts(sqlite_path, launches),
         "telemetry": telemetry,
         "wall_seconds": elapsed,
@@ -139,7 +142,8 @@ def _run_window(plan, window, args, output_root, lock_path, print_lock):
     temporary = Path(str(result_path) + ".tmp")
     temporary.write_text(json.dumps(payload, indent=1), encoding="utf-8")
     os.replace(temporary, result_path)
-    sqlite_path.unlink()
+    if not args.retain_sqlite:
+        sqlite_path.unlink()
     with print_lock:
         print(json.dumps({
             "case_id": case_id, "window": window, "status": "measured",
@@ -164,6 +168,11 @@ def main():
     parser.add_argument("--concurrency", type=int, default=3)
     parser.add_argument("--physical-gpu", type=int, required=True)
     parser.add_argument("--nsys", required=True)
+    parser.add_argument("--gpu-metrics-devices", choices=("cuda-visible",),
+                        default=None,
+                        help="diagnostic capture of GPU Metrics in the same report")
+    parser.add_argument("--retain-sqlite", action="store_true",
+                        help="retain diagnostic metric tables beside the report")
     parser.add_argument("--python", required=True)
     parser.add_argument("--gpu-lock", type=Path, required=True,
                         help="one lock file shared by every campaign on the GPU")

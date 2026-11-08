@@ -28,7 +28,7 @@ set -euo pipefail
 : "${DSR1_PORT:?must be set}"
 : "${DSR1_MAX_MODEL_LEN:?must be set}"
 : "${VLLM_USE_SIMPLE_KV_OFFLOAD:?must be set (0 or 1)}"
-B=/mnt/public/yangxinhao
+B=${MIDLAYER_H200_PUBLIC_ROOT:?set MIDLAYER_H200_PUBLIC_ROOT}
 MODEL=$B/models/DeepSeek-R1-0528-config
 export HOME=$B/h200_microbench/home XDG_CACHE_HOME=$B/cache/xdg HF_HOME=$B/cache/hf \
        VLLM_CACHE_ROOT=$B/cache/vllm_dsr1 TRITON_CACHE_DIR=$B/cache/triton_dsr1 \

@@ -1,7 +1,7 @@
 #!/bin/bash
 # resume_gpus.sh <gpu>...: release the reservation from yield_gpus.sh and restart the recorded kernel queue.
 set -u
-K=/mnt/public/yangxinhao/h200_microbench/kcampaign; cd $K
+K=${MIDLAYER_H200_PUBLIC_ROOT:?set MIDLAYER_H200_PUBLIC_ROOT}/h200_microbench/kcampaign; cd $K
 say() { echo "$(date '+%F %T') $*"; }
 release() {  # release <gpu>: the reservation is `flock -x ... sleep 86400`; the sleep inherits the lock,
   # so stop the sleep first, then the flock, and verify the lock is really free
@@ -27,6 +27,6 @@ for g in "$@"; do
   else
     body="exec ./chain.sh $g $queue"
   fi
-  REPO=$K/repo_v030 PY=/mnt/public/yangxinhao/envs/vllm030/bin/python setsid nohup bash -c "$body" < /dev/null >> logs/chain_gpu${g}_resume.log 2>&1 &
+  REPO=$K/repo_v030 PY=${MIDLAYER_H200_PUBLIC_ROOT:?set MIDLAYER_H200_PUBLIC_ROOT}/envs/vllm030/bin/python setsid nohup bash -c "$body" < /dev/null >> logs/chain_gpu${g}_resume.log 2>&1 &
   say "gpu$g: released and resumed: $body"
 done

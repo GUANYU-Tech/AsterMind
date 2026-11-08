@@ -1,1 +1,0 @@
-{"scheduler_pipeline_depth":2,"scheduler_pipeline_depth_evidence":{"configured_depth":2,"executor_class":"t.FakeExecutor","pipeline_parallel_size":1,"runtime_version":"0.30.0","source_field":"vllm_config.max_concurrent_batches","source_identity":{"module_file":"<import-location>","module_name":"<import-location>"},"source_kind":"runtime_vllm_config_field"},"schema_version":1}

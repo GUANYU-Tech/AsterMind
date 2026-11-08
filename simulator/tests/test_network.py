@@ -1,8 +1,9 @@
 import sys
+from types import SimpleNamespace
 import unittest
-from pathlib import Path
 
 from network_sim import CommunicationRuntime, TransferRequest
+from network_sim.comm.ns3_runtime import DEFAULT_LIBRARY, NS3Runtime
 from simulator.config import SimulationConfig
 from simulator.examples.make_examples import example
 
@@ -10,6 +11,25 @@ from simulator.examples.make_examples import example
 class SharedNetworkTests(unittest.TestCase):
     def topology(self):
         return SimulationConfig.model_validate(example()).topology()
+
+    def test_cell_executors_are_distinct_and_share_the_network_driver(self):
+        from simulator.engine import Simulation
+
+        def make_cell(config, loop, on_complete, on_output, executor):
+            return SimpleNamespace(executor=executor, close=lambda: None)
+
+        config = SimulationConfig.model_validate(example())
+        with Simulation(config, cell_factory=make_cell) as simulation:
+            first = simulation.cells["cellA"].executor
+            second = simulation.cells["cellB"].executor
+            self.assertIsNot(first, second)
+            self.assertIs(first.transport, second.transport)
+            self.assertIs(first.transport, simulation.transport)
+            self.assertIs(first.transport.network, simulation.network)
+            self.assertIs(first.loop, simulation.loop)
+            self.assertIs(second.loop, simulation.loop)
+            self.assertEqual({key[0] for key in first.placements}, {"cellA"})
+            self.assertEqual({key[0] for key in second.placements}, {"cellB"})
 
     def test_three_origins_contend_on_one_resource(self):
         with CommunicationRuntime(self.topology()) as runtime:
@@ -22,9 +42,8 @@ class SharedNetworkTests(unittest.TestCase):
             self.assertGreater(events[0].completion_time_ns, 24_000_000)
             self.assertTrue(all(e.path[0] == "user" and e.path[-1] == "gpu0" for e in events))
 
-    @unittest.skipUnless(sys.platform != "win32" and (Path(__file__).parents[1]/"build/libserving_ns3.so").exists(), "Linux ns-3 build required")
+    @unittest.skipUnless(sys.platform != "win32" and DEFAULT_LIBRARY.is_file(), "Linux ns-3 build required")
     def test_real_ns3_packets_and_fifo_competition(self):
-        from simulator.ns3_runtime import NS3Runtime
         with NS3Runtime(self.topology(), packet_bytes=1000) as runtime:
             runtime.submit(TransferRequest(id="one", source="user", target="gpu0", size_bytes=10000))
             runtime.submit(TransferRequest(id="two", source="user", target="gpu0", size_bytes=10000))

@@ -36,7 +36,6 @@ import sys
 
 import threading
 
-import time
 
 import warnings
 
@@ -107,12 +106,6 @@ from src.serving.backend.mtp_acceptance_replay import (
     mtp_acceptance_steps_manifest,
     closed_loop_admission_contract_sha256,
     pd_decode_admission_contract_sha256,
-)
-
-from src.serving.backend.sglang_scheduler_mirror import (
-    SGLANG_SOURCE_VERSIONS,
-    SGLangSchedulerMirrorBackend,
-    SGLangSchedulerMirrorConfig,
 )
 
 from src.serving.backend.mtp_acceptance_assumption import (
@@ -260,6 +253,8 @@ from evaluation.serving.simulation.simulation_artifacts import (
 
 from evaluation.serving.simulation.simulation_configuration import (
     ROOT,
+    _cli_hardware_id,
+    _cli_hardware_identity_scope,
     DSV3_PD_MTP_MAX_REQUESTS as _DSV3_PD_MTP_MAX_REQUESTS,
     ENGINE_CORE_HOST_ROUND_PROFILE_BY_HARDWARE as _ENGINE_CORE_HOST_ROUND_PROFILE_BY_HARDWARE,
     GLM_PD_MTP_MAX_REQUESTS as _GLM_PD_MTP_MAX_REQUESTS,
@@ -312,8 +307,8 @@ from evaluation.serving.simulation.simulation_configuration import ascend018_den
 from evaluation.serving.simulation.simulation_configuration import metax024_colocated_ep2_cli_scope as _metax024_colocated_ep2_cli_scope
 from evaluation.serving.simulation.simulation_configuration import normalize_default_model_source as _normalize_default_model_source
 from evaluation.serving.simulation.simulation_configuration import normalize_glm_mtp_cli_source as _normalize_glm_mtp_cli_source
+from evaluation.serving.simulation.simulation_configuration import normalize_vllm_step_cli_source as _normalize_vllm_step_cli_source
 from evaluation.serving.simulation.simulation_configuration import normalize_mtp_draft_token_ids as _normalize_mtp_draft_token_ids
-from evaluation.serving.simulation.simulation_configuration import normalize_sglang_cli_source as _normalize_sglang_cli_source
 from evaluation.serving.simulation.simulation_configuration import shape_only_dense_conformance_cli_scope as _shape_only_dense_conformance_cli_scope
 from evaluation.serving.simulation.simulation_configuration import shared_dense_graph_cli_scope as _shared_dense_graph_cli_scope
 from evaluation.serving.simulation.simulation_configuration import vllm011_colocated_ep2_cli_scope as _vllm011_colocated_ep2_cli_scope
@@ -323,14 +318,16 @@ from evaluation.serving.simulation.simulation_configuration import vllm011_moe_c
 from evaluation.serving.simulation.simulation_configuration import vllm011_multi_colocated_cli_scope as _vllm011_multi_colocated_cli_scope
 from src.serving.workload.model_config import is_validated_qwen3_moe_ep2_model_scope
 from src.serving.workload.model_config import is_validated_qwen3_pipeline_model_scope
+from evaluation.serving.simulation.simulation_configuration import gqa_pd_cli_scope, mla_pcp_pd_cli_scope, glm_bf16_cli_source_scope
 
 
 def _launch_data_provenance(hardware_ids: tuple[str, ...]) -> dict:
     return launch_data_provenance(hardware_ids, repository_root=ROOT)
 
 
+@_cli_hardware_identity_scope()
 def _parse_args(argv=None):
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev=False)
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--workload")
     source.add_argument("--production-trace")
@@ -353,9 +350,10 @@ def _parse_args(argv=None):
         required=True,
     )
     parser.add_argument(
-        "--backend", choices=("vllm", "conformance", "sglang_mirror"),
+        "--backend", choices=("vllm", "conformance"),
         required=True)
     parser.add_argument("--vllm-scheduler-version", choices=("0.11.0", "0.30.0"), default="0.11.0")
+    parser.add_argument("--vllm-executor-backend", choices=("uni", "mp"))
     parser.add_argument("--vllm-sdk-python", type=Path)
     parser.add_argument("--vllm-source-root", type=Path)
     parser.add_argument("--vllm-cache-layout", choices=("LBHNC", "BLHNC", "BLNHC"))
@@ -383,11 +381,17 @@ def _parse_args(argv=None):
                         help="explicit C500 native allocator/unset target flags source scenario; never inferred from simulator environment")
     parser.add_argument("--symbolic-forward-source", choices=("cuda_eager_inplace", "vllm_ascend_eager", "vllm_0_30_v4_sync_fp8_ds_mla",
                         "vllm_0_30_v32_bf16_sync_explicit_allreduce", "vllm_0_30_v32_fp8_sync_explicit_allreduce",
-                        "vllm_0_30_k2_6_int4_sync_explicit_allreduce", "vllm_0_27_1_deepseek_v3_sync_fp8", "vllm_0_11_glm4_sync",
+                        "vllm_0_30_k2_6_int4_sync_explicit_allreduce", "vllm_0_30_k3_mxfp4_sync", "vllm_0_27_1_deepseek_v3_sync_fp8", "vllm_0_11_glm4_sync",
                         *_SGLANG_VIRTUAL_TARGET_SOURCES),
                         help="metadata-only shared model forward; does not execute actual tensors or a GPU model")
     parser.add_argument("--source-workspace-initial-capacity-bytes", nargs="+", type=int,
-                        help="declared initial single-lane workspace capacity per TP rank; source growth carries across steps, not observed runtime history")
+                        help="declared workspace entry bytes per TP rank; BF16 GLM PD also accepts all deployment physical ranks in pool order, required with different endpoint geometry")
+    parser.add_argument("--norm-source-batch-invariant", choices=("disabled",),
+                        help="explicit vLLM0.30 CUDA Norm default-source scenario; capture flag and native provider remain unobserved")
+    parser.add_argument("--bf16-gemm-model", choices=("tiled_reference",),
+                        help="explicit ordinary BF16 finite-tile analytical reference; no cuBLAS provider or launch attestation")
+    parser.add_argument("--dense-source-input-policy", choices=("declared_zero_tp2",),
+                        help="explicit TP2 input approximation: retain known IDs; declare unknown IDs/padding zero, not observed content")
     parser.add_argument("--v4-source-use-deep-gemm", choices=("enabled", "disabled"),
                         help="explicit mHC source branch declaration; not installed provider evidence")
     parser.add_argument("--v4-indexer-selection-source", choices=("declared_causal_topk",),
@@ -395,27 +399,13 @@ def _parse_args(argv=None):
     parser.add_argument("--glm-indexer-selection-source", choices=("declared_causal_topk",),
                         help="explicit GLM cardinality domain, not observed selected indices")
     parser.add_argument("--glm-prefill-attention-source", choices=("force_sparse_mqa",),
-                        help="explicit vLLM sparse_mla_force_mqa source branch; no default backend inference")
-    parser.add_argument(
-        "--sglang-source-version", choices=SGLANG_SOURCE_VERSIONS,
-        default=None)
-    parser.add_argument(
-        "--sglang-max-total-num-tokens", type=int, default=None)
-    parser.add_argument(
-        "--sglang-max-total-num-tokens-source", default=None)
-    parser.add_argument(
-        "--sglang-max-running-requests", type=int, default=None)
-    parser.add_argument("--sglang-request-token-transcript", action="append", nargs=3,
-        metavar=("REQUEST_ID", "PROMPT_IDS", "OUTPUT_IDS"),
-        help="repeat per request with comma-separated integer prompt/output IDs; empty output is an empty string; no tokenizer or numerical model is run")
-    parser.add_argument("--sglang-token-transcript-source-id",
-        help="identity of the explicitly supplied token transcript, not proof of observed model output")
-    parser.add_argument("--sglang-step-source-input", action="append", nargs=3, metavar=("STEP_ID", "KIND", "JSON"),
-        help="repeat exact existing source dataclass fields per step; KIND=none/prefill/graph/eagle, with JSON null for explicit none; no IDs or slots are generated")
+                        help="force vLLM sparse MQA; BF16 CP1 may omit this flag for shape-checked fresh-dense prefill and ordinary sparse decode")
     parser.add_argument("--glm-mtp-step-source-input", action="append", nargs=2, metavar=("STEP_ID", "JSON"),
         help="repeat explicit V32PaddedMTPInputs JSON per Scheduler step; not numerically generated or observed drafts")
     parser.add_argument("--glm-mtp-initial-target-token-ids", nargs="+", type=int,
         help="explicit initial RuntimeInputs IDs; each executed step uses its BackendStep IDs, including the CPU Scheduler's declared length-only protocol")
+    parser.add_argument("--vllm-step-source-input", action="append", nargs=2, metavar=("STEP_ID", "JSON"),
+        help="explicit VLLMDenseGraphInputs with scheduled IDs and optional retained padding per target step; no IDs are inferred")
     parser.add_argument(
         "--prediction-method",
         choices=("midlayer", "roofline", "roofline_span_floor", "pipeweave"),
@@ -470,7 +460,7 @@ def _parse_args(argv=None):
     parser.add_argument("--trace-prefix-hit-tokens-field")
     parser.add_argument("--trace-prompt-token-ids-field")
     parser.add_argument("--trace-output-token-ids-field")
-    parser.add_argument("--prefix-cache-mode", choices=("trace", "token_ids"), default="trace")
+    parser.add_argument("--prefix-cache-mode", choices=("trace", "token_ids", "trace_no_hit"), default="trace")
     parser.add_argument("--trace-request-id-field")
     parser.add_argument(
         "--trace-success-filter-mode",
@@ -514,6 +504,12 @@ def _parse_args(argv=None):
         "--vllm-async-scheduling",
         action=argparse.BooleanOptionalAction,
         default=False,
+    )
+    parser.add_argument(
+        "--vllm-async-terminal-guard-source",
+        choices=("vllm_0_18_0_running_max_tokens_guard",),
+        default=None,
+        help="explicit diagnostic bridge for the vLLM 0.18 async terminal guard",
     )
     kv_capacity = parser.add_mutually_exclusive_group()
     kv_capacity.add_argument(
@@ -572,7 +568,7 @@ def _parse_args(argv=None):
     parser.add_argument("--expert-routing-canonical-payload-sha256")
     parser.add_argument(
         "--execution-mode",
-        choices=("accelerated", "reference"),
+        choices=("accelerated", "reference", "fast"),
         default="accelerated",
     )
     parser.add_argument(
@@ -618,6 +614,14 @@ def _parse_args(argv=None):
             "runtime-prepare profile of hardware with versioned Host profiles "
             "(required there in Host timing modes; rejected elsewhere)"),
     )
+    parser.add_argument("--interactive-view", choices=("breakdown", "swimlanes"), default="swimlanes", help="offline report layout")
+    parser.add_argument("--interactive-detail-mode", choices=("summary", "sampled", "all"), default="summary", help="summary preserves fast paths (default); sampled/all explicitly capture operator detail")
+    parser.add_argument("--interactive-max-events", type=int, default=100000, help="maximum retained detailed Host/Device events; request-aware sampling across the run; all-step summaries remain complete")
+    parser.add_argument("--no-interactive-report", dest="interactive_report", action="store_false",
+        default=False, help=argparse.SUPPRESS)
+    parser.add_argument("--interactive-report", dest="interactive_report", action="store_true",
+        default=False, help="write the offline HTML report plus its visualization projection")
+    parser.add_argument("--interactive-output", help="override the default offline HTML path; summaries preserve compact execution")
     parser.add_argument(
         "--step-retention",
         choices=("auto", "full", "streaming_aggregate"),
@@ -629,6 +633,7 @@ def _parse_args(argv=None):
     )
     parser.add_argument("--prefill-tp-size", type=int, required=True)
     parser.add_argument("--prefill-pp-size", type=int, default=1)
+    parser.add_argument("--prefill-pp-layer-partition", nargs="+", type=int)
     parser.add_argument("--pipeline-ranks-per-node", type=int)
     parser.add_argument(
         "--enable-expert-parallel",
@@ -647,9 +652,19 @@ def _parse_args(argv=None):
     )
     parser.add_argument("--ffn-tp-size", type=int)
     parser.add_argument("--decode-tp-size", type=int)
+    parser.add_argument("--decode-pp-size", type=int, default=1)
+    parser.add_argument("--decode-pp-layer-partition", nargs="+", type=int)
+    parser.add_argument("--prefill-dp-size", type=int, default=1)
+    parser.add_argument("--decode-dp-size", type=int, default=1)
+    parser.add_argument("--prefill-cp-size", type=int, default=1)
+    parser.add_argument("--decode-cp-size", type=int, default=1)
+    parser.add_argument("--prefill-expert-parallel", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--decode-expert-parallel", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--num-prefill-instances", type=int)
     parser.add_argument("--num-decode-instances", type=int)
     parser.add_argument("--transfer-algorithm", choices=("send_recv",))
+    parser.add_argument("--kv-transfer-backend",
+        choices=("analytical_roofline_v1", "protobridge"), default="protobridge")
     parser.add_argument(
         "--transfer-link", choices=("nvlink", "metaxlink", "hccs",
                                     "infiniband"))
@@ -669,11 +684,65 @@ def _parse_args(argv=None):
     parser.add_argument("--slo-config-sha256")
     parser.add_argument("--interactivity-tgs-config")
     parser.add_argument("--interactivity-tgs-config-sha256")
+    parser.add_argument("--state-audit-output",
+        help="optional per-rank logical-work and source-memory lifecycle sidecar")
     parser.add_argument("--output")
+    parser.add_argument("--settings-summary", type=Path,
+                        help="write a human-readable summary of the completed simulation")
+    parser.add_argument("--quiet", action="store_true", help="do not print the saved result JSON")
     args = parser.parse_args(argv)
+    if args.interactive_output is not None and args.output is not None and Path(args.interactive_output).resolve() == Path(args.output).resolve():
+        parser.error("report and result output paths must differ")
+    if args.interactive_detail_mode == "all" and (not args.interactive_report or args.interactive_view != "swimlanes"):
+        parser.error("--interactive-detail-mode all requires enabled reports and --interactive-view swimlanes")
+    for side in ("prefill", "decode"):
+        field = side + "_pp_layer_partition"
+        partition = getattr(args, field)
+        if partition is not None:
+            partition = tuple(partition)
+            model = load_model_config(args.model)
+            if (len(partition) != getattr(args, side + "_pp_size") or sum(partition) != model.num_hidden_layers
+                    or any(count <= 0 for count in partition)):
+                parser.error("--" + side + "-pp-layer-partition requires positive counts matching PP and all decoder layers")
+            if model.model_type != "glm_moe_dsa" or model.weight_dtype != "bf16":
+                parser.error("explicit per-pool pipeline source partitions require BF16 GLM")
+            start = 0
+            for count in partition:
+                if (args.glm_prefill_attention_source == "force_sparse_mqa"
+                        and model.indexer_types[start] != "full"):
+                    parser.error("GLM source stage needs a local full indexer/top-k input; this does not mark the upstream partition illegal")
+                start += count
+            setattr(args, field, partition)
+    if args.deployment != "pd_disagg" and args.decode_pp_layer_partition is not None:
+        parser.error("--decode-pp-layer-partition requires pd_disagg")
+    if args.deployment != "pd_disagg" and (
+            args.prefill_expert_parallel is not None or args.decode_expert_parallel is not None):
+        parser.error("independent P/D expert parallel options require pd_disagg")
+    args.prefill_expert_parallel = (args.enable_expert_parallel
+        if args.prefill_expert_parallel is None else args.prefill_expert_parallel)
+    args.decode_expert_parallel = (args.enable_expert_parallel
+        if args.decode_expert_parallel is None else args.decode_expert_parallel)
+    if args.prefill_dp_size < 1 or args.decode_dp_size < 1:
+        parser.error("P/D data parallel sizes must be positive")
+    if args.prefill_cp_size < 1 or args.decode_cp_size < 1:
+        parser.error("P/D context parallel sizes must be positive")
+    if args.deployment != "pd_disagg" and (args.prefill_cp_size != 1 or args.decode_cp_size != 1):
+        parser.error("P/D context parallel options require pd_disagg")
+    if ((args.deployment not in ("pd_disagg", "colocated") and args.prefill_dp_size != 1)
+            or (args.deployment != "pd_disagg" and args.decode_dp_size != 1)):
+        parser.error("data parallel options require pd_disagg or the GLM colocated source")
+    if args.deployment != "pd_disagg" and args.decode_pp_size != 1:
+        parser.error("--decode-pp-size is only valid for pd_disagg")
     _normalize_default_model_source(args)
-    _normalize_sglang_cli_source(args, parser)
+    if (args.symbolic_forward_source == "vllm_0_30_v32_bf16_sync_explicit_allreduce"
+            and max(args.prefill_pp_size, args.decode_pp_size) > 1 and not glm_bf16_cli_source_scope(args)):
+        parser.error("GLM pipeline source requires legal BF16 shards, CP1 and a full indexer for forced sparse attention; automatic dense/sparse selection validates top-k dependencies per step")
+    if args.deployment == "colocated" and args.prefill_dp_size != 1 and not glm_bf16_cli_source_scope(args):
+        parser.error("colocated data parallel requires the explicit BF16 GLM source")
+    if max(args.prefill_cp_size, args.decode_cp_size) > 1 and not mla_pcp_pd_cli_scope(args):
+        parser.error("PCP PD requires explicit analytical GLM BF16 sparse-MQA eager0.30, PP1 and legal TP*CP*DP expert shards")
     _normalize_glm_mtp_cli_source(args, parser)
+    _normalize_vllm_step_cli_source(args, parser)
     _normalize_mtp_draft_token_ids(args, parser)
     args.activation_source_compilation_options = None
     if args.activation_source_compilation_options_json is not None:
@@ -700,14 +769,14 @@ def _parse_args(argv=None):
     if args.activation_source_profile is not None:
         source_model = load_model_config(args.model)
         metax024 = (args.activation_source_profile == "vllm_metax_0_24_no_metadata_native_triton_fp32_noise_cold_cache"
-            and args.vllm_scheduler_version == "0.11.0" and HWSpec(args.hardware_config).hardware_id == "metax_c500"
+            and args.vllm_scheduler_version == "0.11.0" and _cli_hardware_id(args.hardware_config, HWSpec) == "metax_c500"
             and args.symbolic_forward_source == "cuda_eager_inplace"
             and args.target_sampling_source == "vllm_0_24_plain_greedy_bf16" and args.prefill_tp_size == 1)
         if (args.activation_source_profile == "vllm_metax_0_24_no_metadata_native_triton_fp32_noise_cold_cache"
                 and not metax024):
             parser.error("MetaX0.24 startup projection requires C500 BF16 dense TP1 with its explicit0.24 model source")
         ascend018 = (args.activation_source_profile == "vllm_ascend_0_18_no_metadata_head_only"
-            and args.vllm_scheduler_version == "0.11.0" and HWSpec(args.hardware_config).hardware_id == "ascend_910b"
+            and args.vllm_scheduler_version == "0.11.0" and _cli_hardware_id(args.hardware_config, HWSpec) == "ascend_910b"
             and args.symbolic_forward_source == "vllm_ascend_eager"
             and args.target_sampling_source == "vllm_0_18_plain_greedy_bf16"
             and source_model.model_type == "qwen3" and args.prefill_tp_size == 1
@@ -715,10 +784,10 @@ def _parse_args(argv=None):
         if args.activation_source_profile == "vllm_ascend_0_18_no_metadata_head_only" and not ascend018:
             parser.error("Ascend0.18 startup projection requires Qwen3 BF16 TP1 and matching eager or explicit PIECEWISE request configuration; FULL/NONE cannot borrow the PIECEWISE startup policy")
         flashinfer011 = (args.vllm_scheduler_version == "0.11.0"
-            and HWSpec(args.hardware_config).hardware_id == "nvidia_a800"
+            and _cli_hardware_id(args.hardware_config, HWSpec) == "nvidia_a800"
             and args.activation_source_profile == "cuda_eager_inplace_fa_no_metadata_flashinfer_0_4_1_top_k_first")
         source011 = (args.vllm_scheduler_version == "0.11.0"
-            and HWSpec(args.hardware_config).hardware_id == "nvidia_a800"
+            and _cli_hardware_id(args.hardware_config, HWSpec) == "nvidia_a800"
             and (args.activation_source_profile == "cuda_eager_inplace_fa_no_metadata_pytorch_sort_fp32_noise" or flashinfer011))
         if (args.activation_source_profile == "cuda_eager_inplace_fa_no_metadata_flashinfer_0_4_1_top_k_first"
                 and not flashinfer011):
@@ -731,7 +800,7 @@ def _parse_args(argv=None):
                 or (args.symbolic_forward_source != "cuda_eager_inplace" and not ascend018)
                 or source_model.model_type not in ("qwen3", "llama") or source_model.num_experts
                 or source_model.compute_dtype != "bf16" or source_model.weight_dtype != "bf16"
-                or (HWSpec(args.hardware_config).hardware_id not in ("nvidia_a800", "nvidia_h200") and not (ascend018 or metax024))):
+                or (_cli_hardware_id(args.hardware_config, HWSpec) not in ("nvidia_a800", "nvidia_h200") and not (ascend018 or metax024))):
             parser.error("activation source capacity requires versioned CPU dense BF16 Qwen3-or-Llama/TP1-or-TP2/PP1 colocated with a bound runtime policy;0.11 requires A800 PyTorch-sort or FlashInfer0.4.1; only FlashInfer0.4.1 permits separate graph configuration/reserves;0.30 A800-or-H200; other startup sources remain unbound")
     glm_sources = ("vllm_0_30_v32_bf16_sync_explicit_allreduce", "vllm_0_30_v32_fp8_sync_explicit_allreduce")
     dsv3_source = "vllm_0_27_1_deepseek_v3_sync_fp8"
@@ -740,25 +809,35 @@ def _parse_args(argv=None):
             args.glm_indexer_selection_source is not None or args.glm_prefill_attention_source is not None):
         parser.error("GLM attention source options require the matching virtual forward")
     if args.source_workspace_initial_capacity_bytes is not None:
+        workspace_ranks = args.prefill_tp_size
+        if glm_bf16_cli_source_scope(args):
+            workspace_ranks *= args.prefill_pp_size * args.prefill_dp_size * args.prefill_cp_size
+            if args.deployment == "pd_disagg" and args.num_prefill_instances is not None and args.num_decode_instances is not None:
+                workspace_ranks = (workspace_ranks * args.num_prefill_instances
+                    + args.decode_tp_size * args.decode_pp_size * args.decode_dp_size * args.decode_cp_size * args.num_decode_instances)
+        workspace_lengths = ((workspace_ranks, args.prefill_tp_size) if mla_pcp_pd_cli_scope(args)
+            and args.prefill_cp_size == args.decode_cp_size == 1
+            and args.prefill_pp_size == args.decode_pp_size == args.prefill_dp_size == args.decode_dp_size == 1
+            and args.prefill_tp_size == args.decode_tp_size else (workspace_ranks,))
         if (args.symbolic_forward_source not in ("vllm_0_30_v4_sync_fp8_ds_mla", *glm_sources)
-                or len(args.source_workspace_initial_capacity_bytes) != args.prefill_tp_size
+                or len(args.source_workspace_initial_capacity_bytes) not in workspace_lengths
                 or any(size < 0 for size in args.source_workspace_initial_capacity_bytes)):
-            parser.error("source workspace history requires virtual V4/GLM and one nonnegative entry capacity per TP rank")
+            parser.error("source workspace history requires virtual V4/GLM and one nonnegative entry capacity per TP rank; PCP PD requires every deployment physical rank")
     if args.vllm_scheduler_version == "0.30.0":
         if args.symbolic_forward_source == "vllm_0_11_glm4_sync":
             parser.error("virtual GLM4 source requires the explicit0.11 Scheduler")
         virtual_pp = (args.deployment == "colocated" and not args.enable_expert_parallel
-            and HWSpec(args.hardware_config).hardware_id == "nvidia_a800"
+            and _cli_hardware_id(args.hardware_config, HWSpec) == "nvidia_a800"
             and args.symbolic_forward_source == "cuda_eager_inplace"
             and is_validated_qwen3_pipeline_model_scope(load_model_config(args.model), args.prefill_tp_size, args.prefill_pp_size))
-        virtual_pd = (args.deployment == "pd_disagg"
+        virtual_pd = gqa_pd_cli_scope(args) or mla_pcp_pd_cli_scope(args) or (args.deployment == "pd_disagg"
             and args.symbolic_forward_source in ("cuda_eager_inplace", "vllm_ascend_eager")
             and load_model_config(args.model).model_type in ("qwen3", "qwen3_moe")
             and args.prefill_tp_size in (1, 2) and args.decode_tp_size in (1, 2)
             and (not args.enable_expert_parallel or args.decode_tp_size == args.prefill_tp_size == 2))
         virtual_af = (args.deployment == "af_disagg" and not args.enable_expert_parallel
             and args.symbolic_forward_source == "cuda_eager_inplace"
-            and HWSpec(args.hardware_config).hardware_id == "nvidia_a800"
+            and _cli_hardware_id(args.hardware_config, HWSpec) == "nvidia_a800"
             and (load_model_config(args.model).model_type in ("qwen3", "llama")
                 or (load_model_config(args.model).model_type == "qwen3_moe" and args.prefill_tp_size == 1))
             and args.prefill_pp_size == 1 and args.prefill_tp_size == args.ffn_tp_size
@@ -768,37 +847,96 @@ def _parse_args(argv=None):
             and is_validated_qwen3_moe_ep2_model_scope(load_model_config(args.model)))
         virtual_kimi_ep8 = (args.symbolic_forward_source == "vllm_0_30_k2_6_int4_sync_explicit_allreduce"
             and _is_kimi_h200_colocated_tp8_ep8_target_scope(args))
+        virtual_k3 = args.symbolic_forward_source == "vllm_0_30_k3_mxfp4_sync"
         virtual_pd_af = (args.deployment == "pd_af_disagg" and args.symbolic_forward_source == "cuda_eager_inplace"
             and not args.enable_expert_parallel and args.prefill_tp_size == args.decode_tp_size == args.ffn_tp_size == args.prefill_pp_size == 1
-            and HWSpec(args.hardware_config).hardware_id == "nvidia_a800"
+            and _cli_hardware_id(args.hardware_config, HWSpec) == "nvidia_a800"
             and load_model_config(args.model).model_type in ("qwen3", "qwen3_moe", "llama"))
         virtual_host_kv = (args.symbolic_forward_source == "cuda_eager_inplace"
             and args.deployment in ("colocated", "af_disagg") and args.prefill_tp_size == args.prefill_pp_size == 1
-            and not args.enable_expert_parallel and HWSpec(args.hardware_config).hardware_id == "nvidia_a800"
+            and not args.enable_expert_parallel and _cli_hardware_id(args.hardware_config, HWSpec) == "nvidia_a800"
             and load_model_config(args.model).model_type in ("qwen3", "qwen3_moe", "llama"))
+        ordinary_async = (args.vllm_async_scheduling and args.deployment == "colocated"
+            and args.symbolic_forward_source == "cuda_eager_inplace"
+            and HWSpec(args.hardware_config).hardware_id == "nvidia_h200"
+            and args.prefill_tp_size in (1, 2) and args.prefill_pp_size == 1
+            and load_model_config(args.model).compute_dtype == load_model_config(args.model).weight_dtype == "bf16"
+            and ((load_model_config(args.model).model_type in ("qwen3", "llama") and not args.enable_expert_parallel)
+                or (args.prefill_tp_size == 2 and args.enable_expert_parallel
+                    and is_validated_qwen3_moe_ep2_model_scope(load_model_config(args.model))))
+            and args.mtp_num_speculative_tokens == 0)
+        ordinary_async_graph = (ordinary_async
+            and args.graph_mode == "FULL_AND_PIECEWISE"
+            and _shared_dense_graph_cli_scope(args))
         if (args.backend != "vllm" or (args.deployment != "colocated" and not virtual_pd and not virtual_af and not virtual_pd_af) or args.additional_colocated_hardware_config
-                or (args.prefill_pp_size != 1 and not virtual_pp) or (args.enable_expert_parallel and not virtual_ep2 and not virtual_kimi_ep8) or args.vllm_async_scheduling
-                or args.enable_prefix_caching or (args.mtp_num_speculative_tokens and args.glm_mtp_step_inputs is None) or args.scheduler_pipeline_depth != 1
-                or args.serving_timing_mode != "device_only" or args.graph_mode != "NONE"
+                or (args.prefill_pp_size != 1 and not virtual_pp and not virtual_k3 and not gqa_pd_cli_scope(args) and not glm_bf16_cli_source_scope(args)) or (args.enable_expert_parallel and not virtual_ep2 and not virtual_kimi_ep8 and not gqa_pd_cli_scope(args) and not glm_bf16_cli_source_scope(args))
+                or (args.vllm_async_scheduling and not ordinary_async)
+                or (args.enable_prefix_caching and not (ordinary_async
+                    and args.prefix_cache_mode == "trace_no_hit"))
+                or (args.mtp_num_speculative_tokens and args.glm_mtp_step_inputs is None)
+                or args.scheduler_pipeline_depth != (2 if ordinary_async else 1)
+                or (args.serving_timing_mode != "device_only"
+                    and not (ordinary_async and args.serving_timing_mode in (
+                        "device_plus_launch", "device_plus_launch_plus_scheduler")))
+                or (args.serving_timing_mode in ("device_plus_launch", "device_plus_launch_plus_scheduler")
+                    and args.host_runtime_prepare_profile is None)
+                or (args.graph_mode != "NONE" and not ordinary_async_graph)
                 or (args.kv_lifecycle_replay is not None and not virtual_host_kv)
                 or (args.symbolic_forward_source is None and args.expert_routing_policy != "seeded_assumption")):
-            parser.error("0.30 CLI requires synchronous PP1/MTP-off eager device-only colocated or virtual Qwen PD pools without prefix/KV replay")
-        if args.runtime_memory_policy is None or args.num_kv_blocks is not None:
-            parser.error("0.30 CLI requires --runtime-memory-policy; debug capacity cannot establish normal Serving")
+            parser.error("0.30 CLI requires synchronous depth1 or ordinary H200 TP1/TP2 async depth2, device-only or explicit launch and runtime-prepare Host profiles for ordinary async, with only trace_no_hit prefix caching and no KV replay; async graph requires FULL_AND_PIECEWISE")
+        if args.serving_timing_mode == "device_plus_launch_plus_scheduler":
+            from src.serving.host_timing import load_scheduler_host_profile, load_host_request_path_profile
+            from src.serving.backend.vllm import _validate_vllm030_host_profiles
+            if not args.scheduler_host_profile:
+                parser.error("0.30 full Host timing requires its exact source-bound Scheduler profile")
+            try:
+                profiles = tuple(load_scheduler_host_profile(path) for path in args.scheduler_host_profile)
+                selected = tuple(profile for profile in profiles if profile.hardware_id == _cli_hardware_id(args.hardware_config, HWSpec))
+                if len(selected) != 1:
+                    raise ValueError("0.30 full Host timing requires one matching hardware Scheduler profile")
+                _validate_vllm030_host_profiles(selected[0])
+                if not args.host_request_path_profile:
+                    raise ValueError("0.30 full Host timing requires its versioned request-path profile")
+                request_profiles = tuple(load_host_request_path_profile(path) for path in args.host_request_path_profile)
+                request_selected = tuple(profile for profile in request_profiles
+                    if profile.hardware_id == _cli_hardware_id(args.hardware_config, HWSpec))
+                if len(request_selected) != 1 or not request_selected[0].supports_runtime_version("0.30.0"):
+                    raise ValueError("0.30 full Host request-path profile must match the native runtime version")
+            except (OSError, ValueError, NotImplementedError) as error:
+                parser.error(str(error))
+        k3_mathematical_tp1 = (virtual_k3 and (args.prefill_tp_size, args.prefill_pp_size) == (1, 1)
+            and args.runtime_memory_policy is None and args.num_kv_blocks is None)
+        if ((args.runtime_memory_policy is None and not k3_mathematical_tp1) or args.num_kv_blocks is not None):
+            parser.error("0.30 CLI requires --runtime-memory-policy; debug capacity cannot establish normal Serving; only explicit K3 TP1 may use its built-in mathematical byte budget")
         if any(value is None for value in (args.vllm_sdk_python, args.vllm_source_root, args.vllm_cache_layout)):
             parser.error("0.30 CLI requires explicit --vllm-sdk-python, --vllm-source-root and --vllm-cache-layout")
         if args.v4_indexer_selection_source is not None and args.symbolic_forward_source != "vllm_0_30_v4_sync_fp8_ds_mla":
             parser.error("--v4-indexer-selection-source requires the virtual V4 source profile")
         if args.symbolic_forward_source is not None:
             symbolic_model = load_model_config(args.model)
+            if virtual_k3 and (
+                    symbolic_model.model_id != "moonshotai/Kimi-K3" or symbolic_model.model_type != "kimi_linear"
+                    or symbolic_model.compute_dtype != "bf16" or symbolic_model.weight_dtype != "mxfp4"
+                    or symbolic_model.attention_layout != "hybrid_kda_mla"
+                    or _cli_hardware_id(args.hardware_config, HWSpec) != "nvidia_h200"
+                    or args.deployment != "colocated" or (args.prefill_tp_size, args.prefill_pp_size) not in ((1, 1), (1, 16))
+                    or (args.prefill_pp_size == 16 and args.pipeline_ranks_per_node != 8)
+                    or args.enable_expert_parallel or args.expert_routing_policy != "seeded_assumption"
+                    or args.attention_kv_layout != "mla" or args.attention_kv_distribution != "uniform"
+                    or args.target_sampling_source != "vllm_0_30_plain_greedy_bf16"
+                    or args.launch_policy != "analytical_launch" or args.prediction_method not in ("midlayer", "roofline")
+                    or args.collective_backend != "analytical_roofline_v1"
+                    or args.v4_eager_metadata or args.v4_routing_source is not None
+                    or args.v4_weight_storage_profile is not None or args.v4_source_use_deep_gemm is not None):
+                parser.error("virtual K3 requires the bound BF16/MXFP4 checkpoint, H200 colocated TP1/PP16 or TP1/PP1, two-eight-GPU-node PP placement, seeded routing, uniform MLA, analytical launch and plain greedy")
             if args.symbolic_forward_source in mla_sources:
                 expected_model_type = ("deepseek_v3" if args.symbolic_forward_source == dsv3_source else
                     "glm_moe_dsa" if args.symbolic_forward_source in glm_sources else "kimi_k2")
                 expected_sampler = ("vllm_0_27_1_plain_greedy_bf16" if args.symbolic_forward_source == dsv3_source
                     else "vllm_0_30_rejection_raw_logits_bf16" if args.glm_mtp_step_inputs is not None else "vllm_0_30_plain_greedy_bf16")
                 if (symbolic_model.model_type != expected_model_type or symbolic_model.compute_dtype != "bf16"
-                        or HWSpec(args.hardware_config).hardware_id != "nvidia_h200"
-                        or (args.prefill_tp_size != 8 and args.glm_mtp_step_inputs is None)
+                        or (_cli_hardware_id(args.hardware_config, HWSpec) != "nvidia_h200" and not glm_bf16_cli_source_scope(args))
+                        or (args.prefill_tp_size != 8 and args.glm_mtp_step_inputs is None and not glm_bf16_cli_source_scope(args))
                         or args.expert_routing_policy is None or args.attention_kv_layout != "mla"
                         or args.attention_kv_distribution != "uniform"
                         or args.target_sampling_source != expected_sampler
@@ -811,11 +949,11 @@ def _parse_args(argv=None):
             if args.symbolic_forward_source in ("cuda_eager_inplace", "vllm_ascend_eager") and (symbolic_model.model_type not in ("qwen3", "qwen3_moe", "llama")
                     or symbolic_model.compute_dtype not in ("bf16", "fp16") or symbolic_model.weight_dtype != symbolic_model.compute_dtype
                     or (symbolic_model.compute_dtype == "fp16" and symbolic_model.model_type != "qwen3")
-                    or HWSpec(args.hardware_config).hardware_id not in (("ascend_910b",) if
+                    or _cli_hardware_id(args.hardware_config, HWSpec) not in (("ascend_910b",) if
                         args.symbolic_forward_source == "vllm_ascend_eager" else ("nvidia_a800", "nvidia_h200", "metax_c500"))
                     or (args.symbolic_forward_source == "vllm_ascend_eager" and symbolic_model.num_experts
                         and symbolic_model.model_type != "qwen3_moe")
-                    or args.prefill_tp_size < 1 or (args.prefill_pp_size != 1 and not virtual_pp)
+                    or args.prefill_tp_size < 1 or (args.prefill_pp_size != 1 and not virtual_pp and not gqa_pd_cli_scope(args))
                     or (symbolic_model.num_experts > 0 and args.expert_routing_policy is None)
                     or (symbolic_model.num_experts == 0 and args.expert_routing_policy is not None)
                     or args.attention_kv_layout != "paged_varlen"
@@ -850,7 +988,7 @@ def _parse_args(argv=None):
             parser.error("Ascend0.18 source requires CPU0.11 colocated BF16 dense Qwen3/Llama TP1/TP2 EP-off or validated Qwen3-MoE TP=EP2; PP1 MTP-off FULL/eager and matching greedy source")
     elif args.symbolic_forward_source == "cuda_eager_inplace" and args.vllm_scheduler_version == "0.11.0":
         symbolic_model = load_model_config(args.model)
-        metax024 = (HWSpec(args.hardware_config).hardware_id == "metax_c500"
+        metax024 = (_cli_hardware_id(args.hardware_config, HWSpec) == "metax_c500"
             and ((symbolic_model.model_type in ("qwen3", "llama") and not symbolic_model.num_experts
             and symbolic_model.compute_dtype == "bf16" and args.deployment == "colocated"
             and args.prefill_pp_size == 1 and not args.additional_colocated_hardware_config)
@@ -873,8 +1011,8 @@ def _parse_args(argv=None):
                 or symbolic_model.compute_dtype not in ("bf16", "fp16") or symbolic_model.weight_dtype != symbolic_model.compute_dtype
                 or (symbolic_model.compute_dtype == "fp16" and symbolic_model.model_type != "qwen3")
                 or (args.expert_routing_policy is not None and not moe011)
-                or (HWSpec(args.hardware_config).hardware_id != "nvidia_a800" and not metax024
-                    and not (HWSpec(args.hardware_config).hardware_id == "nvidia_h200"
+                or (_cli_hardware_id(args.hardware_config, HWSpec) != "nvidia_a800" and not metax024
+                    and not (_cli_hardware_id(args.hardware_config, HWSpec) == "nvidia_h200"
                         and (not symbolic_model.num_experts or _vllm011_colocated_ep2_cli_scope(args, symbolic_model))
                         and symbolic_model.compute_dtype == "bf16"
                         and args.deployment == "colocated" and args.prefill_pp_size == 1
@@ -902,7 +1040,7 @@ def _parse_args(argv=None):
                 or args.launch_policy != "analytical_launch"
                 or symbolic_model.model_type != "glm4_moe" or symbolic_model.compute_dtype != "bf16"
                 or symbolic_model.weight_dtype != "bf16" or args.expert_routing_policy is None
-                or HWSpec(args.hardware_config).hardware_id != "nvidia_a800"
+                or _cli_hardware_id(args.hardware_config, HWSpec) != "nvidia_a800"
                 or args.attention_kv_layout != "paged_varlen" or args.attention_kv_distribution != "uniform"
                 or args.target_sampling_source != expected_sampler
                 or args.v4_eager_metadata or args.v4_routing_source is not None
@@ -1181,10 +1319,13 @@ def _parse_args(argv=None):
             "unknown MTP acceptance policy: "
             f"{args.mtp_acceptance_policy!r}")
     args.mtp_acceptance_assumption = mtp_acceptance_assumption
-    if args.num_kv_blocks is None and args.runtime_memory_policy is None:
+    if (args.num_kv_blocks is None and args.runtime_memory_policy is None
+            and not (args.vllm_scheduler_version == "0.30.0"
+                and args.symbolic_forward_source == "vllm_0_30_k3_mxfp4_sync"
+                and (args.prefill_tp_size, args.prefill_pp_size) == (1, 1))):
         parser.error(
             "production Forward requires --runtime-memory-policy; narrow "
-            "fixtures may use --debug-num-kv-blocks")
+            "fixtures may use --debug-num-kv-blocks; explicit K3 TP1 has a mathematical byte budget")
     if args.num_kv_blocks is not None and args.num_kv_blocks < 1:
         parser.error("--debug-num-kv-blocks must be positive")
     if (args.runtime_memory_policy is not None
@@ -1242,30 +1383,7 @@ def _parse_args(argv=None):
             args.mtp_acceptance_source_id != "disabled",
             args.mtp_acceptance_replay is not None,
     )):
-        if args.backend != "sglang_mirror":
-            parser.error("MTP options require --backend vllm")
-        if (args.mtp_acceptance_policy != "maximum_entropy"
-                or args.mtp_acceptance_replay is not None
-                or args.mtp_fixed_accepted_tokens):
-            parser.error(
-                "the SGLang mirror requires maximum-entropy EAGLE acceptance")
-    sglang_options = (
-        args.sglang_source_version,
-        args.sglang_max_total_num_tokens,
-        args.sglang_max_total_num_tokens_source,
-        args.sglang_max_running_requests,
-    )
-    if args.backend == "sglang_mirror":
-        if any(option is None for option in sglang_options):
-            parser.error(
-                "--backend sglang_mirror requires --sglang-source-version, "
-                "--sglang-max-total-num-tokens, "
-                "--sglang-max-total-num-tokens-source and "
-                "--sglang-max-running-requests")
-        if args.deployment != "colocated":
-            parser.error("--backend sglang_mirror requires colocated")
-    elif any(option is not None for option in sglang_options):
-        parser.error("SGLang options require --backend sglang_mirror")
+        parser.error("MTP options require --backend vllm")
     if args.kv_lifecycle_replay is not None:
         if args.backend != "vllm":
             parser.error("KV lifecycle replay requires --backend vllm")
@@ -1358,6 +1476,8 @@ def _parse_args(argv=None):
             parser.error("token_ids prefix cache requires vllm and production trace token ID mapping")
         if args.closed_loop_client_count is not None or args.kv_lifecycle_replay is not None:
             parser.error("token prefix cache does not support closed-loop admission or KV lifecycle replay")
+    if args.prefix_cache_mode == "trace_no_hit" and args.canonical_requests is None:
+        parser.error("trace_no_hit requires canonical requests with recorded prefix-hit counts")
     if args.production_trace is None and any((args.trace_prompt_token_ids_field, args.trace_output_token_ids_field)):
         parser.error("token ID mappings require --production-trace")
     if args.backend != "vllm" and args.prefill_pp_size != 1:
@@ -1372,12 +1492,16 @@ def _parse_args(argv=None):
             scheduler_version=args.vllm_scheduler_version,
             tensor_parallel_size=args.prefill_tp_size,
             pipeline_parallel_size=args.prefill_pp_size,
-            enable_expert_parallel=args.enable_expert_parallel,
+            context_parallel_size=args.prefill_cp_size,
+            data_parallel_size=args.prefill_dp_size if load_model_config(args.model).model_type == "glm_moe_dsa" else 1,
+            pipeline_layer_partition=args.prefill_pp_layer_partition,
+            enable_expert_parallel=(args.prefill_expert_parallel if args.deployment == "pd_disagg" else args.enable_expert_parallel),
             max_model_len=args.max_model_len,
             enable_chunked_prefill=args.enable_chunked_prefill,
             enable_prefix_caching=args.enable_prefix_caching,
             prefix_cache_mode=args.prefix_cache_mode,
             async_scheduling=args.vllm_async_scheduling,
+            async_terminal_guard_source=args.vllm_async_terminal_guard_source,
             mtp_draft_token_ids_by_step=args.mtp_draft_token_ids_by_step,
             mtp_num_speculative_tokens=args.mtp_num_speculative_tokens,
             mtp_acceptance_policy=args.mtp_acceptance_policy,
@@ -1435,6 +1559,8 @@ def _parse_args(argv=None):
                 "the current vLLM baseline supports only colocated, "
                 "af_disagg, pd_disagg, or pd_af_disagg deployment")
         if (args.prefill_tp_size not in (1, 2)
+                and not gqa_pd_cli_scope(args)
+                and not glm_bf16_cli_source_scope(args)
                 and not target_tp8_scope
                 and not target_h200_aggregate_scope
                 and not target_h200_pd_ep1_scope
@@ -1489,6 +1615,8 @@ def _parse_args(argv=None):
             and args.prediction_method == "midlayer"
         )
         if (not colocated_ep2 and not pd_ep2 and not standalone_af_ep2
+                and not gqa_pd_cli_scope(args)
+                and not glm_bf16_cli_source_scope(args)
                 and not target_tp8_scope
                 and not target_kimi_h200_colocated_scope):
             parser.error(
@@ -1657,7 +1785,15 @@ def _parse_args(argv=None):
                     "standalone AF MTP requires seeded-assumption expert "
                     "routing")
     elif args.deployment == "pd_disagg":
-        if args.prefill_pp_size != 1:
+        if ((args.prefill_expert_parallel != args.enable_expert_parallel
+                or args.decode_expert_parallel != args.enable_expert_parallel)
+                and not gqa_pd_cli_scope(args) and not mla_pcp_pd_cli_scope(args)):
+            parser.error("independent EP flags require source-supported eager0.30 GQA or GLM PCP PD")
+        if ((args.prefill_dp_size != 1 or args.decode_dp_size != 1)
+                and not gqa_pd_cli_scope(args) and not mla_pcp_pd_cli_scope(args)):
+            parser.error("independent DP replica scheduling requires eager0.30 GQA or GLM PCP PD")
+        if ((args.prefill_pp_size != 1 or args.decode_pp_size != 1)
+                and not gqa_pd_cli_scope(args) and not mla_pcp_pd_cli_scope(args)):
             parser.error("pd_disagg currently requires --prefill-pp-size 1")
         if args.additional_colocated_hardware_config:
             parser.error(
@@ -1697,6 +1833,8 @@ def _parse_args(argv=None):
         if args.backend == "vllm":
             if ((args.prefill_tp_size not in (1, 2)
                  or args.decode_tp_size not in (1, 2))
+                    and not gqa_pd_cli_scope(args)
+                    and not mla_pcp_pd_cli_scope(args)
                     and not target_tp8_scope
                     and not target_h200_pd_ep1_scope
                     and not target_dsv3_h200_pd_ep1_scope):
@@ -1705,9 +1843,12 @@ def _parse_args(argv=None):
                     "selected prefill/decode TP sizes in {1, 2}")
             if (Path(args.decode_hardware_config).resolve()
                     != Path(args.hardware_config).resolve()):
-                parser.error(
-                    "the current vLLM PD baseline requires the same hardware "
-                    "config file for P and D")
+                if (args.transfer_link != "infiniband"
+                        or args.kv_transfer_backend != "analytical_roofline_v1"):
+                    parser.error("heterogeneous PD requires --transfer-link infiniband "
+                        "--kv-transfer-backend analytical_roofline_v1")
+                if args.mtp_num_speculative_tokens:
+                    parser.error("heterogeneous PD draft MTP is outside this request contract")
             if args.mtp_num_speculative_tokens != 0:
                 if ((args.prefill_tp_size != 1
                      or args.decode_tp_size != 1)
@@ -1844,12 +1985,48 @@ def _parse_args(argv=None):
     else:
         raise AssertionError(
             f"argparse allowed unknown deployment: {args.deployment!r}")
+    if args.norm_source_batch_invariant is not None and (
+            args.vllm_scheduler_version != "0.30.0"
+            or args.symbolic_forward_source != "cuda_eager_inplace"):
+        parser.error("Norm source declaration requires non-batch-invariant vLLM0.30 CUDA source")
+    if args.bf16_gemm_model is not None and (
+            args.vllm_scheduler_version != "0.30.0"
+            or args.symbolic_forward_source != "cuda_eager_inplace"
+            or args.launch_policy != "analytical_launch"):
+        parser.error("BF16 tiled reference requires vLLM0.30 CUDA analytical source")
     return args
 
 
+@_cli_hardware_identity_scope()
 def _run_from_cli_args(argv=None) -> tuple[argparse.Namespace, dict]:
     args = _parse_args(argv)
-    return args, run(args)
+    if args.quiet and args.output is None:
+        raise ValueError("--quiet requires --output")
+    if args.settings_summary is not None and args.output is None:
+        raise ValueError("--settings-summary requires --output")
+    if (args.settings_summary is not None
+            and args.settings_summary.resolve() == Path(args.output).resolve()):
+        raise ValueError("--settings-summary must differ from --output")
+    if args.settings_summary is not None and args.settings_summary.exists():
+        raise ValueError("--settings-summary already exists")
+    try:
+        payload = run(args)
+    except Exception as error:
+        if args.interactive_report:
+            from evaluation.reporting.serving_interactive import write_status_report, default_report_path
+            from evaluation.reporting.serving_viewer_ui import _configuration_metadata
+            output = default_report_path(args.output, args.interactive_output)
+            write_status_report({"main_chain_status": {"status": "unsupported" if isinstance(error, NotImplementedError) else "failed",
+                "reason": type(error).__name__ + ": simulation failed; see the process log for details"},
+                "request_source": {"requested_cli_options": _configuration_metadata(vars(args))}}, output)
+        raise
+    if args.settings_summary is not None:
+        from evaluation.serving.experiments.experiment_runner import render_simulation_settings
+        summary = render_simulation_settings(
+            json.loads(Path(args.output).read_text()), Path(args.output))
+        with args.settings_summary.open("x", encoding="utf-8") as stream:
+            stream.write(summary)
+    return args, payload
 
 
 def run_cli_args(argv=None) -> dict:
@@ -1860,7 +2037,7 @@ def run_cli_args(argv=None) -> dict:
 
 
 def _ensure_deterministic_hash_seed() -> None:
-    if os.environ.get("PYTHONHASHSEED") is not None:
+    if "PYTHONHASHSEED" in os.environ:
         return
     os.environ["PYTHONHASHSEED"] = "0"
     os.execvpe(sys.executable, [sys.executable, *sys.argv], os.environ)
@@ -1870,7 +2047,9 @@ def main(argv=None) -> int:
     if argv is None:
         _ensure_deterministic_hash_seed()
     args, payload = _run_from_cli_args(argv)
-    if args.output:
+    if args.quiet:
+        pass
+    elif args.output:
         sys.stdout.write(Path(args.output).read_text())
     else:
         printed_payload = _persistence_projection(payload)

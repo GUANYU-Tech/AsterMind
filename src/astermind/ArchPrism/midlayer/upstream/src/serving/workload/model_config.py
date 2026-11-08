@@ -238,6 +238,13 @@ _DSV4_CONFIG_KEYS = frozenset((
     "vocab_size",
 ))
 
+_DSV4_DSPARK_FIELDS = frozenset(("dspark_block_size", "dspark_noise_token_id",
+    "dspark_target_layer_ids", "dspark_markov_rank"))
+_DSV4_DSPARK_MODEL_IDS = frozenset(("deepseek-ai/DeepSeek-V4-Flash-DSpark",
+    "deepseek-ai/DeepSeek-V4-Pro-DSpark"))
+# vLLM0.30 nvidia/dspark.py uses three draft layers when the official
+# config has no n_mtp_layers. num_hidden_layers remains the target offset.
+_DSV4_DSPARK_LAYER_COUNT = 3
 # On-disk config.json identities of the pinned fixed-target model files.
 # ``_repository_target_provenance`` keys on exactly these digests; the
 # Scheduler, workload-construction, and emission gates reference the same
@@ -479,6 +486,22 @@ _OFFICIAL_CONFIG_PROVENANCE = {
         "extracted_config_sha256": "58d2046697a8e44cbb77f6e679cf6d0477b718e289af4ba1a2642763b39d6d32"
     }
 }
+
+
+_DSPARK_MODEL_IDS = (
+    "deepseek-ai/DeepSeek-V4-Flash-DSpark",
+    "deepseek-ai/DeepSeek-V4-Pro-DSpark",
+)
+_DSPARK_CONFIG_KEYS = frozenset(("dspark_block_size", "dspark_noise_token_id",
+    "dspark_target_layer_ids", "dspark_markov_rank"))
+# Frozen0.30 DSparkDeepseekV4Model uses n_mtp_layers or3. The two registered
+# configs do not carry n_mtp_layers;num_nextn_predict_layers remains its raw1.
+_DSPARK_SOURCE_DRAFT_LAYERS = 3
+
+
+def _is_dspark_config_identity(config_sha256):
+    return (type(config_sha256) is str and config_sha256 in _OFFICIAL_CONFIG_PROVENANCE
+        and _OFFICIAL_CONFIG_PROVENANCE[config_sha256]["model_id"] in _DSPARK_MODEL_IDS)
 
 
 @dataclass(frozen=True)
@@ -823,7 +846,9 @@ def _named_target_workload_contract(model_type: str, config_sha256: str) -> str:
     if model_type == "deepseek_v3":
         return "deepseek_v3_vllm_0_27_1_logical_v1"
     if model_type == "deepseek_v4":
-        return "deepseek_v4_vllm_0_30_0_logical_v1"
+        return ("deepseek_v4_dspark_vllm_0_30_0_metadata_only_v1"
+            if _is_dspark_config_identity(config_sha256)
+            else "deepseek_v4_vllm_0_30_0_logical_v1")
     raise ValueError(f"model type has no named target workload contract: {model_type!r}")
 
 
@@ -836,6 +861,8 @@ def validate_named_target_identity(model: "ModelConfig") -> None:
     """
     if not isinstance(model, ModelConfig):
         raise TypeError("target identity validation requires ModelConfig")
+    if model.is_dspark_draft:
+        raise NotImplementedError("DSpark draft requires its separate target-hidden/proposer source; ordinary V4 target execution is unavailable")
     if model.model_type not in TARGET_MODEL_CONFIG_SHA256_BY_TYPE:
         return
     allowed = model.config_sha256 in TARGET_MODEL_CONFIG_SHA256_BY_TYPE[model.model_type]
@@ -1063,8 +1090,34 @@ class ModelConfig:
     rotary_dim: int | None = None
     moe_group_count: int | None = None
     moe_topk_group_count: int | None = None
+    # Official DSpark metadata, normalized together at the model boundary.
+    # The target-style raw architecture and target layer count remain intact.
+    dspark_block_size: int | None = None
+    dspark_noise_token_id: int | None = None
+    dspark_target_layer_ids: tuple[int, ...] | None = None
+    dspark_markov_rank: int | None = None
 
     def __post_init__(self) -> None:
+        self._validate_dspark_metadata()
+        draft_fields = (self.dspark_block_size, self.dspark_noise_token_id,
+            self.dspark_target_layer_ids, self.dspark_markov_rank)
+        if any(value is not None for value in draft_fields):
+            if (any(value is None for value in draft_fields) or self.model_type != "deepseek_v4"
+                    or self.model_id not in _DSV4_DSPARK_MODEL_IDS):
+                raise ValueError("DSpark fields require the complete registered V4 draft metadata")
+            for name in ("dspark_block_size", "dspark_noise_token_id", "dspark_markov_rank"):
+                if type(getattr(self, name)) is not int:
+                    raise TypeError(f"ModelConfig.{name} must be an integer")
+            if (self.dspark_block_size < 2 or self.dspark_markov_rank < 1
+                    or not 0 <= self.dspark_noise_token_id < self.vocab_size):
+                raise ValueError("DSpark requires a valid noise token, block size and Markov rank")
+            layers = self.dspark_target_layer_ids
+            if (not isinstance(layers, tuple) or len(layers) != _DSV4_DSPARK_LAYER_COUNT
+                    or any(type(layer) is not int or not 0 <= layer < self.num_hidden_layers for layer in layers)
+                    or tuple(sorted(set(layers))) != layers):
+                raise ValueError("DSpark target layer IDs must be three distinct ordered in-range target layers")
+        elif self.model_id in _DSV4_DSPARK_MODEL_IDS:
+            raise ValueError("registered DSpark draft identity cannot drop its draft metadata")
         if self.rotary_dim is not None and (type(self.rotary_dim) is not int
                 or not 0 < self.rotary_dim <= self.head_dim or self.rotary_dim % 2):
             raise ValueError("ModelConfig.rotary_dim must be positive, even and no wider than its head")
@@ -1281,15 +1334,15 @@ class ModelConfig:
                 if not isinstance(self.compress_ratios, tuple):
                     raise TypeError(
                         "ModelConfig.compress_ratios must be a tuple")
-                # The pinned configs carry one entry per decoder layer plus
-                # one trailing 0 placeholder per NextN/MTP layer; upstream
-                # only consumes indices < num_hidden_layers and maps the
-                # MTP layer to ratio 1 (deepseek_v4/attention.py:224-230).
+                # The pinned configs carry one entry per target layer plus
+                # a zero placeholder for each actual draft layer (one NextN
+                # or three DSpark). Upstream maps draft layers to ratio 1
+                # (deepseek_v4/attention.py:224-230).
                 if len(self.compress_ratios) != (
-                        self.num_hidden_layers + self.num_mtp_layers):
+                        self.num_hidden_layers + (_DSV4_DSPARK_LAYER_COUNT if self.is_dspark_draft else self.num_mtp_layers)):
                     raise ValueError(
                         "DeepSeek-V4 compress_ratios must cover every "
-                        "hidden layer plus one placeholder per MTP layer")
+                        "hidden layer of the target plus its source MTP/DSpark draft tail")
                 for value in self.compress_ratios:
                     if isinstance(value, bool) or not isinstance(value, int):
                         raise TypeError(
@@ -1530,6 +1583,51 @@ class ModelConfig:
         if self.num_dense_layers == self.num_hidden_layers:
             raise ValueError("MoE models require at least one routed MoE layer")
 
+    def _validate_dspark_metadata(self):
+        present = (self.dspark_block_size is not None or self.dspark_noise_token_id is not None
+            or self.dspark_target_layer_ids is not None or self.dspark_markov_rank is not None)
+        if not _is_dspark_config_identity(self.config_sha256):
+            if present:
+                raise ValueError("DSpark metadata requires its exact registered official source identity")
+            return
+        if self.model_type != "deepseek_v4" or self.attention_layout != "dsv4_sparse_mla":
+            raise ValueError("DSpark requires its original DeepSeek-V4 sparse model geometry")
+        provenance = _OFFICIAL_CONFIG_PROVENANCE[self.config_sha256]
+        actual = (self.model_id, self.model_revision, self.model_source_url,
+            self.source_config_sha256, self.canonical_config_sha256, self.config_extraction_path,
+            self.extracted_config_sha256)
+        expected = tuple(provenance[key] for key in ("model_id", "revision", "source_url",
+            "source_config_sha256", "canonical_config_sha256", "extraction_path", "extracted_config_sha256"))
+        if actual != expected:
+            raise ValueError("DSpark metadata provenance disagrees with its exact official source")
+        if not present:
+            raise ValueError("registered DSpark draft identity cannot drop its draft metadata")
+        for name in ("dspark_block_size", "dspark_noise_token_id", "dspark_markov_rank"):
+            if type(getattr(self, name)) is not int:
+                raise TypeError("DSpark " + name + " must be an integer")
+        if self.dspark_block_size <= 1 or self.dspark_markov_rank <= 0:
+            raise ValueError("DSpark requires a positive Markov rank and anchor-plus-noise block")
+        if not 0 <= self.dspark_noise_token_id < self.vocab_size:
+            raise ValueError("DSpark noise token must be inside the official vocabulary")
+        layers = self.dspark_target_layer_ids
+        if (type(layers) is not tuple or len(layers) != _DSPARK_SOURCE_DRAFT_LAYERS
+                or any(type(layer) is not int or not 0 <= layer < self.num_hidden_layers for layer in layers)
+                or tuple(sorted(set(layers))) != layers):
+            raise ValueError("DSpark target layers must retain three ordered distinct valid decoder IDs")
+        if (self.target_semantics is None or self.target_semantics.workload_contract !=
+                "deepseek_v4_dspark_vllm_0_30_0_metadata_only_v1"):
+            raise ValueError("DSpark cannot use the ordinary V4 workload contract")
+
+    @property
+    def is_dspark_draft(self) -> bool:
+        return self.dspark_block_size is not None
+
+    @property
+    def dspark_layer_indices(self) -> tuple[int, ...]:
+        if not self.is_dspark_draft:
+            raise ValueError("DSpark layer indices require a registered draft config")
+        return tuple(range(self.num_hidden_layers, self.num_hidden_layers + _DSV4_DSPARK_LAYER_COUNT))
+
     @property
     def dtype_bytes(self) -> int:
         """Element width derived from the canonical compute dtype."""
@@ -1612,8 +1710,14 @@ class ModelConfig:
         if self.config_sha256 not in GLM_BLOCK_FP8_CONFIG_SHA256S:
             return None
         normalized = asdict(self)
+        # This GLM-only assumption identity predates the unrelated DSpark
+        # fields. Preserve its original structural projection and route seed.
         for name in ("model_id", "model_revision", "config_sha256", "source_config_sha256",
                      "canonical_config_sha256", "extracted_config_sha256", "model_source_url"):
+            del normalized[name]
+        # Draft-only metadata cannot change the existing GLM routing seed
+        # contract when every such field is absent on this target model.
+        for name in _DSV4_DSPARK_FIELDS:
             del normalized[name]
         return hashlib.sha256(json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
@@ -1744,6 +1848,9 @@ class ModelConfig:
           compressor state cache, same fp32 semantics.
         """
 
+        if self.is_dspark_draft:
+            raise NotImplementedError("DSpark draft cache inventory requires its context-KV/proposer ownership")
+
         def padded_page_per_token(page_states: int,
                                   state_bytes: int) -> Fraction:
             page_bytes = page_states * state_bytes
@@ -1787,6 +1894,8 @@ class ModelConfig:
             self, layer_index: int) -> tuple[tuple[str, Fraction, int | None], ...]:
         """Return the exact cache inventory of one DeepSeek-V4 layer."""
 
+        if self.is_dspark_draft:
+            raise NotImplementedError("DSpark draft cache ownership requires its context-KV/proposer source, not target cache layers")
         if self.attention_layout != "dsv4_sparse_mla":
             raise NotImplementedError(
                 "DeepSeek-V4 cache inventory only exists for DeepSeek-V4 "
@@ -1837,6 +1946,8 @@ class ModelConfig:
           (compressor.py:139-196, attention.py:1005-1014).
         """
 
+        if self.is_dspark_draft:
+            raise NotImplementedError("DSpark draft Scheduler caches require their separate draft ownership")
         if self.attention_layout != "dsv4_sparse_mla":
             raise NotImplementedError(
                 "DeepSeek-V4 scheduler cache groups only exist for "
@@ -2095,8 +2206,8 @@ class ModelConfig:
         tensor_parallel_size: int,
         layer_start: int,
         layer_end: int,
-    ) -> int:
-        """Return exact rank-local KV bytes for a contiguous PP layer range."""
+    ) -> int | Fraction:
+        """Rank-local logical cache rate; native arenas own physical bytes."""
 
         for name, value in (
                 ("tensor_parallel_size", tensor_parallel_size),
@@ -2108,6 +2219,10 @@ class ModelConfig:
         if not 0 <= layer_start < layer_end <= self.num_hidden_layers:
             raise ValueError("KV layer range must be non-empty and in bounds")
         local_layers = layer_end - layer_start
+        if self.attention_layout == "dsv4_sparse_mla":
+            if self.num_attention_heads % tensor_parallel_size:
+                raise ValueError("DeepSeek-V4 query heads must be divisible by tensor parallel size")
+            return self._dsv4_kv_bytes(self.compress_ratios[layer_start:layer_end])
         if self.attention_layout == "hybrid_kda_mla":
             raise NotImplementedError("K3 hybrid capacity requires separate KDA state and NoPE MLA cache contracts")
         if self.attention_layout == "standard_gqa":
@@ -2135,8 +2250,9 @@ class ModelConfig:
     def layer_uses_moe(self, layer_index: int) -> bool:
         if isinstance(layer_index, bool) or not isinstance(layer_index, int):
             raise TypeError("layer_index must be an integer")
-        if not 0 <= layer_index < self.num_hidden_layers:
-            raise ValueError("layer_index is outside the target model")
+        limit = self.num_hidden_layers + (3 if self.dspark_block_size is not None else 0)
+        if not 0 <= layer_index < limit:
+            raise ValueError("layer_index is outside the target or exact DSpark draft model")
         if self.target_semantics is None:
             return bool(
                 self.num_experts and layer_index >= self.num_dense_layers)
@@ -2224,8 +2340,8 @@ def is_validated_llama_tp2_model_scope(model: ModelConfig) -> bool:
     )
 
 
-def is_validated_qwen3_moe_ep2_model_scope(model: ModelConfig) -> bool:
-    """Return whether Qwen3MoE has the source-backed TP=EP=2 semantics."""
+def is_qwen3_moe_source_model_scope(model: ModelConfig) -> bool:
+    """Ordinary unquantized Qwen3MoE model semantics; placement is separate."""
 
     if not isinstance(model, ModelConfig):
         raise TypeError("Qwen3MoE TP=EP=2 scope requires a ModelConfig")
@@ -2234,13 +2350,11 @@ def is_validated_qwen3_moe_ep2_model_scope(model: ModelConfig) -> bool:
         and model.model_type == "qwen3_moe"
         and model.attention_layout == "standard_gqa"
         and model.num_experts > 0
-        and model.num_experts % 2 == 0
         and 0 < model.num_experts_per_tok <= model.num_experts
         and model.num_dense_layers == 0
         and model.num_shared_experts == 0
         and model.num_mtp_layers == 0
         and model.mtp_architecture == "none"
-        and model.moe_intermediate_size % 2 == 0
         and model.compute_dtype == "bf16"
         and model.weight_dtype == "bf16"
         and model.weight_group_size == 0
@@ -2249,26 +2363,335 @@ def is_validated_qwen3_moe_ep2_model_scope(model: ModelConfig) -> bool:
     )
 
 
+def is_validated_qwen3_moe_ep2_model_scope(model: ModelConfig) -> bool:
+    """Retain the existing versioned TP=EP2 model domain."""
+    return (is_qwen3_moe_source_model_scope(model) and model.num_experts % 2 == 0
+        and model.moe_intermediate_size % 2 == 0)
+
+
+def is_deepseek_v3_parallel_model_scope(model: ModelConfig, tensor_parallel_size: int, pipeline_parallel_size: int,
+                                      *, expert_parallel=False) -> bool:
+    """V3 ordinary FP8 TP/PP geometry, including the configured local L32.
+
+    Row shards must retain whole block scales. The pinned source constructs
+    its layer loop from num_hidden_layers; provider/normal capacity is separate.
+    """
+    tp, pp = tensor_parallel_size, pipeline_parallel_size
+    if (not isinstance(model, ModelConfig) or type(expert_parallel) is not bool
+            or type(tp) is not int or tp < 1 or type(pp) is not int or pp < 1
+            or model.model_type != "deepseek_v3" or model.model_id != "deepseek-ai/DeepSeek-V3"
+            or model.target_semantics.workload_contract != "deepseek_v3_vllm_0_27_1_logical_v1"
+            or model.compute_dtype != "bf16" or model.weight_dtype != "fp8" or model.num_shared_experts != 1
+            or pp > model.num_hidden_layers or model.num_attention_heads % tp or model.hidden_size % tp
+            or model.intermediate_size % tp or model.moe_intermediate_size % tp
+            or expert_parallel and model.num_experts % tp):
+        return False
+    heads = model.num_attention_heads // tp
+    return all(width % 128 == 0 for width in (model.hidden_size, model.q_lora_rank, model.kv_lora_rank,
+        model.intermediate_size // tp, model.moe_intermediate_size // tp,
+        heads * (model.qk_nope_head_dim + model.qk_rope_head_dim),
+        heads * (model.qk_nope_head_dim + model.v_head_dim), heads * model.v_head_dim))
+
+
+def is_deepseek_v3_data_parallel_model_scope(model: ModelConfig, config) -> bool:
+    """V3 whole-block FP8 TP/DP or uniform linear global EP geometry."""
+    from src.serving.parallelism.parallel_config import ParallelConfig
+    if (not isinstance(config, ParallelConfig) or config.data_parallel_size <= 1
+            or config.context_parallel_size != 1 or config.sequence_parallel_size != 1
+            or not is_deepseek_v3_parallel_model_scope(model, config.tensor_parallel_size,
+                config.pipeline_parallel_size, expert_parallel=config.enable_expert_parallel)):
+        return False
+    if config.enable_expert_parallel:
+        return model.num_experts % config.expert_parallel_size == 0
+    expert_tp = config.tensor_parallel_size * config.data_parallel_size
+    return model.moe_intermediate_size % expert_tp == 0 and model.moe_intermediate_size // expert_tp % 128 == 0
+
+
+def is_glm_fp8_tensor_model_scope(model: ModelConfig, tensor_parallel_size: int) -> bool:
+    """Official GLM block-FP8 source shards without quantization padding.
+
+    The ordinary CP1 program retains BF16 activations/cache and replicates
+    latent projections. Row/column-sharded FP8 weights require whole 128x128
+    scale blocks. This establishes geometry, not runtime/provider capacity.
+    """
+    tp = tensor_parallel_size
+    if (not isinstance(model, ModelConfig) or type(tp) is not int or tp < 1
+            or model.model_type != "glm_moe_dsa" or model.compute_dtype != "bf16" or model.weight_dtype != "fp8"
+            or model.quantized_weight_targets != ("Linear",) or model.num_shared_experts != 1
+            or model.num_attention_heads % tp or model.hidden_size % tp
+            or model.intermediate_size % tp or model.moe_intermediate_size % tp):
+        return False
+    heads = model.num_attention_heads // tp
+    return all(width % 128 == 0 for width in (model.hidden_size, model.q_lora_rank, model.kv_lora_rank,
+        model.intermediate_size // tp, model.moe_intermediate_size // tp,
+        heads * (model.qk_nope_head_dim + model.qk_rope_head_dim),
+        heads * (model.qk_nope_head_dim + model.v_head_dim), heads * model.v_head_dim))
+
+
+def is_glm_mtp_tensor_model_scope(model: ModelConfig, tensor_parallel_size: int, *, expert_parallel: bool = False) -> bool:
+    """GLM0.30 appended MTP geometry with ordinary TP and full logits.
+
+    The rank-local source requires SP/CP1 and full-indexer stage starts; a
+    nonempty target PP runs its whole drafter on the last stage. BF16 may use stage TP ranks as uniform EP;
+    Block-FP8 uses an explicitly declared deferred-input Cutlass source;
+    this geometry does not accept its provider or pricing. Rank-local FP8
+    EP uses NoDPEP prepare and deferred Cutlass; cache geometry is independent.
+    Coordinated DP uses uniform global EP and model SP at PP1 or internal MoE SP at PP>1.
+    Native depth, padded rows, rejection and explicit draft IDs are separate.
+    """
+    tp = tensor_parallel_size
+    if (not isinstance(model, ModelConfig) or type(tp) is not int or tp < 1 or type(expert_parallel) is not bool
+            or model.model_type != "glm_moe_dsa" or model.attention_layout != "dsa_mla"
+            or model.model_id not in ("zai-org/GLM-5.2", "zai-org/GLM-5.2-FP8", "zai-org/GLM-5.3")
+            or not (model.config_sha256 == GLM_MOE_DSA_CONFIG_SHA256
+                or model.config_sha256 in GLM_BLOCK_FP8_CONFIG_SHA256S)
+            or model.compute_dtype != "bf16" or model.weight_dtype not in ("bf16", "fp8")
+            or model.mtp_architecture != "glm_moe_dsa_mtp" or model.num_mtp_layers != 1
+            or model.num_attention_heads % tp or model.hidden_size % tp
+            or model.intermediate_size % tp or model.moe_intermediate_size % tp
+            or expert_parallel and (tp < 2 or model.num_experts % tp)
+            or (-(-model.vocab_size // 64) * 64) % tp):
+        return False
+    return model.weight_dtype == "bf16" or is_glm_fp8_tensor_model_scope(model, tp)
+
+
+def is_glm_fp8_data_parallel_model_scope(model: ModelConfig, parallelism) -> bool:
+    """Ordinary CP1 GLM FP8 DP geometry, independent of MTP or pricing."""
+    from src.serving.parallelism.parallel_config import ParallelConfig
+    if not isinstance(parallelism, ParallelConfig) or not isinstance(model, ModelConfig):
+        return False
+    tp, dp, pp = parallelism.tensor_parallel_size, parallelism.data_parallel_size, parallelism.pipeline_parallel_size
+    return (model.config_sha256 in GLM_BLOCK_FP8_CONFIG_SHA256S
+        and model.num_hidden_layers == 78 and is_glm_fp8_tensor_model_scope(model, tp)
+        and dp > 1 and 1 <= pp <= model.num_hidden_layers and parallelism.context_parallel_size == 1
+        and parallelism.sequence_parallel_size in ((1, tp) if parallelism.enable_expert_parallel else (1,))
+        and (model.num_experts % parallelism.expert_parallel_size == 0 if parallelism.enable_expert_parallel
+            else model.moe_intermediate_size % (tp * dp * 128) == 0))
+
+
+def is_glm_mtp_data_parallel_model_scope(model: ModelConfig, parallelism) -> bool:
+    """GLM BF16-compute CP1 DP source geometry, separate from provider/capacity.
+
+    Uniform EP spans the actual TP*DP ranks at each target PP stage. The
+    TP>1 EP uses model SP at PP1 and internal MoE SP at PP>1.
+    TP1 needs no sequence sharding. Official block-FP8 retains whole128
+    weight blocks in shared/dense TP and routed TP*DP shards, or complete
+    routed experts under EP. The source binds deferred Cutlass input quantization.
+    Both dtypes accept independent SP1 or the legacy explicit SP=TP declaration;
+    actual model/MoE SP comes from the source TP/DP/EP/PP configuration.
+    """
+    from src.serving.parallelism.parallel_config import ParallelConfig
+    if not isinstance(parallelism, ParallelConfig):
+        return False
+    tp, dp, pp = (parallelism.tensor_parallel_size, parallelism.data_parallel_size, parallelism.pipeline_parallel_size)
+    return (is_glm_mtp_tensor_model_scope(model, tp)
+        and model.num_hidden_layers == 78 and dp > 1 and 1 <= pp <= model.num_hidden_layers
+        and parallelism.context_parallel_size == 1
+        and parallelism.sequence_parallel_size in ((1, tp) if parallelism.enable_expert_parallel else (1,))
+        and (model.num_experts % parallelism.expert_parallel_size == 0
+            if parallelism.enable_expert_parallel else model.moe_intermediate_size % (tp * dp) == 0
+                and (model.weight_dtype == "bf16" or model.moe_intermediate_size // (tp * dp) % 128 == 0)))
+
+
+def is_deepseek_v4_parallel_model_scope(model: ModelConfig, tensor_parallel_size: int,
+                                       pipeline_parallel_size: int, *, expert_parallel=False) -> bool:
+    """Ordinary target-only V4 TP/PP geometry; no provider acceptance.
+
+    Grouped output divides whole output groups. Logical MXFP4 shards keep
+    whole32-value groups; the Marlin source pads storage to128 columns.
+    Draft DSpark identities are separate models.
+    """
+    tp, pp = tensor_parallel_size, pipeline_parallel_size
+    if (not isinstance(model, ModelConfig) or type(expert_parallel) is not bool or type(tp) is not int or tp < 1
+            or type(pp) is not int or not 1 <= pp <= model.num_hidden_layers
+            or model.model_type != "deepseek_v4" or model.attention_layout != "dsv4_sparse_mla"
+            or not is_named_target_model_identity("deepseek_v4", model.config_sha256)
+            or model.model_id not in ("deepseek-ai/DeepSeek-V4-Flash", "deepseek-ai/DeepSeek-V4-Pro")
+            or model.compute_dtype != "bf16" or model.weight_dtype != "fp8" or model.expert_dtype != "fp4"
+            or model.o_groups % tp or model.num_attention_heads % tp or model.hidden_size % tp
+            or model.num_experts % tp or model.moe_intermediate_size % tp
+            or (-(-model.vocab_size // 64) * 64) % tp):
+        return False
+    return (model.hidden_size % 256 == 0 and (expert_parallel or model.moe_intermediate_size // tp % 32 == 0)
+        and model.num_shared_experts * model.moe_intermediate_size % 128 == 0
+        and 0 < model.num_attention_heads // tp <= 128)
+
+
+def is_deepseek_v4_data_parallel_model_scope(model: ModelConfig, config) -> bool:
+    """Modular V4 whole-shard DP/EP geometry, without provider acceptance."""
+    from src.serving.parallelism.parallel_config import ParallelConfig
+    if (not isinstance(config, ParallelConfig) or config.data_parallel_size <= 1
+            or config.context_parallel_size != 1 or config.sequence_parallel_size != 1
+            or not is_deepseek_v4_parallel_model_scope(model, config.tensor_parallel_size,
+                config.pipeline_parallel_size, expert_parallel=config.enable_expert_parallel)):
+        return False
+    if config.enable_expert_parallel:
+        return model.num_experts % config.expert_parallel_size == 0
+    expert_tp = config.tensor_parallel_size * config.data_parallel_size
+    return model.moe_intermediate_size % expert_tp == 0 and model.moe_intermediate_size // expert_tp % 32 == 0
+
+
+def is_kimi_k3_pipeline_model_scope(model: ModelConfig, pipeline_parallel_size: int) -> bool:
+    """Nonempty PP geometry of the adapted TP1 K3 hybrid source program."""
+    if not isinstance(model, ModelConfig):
+        raise TypeError("K3 pipeline geometry requires ModelConfig")
+    return (type(pipeline_parallel_size) is int and 1 <= pipeline_parallel_size <= model.num_hidden_layers
+        and model.model_type == "kimi_linear" and model.attention_layout == "hybrid_kda_mla"
+        and model.kimi_k3_semantics is not None and model.compute_dtype == "bf16"
+        and model.weight_dtype == "mxfp4" and model.num_mtp_layers == 0)
+
+
+def is_kimi_k3_parallel_model_scope(model: ModelConfig, tensor_parallel_size: int,
+                                    pipeline_parallel_size: int, *, expert_parallel=False) -> bool:
+    """Ordinary DP1 K3 TP/EP/PP geometry, without a provider/capacity claim."""
+    tp = tensor_parallel_size
+    if not is_kimi_k3_pipeline_model_scope(model, pipeline_parallel_size):
+        return False
+    source = model.kimi_k3_semantics
+    return (type(tp) is int and tp > 0 and type(expert_parallel) is bool
+        and (not expert_parallel or tp > 1 and model.num_experts % tp == 0)
+        and model.num_attention_heads % tp == 0
+        and source.kda_num_heads % tp == 0 and model.hidden_size % tp == 0
+        and model.intermediate_size % tp == 0 and model.moe_intermediate_size % tp == 0
+        and (model.moe_intermediate_size * model.num_shared_experts) % tp == 0
+        and (-(-model.vocab_size // 64) * 64) % tp == 0)
+
+
+def is_kimi_k3_data_parallel_model_scope(model: ModelConfig, parallelism) -> bool:
+    """Current ordinary modular K3 DP source, with exact intermediate shards.
+
+    TP>1 global EP uses model SP at PP1. The modular PP>1 constructor
+    explicitly disables that SP path and retains the ordinary TP tail.
+    """
+    from src.serving.parallelism.parallel_config import ParallelConfig
+    if not isinstance(parallelism, ParallelConfig):
+        raise TypeError("K3 DP geometry requires ParallelConfig")
+    tp, dp = parallelism.tensor_parallel_size, parallelism.data_parallel_size
+    if (dp < 2 or parallelism.sequence_parallel_size != 1 or parallelism.context_parallel_size != 1
+            or not is_kimi_k3_parallel_model_scope(model, tp, parallelism.pipeline_parallel_size)):
+        return False
+    if parallelism.enable_expert_parallel:
+        return model.num_experts % (tp * dp) == 0
+    return (model.moe_intermediate_size % (tp * dp * 64) == 0
+        and max(model.moe_intermediate_size // tp, 256) % (dp * 64) == 0)
+
+
+def is_kimi_k2_parallel_model_scope(model: ModelConfig, tensor_parallel_size: int,
+                                     pipeline_parallel_size: int, *, expert_parallel=False) -> bool:
+    """K2 text source geometry, independent of provider and capacity.
+
+    Ordinary MLA divides query heads; the shared/dense MLP uses TP, while
+    routed experts use TP shards or stage-local EP. INT4 reduction shards
+    retain whole checkpoint quantization groups. No DP/SP source is implied.
+    """
+    if not isinstance(model, ModelConfig):
+        raise TypeError("Kimi parallel geometry requires ModelConfig")
+    if (type(tensor_parallel_size) is not int or tensor_parallel_size < 1
+            or type(pipeline_parallel_size) is not int or pipeline_parallel_size < 1
+            or type(expert_parallel) is not bool):
+        raise ValueError("Kimi parallel geometry requires positive TP/PP and boolean EP")
+    contracts = {"moonshotai/Kimi-K2.6": "kimi_k2_6_vllm_0_27_1_logical_v1",
+                 "moonshotai/Kimi-K2.7-Code": "kimi_k2_7_code_vllm_0_30_0_logical_v1"}
+    tp = tensor_parallel_size
+    return (model.model_type == "kimi_k2" and model.model_id in contracts
+        and model.target_semantics is not None
+        and model.target_semantics.workload_contract == contracts[model.model_id]
+        and model.attention_layout == "mla" and model.compute_dtype == "bf16"
+        and model.weight_dtype == "mixed_int4_bf16" and model.weight_group_size > 0
+        and model.num_shared_experts == 1 and model.num_mtp_layers == 0
+        and model.num_attention_heads % tp == 0 and model.hidden_size % tp == 0
+        and model.intermediate_size % tp == 0 and model.moe_intermediate_size % tp == 0
+        and (-(-model.vocab_size // 64) * 64) % tp == 0
+        and pipeline_parallel_size <= model.num_hidden_layers
+        and (model.num_experts % tp == 0 if expert_parallel else
+            model.moe_intermediate_size // tp % model.weight_group_size == 0))
+
+
+
+def is_kimi_k2_data_parallel_model_scope(model: ModelConfig, config) -> bool:
+    """Ordinary K2 whole-group expert TP or uniform global EP; no provider claim."""
+    from src.serving.parallelism.parallel_config import ParallelConfig
+    if (not isinstance(config, ParallelConfig) or config.data_parallel_size <= 1
+            or config.context_parallel_size != 1 or config.sequence_parallel_size != 1
+            or not is_kimi_k2_parallel_model_scope(model, config.tensor_parallel_size,
+                config.pipeline_parallel_size, expert_parallel=config.enable_expert_parallel)):
+        return False
+    if config.enable_expert_parallel:
+        return model.num_experts % config.expert_parallel_size == 0
+    expert_tp = config.tensor_parallel_size * config.data_parallel_size
+    return (model.moe_intermediate_size % expert_tp == 0
+        and model.moe_intermediate_size // expert_tp % model.weight_group_size == 0)
+
+def is_dense_parallel_model_scope(model: ModelConfig, tensor_parallel_size: int,
+                                  pipeline_parallel_size: int) -> bool:
+    """Adapted unquantized GQA source geometry, separate from backend gates.
+
+    vLLM Qwen3 inherits Qwen2's PP decoder loop; Llama has the same
+    hidden/residual stage ports. Both use QKV/row parallel projections.
+    This predicate does not grant native provider or measured accuracy.
+    """
+    from src.serving.parallelism.parallel_config import ParallelConfig
+    from src.serving.parallelism.tp import validate_gqa_parallelism
+    if not isinstance(model, ModelConfig):
+        raise TypeError("dense parallel scope requires ModelConfig")
+    config = ParallelConfig(tensor_parallel_size=tensor_parallel_size,
+        pipeline_parallel_size=pipeline_parallel_size)
+    if (model.model_type not in ("qwen3", "llama") or model.num_experts
+            or model.attention_layout != "standard_gqa"
+            or model.compute_dtype != model.weight_dtype or model.compute_dtype not in ("bf16", "fp16")
+            or (model.model_type == "llama" and model.compute_dtype != "bf16")
+            or model.num_mtp_layers or model.hidden_act != "silu" or model.rms_norm_eps is None
+            or model.rope_scaling_type not in (("default", "llama3") if model.model_type == "llama" else ("default",))):
+        return False
+    try:
+        validate_gqa_parallelism(model, config)
+    except ValueError:
+        return False
+    return True
+
+
 def is_validated_qwen3_tp1_pp_model_scope(model: ModelConfig, pipeline_parallel_size: int) -> bool:
-    """Uniform, untied dense Qwen pipeline semantics shared by source owners."""
+    """Dense Qwen with contiguous nonempty pipeline stages."""
     if not isinstance(model, ModelConfig) or type(pipeline_parallel_size) is not int or pipeline_parallel_size < 1:
         raise ValueError("Qwen pipeline scope requires ModelConfig and a positive stage count")
     return (pipeline_parallel_size > 1 and model.model_type == "qwen3"
         and model.architecture == "Qwen3ForCausalLM" and model.attention_layout == "standard_gqa"
         and model.compute_dtype == model.weight_dtype == "bf16" and not model.num_experts
-        and not model.num_mtp_layers and not model.tie_word_embeddings
+        and not model.num_mtp_layers
         and model.hidden_act == "silu" and model.rms_norm_eps is not None
         and model.rope_scaling_type == "default"
-        and model.num_hidden_layers % pipeline_parallel_size == 0)
+        and pipeline_parallel_size <= model.num_hidden_layers)
 
 
 def is_validated_qwen3_pipeline_model_scope(model: ModelConfig, tensor_parallel_size: int,
                                             pipeline_parallel_size: int) -> bool:
-    """Existing uniform TP1 pipeline and the source TP2/PP2 lane path."""
+    """Contiguous Qwen stages with legal rank-local attention/MLP shards."""
     if type(tensor_parallel_size) is not int or tensor_parallel_size < 1:
         raise ValueError("Qwen pipeline scope requires a positive tensor-parallel size")
+    tp = tensor_parallel_size
     return (is_validated_qwen3_tp1_pp_model_scope(model, pipeline_parallel_size)
-        and (tensor_parallel_size == 1 or (tensor_parallel_size, pipeline_parallel_size) == (2, 2)))
+        and model.num_attention_heads % tp == 0
+        and model.hidden_size % tp == 0 and model.intermediate_size % tp == 0
+        and (model.num_key_value_heads % tp == 0 or tp % model.num_key_value_heads == 0))
+
+
+def is_qwen3_moe_pipeline_model_scope(model: ModelConfig, tensor_parallel_size: int,
+                                     pipeline_parallel_size: int) -> bool:
+    """Qwen3Moe's ordinary BF16 decoder loop with contiguous PP ownership.
+
+    Expert ownership is validated by the caller's EP plan; PP partitions the
+    decoder layers and leaves each stage's TP/EP group independent.
+    """
+    if (type(tensor_parallel_size) is not int or tensor_parallel_size < 1
+            or type(pipeline_parallel_size) is not int or pipeline_parallel_size < 1):
+        raise ValueError("Qwen3MoE pipeline requires positive TP and PP sizes")
+    tp = tensor_parallel_size
+    return (is_qwen3_moe_source_model_scope(model)
+        and 1 < pipeline_parallel_size <= model.num_hidden_layers
+        and model.hidden_act == "silu" and model.rms_norm_eps is not None
+        and model.rope_scaling_type == "default"
+        and model.num_attention_heads % tp == 0 and model.hidden_size % tp == 0
+        and (model.num_key_value_heads % tp == 0 or tp % model.num_key_value_heads == 0))
 
 
 def is_validated_qwen3_tp2_host_kv_model_scope(
@@ -2462,7 +2885,11 @@ def load_model_config(model_path: str | Path) -> ModelConfig:
         raise ValueError(
             f"model_type {model_type!r} requires architecture "
             f"{schema['architecture']!r}, got {architecture!r}")
-    if model_type == "deepseek_v4" and set(cfg) != _DSV4_CONFIG_KEYS:
+    dspark = model_type == "deepseek_v4" and _is_dspark_config_identity(config_sha256)
+    if dspark and type(cfg["dspark_target_layer_ids"]) is not list:
+        raise TypeError("DSpark target layer IDs require the original JSON list")
+    expected_v4_keys = _DSV4_CONFIG_KEYS | _DSPARK_CONFIG_KEYS if dspark else _DSV4_CONFIG_KEYS
+    if model_type == "deepseek_v4" and set(cfg) != expected_v4_keys:
         raise ValueError(
             "DeepSeek-V4 config keys must be exactly the pinned campaign "
             f"key set, got {sorted(cfg)}")
@@ -3204,7 +3631,8 @@ def load_model_config(model_path: str | Path) -> ModelConfig:
             index_topk_pattern=None,
             indexer_rope_layout=None,
             mtp_runtime_status=(
-                "unsupported_deepseek_v4_mtp_runtime_not_modeled"),
+                "unsupported_deepseek_v4_dspark_speculator_runtime_not_modeled" if dspark
+                else "unsupported_deepseek_v4_mtp_runtime_not_modeled"),
         )
     elif model_type in ("qwen3", "qwen3_moe", "llama", "glm4_moe", "kimi_linear"):
         target_semantics = None
@@ -3307,6 +3735,10 @@ def load_model_config(model_path: str | Path) -> ModelConfig:
         rotary_dim=glm4_rotary_dim,
         moe_group_count=glm4_group_count,
         moe_topk_group_count=glm4_topk_groups,
+        dspark_block_size=cfg["dspark_block_size"] if dspark else None,
+        dspark_noise_token_id=cfg["dspark_noise_token_id"] if dspark else None,
+        dspark_target_layer_ids=tuple(cfg["dspark_target_layer_ids"]) if dspark else None,
+        dspark_markov_rank=cfg["dspark_markov_rank"] if dspark else None,
     )
 
 

@@ -85,8 +85,7 @@ def parse_coverage_arguments(argv: Sequence[str] | None = None) -> argparse.Name
         default="accelerated",
     )
     parser.add_argument(
-        "--jobs", type=int, choices=range(1, 65),
-        default=min(15, os.cpu_count() or 1), metavar="1..64",
+        "--jobs", type=int, default=os.cpu_count() or 1, metavar="N",
     )
     return parser.parse_args(argv)
 
@@ -1190,8 +1189,8 @@ def run_coverage_census(
         raise ValueError(f"unknown coverage input mode: {input_mode!r}")
     if isinstance(jobs, bool) or not isinstance(jobs, int):
         raise TypeError("coverage jobs must be an integer")
-    if jobs < 1 or jobs > 64:
-        raise ValueError("coverage jobs must be between 1 and 64")
+    if jobs < 1:
+        raise ValueError("coverage jobs must be positive")
     selected_root = None if candidate_root is None else Path(candidate_root)
     hardware_ids = {
         cell.hardware.hardware_id for _, cell in selections

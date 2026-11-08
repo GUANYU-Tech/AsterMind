@@ -11,7 +11,7 @@
 # duration and aiv_icache_miss_rate, so the PMU arbitrates whether the
 # interleaving actually evicted anything.
 set -e
-BIN=/mnt/gpfs/midlayer_yxh/round8_icache/build/vector_opcode_bench
+BIN=${MIDLAYER_ASCEND_VECTOR_OPCODE_BIN:?set MIDLAYER_ASCEND_VECTOR_OPCODE_BIN}
 A_OP=${A_OP:-11}      # mul_serialized
 B_OP=${B_OP:-27}      # rmsnorm_half_interval_reduce
 ELEMS=${ELEMS:-2048}

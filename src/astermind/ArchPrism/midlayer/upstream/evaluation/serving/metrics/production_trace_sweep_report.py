@@ -20,6 +20,7 @@ from evaluation.serving.metrics.production_trace_report_shape import (
     _SWEEP_FIELDS,
     _AGGREGATE_SWEEP_FIELDS,
     _AGGREGATE_RESULT_FIELDS,
+    _AGGREGATE_RESULT_TIMING_FIELDS,
     _POINT_FIELDS,
     _SUMMARY_METRIC_FIELDS,
     _REPLAY_FIELDS,
@@ -459,7 +460,8 @@ def _validate_aggregate_point(
     _exact_fields(
         summary_metrics, _SUMMARY_METRIC_FIELDS, f"{label} summary metrics")
     result = _mapping(point["result"], f"{label} result")
-    _exact_fields(result, _AGGREGATE_RESULT_FIELDS, f"{label} result")
+    _exact_fields(result, _AGGREGATE_RESULT_FIELDS | _AGGREGATE_RESULT_TIMING_FIELDS,
+        f"{label} result")
     if (result["schema_version"] != 1
             or result["kind"] != "production_trace_simulation_aggregate"
             or result["version"] != 3

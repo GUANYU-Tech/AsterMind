@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import math
+import os
 import re
 from pathlib import Path
 import statistics
@@ -43,11 +44,14 @@ FUSED_MOE = ROOT / "microbench/nvidia_h200/operators/fused_moe"
 RUNNER_PATH = {
     "tri": campaign.TRI, "w2r": campaign.W2R, "w1r": campaign.W1R}
 KERNEL_MODULE = "microbench/nvidia_h200/operators/fused_moe/vllm_0_11_fused_moe_kernel.py"
-VLLM_SOURCE = ("/share_data/yangxinhao/chip_modeling/vllm_src_3ver/a800/vllm/"
-               "model_executor/layers/fused_moe/fused_moe.py")
+VLLM_SOURCE = str(
+    Path(os.environ["MIDLAYER_A800_VLLM_SOURCE"])
+    / "model_executor/layers/fused_moe/fused_moe.py"
+)
 VLLM_SOURCE_SHA256 = (
     "8be8477a653894194ef5c5095afc287b0409a51d980590a36dd43c8471f6740e")
-REMOTE_ROOT = "/mnt/public/yangxinhao/h200_microbench/wp1_moe_triton"
+REMOTE_ROOT = os.path.join(
+    os.environ["MIDLAYER_H200_PUBLIC_ROOT"], "h200_microbench/wp1_moe_triton")
 DEVICE_RENAME = {2: 0, 6: 3}
 TEXT_RENAMES = (
     ("idle devices 2 and 6", "idle H200 GPUs 0 and 3"),

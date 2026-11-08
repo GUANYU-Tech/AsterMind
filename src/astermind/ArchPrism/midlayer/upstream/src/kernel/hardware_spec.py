@@ -192,6 +192,7 @@ from src.kernel.ascend_910b_mechanism_loaders import (
     load_aic_mte2_operand_pair_finite_overlap_domain as _load_aic_mte2_operand_pair_finite_overlap_domain,
     load_aic_mte2_operand_pair_overlap_domain as _load_aic_mte2_operand_pair_overlap_domain,
     load_aic_mte2_paged_gqa128_stride_service as _load_aic_mte2_paged_gqa128_stride_service,
+    load_split_fuse_mte2_short_tail_service as _load_split_fuse_mte2_short_tail_service,
 )
 from src.kernel.hardware_reference_validation import (
     linear_interpolate as _linear_interpolate,
@@ -404,6 +405,7 @@ _SCHEDULING_OPTIONAL_FIELDS = {
     "early_exit_cta_retire",
     "gemm_bf16_mma_saturation",
     "metax_fused_moe_bm32_bf16_mma_occupancy",
+    "h200_fused_moe_w2_active_sm_clock",
     "fa_tile16_operand_completion",
     "fia_cross_domain_three_handoff",
     "fia_aiv_sync_all_service",
@@ -624,9 +626,9 @@ def _validate_top_level_config(cfg):
         _require_fields_with_optional("roofline features", cfg["features"],
             {"kernel_memory_model", "kernel_dtype", "parameter_source"}, {"fpga_execution", "gpu_vector_memory_only"})
         if "gpu_vector_memory_only" in cfg["features"]:
-            if (cfg["hardware_id"] != "hygon_bw1100"
+            if (cfg["hardware_id"] not in ("hygon_bw1100", "nvidia_rtx_pro_5500")
                     or type(cfg["features"]["gpu_vector_memory_only"]) is not bool):
-                raise ValueError("gpu_vector_memory_only requires BW1100 and an explicit boolean")
+                raise ValueError("gpu_vector_memory_only requires BW1100 or RTX PRO 5500 and an explicit boolean")
         if cfg["features"]["kernel_dtype"] not in ("bf16", "fp16", "fp8", "int8"):
             raise ValueError("roofline profile requires an explicit supported primary dtype")
         source = cfg["features"]["parameter_source"]
@@ -677,10 +679,14 @@ def _validate_top_level_config(cfg):
         if not isinstance(ic, dict):
             raise ValueError("aggregate interconnect must be a mapping")
         if ic:
-            _require_exact_fields("aggregate interconnect", ic, {
+            _require_fields_with_optional("aggregate interconnect", ic, {
                 "roce_unidir_bw_GB_s", "roce_devices_per_nic",
                 "roce_switch_topology", "roce_signal_latency_ns",
-                "roce_collective_startup_ns", "parameter_source"})
+                "roce_collective_startup_ns", "parameter_source"}, {"pcie_bw_bytes_s"})
+            if "pcie_bw_bytes_s" in ic:
+                value = ic["pcie_bw_bytes_s"]
+                if (type(value) not in (int, float) or not math.isfinite(value) or value <= 0):
+                    raise ValueError("aggregate PCIe bandwidth must be finite positive bytes/s")
             for name in ("roce_unidir_bw_GB_s", "roce_signal_latency_ns",
                          "roce_collective_startup_ns"):
                 value = ic[name]
@@ -3156,6 +3162,101 @@ def _normalize_gemm_bf16_mma_saturation(value, repository_root):
         "reference_sha256": reference_sha256,
         "production_or_evaluation_duration_consumed": False,
     }
+
+
+def _normalize_h200_fused_moe_w2_active_sm_clock(
+        value, repository_root, hardware_id):
+    """Load the independent, same-CTA clock64/globaltimer W2 clock point."""
+
+    owner = "scheduling.h200_fused_moe_w2_active_sm_clock"
+    if hardware_id != "nvidia_h200":
+        raise ValueError(f"{owner} is H200-only")
+    if not isinstance(value, dict):
+        raise TypeError(f"{owner} must be a mapping")
+    _require_exact_fields(owner, value, {
+        "reference_path", "reference_sha256",
+        "production_or_evaluation_duration_consumed",
+    })
+    payload = _read_owned_reference(
+        value, owner, hardware_id, repository_root)
+    reference = json.loads(payload)
+    _require_exact_fields(owner + " reference", reference, {
+        "schema_version", "hardware_id", "mechanism", "probe_mode",
+        "k_rounds", "static_probe_boundary", "selection", "measurements",
+        "selected_sm_clock_hz", "raw", "source_sha256", "source_launch",
+        "production_or_evaluation_duration_consumed",
+        "parameter_fit_from_production_duration", "scope_limitations",
+    })
+    if (reference["schema_version"] != 1
+            or reference["hardware_id"] != hardware_id
+            or reference["mechanism"] != "bf16_w2_panel_wgmma_active_sm_clock"
+            or reference["probe_mode"] != "gather_plus_wgmma"
+            or reference["k_rounds"] != 12
+            or reference["static_probe_boundary"] != (
+                "synthetic_routed_panel_cp_async_and_wgmma_no_router_or_output")
+            or reference["selection"] != (
+                "median_of_three_grid_cta_clock_mhz_p50")
+            or reference["production_or_evaluation_duration_consumed"]
+            is not False
+            or reference["parameter_fit_from_production_duration"]
+            is not False):
+        raise ValueError(f"{owner} reference has an invalid evidence boundary")
+    if (not isinstance(reference["source_sha256"], str)
+            or not re.fullmatch("[0-9a-f]{64}",
+                                reference["source_sha256"])
+            or not isinstance(reference["scope_limitations"], list)
+            or not reference["scope_limitations"]
+            or any(not isinstance(item, str) or not item
+                   for item in reference["scope_limitations"])):
+        raise ValueError(f"{owner} reference provenance is invalid")
+    rows = reference["measurements"]
+    if (not isinstance(rows, list) or len(rows) != 3
+            or [row["grid_ctas"] for row in rows] != [132, 2112, 33784]):
+        raise ValueError(f"{owner} reference lacks the three grid points")
+    measured = []
+    for row in rows:
+        _require_exact_fields(owner + " measurement", row, {
+            "grid_ctas", "cta_clock_mhz_p50"})
+        clock_mhz = row["cta_clock_mhz_p50"]
+        if (isinstance(clock_mhz, bool)
+                or not isinstance(clock_mhz, (int, float))
+                or not math.isfinite(clock_mhz) or clock_mhz <= 0):
+            raise ValueError(f"{owner} measured clock must be positive")
+        measured.append(float(clock_mhz))
+    selected = reference["selected_sm_clock_hz"]
+    if (isinstance(selected, bool) or not isinstance(selected, (int, float))
+            or not math.isfinite(selected) or selected <= 0
+            or not math.isclose(
+                selected, statistics.median(measured) * 1e6,
+                rel_tol=0, abs_tol=0.001)):
+        raise ValueError(f"{owner} selected clock disagrees with probe")
+    source = reference["source_launch"]
+    required_source = {
+        "algorithm": "triton_grouped_gemm:w2", "dtype": "bf16",
+        "variant": "w2", "tile_m": 128, "tile_n": 256,
+        "tile_k": 64, "group_size_m": 16,
+        "threads_per_cta": 256,
+        "dynamic_shared_memory_bytes": 196608, "experts": 128,
+        "hidden": 2048, "intermediate": 768,
+        "grid_min": 132, "grid_max": 33784,
+    }
+    _require_exact_fields(owner + " source launch", source,
+                          set(required_source))
+    if source != required_source:
+        raise ValueError(f"{owner} source launch drifted")
+    raw = reference["raw"]
+    _require_exact_fields(owner + " raw", raw, {"path", "sha256", "size"})
+    if (not isinstance(raw["path"], str)
+            or not raw["path"].startswith(
+                "profiler_output/microbench/nvidia_h200/")
+            or ".." in raw["path"].split("/")
+            or isinstance(raw["size"], bool)
+            or not isinstance(raw["size"], int) or raw["size"] <= 0
+            or not isinstance(raw["sha256"], str)
+            or not re.fullmatch("[0-9a-f]{64}", raw["sha256"])):
+        raise ValueError(f"{owner} raw pin is invalid")
+    return {"sm_clock_hz": float(selected), "source_launch": source,
+            "reference_path": value["reference_path"]}
 
 
 def _normalize_metax_fused_moe_bm32_bf16_mma_occupancy(
@@ -8705,9 +8806,36 @@ class ResourceGroup:
 # These are the existing lowering/source-template domains, owned here so
 # common lowering and predictors consume the same hardware declaration.
 _SOURCE_CONTRACT_HARDWARE = {
+    # Existing source domains only: these declarations move literal device
+    # guards out of generic consumers without admitting new source programs.
+    'bf16_fp32_symbolic_matmul_source_math': ('nvidia_h200',),
+    'bf16_fp8_expert_source_launch_binding': ('nvidia_h200',),
+    'bf16_symbolic_matmul_source_math': ('nvidia_h200',),
+    'bf16_symbolic_vector_source_math': ('nvidia_h200',),
+    'dense_fp16_symbolic_source_math': ('nvidia_h200',),
+    'h200_partial_source_programs': ('nvidia_h200',),
+    'kimi_grouped_marlin_source_math': ('nvidia_h200',),
+    'kimi_marlin_i256_source_math': ('nvidia_h200',),
+    'marlin_routed_expert_source_launch_binding': ('nvidia_h200',),
+    'mla_decode_source_launch_binding': ('nvidia_h200',),
+    'multistage_attention_indexer_unbound_source_math': ('nvidia_h200',),
+    'pytorch_2_8_grouped_strided_norm_copy_source': ('nvidia_h200',),
+    'unbound_bf16_expert_source_math': ('nvidia_h200',),
+    'unbound_grouped_bf16_expert_source_math': ('nvidia_h200',),
+    'vllm_0_27_1_v3_l32_tp4_source_projection': ('nvidia_h200',),
+    'vllm_0_30_indexer_source_launch_binding': ('nvidia_h200',),
+    'vllm_source_vector_launch_binding': ('nvidia_h200',),
+    'vllm_unquantized_prepared_expert_source_recipe': ('nvidia_h200',),
+    'unbound_clamped_silu_source_math': ('nvidia_h200',),
+    'unbound_materialized_gather_source_math': ('nvidia_h200',),
+    # Only the validated native EP1 W4A16 public input is reused: its full
+    # resource tuple is fixed by exact geometry/launch/other attributes and
+    # routed rows, active experts and padded M rows. Live HW and source data
+    # guards remain mandatory; this admission adds no rate or pricing rule.
+    'vllm_0_30_marlin_w4a16_ep1_public_resource_reuse': ('nvidia_h200',),
     'kimi_ep_marlin_swiglu_math': ('nvidia_a800', 'nvidia_h200'),
     'ascend_0_18_moe_dispatch_math': ('ascend_910b',),
-    'aggregate_gpu_source_roofline': ('hygon_bw1100',),
+    'aggregate_gpu_source_roofline': ('hygon_bw1100', 'nvidia_rtx_pro_5500'),
     'programmed_mxfp4_fp8_expert_service': ('intel_agmf039r47',),
     'aten_advanced_indexing_long_math': ('nvidia_a800', 'nvidia_h200', 'metax_c500'),
     'vllm_0_11_embedding_index_select_math': ('nvidia_a800', 'nvidia_h200'),
@@ -8717,6 +8845,7 @@ _SOURCE_CONTRACT_HARDWARE = {
     'mla_tp8_ep8_source_projection': ('nvidia_h200',),
     'kimi_tp8_pp2_ep8_source_projection': ('nvidia_a800',),
     'kimi_tp1_source_projection': ('nvidia_a800', 'nvidia_h200'),
+    'kimi_k3_pp16_source_projection': ('nvidia_h200',),
     'kimi_tp1_unbound_source_lowering': ('nvidia_a800',),
     'target_tp1_representative_source_projection': ('nvidia_a800',),
     'pytorch_2_8_embedding_index_select_launch': ('nvidia_a800', 'nvidia_h200'),
@@ -8744,6 +8873,7 @@ _SOURCE_CONTRACT_HARDWARE = {
     'vllm_0_11_masked_embedding_pipeline_endpoint': ('nvidia_a800',),
     'pytorch_2_8_advanced_indexing_int64_launch': ('nvidia_a800',),
     'vllm_0_27_1_symbolic_embedding': ('nvidia_h200',),
+    'vllm_0_27_1_symbolic_masked_embedding': ('nvidia_h200',),
     'sm90_tf32_hc_prenorm_gemm_impl': ('nvidia_h200',),
     'symbolic_glm4_sigmoid_topk': ('nvidia_a800', 'nvidia_h200'),
     'symbolic_grouped_routed_experts': ('nvidia_h200',),
@@ -8774,6 +8904,8 @@ _SOURCE_CONTRACT_HARDWARE = {
     'vllm_0_11_symbolic_logits_boundary': ('nvidia_a800', 'nvidia_h200', 'metax_c500', 'ascend_910b'),
     'vllm_0_11_symbolic_plain_greedy': ('nvidia_a800', 'nvidia_h200', 'metax_c500', 'ascend_910b'),
     'vllm_0_30_group_fp8_fp32_scales': ('nvidia_h200',),
+    'vllm_0_30_fa3_gqa_fresh_prefill': ('nvidia_h200',),
+    'vllm_0_30_fa3_sparse_mla': ('nvidia_h200',),
     'vllm_0_27_1_symbolic_grouped_routing': ('nvidia_h200',),
     'vllm_0_27_1_symbolic_logits_boundary': ('nvidia_h200',),
     'vllm_0_27_1_symbolic_plain_greedy': ('nvidia_h200',),
@@ -8912,6 +9044,138 @@ class HWSpec:
     def supports_source_contract(self, source_contract: str) -> bool:
         return self.source_contract_supported(source_contract, self.hardware_id)
 
+
+
+
+
+
+
+    def require_v030_fa3_gqa_prefill_source_launch(self, kernel) -> None:
+        """Validate a supplied source launch without selecting a new one."""
+
+        if not self.supports_source_contract("vllm_0_30_fa3_gqa_fresh_prefill"):
+            raise ValueError("hardware has no vLLM 0.30 FA3 GQA source binding")
+        from src.kernel.launch_config.nvidia_h200.flash_attn_launch import (
+            validate_v030_gqa_fresh_prefill_launch_contract)
+        validate_v030_gqa_fresh_prefill_launch_contract(
+            kernel.shape, kernel.dtype, kernel.variant, kernel.attributes, self,
+            kernel.launch)
+
+    def fa3_gqa_observed_source_splits(self, kernel, *, block_m, block_n):
+        """Validate the hardware-owned FA3 program and derive its split facts."""
+        from src.kernel.launch_config.nvidia_h200.flash_attn_launch import (
+            validate_v030_gqa_observed_launch, v030_gqa_dynamic_splits)
+        validate_v030_gqa_observed_launch(kernel, self)
+        return v030_gqa_dynamic_splits(
+            (kernel.attributes["model_input_q_lens"] if "source_program" in kernel.attributes
+                and kernel.attributes["source_program"] == "vllm_0_30_fa3_gqa_full_decode" else kernel.attributes["q_lens"]),
+            (kernel.attributes["model_input_kv_lens"] if "source_program" in kernel.attributes
+                and kernel.attributes["source_program"] == "vllm_0_30_fa3_gqa_full_decode" else kernel.attributes["kv_lens"]),
+            ratio=kernel.shape["num_query_heads"] // kernel.shape["num_kv_heads"],
+            kv_heads=kernel.shape["num_kv_heads"], block_m=block_m, block_n=block_n,
+            split_cap=kernel.launch.tiling.num_kv_splits,
+            num_sms=int(self.num_compute_units), allow_source_padding=("source_program" in kernel.attributes
+                and kernel.attributes["source_program"] == "vllm_0_30_fa3_gqa_full_decode"))
+
+    def fa3_prepare_varlen_launch(self, batch):
+        """Forward the public metadata launch to its bound FA3 source owner."""
+        if not self.supports_source_contract("vllm_0_30_fa3_gqa_fresh_prefill"):
+            raise NotImplementedError("FA3 prepare source is not bound on this hardware")
+        from src.kernel.launch_config.nvidia_h200.flash_attn_launch import select_fa3_prepare_varlen_launch
+        return select_fa3_prepare_varlen_launch(batch)
+
+    def fa3_gqa_forward_specs(self, shape, dtype, attributes, *, page_size,
+                              num_splits, scheduler_metadata_precomputed):
+        """Forward explicit caller facts to the hardware-owned FA3 call."""
+        from src.kernel.launch_config.nvidia_h200.flash_attn_launch import select_v030_gqa_forward_specs
+        return select_v030_gqa_forward_specs(
+            shape, dtype, attributes, self, page_size=page_size,
+            num_splits=num_splits,
+            scheduler_metadata_precomputed=scheduler_metadata_precomputed)
+
+    def fa3_gqa_model_call_facts(self, version, *, page_size,
+                               graph_configured_mode="NONE", max_capture_tokens=0, query_tokens=None):
+        """Pinned ordinary eager default scenario, not observed runtime state.
+
+        vLLM0.30 CacheConfig resolves an unspecified block size to16. Its
+        ordinary FA3 metadata builder enables AOT, passes num_splits=0 and
+        shares that metadata across layers. PIECEWISE with eager attention
+        uses the same caller. A caller configured with FULL graphs passes
+        the source-default fixed split count while logical rows fit its
+        capture bound, even when this particular attention call runs eager.
+        Captured attention, MTP and overrides require separate source facts.
+        """
+        if (not self.supports_source_contract("vllm_0_30_fa3_gqa_fresh_prefill")
+                or version != "vllm_0_30_0"):
+            raise ValueError("FA3 GQA source facts require the explicit ordinary vLLM0.30 scenario")
+        if page_size is not None and (type(page_size) is not int or page_size < 16 or page_size % 16):
+            raise ValueError("FA3 GQA requires the declared aligned page size")
+        if graph_configured_mode not in ("NONE","PIECEWISE","FULL","FULL_DECODE_ONLY","FULL_AND_PIECEWISE"):
+            raise ValueError("FA3 caller requires an explicit supported graph configuration")
+        if type(max_capture_tokens) is not int or max_capture_tokens<0:
+            raise ValueError("FA3 caller capture bound must be a nonnegative integer")
+        if graph_configured_mode=="NONE":
+            if max_capture_tokens!=0 or query_tokens is not None:
+                raise ValueError("an eager caller cannot discard supplied graph facts")
+        elif type(query_tokens) is not int or query_tokens<=0:
+            raise ValueError("FA3 graph-configured caller requires its actual positive logical token count")
+        from src.kernel.launch_config.nvidia_h200.flash_attn_launch import (
+            FA3_GQA_PREFILL_030_SOURCE_REVISION, FA3_GQA_DEFAULT_GRAPH_SPLITS_030)
+        full=graph_configured_mode in ("FULL","FULL_DECODE_ONLY","FULL_AND_PIECEWISE")
+        splits=(FA3_GQA_DEFAULT_GRAPH_SPLITS_030 if full and query_tokens<=max_capture_tokens else 0)
+        facts={"fa3_gqa_page_size": 16 if page_size is None else page_size,
+            "fa3_gqa_page_origin": "vllm030_CacheConfig_default" if page_size is None else "declared_hbm_tier",
+            "fa3_gqa_num_splits": splits, "fa3_gqa_scheduler_metadata_precomputed": True,
+            "fa3_gqa_source_revision": FA3_GQA_PREFILL_030_SOURCE_REVISION,
+            "fa3_gqa_caller_scenario": "vllm030_ordinary_eager_default_aot",
+            "fa3_gqa_runtime_binary_bound": False}
+        if graph_configured_mode!="NONE":
+            facts.update({"fa3_gqa_caller_scenario":"vllm030_graph_configured_eager_attention_default_aot",
+                "fa3_gqa_graph_configured_mode":graph_configured_mode,
+                "fa3_gqa_max_capture_tokens":max_capture_tokens,"fa3_gqa_query_tokens":query_tokens})
+        return facts
+
+    def fa3_mla_forward_specs(self, shape, dtype, variant, attributes, *,
+                              scheduler_metadata_precomputed):
+        """Forward one FA3 MLA call, not another attention provider."""
+        from src.kernel.launch_config.nvidia_h200.flash_attn_launch import select_fa3_mla_forward_specs
+        return select_fa3_mla_forward_specs(
+            shape, dtype, variant, attributes, self,
+            scheduler_metadata_precomputed=scheduler_metadata_precomputed)
+
+    def fa3_sparse_mla_forward_specs(self, shape, dtype, attributes, *, topk_capacity):
+        """Forward actual sparse caller capacity separately from used lengths."""
+        from src.kernel.launch_config.nvidia_h200.flash_attn_launch import select_v030_sparse_mla_forward_specs
+        return select_v030_sparse_mla_forward_specs(
+            shape, dtype, attributes, self, topk_capacity=topk_capacity)
+
+    def require_fa3_mla_source_revision(self, revision):
+        """Check caller provenance against the hardware launch source owner."""
+        from src.kernel.launch_config.nvidia_h200.flash_attn_launch import (
+            FA3_SOURCE_REVISION, FA3_GQA_PREFILL_030_SOURCE_REVISION, FA3_MLA_PREFILL_027_SOURCE_REVISION)
+        if self.hardware_id != "nvidia_h200" or revision not in (
+                FA3_SOURCE_REVISION, FA3_GQA_PREFILL_030_SOURCE_REVISION, FA3_MLA_PREFILL_027_SOURCE_REVISION):
+            raise ValueError("FA3 MLA caller source revision does not match its hardware program")
+
+    def fa3_mla_source_revision_for_model(self, version):
+        """Identity for an explicit versioned default Hopper source scenario.
+
+        Equal SM90 device sources and equivalent eager host arguments permit
+        source interpretation, without claiming installed binary/rate identity.
+        """
+        from src.kernel.launch_config.nvidia_h200.flash_attn_launch import (
+            FA3_GQA_PREFILL_030_SOURCE_REVISION, FA3_MLA_PREFILL_027_SOURCE_REVISION)
+        if self.hardware_id != "nvidia_h200" or version not in ("vllm_0_30_0", "vllm_0_27_1"):
+            raise ValueError("FA3 model source requires an explicit supported H200 version scenario")
+        return {"vllm_0_30_0": FA3_GQA_PREFILL_030_SOURCE_REVISION,
+            "vllm_0_27_1": FA3_MLA_PREFILL_027_SOURCE_REVISION}[version]
+
+    def fa3_mla_model_backend_source(self, version):
+        """Name the declared source caller; never infer an installed provider."""
+        self.fa3_mla_source_revision_for_model(version)
+        return {"vllm_0_30_0": "vllm_0_30_default_hopper_flash_attn3",
+            "vllm_0_27_1": "vllm_0_27_1_default_hopper_flash_attn3"}[version]
+
     def source_embedding_index_select_launch_domain(self, rows, hidden, vocab, elements):
         """Domain of the already-bound Torch embedding launch, without rederivation."""
         if not self.supports_source_contract("pytorch_2_8_embedding_index_select_launch"):
@@ -8937,6 +9201,8 @@ class HWSpec:
         if self.roofline_only:
             if link == "roce" and self.interconnect:
                 return self.interconnect["roce_bw_bytes_s"]
+            if link == "pcie" and "pcie_bw_bytes_s" in self.interconnect:
+                return float(self.interconnect["pcie_bw_bytes_s"])
             raise NotImplementedError("aggregate roofline profile has no declared interconnect bandwidth")
         if link == "nvlink":
             bandwidth_key = "nvlink_bw_bytes_s"
@@ -9287,6 +9553,13 @@ class HWSpec:
                     repository_root))
         else:
             self.metax_fused_moe_bm32_bf16_mma_occupancy = None
+        if "h200_fused_moe_w2_active_sm_clock" in sched:
+            self.h200_fused_moe_w2_active_sm_clock = (
+                _normalize_h200_fused_moe_w2_active_sm_clock(
+                    sched["h200_fused_moe_w2_active_sm_clock"],
+                    repository_root, self.hardware_id))
+        else:
+            self.h200_fused_moe_w2_active_sm_clock = None
         if "fa_tile16_operand_completion" in sched:
             self.fa_tile16_operand_completion = (
                 _normalize_fa_tile16_operand_completion(
@@ -9468,6 +9741,9 @@ class HWSpec:
             _load_aic_mte2_paged_gqa128_stride_service(repository_root)
             if (self._declares_memory_model("ascend_910b"))
             else None)
+        self.split_fuse_mte2_short_tail_service = (
+            _load_split_fuse_mte2_short_tail_service(repository_root)
+            if self._declares_memory_model("ascend_910b") else None)
         if self.aic_mte2_paged_gqa128_stride_service is not None:
             if self.aic_mte2_nd2nz_service is None:
                 raise ValueError(
@@ -12583,6 +12859,29 @@ class HWSpec:
             for group in group_points)
         return _linear_interpolate(
             group_points, durations_at_group_points, active_aic_groups)
+
+    def split_fuse_mte2_short_tail_time_ns(
+            self, descriptor_count, active_aic_groups,
+            dram_miss_fraction, *, two_slot_overlap):
+        """Finite source ingress service for the measured paged-KV geometry."""
+
+        if (type(descriptor_count) is not int
+                or type(active_aic_groups) is not int
+                or active_aic_groups != 24):
+            raise ValueError("SplitFuse short-tail is outside its AIC domain")
+        service = self.split_fuse_mte2_short_tail_service
+        if service is None or descriptor_count not in service:
+            raise ValueError("SplitFuse short-tail count is unmeasured")
+        if (isinstance(dram_miss_fraction, bool)
+                or not isinstance(dram_miss_fraction, (int, float))
+                or not math.isfinite(float(dram_miss_fraction))
+                or not 0.0 <= dram_miss_fraction <= 1.0):
+            raise ValueError("SplitFuse DRAM miss fraction must be in [0, 1]")
+        if not isinstance(two_slot_overlap, bool):
+            raise TypeError("SplitFuse overlap selector must be boolean")
+        mode = "two_slot_overlap" if two_slot_overlap else "drained"
+        warm, cold = service[descriptor_count][mode]
+        return warm + float(dram_miss_fraction) * (cold - warm)
 
     def aic_mte2_nd2nz_large_contiguous_supports(
             self, rows, columns, active_aic_groups):

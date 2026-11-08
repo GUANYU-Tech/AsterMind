@@ -6,7 +6,9 @@ from src.serving.backend.vllm import VLLMBackend, VLLMSchedulerConfig
 
 
 def create_scheduler(config, backend_config, model, hardware, *, export_embedding_token_ids=True):
-    source_options = {"export_embedding_token_ids": True} if export_embedding_token_ids else {}
+    source_options = {}
+    if export_embedding_token_ids and "export_embedding_token_ids" in VLLMSchedulerConfig.__dataclass_fields__:
+        source_options["export_embedding_token_ids"] = True
     requested = VLLMSchedulerConfig(
         str(config.root / config.model_file), dtype={"bf16": "bfloat16", "fp16": "float16"}[model.compute_dtype],
         max_model_len=config.max_model_len, enable_chunked_prefill=True,

@@ -107,19 +107,19 @@ def main():
     parser.add_argument("--output-root", required=True, type=Path)
     parser.add_argument("--audit-root", required=True, type=Path)
     parser.add_argument("--source-snapshot", required=True, type=Path)
-    parser.add_argument("--nsys", type=Path,
-                        default=Path("/share_data/yangxinhao/nsys_2025.6.1/bin/nsys"))
+    parser.add_argument("--nsys", type=Path, default=shutil.which("nsys"))
     parser.add_argument("--ncu", type=Path,
                         default=Path("/usr/local/cuda-12.2/bin/ncu"))
     parser.add_argument(
-        "--runner-python", type=Path,
-        default=Path("/home/yangxinhao/miniconda3/envs/r2r_qwen3_next/bin/python"))
+        "--runner-python", type=Path, default=Path(sys.executable))
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument(
         "--baseline-commit", default="0c530a00a9f7c1135210e99b843cce3f8250e3ac")
     parser.add_argument("--skip-case", action="append", default=[])
     args = parser.parse_args()
 
+    if args.nsys is None:
+        parser.error("--nsys is required when nsys is not available on PATH")
     input_manifest = _load_capture_inputs(args.capture_input_manifest)
     if args.output_root.exists() or args.audit_root.exists():
         raise FileExistsError("A800 full-capture output and audit roots must be new")

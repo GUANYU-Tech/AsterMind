@@ -46,6 +46,7 @@ class RuntimePrepareRule:
     mechanisms: Tuple[str, ...]
     call_id_pattern: str | None = None
     gate_pattern: str | None = None
+    attribute_constraints: Tuple[Tuple[str, Tuple[str, ...]], ...] = ()
 
     def __post_init__(self) -> None:
         if self.call_id_pattern is not None:
@@ -58,6 +59,11 @@ class RuntimePrepareRule:
                 raise ValueError(
                     "runtime prepare rule gate_pattern must be non-empty")
             re.compile(self.gate_pattern)
+        names = tuple(name for name, _ in self.attribute_constraints)
+        if (len(set(names)) != len(names) or any(not isinstance(name, str) or not name for name in names)
+                or any(not values or any(not isinstance(value, str) or not value for value in values)
+                       for _, values in self.attribute_constraints)):
+            raise ValueError("runtime prepare rule attribute constraints must be unique non-empty strings")
 
 
 @dataclass(frozen=True)
@@ -303,6 +309,23 @@ _ASCEND_910B_RULE_SET = RuntimePrepareRuleSet(
 _CUDA_LIKE_RULE_SET = RuntimePrepareRuleSet(
     hardware_ids=("nvidia_a800", "metax_c500", "nvidia_h200"),
     variant_rules=(
+        # Explicit mathematical source programs preserve the modular router
+        # and prepared-expert Host wrappers even without native launch specs.
+        # Legacy vLLM0.11 independent services are declared CPU proxies for
+        # the same allocation/dispatch mechanisms in vLLM0.30; no new price.
+        # Graph capture suppresses these events through the shared timeline.
+        # Do not infer an FX piece entry from the router's location: modern
+        # modular custom-op boundaries do not prove that partition structure.
+        RuntimePrepareRule(
+            KernelKind.VECTOR, ("moe_topk",), ("moe_gating_prepare",),
+            attribute_constraints=(("source_program", ("vllm_0_30_bf16_softmax_topk",)),),
+        ),
+        RuntimePrepareRule(
+            KernelKind.FUSED_MOE, ("routed_experts",),
+            ("compiled_fx_moe_wrapper_control", "moe_unquant_mlp_wrapper_prepare"),
+            attribute_constraints=(("mathematical_program", ("unquantized_bf16_swiglu_v1",
+                                          "unquantized_bf16_grouped_swiglu_v1")),),
+        ),
         # Piecewise compilation splits the eager program at the attention
         # ops, yielding num_layers + 1 compiled pieces per forward
         # (vllm compilation/backends.py split_graph).  Each decoder layer
@@ -358,7 +381,7 @@ _ASCEND_910B_TOKEN_EMBEDDING_ANCHOR = re.compile(
 
 
 _ASCEND_910B_LM_HEAD_ANCHOR = re.compile(
-    r"(?:^|:)lm-head(?:\:tp-rank-([0-9]+))?$")
+    r"(?:^|:)lm-head(?::projection)?(?:\:tp-rank-([0-9]+))?$")
 
 
 def _ascend_910b_model_runner_outer_events(
@@ -392,6 +415,10 @@ def _ascend_910b_model_runner_outer_events(
         ):
             match = pattern.search(call.call_id)
             if match is None:
+                continue
+            # TP multi-row logits also materialize a VECTOR named lm-head.
+            # ModelRunner preparation belongs to the linear projection.
+            if label == "LM-head" and call.kernel_spec.kind is not KernelKind.GEMM:
                 continue
             encoded_rank = match.group(1)
             if call.rank in target:
@@ -864,18 +891,152 @@ _ASCEND_910B_DENSE_NODE_CLASSES: Mapping[
 }
 
 
+def _ascend_masked_embedding_node_classes(spec):
+    """Expand the ordinary Ascend0.18 TP2 helper's actual FX operations.
+
+    AscendVocabParallelEmbedding._get_masked_input_and_mask has no separate
+    compiled decorator. The installed npugraph_ex optimized FX retains seven
+    mask-ids and two mask-output ATen calls. Independent complete-submit
+    measurements replace the occurrence's generic enqueue charge. Missing
+    mechanism evidence fails closed.
+    """
+    attrs = spec.attributes
+    if (attrs["mask_program"] != "vllm_ascend_no_added_vocab"
+            or attrs["tensor_parallel_size"] != 2):
+        raise ValueError("Ascend TP Host mask dispatch requires its no-added-vocabulary TP2 source")
+    stage = attrs["stage"]
+    if stage == "mask_ids":
+        scalar_mul = "scalar_zero_mul_bool" if attrs["tensor_parallel_rank"] == 0 else "scalar_mul_bool"
+        primitives = ("ge_scalar", "lt_scalar", "bool_and", scalar_mul,
+                      "sub_int32_int64", "bool_mul_int64", "bool_invert")
+    elif stage == "mask_output":
+        if spec.dtype != "bf16":
+            raise ValueError("Ascend TP Host output mask requires its BF16 source")
+        primitives = ("unsqueeze", "masked_fill_inplace")
+    else:
+        raise ValueError("Ascend TP Host mask dispatch requires an explicit stage")
+    return tuple((f"aten_{primitive}_host_submit", 1) for primitive in primitives)
+
+
+def _ascend_source_moe_node_classes(plan, ascend_compilation_mode):
+    """Bind the ordinary 0.18 AllGather MoE wrapper to all its source calls.
+
+    The source model exposes routing and owner masking separately from the
+    six lowered expert children. This is one opaque moe_forward invocation,
+    not six compiled-FX entries. Legacy split-piece descriptors stay separate.
+    """
+    routes = {}
+    for call in plan.calls:
+        spec = call.kernel_spec
+        if (spec.kind is KernelKind.VECTOR and spec.variant == "moe_topk"
+                and spec.attributes["source_program"] == "vllm_0_18_bf16_softmax_topk"
+                and spec.attributes["stage"] == "route"):
+            match = re.search(r":layer-([0-9]+):route$", call.call_id)
+            if match is None:
+                raise ValueError("Ascend source MoE route has no layer anchor")
+            key = (int(match.group(1)), call.rank)
+            if key in routes:
+                raise ValueError("Ascend source MoE route is duplicated")
+            routes[key] = call
+    if not routes:
+        return {}
+    if ascend_compilation_mode == "NONE":
+        wrapper_mechanism = "compiled_fx_moe_wrapper_control"
+    elif ascend_compilation_mode in ("FULL", "FULL_DECODE_ONLY", "PIECEWISE"):
+        wrapper_mechanism = "compiled_fx_moe_source_wrapper_prepare"
+    else:
+        raise ValueError("Ascend source MoE requires its configured compilation mode")
+    layers = {layer for layer, _ in routes}
+    if (layers != set(range(max(layers) + 1))
+            or set(routes) != {(layer, rank) for layer in layers for rank in (0, 1)}):
+        raise ValueError("Ascend source MoE requires complete TP2/EP2 layer lanes")
+    calls_by_id = {call.call_id: call for call in plan.calls}
+    result = {}
+    child_contract = (
+        # The legacy token-dispatch price also contains owner-mask work.
+        # This source exposes that mask as its own three complete submits.
+        (KernelKind.VECTOR, "moe_init_routing", ("stream_record_event_prepare", "moe_init_routing_prepare")),
+        (KernelKind.FUSED_MOE, "w1", ("moe_grouped_gemm_prepare", "moe_unquant_mlp_wrapper_prepare")),
+        (KernelKind.VECTOR, "moe_swiglu", ("moe_swiglu_prepare",)),
+        (KernelKind.FUSED_MOE, "w2", ("moe_grouped_gemm_prepare",)),
+        (KernelKind.VECTOR, "moe_abs", ("aten_abs_int32_host_submit",)),
+        (KernelKind.VECTOR, "moe_token_unpermute", ("stream_record_event_prepare", "moe_token_combine_prepare")),
+    )
+    for (_, rank), route in routes.items():
+        prefix = route.call_id.removesuffix(":route")
+        owner_id = prefix + ":owner-mask"
+        if owner_id not in calls_by_id:
+            raise ValueError("Ascend source MoE owner mask is missing")
+        owner = calls_by_id[owner_id]
+        if (owner.rank != rank or owner.kernel_spec.variant != "moe_topk"
+                or owner.kernel_spec.attributes["source_program"] != "vllm_0_18_bf16_softmax_topk"
+                or owner.kernel_spec.attributes["stage"] != "owner_mask"):
+            raise ValueError("Ascend source MoE owner mask disagrees with its route")
+        # When compiled, this is one opaque FX node. The legacy wrapper-control
+        # price subtracts the generic node entry, which its legacy anchor
+        # rules charge separately. Source plans have no such anchor; use the
+        # complete independently measured TorchAir wrapper boundary here,
+        # once only. Its compiler/source capture is independent of the
+        # legacy Inductor control-plus-generic-entry arithmetic.
+        # Configured NONE keeps control-only pricing without an FX entry.
+        # The measurement stubs Device children and stream/Event APIs, so
+        # their submits and three event records remain separate charges.
+        result[route.call_id] = ((wrapper_mechanism, 1),
+                                ("stream_record_event_prepare", 1),
+                                ("moe_gating_prepare", 1))
+        result[owner_id] = tuple((name, 1) for name in (
+            "aten_index_int32_host_submit", "aten_ne_scalar_host_submit", "aten_bf16_mul_bool_host_submit"))
+        first_child_id = f"{prefix}:experts:0"
+        if first_child_id not in calls_by_id:
+            raise ValueError("Ascend source MoE expert child is missing")
+        first_spec = calls_by_id[first_child_id].kernel_spec
+        if (first_spec.variant != "moe_init_routing"
+                or first_spec.attributes["mathematical_program"] != "ascend_0_18_moe_dispatch_math_v1"):
+            raise ValueError("Ascend source MoE requires its explicit dispatch math")
+        empty_local = first_spec.attributes["routed_rows"] == 0
+        # Lowering omits W1/activation/W2 device math for an empty EP rank.
+        # unquant_apply_mlp still calls all three APIs. Retain their Host
+        # prepare and enqueue group after dispatch and before abs/combine.
+        contract = (tuple(child_contract[index] for index in (0, 4, 5))
+                    if empty_local else child_contract)
+        source_ids = set()
+        for index, (kind, variant, mechanisms) in enumerate(contract):
+            call_id = f"{prefix}:experts:{index}"
+            if call_id not in calls_by_id:
+                raise ValueError("Ascend source MoE expert child is missing")
+            child = calls_by_id[call_id]
+            if (child.rank != rank or child.kernel_spec.kind is not kind
+                    or child.kernel_spec.variant != variant):
+                raise ValueError("Ascend source MoE expert child order or rank disagrees")
+            if variant in ("moe_init_routing", "moe_abs", "moe_token_unpermute"):
+                if (child.kernel_spec.attributes["mathematical_program"] != "ascend_0_18_moe_dispatch_math_v1"
+                        or child.kernel_spec.attributes["routed_rows"] != first_spec.attributes["routed_rows"]):
+                    raise ValueError("Ascend source MoE dispatch children disagree on local routed rows")
+            source_ids.add(child.source_node_ids)
+            result[call_id] = tuple((name, 1) for name in mechanisms)
+            if empty_local and variant == "moe_abs":
+                result[call_id] = (("moe_unquant_mlp_wrapper_prepare", 1),
+                    ("moe_grouped_gemm_prepare", 2), ("moe_swiglu_prepare", 1)) + result[call_id]
+        if len(source_ids) != 1:
+            raise ValueError("Ascend source MoE expert children must share one wrapper source")
+    return result
+
+
 def _dense_node_dispatch_events(
     plan: KernelPlan,
     repeat_by_call,
     enabled: frozenset,
+    source_moe_classes,
+    ascend_compilation_mode: str,
 ) -> Mapping[tuple[str, int, str, int], tuple[RuntimePrepareEvent, ...]]:
     """Charge the dense torchair graph entry and per-node class dispatch.
 
-    The dense 910B decoder is one unsplit FX graph (torchair
-    ``FULL_DECODE_ONLY`` with ``splitting_ops=[]`` and
-    ``enable_npugraph_ex``): the Host lane enters the compiled graph once
-    per forward and then dispatches each codegen'd kernel node.  Every
-    plan call is mapped to its source node classes through a fail-closed
+    Ascend0.18 FULL/FULL_DECODE_ONLY clears splitting_ops: the model enters
+    one compiled graph at embedding, including above-capture-limit calls.
+    PIECEWISE splits at attention and enters one further piece per layer.
+    NONE disables compilation. The configured source mode, not the current
+    step's replay mode, determines those eager graph-entry occurrences.
+    Every plan call is mapped to its source node classes through a fail-closed
     table; a call outside the table aborts the mapping instead of
     borrowing a neighbouring class.  Llama's ``rotary-*`` helper children
     are folded into one compiled rotary source call and are skipped.
@@ -896,6 +1057,7 @@ def _dense_node_dispatch_events(
     if layer_ids and layer_ids != set(range(max(layer_ids) + 1)):
         raise ValueError("dense node dispatch layer descriptor is incomplete")
     graph_entry_calls = []
+    post_attention_candidates = {}
     events = {}
     for call in plan.calls:
         if ":rotary-" in call.call_id or ":rotary:" in call.call_id:
@@ -915,14 +1077,30 @@ def _dense_node_dispatch_events(
             # unmeasured class and double-charge the same lane.
             continue
         class_key = (call.kernel_spec.kind, call.kernel_spec.variant)
-        if class_key not in _ASCEND_910B_DENSE_NODE_CLASSES:
+        if call.call_id in source_moe_classes:
+            node_classes = source_moe_classes[call.call_id]
+            missing = {name for name, _ in node_classes} - enabled
+            if missing:
+                raise ValueError(f"Ascend source MoE Host dispatch lacks independent measurements: {sorted(missing)!r}")
+        elif class_key == (KernelKind.VECTOR, "vllm_masked_embedding"):
+            node_classes = _ascend_masked_embedding_node_classes(call.kernel_spec)
+            missing = {name for name, _ in node_classes} - enabled
+            if missing:
+                raise ValueError(
+                    "Ascend TP embedding Host dispatch lacks independent primitive "
+                    f"measurements: {sorted(missing)!r}")
+        elif class_key not in _ASCEND_910B_DENSE_NODE_CLASSES:
             raise ValueError(
                 "dense node dispatch has no node class for "
                 f"({call.kernel_spec.kind.name}, "
                 f"{call.kernel_spec.variant!r}) at {call.call_id!r}")
-        node_classes = _ASCEND_910B_DENSE_NODE_CLASSES[class_key]
+        else:
+            node_classes = _ASCEND_910B_DENSE_NODE_CLASSES[class_key]
         if _ASCEND_910B_TOKEN_EMBEDDING_ANCHOR.search(call.call_id) is not None:
             graph_entry_calls.append(call)
+        match = re.search(r":layer-([0-9]+):(attention:output-copy|o-proj)$", call.call_id)
+        if match is not None:
+            post_attention_candidates[(int(match.group(1)), call.rank, match.group(2))] = call
         selected = tuple(
             (mechanism, count) for mechanism, count in node_classes
             if mechanism in enabled)
@@ -938,13 +1116,40 @@ def _dense_node_dispatch_events(
                 if key in events:
                     raise ValueError(
                         "dense node dispatch occurrence is duplicated")
+                # production_node_dispatch measures each native operator
+                # entry through its asynchronous return, including enqueue.
+                # The atomic *_host_submit mechanisms use that same boundary.
+                # Existing MoE *_prepare prices remain increments over enqueue.
+                complete_submit = any(
+                    mechanism.endswith(("_host_submit", "_node_dispatch"))
+                    for mechanism, _ in selected)
                 events[key] = tuple(
-                    RuntimePrepareEvent(mechanism, count)
-                    for mechanism, count in selected)
-    if layer_ids and not graph_entry_calls:
+                    RuntimePrepareEvent(mechanism, count, replaces_eager_enqueue=(
+                        complete_submit and index == len(selected) - 1),
+                        additional_eager_enqueue_count=(count if (
+                            call.call_id in source_moe_classes
+                            and call.kernel_spec.variant == "moe_abs"
+                            and mechanism in ("moe_grouped_gemm_prepare", "moe_swiglu_prepare")) else 0))
+                    for index, (mechanism, count) in enumerate(selected))
+    ranks = {call.rank for call in plan.calls if call.rank is not None}
+    expected_entry_layers = {(layer, rank) for layer in layer_ids for rank in ranks}
+    entry_layers = {(layer, rank) for layer, rank, _ in post_attention_candidates}
+    if layer_ids and (not graph_entry_calls or entry_layers != expected_entry_layers):
         raise ValueError(
-            "dense node dispatch requires a token-embedding graph-entry "
-            "anchor per Host lane")
+            "dense node dispatch requires one post-attention graph-entry "
+            "anchor per layer and Host lane")
+    if ascend_compilation_mode == "PIECEWISE":
+        for layer, rank in sorted(entry_layers):
+            graph_entry_calls.append(post_attention_candidates[
+                (layer, rank, "attention:output-copy") if
+                (layer, rank, "attention:output-copy") in post_attention_candidates else
+                (layer, rank, "o-proj")])
+    elif ascend_compilation_mode == "NONE":
+        graph_entry_calls.clear()
+    elif ascend_compilation_mode in ("FULL", "FULL_DECODE_ONLY"):
+        pass
+    else:
+        raise ValueError("unsupported Ascend source compilation mode")
     for call in graph_entry_calls:
         occurrence_indices = (
             range(repeat_by_call[call.call_id].repeat_count)
@@ -967,10 +1172,63 @@ def _dense_node_dispatch_events(
     return events
 
 
+VLLM030_V2_INPUT_PREPARE = "vllm030_v2_input_prepare"
+
+
+def _model_execution_versions(plan: KernelPlan):
+    """Model-source versions, excluding unversioned generic primitives."""
+    return frozenset(call.kernel_spec.attributes["model_execution_version"]
+                     for call in plan.calls if "model_execution_version" in call.kernel_spec.attributes
+                     and call.kernel_spec.attributes["model_execution_version"] is not None)
+
+
+def _vllm030_v2_input_prepare_events(plan: KernelPlan):
+    """One declared V2 preparation before the first submit on each worker.
+
+    Selecting this versioned mechanism in a Host profile explicitly declares
+    the V2 runner. Its independent measurement includes gather_batch_req_state,
+    prepare_inputs and prepare_attn, excluding the model/AOT metadata builder.
+    The compact model graph has no calls for these input kernels/copies;
+    their CPU enqueue service therefore replaces no existing model submit.
+    This Host service remains outside model capture and may overlap earlier
+    GPU work through the existing submit-lane and device-floor schedule.
+    """
+    if {call.kernel_spec.hardware_id for call in plan.calls} != {"nvidia_h200"}:
+        raise ValueError("V2 input preparation profile requires an H200-only plan")
+    if _model_execution_versions(plan) != {"vllm_0_30_0"}:
+        raise ValueError("V2 input preparation requires explicit vLLM0.30 model source")
+    repeats = {call_id for repeat in plan.block_repeats for call_id in repeat.call_ids}
+    first = {}
+    for call in plan.topological_order():
+        for lane in call_host_lanes(call):
+            if lane not in first:
+                first[lane] = (call, 0 if call.call_id in repeats else -1)
+    if not first:
+        raise ValueError("V2 input preparation requires a worker Host lane")
+    return {(pool, rank, call.call_id, index): (
+                RuntimePrepareEvent(VLLM030_V2_INPUT_PREPARE, graph_capturable=False),)
+            for (pool, rank), (call, index) in first.items()}
+
+
+def runtime_prepare_source_signature(plan: KernelPlan, prefix: str):
+    """Source fields consumed by Host rules beyond the scheduling topology."""
+    variants = frozenset(("vllm_masked_embedding", "moe_topk", "moe_init_routing", "routed_experts",
+                          "w1", "moe_swiglu", "w2", "moe_abs", "moe_token_unpermute"))
+    fields = ("stage", "mask_program", "tensor_parallel_size", "tensor_parallel_rank", "source_program",
+              "mathematical_program", "routed_rows")
+    local = tuple((call.call_id.removeprefix(prefix), call.kernel_spec.dtype,
+                  tuple((name, call.kernel_spec.attributes[name]) for name in fields
+                        if name in call.kernel_spec.attributes),
+                  tuple(name.removeprefix(prefix) for name in call.source_node_ids))
+                 for call in plan.calls if call.kernel_spec.variant in variants)
+    return local, _model_execution_versions(plan)
+
+
 def runtime_prepare_events(
     plan: KernelPlan,
     *,
     enabled_mechanisms: Tuple[str, ...],
+    ascend_compilation_mode: str | None = None,
 ) -> Mapping[tuple[str, int, str, int], tuple[RuntimePrepareEvent, ...]]:
     """Map source-declared runtime mechanisms to concrete Host-lane events.
 
@@ -1003,6 +1261,14 @@ def runtime_prepare_events(
     enabled = frozenset(enabled_mechanisms)
     if len(enabled) != len(enabled_mechanisms):
         raise ValueError("enabled runtime prepare mechanisms must be unique")
+    if ascend_compilation_mode is not None:
+        if hardware_id != "ascend_910b":
+            raise ValueError("Ascend compilation mode requires ascend_910b")
+        if ascend_compilation_mode not in ("NONE", "FULL", "FULL_DECODE_ONLY", "PIECEWISE"):
+            raise ValueError("unsupported Ascend source compilation mode")
+    if (hardware_id == "ascend_910b" and "compiled_fx_graph_entry" in enabled
+            and ascend_compilation_mode is None):
+        raise ValueError("Ascend Host graph entries require the configured source compilation mode")
     for exclusive_group in rule_set.exclusive_mechanism_groups:
         if set(exclusive_group) <= enabled:
             raise ValueError(
@@ -1029,15 +1295,26 @@ def runtime_prepare_events(
         for repeat in plan.block_repeats
         for call_id in repeat.call_ids
     }
+    source_moe_classes = (_ascend_source_moe_node_classes(plan, ascend_compilation_mode)
+                          if hardware_id == "ascend_910b" else {})
+    if source_moe_classes and ("compiled_fx_graph_entry" not in enabled
+            or any(":moe:" in call.call_id for call in plan.calls)):
+        raise ValueError("Ascend source MoE requires one explicit source graph contract, without legacy split anchors")
     events = {}
     for call in plan.calls:
+        if call.call_id in source_moe_classes:
+            # The source-aware descriptor below covers these calls in full;
+            # generic legacy rules would charge owner masking again at W1.
+            continue
         mechanisms = []
         rule_key = (call.kernel_spec.kind, call.kernel_spec.variant)
         if rule_key in rule_by_kind_variant:
             rule = rule_by_kind_variant[rule_key]
             if rule not in gated_rules and (
                     rule.call_id_pattern is None
-                    or re.search(rule.call_id_pattern, call.call_id)):
+                    or re.search(rule.call_id_pattern, call.call_id)) and all(
+                        name in call.kernel_spec.attributes and call.kernel_spec.attributes[name] in values
+                        for name, values in rule.attribute_constraints):
                 mechanisms.extend(rule.mechanisms)
         if call.kernel_spec.kind is KernelKind.COMMUNICATION:
             transfer = call.kernel_spec.transfer
@@ -1085,7 +1362,8 @@ def runtime_prepare_events(
             and "compiled_fx_graph_entry" in enabled):
         _merge_runtime_prepare_events(
             events, _dense_node_dispatch_events(
-                plan, repeat_by_call, enabled))
+                plan, repeat_by_call, enabled, source_moe_classes,
+                ascend_compilation_mode))
     if (hardware_id == "ascend_910b"
             and "compiled_fx_rotary_composite_entry" in enabled
             and any(":rotary-" in call.call_id or ":rotary:" in call.call_id for call in plan.calls)):
@@ -1130,4 +1408,6 @@ def runtime_prepare_events(
              "model_runner_logits_prepare"),
             enabled, drop_empty=True)
         _merge_runtime_prepare_events(events, outer_events)
+    if VLLM030_V2_INPUT_PREPARE in enabled:
+        _merge_runtime_prepare_events(events, _vllm030_v2_input_prepare_events(plan))
     return events

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import hashlib
 import inspect
 import json
@@ -16,6 +17,7 @@ from typing import Any, Callable, Sequence
 from evaluation.serving.experiments.experiment_plan import git_code_identity
 from src.serving.request_gen import load_canonical_requests
 from src.serving.request_gen.request_stream import (
+    RequestStream,
     RequestSpec,
     request_stream_sha256,
 )
@@ -62,6 +64,29 @@ def _sample_sharegpt(
                 f"{sample.expected_output_len} != {request.output_tokens}"
             )
     return tokenizer, samples
+
+
+def _diagnostic_output_capped_requests(
+    requests: Sequence[RequestSpec],
+    *,
+    diagnostic_request_count: int | None,
+    diagnostic_output_token_cap: int | None,
+) -> tuple[RequestSpec, ...]:
+    """Derive a short-output diagnostic stream after canonical sample checks."""
+    if diagnostic_output_token_cap is None:
+        return tuple(requests)
+    if diagnostic_request_count is None:
+        raise ValueError("diagnostic output cap requires diagnostic request count")
+    if (type(diagnostic_output_token_cap) is not int
+            or not 4 <= diagnostic_output_token_cap <= 8):
+        raise ValueError("diagnostic output cap must be an integer from four to eight")
+    if any(request.output_token_ids is not None for request in requests):
+        raise ValueError("diagnostic output cap requires length-only requests")
+    return tuple(
+        replace(request, output_tokens=min(request.output_tokens,
+                                           diagnostic_output_token_cap))
+        for request in requests
+    )
 
 
 def _prefix_cache_reuse_evidence(
@@ -574,11 +599,21 @@ def build_ground_truth(
     case: dict[str, Any],
     server_plan: dict[str, Any],
     dry_run: bool,
+    diagnostic_request_count: int | None = None,
+    diagnostic_output_token_cap: int | None = None,
     benchmark_boundary_callback: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     requests_path = case["requests_path"]
-    request_stream = load_canonical_requests(requests_path)
-    requests = request_stream.requests
+    canonical_stream = load_canonical_requests(requests_path)
+    canonical_requests = canonical_stream.requests
+    if len(canonical_requests) != case["requests_row_count"]:
+        raise ValueError("requests.csv row count disagrees with case manifest")
+    if diagnostic_request_count is not None:
+        if (type(diagnostic_request_count) is not int
+                or not 8 <= diagnostic_request_count < len(canonical_requests)):
+            raise ValueError("diagnostic request count must be 8 through canonical count - 1")
+    requests = (canonical_requests if diagnostic_request_count is None
+                else canonical_requests[:diagnostic_request_count])
     if requests[0].arrival_time_s != 0:
         raise ValueError("canonical request schedule must start at zero seconds")
     if any(request.output_tokens < 1 for request in requests):
@@ -591,22 +626,29 @@ def build_ground_truth(
         model=model,
         dataset=dataset,
         seed=seed,
-        requests=requests,
+        requests=canonical_requests,
     )
+    if diagnostic_request_count is not None:
+        samples = samples[:diagnostic_request_count]
+    requests = _diagnostic_output_capped_requests(
+        requests,
+        diagnostic_request_count=diagnostic_request_count,
+        diagnostic_output_token_cap=diagnostic_output_token_cap,
+    )
+    request_stream = RequestStream(requests)
     prefix_cache_evidence = _prefix_cache_reuse_evidence(
         tokenizer,
         samples,
         kv_block_size_tokens=server_plan["engine"]["kv_block_size_tokens"],
     )
-    if len(requests) != case["requests_row_count"]:
-        raise ValueError("requests.csv row count disagrees with case manifest")
     import vllm
 
     result: dict[str, Any] = {
         "schema_version": 1,
         "status": "dry_run" if dry_run else "running",
         "workload": {
-            "kind": "sharegpt_canonical_schedule",
+            "kind": ("sharegpt_canonical_schedule" if diagnostic_request_count is None
+                     else "sharegpt_diagnostic_prefix_schedule"),
             "request_count": len(requests),
             "expected_qps": case["runtime"]["target_qps"],
             "scheduled_duration_s": requests[-1].arrival_time_s,
@@ -638,6 +680,14 @@ def build_ground_truth(
         },
         "metrics": None,
     }
+    if diagnostic_request_count is not None:
+        result["workload"]["canonical_request_stream_sha256"] = (
+            request_stream_sha256(canonical_stream))
+        result["workload"]["canonical_request_count"] = len(canonical_requests)
+    if diagnostic_output_token_cap is not None:
+        result["workload"]["diagnostic_output_token_cap"] = (
+            diagnostic_output_token_cap
+        )
     if dry_run:
         return result
     result["metrics"] = asyncio.run(_run_http_benchmark(

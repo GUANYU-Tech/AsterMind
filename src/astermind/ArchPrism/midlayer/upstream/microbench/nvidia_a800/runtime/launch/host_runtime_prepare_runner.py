@@ -11,6 +11,7 @@ import argparse
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 from pathlib import Path
 import platform
 import statistics
@@ -48,6 +49,22 @@ def _linear_slope(xs, ys):
     return sum(
         (x - x_mean) * (y - y_mean) for x, y in zip(xs, ys)
     ) / denominator
+
+
+def _cpu_model() -> str:
+    names = {
+        line.partition(":")[2].strip()
+        for line in Path("/proc/cpuinfo").read_text(encoding="utf-8").splitlines()
+        if line.startswith("model name")
+    }
+    if len(names) != 1 or not next(iter(names)):
+        raise RuntimeError("Host runtime-prepare capture needs one CPU model identity")
+    return next(iter(names))
+
+
+def _cpu_product(model: str) -> str:
+    # Linux often appends an advertised clock to the same vendor/SKU.
+    return model.casefold().split(" cpu @", 1)[0].strip()
 
 
 def _profile_device_activities(call):
@@ -100,13 +117,18 @@ def _measure(call, trials, eager_enqueue_ns):
         tuple(median_total_by_chain[length] for length in CHAIN_LENGTHS),
     )
     submit_ns = device_activities["count"] * eager_enqueue_ns
+    runtime_prepare_ns = host_service_ns - submit_ns
+    if not math.isfinite(runtime_prepare_ns) or runtime_prepare_ns < 0:
+        raise RuntimeError(
+            "Host runtime-prepare slope is smaller than independently "
+            "measured eager enqueue; recapture instead of clipping")
     return {
         "physical_device_activity_count": device_activities["count"],
         "physical_device_activity_names": device_activities["names"],
         "median_total_ns_by_chain_length": median_total_by_chain,
         "fitted_host_service_ns_per_call": host_service_ns,
         "eager_enqueue_ns_removed_per_call": submit_ns,
-        "runtime_prepare_ns_per_call": max(0.0, host_service_ns - submit_ns),
+        "runtime_prepare_ns_per_call": runtime_prepare_ns,
         "samples": samples,
     }
 
@@ -303,8 +325,35 @@ def main():
     parser.add_argument("--device-id", type=int, required=True)
     parser.add_argument("--eager-enqueue-us", type=float, required=True)
     parser.add_argument("--trials", type=int, default=15)
+    parser.add_argument("--expected-host-cpu-model")
+    parser.add_argument("--expected-vllm-version")
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
+    if not math.isfinite(args.eager_enqueue_us) or args.eager_enqueue_us <= 0:
+        raise ValueError("--eager-enqueue-us must be finite and positive")
+    if args.trials < 1:
+        raise ValueError("--trials must be positive")
+    host_cpu_model = _cpu_model()
+    if (args.expected_host_cpu_model is not None
+            and (not args.expected_host_cpu_model.strip()
+                 or _cpu_product(host_cpu_model) != _cpu_product(
+                     args.expected_host_cpu_model))):
+        raise RuntimeError(
+            f"Host CPU {host_cpu_model!r} differs from expected "
+            f"{args.expected_host_cpu_model!r}")
+    installed_vllm_version = None
+    if args.hardware_id in ("nvidia_a800", "nvidia_h200"):
+        import vllm
+        installed_vllm_version = vllm.__version__
+    if args.expected_vllm_version is not None:
+        if installed_vllm_version != args.expected_vllm_version:
+            raise RuntimeError(
+                f"vLLM {installed_vllm_version!r} differs from expected "
+                f"{args.expected_vllm_version!r}")
+    torch_device = torch.cuda.get_device_name(args.device_id)
+    if args.hardware_id == "nvidia_h200" and torch_device != "NVIDIA H200":
+        raise RuntimeError(
+            f"nvidia_h200 runtime-prepare capture requires NVIDIA H200, got {torch_device!r}")
     if args.output_dir.exists():
         raise FileExistsError(args.output_dir)
     args.output_dir.mkdir(parents=True)
@@ -324,9 +373,11 @@ def main():
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "environment": {
             "hostname": platform.node(),
+            "host_cpu_model": host_cpu_model,
             "python": sys.version,
             "torch": torch.__version__,
-            "device": torch.cuda.get_device_name(args.device_id),
+            "device": torch_device,
+            "vllm_version": installed_vllm_version,
         },
         "source": {"path": str(source), "sha256": _sha256(source)},
         "contract": {

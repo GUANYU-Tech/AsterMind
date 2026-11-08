@@ -10,12 +10,12 @@ GPU=$1; RUN=$2; SRC=$3
 PROGRAMS=${4:-"sgl_bm16_bn64_bk128_w4_s5 sgl_bm16_bn64_bk128_w4_s3 sgl_bm16_bn64_bk128_w4_s4 sgl_bm16_bn128_bk128_w4_s3 sgl_bm16_bn128_bk128_w4_s4 sgl_tma_bm16_bn128_bk128_w4_s2 sgl_tma_bm16_bn128_bk64_w4_s3 sgl_tma_bm16_bn256_bk64_w4_s3"}
 mkdir -p $RUN; cd $RUN
 export PYTHONNOUSERSITE=1 PYTHONPATH=$SRC
-export TRITON_CACHE_DIR=/mnt/public/yangxinhao/cache/sgl_tile/triton_gpu$GPU
+export TRITON_CACHE_DIR=${MIDLAYER_H200_PUBLIC_ROOT:?set MIDLAYER_H200_PUBLIC_ROOT}/cache/sgl_tile/triton_gpu$GPU
 for proc in 1 2; do
   for prog in $PROGRAMS; do
     for attempt in 1 2 3 4; do
       tag=gpu${GPU}_${prog}_p${proc}_a${attempt}
-      CUDA_VISIBLE_DEVICES=$GPU /mnt/public/yangxinhao/envs/sglang0512/bin/python $SRC/sm90_fp8_block_tile_pipeline_sglang_runner.py --program $prog --trials 9 --clock-log $tag.clock.csv > $tag.csv 2> $tag.err
+      CUDA_VISIBLE_DEVICES=$GPU ${MIDLAYER_H200_PUBLIC_ROOT:?set MIDLAYER_H200_PUBLIC_ROOT}/envs/sglang0512/bin/python $SRC/sm90_fp8_block_tile_pipeline_sglang_runner.py --program $prog --trials 9 --clock-log $tag.clock.csv > $tag.csv 2> $tag.err
       if grep -q "^CLOCK,$GPU,.*,1$" $tag.csv; then echo "ACCEPT $tag"; break; else echo "REJECT $tag"; fi
     done
   done

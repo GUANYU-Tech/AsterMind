@@ -23,9 +23,10 @@ import time
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT))
 OUTPUT_ROOT = ROOT / "profiler_output/microbench/nvidia_a800"
-VLLM_SOURCE = Path(
-    "/share_data/yangxinhao/chip_modeling/vllm_src_3ver/a800/vllm/"
-    "model_executor/layers/fused_moe/fused_moe.py")
+VLLM_SOURCE = (
+    Path(os.environ["MIDLAYER_A800_VLLM_SOURCE"])
+    / "model_executor/layers/fused_moe/fused_moe.py"
+)
 DEVICE_NAME = "NVIDIA A800-SXM4-80GB"
 PREFERRED_DEVICES = (2, 6)
 DEFAULT_EXPERTS = 8

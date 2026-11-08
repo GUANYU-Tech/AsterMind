@@ -59,7 +59,7 @@ are NOT re-measured here: their limiting uncertainty is day-to-day drift, not
 setup noise, so repeating the setup would tighten them by 1.01x on two of three
 cards.  Pass 1 as the repeat count to reproduce that protocol exactly.
 
-Usage: vllm_delivery_region_runner.py MODEL FANOUTS ROUNDS [REPEATS] [JSON_OUT]
+Usage: vllm_delivery_region_runner.py MODEL FANOUTS ROUNDS [REPEATS] [JSON_OUT] [HISTORY_ROUNDS]
 """
 
 import asyncio, inspect, json, os, socket as sk, statistics, subprocess, sys, threading, time
@@ -146,7 +146,9 @@ def _resp_classes():
 
 
 MODEL = sys.argv[1]; FANOUTS = [int(x) for x in sys.argv[2].split(",")]
-R = int(sys.argv[3]); WARM = 5
+R = int(sys.argv[3]); WARM = int(sys.argv[6]) if len(sys.argv) > 6 else 5
+if WARM < 5:
+    raise SystemExit("HISTORY_ROUNDS must be at least five")
 # Repeats are specified per fanout ("2:14,64:7") because the two-point
 # estimator reads only two of the measured fanouts and they do not deserve
 # equal budget.  ic = v2 - (v64-v2)/62, so d(ic)/d(v2) = 1.016 against

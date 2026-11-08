@@ -6,7 +6,7 @@ cannot authorize the intermediate ports of a decomposed native recipe.
 """
 from dataclasses import replace
 
-from src.kernel.kernel_spec import KernelKind
+from src.kernel.kernel_spec import KernelKind, linear_expert_partition
 from src.kernel.memory_access_builder import ElementwiseBindings
 from src.kernel.memory_fused_moe import FusedMoEBindings
 from src.serving.workload.workload_graph import WorkloadKind
@@ -148,7 +148,8 @@ def _validate_public_expert_ports(call, source):
     spec = call.kernel_spec
     tokens, experts, topk, hidden, intermediate = (spec.shape[name]
         for name in ("tokens", "experts", "topk", "hidden", "intermediate"))
-    local_experts = experts // source.attributes["expert_parallel_size"]
+    local_experts = len(linear_expert_partition(experts, source.attributes["expert_parallel_size"],
+        source.attributes["expert_rank"] if source.attributes["expert_parallel_size"] > 1 else 0))
     w13, w2 = source.inputs[3:]
     _layout(w13, (local_experts, 2 * intermediate, hidden), "bf16")
     _layout(w2, (local_experts, hidden, intermediate), "bf16")
@@ -165,6 +166,12 @@ def bind_moe_memory(call, source):
     if source.rank != call.rank or source.pool_name != call.pool_name or call.source_node_ids != (source.node_id,):
         raise ValueError("MoE binding crossed its actual source call")
     spec = call.kernel_spec
+    if "symbolic_zero_extent_parameter_roles" in source.attributes:
+        if (spec.kind is not KernelKind.VECTOR or spec.variant != "elementwise" or spec.attributes["operation"] != "fill"
+                or spec.attributes["reads"] != 0 or spec.attributes["writes"] != 1
+                or source.attributes["owned_experts"] or len(source.inputs) != 3 or len(source.outputs) != 1):
+            raise ValueError("empty expert output must be one actual zero write with no parameters")
+        return _binding(call, source, (), _roles(source.outputs, ("output",)), ())
     if spec.kind is KernelKind.FUSED_MOE:
         _validate_public_expert_ports(call, source)
         if spec.variant in ("w1", "w2"):

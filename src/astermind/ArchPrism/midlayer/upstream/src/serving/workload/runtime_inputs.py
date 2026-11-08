@@ -1881,6 +1881,163 @@ _EXPERT_ROUTING_RESOLVE_KWDEFAULTS = dict(ExpertRoutingInput.resolve.__kwdefault
 _EXPERT_ROUTING_RESOLUTION_TYPE = ExpertRoutingResolution
 
 @dataclass(frozen=True)
+class K3SourceInputs:
+    """Actual Scheduler cache coordinates for one ordinary K3 source step."""
+
+    request_ids: tuple[str, ...]
+    slot_mapping: tuple[int, ...]
+    state_indices_by_layer: tuple[tuple[int, ...], ...]
+    cache_capacity_tokens: int
+    state_pool_slots: int
+    prefill_output_source: str | None
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.request_ids, tuple) or not self.request_ids
+                or any(not isinstance(request_id, str) or not request_id for request_id in self.request_ids)
+                or len(set(self.request_ids)) != len(self.request_ids)):
+            raise ValueError("K3 source requires distinct nonempty request IDs")
+        if type(self.cache_capacity_tokens) is not int or self.cache_capacity_tokens <= 0:
+            raise ValueError("K3 MLA cache capacity must be positive")
+        if type(self.state_pool_slots) is not int or self.state_pool_slots <= 1:
+            raise ValueError("K3 recurrent-state pool must contain a null block and a request block")
+        if (not isinstance(self.slot_mapping, tuple)
+                or any(type(slot) is not int or not 0 <= slot < self.cache_capacity_tokens for slot in self.slot_mapping)
+                or len(set(self.slot_mapping)) != len(self.slot_mapping)):
+            raise ValueError("K3 source requires disjoint valid MLA write slots")
+        if (not isinstance(self.state_indices_by_layer, tuple) or len(self.state_indices_by_layer) != 93
+                or sum(bool(indices) for indices in self.state_indices_by_layer) != 69
+                or any(not isinstance(indices, tuple) for indices in self.state_indices_by_layer)
+                or any(indices and len(indices) != len(self.request_ids) for indices in self.state_indices_by_layer)
+                or any(type(index) is not int or not 0 < index < self.state_pool_slots
+                    for indices in self.state_indices_by_layer for index in indices)
+                or any(len(set(indices)) != len(indices) for indices in self.state_indices_by_layer)):
+            raise ValueError("K3 source requires 69 layer-specific recurrent-state blocks per request")
+        if self.prefill_output_source not in (None, "supports_out"):
+            raise ValueError("K3 prefill output source must be explicit supports_out or None")
+
+
+@dataclass(frozen=True)
+class K3DataParallelSourceInputs:
+    """Actual independent hybrid-cache coordinates in physical DP order.
+
+    None is an idle replica, never a synthetic cache/state allocation.
+    Latent-tail scenario belongs to the run, not the native cache receipt.
+    """
+
+    source_inputs_by_replica: tuple[K3SourceInputs | None, ...]
+    # Idle workers retain their hybrid-pool address extents. These are
+    # capacities, not request coordinates, GPU arena binding or state IDs.
+    cache_capacity_tokens_by_replica: tuple[int, ...] | None = None
+    state_pool_slots_by_replica: tuple[int, ...] | None = None
+
+    def __post_init__(self) -> None:
+        states = self.source_inputs_by_replica
+        if (not isinstance(states, tuple) or len(states) < 2 or not any(state is not None for state in states)
+                or any(state is not None and not isinstance(state, K3SourceInputs) for state in states)):
+            raise ValueError("K3 DP requires actual typed hybrid states and explicit idle replicas")
+        requests = tuple(request_id for state in states if state is not None for request_id in state.request_ids)
+        if len(set(requests)) != len(requests):
+            raise ValueError("K3 DP hybrid states must retain disjoint original request IDs")
+        caches,slots=self.cache_capacity_tokens_by_replica,self.state_pool_slots_by_replica
+        if (caches is None)!=(slots is None):
+            raise ValueError("K3 DP retained capacities require both MLA and recurrent pools")
+        if caches is not None and (type(caches) is not tuple or type(slots) is not tuple
+                or len(caches)!=len(states) or len(slots)!=len(states)
+                or any(type(value) is not int or value<1 for value in caches)
+                or any(type(value) is not int or value<=1 for value in slots)
+                or any(state is not None and (state.cache_capacity_tokens!=caches[index]
+                    or state.state_pool_slots!=slots[index]) for index,state in enumerate(states))):
+            raise ValueError("K3 DP retained capacities must match each actual hybrid pool")
+
+
+@dataclass(frozen=True)
+class DSparkReplicaInputs:
+    """One native Scheduler's actual cache tables and declared token feedback.
+
+    Tables retain original native group IDs. They cannot be reconstructed
+    from aggregate allocation/release events or shared with another DP owner.
+    Empty request rows retain genuine idle-worker geometry. The optional
+    capacity normalizes legacy frozen-cohort frames to their current batch.
+    Legacy indices declare identity rows; the native bridge supplies the
+    source-derived resident indices independently of scheduled batch order.
+    Admissions retain scheduled_new_reqs order and require complete fresh
+    prompts at the source boundary before any new row is staged.
+    """
+    request_ids: tuple[str, ...]
+    prompt_lengths: tuple[int, ...]
+    sampled_token_ids: tuple[tuple[int, ...], ...]
+    block_tables: tuple[tuple[tuple[int, ...], ...], ...]
+    block_sizes: tuple[int, ...]
+    target_swa_group: int
+    draft_layer_groups: tuple[int, ...]
+    num_kv_blocks: int
+    request_state_capacity: int | None = None
+    idle_request_state_source: str | None = None
+    request_state_indices: tuple[int, ...] | None = None
+    admitted_request_ids: tuple[str, ...] = ()
+
+    def __post_init__(self):
+        batch = len(self.request_ids)
+        if (type(self.request_ids) is not tuple
+                or any(type(key) is not str or not key for key in self.request_ids)
+                or len(set(self.request_ids)) != batch
+                or type(self.prompt_lengths) is not tuple or len(self.prompt_lengths) != batch
+                or any(type(n) is not int or n < 1 for n in self.prompt_lengths)
+                or type(self.sampled_token_ids) is not tuple or len(self.sampled_token_ids) != batch
+                or any(type(ids) is not tuple or not 1 <= len(ids) <= 6
+                    or any(type(token) is not int or token < 0 for token in ids) for ids in self.sampled_token_ids)):
+            raise ValueError("DSpark native frame requires original requests, prompts and declared sampled prefixes")
+        if self.request_state_capacity is None:
+            object.__setattr__(self,'request_state_capacity',max(1,batch))
+        if type(self.request_state_capacity) is not int or self.request_state_capacity<max(1,batch):
+            raise ValueError('DSpark native frame requires a fixed positive request-state capacity')
+        if self.request_state_indices is None:
+            object.__setattr__(self,'request_state_indices',tuple(range(batch)))
+        if (type(self.request_state_indices) is not tuple or len(self.request_state_indices)!=batch
+                or len(set(self.request_state_indices))!=batch
+                or any(type(index) is not int or not 0<=index<self.request_state_capacity
+                    for index in self.request_state_indices)):
+            raise ValueError('DSpark request-state indices must name distinct resident rows in scheduled request order')
+        if (type(self.admitted_request_ids) is not tuple or len(set(self.admitted_request_ids))!=len(self.admitted_request_ids)
+                or any(type(key) is not str or key not in self.request_ids for key in self.admitted_request_ids)):
+            raise ValueError('DSpark admitted request IDs must be distinct current requests in native admission order')
+        if (batch==0 and self.idle_request_state_source not in ('never_admitted_constructor','retained_request_state')
+                or batch>0 and self.idle_request_state_source is not None):
+            raise ValueError('DSpark idle state requires an explicit never-admitted constructor or retained request-state source')
+        if (type(self.block_tables) is not tuple or not self.block_tables
+                or type(self.block_sizes) is not tuple or len(self.block_sizes) != len(self.block_tables)
+                or any(type(size) is not int or size < 1 for size in self.block_sizes)
+                or type(self.num_kv_blocks) is not int or self.num_kv_blocks < 1
+                or type(self.draft_layer_groups) is not tuple or len(self.draft_layer_groups) != 3
+                or any(type(group) is not int or not 0 <= group < len(self.block_tables)
+                    for group in (self.target_swa_group, *self.draft_layer_groups))):
+            raise ValueError("DSpark native frame requires actual group IDs, block sizes and capacity")
+        for table in self.block_tables:
+            if (type(table) is not tuple or len(table) != batch
+                    or any(type(row) is not tuple or any(type(block) is not int or not 0 <= block < self.num_kv_blocks
+                        for block in row) for row in table)):
+                raise ValueError("DSpark native tables must cover every original request with valid physical block IDs")
+
+
+@dataclass(frozen=True)
+class DSparkSourceInputs:
+    draft_model: object
+    replicas: tuple[DSparkReplicaInputs | None, ...]
+
+    def __post_init__(self):
+        from .model_config import ModelConfig
+        if not isinstance(self.draft_model, ModelConfig) or not self.draft_model.is_dspark_draft:
+            raise ValueError("DSpark source requires its registered draft ModelConfig")
+        if (type(self.replicas) is not tuple or not self.replicas
+                or any(state is not None and not isinstance(state, DSparkReplicaInputs) for state in self.replicas)
+                or not any(state is not None and bool(state.request_ids) for state in self.replicas)):
+            raise ValueError("DSpark source requires physical DP order and explicit idle replicas")
+        ids = tuple(key for state in self.replicas if state is not None for key in state.request_ids)
+        if len(set(ids)) != len(ids):
+            raise ValueError("DSpark source replicas must retain disjoint original request IDs")
+
+
+@dataclass(frozen=True)
 class V32PaddedMTPInputs:
     """Shared0.27/0.30 padded scenarios, never numerically generated drafts.
 
@@ -1920,6 +2077,117 @@ class V32PaddedMTPInputs:
         if any(type(value) is not bool or value for value in (
                 self.parallel_drafting, self.use_local_argmax_reduction, self.probabilistic)):
             raise NotImplementedError("V32 source requires sequential full-logits deterministic greedy drafting")
+
+
+@dataclass(frozen=True)
+class DSparkFirstProposalInputs:
+    """Declared first-proposal transcript, distinct from ordinary V4/MTP."""
+    request_ids: tuple[str,...]
+    draft_model: "ModelConfig"
+    target_positions: tuple[int,...]
+    target_slot_mapping: tuple[int,...]
+    anchor_token_ids: tuple[int,...]
+    draft_token_ids: tuple[tuple[int,...],...]
+    source_kind: str
+    source_id: str
+    confidence_enabled: bool = False
+    confidence_head_available: bool | None = None
+
+    # One schema for first and later proposals. None means first proposal;
+    # verification supplies every predecessor/greedy fact explicitly.
+    predecessor_step_id: str | None = None
+    previous_retained_kv_tokens: int | None = None
+    previous_anchor_token_ids: tuple[int, ...] | None = None
+    previous_draft_token_ids: tuple[tuple[int, ...], ...] | None = None
+    target_greedy_token_ids: tuple[int, ...] | None = None
+    target_bonus_token_ids: tuple[int, ...] | None = None
+    accepted_drafts: int | None = None
+    finish_request: bool = False
+    delivered_token_count: int | None = None
+
+
+    def __post_init__(self):
+        from .model_config import ModelConfig
+        if (type(self.request_ids)is not tuple or len(self.request_ids)!=1
+                or any(type(value)is not str or not value for value in self.request_ids)
+                or not isinstance(self.draft_model,ModelConfig) or self.draft_model.dspark_block_size!=5
+                or self.source_kind not in ("declared_synthetic","explicit_assumption")
+                or type(self.source_id)is not str or not self.source_id):
+            raise ValueError("DSpark first proposal needs an actual registered draft config and explicit one-request transcript")
+        self.validate_progress()
+        if len(self.target_positions)!=len(self.target_slot_mapping):
+            raise ValueError("DSpark target positions and logical slots must cover the same source rows")
+        if (type(self.anchor_token_ids)is not tuple or len(self.anchor_token_ids)!=1
+                or type(self.draft_token_ids)is not tuple or len(self.draft_token_ids)!=5
+                or any(type(ids)is not tuple or len(ids)!=1 for ids in self.draft_token_ids)
+                or any(type(v)is not int or not 0<=v<self.draft_model.vocab_size
+                    for ids in (self.anchor_token_ids,*self.draft_token_ids) for v in ids)):
+            raise ValueError("DSpark first proposal requires actual bounded token scenarios for every sequential sample")
+        if type(self.confidence_enabled)is not bool or self.confidence_head_available not in (None,True,False):
+            raise TypeError("DSpark confidence mode and optional checkpoint presence must be typed explicitly")
+        if self.confidence_head_available is not None and type(self.confidence_head_available)is not bool:
+            raise TypeError("DSpark checkpoint head presence cannot be inferred from an integer")
+        if self.confidence_enabled:
+            raise NotImplementedError("DSpark first proposal currently requires confidence-disabled sampling")
+
+
+    @property
+    def is_verification(self):
+        return self.predecessor_step_id is not None
+
+    @property
+    def retained_kv_tokens(self):
+        return (self.previous_retained_kv_tokens + self.accepted_drafts + 1
+            if self.is_verification else len(self.target_positions))
+
+    def validate_progress(self):
+        if type(self.finish_request) is not bool:
+            raise ValueError("DSpark request completion flag must be explicit and typed")
+        valid_count=1 if self.accepted_drafts is None else self.accepted_drafts+1
+        if self.delivered_token_count is not None and (type(self.delivered_token_count) is not int
+                or not 0<=self.delivered_token_count<=valid_count
+                or (self.delivered_token_count<valid_count and not self.finish_request)):
+            raise ValueError("DSpark delivered prefix must match raw output or its explicit terminal truncation")
+        facts = (self.previous_retained_kv_tokens, self.previous_anchor_token_ids,
+            self.previous_draft_token_ids, self.target_greedy_token_ids, self.accepted_drafts)
+        if not self.is_verification:
+            if any(value is not None for value in (*facts, self.target_bonus_token_ids)):
+                raise ValueError("DSpark first proposal cannot carry verification facts without a predecessor")
+            expected = tuple(range(len(self.target_positions)))
+        else:
+            if (type(self.predecessor_step_id) is not str or not self.predecessor_step_id
+                    or type(self.previous_retained_kv_tokens) is not int or self.previous_retained_kv_tokens <= 0
+                    or type(self.accepted_drafts) is not int or not 0 <= self.accepted_drafts <= 5
+                    or type(self.previous_anchor_token_ids) is not tuple or len(self.previous_anchor_token_ids) != 1
+                    or type(self.previous_draft_token_ids) is not tuple or len(self.previous_draft_token_ids) != 5
+                    or any(type(ids) is not tuple or len(ids) != 1 for ids in self.previous_draft_token_ids)
+                    or type(self.target_greedy_token_ids) is not tuple or len(self.target_greedy_token_ids) != 5):
+                raise ValueError("DSpark verification requires explicit predecessor, live KV and five target greedy IDs")
+            tokens = (*self.previous_anchor_token_ids, *(ids[0] for ids in self.previous_draft_token_ids),
+                *self.target_greedy_token_ids)
+            if any(type(token) is not int or not 0 <= token < self.draft_model.vocab_size for token in tokens):
+                raise ValueError("DSpark verification transcript has an invalid token ID")
+            accepted = self.accepted_drafts
+            previous = tuple(ids[0] for ids in self.previous_draft_token_ids)
+            if (previous[:accepted] != self.target_greedy_token_ids[:accepted]
+                    or (accepted < 5 and previous[accepted] == self.target_greedy_token_ids[accepted])):
+                raise ValueError("DSpark accepted count must equal the deterministic greedy matching prefix")
+            if accepted == 5:
+                if (type(self.target_bonus_token_ids) is not tuple or len(self.target_bonus_token_ids) != 1
+                        or type(self.target_bonus_token_ids[0]) is not int
+                        or not 0 <= self.target_bonus_token_ids[0] < self.draft_model.vocab_size):
+                    raise ValueError("DSpark all-accepted verification requires its actually consumed bonus scenario")
+                terminal = self.target_bonus_token_ids
+            else:
+                if self.target_bonus_token_ids is not None:
+                    raise ValueError("DSpark rejection returns before reading the sixth bonus logits row")
+                terminal = (self.target_greedy_token_ids[accepted],)
+            if self.anchor_token_ids != terminal:
+                raise ValueError("DSpark next anchor must equal the terminal verification token")
+            expected = tuple(range(self.previous_retained_kv_tokens, self.previous_retained_kv_tokens + 6))
+        if (self.target_positions != expected or self.target_slot_mapping != expected
+                or any(type(value) is not int for values in (self.target_positions, self.target_slot_mapping) for value in values)):
+            raise ValueError("DSpark positions and slots must match the current declared logical arena")
 
 
 @dataclass(frozen=True)
@@ -1989,8 +2257,72 @@ class RuntimeInputs:
     glm_prefill_attention_source: str | None = None
     model_source_inputs: object | None = None
     maca_copy_runtime_source: str | None = None
+    # Explicit ordinary model-run scenario; never inferred from Scheduler rows or provider receipts.
+    k3_latent_tail_tier: str | None = None
+    # This source profile historically traces Triton KDA. Native decode is
+    # an explicit alternate source, never inferred from an installed GPU op.
+    k3_kda_decode_backend: str = "triton"
+    # Request-ID keyed prompt lengths for variable-size Production windows.
+    # The workload builder projects these to each Scheduler step's row order.
+    symbolic_source_prompt_lengths_by_request: Mapping[str, int] | None = None
+    dspark_all_token_ids_storage: str | None = None
+    # Pinned0.30 sparse_attn_indexer env default; a declared override affects
+    # no-metadata temporary allocation, never fitted operator timing.
+    glm_indexer_max_logits_mb: int = 512
+    # Standalone/warm source may explicitly declare this per-DP proposer
+    # history. A run-owned SourceProgramCache binds constructor and updates.
+    glm_mtp_legacy_skip_topk_by_data_rank: tuple[bool, ...] | None = None
+    # Explicit vLLM0.30 CUDA Norm source branch; None stays unknown. False
+    # declares the upstream environment default, not an observed provider.
+    norm_source_batch_invariant: bool | None = None
+    # Explicit finite-tile analytical program, not a captured cuBLAS launch.
+    bf16_gemm_model: str | None = None
+    # Explicit input approximation for the ordinary TP2 source. Unknown
+    # scheduled IDs and retained tails are declared zero, never observed.
+    dense_source_input_policy: str | None = None
+    dense_source_capture_limits: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
+        if self.dense_source_input_policy is None:
+            if self.dense_source_capture_limits is not None:
+                raise ValueError("dense source capture limits require an explicit input policy")
+        elif (self.dense_source_input_policy != "declared_zero_tp2"
+                or type(self.dense_source_capture_limits) is not tuple
+                or len(self.dense_source_capture_limits) != 2
+                or any(type(value) is not int or value <= 0 for value in self.dense_source_capture_limits)
+                or self.serving_framework != "vllm" or self.model_execution_version != "vllm_0_30_0"
+                or self.symbolic_forward_source != "cuda_eager_inplace"
+                or self.target_sampling_source != "vllm_0_30_plain_greedy_bf16"
+                or self.mtp_draft_sampling_source is not None
+                or self.graph_execution.configured_mode != "FULL_AND_PIECEWISE"):
+            raise ValueError("declared dense input policy requires ordinary0.30 FULL/PIECEWISE and explicit capture limits")
+        if self.bf16_gemm_model is not None and (
+                self.bf16_gemm_model != "tiled_reference"
+                or self.serving_framework != "vllm"
+                or self.model_execution_version != "vllm_0_30_0"
+                or self.symbolic_forward_source != "cuda_eager_inplace"):
+            raise ValueError("BF16 GEMM reference requires explicit vLLM0.30 CUDA analytical source")
+        if self.norm_source_batch_invariant is not None:
+            if type(self.norm_source_batch_invariant) is not bool:
+                raise TypeError("Norm source batch-invariant declaration must be boolean")
+            if (self.norm_source_batch_invariant is not False
+                    or self.serving_framework != "vllm"
+                    or self.model_execution_version != "vllm_0_30_0"
+                    or self.symbolic_forward_source != "cuda_eager_inplace"):
+                raise ValueError("Norm source declaration requires non-batch-invariant vLLM0.30 CUDA source")
+        if type(self.glm_indexer_max_logits_mb) is not int or self.glm_indexer_max_logits_mb <= 0:
+            raise ValueError("GLM indexer temporary logits MiB must be an explicit positive integer")
+        if self.k3_kda_decode_backend not in ("triton","native") or (
+                self.k3_kda_decode_backend=="native" and self.symbolic_forward_source!="vllm_0_30_k3_mxfp4_sync"):
+            raise ValueError("K3 KDA decode requires an explicit Triton or native source backend")
+        if self.glm_mtp_legacy_skip_topk_by_data_rank is not None and (
+                type(self.glm_mtp_legacy_skip_topk_by_data_rank) is not tuple or not self.glm_mtp_legacy_skip_topk_by_data_rank
+                or any(type(value) is not bool for value in self.glm_mtp_legacy_skip_topk_by_data_rank)
+                or self.model_execution_version != "vllm_0_30_0"
+                or self.symbolic_forward_source not in ("vllm_0_30_v32_bf16_sync_explicit_allreduce",
+                    "vllm_0_30_v32_fp8_sync_explicit_allreduce")
+                or self.mtp_draft_sampling_source != "vllm_0_30_legacy_full_logits_greedy"):
+            raise ValueError("GLM MTP legacy skip-topk history must declare a boolean per DP replica")
         if self.maca_copy_runtime_source is not None and (
                 self.maca_copy_runtime_source != MACA_COPY_RUNTIME_SOURCE
                 or self.serving_framework != "vllm"
@@ -2000,8 +2332,20 @@ class RuntimeInputs:
             from .graph_padding import VLLMDenseGraphInputs
             from .traced_sglang import SGLangEagleChainState, SGLangPrefillInputs, SGLangGraphInputs
             if not isinstance(self.model_source_inputs, (SGLangEagleChainState, SGLangPrefillInputs, SGLangGraphInputs,
-                    V32PaddedMTPInputs, VLLMDenseGraphInputs)):
+                    K3SourceInputs, K3DataParallelSourceInputs, DSparkSourceInputs, V32PaddedMTPInputs, VLLMDenseGraphInputs, DSparkFirstProposalInputs)):
                 raise TypeError("model-source inputs require a registered typed source state")
+            if isinstance(self.model_source_inputs,DSparkFirstProposalInputs) and (
+                    self.serving_framework!="vllm" or self.model_execution_version!="vllm_0_30_0"
+                    or self.symbolic_forward_source!="vllm_0_30_v4_sync_fp8_ds_mla"
+                    or self.target_sampling_source!="vllm_0_30_plain_greedy_bf16"
+                    or self.graph_execution.enabled or self.mtp_draft_sampling_source is not None
+                    or self.mtp_proposer_execution_source is not None or self.v4_source_use_deep_gemm is not False):
+                raise ValueError("DSpark first proposal requires its declared eager0.30 paired V4 source")
+            if isinstance(self.model_source_inputs, (K3SourceInputs, K3DataParallelSourceInputs)) and (
+                    self.serving_framework != "vllm" or self.model_execution_version != "vllm_0_30_0"
+                    or self.symbolic_forward_source != "vllm_0_30_k3_mxfp4_sync"
+                    or self.graph_execution.enabled):
+                raise ValueError("K3 Scheduler coordinates require their matching eager vLLM0.30 source")
             if isinstance(self.model_source_inputs, VLLMDenseGraphInputs) and (
                     self.serving_framework != "vllm" or self.model_execution_version != "vllm_0_30_0"
                     or self.symbolic_forward_source != "cuda_eager_inplace" or not self.graph_execution.enabled):
@@ -2026,7 +2370,45 @@ class RuntimeInputs:
                 raise ValueError("EAGLE source state requires its matching SGLang target and sampler")
         if not isinstance(self.expert_routing, ExpertRoutingInput):
             raise TypeError("expert_routing must be ExpertRoutingInput")
+        if self.symbolic_forward_source == "vllm_0_30_v4_dspark":
+            if (self.serving_framework != "vllm" or self.model_execution_version != "vllm_0_30_0"
+                    or self.graph_execution.enabled or self.attention_kv_layout != "mla"
+                    or self.attention_kv_distribution != "uniform" or self.mtp_proposer_execution_source is not None
+                    or self.target_sampling_source != "vllm_0_30_V2_greedy"
+                    or self.mtp_draft_sampling_source != "vllm_0_30_dspark_greedy_full_vocab"
+                    or self.v4_source_use_deep_gemm is not False
+                    or self.v4_eager_metadata_source != "vllm_0_30_eager_dict_all_valid"
+                    or self.v4_routing_source != "vllm_0_30_modular_cuda_top6_pure_text"
+                    or self.dspark_all_token_ids_storage not in ('declared_uva_host','declared_gpu_fallback')
+                    or self.expert_routing.source_kind not in ("explicit_assumption", "profile_observation", "replay_observation")
+                    or any(type(limit) is not int or limit < 1 for limit in (self.v4_source_max_model_len,self.v4_source_max_batched_tokens))
+                    or type(self.symbolic_workspace_initial_capacity_bytes) is not tuple
+                    or not self.symbolic_workspace_initial_capacity_bytes
+                    or any(type(size) is not int or size < 0 for size in self.symbolic_workspace_initial_capacity_bytes)
+                    or self.model_source_inputs is not None and not isinstance(self.model_source_inputs, DSparkSourceInputs)):
+                raise ValueError("DSpark runtime requires its explicit eager V2/Markov source, limits and typed native frame")
+            if any(getattr(self, name) is not None for name in (
+                    "maca_copy_runtime_source","k3_latent_tail_tier","symbolic_source_prompt_lengths",
+                    "symbolic_source_prompt_lengths_by_request","symbolic_source_max_model_len",
+                    "symbolic_source_max_batched_tokens","symbolic_source_max_requests","v3_mtp_draft_input_token_ids",
+                    "v3_mtp_attention_source","v3_mtp_batch_invariant","glm_indexer_selection_source",
+                    "glm_prefill_attention_source","v4_source_prompt_lengths")):
+                raise ValueError("DSpark runtime cannot carry foreign model source declarations")
+            if self.v4_indexer_selection_source not in (None,"declared_causal_topk"):
+                raise ValueError("DSpark runtime requires its explicit causal target indexer selection")
+            return
+        if isinstance(self.model_source_inputs, DSparkSourceInputs):
+            raise ValueError("DSpark native frame requires the explicit DSpark runtime source")
+        if self.dspark_all_token_ids_storage is not None:
+            raise ValueError("DSpark token history storage requires the explicit DSpark runtime source")
         glm_sources = ("vllm_0_30_v32_bf16_sync_explicit_allreduce", "vllm_0_30_v32_fp8_sync_explicit_allreduce")
+        k3_source = self.symbolic_forward_source == "vllm_0_30_k3_mxfp4_sync"
+        if self.k3_latent_tail_tier not in (None, "ALLREDUCE_OVERLAP", "COLUMN_PARALLEL"):
+            raise ValueError("K3 latent tail requires an explicit supported ordinary source scenario")
+        if self.k3_latent_tail_tier is not None and (not k3_source or self.serving_framework != "vllm"
+                or self.model_execution_version != "vllm_0_30_0" or self.graph_execution.enabled
+                or self.mtp_draft_sampling_source is not None or self.mtp_proposer_execution_source is not None):
+            raise ValueError("K3 latent tail belongs only to the declared eager0.30 target source")
         dsv3_source = self.symbolic_forward_source == "vllm_0_27_1_deepseek_v3_sync_fp8"
         dsv3_source011 = self.symbolic_forward_source == "vllm_0_11_deepseek_v3_sync_fp8"
         sglang_sources = ("sglang_0_5_19_deepseek_v3_decode_fp8",
@@ -2076,6 +2458,21 @@ class RuntimeInputs:
                     or self.model_execution_version != "vllm_0_30_0" or self.serving_framework != "vllm"
                     or self.mtp_draft_sampling_source is not None or self.model_source_inputs is not None):
                 raise ValueError("symbolic source prompt lengths require an ordinary GLM/Kimi0.30 MLA source")
+        if self.symbolic_source_prompt_lengths_by_request is not None:
+            values = self.symbolic_source_prompt_lengths_by_request
+            if (self.symbolic_source_prompt_lengths is not None
+                    or not isinstance(values, Mapping) or not values
+                    or any(not isinstance(key, str) or not key
+                        or type(length) is not int or length < 0
+                        for key, length in values.items())):
+                raise ValueError("source prompt lengths by request require unique request IDs and nonnegative lengths")
+            if (not pending_mla030 and self.symbolic_forward_source not in (
+                    *glm_sources, "vllm_0_30_k2_6_int4_sync_explicit_allreduce")
+                    or self.model_execution_version != "vllm_0_30_0"
+                    or self.serving_framework != "vllm"
+                    or self.mtp_draft_sampling_source is not None
+                    or self.model_source_inputs is not None):
+                raise ValueError("source prompt lengths by request require an ordinary GLM/Kimi0.30 MLA source")
         source_version = ("sglang_0_5_19" if sglang_source else "vllm_0_27_1" if dsv3_source
             else "vllm_0_18_0" if pending_dense018 or (self.symbolic_forward_source == "vllm_ascend_eager"
                 and self.model_execution_version == "vllm_0_18_0")
@@ -2139,12 +2536,12 @@ class RuntimeInputs:
             raise ValueError("unsupported GLM indexer selection source")
         if self.glm_prefill_attention_source not in (None, "force_sparse_mqa"):
             raise ValueError("unsupported GLM prefill attention source")
-        if self.symbolic_forward_source in mla_sources or glm4_mtp or pending_mla030:
+        if k3_source or self.symbolic_forward_source in mla_sources or glm4_mtp or pending_mla030:
             for limit in (self.symbolic_source_max_model_len, self.symbolic_source_max_batched_tokens):
                 if type(limit) is not int or limit <= 0:
-                    raise ValueError("symbolic MLA requires explicit positive constructor limits")
+                    raise ValueError("symbolic MLA/K3 requires explicit positive constructor limits")
             if self.expert_routing.source_kind == "not_applicable":
-                raise ValueError("symbolic MLA requires an explicit expert routing input")
+                raise ValueError("symbolic MLA/K3 requires an explicit expert routing input")
         elif self.symbolic_source_max_model_len is not None or self.symbolic_source_max_batched_tokens is not None:
             raise ValueError("symbolic MLA constructor limits require their matching model source")
         if self.symbolic_forward_source in glm_sources:
@@ -2171,8 +2568,10 @@ class RuntimeInputs:
                 raise ValueError("symbolic max requests requires its declared MTP source")
         elif glm4_mtp or dsv3_mtp or glm_mtp:
             raise ValueError("MTP requires its explicit constructor request capacity")
-        if self.symbolic_forward_source not in (None, "cuda_eager_inplace", "vllm_ascend_eager", "vllm_0_11_glm4_sync", "vllm_0_30_v4_sync_fp8_ds_mla", *sglang_sources, *mla_sources):
+        if self.symbolic_forward_source not in (None, "cuda_eager_inplace", "vllm_ascend_eager", "vllm_0_11_glm4_sync", "vllm_0_30_v4_sync_fp8_ds_mla", "vllm_0_30_k3_mxfp4_sync", *sglang_sources, *mla_sources):
             raise ValueError("unsupported symbolic_forward_source")
+        if k3_source and self.expert_routing.source_kind not in ("explicit_assumption", "profile_observation", "replay_observation"):
+            raise ValueError("K3 source requires an explicit expert-routing input")
         symbolic_decode_graph = ((self.symbolic_forward_source == "cuda_eager_inplace" or pending_dense011 or pending_dense024)
             and self.graph_execution.uniform_decode_query_len == 1
             and ((self.graph_execution.configured_mode == "FULL_DECODE_ONLY"
@@ -2582,11 +2981,42 @@ def profiled_expert_token_counts(
         profile_sha256, routing_group_id, algorithm)
 
 
-@functools.lru_cache(maxsize=128)
+_PROFILED_EXPERT_COUNTS = None
+
+
 def _cached_profiled_expert_counts(num_tokens, topk, weights, weight_types,
+                                  profile_sha256, routing_group_id, algorithm):
+    global _PROFILED_EXPERT_COUNTS
+    if _PROFILED_EXPERT_COUNTS is None:
+        from src.serving.kernel_lowering.execution_timeline import _ExperimentCache
+        _PROFILED_EXPERT_COUNTS = _ExperimentCache()
+    key = (num_tokens, topk, weights, weight_types, profile_sha256, routing_group_id, algorithm)
+    hash(key)
+    if key in _PROFILED_EXPERT_COUNTS:
+        _PROFILED_EXPERT_COUNTS.move_to_end(key)
+        return _PROFILED_EXPERT_COUNTS[key]
+    result = _profiled_expert_counts_uncached(num_tokens, topk, weights,
+        weight_types, profile_sha256, routing_group_id, algorithm)
+    _PROFILED_EXPERT_COUNTS[key] = result
+    while len(_PROFILED_EXPERT_COUNTS) > 128:
+        _PROFILED_EXPERT_COUNTS.popitem(last=False)
+    return result
+
+
+def _profiled_expert_counts_uncached(num_tokens, topk, weights, weight_types,
                                   profile_sha256, routing_group_id, algorithm):
     # Exact immutable inputs, including scalar types, name the existing draws.
     # Boundary checks and per-layer provenance stay outside this finite memo.
+    if all(kind is float for kind in weight_types):
+        from .profiled_routing_native import sample
+        prefix = (f"midlayer:{algorithm}:{profile_sha256}:{routing_group_id}").encode("utf-8")
+        ratios = tuple(
+            int.from_bytes(hashlib.sha256(
+                prefix + b":" + str(token_index).encode("ascii") + b":"
+                + str(route_index).encode("ascii")).digest()[:8], "big")
+            / (1 << 64)
+            for token_index in range(num_tokens) for route_index in range(topk))
+        return sample(weights, ratios, topk)
     return _draw_profiled_expert_counts(num_tokens, topk, weights,
         profile_sha256, routing_group_id, algorithm)
 

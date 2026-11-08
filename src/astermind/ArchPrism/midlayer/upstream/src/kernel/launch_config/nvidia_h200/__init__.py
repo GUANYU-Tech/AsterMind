@@ -1,7 +1,8 @@
-"""NVIDIA H200 launch selection for kernels the A800 package does not select.
+"""Independent NVIDIA H200 launch selection.
 
-The dispatcher (select_launch_config._OWN_PACKAGE_SELECTORS) routes only the
-(module, function) selectors listed there to this package; every other H200
-launch uses the projected A800 package.  Modules here must not import another
-hardware package.
+Every H200 launch request resolves within this package. A source/runtime or
+compiler domain which is not bound remains an explicit unsupported request;
+no selector or collective rules are projected from another hardware package.
 """
+
+from .collective_rules import COLLECTIVE_RULES

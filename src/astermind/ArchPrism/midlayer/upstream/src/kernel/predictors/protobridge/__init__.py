@@ -1,1 +1,1 @@
-"""Midlayer adapter boundary for the vendored ProtoBridge surrogate."""
+"""Midlayer adapter boundary for the ProtoBridge upstream surrogate linked as a git submodule."""

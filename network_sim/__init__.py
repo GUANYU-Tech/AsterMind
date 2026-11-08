@@ -1,8 +1,8 @@
-"""Physical topology, terminal acquisition and AsterMind FlowSim adapter."""
+"""Expose the src-layout network package from the repository root."""
 
-from .model import Scenario, TransferRequest, CompletionEvent, FailureEvent, LinkPolicyConfig
-from .topology import PhysicalTopology
-from .runtime import CommunicationRuntime
+from pathlib import Path
 
-__all__ = ["Scenario", "TransferRequest", "PhysicalTopology", "CommunicationRuntime",
-           "CompletionEvent", "FailureEvent", "LinkPolicyConfig"]
+__path__ = [str(Path(__file__).resolve().parents[1] / "src" / "network_sim")]
+
+from .api import *
+from .api import __all__

@@ -84,8 +84,14 @@ def write_sharegpt_evaluation_report(
     cells: Sequence[Mapping[str, object]],
     *,
     run_elapsed_wall_time_seconds: float,
+    plot_jobs: int = 1,
 ) -> Mapping[str, Path]:
     """Write maintained tables and plots after a successful metrics run."""
+
+    if type(plot_jobs) is not int:
+        raise TypeError("ShareGPT plot_jobs must be an integer")
+    if plot_jobs < 1:
+        raise ValueError("ShareGPT plot_jobs must be positive")
 
     destination = Path(output_dir)
     if not destination.is_dir():
@@ -166,6 +172,7 @@ def write_sharegpt_evaluation_report(
         speed_rows,
         memory_rows,
         host_timing_rows,
+        plot_jobs=plot_jobs,
     )
     plot_wall_time_seconds = time.perf_counter() - plot_started
     paths.update(plot_paths)
@@ -956,6 +963,8 @@ def _write_plots(
     speed_rows: Sequence[Mapping[str, object]],
     memory_rows: Sequence[Mapping[str, object]],
     host_timing_rows: Sequence[Mapping[str, object]],
+    *,
+    plot_jobs: int = 1,
 ) -> Mapping[str, Path]:
     try:
         import matplotlib
@@ -988,94 +997,24 @@ def _write_plots(
         plt, case_memory_path, hardware_ids, memory_rows
     )
     paths["plot_serving_case_peak_rss"] = case_memory_path
-    for hardware_id in hardware_ids:
-        hardware_cells = sorted([
-            cell for cell in cells if cell["hardware_id"] == hardware_id
-        ], key=_case_sort_key)
-        three_mode_flags = ["timing_mode_results" in cell for cell in hardware_cells]
-        if any(three_mode_flags):
-            if not all(three_mode_flags):
-                raise ValueError(
-                    f"{hardware_id} report cannot mix three-mode and legacy cells"
-                )
-            hardware_speed = [
-                row for row in speed_rows if row["hardware_id"] == hardware_id
-            ]
-            throughput_path = plot_dir / (
-                f"{hardware_id}_throughput_and_simulation_time.png"
-            )
-            _write_three_mode_throughput_and_speed_plot(
-                plt,
-                throughput_path,
-                hardware_id,
-                hardware_cells,
-                hardware_speed,
-            )
-            paths[
-                f"plot_{hardware_id}_throughput_and_simulation_time"
-            ] = throughput_path
-            for metric_name, filename_metric in _PLOTTED_LATENCY_METRICS.items():
-                latency_path = plot_dir / (
-                    f"{hardware_id}_{filename_metric}_quantile_curves.png"
-                )
-                _write_three_mode_latency_quantile_curves_plot(
-                    plt,
-                    latency_path,
-                    hardware_id,
-                    hardware_cells,
-                    metric_name,
-                )
-                paths[
-                    f"plot_{hardware_id}_{filename_metric}_quantile_curves"
-                ] = latency_path
-            for cell in hardware_cells:
-                if "observed_scheduler_progress" not in cell:
-                    continue
-                scheduler_path = plot_dir / (
-                    f"{_plot_slug(str(cell['cell_id']))}_scheduler_steps.png"
-                )
-                _write_scheduler_comparison_plot(plt, scheduler_path, cell)
-                paths[
-                    f"plot_{_plot_slug(str(cell['cell_id']))}_scheduler_steps"
-                ] = scheduler_path
-            continue
-        for metric_name, metric_label in (
-            ("ttft_ms", "TTFT"),
-            ("tpot_ms", "TPOT"),
-        ):
-            latency_path = plot_dir / (
-                f"{hardware_id}_{metric_name[:-3]}_request_comparison.png"
-            )
-            _write_latency_request_comparison_plot(
-                plt,
-                latency_path,
-                hardware_id,
-                hardware_cells,
-                metric_name,
-                metric_label,
-            )
-            paths[
-                f"plot_{hardware_id}_{metric_name[:-3]}_request_comparison"
-            ] = latency_path
-        breakdown_path = plot_dir / f"{hardware_id}_ttft_breakdown.png"
-        _write_ttft_breakdown_plot(
-            plt, breakdown_path, hardware_id, hardware_cells
-        )
-        paths[f"plot_{hardware_id}_ttft_breakdown"] = breakdown_path
-        component_path = (
-            plot_dir / f"{hardware_id}_ttft_component_comparison.png"
-        )
-        _write_ttft_component_comparison_plot(
-            plt, component_path, hardware_id, hardware_cells
-        )
-        paths[f"plot_{hardware_id}_ttft_component_comparison"] = component_path
-
-        if has_scheduler_progress_evidence(hardware_cells):
-            scheduler_path = plot_dir / f"{hardware_id}_scheduler_progress.png"
-            _write_scheduler_progress_grid(
-                plt, scheduler_path, hardware_id, hardware_cells
-            )
-            paths[f"plot_{hardware_id}_scheduler_progress"] = scheduler_path
+    tasks = [(
+        plot_dir, hardware_id,
+        sorted([cell for cell in cells if cell["hardware_id"] == hardware_id],
+            key=_case_sort_key),
+        [row for row in speed_rows if row["hardware_id"] == hardware_id],
+    ) for hardware_id in hardware_ids]
+    workers = min(plot_jobs, len(tasks))
+    if workers > 1:
+        from concurrent.futures import ProcessPoolExecutor
+        from multiprocessing import get_context
+        # Matplotlib is not thread-safe. Each spawned process owns its figures;
+        # map preserves the existing hardware order and propagates worker errors.
+        with ProcessPoolExecutor(max_workers=workers, mp_context=get_context("spawn")) as executor:
+            for group_paths in executor.map(_write_hardware_plot_group, tasks):
+                paths.update(group_paths)
+    else:
+        for task in tasks:
+            paths.update(_write_hardware_plot_group(task))
 
     if host_timing_rows:
         overhead_path = (
@@ -1085,6 +1024,102 @@ def _write_plots(
             plt, overhead_path, hardware_ids, host_timing_rows
         )
         paths["plot_three_hardware_host_timing_overhead_percent"] = overhead_path
+    return paths
+
+
+def _write_hardware_plot_group(task) -> Mapping[str, Path]:
+    """Render the unchanged figures for one independent hardware group."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    plot_dir, hardware_id, hardware_cells, speed_rows = task
+    paths = {}
+    three_mode_flags = ["timing_mode_results" in cell for cell in hardware_cells]
+    if any(three_mode_flags):
+        if not all(three_mode_flags):
+            raise ValueError(
+                f"{hardware_id} report cannot mix three-mode and legacy cells"
+            )
+        hardware_speed = [
+            row for row in speed_rows if row["hardware_id"] == hardware_id
+        ]
+        throughput_path = plot_dir / (
+            f"{hardware_id}_throughput_and_simulation_time.png"
+        )
+        _write_three_mode_throughput_and_speed_plot(
+            plt,
+            throughput_path,
+            hardware_id,
+            hardware_cells,
+            hardware_speed,
+        )
+        paths[
+            f"plot_{hardware_id}_throughput_and_simulation_time"
+        ] = throughput_path
+        for metric_name, filename_metric in _PLOTTED_LATENCY_METRICS.items():
+            latency_path = plot_dir / (
+                f"{hardware_id}_{filename_metric}_quantile_curves.png"
+            )
+            _write_three_mode_latency_quantile_curves_plot(
+                plt,
+                latency_path,
+                hardware_id,
+                hardware_cells,
+                metric_name,
+            )
+            paths[
+                f"plot_{hardware_id}_{filename_metric}_quantile_curves"
+            ] = latency_path
+        for cell in hardware_cells:
+            if "observed_scheduler_progress" not in cell:
+                continue
+            scheduler_path = plot_dir / (
+                f"{_plot_slug(str(cell['cell_id']))}_scheduler_steps.png"
+            )
+            _write_scheduler_comparison_plot(plt, scheduler_path, cell)
+            paths[
+                f"plot_{_plot_slug(str(cell['cell_id']))}_scheduler_steps"
+            ] = scheduler_path
+        return paths
+    for metric_name, metric_label in (
+        ("ttft_ms", "TTFT"),
+        ("tpot_ms", "TPOT"),
+    ):
+        latency_path = plot_dir / (
+            f"{hardware_id}_{metric_name[:-3]}_request_comparison.png"
+        )
+        _write_latency_request_comparison_plot(
+            plt,
+            latency_path,
+            hardware_id,
+            hardware_cells,
+            metric_name,
+            metric_label,
+        )
+        paths[
+            f"plot_{hardware_id}_{metric_name[:-3]}_request_comparison"
+        ] = latency_path
+    breakdown_path = plot_dir / f"{hardware_id}_ttft_breakdown.png"
+    _write_ttft_breakdown_plot(
+        plt, breakdown_path, hardware_id, hardware_cells
+    )
+    paths[f"plot_{hardware_id}_ttft_breakdown"] = breakdown_path
+    component_path = (
+        plot_dir / f"{hardware_id}_ttft_component_comparison.png"
+    )
+    _write_ttft_component_comparison_plot(
+        plt, component_path, hardware_id, hardware_cells
+    )
+    paths[f"plot_{hardware_id}_ttft_component_comparison"] = component_path
+
+    if has_scheduler_progress_evidence(hardware_cells):
+        scheduler_path = plot_dir / f"{hardware_id}_scheduler_progress.png"
+        _write_scheduler_progress_grid(
+            plt, scheduler_path, hardware_id, hardware_cells
+        )
+        paths[f"plot_{hardware_id}_scheduler_progress"] = scheduler_path
+
     return paths
 
 
@@ -2677,6 +2712,13 @@ def _write_latency_small_multiples(
 
 
 def _identity_row(cell: Mapping[str, object]) -> dict[str, object]:
+    if "observation_quality" in cell:
+        quality = _mapping(cell["observation_quality"], "observation quality")
+        quality_status = quality["status"]
+        failed_metrics = ",".join(quality["failed_metrics"])
+    else:
+        quality_status = "legacy_contract"
+        failed_metrics = ""
     return {
         "cell_id": cell["cell_id"],
         "hardware_id": cell["hardware_id"],
@@ -2686,6 +2728,8 @@ def _identity_row(cell: Mapping[str, object]) -> dict[str, object]:
         "prediction_status": cell["prediction_status"],
         "performance_timing_status": cell["performance_timing_status"],
         "accuracy_claim_status": cell["accuracy_claim_status"],
+        "observer_quality_status": quality_status,
+        "observer_failed_metrics": failed_metrics,
     }
 
 

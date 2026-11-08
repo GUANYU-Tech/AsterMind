@@ -17,6 +17,7 @@ from evaluation.serving.experiments.experiment_manifest import (
 from src.serving.backend.vllm_scheduler_process import (
     VLLM_SCHEDULER_SOURCE_COMMIT,
     VLLM_SCHEDULER_VERSION,
+    VLLM030_SOURCE_COMMIT,
 )
 from src.kernel.predictors.protobridge.adapter import (
     development_profile_config_sha256,
@@ -273,7 +274,7 @@ def scheduler_async_scheduling_from_validated_case(
     """Resolve vLLM async scheduling from the observed executor capacity."""
 
     manifest = _mapping(case.manifest, "compact manifest")
-    if manifest["schema_version"] != 5:
+    if manifest["schema_version"] not in (5, 7):
         raise ValueError(
             "runtime Scheduler evidence is required to resolve async mode"
         )
@@ -795,6 +796,25 @@ def _validate_case_binding(
     _sequence(provenance["gaps"], "manifest provenance gaps")
 
 
+def validate_case_data_pins(cell: Phase1Cell, case: ValidatedCompactCase) -> None:
+    """Bind a loaded case's actual files to the selected suite cell."""
+
+    case_dir = Path(case.case_dir).resolve()
+    manifest_path = case_dir / "manifest.json"
+    manifest_sha = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    if manifest_sha != cell.manifest_sha256:
+        raise ValueError(f"{cell.cell_id} suite manifest SHA256 differs from case bytes")
+    requests = _mapping(case.manifest["requests"], "manifest requests")
+    requests_path = (case_dir / _relative_path(
+        requests["path"], "manifest requests path")).resolve()
+    if case_dir not in requests_path.parents:
+        raise ValueError(f"{cell.cell_id} requests path escapes case directory")
+    requests_sha = hashlib.sha256(requests_path.read_bytes()).hexdigest()
+    if (requests_sha != cell.requests_sha256
+            or requests_sha != _sha256(requests["sha256"], "manifest requests SHA256")):
+        raise ValueError(f"{cell.cell_id} suite requests SHA256 differs from case bytes")
+
+
 def _canonical_dataset_model_id(model_id: str) -> str:
     if model_id in _LEGACY_MODEL_IDS:
         return _LEGACY_MODEL_IDS[model_id]
@@ -804,10 +824,23 @@ def _canonical_dataset_model_id(model_id: str) -> str:
 
 
 def _validate_prediction_contract(prediction: Mapping[str, object]) -> None:
+    # Prediction runtime identity is independent of capture provenance. Bind
+    # each supported CPU Scheduler version to its authoritative source owner.
+    scheduler_sources = {
+        VLLM_SCHEDULER_VERSION: VLLM_SCHEDULER_SOURCE_COMMIT,
+        "0.30.0": VLLM030_SOURCE_COMMIT,
+    }
+    version = prediction["scheduler_version"]
+    if type(version) is not str or version not in scheduler_sources:
+        raise ValueError(f"prediction contract has unsupported scheduler_version: {version!r}")
+    if prediction["scheduler_source_commit"] != scheduler_sources[version]:
+        raise ValueError("prediction scheduler_source_commit disagrees with its declared version")
     fixed_fields = {
         field: expected
         for field, expected in _EXPECTED_PREDICTION.items()
         if field not in {
+            "scheduler_version",
+            "scheduler_source_commit",
             "launch_policy",
             "tensor_collective_backend",
             "tensor_all_reduce_profile_sha256",

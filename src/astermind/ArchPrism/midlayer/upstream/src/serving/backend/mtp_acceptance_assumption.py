@@ -85,7 +85,16 @@ class MTPAcceptanceAssumption:
         request_id: str,
         proposed_tokens: int,
     ) -> int:
-        """Select one stable K without pretending it is observed routing."""
+        """Select one stable K without pretending it is observed routing.
+
+        The draw is a quantile of a deterministic hash evaluated in
+        *ascending cumulative probability* order: threshold[i] is the
+        boundary between outcome i and outcome i+1, so a uniform hash
+        sample lands in outcome i with probability exactly
+        ``probabilities[i]``.  (Selecting on the descending limb — the
+        probability of accepting at least k tokens — would double-count
+        and push the realized mean to depth+1 minus the target.)
+        """
 
         for name, value in (("step_id", step_id), ("request_id", request_id)):
             if not isinstance(value, str) or not value:

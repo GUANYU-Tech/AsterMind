@@ -16,9 +16,9 @@ ROOT = Path(__file__).resolve().parents[4]
 SOURCE = Path(__file__).with_name("moe_routing_atomic_service.cu")
 RUNNER = Path(__file__)
 OUTPUT_ROOT = ROOT / "profiler_output" / "microbench" / "nvidia_a800"
-VLLM_MOE_BINARY = Path(
-    "/share_data/yangxinhao/chip_modeling/vllm_src_3ver/a800/vllm/"
-    "_moe_C.abi3.so")
+VLLM_MOE_BINARY = (
+    Path(os.environ["MIDLAYER_A800_VLLM_SOURCE"]) / "_moe_C.abi3.so"
+)
 DEVICE_NAME = "NVIDIA A800-SXM4-80GB"
 CASES = (
     (0, "shared_cta_e128_r262144", 0, 262144, 128, 1, 1024),

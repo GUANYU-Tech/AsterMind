@@ -456,6 +456,46 @@ def build_production_trace_replay(
     )
 
 
+def select_production_trace_window(
+    trace: ProductionTrace,
+    *,
+    request_start: int | None = None,
+    request_end: int | None = None,
+    arrival_start_s: float | None = None,
+    arrival_end_s: float | None = None,
+) -> RequestStream:
+    """Select an explicit half-open request and/or arrival window without rewriting rows."""
+
+    if not isinstance(trace, ProductionTrace):
+        raise TypeError("production window requires ProductionTrace")
+    if ((request_start is None) != (request_end is None)):
+        raise ValueError("production request window requires both start and end")
+    if ((arrival_start_s is None) != (arrival_end_s is None)):
+        raise ValueError("production arrival window requires both start and end")
+    if request_start is None and arrival_start_s is None:
+        raise ValueError("production window requires an explicit range")
+    if request_start is not None:
+        if (type(request_start) is not int or type(request_end) is not int
+                or not 0 <= request_start < request_end <= len(trace.requests)):
+            raise ValueError("production request window must be a valid half-open range")
+    else:
+        request_start, request_end = 0, len(trace.requests)
+    if arrival_start_s is not None:
+        if (type(arrival_start_s) not in (int, float)
+                or type(arrival_end_s) not in (int, float)
+                or not math.isfinite(arrival_start_s)
+                or not math.isfinite(arrival_end_s)
+                or not 0 <= arrival_start_s < arrival_end_s):
+            raise ValueError("production arrival window must be finite, nonnegative and half-open")
+    selected = trace.requests.requests[request_start:request_end]
+    if arrival_start_s is not None:
+        selected = tuple(request for request in selected
+            if arrival_start_s <= request.arrival_time_s < arrival_end_s)
+    if not selected:
+        raise ValueError("production window selected no requests")
+    return RequestStream(selected)
+
+
 def build_production_trace_arrival_rate_sweep(
     trace: ProductionTrace,
     arrival_rate_scales: Iterable[float],

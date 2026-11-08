@@ -15,7 +15,7 @@
 #   6 nccl_ring_protocol     GPU A,B NCCL Ring LL/LL128/Simple + auto, 2 ranks, CUDA-graph nodes
 # Every step runs even when an earlier one failed (except those needing the
 # eager enqueue value); the exit code is non-zero if any step failed.
-# Output: /mnt/public/yangxinhao/h200_microbench/host_profiles/<stamp>/
+# Output: ${MIDLAYER_H200_PUBLIC_ROOT:?set MIDLAYER_H200_PUBLIC_ROOT}/h200_microbench/host_profiles/<stamp>/
 set -uo pipefail
 if [ "$#" -ne 2 ]; then echo "usage: $0 <gpuA> <gpuB>" >&2; exit 2; fi
 A=$1; B=$2
@@ -25,7 +25,7 @@ done
 if [ "$A" = "$B" ]; then echo "gpuA and gpuB must differ" >&2; exit 2; fi
 DRY=${DRY:-0}; NO_FLOCK=${NO_FLOCK:-0}; LOCK_WAIT_S=${LOCK_WAIT_S:-600}
 
-PUBLIC=/mnt/public/yangxinhao
+PUBLIC=${MIDLAYER_H200_PUBLIC_ROOT:?set MIDLAYER_H200_PUBLIC_ROOT}
 # The snapshot this script lives in (deployed under
 # $PUBLIC/src/midlayer_h200_host_profiles/<shortsha>/ with SOURCE_COMMIT).
 SNAP=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)

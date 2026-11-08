@@ -115,10 +115,8 @@ def select_fused_moe_launch(shape: Mapping[str, int], dtype: Optional[str],
         raise ValueError(
             "expert_parallel_size must divide FUSED_MOE experts")
     global_routed_rows = tokens * topk
-    if expert_parallel_size == 1:
-        routed_rows = global_routed_rows
-    else:
-        routed_rows = _rank_local_routed_rows(
+    if expert_parallel_size > 1:
+        _rank_local_routed_rows(
             attributes, experts, global_routed_rows)
     del hidden, intermediate
     launch_policy(attributes)
@@ -126,7 +124,12 @@ def select_fused_moe_launch(shape: Mapping[str, int], dtype: Optional[str],
     # CANN 8.5.1 BF16 GroupedMatmul launch payloads select a 16-row aligned
     # base-M capped at 128, with base-N=256 and base-K=64.  These are discrete
     # compiler launch facts; they are not inferred from kernel duration.
-    tile_m = min(128, ((routed_rows + 15) // 16) * 16)
+    # 0.18 init-routing retains a global T*K-row expanded_x allocation.
+    # Native GMM's TCube descriptor follows that physical x extent, not the
+    # device group-list sum. Local expert counts still determine math/traffic.
+    # See grouped_matmul_ep_input_rows_cann_8_5_1.json's same-x/different-count
+    # controls and W1/W2 output-shape observations.
+    tile_m = min(128, ((global_routed_rows + 15) // 16) * 16)
     parameters = {
         "group_size_m": 0.0,
         "padded_rows": 0.0,
@@ -139,7 +142,7 @@ def select_fused_moe_launch(shape: Mapping[str, int], dtype: Optional[str],
         "operand_replay_a": 1.0,
         "operand_replay_b": 1.0,
     }
-    program = cann_grouped_matmul_k_program(tile_m, routed_rows)
+    program = cann_grouped_matmul_k_program(tile_m, global_routed_rows)
     if program is not None:
         for name, value in zip(CANN_GROUPED_MATMUL_K_PROGRAM_PARAMETER_NAMES,
                                program):

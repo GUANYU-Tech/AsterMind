@@ -398,6 +398,16 @@ def _build_routed_moe_tiles(kernel,hardware,bindings,views,ready,program_id):
     return program
 
 
+def _routed_source_events_present(actual, expected):
+    """Compare complete event values once, using their unique native IDs."""
+    if all(type(event) is ProgramEvent for event in (*actual, *expected)):
+        events = unique_by(actual, 'event_id')
+        return all(event.event_id in events and events[event.event_id] == event for event in expected)
+    # Subclasses can supply different equality semantics. Preserve the
+    # original membership checks for those contracts without inferring IDs.
+    return all(event in actual for event in expected)
+
+
 def routed_moe_source_demands(program, *, expected_kernel=None,expected_hardware=None,expected_bindings=None):
     """Validate the unique tile pipeline before projecting retained pricing."""
     from src.kernel.memory_access import _tile_template_requested_bytes
@@ -476,7 +486,7 @@ def routed_moe_source_demands(program, *, expected_kernel=None,expected_hardware
     if (family!=expected or set(views)!=parent_roles|{view.view_id for view in selected}
             or any(views[view.view_id]!=view for view in selected)
             or any(allocations[a.allocation_id]!=a for a in selected_allocations)
-            or any(event not in program.events for event in internal_events)):
+            or not _routed_source_events_present(program.events, internal_events)):
         raise ValueError('routed wrapper lost actual stage/scale/alias producer causality')
     axes=unique_by(family.axes,'axis_id')
     activation_read=output_write=packed_read=routing_read=0

@@ -66,6 +66,8 @@ def main():
     parser.add_argument('--device-index',type=int,required=True)
     parser.add_argument('--port',type=int,required=True)
     parser.add_argument('--startup-timeout-seconds',type=int,default=300)
+    parser.add_argument('--task-root',type=Path,
+        help='assigned remote task root; required only for authorized execution')
     parser.add_argument('--execute-authorized-device-startup',action='store_true')
     args=parser.parse_args()
     if args.device_index<0 or not 1024<=args.port<=65535 or not 1<=args.startup_timeout_seconds<=600:
@@ -76,8 +78,10 @@ def main():
                          'raw_output':str(args.raw_output),'device_index':args.device_index},indent=2));return 0
     # This branch is not exercised during CPU preparation. Owner must first
     # authorize/coordinate an idle NPU and stage this bundle in its task dir.
+    if args.task_root is None:
+        raise ValueError('--task-root is required for authorized execution')
     raw=args.raw_output.resolve()
-    allowed=Path('/mnt/gpfs/midlayer_yxh')
+    allowed=args.task_root.resolve()
     if allowed not in raw.parents or not raw.relative_to(allowed).parts[0].startswith('wt-'):
         raise ValueError('Raw output must be in the assigned remote task directory')
     task_root=allowed/raw.relative_to(allowed).parts[0]

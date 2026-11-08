@@ -933,6 +933,7 @@ def compare_v4_input_projection_work(reference, plan, hardware):
     """
     from src.kernel.kernel_base import create_predictor
     from src.kernel.kernel_spec import KernelKind
+    from src.kernel.predictors.gemm import bf16_fp32_gemm_logical_work, unquantized_bf16_gemm_logical_work
     from src.serving.kernel_lowering.kernel_plan import hardware_for_call
     expected = {(row["rank"], row["layer"], row["role"]): row for row in reference["mixed_projection_work"]}
     if len(expected) != len(reference["mixed_projection_work"]):
@@ -959,14 +960,31 @@ def compare_v4_input_projection_work(reference, plan, hardware):
             actual[key] = {"valid_contract": False, "kind": kernel.kind.value,
                 "input_dtype": kernel.dtype, "call_id": call.call_id}
             continue
-        owner_input, compulsory = create_predictor(kernel.kind).resource_input(kernel, hardware_for_call(call, hardware))
-        traffic = {kind: sum(node.bytes for path in owner_input.memory_paths if path.access_kind == kind
-            for node in path.nodes if node.resource_role == "dram") for kind in ("read", "write")}
+        if kernel.launch is None and output_dtype == "fp32":
+            work = bf16_fp32_gemm_logical_work(kernel)
+            compulsory = work["logical_bytes"]
+            traffic = {"read": compulsory - work["write_bytes"], "write": work["write_bytes"]}
+            tensor_flops = work["demand"]["compute_tensor"]
+            native_bound = False
+        elif (kernel.launch is None and "mathematical_program" in kernel.attributes
+                and kernel.attributes["mathematical_program"] == "unquantized_bf16_flops_bytes_v1"):
+            work = unquantized_bf16_gemm_logical_work(kernel)
+            traffic = {access: sum(item["bytes"] for item in work["operands"] if item["access"] == access)
+                for access in ("read", "write")}
+            compulsory = sum(traffic.values())
+            tensor_flops = work["mathematical_tensor_flops"]
+            native_bound = False
+        else:
+            owner_input, compulsory = create_predictor(kernel.kind).resource_input(kernel, hardware_for_call(call, hardware))
+            traffic = {kind: sum(node.bytes for path in owner_input.memory_paths if path.access_kind == kind
+                for node in path.nodes if node.resource_role == "dram") for kind in ("read", "write")}
+            tensor_flops = owner_input.demand_per_resource["compute_tensor"]
+            native_bound = kernel.execution_support == "supported" and kernel.launch is not None
         actual[key] = {"valid_contract": True, "shape": {name: kernel.shape[name] for name in ("b", "m", "n", "k")},
             "input_dtype": kernel.dtype, "weight_dtype": (kernel.dtype if role == "indexer_weights_projection"
                 else kernel.attributes["weight_dtype"]),
             "output_dtype": output_dtype,
-            "tensor_flops": owner_input.demand_per_resource["compute_tensor"],
+            "tensor_flops": tensor_flops, "native_resource_program_bound": native_bound,
             "read_bytes": traffic["read"], "write_bytes": traffic["write"], "compulsory_bytes": compulsory,
             "call_id": call.call_id}
     checks = []

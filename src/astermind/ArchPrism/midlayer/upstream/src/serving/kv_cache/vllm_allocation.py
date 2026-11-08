@@ -12,7 +12,11 @@ import traceback
 from src.serving.parallelism.parallel_config import ParallelConfig
 from src.serving.parallelism.pp import pipeline_layer_ranges_for_model
 from src.serving.workload.model_config import (
-    ModelConfig, is_validated_qwen3_moe_ep2_model_scope, is_validated_qwen3_pipeline_model_scope,
+    ModelConfig, is_validated_qwen3_moe_ep2_model_scope, is_validated_qwen3_pipeline_model_scope, is_qwen3_moe_pipeline_model_scope,
+    is_dense_parallel_model_scope, is_kimi_k2_parallel_model_scope, is_deepseek_v3_parallel_model_scope,
+    is_deepseek_v4_parallel_model_scope,
+    is_kimi_k3_parallel_model_scope,
+    is_glm_mtp_tensor_model_scope,
 )
 
 
@@ -29,37 +33,58 @@ def _vllm030_full_gqa_model(model):
     other attention families remain outside this source projection.
     """
     return (model.model_type in ("qwen3", "qwen3_moe", "llama")
-        and model.attention_layout == "standard_gqa" and model.weight_dtype == "bf16"
+        and model.attention_layout == "standard_gqa" and model.weight_dtype == model.compute_dtype
+        and (model.compute_dtype == "bf16" or model.model_type == "qwen3" and model.compute_dtype == "fp16")
         and ((model.model_type == "qwen3_moe" and model.num_experts > 0)
              or (model.model_type != "qwen3_moe" and model.num_experts == 0)))
 
 
 def _vllm030_kimi_mla_model(model):
-    return (model.model_id == "moonshotai/Kimi-K2.6" and model.model_type == "kimi_k2"
-        and model.attention_layout == "mla" and model.compute_dtype == "bf16" and model.weight_dtype == "mixed_int4_bf16")
+    if model.model_id == "moonshotai/Kimi-K2.7-Code":
+        from src.serving.workload.model_config import validate_named_target_identity
+        validate_named_target_identity(model)
+    return is_kimi_k2_parallel_model_scope(model, 1, 1)
 
 
 def vllm030_supports_expert_parallel_cache(model, tensor_parallel_size):
     """Cache placement domains, independent of executing expert workers.
 
-    GLM/K2.6 DP/CP1 TP=EP8 source partitions FFN experts, not its
-    replicated latent/indexer attention caches. It has the same per-layer MLA spec
-    as EP-off. Actual expert/communication providers are not established.
+    Ordinary MLA, V4 and hybrid K3 accept legal stage-local TP/EP widths.
+    Experts never shard the replicated latent/indexer attention caches, whose
+    native CP1 projection has the same per-layer spec as EP-off. Actual expert
+    and communication providers are not established.
     """
     if not isinstance(model, ModelConfig) or type(tensor_parallel_size) is not int:
         raise TypeError("0.30 expert cache scope requires ModelConfig and integer TP")
     glm = (model.model_type == "glm_moe_dsa" and model.attention_layout == "dsa_mla"
         and model.model_id in ("zai-org/GLM-5.2", "zai-org/GLM-5.2-FP8", "zai-org/GLM-5.3")
         and model.compute_dtype == "bf16" and model.weight_dtype in ("bf16", "fp8"))
-    return ((tensor_parallel_size == 2 and is_validated_qwen3_moe_ep2_model_scope(model))
-        or (tensor_parallel_size == 8 and (_vllm030_kimi_mla_model(model) or glm)))
+    return ((tensor_parallel_size >= 2 and _vllm030_full_gqa_model(model)
+        and model.model_type == "qwen3_moe"
+        and model.num_attention_heads % tensor_parallel_size == 0
+        and (model.num_key_value_heads % tensor_parallel_size == 0 or tensor_parallel_size % model.num_key_value_heads == 0))
+        or (_vllm030_kimi_mla_model(model) and tensor_parallel_size > 1
+            and is_kimi_k2_parallel_model_scope(model, tensor_parallel_size, 1, expert_parallel=True))
+        or is_kimi_k3_parallel_model_scope(model, tensor_parallel_size, 1, expert_parallel=True)
+        or (tensor_parallel_size > 1 and is_deepseek_v4_parallel_model_scope(
+            model, tensor_parallel_size, 1, expert_parallel=True))
+        or (tensor_parallel_size > 1 and is_deepseek_v3_parallel_model_scope(
+            model, tensor_parallel_size, 1, expert_parallel=True))
+        or (tensor_parallel_size > 1 and glm and (model.weight_dtype == "bf16"
+            or is_glm_mtp_tensor_model_scope(model, tensor_parallel_size, expert_parallel=True))
+            and model.num_attention_heads % tensor_parallel_size == 0))
 
 
 def vllm030_uses_plain_mla_cache(model):
     """Ordinary latent/RoPE owners shared by V3 and the Kimi text wrapper."""
+    if model.model_type == "deepseek_v3" and model.num_hidden_layers == 32:
+        from src.serving.workload.model_config import DEEPSEEK_V3_L32_CONFIG_SHA256, validate_named_target_identity
+        if model.config_sha256 != DEEPSEEK_V3_L32_CONFIG_SHA256:
+            return False
+        validate_named_target_identity(model)
     return (_vllm030_kimi_mla_model(model)
         or (model.model_id == "deepseek-ai/DeepSeek-V3" and model.model_type == "deepseek_v3"
-            and model.num_hidden_layers == 61 and model.attention_layout == "mla"
+            and model.num_hidden_layers > 0 and model.attention_layout == "mla"
             and model.compute_dtype == "bf16" and model.weight_dtype == "fp8"))
 
 
@@ -155,7 +180,8 @@ class VLLMKVAllocation:
                 "non-empty unique layer names")
 
 
-def validate_vllm030_cache_placement(vllm_config, worker, *, available_memory: int | None = None) -> int:
+def validate_vllm030_cache_placement(vllm_config, worker, *, available_memory: int | None = None,
+                                     model: ModelConfig | None = None) -> int:
     """Validate ordinary 0.30 shared-arena descriptors using upstream planning.
 
     Source-verified CPU callers supply genuine native config objects. Re-plan
@@ -175,11 +201,14 @@ def validate_vllm030_cache_placement(vllm_config, worker, *, available_memory: i
         raise ValueError("0.30 placement validation rejects debug block overrides")
     if type(worker.num_blocks) is not int or worker.num_blocks <= 0:
         raise ValueError("0.30 cache placement requires a positive native block count")
+    dspark = vllm_config.speculative_config is not None and vllm_config.speculative_config.method == "dspark"
     if (not isinstance(worker.kv_cache_groups, list) or not worker.kv_cache_groups
             or any(not isinstance(group, KVCacheGroupSpec) or group.host_resident is not False
-                   or group.is_eagle_group is not False or group.role is not KVCacheGroupRole.DEFAULT
-                   for group in worker.kv_cache_groups)):
+                   or type(group.is_eagle_group) is not bool or not dspark and group.is_eagle_group
+                   or group.role is not KVCacheGroupRole.DEFAULT for group in worker.kv_cache_groups)):
         raise ValueError("0.30 cache placement requires ordinary device-only target groups")
+    if dspark:
+        _validate_vllm030_dspark_worker_groups(vllm_config, worker)
     if (not isinstance(worker.kv_cache_tensors, list) or not worker.kv_cache_tensors
             or any(not isinstance(tensor, KVCacheTensor) for tensor in worker.kv_cache_tensors)):
         raise ValueError("0.30 cache placement requires native tensor descriptors")
@@ -200,6 +229,118 @@ def validate_vllm030_cache_placement(vllm_config, worker, *, available_memory: i
     if planned != worker:
         raise ValueError("0.30 cache placement disagrees with source-planned offsets, strides, owners or block count")
     return arena_bytes
+
+
+def _validate_vllm030_dspark_worker_groups(vllm_config, worker):
+    """Re-derive native global grouping and PP projection, including drop flags.
+
+    DSpark enables the native Eagle block-drop annotation. A global mixed
+    SWA group may keep its flag on PP projections that have no local draft
+    layer, so flags cannot be guessed from the last-stage owner names alone.
+    """
+    from src.serving.workload.model_config import load_model_config
+    from vllm.v1.core.kv_cache_utils import get_kv_cache_groups, _project_kv_cache_groups_to_worker
+    model = load_model_config(vllm_config.model_config.model)
+    validate_vllm030_dspark_config(vllm_config, model)
+    global_specs = vllm030_v4_cache_specs(vllm_config, model)
+    global_groups = get_kv_cache_groups(vllm_config, global_specs)
+    owners = tuple(name for group in worker.kv_cache_groups for name in group.layer_names)
+    matches = tuple(specs for specs in vllm030_worker_cache_specs(vllm_config, model) if set(specs) == set(owners))
+    if (not matches or len(owners) != len(set(owners)) or any(specs != matches[0] for specs in matches)):
+        raise ValueError("0.30 DSpark worker cache owners differ from an actual PP stage")
+    expected = _project_kv_cache_groups_to_worker(global_groups, matches[0])
+    if expected != worker.kv_cache_groups:
+        raise ValueError("0.30 DSpark cache groups or block-drop flags differ from native source planning")
+
+
+def vllm030_kimi_k3_cache_storage_manifest(vllm_config, model: ModelConfig, workers: tuple) -> dict:
+    """Expose validated native pages, never charge their logical projections.
+
+    The CPU allocator's descriptors overlay one arena per worker. MambaBase
+    slices each page into consecutive typed states. No device tensor, physical
+    address, independent per-layer allocation or provider binding is implied.
+    """
+    from math import prod
+    from vllm.utils.torch_utils import get_dtype_size
+    from vllm.model_executor.layers.mamba.mamba_utils import get_conv_state_layout
+    from vllm.v1.kv_cache_interface import MambaSpec, MLAAttentionSpec, UniformTypeKVCacheSpecs
+
+    if not isinstance(model, ModelConfig) or model.model_id != "moonshotai/Kimi-K3":
+        raise NotImplementedError("K3 cache storage requires the exact hybrid source model")
+    expected = vllm030_worker_cache_specs(vllm_config, model)
+    global_specs = vllm030_model_cache_specs(vllm_config, model)
+    if not isinstance(workers, tuple) or len(workers) != len(expected):
+        raise ValueError("K3 cache storage requires all actual TP/PP workers")
+    records = []
+    for rank, (worker, specs) in enumerate(zip(workers, expected, strict=True)):
+        arena = validate_vllm030_cache_placement(vllm_config, worker)
+        groups, inactive = {}, set()
+        for index, group in enumerate(worker.kv_cache_groups):
+            if not group.layer_names and isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
+                # PP preserves an empty global group's spec object. Native
+                # planning still emits its descriptors, but no local layer
+                # binds those pages. Keep the real backing, not fake owners.
+                for name, leaf in group.kv_cache_spec.kv_cache_specs.items():
+                    if name not in global_specs or leaf != global_specs[name]:
+                        raise ValueError("K3 inactive cache descriptor differs from global source")
+                    inactive.add(name)
+            for name in group.layer_names:
+                leaf = (group.kv_cache_spec.kv_cache_specs[name]
+                    if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs) else group.kv_cache_spec)
+                if name in groups or name not in specs or leaf != specs[name]:
+                    raise ValueError("K3 cache storage group differs from its source spec")
+                groups[name] = index
+        if set(groups) != set(specs):
+            raise ValueError("K3 cache storage lost source layer owners")
+        layers = []
+        descriptors = []
+        for tensor in worker.kv_cache_tensors:
+            descriptors.append({"size": tensor.size, "offset": tensor.offset,
+                "layer_stride": tensor.layer_stride, "block_stride": tensor.block_stride,
+                "layers": tuple(tensor.layers), "host_resident": tensor.host_resident})
+            for index, name in enumerate(tensor.layers):
+                if name not in specs and name not in inactive:
+                    raise ValueError("K3 cache descriptor has no local or empty-group source owner")
+                if name not in specs:
+                    # Empty-group descriptors are not bound by any local
+                    # layer; their global address extent need not fit this
+                    # stage's smaller arena. Only actual local pages count.
+                    continue
+                spec = global_specs[name]
+                first = tensor.offset + index * tensor.layer_stride
+                last_end = first + (worker.num_blocks - 1) * tensor.block_stride + spec.page_size_bytes
+                if not 0 <= first < last_end <= arena:
+                    raise ValueError("K3 native page extent exceeds its shared arena")
+                row = {"owner": name, "group_index": groups[name], "spec_type": type(spec).__name__,
+                    "page_size_bytes": spec.page_size_bytes, "block_tokens": spec.block_size,
+                    "block0_offset_bytes": first, "block_stride_bytes": tensor.block_stride,
+                    "last_page_end_bytes": last_end}
+                if type(spec) is MambaSpec:
+                    states, offset = [], 0
+                    for shape, dtype in zip(spec.shapes, spec.dtypes, strict=True):
+                        size = prod(shape) * get_dtype_size(dtype)
+                        states.append({"shape": tuple(shape), "dtype": str(dtype).removeprefix("torch."),
+                            "offset_within_page_bytes": offset, "state_content_bytes": size})
+                        offset += size
+                    if offset != spec.state_content_size_bytes or offset > spec.page_size_bytes:
+                        raise ValueError("K3 Mamba typed states exceed the native page")
+                    row.update(states=tuple(states), state_content_size_bytes=offset,
+                        page_size_padded=spec.page_size_padded, conv_state_layout=get_conv_state_layout())
+                elif type(spec) is MLAAttentionSpec:
+                    row.update(dtype=str(spec.dtype).removeprefix("torch."),
+                        num_kv_heads=spec.num_kv_heads, head_size=spec.head_size)
+                else:
+                    raise NotImplementedError("K3 cache storage requires native Mamba/MLA leaves")
+                layers.append(row)
+        if len(layers) != len(specs) or {row["owner"] for row in layers} != set(specs):
+            raise ValueError("K3 cache storage descriptors lost or duplicated source owners")
+        records.append({"local_rank": rank, "num_blocks": worker.num_blocks,
+            "shared_arena_bytes": arena, "descriptors": tuple(descriptors), "layers": tuple(layers),
+            "inactive_descriptor_owners": tuple(sorted(inactive - set(specs)))})
+    return {"resolved_layout": vllm_config.cache_config.get_resolved_kv_cache_layout().name,
+        "workers": tuple(records), "accounting": "one_shared_arena_per_worker; descriptors_and_groups_overlay",
+        "address_rule": "block0_offset_bytes + block_id * block_stride_bytes + state_offset_within_page_bytes",
+        "normal_capacity_accepted": False, "gpu_cache_binding_executed": False}
 
 
 def allocate_vllm030_glm_cache(
@@ -242,15 +383,28 @@ def allocate_vllm030_model_cache(
     """
     if not isinstance(model, ModelConfig) or not isinstance(parallelism, ParallelConfig):
         raise TypeError("0.30 model allocation requires ModelConfig and ParallelConfig")
+    if model.model_id == "moonshotai/Kimi-K3":
+        return allocate_vllm030_kimi_k3_cache(
+            vllm_config, model, parallelism, available_memory_by_rank,
+            source_root=source_root, supported_layouts_by_rank=supported_layouts_by_rank)
     full_gqa = _vllm030_full_gqa_model(model)
     if ((model.model_id not in ("zai-org/GLM-5.2", "zai-org/GLM-5.2-FP8", "zai-org/GLM-5.3",
                                "deepseek-ai/DeepSeek-V4-Flash", "deepseek-ai/DeepSeek-V4-Pro")
             and not full_gqa and not vllm030_uses_plain_mla_cache(model))
-            or model.compute_dtype != "bf16"):
-        raise NotImplementedError("0.30 cache allocation requires a supported BF16-compute source model")
+            or (model.compute_dtype != "bf16" and not full_gqa)):
+        raise NotImplementedError("0.30 cache allocation requires a supported 16-bit-compute source model")
     if (not parallelism.is_rank_local or (parallelism.pipeline_parallel_size != 1 and not (
-            not parallelism.enable_expert_parallel
-            and is_validated_qwen3_pipeline_model_scope(model, parallelism.tensor_parallel_size, parallelism.pipeline_parallel_size)))
+            (model.model_type == "glm_moe_dsa" and model.weight_dtype in ("bf16", "fp8")
+                and parallelism.pipeline_parallel_size <= model.num_hidden_layers)
+            or (is_dense_parallel_model_scope(model, parallelism.tensor_parallel_size, parallelism.pipeline_parallel_size)
+                and not parallelism.enable_expert_parallel)
+            or is_qwen3_moe_pipeline_model_scope(model, parallelism.tensor_parallel_size, parallelism.pipeline_parallel_size)
+            or is_kimi_k2_parallel_model_scope(model, parallelism.tensor_parallel_size, parallelism.pipeline_parallel_size,
+                expert_parallel=parallelism.enable_expert_parallel)
+            or is_deepseek_v3_parallel_model_scope(model, parallelism.tensor_parallel_size,
+                parallelism.pipeline_parallel_size, expert_parallel=parallelism.enable_expert_parallel)
+            or is_deepseek_v4_parallel_model_scope(model, parallelism.tensor_parallel_size,
+                parallelism.pipeline_parallel_size, expert_parallel=parallelism.enable_expert_parallel)))
             or (parallelism.enable_expert_parallel and not vllm030_supports_expert_parallel_cache(
                 model, parallelism.tensor_parallel_size))):
         raise NotImplementedError("0.30 model cache allocation requires rank-local supported PP and expert cache placement")
@@ -296,15 +450,19 @@ def allocate_vllm030_model_cache(
             or native_parallel.enable_expert_parallel != parallelism.enable_expert_parallel):
         raise ValueError("0.30 config parallelism disagrees with the declared cache ranks")
     if vllm_config.speculative_config is not None:
-        validate_vllm030_glm_mtp_config(vllm_config, model)
+        if model.model_type == "deepseek_v4":
+            validate_vllm030_dspark_config(vllm_config, model)
+        else:
+            validate_vllm030_glm_mtp_config(vllm_config, model)
     if vllm_config.attention_config.hisparse_config is not None:
         raise NotImplementedError("0.30 HiSparse cache placement is not bound")
     if vllm_config.cache_config.num_gpu_blocks_override is not None:
         raise ValueError("0.30 byte-budget allocation rejects a debug block override")
     if model.model_type == "glm_moe_dsa" and vllm_config.cache_config.cache_dtype not in ("auto", "bfloat16"):
         raise NotImplementedError("0.30 GLM source cache path requires BF16 MLA states")
-    if vllm_config.model_config.dtype != torch.bfloat16:
-        raise ValueError("0.30 native model dtype disagrees with BF16 compute source")
+    expected_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}[model.compute_dtype]
+    if vllm_config.model_config.dtype != expected_dtype:
+        raise ValueError("0.30 native model dtype disagrees with declared compute source")
     specs = vllm030_model_cache_specs(vllm_config, model)
     worker_specs = vllm030_worker_cache_specs(vllm_config, model)
     resolve_kv_cache_layout(
@@ -318,7 +476,7 @@ def allocate_vllm030_model_cache(
         owners = [name for group in config.kv_cache_groups for name in group.layer_names]
         if len(owners) != len(expected) or set(owners) != set(expected):
             raise RuntimeError("0.30 native cache grouping lost or duplicated source cache owners")
-        validate_vllm030_cache_placement(vllm_config, config, available_memory=budget)
+        validate_vllm030_cache_placement(vllm_config, config, available_memory=budget, model=model)
     scheduler_config = generate_scheduler_kv_cache_config(native_configs)
     if any(config.num_blocks != scheduler_config.num_blocks for config in native_configs):
         raise RuntimeError("0.30 allocator did not reconcile worker block counts")
@@ -326,7 +484,7 @@ def allocate_vllm030_model_cache(
 
 
 def vllm030_v4_cache_specs(vllm_config, model: ModelConfig):
-    """FlashMLA/H200 source cache map for Flash TP4 or Pro TP8, target-off.
+    """FlashMLA/H200 source cache map for legal V4 target and optional DSpark.
 
     Construct native 0.30 spec objects, not model layers or GPU buffers.
     SWA and FP32 compressor states are sliding groups; compressed KV and
@@ -343,14 +501,14 @@ def vllm030_v4_cache_specs(vllm_config, model: ModelConfig):
             or model.model_type != "deepseek_v4"):
         raise NotImplementedError("0.30 V4 cache map supports accurate V4 Flash/Pro only")
     parallel = vllm_config.parallel_config
-    if ((model.model_id, parallel.tensor_parallel_size) not in (
-                ("deepseek-ai/DeepSeek-V4-Flash", 4), ("deepseek-ai/DeepSeek-V4-Pro", 8))
-            or parallel.pipeline_parallel_size != 1
+    if (not is_deepseek_v4_parallel_model_scope(model, parallel.tensor_parallel_size,
+                parallel.pipeline_parallel_size, expert_parallel=parallel.enable_expert_parallel)
             or parallel.data_parallel_size != 1 or parallel.decode_context_parallel_size != 1
-            or parallel.prefill_context_parallel_size != 1 or parallel.enable_expert_parallel
-            or vllm_config.speculative_config is not None
+            or parallel.prefill_context_parallel_size != 1
             or vllm_config.attention_config.hisparse_config is not None):
-        raise NotImplementedError("0.30 V4 cache map requires Flash/TP4 or Pro/TP8, PP1/CP1/DP1/EP-off/MTP-off")
+        raise NotImplementedError("0.30 V4 cache map requires whole-block TP/stage-local EP, nonempty PP, CP1/DP1")
+    draft = (None if vllm_config.speculative_config is None else
+        validate_vllm030_dspark_config(vllm_config, model))
     if (vllm_config.model_config.dtype != torch.bfloat16
             or vllm_config.cache_config.cache_dtype != "fp8_ds_mla"):
         raise NotImplementedError("0.30 V4 FlashMLA source map requires BF16 compute and fp8_ds_mla cache")
@@ -395,7 +553,19 @@ def vllm030_v4_cache_specs(vllm_config, model: ModelConfig):
             specs[prefix + ".indexer.compressor.state_cache"] = SlidingWindowMLASpec(
                 block_size=4, num_kv_heads=1, head_size=4 * model.index_head_dim,
                 dtype=torch.float32, sliding_window=8, alignment=576)
+    if draft is not None:
+        # DSpark constructs three appended decoder layers, each ratio1.
+        # Their SWA layer is identical to the target's uncompressed SWA spec;
+        # main-projected context and query write the SAME layer cache.
+        for layer in draft.dspark_layer_indices:
+            specs[f"model.layers.{layer}.attn.swa_cache"] = specs["model.layers.0.attn.swa_cache"]
     return specs
+
+
+def vllm030_dspark_cache_specs(vllm_config, model: ModelConfig):
+    """Compatibility entry for the complete target plus three draft cache owners."""
+    validate_vllm030_dspark_config(vllm_config, model)
+    return vllm030_v4_cache_specs(vllm_config, model)
 
 
 def normalize_vllm030_glm_allocation(vllm_config, model: ModelConfig, workers: tuple,
@@ -432,7 +602,7 @@ def normalize_vllm030_model_allocation(vllm_config, model: ModelConfig, workers:
         raise TypeError("0.30 allocation facts require all genuine worker/Scheduler configurations")
     arenas = []
     for rank, (worker, expected_specs) in enumerate(zip(workers, rank_specs, strict=True)):
-        arenas.append(validate_vllm030_cache_placement(vllm_config, worker))
+        arenas.append(validate_vllm030_cache_placement(vllm_config, worker, model=model))
         if worker.num_blocks != workers[0].num_blocks:
             raise ValueError("0.30 allocation facts disagree on reconciled rank block counts")
         tp = vllm_config.parallel_config.tensor_parallel_size
@@ -440,11 +610,15 @@ def normalize_vllm030_model_allocation(vllm_config, model: ModelConfig, workers:
             raise ValueError("0.30 cache groups disagree within a tensor-parallel stage")
         actual_specs = {}
         for group in worker.kv_cache_groups:
-            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
+            if not group.layer_names:
+                members = {}
+            elif isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
                 members = group.kv_cache_spec.kv_cache_specs
             elif _vllm030_full_gqa_model(model) and type(group.kv_cache_spec) is FullAttentionSpec:
                 members = {name: group.kv_cache_spec for name in group.layer_names}
             elif vllm030_uses_plain_mla_cache(model) and type(group.kv_cache_spec) is MLAAttentionSpec:
+                members = {name: group.kv_cache_spec for name in group.layer_names}
+            elif model.model_id == "moonshotai/Kimi-K3":
                 members = {name: group.kv_cache_spec for name in group.layer_names}
             else:
                 raise NotImplementedError("0.30 allocation facts require supported source group types")
@@ -463,11 +637,15 @@ def normalize_vllm030_model_allocation(vllm_config, model: ModelConfig, workers:
         first_spec, spec_type = first_group, "FullAttentionSpec"
     elif vllm030_uses_plain_mla_cache(model) and type(first_group) is MLAAttentionSpec:
         first_spec, spec_type = first_group, "MLAAttentionSpec"
+    elif model.model_id == "moonshotai/Kimi-K3":
+        first_spec, spec_type = first_group, type(first_group).__name__
     else:
         raise NotImplementedError("0.30 source allocation has an unsupported group type")
     return VLLMKVAllocation(
         **identity, allocator_symbol=_ALLOCATOR_SYMBOL, scheduler_config_symbol=_SCHEDULER_CONFIG_SYMBOL,
-        kv_spec_type=spec_type, kv_block_size_tokens=vllm_config.cache_config.block_size,
+        kv_spec_type=spec_type,
+        kv_block_size_tokens=(vllm_config.model_config.max_model_len if model.model_id == "moonshotai/Kimi-K3"
+                              else vllm_config.cache_config.block_size),
         max_model_len=vllm_config.model_config.max_model_len,
         kv_page_size_bytes_per_layer=first_spec.page_size_bytes,
         num_kv_blocks=scheduler_cache.num_blocks, worker_num_kv_blocks=tuple(worker.num_blocks for worker in workers),
@@ -480,7 +658,10 @@ def vllm030_model_cache_specs(vllm_config, model: ModelConfig):
     if model.model_type == "glm_moe_dsa":
         return vllm030_glm_cache_specs(vllm_config, model)
     if model.model_type == "deepseek_v4":
-        return vllm030_v4_cache_specs(vllm_config, model)
+        return (vllm030_v4_cache_specs(vllm_config, model) if vllm_config.speculative_config is None
+            else vllm030_dspark_cache_specs(vllm_config, model))
+    if model.model_id == "moonshotai/Kimi-K3":
+        return vllm030_kimi_k3_cache_specs(vllm_config, model)
     if vllm030_uses_plain_mla_cache(model):
         return _vllm030_plain_mla_cache_specs(vllm_config, model)
     if _vllm030_full_gqa_model(model):
@@ -494,12 +675,33 @@ def vllm030_worker_cache_specs(vllm_config, model: ModelConfig):
     parallel = vllm_config.parallel_config
     if parallel.pipeline_parallel_size == 1:
         return tuple(dict(specs) for _ in range(parallel.tensor_parallel_size))
-    from src.serving.parallelism.pp import pipeline_layer_ranges_for_model
+    from vllm.distributed.utils import get_pp_indices
     # Each stage owns its local decoder layers; each TP lane uses the
     # source-sharded KV head descriptors for those layers.
-    ranges = pipeline_layer_ranges_for_model(model, parallel.pipeline_parallel_size)
-    return tuple({f"model.layers.{layer}.self_attn.attn": specs[f"model.layers.{layer}.self_attn.attn"]
-        for layer in range(first, end)} for first, end in ranges for _ in range(parallel.tensor_parallel_size))
+    ranges = tuple(get_pp_indices(model.num_hidden_layers, stage, parallel.pipeline_parallel_size)
+        for stage in range(parallel.pipeline_parallel_size))
+    if model.model_id == "moonshotai/Kimi-K3":
+        return tuple({f"language_model.model.layers.{layer}.self_attn": specs[f"language_model.model.layers.{layer}.self_attn"]
+            for layer in range(first, end)} for first, end in ranges for _ in range(parallel.tensor_parallel_size))
+    prefix = "language_model.model" if _vllm030_kimi_mla_model(model) else "model"
+    rows = []
+    for stage, (first, end) in enumerate(ranges):
+        layers = tuple(range(first, end))
+        if vllm_config.speculative_config is not None:
+            # GPUModelRunner constructs the complete drafter only on the
+            # last PP stage. Its appended cache is not a target decoder.
+            if model.model_type == "glm_moe_dsa":
+                appended = tuple(range(model.num_hidden_layers, model.num_hidden_layers + model.num_mtp_layers))
+            elif model.model_type == "deepseek_v4":
+                appended = validate_vllm030_dspark_config(vllm_config, model).dspark_layer_indices
+            else:
+                raise NotImplementedError("0.30 PP draft placement requires explicit GLM MTP or V4 DSpark source")
+            if stage == parallel.pipeline_parallel_size - 1:
+                layers += appended
+        row = {name: spec for layer in layers for name, spec in specs.items()
+            if name.startswith(f"{prefix}.layers.{layer}.")}
+        rows.extend(dict(row) for _ in range(parallel.tensor_parallel_size))
+    return tuple(rows)
 
 
 def vllm030_dense_cache_specs(vllm_config, model: ModelConfig):
@@ -512,16 +714,21 @@ def vllm030_dense_cache_specs(vllm_config, model: ModelConfig):
     import torch
     from vllm.v1.kv_cache_interface import FullAttentionSpec
     parallel = vllm_config.parallel_config
-    if (not _vllm030_full_gqa_model(model) or model.compute_dtype != "bf16"):
-        raise NotImplementedError("dense cache source requires BF16 Qwen3/Llama full GQA PP1")
-    if parallel.pipeline_parallel_size != 1 and (parallel.enable_expert_parallel
-            or not is_validated_qwen3_pipeline_model_scope(model, parallel.tensor_parallel_size, parallel.pipeline_parallel_size)):
+    if not _vllm030_full_gqa_model(model):
+        raise NotImplementedError("dense cache source requires unquantized 16-bit Qwen3/Llama full GQA")
+    dtype_name = {"bf16": "bfloat16", "fp16": "float16"}[model.compute_dtype]
+    dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}[model.compute_dtype]
+    if vllm_config.model_config.dtype != dtype:
+        raise ValueError("dense cache native dtype disagrees with source model")
+    if parallel.pipeline_parallel_size != 1 and (not ((not parallel.enable_expert_parallel
+                and is_dense_parallel_model_scope(model, parallel.tensor_parallel_size, parallel.pipeline_parallel_size))
+                or is_qwen3_moe_pipeline_model_scope(model, parallel.tensor_parallel_size, parallel.pipeline_parallel_size))):
         raise NotImplementedError("0.30 pipeline cache source requires uniform untied Qwen3 TP1 PP or TP2/PP2, EP-off")
     hf = vllm_config.model_config.hf_config.to_dict()
     if model.model_type == "qwen3" and (hf["rms_norm_eps"] != model.rms_norm_eps
             or hf["hidden_act"] != model.hidden_act):
         raise ValueError("native Qwen3 optional configuration disagrees with source-normalized metadata")
-    if (vllm_config.cache_config.cache_dtype not in ("auto", "bfloat16")
+    if (vllm_config.cache_config.cache_dtype not in ("auto", dtype_name)
             or ("sliding_window" in hf and hf["sliding_window"] is not None)
             or ("use_sliding_window" in hf and hf["use_sliding_window"] is not False)
             or ("layer_types" in hf and hf["layer_types"] is not None
@@ -533,7 +740,7 @@ def vllm030_dense_cache_specs(vllm_config, model: ModelConfig):
     return {f"model.layers.{layer}.self_attn.attn": FullAttentionSpec(
         block_size=block, num_kv_heads=model.kv_heads_per_tensor_parallel_rank(
             vllm_config.parallel_config.tensor_parallel_size),
-        head_size=model.head_dim, head_size_v=model.head_dim, dtype=torch.bfloat16)
+        head_size=model.head_dim, head_size_v=model.head_dim, dtype=dtype)
         for layer in range(model.num_hidden_layers)}
 
 
@@ -560,14 +767,19 @@ def _vllm030_plain_mla_cache_specs(vllm_config, model: ModelConfig):
     if not vllm030_uses_plain_mla_cache(model):
         raise NotImplementedError("0.30 ordinary MLA cache projection requires its supported checkpoint")
     parallel = vllm_config.parallel_config
-    if (parallel.pipeline_parallel_size != 1 or parallel.data_parallel_size != 1
+    kimi_parallel = is_kimi_k2_parallel_model_scope(model, parallel.tensor_parallel_size,
+        parallel.pipeline_parallel_size, expert_parallel=parallel.enable_expert_parallel)
+    v3_parallel = is_deepseek_v3_parallel_model_scope(model, parallel.tensor_parallel_size,
+        parallel.pipeline_parallel_size, expert_parallel=parallel.enable_expert_parallel)
+    if ((_vllm030_kimi_mla_model(model) and not kimi_parallel)
+            or (parallel.pipeline_parallel_size != 1 and not (kimi_parallel or v3_parallel)) or parallel.data_parallel_size != 1
             or parallel.decode_context_parallel_size != 1 or parallel.prefill_context_parallel_size != 1
             or (parallel.enable_expert_parallel and not vllm030_supports_expert_parallel_cache(
                 model, parallel.tensor_parallel_size)) or vllm_config.speculative_config is not None
             or vllm_config.attention_config.hisparse_config is not None
             or vllm_config.cache_config.sliding_window is not None
             or not vllm_config.model_config.use_mla):
-        raise NotImplementedError("0.30 Kimi cache projection requires ordinary MLA PP1/CP1/DP1/MTP-off, EP-off or exact K2.6 EP8")
+        raise NotImplementedError("0.30 ordinary MLA cache requires legal K2 TP/PP or V3 PP1, CP1/DP1/MTP-off and supported EP")
     if (vllm_config.model_config.dtype != torch.bfloat16
             or vllm_config.cache_config.cache_dtype not in ("auto", "bfloat16")):
         raise NotImplementedError("0.30 Kimi cache projection requires BF16 latent storage")
@@ -587,6 +799,73 @@ def _vllm030_plain_mla_cache_specs(vllm_config, model: ModelConfig):
         for layer in range(model.num_hidden_layers)}
 
 
+def validate_vllm030_dspark_config(vllm_config, model: ModelConfig):
+    """Validate genuine native DSpark metadata against its registered raw config.
+
+    Only same-TP draft/target placement is bound here. Loading the local raw
+    draft config uses the existing model owner/provenance registry, rather than
+    treating the target's extra MTP entry as three separate DSpark layers.
+    This establishes source cache geometry only, never a provider or budget.
+    """
+    import torch
+    from vllm.config import VllmConfig, SpeculativeConfig
+    from src.serving.workload.model_config import load_model_config
+    from src.serving.parallelism.tp import validate_dspark_parallelism
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+    if not isinstance(vllm_config, VllmConfig) or not isinstance(model, ModelConfig):
+        raise TypeError("0.30 DSpark cache validation requires real native and normalized model configs")
+    spec = vllm_config.speculative_config
+    if (model.model_id not in ("deepseek-ai/DeepSeek-V4-Flash", "deepseek-ai/DeepSeek-V4-Pro")
+            or model.is_dspark_draft or not isinstance(spec, SpeculativeConfig) or spec.method != "dspark"
+            or not spec.parallel_drafting or spec.disable_padded_drafter_batch
+            or spec.use_local_argmax_reduction or spec.draft_sample_method != "greedy"
+            or spec.kv_cache_dtype is not None and spec.kv_cache_dtype != "auto"
+                and not spec.kv_cache_dtype.startswith("fp8")):
+        raise NotImplementedError("0.30 DSpark cache placement requires exact V4 parallel full-block greedy source")
+    backend = (spec.attention_backend if spec.attention_backend is not None else vllm_config.attention_config.backend)
+    if backend in (AttentionBackendEnum.FLASHINFER_MLA_SPARSE, AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,
+            AttentionBackendEnum.FLASHINFER_MLA_SPARSE_DSV4):
+        raise NotImplementedError("0.30 DSpark cache source map requires the declared H200 FlashMLA format")
+    if (spec.target_model_config is not vllm_config.model_config
+            or spec.target_parallel_config is not vllm_config.parallel_config):
+        raise ValueError("0.30 DSpark cache requires the actual paired native target config")
+    if (model.compute_dtype != "bf16" or vllm_config.model_config.dtype != torch.bfloat16
+            or vllm_config.model_config.quantization != "deepseek_v4_fp8"
+            or vllm_config.cache_config.cache_dtype != "fp8_ds_mla"
+            or vllm_config.attention_config.hisparse_config is not None):
+        raise NotImplementedError("0.30 DSpark cache requires BF16 compute, source FP8 weights and fp8_ds_mla storage")
+    native_draft = spec.draft_model_config
+    if native_draft is None:
+        raise ValueError("0.30 DSpark cache requires its real native draft model config")
+    draft = load_model_config(native_draft.model)
+    if (not draft.is_dspark_draft or draft.model_id != model.model_id + "-DSpark"
+            or any(getattr(draft, field) != getattr(model, field) for field in ("num_hidden_layers", "hidden_size",
+                "num_attention_heads", "num_experts", "moe_intermediate_size", "vocab_size", "head_dim",
+                "q_lora_rank", "qk_rope_head_dim", "hc_mult", "o_groups", "o_lora_rank", "window_size"))):
+        raise ValueError("0.30 DSpark draft must match its exact registered target identity and geometry")
+    hf, parallel, draft_parallel = native_draft.hf_config, vllm_config.parallel_config, spec.draft_parallel_config
+    if (hf.model_type != "deepseek_v4" or hf.architectures != ["DSparkDraftModel"]
+            or native_draft.architectures != ["DSparkDraftModel"]
+            or native_draft.quantization != "deepseek_v4_fp8"
+            or native_draft.dtype != torch.bfloat16 or spec.num_speculative_tokens != draft.dspark_block_size
+            or hf.dspark_block_size != draft.dspark_block_size or hf.dspark_noise_token_id != draft.dspark_noise_token_id
+            or tuple(hf.dspark_target_layer_ids) != draft.dspark_target_layer_ids
+            or hf.dspark_markov_rank != draft.dspark_markov_rank
+            or hf.sliding_window != draft.window_size or hf.qk_rope_head_dim != draft.qk_rope_head_dim
+            or "n_mtp_layers" in vars(hf) and hf.n_mtp_layers is not None
+                and not (type(hf.n_mtp_layers) is int and hf.n_mtp_layers in (0, len(draft.dspark_layer_indices)))
+            or any(getattr(hf, field) != getattr(draft, field) for field in
+                ("num_hidden_layers", "hidden_size", "num_attention_heads", "num_experts_per_tok", "vocab_size", "head_dim", "q_lora_rank"))
+            or draft_parallel.tensor_parallel_size != parallel.tensor_parallel_size
+            or draft_parallel.pipeline_parallel_size != 1 or draft_parallel.data_parallel_size != 1
+            or draft_parallel.enable_expert_parallel != parallel.enable_expert_parallel
+            or draft_parallel.prefill_context_parallel_size != 1 or draft_parallel.decode_context_parallel_size != 1):
+        raise ValueError("0.30 DSpark native metadata or same-TP draft placement disagrees with registered source")
+    validate_dspark_parallelism(draft, ParallelConfig(tensor_parallel_size=parallel.tensor_parallel_size,
+        enable_expert_parallel=parallel.enable_expert_parallel and parallel.tensor_parallel_size > 1))
+    return draft
+
+
 def validate_vllm030_glm_mtp_config(vllm_config, model: ModelConfig):
     """Validate the source's exact GLM sequential, padded depth-two config.
 
@@ -599,8 +878,9 @@ def validate_vllm030_glm_mtp_config(vllm_config, model: ModelConfig):
             or spec is None or spec.method != "mtp" or spec.num_speculative_tokens != 2
             or spec.parallel_drafting or spec.disable_padded_drafter_batch
             or spec.use_local_argmax_reduction or spec.draft_sample_method != "greedy"
-            or vllm_config.parallel_config.tensor_parallel_size not in (1, 8)):
-        raise NotImplementedError("0.30 MTP placement requires accurate GLM sequential padded depth2 TP1/TP8 full-logits source")
+            or not is_glm_mtp_tensor_model_scope(model, vllm_config.parallel_config.tensor_parallel_size,
+                expert_parallel=vllm_config.parallel_config.enable_expert_parallel)):
+        raise NotImplementedError("0.30 MTP placement requires accurate GLM sequential padded depth2 whole-shard TP full-logits source")
     draft = spec.draft_model_config
     if draft is None:
         raise ValueError("0.30 GLM MTP requires a native draft model config")
@@ -610,12 +890,14 @@ def validate_vllm030_glm_mtp_config(vllm_config, model: ModelConfig):
             or hf.num_nextn_predict_layers != model.num_mtp_layers
             or hf.hidden_size != model.hidden_size or hf.kv_lora_rank != model.kv_lora_rank
             or hf.qk_rope_head_dim != model.qk_rope_head_dim or hf.index_head_dim != model.index_head_dim
-            or spec.draft_parallel_config.tensor_parallel_size != vllm_config.parallel_config.tensor_parallel_size):
+            or spec.draft_parallel_config.tensor_parallel_size != vllm_config.parallel_config.tensor_parallel_size
+            or spec.draft_parallel_config.pipeline_parallel_size != 1
+            or spec.draft_parallel_config.enable_expert_parallel != vllm_config.parallel_config.enable_expert_parallel):
         raise ValueError("0.30 GLM MTP native draft metadata disagrees with appended checkpoint geometry")
 
 
 def vllm030_glm_cache_specs(vllm_config, model: ModelConfig):
-    """Project BF16/CP1 GLM target and explicitly configured appended MTP.
+    """Project BF16-cache/CP1 GLM target and explicitly configured appended MTP.
 
     Does not construct model layers, select a provider or establish capacity.
     """
@@ -628,13 +910,15 @@ def vllm030_glm_cache_specs(vllm_config, model: ModelConfig):
     if model.model_id not in ("zai-org/GLM-5.2", "zai-org/GLM-5.2-FP8", "zai-org/GLM-5.3"):
         raise NotImplementedError("0.30 cache projection requires an accurate GLM config")
     parallel = vllm_config.parallel_config
-    if (parallel.pipeline_parallel_size != 1 or parallel.data_parallel_size != 1
+    # Weight quantization changes neither the latent BF16 cache nor the
+    # per-stage indexer owners. Native PP placement uses these actual specs.
+    if (parallel.pipeline_parallel_size > model.num_hidden_layers or parallel.data_parallel_size != 1
             or parallel.decode_context_parallel_size != 1
             or parallel.prefill_context_parallel_size != 1
             or (parallel.enable_expert_parallel and not vllm030_supports_expert_parallel_cache(
                 model, parallel.tensor_parallel_size))
             or vllm_config.attention_config.hisparse_config is not None):
-        raise NotImplementedError("0.30 GLM cache projection requires PP1/CP1/DP1 and EP-off or EP8")
+        raise NotImplementedError("0.30 GLM cache projection requires nonempty PP/CP1/DP1 and supported TP expert cache placement")
     if vllm_config.speculative_config is not None:
         validate_vllm030_glm_mtp_config(vllm_config, model)
     if (vllm_config.model_config.dtype != torch.bfloat16
@@ -704,11 +988,13 @@ def vllm030_kimi_k3_cache_specs(vllm_config, model: ModelConfig):
     cache, parallel = vllm_config.cache_config, vllm_config.parallel_config
     if native_model is None or native_model.dtype != torch.bfloat16 or not native_model.is_hybrid:
         raise ValueError("K3 native config must be BF16 and hybrid")
-    if (parallel.pipeline_parallel_size != 1 or parallel.data_parallel_size != 1
+    if (not is_kimi_k3_parallel_model_scope(model, parallel.tensor_parallel_size,
+                parallel.pipeline_parallel_size, expert_parallel=parallel.enable_expert_parallel)
+            or parallel.data_parallel_size != 1
             or parallel.decode_context_parallel_size != 1 or parallel.prefill_context_parallel_size != 1
-            or parallel.enable_expert_parallel or parallel.use_sequence_parallel_moe
+            or parallel.use_sequence_parallel_moe
             or vllm_config.speculative_config is not None or cache.use_kda_recoverssm):
-        raise NotImplementedError("K3 cache projection requires PP/CP/DP/SP1, EP-off and MTP-off")
+        raise NotImplementedError("K3 cache projection requires whole TP/stage-local EP, nonempty PP, CP/DP/SP1 and MTP-off")
     if cache.cache_dtype not in ("auto", "bfloat16"):
         raise NotImplementedError("K3 source MLA cache projection requires BF16")
     if cache.enable_prefix_caching or cache.mamba_cache_mode != "none":
@@ -773,9 +1059,10 @@ def allocate_vllm030_kimi_k3_cache(
         raise TypeError("K3 allocation requires ModelConfig and ParallelConfig")
     if model.model_id != "moonshotai/Kimi-K3" or model.kimi_k3_semantics is None:
         raise NotImplementedError("K3 allocation requires exact hybrid Kimi-K3")
-    if (not parallelism.is_rank_local or parallelism.pipeline_parallel_size != 1
-            or parallelism.enable_expert_parallel):
-        raise NotImplementedError("K3 source allocation requires PP/CP/DP/SP1 and EP-off")
+    if (not parallelism.is_rank_local or not is_kimi_k3_parallel_model_scope(model,
+            parallelism.tensor_parallel_size, parallelism.pipeline_parallel_size,
+            expert_parallel=parallelism.enable_expert_parallel)):
+        raise NotImplementedError("K3 source allocation requires whole TP/stage-local EP, nonempty PP and CP/DP/SP1")
     if (not isinstance(available_memory_by_rank, tuple)
             or len(available_memory_by_rank) != parallelism.worker_count
             or any(type(value) is not int or value <= 0 for value in available_memory_by_rank)):
@@ -798,8 +1085,9 @@ def allocate_vllm030_kimi_k3_cache(
     if (not isinstance(vllm_config, VllmConfig) or vllm_config.device_config.device_type != "cpu"
             or not current_platform.is_cpu()):
         raise NotImplementedError("K3 allocation requires the real CPU VllmConfig")
-    if vllm_config.parallel_config.tensor_parallel_size != parallelism.tensor_parallel_size:
-        raise ValueError("K3 native TP disagrees with declared worker ranks")
+    if (vllm_config.parallel_config.tensor_parallel_size != parallelism.tensor_parallel_size
+            or vllm_config.parallel_config.pipeline_parallel_size != parallelism.pipeline_parallel_size):
+        raise ValueError("K3 native TP/PP disagrees with declared worker ranks")
     if vllm_config.cache_config.num_gpu_blocks_override is not None:
         raise ValueError("K3 source allocation rejects debug block overrides")
     if vllm_config.attention_config.hisparse_config is not None:
@@ -810,13 +1098,13 @@ def allocate_vllm030_kimi_k3_cache(
     resolve_kv_cache_layout(vllm_config, [list(x) for x in supported_layouts_by_rank], specs.values())
     if vllm_config.cache_config.get_resolved_kv_cache_layout().name not in supported_layouts_by_rank[0]:
         raise ValueError("K3 resolved layout conflicts with declared worker capabilities")
-    workers = get_kv_cache_configs(vllm_config, [dict(specs) for _ in available_memory_by_rank],
-                                  list(available_memory_by_rank))
+    worker_specs = vllm030_worker_cache_specs(vllm_config, model)
+    workers = get_kv_cache_configs(vllm_config, list(worker_specs), list(available_memory_by_rank))
     if len(workers) != parallelism.worker_count:
         raise RuntimeError("K3 allocator returned inconsistent worker count")
-    for worker, budget in zip(workers, available_memory_by_rank, strict=True):
+    for worker, budget, expected in zip(workers, available_memory_by_rank, worker_specs, strict=True):
         owners = [name for group in worker.kv_cache_groups for name in group.layer_names]
-        if len(owners) != len(specs) or set(owners) != set(specs):
+        if len(owners) != len(expected) or set(owners) != set(expected):
             raise RuntimeError("K3 hybrid grouping lost or duplicated cache owners")
         # Generic non-HiSparse groups overlay one shared backing pool. These
         # descriptors share size, rather than representing independent allocations.
@@ -1068,11 +1356,15 @@ def allocate_vllm030_kv_cache(
     max_batched_tokens: int,
     max_requests: int,
     supported_layouts_by_rank: tuple[tuple[str, ...], ...],
+    pipeline_layer_partition: tuple[int, ...] | None = None,
+    pool_name: str = "analytical-kv-allocation",
+    process_consumer=None,
 ) -> VLLMKVAllocation:
     """Native 0.30 callback for the analytical planner's allocator protocol.
 
     Bind the SDK/limits/layout keywords with functools.partial. The existing
-    guarded CPU process owns all native objects and is closed before returning.
+    guarded CPU process owns all native objects. An explicit consumer may take
+    its untouched state; otherwise it is closed before returning.
     Its caller-supplied budgets are not proof of normal available-KV. CPU
     configuration rewrites must not silently change analytical plan inputs.
     """
@@ -1080,29 +1372,59 @@ def allocate_vllm030_kv_cache(
     from src.serving.backend.vllm_scheduler_process import VLLM030SchedulerProcess
     from src.serving.workload.model_config import load_model_config
 
+    if process_consumer is not None and not callable(process_consumer):
+        raise TypeError("native allocator process consumer must be callable")
     if not isinstance(model, ModelConfig) or not isinstance(parallelism, ParallelConfig):
         raise TypeError("0.30 allocator callback requires ModelConfig and ParallelConfig")
     if not isinstance(scheduler_config, VLLMSchedulerConfig) or scheduler_config.scheduler_version != "0.30.0":
         raise ValueError("0.30 allocator callback requires an explicit 0.30 Scheduler config")
     if (not parallelism.is_rank_local or (parallelism.pipeline_parallel_size != 1 and not (
-            not parallelism.enable_expert_parallel
-            and is_validated_qwen3_pipeline_model_scope(model, parallelism.tensor_parallel_size, parallelism.pipeline_parallel_size)))
+            (model.model_type == "glm_moe_dsa" and model.weight_dtype in ("bf16", "fp8")
+                and parallelism.pipeline_parallel_size <= model.num_hidden_layers)
+            or (is_dense_parallel_model_scope(model, parallelism.tensor_parallel_size, parallelism.pipeline_parallel_size)
+                and not parallelism.enable_expert_parallel)
+            or is_kimi_k3_parallel_model_scope(model, parallelism.tensor_parallel_size,
+                parallelism.pipeline_parallel_size, expert_parallel=parallelism.enable_expert_parallel)
+            or is_qwen3_moe_pipeline_model_scope(model, parallelism.tensor_parallel_size, parallelism.pipeline_parallel_size)
+            or is_kimi_k2_parallel_model_scope(model, parallelism.tensor_parallel_size, parallelism.pipeline_parallel_size,
+                expert_parallel=parallelism.enable_expert_parallel)
+            or is_deepseek_v3_parallel_model_scope(model, parallelism.tensor_parallel_size,
+                parallelism.pipeline_parallel_size, expert_parallel=parallelism.enable_expert_parallel)
+            or is_deepseek_v4_parallel_model_scope(model, parallelism.tensor_parallel_size,
+                parallelism.pipeline_parallel_size, expert_parallel=parallelism.enable_expert_parallel)))
             or (parallelism.enable_expert_parallel and not vllm030_supports_expert_parallel_cache(
                 model, parallelism.tensor_parallel_size))):
-        raise NotImplementedError("0.30 allocator callback requires PP1 or uniform Qwen3 TP1 PP/TP2 PP2, and supported expert placement")
+        raise NotImplementedError("0.30 allocator callback requires PP1 or uniform Qwen3 TP1 PP/TP2 PP2 or K3 PP16, and supported expert placement")
+    if scheduler_config.context_parallel_size > 1 or scheduler_config.data_parallel_size > 1:
+        cp, tp = scheduler_config.context_parallel_size, scheduler_config.tensor_parallel_size
+        if (model.model_type != "glm_moe_dsa" or model.weight_dtype != "bf16"
+                or not parallelism.is_rank_local
+                or (cp > 1 and parallelism.pipeline_parallel_size != 1)):
+            raise NotImplementedError("distributed GLM allocator callback requires its explicit native CP1/DP1 projection")
+        # The planner already projects min-CP budgets; layout declarations
+        # still describe every physical PCP rank and must agree before slicing.
+        if (len(supported_layouts_by_rank) != cp * tp * parallelism.pipeline_parallel_size
+                or any(layouts != supported_layouts_by_rank[0] for layouts in supported_layouts_by_rank)):
+            raise ValueError("PCP allocator requires complete equal physical layout capabilities")
+        from dataclasses import replace
+        scheduler_config = replace(scheduler_config, context_parallel_size=1, data_parallel_size=1,
+            enable_expert_parallel=parallelism.enable_expert_parallel)
+        supported_layouts_by_rank = supported_layouts_by_rank[:tp * parallelism.pipeline_parallel_size]
     configured_model = load_model_config(scheduler_config.model)
     if (configured_model != model
             or scheduler_config.tensor_parallel_size != parallelism.tensor_parallel_size
             or scheduler_config.pipeline_parallel_size != parallelism.pipeline_parallel_size
+            or scheduler_config.pipeline_layer_partition != pipeline_layer_partition
             or scheduler_config.enable_expert_parallel != parallelism.enable_expert_parallel
             or scheduler_config.max_model_len != max_model_len):
         raise ValueError("0.30 allocator callback model/parallelism/length disagrees with analytical inputs")
     process = VLLM030SchedulerProcess(
         scheduler_config, python_executable=python_executable, source_root=source_root,
-        pool_name="analytical-kv-allocation", max_batched_tokens=max_batched_tokens,
+        pool_name=pool_name, max_batched_tokens=max_batched_tokens,
         max_requests=max_requests, kv_block_size_tokens=kv_block_size_tokens,
         available_memory_by_rank=available_memory_by_rank,
         supported_layouts_by_rank=supported_layouts_by_rank)
+    retained = False
     try:
         allocation = VLLMKVAllocation(**process.runtime_info["native_allocation"])
         effective = process.backend_config
@@ -1114,9 +1436,13 @@ def allocate_vllm030_kv_cache(
                 "0.30 effective SDK configuration changed analytical allocator inputs: "
                 f"batch={effective.max_batched_tokens}, requests={effective.max_requests}, "
                 f"block={allocation.kv_block_size_tokens}, model_len={allocation.max_model_len}")
+        if process_consumer is not None:
+            process_consumer(process)
+            retained = True
         return allocation
     finally:
-        process.close()
+        if not retained:
+            process.close()
 
 
 def allocate_vllm_kv_cache(

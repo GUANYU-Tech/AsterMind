@@ -27,6 +27,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import shutil
 import time
 
 BOOST_MHZ = 1980
@@ -34,7 +35,7 @@ EXPECTED_DEVICE_NAME = 'NVIDIA H200'
 EXPECTED_SM_COUNT = 132
 WARMUP_MS = 600
 MAX_ATTEMPTS = 4
-NVCC = Path('/mnt/public/yangxinhao/tools/cuda-12.9/bin/nvcc')
+NVCC = Path(shutil.which('nvcc') or 'nvcc')
 HELPER_DIR = Path(__file__).resolve().parent
 WARMUP_SOURCE = HELPER_DIR / 'gpu_clock_warmup.cu'
 

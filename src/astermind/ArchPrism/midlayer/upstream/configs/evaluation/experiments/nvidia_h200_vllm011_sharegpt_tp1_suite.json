@@ -23,7 +23,7 @@
     {
       "hardware_id": "nvidia_h200",
       "hardware_config_path": "configs/hardware/nvidia_h200.yaml",
-      "hardware_config_sha256": "1b67bb9e4c555976a9d96386967bf50ca36bf11287ad33aedff5adca8ebf406a",
+      "hardware_config_sha256": "2dc939911eb7d3ea1bbb3cc746a44f64f430f6ce8fadf81aa5f4bf38d290c1fe",
       "graph_execution": {
         "configured_mode": "FULL_AND_PIECEWISE",
         "piecewise_eager_workload_kinds": [

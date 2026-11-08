@@ -8,7 +8,7 @@
 # Usage: VLLM_MOE_ROUTING_SIMULATION_STRATEGY=uniform_random \
 #            nvidia_h200_nsys_prefill_capture.sh <out tag>
 set -euo pipefail
-B=/mnt/public/yangxinhao; M=$B/h200_microbench
+B=${MIDLAYER_H200_PUBLIC_ROOT:?set MIDLAYER_H200_PUBLIC_ROOT}; M=$B/h200_microbench
 OUT=$M/nsys/$1; mkdir -p $OUT
 export HOME=$M/home XDG_CACHE_HOME=$B/cache/xdg HF_HOME=$B/cache/hf HF_HUB_OFFLINE=1
 export PATH=$B/tools/nsys_2025.6.1/bin:$PATH

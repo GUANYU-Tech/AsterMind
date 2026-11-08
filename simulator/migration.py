@@ -2,9 +2,14 @@
 
 
 class NetworkKVMigration:
-    def __init__(self, loop, executor, endpoints):
-        self.loop, self.executor, self.endpoints = loop, executor, endpoints
+    def __init__(self, transport, endpoints):
+        self.loop, self.transport, self.endpoints = transport.loop, transport, endpoints
         self.records = {}
+        self._waiting_at_boundary = []
+
+    def on_batch_boundary(self):
+        for begin_if_idle in tuple(self._waiting_at_boundary):
+            begin_if_idle()
 
     def start(self, spec, source, target, history):
         from orbitserve.runtime.engine.cell_events import STEP_COMPLETE
@@ -20,7 +25,7 @@ class NetworkKVMigration:
             raise ValueError("migration needs matching physical rank endpoint maps")
         # Validate every structural route before taking native block references.
         for rank in source_devices:
-            self.executor.network.candidate_path(source_devices[rank], target_devices[rank])
+            self.transport.network.candidate_path(source_devices[rank], target_devices[rank])
         record = dict(id=spec.id, source=source.cell_id, target=target.cell_id,
                       state="waiting_for_batch_boundary", requested_time_s=self.loop.now_s)
         self.records[spec.id] = record
@@ -36,7 +41,7 @@ class NetworkKVMigration:
         def begin_if_idle():
             if source._inflight is not None or target._inflight is not None:
                 return
-            self.executor.boundary_listeners.remove(begin_if_idle)
+            self._waiting_at_boundary.remove(begin_if_idle)
             exported = False
             reserved = False
             try:
@@ -85,7 +90,7 @@ class NetworkKVMigration:
                     for partition in partitions:
                         rank = partition["rank"]
                         try:
-                            self.executor.submit_transport(partition["transfer_id"], partition["source"],
+                            self.transport.submit_transport(partition["transfer_id"], partition["source"],
                                 partition["target"], size, "kv_migration", spec.id,
                                 lambda rank=rank: delivered(rank),
                                 lambda event, rank=rank: delivered(rank, event.model_dump()))
@@ -103,6 +108,6 @@ class NetworkKVMigration:
                 record.update(state="failed")
                 release()
                 raise
-        self.executor.boundary_listeners.append(begin_if_idle)
+        self._waiting_at_boundary.append(begin_if_idle)
         begin_if_idle()
         return record

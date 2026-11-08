@@ -20,9 +20,6 @@ from evaluation.serving.metrics.sharegpt_compact_evaluation import (  # noqa: E4
 )
 
 
-MAX_JOBS = 64
-
-
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--nvidia-h200-vllm-version", choices=tuple(NVIDIA_H200_SUITE_SELECTIONS),
@@ -30,9 +27,8 @@ def main() -> int:
     parser.add_argument(
         "--jobs",
         type=int,
-        choices=range(1, MAX_JOBS + 1),
-        default=min(MAX_JOBS, os.cpu_count() or 1),
-        help="case-level worker processes (default: up to 64)",
+        default=os.cpu_count() or 1,
+        help="case-level worker processes (default: available CPUs)",
     )
     args = parser.parse_args()
     result = run_compact_alignment_suite(

@@ -17,7 +17,8 @@ import hashlib
 import json
 import os
 
-K = "/mnt/public/yangxinhao/h200_microbench/kcampaign"
+K = os.path.join(
+    os.environ["MIDLAYER_H200_PUBLIC_ROOT"], "h200_microbench/kcampaign")
 ap = argparse.ArgumentParser()
 ap.add_argument("--pending", nargs="*", default=[])
 ap.add_argument("--retry", nargs="*", default=[])

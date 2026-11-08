@@ -5,8 +5,9 @@ bare auxiliary inputs retain the native scalar arguments as unbound values.
 Versioned CUDA/CUB references own private rows, logical raking scratch and
 atomic count dataflow. These requests do not assert native issued traffic.
 """
+
+from src.kernel.prediction_cache import runtime_lru_cache
 from dataclasses import replace
-from functools import lru_cache
 
 from src.kernel.memory_access import (
     AccessScope,AddressLevel,ConstantValue,Coverage,EventKind,EventRef,Granularity,
@@ -420,7 +421,7 @@ def _regular_public_bindings(geometry,binding):
     return parents,public
 
 
-@lru_cache(maxsize=16)
+@runtime_lru_cache(maxsize=16)
 def _cached_regular_components(geometry,binding,scope,evidence):
     """Share immutable raking structure, retaining each actual invocation.
 
@@ -431,6 +432,11 @@ def _cached_regular_components(geometry,binding,scope,evidence):
     """
     _regular_public_bindings(geometry,binding)
     r,e,block,capacity,counts=geometry
+    if block is not None:
+        # A bound ABI already has its exact geometry. Build directly in its
+        # actual namespace; the common scan prefix is shared independently of
+        # counts, so copying and renaming that same prefix buys no reuse.
+        return _regular_template_components(geometry,binding,scope,evidence)
     canonical_geometry=(1,e,block,capacity,counts) if block is None else geometry
     canonical_ids={a.allocation_id:f'regular.parent.{i}' for i,a in enumerate(binding.allocations)}
     input_allocation=next(v.allocation_id for v in binding.views if v.view_id=='topk_ids')
@@ -491,8 +497,14 @@ def _cached_regular_components(geometry,binding,scope,evidence):
     return allocations,tuple(selected),events,rebound
 
 
-@lru_cache(maxsize=8)
-def _regular_template_components(geometry,binding,scope,evidence):
+@runtime_lru_cache(maxsize=8)
+def _regular_template_components(geometry,binding,scope,evidence,_prefix_only=False):
+    """Share the complete fixed scan, then append actual expert-owner loops.
+
+    Prefix actors declare their own operation IDs, so the outer count header
+    is absent from that cache key. The returned full program retains its
+    original scope/header, current owner extents and every scan dependency.
+    """
     from src.kernel.memory_access import TileAtomicAdd
     r,e,block,capacity,counts=geometry;symbolic=block is None;upper=2**31-1
     parents,public=_regular_public_bindings(geometry,binding)
@@ -522,66 +534,73 @@ def _regular_template_components(geometry,binding,scope,evidence):
         add(name+'.write',view,Operation.WRITE,deps=deps,unmapped=True,value=value,domain='register')
         add(name,view,Operation.READ,deps=(dep(name+'.write',EventKind.WRITE_VISIBLE),),unmapped=True,domain='register')
         return name
-    if symbolic:
-        for index,role in enumerate(('block_size_arg','capacity_arg'),1):
-            add(role,parents[role],Operation.READ,ready=(binding.input_ready[index],),domain='argument')
-    histogram=vector('histogram',allocate('histogram',-(-e//32)*32,'logical-shared-histogram'),-(-e//32)*32)
-    keys=selected('histogram_keys',histogram,r)
-    add('histogram_init',histogram,Operation.WRITE,value=ConstantValue.ZERO)
-    source_ids=parents['topk_ids']
-    unresolved=public[source_ids.allocation_id].size_bytes is None
-    if unresolved:source_ids=selected('source_ids',source_ids,r)
-    add('expert_read',source_ids,Operation.READ,('route',),('route',),ready=(binding.input_ready[0],),
-        unmapped=unresolved,domain='global')
-    key=TileValueIndex('expert_read','loaded_scalar')
-    add('histogram_read',keys,Operation.READ,('route',),('route',),(dep('histogram_init',EventKind.WRITE_VISIBLE),dep('expert_read')),unmapped=True,index=key)
-    add('histogram_increment',keys,Operation.WRITE,('route',),('route',),(dep('histogram_read'),dep('expert_read')),
-        unmapped=True,index=key,atomic=TileAtomicAdd('histogram_read',1))
-    add('sorted_initialize',parents['sorted_token_ids'],Operation.WRITE,('padded',),('padded',),
-        (dep('capacity_arg'),) if symbolic else (),unmapped=symbolic,domain='global')
-    # A logical 32x32 raking arena records scalar payload slots. Native
-    # alignment/padding and addresses are not inferred from this object.
-    grid=allocate('raking_grid',1024,'logical-shared-raking-grid')
-    rows=[vector(f'raking_row{lane}',grid,32,lane*32*4) for lane in range(32)]
-    for lane,row in enumerate(rows):
-        first=lane*32;n=min(32,max(0,e-first));inputs=()
-        if n:
-            bins=vector(f'histogram_group{lane}',histogram.allocation_id,n,first*4)
-            add(f'histogram_group{lane}',bins,Operation.READ,deps=(dep('histogram_init',EventKind.WRITE_VISIBLE),
-                dep('histogram_increment',EventKind.WRITE_VISIBLE,('route',))))
-            inputs=(dep(f'histogram_group{lane}'),*((dep('block_size_arg'),) if symbolic else ()))
-        add(f'placement{lane}',row,Operation.WRITE,deps=inputs,value=None if n else ConstantValue.ZERO)
-    placement_join=tuple(dep(f'placement{lane}',EventKind.WRITE_VISIBLE) for lane in range(32))
-    partials=[]
-    for lane,row in enumerate(rows):
-        add(f'upsweep_load{lane}',row,Operation.READ,deps=placement_join)
-        cache=register(f'upsweep_cache{lane}',32,(dep(f'upsweep_load{lane}'),))
-        partials.append(register(f'upsweep_sum{lane}',1,(dep(cache),)))
-    # WarpScan<int32,32> shuffle scan: each lane keeps its own previous
-    # value and only lanes >= distance consume that previous peer value.
-    for stage,distance in enumerate((1,2,4,8,16)):
-        previous=partials;partials=[]
-        for lane in range(32):
-            inputs=(dep(previous[lane]),*((dep(previous[lane-distance]),) if lane>=distance else ()))
-            partials.append(register(f'warp_stage{stage}.lane{lane}',1,inputs))
-    downsweep=[]
-    for lane,row in enumerate(rows):
-        prefix=register(f'exclusive_prefix{lane}',1,(dep(partials[lane-1]),) if lane else (dep(partials[0]),),
-            value=ConstantValue.ZERO if lane==0 else None)
-        add(f'downsweep_load{lane}',row,Operation.READ,deps=(dep(f'placement{lane}',EventKind.WRITE_VISIBLE),dep(f'upsweep_load{lane}'),dep(prefix)))
-        cache=register(f'downsweep_cache{lane}',32,(dep(f'downsweep_load{lane}'),))
-        scanned=register(f'downsweep_scanned{lane}',32,(dep(cache),dep(prefix)))
-        add(f'downsweep_store{lane}',row,Operation.WRITE,deps=(dep(scanned),))
-        downsweep.append(dep(f'downsweep_store{lane}',EventKind.WRITE_VISIBLE))
-    for lane,row in enumerate(rows):add(f'copyback{lane}',row,Operation.READ,deps=tuple(downsweep))
-    prefix_writes=[]
-    for expert in range(e+1):
-        output=vector(f'prefix{expert}',parents['cumsum'].allocation_id,1,parents['cumsum'].offset_bytes+expert*4)
-        add(f'prefix{expert}',output,Operation.WRITE,deps=(dep(f'copyback{expert//32}'),),domain='global')
-        prefix_writes.append(dep(f'prefix{expert}',EventKind.WRITE_VISIBLE))
-    end=vector('prefix_end',parents['cumsum'].allocation_id,1,parents['cumsum'].offset_bytes+e*4)
-    add('padded_count',parents['num_tokens_post_padded'],Operation.WRITE,deps=(dep(f'copyback{e//32}'),),domain='global')
-    add('inactive_start',end,Operation.READ,('worker',),(None,),(prefix_writes[-1],),domain='global')
+    if _prefix_only:
+        if symbolic:
+            for index,role in enumerate(('block_size_arg','capacity_arg'),1):
+                add(role,parents[role],Operation.READ,ready=(binding.input_ready[index],),domain='argument')
+        histogram=vector('histogram',allocate('histogram',-(-e//32)*32,'logical-shared-histogram'),-(-e//32)*32)
+        keys=selected('histogram_keys',histogram,r)
+        add('histogram_init',histogram,Operation.WRITE,value=ConstantValue.ZERO)
+        source_ids=parents['topk_ids']
+        unresolved=public[source_ids.allocation_id].size_bytes is None
+        if unresolved:source_ids=selected('source_ids',source_ids,r)
+        add('expert_read',source_ids,Operation.READ,('route',),('route',),ready=(binding.input_ready[0],),
+            unmapped=unresolved,domain='global')
+        key=TileValueIndex('expert_read','loaded_scalar')
+        add('histogram_read',keys,Operation.READ,('route',),('route',),(dep('histogram_init',EventKind.WRITE_VISIBLE),dep('expert_read')),unmapped=True,index=key)
+        add('histogram_increment',keys,Operation.WRITE,('route',),('route',),(dep('histogram_read'),dep('expert_read')),
+            unmapped=True,index=key,atomic=TileAtomicAdd('histogram_read',1))
+        add('sorted_initialize',parents['sorted_token_ids'],Operation.WRITE,('padded',),('padded',),
+            (dep('capacity_arg'),) if symbolic else (),unmapped=symbolic,domain='global')
+        # A logical 32x32 raking arena records scalar payload slots. Native
+        # alignment/padding and addresses are not inferred from this object.
+        grid=allocate('raking_grid',1024,'logical-shared-raking-grid')
+        rows=[vector(f'raking_row{lane}',grid,32,lane*32*4) for lane in range(32)]
+        for lane,row in enumerate(rows):
+            first=lane*32;n=min(32,max(0,e-first));inputs=()
+            if n:
+                bins=vector(f'histogram_group{lane}',histogram.allocation_id,n,first*4)
+                add(f'histogram_group{lane}',bins,Operation.READ,deps=(dep('histogram_init',EventKind.WRITE_VISIBLE),
+                    dep('histogram_increment',EventKind.WRITE_VISIBLE,('route',))))
+                inputs=(dep(f'histogram_group{lane}'),*((dep('block_size_arg'),) if symbolic else ()))
+            add(f'placement{lane}',row,Operation.WRITE,deps=inputs,value=None if n else ConstantValue.ZERO)
+        placement_join=tuple(dep(f'placement{lane}',EventKind.WRITE_VISIBLE) for lane in range(32))
+        partials=[]
+        for lane,row in enumerate(rows):
+            add(f'upsweep_load{lane}',row,Operation.READ,deps=placement_join)
+            cache=register(f'upsweep_cache{lane}',32,(dep(f'upsweep_load{lane}'),))
+            partials.append(register(f'upsweep_sum{lane}',1,(dep(cache),)))
+        # WarpScan<int32,32> shuffle scan: each lane keeps its own previous
+        # value and only lanes >= distance consume that previous peer value.
+        for stage,distance in enumerate((1,2,4,8,16)):
+            previous=partials;partials=[]
+            for lane in range(32):
+                inputs=(dep(previous[lane]),*((dep(previous[lane-distance]),) if lane>=distance else ()))
+                partials.append(register(f'warp_stage{stage}.lane{lane}',1,inputs))
+        downsweep=[]
+        for lane,row in enumerate(rows):
+            prefix=register(f'exclusive_prefix{lane}',1,(dep(partials[lane-1]),) if lane else (dep(partials[0]),),
+                value=ConstantValue.ZERO if lane==0 else None)
+            add(f'downsweep_load{lane}',row,Operation.READ,deps=(dep(f'placement{lane}',EventKind.WRITE_VISIBLE),dep(f'upsweep_load{lane}'),dep(prefix)))
+            cache=register(f'downsweep_cache{lane}',32,(dep(f'downsweep_load{lane}'),))
+            scanned=register(f'downsweep_scanned{lane}',32,(dep(cache),dep(prefix)))
+            add(f'downsweep_store{lane}',row,Operation.WRITE,deps=(dep(scanned),))
+            downsweep.append(dep(f'downsweep_store{lane}',EventKind.WRITE_VISIBLE))
+        for lane,row in enumerate(rows):add(f'copyback{lane}',row,Operation.READ,deps=tuple(downsweep))
+        prefix_writes=[]
+        for expert in range(e+1):
+            output=vector(f'prefix{expert}',parents['cumsum'].allocation_id,1,parents['cumsum'].offset_bytes+expert*4)
+            add(f'prefix{expert}',output,Operation.WRITE,deps=(dep(f'copyback{expert//32}'),),domain='global')
+            prefix_writes.append(dep(f'prefix{expert}',EventKind.WRITE_VISIBLE))
+        end=vector('prefix_end',parents['cumsum'].allocation_id,1,parents['cumsum'].offset_bytes+e*4)
+        add('padded_count',parents['num_tokens_post_padded'],Operation.WRITE,deps=(dep(f'copyback{e//32}'),),domain='global')
+        add('inactive_start',end,Operation.READ,('worker',),(None,),(prefix_writes[-1],),domain='global')
+        return tuple(allocations),tuple(views),tuple(events),tuple(axes),tuple(accesses),tuple(prefix_writes)
+    prefix_geometry=(r,e,block,capacity,None)
+    prefix_scope=replace(scope,op_ids=_regular_geometry_header(prefix_geometry))
+    common=_regular_template_components(prefix_geometry,binding,prefix_scope,evidence,True)
+    allocations,views,events,axes,accesses=(list(values) for values in common[:5])
+    prefix_writes=common[5]
     offset=0
     for expert in range(e):
         pair=vector(f'owner_bounds{expert}',parents['cumsum'].allocation_id,2,parents['cumsum'].offset_bytes+expert*4)
@@ -630,7 +649,7 @@ def build_regular_alignment_source(kernel,binding,granularity,*,program_id):
     regular_alignment_source_demands(result,expected_kernel=kernel);return result
 
 
-@lru_cache(maxsize=16)
+@runtime_lru_cache(maxsize=16)
 def _cached_regular_source(geometry,hardware_id,binding,program_id):
     scope=AccessScope(program_id,_regular_geometry_header(geometry),binding.call_id,(),binding.rank,binding.stream,'logical-regular-alignment')
     evidence=('Versioned CUDA ordinary alignment and CUB 2.2 BlockScan<int32,1024> default non-memoized raking algorithm references; no installed binary byte identity claim.',
@@ -643,7 +662,7 @@ def _cached_regular_source(geometry,hardware_id,binding,program_id):
         (*binding.allocations,*allocations),(*binding.views,*views),(),(*binding.events,*events),(),(family,))
 
 
-@lru_cache(maxsize=16)
+@runtime_lru_cache(maxsize=16)
 def _validate_regular_program(program):
     if not isinstance(program,MemoryAccessProgram):raise TypeError('Ordinary alignment requires a typed memory access program')
     program.__post_init__()
@@ -654,7 +673,7 @@ def regular_alignment_source_demands(program,*,expected_kernel):
         _regular_geometry(expected_kernel)))
 
 
-@lru_cache(maxsize=16)
+@runtime_lru_cache(maxsize=16)
 def _regular_alignment_source_demands(program,hardware_id,geometry):
     from src.kernel.memory_access_builder import ElementwiseBindings
     r,e,block,capacity,counts=geometry;symbolic=block is None;_validate_regular_program(program)

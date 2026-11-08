@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path, PurePosixPath
 import re
 import shlex
@@ -59,6 +60,14 @@ def _sha256(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _mcprofiler_lock_path() -> str:
+    if "MIDLAYER_C500_MCPROFILER_LOCK" not in os.environ:
+        raise ValueError(
+            "MIDLAYER_C500_MCPROFILER_LOCK is required for mcProfiler execution"
+        )
+    return os.environ["MIDLAYER_C500_MCPROFILER_LOCK"]
 
 
 def _validate_inputs(manifest: object, *, require_local_metadata: bool) -> dict:
@@ -264,6 +273,7 @@ def main() -> int:
               "required header when diagnosing a tool report-rendering failure"))
     parser.add_argument("--device", type=int, default=0)
     args = parser.parse_args()
+    mcprofiler_lock_path = _mcprofiler_lock_path()
 
     local_inputs = _load_inputs(args.capture_input_manifest)
     if args.output_root.exists() or args.audit_root.exists():
@@ -388,9 +398,8 @@ def main() -> int:
             remote_allk_dir = (
                 f"{container_case_root}/mcprofiler_out/_allk_attempt_{attempt}")
             profiler_command = [
-                "flock", "-n",
-                "/mnt/disk2/yxh/midlayer_hw_model/profiler_output/.locks/"
-                "metax_c500_mcprofiler.lock", "timeout", "--kill-after=30s",
+                "flock", "-n", mcprofiler_lock_path,
+                "timeout", "--kill-after=30s",
                 f"{args.mcprofiler_timeout_seconds}s",
                 args.mcprofiler, "perf_exec", "--cmdline", child_command,
                 "--casename", case_id, "--output", remote_allk_dir,

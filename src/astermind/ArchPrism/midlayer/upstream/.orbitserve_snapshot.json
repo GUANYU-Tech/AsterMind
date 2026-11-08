@@ -1,13 +1,12 @@
 {
-  "source": "Local midlayer_hw_model-dev export supplied with the OrbitServe rebuttal files",
+  "source": "Standalone midlayer_hw_model-dev (1) export, directory midlayer_hw_model-dev",
   "source_commit": null,
-  "source_config_tree_sha256": "4d32479bb78f33aea078672dfe6aa59d0f9b3bab001d7bd0d949874f4d487cb4",
-  "asset_baseline_commit": "6fe573479c37a931744a6442e7a4b3503eec02e6",
-  "local_adapter_changes": [
-    "src/serving/backend/vllm_scheduler_process.py",
-    "src/serving/backend/vllm.py",
-    "src/serving/execution.py"
-  ],
+  "source_config_tree_sha256": "2e66b9c300efce1d80de158bd519e00e6e95ec797c9262a14b94cf3a25ae251e",
+  "protobridge_commit": "408d4703a86535dc6d2242a88fa64036b6ea92bd",
+  "protobridge_files_sha256": {
+    "LICENSE": "e01cda1cbedde03ba8154ecbdea6b42c14dd330eef498b462f97ca781b027b6e",
+    "surrogate/theory/whitebox_surrogate_v2.py": "0829ed1cbcc67638385e520617fd694c79e1407b30426dfbc2843339414a4a77"
+  },
   "materialized_lfs_files": {
     "kernel_dataset/ascend_910b/flash_attn.json.zst": "f806577a8281a4a47ffeeacd619fd21e4e435c731a08e76245cd2c79e99c72bf",
     "kernel_dataset/ascend_910b/fused_moe.json.zst": "2dda3cfe58b6fea67aab886f761c5911290ae0ebc18c8a942fa95e4d5dd19daa",
@@ -24,10 +23,6 @@
     "kernel_dataset/nvidia_a800/fused_moe.json.zst": "a714dfe1321a5e1baa404d7e6c5b0bfb75fadadba81dc87cab87a92317908b3e",
     "kernel_dataset/nvidia_a800/gemm.json.zst": "3765ff059e729b44a033f44c1b243f2b6d291e796a85df7b490c7a646f71c6e0",
     "kernel_dataset/nvidia_a800/vector.json.zst": "06783ed70c2f4e64a94433cbcb5c0cee1aba1ad1391188f213a6c44f9c55cd1c",
-    "kernel_dataset/nvidia_h200/flash_attn.json.zst": "b9e16e9a21beb62c7d10605328392e82206cc0489b6e8e75008870ea6739d669",
-    "kernel_dataset/nvidia_h200/fused_moe.json.zst": "9d64c1bf54981ed6850c761f8bcc4ede3bf32c75f69902e48131a0a124f79ebd",
-    "kernel_dataset/nvidia_h200/gemm.json.zst": "f98e6dbe313f2c45af660df493c4ec42368f02d69555fde022bfea3b19c02325",
-    "kernel_dataset/nvidia_h200/vector.json.zst": "663f76f2f8a34ee8e08ae0e8f2d20e536877e5c50eccc01a50090fd3b5a4e2b4",
     "kernel_dataset/samsung_hbm_pim/eager_attn.json.zst": "53c4bc216141c94aeab4b6be21760713acf74f92cbc35e4c9295f028c315acbb",
     "kernel_dataset/samsung_hbm_pim/gemm.json.zst": "c79ccc721bd9036e3ffce7ba01d26b6de296b052d652d07863766d3d1eca80d9",
     "kernel_dataset/samsung_hbm_pim/unfused_moe.json.zst": "e10e5fe08afafeaf0236b97cd485781e0bc678a27a98287b230f919ff397fb3b",
@@ -41,8 +36,6 @@
     "launch_data/metax_c500/gemm_launch_selection.manifest.json": "4aa82c0d1a8ca765a2e28d149fe1e799d52408e6af040b82559501f442f60f61",
     "launch_data/nvidia_a800/gemm_launch_selection.csv.zst": "1182f52b5e319d1bf61131061b154cfb6008686c656e62e93b710fcd9aec1005",
     "launch_data/nvidia_a800/gemm_launch_selection.manifest.json": "043fe1a6aa0986b3eaa2d91d04f8158eb794147269879f81df1a39afb94bdb99",
-    "launch_data/nvidia_h200/gemm_launch_selection.csv.zst": "75c281818ac55e5e77378a25e8ddd837f4e31cc8c5dc6628de71d4c10e9fb9bc",
-    "launch_data/nvidia_h200/gemm_launch_selection.manifest.json": "88d534d82f948267990cee7839e6791ab9f969ebf4613b79982c7b7faa9424ae",
     "serving_dataset/moe_expert_freq/deepseek-r1.npy": "f2f7d62f4d8c0ad4fa1d93655e1afb78af02259cb04b83192d4c2326c406740b",
     "serving_dataset/moe_expert_freq/gpt-oss-120b.npy": "420b4899ec1cb3fc89b391af06e79dac925d8c62f321cc1dc10bf38dec430a20",
     "serving_dataset/moe_expert_freq/gpt-oss-20b.npy": "c962a7e2ebbf34c1d2294cf4e6ca079a21ecfcc64cc50b5e8f41c97849cefe38",
@@ -291,79 +284,34 @@
     "serving_dataset/sharegpt/nvidia_a800/qwen3-8b/tp1_qps64/metrics.json": "186505784035f9169ea2047b356125786eba524a657377535e6faa77f0b016d7",
     "serving_dataset/sharegpt/nvidia_a800/qwen3-8b/tp1_qps64/requests.csv": "cb36b79edf5b2ff22c8c91f3eaf2557b9c66dc680a3c7f63edba7f769731b780",
     "serving_dataset/sharegpt/nvidia_a800/qwen3-8b/tp1_qps64/scheduler_steps.jsonl.zst": "1a8a04865718cebbd8478bd80d85b4541e8c3581691a66a78b59722ecc2ef889",
-    "serving_dataset/sharegpt/nvidia_h200/llama-3.1-8b/tp1_qps16/alignment_steps.json.zst": "fb5bd8ac05693be524021b33cdb22f408fd6e3ed908c421a9ee3dfc53a66463a",
-    "serving_dataset/sharegpt/nvidia_h200/llama-3.1-8b/tp1_qps16/manifest.json": "e0d902f202d1f1acc59c1c4977612954b2cc2a5b1d29f25a89470b334f795ef8",
-    "serving_dataset/sharegpt/nvidia_h200/llama-3.1-8b/tp1_qps16/metrics.json": "4f3d87b8667b1df7a64b07da6f29ed215c92eabf6fbda97c6bc245faf47e7f49",
     "serving_dataset/sharegpt/nvidia_h200/llama-3.1-8b/tp1_qps16/requests.csv": "f85c5db9b6e568906fd119d406f1be91c135afed551b4b0c00d5fdb1932a04eb",
     "serving_dataset/sharegpt/nvidia_h200/llama-3.1-8b/tp1_qps16/scheduler_steps.jsonl.zst": "0fcf46f997aae0683a026cdbd46b2fc8ef4ef6964f39af0de329fe729f3b353f",
-    "serving_dataset/sharegpt/nvidia_h200/llama-3.1-8b/tp1_qps4/alignment_steps.json.zst": "6b27f372b20e917981b20df9a69711d46d82ddda6b8106c7372c05147817c3b2",
-    "serving_dataset/sharegpt/nvidia_h200/llama-3.1-8b/tp1_qps4/manifest.json": "030931bac339995bde881cc8033c38b780a4c487ce43d0518db2c6f50846b070",
-    "serving_dataset/sharegpt/nvidia_h200/llama-3.1-8b/tp1_qps4/metrics.json": "8339eb16beaceb0cb7e3d17ce206897d7cb5a4a87cfac427c3350a6e5007f66b",
     "serving_dataset/sharegpt/nvidia_h200/llama-3.1-8b/tp1_qps4/requests.csv": "11bec2ddf6f24cc9cf62ab937fafde1973029998d8e19c303ea0e8490403a727",
     "serving_dataset/sharegpt/nvidia_h200/llama-3.1-8b/tp1_qps4/scheduler_steps.jsonl.zst": "70737519ad14e1024b0fc3e40c90b2db721d01de784c0ad9e5b1442c84825f1d",
-    "serving_dataset/sharegpt/nvidia_h200/llama-3.1-8b/tp1_qps64/alignment_steps.json.zst": "d7edb0ed66d05ec1f000fff51781abea2cbb5f6272b781c08255fed062cbf1ec",
-    "serving_dataset/sharegpt/nvidia_h200/llama-3.1-8b/tp1_qps64/manifest.json": "1bf14bf900c64c9a97beaf26544d02b49c1edbfe5faa1895bc3acba4ce11b23c",
-    "serving_dataset/sharegpt/nvidia_h200/llama-3.1-8b/tp1_qps64/metrics.json": "20fc0966c28fff01eb6f369423598a8756b9a4c681918d5a79cd2b5608b1b5fb",
     "serving_dataset/sharegpt/nvidia_h200/llama-3.1-8b/tp1_qps64/requests.csv": "6e626cda89cc4a59ad75291d345354085089f97680873c9150947dc5acc26d3a",
     "serving_dataset/sharegpt/nvidia_h200/llama-3.1-8b/tp1_qps64/scheduler_steps.jsonl.zst": "592d7a9a0491fb814f6f76aefda726062662adf8df28ca12c4ab189f473ab943",
-    "serving_dataset/sharegpt/nvidia_h200/qwen3-30b-a3b/tp2_ep2_qps1/alignment_steps.json.zst": "c496ae4e983ba604aaf54edd9824ad3ae3bbc45dde30f4c29b98d3535833b3b4",
-    "serving_dataset/sharegpt/nvidia_h200/qwen3-30b-a3b/tp2_ep2_qps1/manifest.json": "2ec5c250bb7118419d3f2aa08219b21d9e545fc2843571c822a08b252d33dbd8",
-    "serving_dataset/sharegpt/nvidia_h200/qwen3-30b-a3b/tp2_ep2_qps1/metrics.json": "e91fc9dc2cf62adbeb488657f0badc3083486d0e2d90eb8ea3c10d4782af2d68",
     "serving_dataset/sharegpt/nvidia_h200/qwen3-30b-a3b/tp2_ep2_qps1/requests.csv": "8eaf4091a0efa100c7c4c572a0285da61f720230bd284bccc82145f36c8982d1",
     "serving_dataset/sharegpt/nvidia_h200/qwen3-30b-a3b/tp2_ep2_qps1/scheduler_steps.jsonl.zst": "cb0d8a229c85dc52ae92b38f6b8cf4155241f446c7c06bd3f2372858e156cdfc",
-    "serving_dataset/sharegpt/nvidia_h200/qwen3-30b-a3b/tp2_ep2_qps16/alignment_steps.json.zst": "27d6facef1b66c7445d57d05d3a94104f13da250f0cd0d69be8f0710e82f8c1b",
-    "serving_dataset/sharegpt/nvidia_h200/qwen3-30b-a3b/tp2_ep2_qps16/manifest.json": "3b03d4ae42a8efac059e54b66df01dcc8ae2a08cf49e38eabe98e6fc681ed7b3",
-    "serving_dataset/sharegpt/nvidia_h200/qwen3-30b-a3b/tp2_ep2_qps16/metrics.json": "f2b98b971aac4062c032db3dee455848b4963ba9d055585779a33861ecee920e",
     "serving_dataset/sharegpt/nvidia_h200/qwen3-30b-a3b/tp2_ep2_qps16/requests.csv": "9d0d1f1d11c7fb39df2d386e6559f16354c13d97d3606aeb316a98bfa63e1148",
     "serving_dataset/sharegpt/nvidia_h200/qwen3-30b-a3b/tp2_ep2_qps16/scheduler_steps.jsonl.zst": "4ccb59d7f19265a04ecc184da0a78b91d73b88336c83bbc38e2935fb31925520",
-    "serving_dataset/sharegpt/nvidia_h200/qwen3-30b-a3b/tp2_ep2_qps4/alignment_steps.json.zst": "2992be29aa7b66c1a5b5e25a41de5bf7ca5f3d0e8ce01a402e82aa26e9fb671e",
-    "serving_dataset/sharegpt/nvidia_h200/qwen3-30b-a3b/tp2_ep2_qps4/manifest.json": "acd5ef59a3ab7627af9abd044630b3774057adbcc68a797bf8273a87da68f7c9",
-    "serving_dataset/sharegpt/nvidia_h200/qwen3-30b-a3b/tp2_ep2_qps4/metrics.json": "7700878367e85b3efef46e1d7bc8c7ecc11a200b27e6234b61082207378ae6a9",
     "serving_dataset/sharegpt/nvidia_h200/qwen3-30b-a3b/tp2_ep2_qps4/requests.csv": "8169e75193f4c2209bad0548d620d52e7872e347fb6a5a43a9277ae207a2733c",
     "serving_dataset/sharegpt/nvidia_h200/qwen3-30b-a3b/tp2_ep2_qps4/scheduler_steps.jsonl.zst": "77063e9bfea646fff23f63cd80bb2a55c349a94c11becebfbb4441ffaf5197b9",
-    "serving_dataset/sharegpt/nvidia_h200/qwen3-32b/tp2_ep1_qps1/alignment_steps.json.zst": "92b61ca465265acce466e3665fe0959275312f42e74b23960213e636aa033254",
-    "serving_dataset/sharegpt/nvidia_h200/qwen3-32b/tp2_ep1_qps1/manifest.json": "4990b03e938b448d4b0419af745aaabc33c1aaad43b9660b3470aba8145625ae",
-    "serving_dataset/sharegpt/nvidia_h200/qwen3-32b/tp2_ep1_qps1/metrics.json": "e4ae566a519323076db1010bf685b5c77b5db088a7cfa296f0776de18e63655d",
     "serving_dataset/sharegpt/nvidia_h200/qwen3-32b/tp2_ep1_qps1/requests.csv": "1f2f9123f8360a69eaeb5de8bb170826389d954728b78719c54075cac60d4239",
     "serving_dataset/sharegpt/nvidia_h200/qwen3-32b/tp2_ep1_qps1/scheduler_steps.jsonl.zst": "58239c4794087273842d5edc726bfc0b214dab6585b35b3f39f0f3bb539b20e2",
-    "serving_dataset/sharegpt/nvidia_h200/qwen3-32b/tp2_ep1_qps16/alignment_steps.json.zst": "195b940753526c279d95ca31652d22ec5c57a22ccc7c4a45f24bc224e3bc89d4",
-    "serving_dataset/sharegpt/nvidia_h200/qwen3-32b/tp2_ep1_qps16/manifest.json": "5aefa98f88c8eb818e2b0b287180660f4278252ac0b848b375fe85fcbaff39d7",
-    "serving_dataset/sharegpt/nvidia_h200/qwen3-32b/tp2_ep1_qps16/metrics.json": "02593d7d81338ea0c1d88d751134f98a28c0e47bbfbf6a7abf68c0f14a7a5033",
     "serving_dataset/sharegpt/nvidia_h200/qwen3-32b/tp2_ep1_qps16/requests.csv": "c7e7b56a2b13d738f249b3563370abc4ed3b823ff5b9dcb9f1a70b65f0d5cee7",
     "serving_dataset/sharegpt/nvidia_h200/qwen3-32b/tp2_ep1_qps16/scheduler_steps.jsonl.zst": "34fd5b843b918644c5c9902b6d2730b86b5bff5095b526f552b540a2837b92c4",
-    "serving_dataset/sharegpt/nvidia_h200/qwen3-32b/tp2_ep1_qps4/alignment_steps.json.zst": "a89e4411a57609922fdd6a2c7e092814f3068dd0fe873034299263e5db9a33e4",
-    "serving_dataset/sharegpt/nvidia_h200/qwen3-32b/tp2_ep1_qps4/manifest.json": "ff21c72dfbe51794bd6f54fe62d2cc389078d0b1295cb32532af55a5ee41b6aa",
-    "serving_dataset/sharegpt/nvidia_h200/qwen3-32b/tp2_ep1_qps4/metrics.json": "68e72b34f26c5b7a4a6df05545cec28a1e814008383285b5b84ca8665bf2f8f0",
     "serving_dataset/sharegpt/nvidia_h200/qwen3-32b/tp2_ep1_qps4/requests.csv": "d076ae4209284a622fe8eff8b8db0e8a82f4a246d81d1324ad94637fbdeb1f73",
     "serving_dataset/sharegpt/nvidia_h200/qwen3-32b/tp2_ep1_qps4/scheduler_steps.jsonl.zst": "a064fe77de8e47ff1da1296b77c148fbf5d34df583f75886b8e89702e66e273a",
-    "serving_dataset/sharegpt/nvidia_h200/qwen3-4b/tp1_qps16/alignment_steps.json.zst": "95344c862cb453c13cce4c6316408f27ff4fd20dc0bbb4f92d6720312f0aaacb",
-    "serving_dataset/sharegpt/nvidia_h200/qwen3-4b/tp1_qps16/manifest.json": "effb3c2617ea8be5af77addb13e1a794fcfb63b20e8d48090247ba6f99af47d6",
-    "serving_dataset/sharegpt/nvidia_h200/qwen3-4b/tp1_qps16/metrics.json": "3f26b44c981b07963d686e5657c10db686138cda41d6354e568c645d20860718",
     "serving_dataset/sharegpt/nvidia_h200/qwen3-4b/tp1_qps16/requests.csv": "ab02b9d540e9fd6d35d8fb612a2df32a5868f4bbe19696c103b32ec3139b78a4",
     "serving_dataset/sharegpt/nvidia_h200/qwen3-4b/tp1_qps16/scheduler_steps.jsonl.zst": "707ff147f1412c4ce8a28021a748a0d733cf67f73c72345369832d8f159327e3",
-    "serving_dataset/sharegpt/nvidia_h200/qwen3-4b/tp1_qps4/alignment_steps.json.zst": "cf998a9331fef4cfffdb8a5c62fe937d38390baaea61705950b5976edd60f169",
-    "serving_dataset/sharegpt/nvidia_h200/qwen3-4b/tp1_qps4/manifest.json": "4eed48b128414a43b614c62123c62c712cd89414672a30408b5b390f358201b8",
-    "serving_dataset/sharegpt/nvidia_h200/qwen3-4b/tp1_qps4/metrics.json": "29485ebd580f26f30de61d024d0c18018aaf83add6a55c83cbd3261982ebd862",
     "serving_dataset/sharegpt/nvidia_h200/qwen3-4b/tp1_qps4/requests.csv": "639df2b6aa0675df84a61f787fc2757506d5525eb2f7dc4d7e0badedca475d0f",
     "serving_dataset/sharegpt/nvidia_h200/qwen3-4b/tp1_qps4/scheduler_steps.jsonl.zst": "1f5f923e2406ca8269396a096a7e09dc39c62b09836ae410b92644c2a4450c96",
-    "serving_dataset/sharegpt/nvidia_h200/qwen3-4b/tp1_qps64/alignment_steps.json.zst": "14046ea3f08d431736bc6311b5ba4b3cc3993c83d68cb579c86de2a8f276f4b2",
-    "serving_dataset/sharegpt/nvidia_h200/qwen3-4b/tp1_qps64/manifest.json": "b10fb214e364bc7e4d1176692dd97b95b17656faf7b98812be2f10509b9063f3",
-    "serving_dataset/sharegpt/nvidia_h200/qwen3-4b/tp1_qps64/metrics.json": "319d920a493cc71a54f3650c43184e9136d626a7fd96f22cd6d8fba5492cef72",
     "serving_dataset/sharegpt/nvidia_h200/qwen3-4b/tp1_qps64/requests.csv": "e169977d6b55bc410d2be544f028b99d767fd5980c72f708954e53903747a563",
     "serving_dataset/sharegpt/nvidia_h200/qwen3-4b/tp1_qps64/scheduler_steps.jsonl.zst": "73076933bcf7dcaeacb61dce9e6b66846bb2f83decb92e0045d1297c166a2614",
-    "serving_dataset/sharegpt/nvidia_h200/qwen3-8b/tp1_qps16/alignment_steps.json.zst": "e6f9a6c9c17cd2f37e4e968419323344724a4ad66086a76e0608560c6f90c46e",
-    "serving_dataset/sharegpt/nvidia_h200/qwen3-8b/tp1_qps16/manifest.json": "021a3fa805c3532646864e0376ccd81713f2beb85c9b5e108ce278ce8197c7df",
-    "serving_dataset/sharegpt/nvidia_h200/qwen3-8b/tp1_qps16/metrics.json": "711ec9fdd1bc46cb6d93544f5538320721a3726e6154e7162e2d4e8fc0c3b621",
     "serving_dataset/sharegpt/nvidia_h200/qwen3-8b/tp1_qps16/requests.csv": "aefc90b259581b642ef1ff8f692c0dae11e6c82dd2f394b12bff7585771d7cc8",
     "serving_dataset/sharegpt/nvidia_h200/qwen3-8b/tp1_qps16/scheduler_steps.jsonl.zst": "07cb2a3efe556726975afc82d5664004d483a8ceff62bd55f0466b7689b5dda4",
-    "serving_dataset/sharegpt/nvidia_h200/qwen3-8b/tp1_qps4/alignment_steps.json.zst": "fe5e17a896b7af7a6bdf7646be09c6f3b217618c72f321080dcb655f11a216c3",
-    "serving_dataset/sharegpt/nvidia_h200/qwen3-8b/tp1_qps4/manifest.json": "65a9d1a4afef906f87d2eda5d4ccf15b0dd1f03e81a7316e3308acb2daa2934a",
-    "serving_dataset/sharegpt/nvidia_h200/qwen3-8b/tp1_qps4/metrics.json": "537664291a896429d7480574330422ca2abfdba564e98fe896988fdd6919c66b",
     "serving_dataset/sharegpt/nvidia_h200/qwen3-8b/tp1_qps4/requests.csv": "a42ae9abb7cc196040213b27636eb480214cd9bc8a3361fbc1ac5f825193d47d",
     "serving_dataset/sharegpt/nvidia_h200/qwen3-8b/tp1_qps4/scheduler_steps.jsonl.zst": "a61b6c8b523d430fe316e34c7690d2f20ef0d11dd52642ebeee07f0a2b95a03c",
-    "serving_dataset/sharegpt/nvidia_h200/qwen3-8b/tp1_qps64/alignment_steps.json.zst": "039b40c83b622156e25d521d4e238015dc1b830d2e621bbf8c3c2c2b8a68ce6c",
-    "serving_dataset/sharegpt/nvidia_h200/qwen3-8b/tp1_qps64/manifest.json": "60cc45a30b939376bd2b43bb32af79b766ef2e834544fdc412bcac21aab463e3",
-    "serving_dataset/sharegpt/nvidia_h200/qwen3-8b/tp1_qps64/metrics.json": "fb395a28c7886685d9cb3ce031cdd2baa82788a8f9e3957937931f632f5bf448",
     "serving_dataset/sharegpt/nvidia_h200/qwen3-8b/tp1_qps64/requests.csv": "cb36b79edf5b2ff22c8c91f3eaf2557b9c66dc680a3c7f63edba7f769731b780",
     "serving_dataset/sharegpt/nvidia_h200/qwen3-8b/tp1_qps64/scheduler_steps.jsonl.zst": "79abe052e0f9d97b20cfe4c37feef523ea010fbf1c37895ba785a8069bdd3937",
     "serving_dataset/sharegpt_pd_disaggregated/ascend_910b/llama-3.1-8b/tp1_qps16/manifest.json": "7b1eff95ceadf228a3cc83a456c02d662ab4568293c8f9298437db93fd9631da",
@@ -636,31 +584,356 @@
     "serving_dataset/sharegpt_pd_disaggregated/nvidia_a800/qwen3-8b/tp1_qps64/requests.csv": "cb36b79edf5b2ff22c8c91f3eaf2557b9c66dc680a3c7f63edba7f769731b780",
     "serving_dataset/sharegpt_pd_disaggregated/nvidia_a800/qwen3-8b/tp1_qps64/scheduler_steps_decode.jsonl.zst": "3b3d0ad7a3885385f2161acf95539238e5c0bc57444dc406101cac33a000c885",
     "serving_dataset/sharegpt_pd_disaggregated/nvidia_a800/qwen3-8b/tp1_qps64/scheduler_steps_prefill.jsonl.zst": "21513e69d1a0124954191f0b6637ee67f078050978c64c0c5b72626ae8bde10b",
-    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c16/manifest.json": "03dc3143c71e8a7383fdc90d0c4b88d5cfb0ce01d3896ae05ffba25d93b78d6e",
     "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c16/requests.csv": "39a436f60378130daf23967dee8bb4712d776bb41569221f56579881a6c23e93",
-    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c16/runtime_memory_policy_colocated.json": "86fe448eca761672add61f7051e629a44235528cd5772503f3413ca9fbedd76f",
-    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c16/runtime_memory_policy_pd_disagg.json": "24bd3c5d1fc960ae62f19feb5864b6d757bdbeeef07f1e93da5107e316424965",
     "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c16/warmup_requests.csv": "70e01c56d4f27ed71e3ce2088550bd84e0376c02c25e521b6bcbdff1e2c2c2f2",
-    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c32/manifest.json": "fc6ad23b88e767cd1eabc394dce8ab28561bfd76f2ec3a3dafc06c0b8096974d",
     "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c32/requests.csv": "72751bf771cb5bdeb4529a20cc5fee3d97a9d124138706483ab5256b0c2f6b1b",
-    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c32/runtime_memory_policy_colocated.json": "3a6e34ef757ff57b857bdff6d985e09fc78b20be8d3ea1db349249eae8d5dc65",
-    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c32/runtime_memory_policy_pd_disagg.json": "67be4ad37ab23f78007274e195d2a0e685bd5aacc60f6dd022d2d4981933ea48",
     "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c32/warmup_requests.csv": "8498af500a8d41ba2c2f3d711dde3a0c4e83358f466b5c8e8eef15cf287f295c",
-    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c4/manifest.json": "b4c9daac6dddf722c21f5fc5e8613f27c093774d3973d56cd36aa731074da029",
     "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c4/requests.csv": "3548f213de6cc0cff85a9e379b53ad7ecf60772764028f678fea0fdb9fc22c84",
-    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c4/runtime_memory_policy_colocated.json": "ab16e17724830fe724e21127e0fc1d7126dd8a72b478d121aec415516b92368b",
-    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c4/runtime_memory_policy_pd_disagg.json": "19bfde0e5ac89fe19fdd269a7cccf8227609aa7c34177facddffad5e7a0b3ca7",
     "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c4/warmup_requests.csv": "8fc02ea51cad39f0f29b53b8315f255fcccec1665c63b59c007791443778c2b7",
-    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c64/manifest.json": "7d395277c1a6274faff198ad49dc35bafbf85a46e3e05b5717641fcfdbb1c927",
     "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c64/requests.csv": "239eb71b9380dd3e376ade7b9372e42b64e7540a330e26c3fc49e4f456a96fdc",
-    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c64/runtime_memory_policy_colocated.json": "4dd25d3218bed4d5005f2d3bb611cbe288440b847d2b7872f9c89ea8d0f0b9b4",
-    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c64/runtime_memory_policy_pd_disagg.json": "bc8d02970bd68e91b7aa14cbd8a9d8a7302ff34d763e56e01d93a6acf6d147be",
     "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c64/warmup_requests.csv": "1b27924868f16d1e0298ea042a46c4095909595a4b8192e2db4bf0688df9978f",
-    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c8/manifest.json": "cd32ec4d8351159e50d304fbdd6313452a3ce87b04bf5faef43931f0cebbb44b",
     "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c8/requests.csv": "da22c348244531f79447d0f5298c2702632e9f4e2f6d9dffab76c7c82b1d59f1",
-    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c8/runtime_memory_policy_colocated.json": "02010e10ee1bd733aed28bea78d2cbd83cfaf918d2646bcd14b20f24fd5558ab",
-    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c8/runtime_memory_policy_pd_disagg.json": "c0cf5bc55e946e1a3bd11daf284a74e0501d86c8a3b3319a82c08c7bb4c13dc2",
     "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c8/warmup_requests.csv": "ec8a422f4183bff60436c47501e54e73b00cba2d126081b33ebf34c2be1244f9"
   },
-  "unavailable_lfs_files": []
+  "unavailable_lfs_files": [
+    "kernel_dataset/nvidia_h200/flash_attn.json.zst",
+    "kernel_dataset/nvidia_h200/fused_moe.json.zst",
+    "kernel_dataset/nvidia_h200/gemm.json.zst",
+    "kernel_dataset/nvidia_h200/vector.json.zst",
+    "launch_data/nvidia_h200/gemm_launch_selection.csv.zst",
+    "launch_data/nvidia_h200/gemm_launch_selection.manifest.json",
+    "serving_dataset/sharegpt/nvidia_h200/llama-3.1-8b/tp1_qps16/alignment_steps.json.zst",
+    "serving_dataset/sharegpt/nvidia_h200/llama-3.1-8b/tp1_qps16/manifest.json",
+    "serving_dataset/sharegpt/nvidia_h200/llama-3.1-8b/tp1_qps16/metrics.json",
+    "serving_dataset/sharegpt/nvidia_h200/llama-3.1-8b/tp1_qps4/alignment_steps.json.zst",
+    "serving_dataset/sharegpt/nvidia_h200/llama-3.1-8b/tp1_qps4/manifest.json",
+    "serving_dataset/sharegpt/nvidia_h200/llama-3.1-8b/tp1_qps4/metrics.json",
+    "serving_dataset/sharegpt/nvidia_h200/llama-3.1-8b/tp1_qps64/alignment_steps.json.zst",
+    "serving_dataset/sharegpt/nvidia_h200/llama-3.1-8b/tp1_qps64/manifest.json",
+    "serving_dataset/sharegpt/nvidia_h200/llama-3.1-8b/tp1_qps64/metrics.json",
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-30b-a3b/tp2_ep2_qps1/alignment_steps.json.zst",
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-30b-a3b/tp2_ep2_qps1/manifest.json",
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-30b-a3b/tp2_ep2_qps1/metrics.json",
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-30b-a3b/tp2_ep2_qps16/alignment_steps.json.zst",
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-30b-a3b/tp2_ep2_qps16/manifest.json",
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-30b-a3b/tp2_ep2_qps16/metrics.json",
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-30b-a3b/tp2_ep2_qps4/alignment_steps.json.zst",
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-30b-a3b/tp2_ep2_qps4/manifest.json",
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-30b-a3b/tp2_ep2_qps4/metrics.json",
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-32b/tp2_ep1_qps1/alignment_steps.json.zst",
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-32b/tp2_ep1_qps1/manifest.json",
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-32b/tp2_ep1_qps1/metrics.json",
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-32b/tp2_ep1_qps16/alignment_steps.json.zst",
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-32b/tp2_ep1_qps16/manifest.json",
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-32b/tp2_ep1_qps16/metrics.json",
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-32b/tp2_ep1_qps4/alignment_steps.json.zst",
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-32b/tp2_ep1_qps4/manifest.json",
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-32b/tp2_ep1_qps4/metrics.json",
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-4b/tp1_qps16/alignment_steps.json.zst",
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-4b/tp1_qps16/manifest.json",
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-4b/tp1_qps16/metrics.json",
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-4b/tp1_qps4/alignment_steps.json.zst",
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-4b/tp1_qps4/manifest.json",
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-4b/tp1_qps4/metrics.json",
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-4b/tp1_qps64/alignment_steps.json.zst",
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-4b/tp1_qps64/manifest.json",
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-4b/tp1_qps64/metrics.json",
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-8b/tp1_qps16/alignment_steps.json.zst",
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-8b/tp1_qps16/manifest.json",
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-8b/tp1_qps16/metrics.json",
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-8b/tp1_qps4/alignment_steps.json.zst",
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-8b/tp1_qps4/manifest.json",
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-8b/tp1_qps4/metrics.json",
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-8b/tp1_qps64/alignment_steps.json.zst",
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-8b/tp1_qps64/manifest.json",
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-8b/tp1_qps64/metrics.json",
+    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c16/manifest.json",
+    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c16/runtime_memory_policy_colocated.json",
+    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c16/runtime_memory_policy_pd_disagg.json",
+    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c32/manifest.json",
+    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c32/runtime_memory_policy_colocated.json",
+    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c32/runtime_memory_policy_pd_disagg.json",
+    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c4/manifest.json",
+    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c4/runtime_memory_policy_colocated.json",
+    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c4/runtime_memory_policy_pd_disagg.json",
+    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c64/manifest.json",
+    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c64/runtime_memory_policy_colocated.json",
+    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c64/runtime_memory_policy_pd_disagg.json",
+    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c8/manifest.json",
+    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c8/runtime_memory_policy_colocated.json",
+    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c8/runtime_memory_policy_pd_disagg.json"
+  ],
+  "local_adapter_changes": {
+    "src/serving/backend/vllm_scheduler_process.py": "Accept the audited official vLLM 0.11.0 Linux x86-64 wheel, with unchanged per-file checks.",
+    "src/serving/execution.py": "Expose the bound plan and the local predictor for the external event executor.",
+    "src/serving/kernel_lowering/kernel_predict.py": "Select local calls while reusing the native predictor and memo.",
+    "src/serving/kernel_lowering/execution_timeline.py": "Expose eager Host launch readiness from the native Host recurrence.",
+    "src/serving/host_timing.py": "Resolve checked-in Host calibration relative to the embedded snapshot marker."
+  },
+  "unavailable_lfs_objects": {
+    "kernel_dataset/nvidia_h200/flash_attn.json.zst": {
+      "sha256": "83b5cc575e4d213faea569b7c1ca0c565e50e7e9c90988df238e6c58ba569672",
+      "size_bytes": 140884
+    },
+    "kernel_dataset/nvidia_h200/fused_moe.json.zst": {
+      "sha256": "f68d24e9d23854628d94dbf0de6df99f39ec467b458f9d50f474b79620bd7610",
+      "size_bytes": 212158
+    },
+    "kernel_dataset/nvidia_h200/gemm.json.zst": {
+      "sha256": "5b3cee07488af33833c718a6e8bb223e1792cd8c5caff8be2aeade0b6db9c2c5",
+      "size_bytes": 112927
+    },
+    "kernel_dataset/nvidia_h200/vector.json.zst": {
+      "sha256": "c39085b6bfee6466f2b9292e0ba1e3ad2653342b2c5836b2f9e313e1504af106",
+      "size_bytes": 71854
+    },
+    "launch_data/nvidia_h200/gemm_launch_selection.csv.zst": {
+      "sha256": "95d7bec2a3f72b15db5392ea5b4e14ce8669fcde604b8e9014db3b7a14b2fcd4",
+      "size_bytes": 3085612
+    },
+    "launch_data/nvidia_h200/gemm_launch_selection.manifest.json": {
+      "sha256": "ff1c701055d0f8fa1a6b8ef51a175ad0c71da61bde2d4e729c4609f02d9dbd67",
+      "size_bytes": 4939
+    },
+    "serving_dataset/sharegpt/nvidia_h200/llama-3.1-8b/tp1_qps16/alignment_steps.json.zst": {
+      "sha256": "fbf9ad751dd3d7705e285b41efa21285fde3a0eedb07406dc4faa52133757934",
+      "size_bytes": 16088
+    },
+    "serving_dataset/sharegpt/nvidia_h200/llama-3.1-8b/tp1_qps16/manifest.json": {
+      "sha256": "3f95c98f69c1672d76d09019c4964010d9f0873442f11bb1a2aa87111b4b674e",
+      "size_bytes": 10710
+    },
+    "serving_dataset/sharegpt/nvidia_h200/llama-3.1-8b/tp1_qps16/metrics.json": {
+      "sha256": "e39ea6cf14bb174ccab17161497f5df84083de4b114178db2f23c924a28d0791",
+      "size_bytes": 24587
+    },
+    "serving_dataset/sharegpt/nvidia_h200/llama-3.1-8b/tp1_qps4/alignment_steps.json.zst": {
+      "sha256": "681c8cd3d981a47873d96fc96106adb920c255db7a19e3ec52ddf195f2bcb245",
+      "size_bytes": 15613
+    },
+    "serving_dataset/sharegpt/nvidia_h200/llama-3.1-8b/tp1_qps4/manifest.json": {
+      "sha256": "bf6cde8472a055353b5b1b28959e015191417766ad3439f8746188ab9448e6bf",
+      "size_bytes": 10714
+    },
+    "serving_dataset/sharegpt/nvidia_h200/llama-3.1-8b/tp1_qps4/metrics.json": {
+      "sha256": "b9cc0972152984c8fb83b9fdf644bd94ec51315484361afda31723be817aae1f",
+      "size_bytes": 24626
+    },
+    "serving_dataset/sharegpt/nvidia_h200/llama-3.1-8b/tp1_qps64/alignment_steps.json.zst": {
+      "sha256": "25133400e1146b647bf29decd9dabc18d4c8b8725c3bf9578cc55693fd3d61e3",
+      "size_bytes": 16111
+    },
+    "serving_dataset/sharegpt/nvidia_h200/llama-3.1-8b/tp1_qps64/manifest.json": {
+      "sha256": "c86487c5076659342e7502d7cd388230f9189c1c462fbe750d06fb4a2e732d28",
+      "size_bytes": 10706
+    },
+    "serving_dataset/sharegpt/nvidia_h200/llama-3.1-8b/tp1_qps64/metrics.json": {
+      "sha256": "15e96e4d62b0351a0902ecfe0521aa3a76df73c89a59c0d786fe1c67e5755b23",
+      "size_bytes": 24604
+    },
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-30b-a3b/tp2_ep2_qps1/alignment_steps.json.zst": {
+      "sha256": "6c4e06b308abc2c664cc7e754e4dd19ec6fbacf4eaeb30cf1d1df2c19308b43d",
+      "size_bytes": 87322
+    },
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-30b-a3b/tp2_ep2_qps1/manifest.json": {
+      "sha256": "f9cdf767672dcabf9e96514d4bdbc1a3ac9945510abc24b81860c29a621548fc",
+      "size_bytes": 11208
+    },
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-30b-a3b/tp2_ep2_qps1/metrics.json": {
+      "sha256": "1da27a7fdf5462a54b4218223b21bceb55cc34386179d17eb917b6ed846c9426",
+      "size_bytes": 24626
+    },
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-30b-a3b/tp2_ep2_qps16/alignment_steps.json.zst": {
+      "sha256": "e5c4a8e2b3e9dc32eded673f78e0025403fc277d244ed8dc4c992587f4ab9c1e",
+      "size_bytes": 84525
+    },
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-30b-a3b/tp2_ep2_qps16/manifest.json": {
+      "sha256": "72b7e90a2cda86c190ed837bd6e29f4f89da236929df2b396cff646e49b80dce",
+      "size_bytes": 11201
+    },
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-30b-a3b/tp2_ep2_qps16/metrics.json": {
+      "sha256": "dd452e81a8524fba30e0a9074937a3f6879fbbcd875287b19aa0febfa37fed92",
+      "size_bytes": 24631
+    },
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-30b-a3b/tp2_ep2_qps4/alignment_steps.json.zst": {
+      "sha256": "c94e5e1e51fda3fa9c09ba324155fd1b5800ab02f83e565540a35c1df8e72f9e",
+      "size_bytes": 88402
+    },
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-30b-a3b/tp2_ep2_qps4/manifest.json": {
+      "sha256": "c33759cdf5299f593133b0f009fcf0acb15cb0f0f95db37a94211d4c15af87fc",
+      "size_bytes": 11201
+    },
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-30b-a3b/tp2_ep2_qps4/metrics.json": {
+      "sha256": "7ace2f79e712d61ba2b35c39015fffdc1bb02060cf2b67446c2dd45fd317e406",
+      "size_bytes": 24597
+    },
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-32b/tp2_ep1_qps1/alignment_steps.json.zst": {
+      "sha256": "0ddea48971b98ab867bcac44a81af3ab2d6010f6039c3e48f5d3e1b10773c64a",
+      "size_bytes": 43847
+    },
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-32b/tp2_ep1_qps1/manifest.json": {
+      "sha256": "1336d3e45f4aa0a017110dbd0ccc29dbcbc4a6bdb776af89edbe57f12577534f",
+      "size_bytes": 11192
+    },
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-32b/tp2_ep1_qps1/metrics.json": {
+      "sha256": "feeb356b5acf082b45c2e738c663e91cc49e4f44c5819c410e4d5dc0dc6f6d6d",
+      "size_bytes": 24678
+    },
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-32b/tp2_ep1_qps16/alignment_steps.json.zst": {
+      "sha256": "fca8e494a6540add98d678c852359bce76ce3d44e11920a141e9500ba729a261",
+      "size_bytes": 44777
+    },
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-32b/tp2_ep1_qps16/manifest.json": {
+      "sha256": "370c3397b14388cabaee461a6e5f332bfb0c4dcb93827c9fa2587600a6bc3ade",
+      "size_bytes": 11189
+    },
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-32b/tp2_ep1_qps16/metrics.json": {
+      "sha256": "c4ca2aa082276e3abfc3af7ae237fc65801bc998508bea6fd618f6385aa4d274",
+      "size_bytes": 24638
+    },
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-32b/tp2_ep1_qps4/alignment_steps.json.zst": {
+      "sha256": "09d7d378eae3c9eb6900a0f0b5d1fa374d02d5f88b8135fb40ef0f32303ea88f",
+      "size_bytes": 45488
+    },
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-32b/tp2_ep1_qps4/manifest.json": {
+      "sha256": "17badbf72e605a75f82864e624588c64199d9db4b2d11221bdf938e00ed62b11",
+      "size_bytes": 11187
+    },
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-32b/tp2_ep1_qps4/metrics.json": {
+      "sha256": "72256b1f6e89b4eb9d070ea50fcfa001d655aacc26ac728b4079c2e3c16863b0",
+      "size_bytes": 24669
+    },
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-4b/tp1_qps16/alignment_steps.json.zst": {
+      "sha256": "171bb818a7238a34cc768b8fb44a0e70461552804065fdf6de05cd2d9e4c493f",
+      "size_bytes": 18874
+    },
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-4b/tp1_qps16/manifest.json": {
+      "sha256": "8ed1ef69aa62c812e24a429742450fa4e4e658d1724bdb082ca92ac939e9a761",
+      "size_bytes": 10699
+    },
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-4b/tp1_qps16/metrics.json": {
+      "sha256": "983cf637b620ccbaef55bb37213561bd8ce913f3d7409357794f07e561b62ce5",
+      "size_bytes": 24648
+    },
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-4b/tp1_qps4/alignment_steps.json.zst": {
+      "sha256": "9b9dad9818a22d6a99466c6be1693e5934151d7be08e421270f3c2f314757178",
+      "size_bytes": 17583
+    },
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-4b/tp1_qps4/manifest.json": {
+      "sha256": "840b575cdeccc6aa077019f1208d9cfc5cd6201f0bb4ae74ba994a06b454644a",
+      "size_bytes": 10701
+    },
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-4b/tp1_qps4/metrics.json": {
+      "sha256": "9ea43975a5be78937be74f4d0ded8fe0c39895e669735966da10b1c2ba1befbe",
+      "size_bytes": 24681
+    },
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-4b/tp1_qps64/alignment_steps.json.zst": {
+      "sha256": "8848ecf1b37bf9f0ae13f08c4ad96a18d9d8437b93e5e8f5e4eb5ab4fc39333a",
+      "size_bytes": 18695
+    },
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-4b/tp1_qps64/manifest.json": {
+      "sha256": "eaffe4c9ba87ec65f2041504bdda7fbe39ad4800e8b1487bb5618dd58afa9970",
+      "size_bytes": 10695
+    },
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-4b/tp1_qps64/metrics.json": {
+      "sha256": "51f69690d0d0fcc373ce41f4897971af0629d1ca7342fc99b0dda63309c4bfe2",
+      "size_bytes": 24612
+    },
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-8b/tp1_qps16/alignment_steps.json.zst": {
+      "sha256": "067158ceee10734ec492a91160bd621e4fc56f4d4eeab6ad64e69909291c6ef0",
+      "size_bytes": 18059
+    },
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-8b/tp1_qps16/manifest.json": {
+      "sha256": "d052bffa8fb146a72568d69098448fa0dd4ea2df8e41b4e176f083e4efaa36c8",
+      "size_bytes": 10700
+    },
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-8b/tp1_qps16/metrics.json": {
+      "sha256": "a0f0eb8a6f852ef8dfb7b5e6b2f4b986a11a4e2f89063d8c047073f029b90376",
+      "size_bytes": 24611
+    },
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-8b/tp1_qps4/alignment_steps.json.zst": {
+      "sha256": "dde5ecc78d5d9a4a412015f108dd618f42e9d0cb591ae0bd41b90d11489ff0a4",
+      "size_bytes": 16411
+    },
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-8b/tp1_qps4/manifest.json": {
+      "sha256": "50f485441f32c004d91a552bd5cdc1c5bcebd1a8549ccf8bb27c38124994e31e",
+      "size_bytes": 10698
+    },
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-8b/tp1_qps4/metrics.json": {
+      "sha256": "229fefa25c1c19f6f4da29b15f27dee178e91ab0ef4ca46043c88491d81d67d1",
+      "size_bytes": 24620
+    },
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-8b/tp1_qps64/alignment_steps.json.zst": {
+      "sha256": "8eece38006d09e74b43cabf8a52dd9a1a5b205407802fdf8f946392049dde04a",
+      "size_bytes": 18323
+    },
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-8b/tp1_qps64/manifest.json": {
+      "sha256": "1f41cf0315b50618924ee6489ea7c6be5a69de4e9d820a8168ab7099466a497b",
+      "size_bytes": 10698
+    },
+    "serving_dataset/sharegpt/nvidia_h200/qwen3-8b/tp1_qps64/metrics.json": {
+      "sha256": "bc0943eceb81d3d39b796b96502d549a32d8612aad9bd3793cec7fd83fe53018",
+      "size_bytes": 24596
+    },
+    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c16/manifest.json": {
+      "sha256": "61b452a67977ece93c6c2af0911fbcf159af826489b31532008386c9265103da",
+      "size_bytes": 1928
+    },
+    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c16/runtime_memory_policy_colocated.json": {
+      "sha256": "f89e347ebcfd66c04ae6e4f3a1153e1b7f01593aa370869e6bb8f4cddfa7e492",
+      "size_bytes": 2969
+    },
+    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c16/runtime_memory_policy_pd_disagg.json": {
+      "sha256": "51084f2ec3bf5f3ce254c5ab9bda6e3a943b8c3c934a7169dbd8d910f5331a63",
+      "size_bytes": 5836
+    },
+    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c32/manifest.json": {
+      "sha256": "1e079e041028e76c32dceae0d5f0d3c2418671463925d7d3480df1dd1514217b",
+      "size_bytes": 1928
+    },
+    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c32/runtime_memory_policy_colocated.json": {
+      "sha256": "03d5bbbde245832a8eba4fc2771aa18a832697abe6f74659d42b635fb993397f",
+      "size_bytes": 2969
+    },
+    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c32/runtime_memory_policy_pd_disagg.json": {
+      "sha256": "01ce087a44b0426ce8ec9e144d3946036a187be848d1fc935b7f1301d995f9d6",
+      "size_bytes": 5836
+    },
+    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c4/manifest.json": {
+      "sha256": "3bd1690058c7104d97eb69788e51ea511b52ddc08b249dabaebf9bedfffe0743",
+      "size_bytes": 1925
+    },
+    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c4/runtime_memory_policy_colocated.json": {
+      "sha256": "c737c8566b806ad4529c172c61582b66fec7a38650dfcc21334d62fe64d211a2",
+      "size_bytes": 2968
+    },
+    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c4/runtime_memory_policy_pd_disagg.json": {
+      "sha256": "a1967fb4b33ee8a6a65ffb69dc22542863a82571c82dfdcdd81c0084e5a95922",
+      "size_bytes": 5834
+    },
+    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c64/manifest.json": {
+      "sha256": "62df9828c70b5e959a255d2d20dc21862ccec83658281238bcebacbf28fb6e85",
+      "size_bytes": 1929
+    },
+    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c64/runtime_memory_policy_colocated.json": {
+      "sha256": "31772e335314a51192a8eed56d717aed5594162b1c6318b5c9c5358073a87620",
+      "size_bytes": 2969
+    },
+    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c64/runtime_memory_policy_pd_disagg.json": {
+      "sha256": "3c3e8ff819e8b154e446e753ec4689cb6faabbc4287b4b702d3f48e2e80d3cc1",
+      "size_bytes": 5836
+    },
+    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c8/manifest.json": {
+      "sha256": "d4e4df35d1b185a61bc6d1728ae59de80425c395ea40974c6669660494be82a9",
+      "size_bytes": 1925
+    },
+    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c8/runtime_memory_policy_colocated.json": {
+      "sha256": "7dcba0d3bf1aca78d4cfc3c8cc3e3664fc479d1a8e168c7aec856f7fb929da5f",
+      "size_bytes": 2968
+    },
+    "serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1/c8/runtime_memory_policy_pd_disagg.json": {
+      "sha256": "2e6de72ddad24ab13f7954169111218a0ee145a2647badaf83db405f33c83369",
+      "size_bytes": 5834
+    }
+  }
 }

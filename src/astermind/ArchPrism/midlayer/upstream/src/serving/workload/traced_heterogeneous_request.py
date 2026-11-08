@@ -16,7 +16,8 @@ from .workload_graph import WorkloadEdge, WorkloadGraph, WorkloadKind, WorkloadN
 class FlashHeterogeneousRequest:
     """Reusable prefill/PD/decode virtual program; no scheduling or time stub."""
 
-    def __init__(self, model, *, input_ids, output_tokens, fpga_cards=8, root_seed=0):
+    def __init__(self, model, *, input_ids, output_tokens, fpga_cards=8, root_seed=0,
+            gpu_hardware_id="hygon_bw1100"):
         if type(output_tokens) is not int or output_tokens < 1:
             raise ValueError("heterogeneous request requires at least one output token")
         if not isinstance(input_ids, tuple) or not input_ids:
@@ -25,8 +26,10 @@ class FlashHeterogeneousRequest:
         if context > model.max_position_embeddings:
             raise ValueError("heterogeneous request exceeds the checkpoint context")
         self.model, self.input_ids, self.output_tokens = model, input_ids, output_tokens
+        self.gpu_hardware_id = gpu_hardware_id
         self.fpga_cards, self.root_seed, self.max_context_tokens = fpga_cards, root_seed, context
-        self.deployment, self.traces, _, _ = _flash_heterogeneous_placement(model, 1, 1, fpga_cards, root_seed, 0)
+        self.deployment, self.traces, _, _ = _flash_heterogeneous_placement(
+            model, 1, 1, fpga_cards, root_seed, 0, gpu_hardware_id)
         self.prefill_graph = None
         self.prefill_traces = ()
         self.prefill_owners = ()
@@ -42,10 +45,12 @@ class FlashHeterogeneousRequest:
         graph, traces, deployment, outputs = trace_flash_heterogeneous_prefill(self.model,
             input_ids=self.input_ids, root_seed=self.root_seed, rank_start=len(self.traces),
             max_context_tokens=self.max_context_tokens,
+            gpu_hardware_id=self.gpu_hardware_id,
             state_observer=lambda trace, layers: owners.append((trace, layers)))
         self.prefill_graph, self.prefill_traces, self.prefill_owners = graph, traces, tuple(owners)
         self.deployment = replace(self.deployment, deployment_id=self.deployment.deployment_id + ":request",
-            worker_pools={**self.deployment.worker_pools, **deployment.worker_pools})
+            worker_pools={**self.deployment.worker_pools, **deployment.worker_pools},
+            data_parallel_groups={**self.deployment.data_parallel_groups, **deployment.data_parallel_groups})
         self.emitted_tokens = 1
         self._prefill_output = outputs[0]
         self.step_records.append({"phase": "prefill", "query_tokens": len(self.input_ids),
@@ -115,7 +120,8 @@ class FlashHeterogeneousRequest:
         kv_length = self.decode_state.kv_length + 1
         result = trace_flash_heterogeneous_decode_layers(self.model, fpga_cards=self.fpga_cards,
             root_seed=self.root_seed, layer_count=self.model.num_hidden_layers, kv_length=kv_length,
-            include_model_boundary=True, execution_state=self.decode_state)
+            include_model_boundary=True, execution_state=self.decode_state,
+            gpu_hardware_id=self.gpu_hardware_id)
         self.emitted_tokens += 1
         self.step_records.append({"phase": "decode", "query_tokens": 1, "kv_length": kv_length, "generated_tokens": 1})
         return result.outputs[0]
@@ -146,7 +152,7 @@ class FlashHeterogeneousBatchRequest:
     """
 
     def __init__(self, model, *, prompt_tokens, output_tokens, concurrency,
-            microbatches, fpga_cards=8, root_seed=0):
+            microbatches, fpga_cards=8, root_seed=0, gpu_hardware_id="hygon_bw1100"):
         if (type(prompt_tokens) is not int or prompt_tokens < 1
                 or type(output_tokens) is not int or output_tokens < 1):
             raise ValueError("fixed request lengths must be positive integers")
@@ -154,17 +160,19 @@ class FlashHeterogeneousBatchRequest:
         if context > model.max_position_embeddings:
             raise ValueError("fixed requests exceed the checkpoint context")
         self.model, self.prompt_tokens, self.output_tokens = model, prompt_tokens, output_tokens
+        self.gpu_hardware_id = gpu_hardware_id
         self.concurrency, self.microbatches = concurrency, microbatches
         self.fpga_cards, self.root_seed = fpga_cards, root_seed
         self.max_context_tokens = context
         self.deployment, self.traces, _, self.batches = _flash_heterogeneous_placement(
-            model, concurrency, microbatches, fpga_cards, root_seed, 0)
+            model, concurrency, microbatches, fpga_cards, root_seed, 0, gpu_hardware_id)
         self.groups = tuple((0, gpu, tuple(t for t in range(concurrency) if t % 8 == gpu))
             for gpu in range(min(8, concurrency)))
         self.decode_states = []
         self.emitted_tokens = 0
         self.handoff_bytes = 0
         self._preparing = False
+        self._pending_prefill_group = False
         self._pending_step = False
 
     def _graph(self):
@@ -174,10 +182,12 @@ class FlashHeterogeneousBatchRequest:
         return graph
 
     def _batch_node(self, node):
-        return replace(node, attributes={**node.attributes,
+        updates = {
             "heterogeneous_request_id": "fixed_batch",
             "heterogeneous_request_concurrency": self.concurrency,
-            "heterogeneous_request_microbatches": self.microbatches})
+            "heterogeneous_request_microbatches": self.microbatches}
+        return (node.with_updates({}, updates, compose=True) if "_module_source_frame" in node.__dict__
+            else node.with_attributes({**node.attributes, **updates}))
 
     def prepare(self):
         """Yield complete TP8 Prefill plus full-arena PD for each local group."""
@@ -193,9 +203,11 @@ class FlashHeterogeneousBatchRequest:
                 self.model, input_ids=ids, request_q_lens=(self.prompt_tokens,) * len(local),
                 root_seed=self.root_seed, rank_start=len(self.traces),
                 max_context_tokens=self.max_context_tokens, namespace="heterogeneous-prefill:" + prefix,
+                gpu_hardware_id=self.gpu_hardware_id,
                 state_observer=lambda trace, layers: owners.append((trace, layers)))
             self.deployment = replace(self.deployment,
-                worker_pools={**self.deployment.worker_pools, **placement.worker_pools})
+                worker_pools={**self.deployment.worker_pools, **placement.worker_pools},
+                data_parallel_groups={**self.deployment.data_parallel_groups, **placement.data_parallel_groups})
             source, layers = owners[0]
             frontier = outputs[0]
             cache_tensors = tuple(tuple((role, FlashHeterogeneousRequest._handoff_tensor(self, tensor,
@@ -217,11 +229,24 @@ class FlashHeterogeneousBatchRequest:
                 (*graph.nodes, *(n for t in self.traces for n in t._nodes.values()))),
                 (*graph.edges, *(e for t in self.traces for e in t._capture_program_edges())))
             joined.topological_order()
+            self._pending_prefill_group = True
             yield HeterogeneousMoETrace(joined, (*prefill_traces, *self.traces), self.deployment,
                 (), (token,), (local,))
-            self._retire_traces()
+            if self._pending_prefill_group:
+                self.retire_prepared_group()
         self.emitted_tokens = 1
         self._preparing = False
+
+    def retire_prepared_group(self):
+        """Release a priced/aborted group while preserving its live cache ports.
+
+        Legacy iteration still acknowledges on resume; the common execution
+        owner can acknowledge before leaving its source metadata scope.
+        """
+        if not self._preparing or not self._pending_prefill_group:
+            raise ValueError("no prepared Prefill/PD group is waiting for retirement")
+        self._retire_traces()
+        self._pending_prefill_group = False
 
     def decode(self):
         if self._preparing or not self.emitted_tokens or self.emitted_tokens >= self.output_tokens:
@@ -231,7 +256,8 @@ class FlashHeterogeneousBatchRequest:
         trace_flash_heterogeneous_decode_layers(self.model, concurrency=self.concurrency,
             microbatches=self.microbatches, fpga_cards=self.fpga_cards, root_seed=self.root_seed,
             layer_count=self.model.num_hidden_layers, kv_length=self.decode_states[0].kv_length + 1,
-            include_model_boundary=True, execution_states=tuple(self.decode_states), defer_graph=True)
+            include_model_boundary=True, execution_states=tuple(self.decode_states), defer_graph=True,
+            gpu_hardware_id=self.gpu_hardware_id)
         outputs = tuple(state.token for state in self.decode_states)
         for trace in self.traces:
             _tag(trace)
@@ -253,11 +279,11 @@ class FlashHeterogeneousBatchRequest:
             trace._nodes.clear()
             trace._edges.clear()
             trace._events.clear()
-            trace._views = {name: view for name, view in trace._views.items() if name in live_views}
+            trace._views = {name: trace._views[name] for name in trace._views if name in live_views}
             trace._references = {name: count for name, count in trace._references.items() if name in live_storage}
-            trace._allocations = {name: replace(allocation,
+            trace._allocations = {name: replace(trace._allocations[name],
                 allocated_event=trace._event("retain:" + name), freed_event=None)
-                for name, allocation in trace._allocations.items() if name in live_storage}
+                for name in trace._allocations if name in live_storage}
             trace._writers = {name: None for name in live_storage}
             trace._readers = {name: set() for name in live_storage}
             trace._persistent_ids.intersection_update(live_storage)

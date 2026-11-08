@@ -2,12 +2,15 @@
 
 from bisect import bisect_left
 from collections import OrderedDict
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from heapq import heappop, heappush
 import hashlib
 import math
 from numbers import Real
 import struct
+import threading
 from typing import Mapping, NamedTuple, Tuple
 
 from src.kernel.hardware_spec import HWSpec
@@ -200,6 +203,9 @@ class ExecutionTimeline:
     launch_kinds: Tuple[str, ...] = ()
     host_intervals: Tuple[HostExecutionInterval, ...] = ()
     runtime_graph_mode: str | None = None
+    # Elapsed until the worker has submitted all Host calls, including
+    # source-declared pre-replay Device synchronization when present.
+    worker_host_wall_s: float = 0.0
 
     @property
     def host_exposed_critical_path_s(self) -> float:
@@ -472,6 +478,12 @@ def call_reserved_resource_ids(call) -> Tuple[str, ...]:
         return resources
     if (call.kernel_spec.kind is KernelKind.COMMUNICATION
             and transfer is not None):
+        if transfer.traffic_matrix_bytes:
+            from src.kernel.predictors.communication import direct_switch_collective_logical_work
+            work = direct_switch_collective_logical_work(call.kernel_spec)
+            return tuple(f"communication:{transfer.link}:nic:{nic}:{direction}"
+                for direction, values in (("tx", work["nic_tx_bytes"]), ("rx", work["nic_rx_bytes"]))
+                for nic, amount in sorted(values.items()) if amount > 0)
         if transfer.link == "roce":
             # The declared nonblocking switch is not one serialized global
             # fabric lane. Physical NIC IDs share capacity across ranks and
@@ -486,11 +498,17 @@ def call_reserved_resource_ids(call) -> Tuple[str, ...]:
                     for direction in ("tx", "rx"))
             return tuple(f"communication:roce:nic:{nic}:{direction}"
                 for nic, direction in endpoints)
-        endpoint_resources = tuple(
+        if transfer.destination_hardware_id is not None:
+            endpoint_resources = (
+                f"communication:endpoint:{call.kernel_spec.hardware_id}:{transfer.source_rank}:{transfer.link}",
+                f"communication:endpoint:{transfer.destination_hardware_id}:{transfer.destination_rank}:{transfer.link}",
+            )
+        else:
+            endpoint_resources = tuple(
             f"communication:endpoint:{call.kernel_spec.hardware_id}:"
             f"{rank}:{transfer.link}"
             for rank in transfer.participants
-        )
+            )
         return endpoint_resources + (
             f"communication:fabric:{transfer.resource_id}",)
     return (
@@ -524,90 +542,16 @@ def with_earliest_ready_resource_order(plan, predictions):
             raise ValueError("earliest-ready resource order requires positive finite call durations")
 
     calls = plan.calls
-    positions = {call.call_id: index for index, call in enumerate(calls)}
-    successors = [[] for _ in calls]
-    indegree = [len(set(call.dependencies)) for call in calls]
-    dependency_end = [0.0] * len(calls)
     resources = tuple(call_reserved_resource_ids(call) for call in calls)
-    ready_time = {resource: 0.0 for group in resources for resource in group}
-    last_call = {}
-    group_index, group_resources = {}, []
-    call_groups = []
-    for group in resources:
-        if group not in group_index:
-            group_index[group] = len(group_resources)
-            group_resources.append(group)
-        call_groups.append(group_index[group])
-    waiting = [[] for _ in group_resources]
-    eligible = [[] for _ in group_resources]
-    versions = [0] * len(group_resources)
-    ready = []
-
-    def group_head(group):
-        resource_time = max(ready_time[resource] for resource in group_resources[group])
-        while waiting[group] and waiting[group][0][0] <= resource_time:
-            _, position = heappop(waiting[group])
-            heappush(eligible[group], position)
-        if eligible[group]:
-            return resource_time, eligible[group][0], True
-        if waiting[group]:
-            time, position = waiting[group][0]
-            return time, position, False
-        return None
-
-    def enqueue_group(group):
-        versions[group] += 1
-        head = group_head(group)
-        if head is not None:
-            time, position, _ = head
-            heappush(ready, (time, position, group, versions[group]))
-
-    for index, call in enumerate(calls):
-        for parent in set(call.dependencies):
-            successors[positions[parent]].append(index)
-        if indegree[index] == 0:
-            heappush(waiting[call_groups[index]], (0.0, index))
-    for group in range(len(group_resources)):
-        enqueue_group(group)
-
-    ordered = [None] * len(calls)
-    scheduled = 0
-    while ready:
-        time, position, group, version = heappop(ready)
-        if version != versions[group]:
-            continue
-        head = group_head(group)
-        if head is None:
-            continue
-        start, current_position, was_eligible = head
-        if (start, current_position) != (time, position):
-            enqueue_group(group)
-            continue
-        if was_eligible:
-            heappop(eligible[group])
-        else:
-            heappop(waiting[group])
-        call = calls[position]
-        end = start + predictions[call.call_id].t_total_s
-        if not math.isfinite(end):
-            raise ValueError("earliest-ready resource schedule exceeds finite time")
-        predecessors = {last_call[resource] for resource in resources[position] if resource in last_call}
-        predecessors.difference_update(call.dependencies)
-        ordered[position] = replace(call, dependencies=call.dependencies + tuple(sorted(predecessors, key=positions.__getitem__)))
-        for resource in resources[position]:
-            ready_time[resource], last_call[resource] = end, call.call_id
-        scheduled += 1
-        enqueue_group(group)
-        for successor in successors[position]:
-            dependency_end[successor] = max(dependency_end[successor], end)
-            indegree[successor] -= 1
-            if indegree[successor] == 0:
-                successor_group = call_groups[successor]
-                heappush(waiting[successor_group], (dependency_end[successor], successor))
-                enqueue_group(successor_group)
-    if scheduled != len(calls):
-        raise ValueError("earliest-ready resource order did not schedule every call")
+    from .timeline_native import native_resource_predecessors
+    preceding = native_resource_predecessors(calls, resources, predictions)
+    ordered = []
+    for call, parents in zip(calls, preceding, strict=True):
+        original = set(call.dependencies)
+        extra = tuple(calls[position].call_id for position in parents if calls[position].call_id not in original)
+        ordered.append(call.with_dependencies(call.dependencies + extra))
     return KernelPlan(ordered)
+
 
 
 def call_host_lanes(call) -> Tuple[Tuple[str, int], ...]:
@@ -707,6 +651,34 @@ def _plan_structure_key(calls, block_repeats, prefix):
     )
 
 
+class _PlanStructureKey(tuple):
+    """Exact immutable structure tuple with its Python hash computed once."""
+
+    def __new__(cls, values):
+        result = tuple.__new__(cls, values)
+        object.__setattr__(result, "_cached_hash", tuple.__hash__(result))
+        return result
+
+    def __hash__(self):
+        return self._cached_hash
+
+    def __setattr__(self, name, value):
+        raise TypeError("plan structure keys are immutable")
+
+    def __reduce_ex__(self, protocol):
+        # A spawned interpreter may use a different salted string hash.
+        return type(self), (tuple(self),)
+
+
+def _retain_plan_structure_key(value):
+    # Foreign hash/equality implementations must keep the ordinary path.
+    # Equality still compares the complete tuple, including on hash collision.
+    def native(item):
+        return (type(item) in (str, int, bool, type(None), KernelKind)
+            or type(item) is tuple and all(native(part) for part in item))
+    return _PlanStructureKey(value) if native(value) else value
+
+
 class _LogicalCall(NamedTuple):
     call_id: str
     dependencies: Tuple[str, ...]
@@ -728,35 +700,146 @@ class _PlanScheduleContext(NamedTuple):
     lanes_by_call_id: Mapping[str, tuple]
 
 
-# Each entry owns a complete call-structure graph. Retaining thousands of
-# unique decode structures can consume more RAM than the current forward.
-# Eviction only rebuilds metadata; live durations and recurrence are unchanged.
+_DEFAULT_CACHE_SCOPE = object()
+_CACHE_SCOPE = ContextVar("serving_execution_cache_scope", default=_DEFAULT_CACHE_SCOPE)
+
+
+class _ExperimentCache(OrderedDict):
+    def __init__(self):
+        super().__init__()
+        self._lock = threading.RLock()
+
+    @staticmethod
+    def _scoped(key):
+        return _CACHE_SCOPE.get(), key
+
+    def __contains__(self, key):
+        with self._lock:
+            return super().__contains__(self._scoped(key))
+
+    def __getitem__(self, key):
+        with self._lock:
+            return super().__getitem__(self._scoped(key))
+
+    def __setitem__(self, key, value):
+        with self._lock:
+            super().__setitem__(self._scoped(key), value)
+
+    def move_to_end(self, key):
+        with self._lock:
+            super().move_to_end(self._scoped(key))
+
+    def __iter__(self):
+        with self._lock:
+            return iter(tuple(super().__iter__()))
+
+    def put(self, key, value, limit):
+        with self._lock:
+            self[key] = value
+            self.move_to_end(key)
+            while len(self) > limit:
+                self.popitem(last=False)
+
+    def popitem(self, last=True):
+        with self._lock:
+            scope = _CACHE_SCOPE.get()
+            keys = super().__reversed__() if last else super().__iter__()
+            for key in keys:
+                if key[0] is scope:
+                    value = super().__getitem__(key)
+                    super().__delitem__(key)
+                    return key, value
+            raise KeyError("dictionary is empty")
+
+    def __len__(self):
+        scope = _CACHE_SCOPE.get()
+        with self._lock:
+            # Counting does not need LRU order. OrderedDict iteration rehashes
+            # each key on CPython; routing keys contain long numeric tuples.
+            return sum(key[0] is scope for key in dict.__iter__(self))
+
+    def __bool__(self):
+        return len(self) > 0
+
+    def clear_scope(self, scope):
+        with self._lock:
+            for key in tuple(self):
+                if key[0] is scope:
+                    super().__delitem__(key)
+
+
+def experiment_cache_scope():
+    scope = object()
+    token = _CACHE_SCOPE.set(scope)
+    try:
+        from src.serving.workload.traced_forward import _source_layout_cache_scope
+        from src.kernel.prediction_cache import prediction_cache_scope
+        with _source_layout_cache_scope(), prediction_cache_scope():
+            yield scope
+    finally:
+        _CACHE_SCOPE.reset(token)
+        for name in ("_PLAN_CONTEXTS", "_PLAN_STRUCTURE_KEYS", "_GRAPH_SEGMENT_MAPPINGS", "_RUNTIME_PREPARE_MAPPINGS",
+                "_RUNTIME_GRAPH_SEGMENTS", "_NORMALIZED_GRAPH_SEGMENTS", "_HOST_LANE_PROGRAMS",
+                "_SUMMARY_SCHEDULE_PLANS", "_STATIC_HOST_TIMELINES", "_LAUNCH_GAPS"):
+            cache = globals()[name]
+            if type(cache) is _ExperimentCache:
+                cache.clear_scope(scope)
+        from .timeline_native import _HOST_CACHE, _PLAN_CACHE, _ARRAY_CACHE
+        for cache in (_HOST_CACHE, _PLAN_CACHE, _ARRAY_CACHE):
+            cache.clear_scope(scope)
+        from src.serving.workload.runtime_inputs import _PROFILED_EXPERT_COUNTS
+        if _PROFILED_EXPERT_COUNTS is not None:
+            _PROFILED_EXPERT_COUNTS.clear_scope(scope)
+
+
+experiment_cache_scope = contextmanager(experiment_cache_scope)
+
+
 _PLAN_CONTEXT_CACHE_LIMIT = 16
-_PLAN_CONTEXTS: OrderedDict = OrderedDict()
+_PLAN_CONTEXTS: OrderedDict = _ExperimentCache()
+_PLAN_STRUCTURE_KEYS: OrderedDict = _ExperimentCache()
 _GRAPH_SEGMENT_MAPPING_CACHE_LIMIT = 16
-_GRAPH_SEGMENT_MAPPINGS: OrderedDict = OrderedDict()
+_GRAPH_SEGMENT_MAPPINGS: OrderedDict = _ExperimentCache()
 _RUNTIME_PREPARE_MAPPING_CACHE_LIMIT = 16
-_RUNTIME_PREPARE_MAPPINGS: OrderedDict = OrderedDict()
+_RUNTIME_PREPARE_MAPPINGS: OrderedDict = _ExperimentCache()
 _RUNTIME_GRAPH_SEGMENTS_CACHE_LIMIT = 16
-_RUNTIME_GRAPH_SEGMENTS: OrderedDict = OrderedDict()
+_RUNTIME_GRAPH_SEGMENTS: OrderedDict = _ExperimentCache()
 _NORMALIZED_GRAPH_SEGMENTS_CACHE_LIMIT = 16
-_NORMALIZED_GRAPH_SEGMENTS: OrderedDict = OrderedDict()
+_NORMALIZED_GRAPH_SEGMENTS: OrderedDict = _ExperimentCache()
 _INTERVAL_PAIR = struct.Struct("!dd")
 _HOST_LANE_PROGRAM_CACHE_LIMIT = 16
-_HOST_LANE_PROGRAMS: OrderedDict = OrderedDict()
+_HOST_LANE_PROGRAMS: OrderedDict = _ExperimentCache()
 
 
 def _cache_put(cache: OrderedDict, limit: int, key, value) -> None:
+    if isinstance(cache, _ExperimentCache):
+        cache.put(key, value, limit)
+        return
     cache[key] = value
     cache.move_to_end(key)
     while len(cache) > limit:
         cache.popitem(last=False)
 
 
+def _cached_plan_structure_key(plan, calls, prefix):
+    """Read the exact fingerprint without compiling an unused schedule."""
+    token = plan.__dict__["_schedule_structure_token"] if type(plan) is KernelPlan and "_schedule_structure_token" in plan.__dict__ else None
+    token_key = (token, prefix)
+    if token is not None and token_key in _PLAN_STRUCTURE_KEYS:
+        structure_key = _PLAN_STRUCTURE_KEYS[token_key]
+        _PLAN_STRUCTURE_KEYS.move_to_end(token_key)
+    else:
+        structure_key = _plan_structure_key(calls, plan.block_repeats, prefix)
+        if token is not None:
+            structure_key = _retain_plan_structure_key(structure_key)
+            _cache_put(_PLAN_STRUCTURE_KEYS, _PLAN_CONTEXT_CACHE_LIMIT, token_key, structure_key)
+    return structure_key
+
+
 def _plan_schedule_context(plan, calls, prefix):
     """Return the cached structure-only schedule context for one plan."""
 
-    structure_key = _plan_structure_key(calls, plan.block_repeats, prefix)
+    structure_key = _cached_plan_structure_key(plan, calls, prefix)
     cached = (
         _PLAN_CONTEXTS[structure_key]
         if structure_key in _PLAN_CONTEXTS else None)
@@ -1045,6 +1128,8 @@ def _runtime_prepare_mapping(
         names = tuple(mechanism.mechanism for mechanism in normalized_mechanisms)
         if len(set(names)) != len(names):
             raise ValueError("runtime prepare mechanisms cannot repeat")
+        if sum(event.replaces_eager_enqueue for event in normalized_mechanisms) > 1:
+            raise ValueError("one Host occurrence cannot have multiple complete-submit owners")
         for mechanism in normalized_mechanisms:
             profile.service_time_s(
                 mechanism.mechanism,
@@ -1156,6 +1241,18 @@ def _cached_graph_segment_mapping(
     return result
 
 
+@dataclass(frozen=True)
+class _HostPrepareServices:
+    times_s: tuple[tuple[float, int], ...]
+    replaces_eager_enqueue: bool
+
+    def service_entries(self, eager_service_s):
+        for prepare_s, extra_enqueues in self.times_s:
+            yield prepare_s, 0
+            for _ in range(extra_enqueues):
+                yield eager_service_s, 1
+
+
 def _cached_runtime_prepare_mapping(
     structure_key,
     context,
@@ -1209,14 +1306,14 @@ def _cached_runtime_prepare_mapping(
             call = calls_by_id[lane_occurrence[2]]
             profile = host_runtime_prepare_profiles[
                 call.kernel_spec.hardware_id]
-            services[lane_occurrence] = tuple(
-                profile.service_time_s(
+            services[lane_occurrence] = _HostPrepareServices(tuple(
+                (profile.service_time_s(
                     event.mechanism,
                     pool_name=lane_occurrence[0],
                     rank=lane_occurrence[1],
-                ) * event.count
+                ) * event.count, event.additional_eager_enqueue_count)
                 for event in mechanisms
-            )
+            ), any(event.replaces_eager_enqueue for event in mechanisms))
     _cache_put(
         _RUNTIME_PREPARE_MAPPINGS,
         _RUNTIME_PREPARE_MAPPING_CACHE_LIMIT,
@@ -1880,9 +1977,44 @@ class _SummarySchedulePlan(NamedTuple):
 
 
 _SUMMARY_SCHEDULE_PLAN_CACHE_LIMIT = 16
-_SUMMARY_SCHEDULE_PLANS: OrderedDict = OrderedDict()
+_SUMMARY_SCHEDULE_PLANS: OrderedDict = _ExperimentCache()
 _STATIC_HOST_TIMELINE_CACHE_LIMIT = 16
-_STATIC_HOST_TIMELINES: OrderedDict = OrderedDict()
+_STATIC_HOST_TIMELINES: OrderedDict = _ExperimentCache()
+
+
+def _expanded_device_schedule(plan, calls):
+    """Compile the current expanded DAG directly to the common recurrence ABI.
+
+    Without Host events or repeats there is one occurrence per current call.
+    Dynamic routing must compile its real edges/resources, and does not need
+    the normalized Host/source-occurrence indexes or a whole-graph cache key.
+    """
+    token = plan.__dict__["_schedule_structure_token"] if "_schedule_structure_token" in plan.__dict__ else None
+    key = ("expanded_device", token)
+    if token is not None and key in _SUMMARY_SCHEDULE_PLANS:
+        return _SUMMARY_SCHEDULE_PLANS[key]
+    positions = {call.call_id: index for index, call in enumerate(calls)}
+    resources, resource_rows, resource_ids = {}, [], []
+    dependency_rows = []
+    for index, call in enumerate(calls):
+        parents = tuple(positions[name] for name in call.dependencies)
+        if any(parent >= index for parent in parents):
+            raise ValueError("expanded device schedule requires topologically preceding dependencies")
+        dependency_rows.append(parents)
+        row = call_reserved_resource_ids(call)
+        resource_ids.append(row)
+        for resource in row:
+            if resource not in resources:
+                resources[resource] = len(resources)
+        resource_rows.append(tuple(resources[resource] for resource in row))
+    size = len(calls)
+    compiled = _SummarySchedulePlan(size, tuple(range(size)), tuple(dependency_rows), tuple(resource_rows),
+        tuple(resource_ids), len(resources), tuple(call.kernel_spec.transfer is not None for call in calls),
+        (1,) * size, (-1,) * size, (False,) * size, (False,) * size, (-1,) * size, (), 0,
+        tuple((call.call_id, -1) for call in calls))
+    if token is not None:
+        _cache_put(_SUMMARY_SCHEDULE_PLANS, _SUMMARY_SCHEDULE_PLAN_CACHE_LIMIT, key, compiled)
+    return compiled
 
 
 def _summary_schedule_plan(
@@ -2027,7 +2159,8 @@ class _StaticHostTimeline(NamedTuple):
 
 
 def _static_host_timeline(
-    schedule_plan,
+    logical_keys,
+    call_index,
     host_lane_program,
     hardware_by_call_index,
     eager_service_s_by_hardware,
@@ -2051,12 +2184,15 @@ def _static_host_timeline(
     graph_replay_count = 0
     launch_kinds = set()
     ready_time_s = []
-    for slot, logical_key in enumerate(schedule_plan.logical_keys):
-        hardware_id = hardware_by_call_index[schedule_plan.call_index[slot]]
+    for slot, logical_key in enumerate(logical_keys):
+        hardware_id = hardware_by_call_index[call_index[slot]]
         host_ends = []
         for lane, segment, service_times in host_lane_program[logical_key]:
             if service_times is not None:
-                for service_s in service_times:
+                for service_s, extra_enqueues in service_times.service_entries(eager_service_s_by_hardware[hardware_id]):
+                    if extra_enqueues:
+                        eager_dispatch_count += extra_enqueues
+                        launch_kinds.add("eager")
                     host_start_s = (
                         host_ready_by_lane[lane]
                         if lane in host_ready_by_lane else 0.0)
@@ -2068,7 +2204,8 @@ def _static_host_timeline(
                     launch_cpu_time_s += service_s
                 launch_kinds.add("runtime_prepare")
             if segment is None:
-                service_s = eager_service_s_by_hardware[hardware_id]
+                service_s = (0.0 if service_times is not None and service_times.replaces_eager_enqueue
+                             else eager_service_s_by_hardware[hardware_id])
                 host_start_s = (
                     host_ready_by_lane[lane]
                     if lane in host_ready_by_lane else 0.0)
@@ -2115,6 +2252,22 @@ def _static_host_timeline(
     )
 
 
+def eager_host_ready_times(calls, logical_keys, host_launch_profiles):
+    """Reuse the native eager Host schedule without building a device timeline."""
+    hardware_ids = tuple(call.kernel_spec.hardware_id for call in calls)
+    if set(hardware_ids) != set(host_launch_profiles):
+        raise ValueError("Host launch profiles must cover KernelPlan hardware exactly")
+    call_index = {call.call_id: index for index, call in enumerate(calls)}
+    lanes = {call.call_id: tuple((lane, None, None) for lane in call_host_lanes(call)) for call in calls}
+    timeline = _static_host_timeline(
+        logical_keys, tuple(call_index[key[0]] for key in logical_keys),
+        {key: lanes[key[0]] for key in logical_keys}, hardware_ids,
+        {hardware_id: profile.service_time_s("eager") for hardware_id, profile in host_launch_profiles.items()},
+        {},
+    )
+    return dict(zip(logical_keys, timeline.ready_time_s, strict=True))
+
+
 def _cached_static_host_timeline(
     structure_key,
     schedule_plan,
@@ -2140,7 +2293,8 @@ def _cached_static_host_timeline(
         _STATIC_HOST_TIMELINES.move_to_end(cache_key)
         return cached[2]
     timeline = _static_host_timeline(
-        schedule_plan,
+        schedule_plan.logical_keys,
+        schedule_plan.call_index,
         host_lane_program,
         hardware_by_call_index,
         eager_service_s_by_hardware,
@@ -2156,7 +2310,7 @@ def _cached_static_host_timeline(
 
 
 _LAUNCH_GAP_CACHE_LIMIT = 16
-_LAUNCH_GAPS: OrderedDict = OrderedDict()
+_LAUNCH_GAPS: OrderedDict = _ExperimentCache()
 
 
 def _cached_launch_gap_by_slot(
@@ -2215,6 +2369,78 @@ def _build_summary_execution_timeline(
     graph_replay_service_s_by_hardware,
     shared_resource_calendar,
     launch_gap_by_slot,
+    device_floor_s,
+):
+    from .timeline_native import native_summary_recurrence
+    requires_source_order = device_floor_s != 0.0 or (
+        host_lane_program is not None and any(
+            segment is not None and segment.sync_before_replay
+            for operations in host_lane_program.values()
+            for _lane, segment, _service in operations))
+    # The native recurrence has no cross-step floor or actual stream-sync
+    # boundary yet. Use the existing exact Python scheduler for that scope.
+    result = None if requires_source_order else native_summary_recurrence(
+        plan, predictions, calls, origin_time_s,
+        host_launch_profiles, static_host_timeline, launch_gap_by_slot,
+        shared_resource_calendar, schedule_plan, host_lane_program,
+        hardware_by_call_index, eager_service_s_by_hardware,
+        graph_replay_service_s_by_hardware)
+    if result is None:
+        return _build_summary_execution_timeline_python(
+            plan, predictions, calls, calls_by_id, origin_time_s,
+            host_launch_profiles, runtime_graph_mode, host_lane_program,
+            schedule_plan, static_host_timeline, hardware_by_call_index,
+            eager_service_s_by_hardware, graph_replay_service_s_by_hardware,
+            shared_resource_calendar, launch_gap_by_slot, device_floor_s)
+    (duration_s, predicted_device_time_s, repeat_bounds, interval_records,
+        launch_cpu_time_s, launch_critical_path_s, eager_dispatch_count,
+        graph_replay_count, launch_kinds) = result
+    block_repeats = tuple(ExecutionBlockRepeat(
+        repeat.block_id, repeat.repeat_count, repeat_bounds[position][0],
+        repeat_bounds[position][1], (),
+        tuple((call_id, hashlib.sha256(interval_records[digest_index]).hexdigest())
+            for call_id, digest_index in zip(repeat.call_ids,
+                schedule_plan.digest_groups[position])))
+        for position, repeat in enumerate(plan.block_repeats))
+    host_timing = host_launch_profiles is not None
+    if host_timing:
+        launch_kinds = set(launch_kinds)
+        host_device_overlap_s = max(0.0,
+            predicted_device_time_s + launch_critical_path_s - duration_s)
+    else:
+        launch_cpu_time_s = 0.0
+        launch_critical_path_s = 0.0
+        host_device_overlap_s = 0.0
+        eager_dispatch_count = 0
+        graph_replay_count = 0
+        launch_kinds = set()
+    return ExecutionTimeline(
+        (), duration_s, block_repeats, (), (),
+        tuple((call.call_id, count)
+            for call, count in zip(calls, schedule_plan.occurrence_counts)),
+        (), 0, False, predicted_device_time_s, launch_cpu_time_s,
+        launch_critical_path_s, host_device_overlap_s, eager_dispatch_count,
+        graph_replay_count, tuple(sorted(launch_kinds)), (), runtime_graph_mode,
+        launch_critical_path_s)
+
+
+def _build_summary_execution_timeline_python(
+    plan,
+    predictions,
+    calls,
+    calls_by_id,
+    origin_time_s,
+    host_launch_profiles,
+    runtime_graph_mode,
+    host_lane_program,
+    schedule_plan,
+    static_host_timeline,
+    hardware_by_call_index,
+    eager_service_s_by_hardware,
+    graph_replay_service_s_by_hardware,
+    shared_resource_calendar,
+    launch_gap_by_slot,
+    device_floor_s,
 ):
     """Schedule exactly while retaining only report-visible timing state."""
 
@@ -2230,15 +2456,16 @@ def _build_summary_execution_timeline(
     logical_keys = schedule_plan.logical_keys
     durations = [
         predictions[call.call_id].t_total_s for call in calls]
-    resource_end_time_s = [origin_time_s] * schedule_plan.resource_count
+    resource_end_time_s = [max(origin_time_s, device_floor_s)] * schedule_plan.resource_count
     end_by_slot = [0.0] * occurrence_count
     host_timing = host_launch_profiles is not None
     if host_timing:
         device_resource_end_time_s = (
-            [origin_time_s] * schedule_plan.resource_count)
+            [max(origin_time_s, device_floor_s)] * schedule_plan.resource_count)
         device_end_by_slot = [0.0] * occurrence_count
     maximum_end_time_s = origin_time_s
-    maximum_device_end_time_s = origin_time_s
+    maximum_device_end_time_s = max(origin_time_s, device_floor_s)
+    prior_device_end_by_lane = {}
     repeat_bounds = [[None, None] for _ in plan.block_repeats]
     # One occurrence contributes 16 bytes to its call's interval digest.  The
     # digest is a stream, so collecting a step's contributions and feeding
@@ -2298,7 +2525,10 @@ def _build_summary_execution_timeline(
                 for lane, segment, service_times in host_lane_program[
                         logical_keys[slot]]:
                     if service_times is not None:
-                        for service_s in service_times:
+                        for service_s, extra_enqueues in service_times.service_entries(eager_service_s_by_hardware[hardware_id]):
+                            if extra_enqueues:
+                                eager_dispatch_count += extra_enqueues
+                                launch_kinds.add("eager")
                             host_start_s = (
                                 host_ready_by_lane[lane]
                                 if lane in host_ready_by_lane
@@ -2311,7 +2541,8 @@ def _build_summary_execution_timeline(
                             launch_cpu_time_s += service_s
                         launch_kinds.add("runtime_prepare")
                     if segment is None:
-                        service_s = eager_service_s_by_hardware[hardware_id]
+                        service_s = (0.0 if service_times is not None and service_times.replaces_eager_enqueue
+                                     else eager_service_s_by_hardware[hardware_id])
                         host_start_s = (
                             host_ready_by_lane[lane]
                             if lane in host_ready_by_lane else origin_time_s)
@@ -2341,9 +2572,15 @@ def _build_summary_execution_timeline(
                             # This is a dependency barrier, not a serving-
                             # duration correction: wait until the device
                             # predecessor is complete, then pay only the
-                            # measured replay enqueue service below.
+                            # measured replay enqueue service below. Use
+                            # actual Host-constrained completion for earlier
+                            # calls on this stream; the parallel device-only
+                            # recurrence omits their enqueue delay.
                             host_start_s = max(
-                                host_start_s, device_ready_time_s)
+                                host_start_s, device_ready_time_s,
+                                prior_device_end_by_lane[lane]
+                                if lane in prior_device_end_by_lane else
+                                max(origin_time_s, device_floor_s))
                         host_end_s = host_start_s + service_s
                         host_ready_by_lane[lane] = host_end_s
                         host_service_by_lane[lane] = (
@@ -2370,6 +2607,12 @@ def _build_summary_execution_timeline(
             maximum_end_time_s = end_time_s
         for resource_id in resources:
             resource_end_time_s[resource_id] = end_time_s
+        if host_timing:
+            for lane, _, _ in host_lane_program[logical_keys[slot]]:
+                prior_device_end_by_lane[lane] = max(
+                    prior_device_end_by_lane[lane]
+                    if lane in prior_device_end_by_lane else 0.0,
+                    end_time_s)
         digest_index = digest_slot[slot]
         if digest_index < 0:
             continue
@@ -2414,7 +2657,8 @@ def _build_summary_execution_timeline(
         launch_critical_path_s = 0.0
         host_device_overlap_s = 0.0
     else:
-        predicted_device_time_s = maximum_device_end_time_s - origin_time_s
+        predicted_device_time_s = (
+            maximum_device_end_time_s - max(origin_time_s, device_floor_s))
         if static_host_timeline is None:
             launch_critical_path_s = max(host_service_by_lane.values())
         else:
@@ -2450,6 +2694,8 @@ def _build_summary_execution_timeline(
         tuple(sorted(launch_kinds)),
         (),
         runtime_graph_mode,
+        (max(host_ready_by_lane.values(), default=origin_time_s) - origin_time_s
+         if static_host_timeline is None else static_host_timeline.launch_critical_path_s),
     )
 
 
@@ -2458,6 +2704,7 @@ def build_execution_timeline(
     predictions: Mapping[str, KernelPrediction],
     *,
     origin_time_s: float = 0.0,
+    device_floor_s: float = 0.0,
     shared_resource_calendar: ExecutionResourceCalendar | None = None,
     host_launch_profiles: Mapping[str, HostLaunchProfile] | None = None,
     host_runtime_prepare_profiles: Mapping[
@@ -2472,6 +2719,9 @@ def build_execution_timeline(
     runtime_prepare_events_token: object | None = None,
     plan_structure_runtime_graph_segments: object | None = None,
 ) -> ExecutionTimeline:
+    if (isinstance(device_floor_s, bool) or not isinstance(device_floor_s, Real)
+            or not math.isfinite(device_floor_s) or device_floor_s < 0):
+        raise ValueError("cross-step device floor must be finite and non-negative")
     if not isinstance(materialize_timeline_details, bool):
         raise TypeError("timeline detail materialization flag must be boolean")
     if plan_structure_runtime_graph_segments is not None:
@@ -2542,6 +2792,12 @@ def build_execution_timeline(
             "runtime prepare timing requires Host launch profiles")
     calls = plan.topological_order()
     calls_by_id = {call.call_id: call for call in calls}
+    if (not materialize_timeline_details and host_launch_profiles is None
+            and not plan.block_repeats and shared_resource_calendar is None and device_floor_s == 0.0):
+        schedule_plan = _expanded_device_schedule(plan, calls)
+        return _build_summary_execution_timeline(plan, predictions, calls, calls_by_id, origin_time_s,
+            None, None, None, schedule_plan, None,
+            tuple(call.kernel_spec.hardware_id for call in calls), None, None, None, None, 0.0)
     if not materialize_timeline_details:
         # Per-step plans are structurally identical except for the embedded
         # schedule-step ID prefix, so all structure-only artifacts are
@@ -2629,7 +2885,11 @@ def build_execution_timeline(
                     in runtime_prepare_events.items()
                 }
             )
-            prepare_events_token = runtime_prepare_events
+            # The public input mapping may be updated in place between
+            # calls. Cache against this immutable-in-use normalized snapshot,
+            # not the caller's dictionary identity. The private owner token
+            # above is retained for already-frozen source events.
+            prepare_events_token = norm_prepare_events
         if host_launch_profiles is not None:
             runtime_prepare_by_lane_occurrence, prepare_services = (
                 _cached_runtime_prepare_mapping(
@@ -2646,29 +2906,33 @@ def build_execution_timeline(
             )
         norm_call_ids = tuple(
             call.call_id[prefix_length:] for call in calls)
-        schedule_plan = _cached_summary_schedule_plan(
-            structure_key,
-            schedule_context,
-            norm_call_ids,
-            {
-                call.call_id[prefix_length:]: call_reserved_resource_ids(call)
-                for call in calls
-            },
-            {
-                call.call_id[prefix_length:]:
-                    call.kernel_spec.transfer is not None
-                for call in calls
-            },
-            tuple(
-                (
-                    tuple(
-                        call_id[prefix_length:]
-                        for call_id in repeat.call_ids),
-                    repeat.repeat_count,
-                )
-                for repeat in plan.block_repeats
-            ),
-        )
+        if structure_key in _SUMMARY_SCHEDULE_PLANS:
+            schedule_plan = _SUMMARY_SCHEDULE_PLANS[structure_key]
+            _SUMMARY_SCHEDULE_PLANS.move_to_end(structure_key)
+        else:
+            schedule_plan = _cached_summary_schedule_plan(
+                structure_key,
+                schedule_context,
+                norm_call_ids,
+                {
+                    call.call_id[prefix_length:]: call_reserved_resource_ids(call)
+                    for call in calls
+                },
+                {
+                    call.call_id[prefix_length:]:
+                        call.kernel_spec.transfer is not None
+                    for call in calls
+                },
+                tuple(
+                    (
+                        tuple(
+                            call_id[prefix_length:]
+                            for call_id in repeat.call_ids),
+                        repeat.repeat_count,
+                    )
+                    for repeat in plan.block_repeats
+                ),
+            )
         hardware_by_call_index = tuple(
             call.kernel_spec.hardware_id for call in calls)
         # A device-only summary never reads a Host program. Constructing it
@@ -2701,7 +2965,7 @@ def build_execution_timeline(
                 hardware_id: profile.service_time_s("graph_replay")
                 for hardware_id, profile in host_launch_profiles.items()
             }
-            if origin_time_s == 0.0:
+            if origin_time_s == 0.0 and device_floor_s == 0.0:
                 # The Host timeline is measured from the step origin, so it
                 # only detaches from the device recurrence when that origin is
                 # the zero the structure-only walk resolves it against.
@@ -2730,6 +2994,7 @@ def build_execution_timeline(
             graph_replay_service_s_by_hardware,
             shared_resource_calendar,
             launch_gap_by_slot,
+            device_floor_s,
         )
     (
         calls,
@@ -2824,7 +3089,8 @@ def build_execution_timeline(
     remaining_dependency_uses = {}
     terminal_candidates = []
     maximum_end_time_s = origin_time_s
-    maximum_device_end_time_s = origin_time_s
+    maximum_device_end_time_s = max(origin_time_s, device_floor_s)
+    prior_device_end_by_lane = {}
     host_ready_by_lane = {}
     host_service_by_lane = {}
     eager_dispatch_count = 0
@@ -2900,10 +3166,10 @@ def build_execution_timeline(
                 if (predecessor_end := device_resource_predecessor[
                     resource_id]) is not None
             )
-            device_ready_time_s = (
+            device_ready_time_s = max(device_floor_s, (
                 max(device_predecessor_ends)
                 if device_predecessor_ends else origin_time_s
-            ) + launch_gap_s
+            )) + launch_gap_s
             device_end_time_s = device_ready_time_s + duration_s
             device_end_by_key[logical_key] = device_end_time_s
             maximum_device_end_time_s = max(
@@ -2932,7 +3198,8 @@ def build_execution_timeline(
                 for predecessor in predecessor_causes
             )
         else:
-            ready_time_s = origin_time_s
+            ready_time_s = max(origin_time_s, device_floor_s)
+        ready_time_s = max(ready_time_s, device_floor_s)
         if host_launch_profiles is None:
             launch_gap_s = 0.0
         else:
@@ -3022,9 +3289,38 @@ def build_execution_timeline(
                     ))
                     last_host_event_by_lane[lane] = event_id
                     launch_kinds.add("runtime_prepare")
+                    for enqueue_index in range(prepare_event.additional_eager_enqueue_count):
+                        service_s = profile.service_time_s("eager")
+                        host_start_s = host_ready_by_lane[lane]
+                        host_end_s = host_start_s + service_s
+                        host_ready_by_lane[lane] = host_end_s
+                        host_service_by_lane[lane] += service_s
+                        launch_cpu_time_s += service_s
+                        eager_dispatch_count += 1
+                        relative_host_start_s = host_start_s - origin_time_s
+                        relative_host_end_s = host_end_s - origin_time_s
+                        represented_service_s = max(0.0, relative_host_end_s - relative_host_start_s)
+                        exposed_s = min(represented_service_s,
+                            max(0.0, host_end_s - max(host_start_s, ready_time_s)))
+                        event_id = (f"source-only-eager-submit:{prepare_event.mechanism}:"
+                            f"{enqueue_index}:{call.call_id}:{occurrence_label}:rank-{lane[1]}")
+                        host_intervals.append(HostExecutionInterval(
+                            event_id=event_id, event_kind="eager_submit",
+                            pool_name=lane[0], rank=lane[1], call_id=call.call_id,
+                            call_occurrence_index=logical_key[1],
+                            covered_call_occurrences=(logical_key,),
+                            device_predecessor_occurrences=ordered_device_predecessors,
+                            host_predecessor_event_id=last_host_event_by_lane[lane],
+                            runtime_graph_mode=runtime_graph_mode, graph_segment_id=None,
+                            start_time_s=relative_host_start_s, end_time_s=relative_host_end_s,
+                            exposed_time_s=exposed_s,
+                            overlapped_time_s=represented_service_s - exposed_s))
+                        last_host_event_by_lane[lane] = event_id
+                        launch_kinds.add("eager")
                 if segment is None:
                     launch_kind = "eager"
-                    service_s = profile.service_time_s(launch_kind)
+                    service_s = (0.0 if any(event.replaces_eager_enqueue for event in prepare_mechanisms)
+                                 else profile.service_time_s(launch_kind))
                     host_start_s = (
                         host_ready_by_lane[lane]
                         if lane in host_ready_by_lane else origin_time_s)
@@ -3087,8 +3383,13 @@ def build_execution_timeline(
                         if lane in host_ready_by_lane else origin_time_s)
                     if segment.sync_before_replay:
                         # See the summary scheduler above: the source-level
-                        # current-stream synchronize is modeled as a barrier.
-                        host_start_s = max(host_start_s, device_ready_time_s)
+                        # current-stream synchronize is modeled as a barrier
+                        # on actual prior stream work, including Host enqueue.
+                        host_start_s = max(
+                            host_start_s, device_ready_time_s,
+                            prior_device_end_by_lane[lane]
+                            if lane in prior_device_end_by_lane else
+                            max(origin_time_s, device_floor_s))
                     host_end_s = host_start_s + service_s
                     host_ready_by_lane[lane] = host_end_s
                     host_service_by_lane[lane] = (
@@ -3236,6 +3537,12 @@ def build_execution_timeline(
         }
         for resource_id in reserved_resource_ids:
             resource_predecessor[resource_id] = state
+        if host_launch_profiles is not None:
+            for lane in call_host_lanes(call):
+                prior_device_end_by_lane[lane] = max(
+                    prior_device_end_by_lane[lane]
+                    if lane in prior_device_end_by_lane else 0.0,
+                    end)
         if not terminal_candidates:
             maximum_end_time_s = end
             terminal_candidates.append(state)
@@ -3448,7 +3755,7 @@ def build_execution_timeline(
         host_device_overlap_s = 0.0
     else:
         predicted_device_time_s = (
-            maximum_device_end_time_s - origin_time_s
+            maximum_device_end_time_s - max(origin_time_s, device_floor_s)
         )
         launch_critical_path_s = max(host_service_by_lane.values())
         host_device_overlap_s = max(
@@ -3479,4 +3786,5 @@ def build_execution_timeline(
         tuple(sorted(launch_kinds)),
         tuple(host_intervals),
         runtime_graph_mode,
+        max(host_ready_by_lane.values(), default=origin_time_s) - origin_time_s,
     )

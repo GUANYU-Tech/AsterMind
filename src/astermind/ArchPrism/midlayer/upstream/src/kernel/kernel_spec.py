@@ -102,6 +102,20 @@ class _PrunedVectorParameterSchemas:
 _VECTOR_PARAMETER_SCHEMA_CACHE = {}
 
 
+def linear_expert_partition(num_experts: int, world_size: int, rank: int) -> tuple[int, ...]:
+    """Contiguous base/remainder placement, including empty expert ranks.
+
+    vLLM0.30 expert_map_manager.determine_expert_map with EPLB disabled
+    gives the first remainder ranks one extra expert.
+    """
+    if (type(num_experts) is not int or num_experts < 1 or type(world_size) is not int or world_size < 1
+            or type(rank) is not int or not 0 <= rank < world_size):
+        raise ValueError("linear expert placement requires positive experts/world and an in-range rank")
+    base, remainder = divmod(num_experts, world_size)
+    start = rank * base + min(rank, remainder)
+    return tuple(range(start, start + base + (rank < remainder)))
+
+
 class KernelKind(str, Enum):
     GEMM = "GEMM"
     FLASH_ATTN = "FLASH_ATTN"
@@ -250,8 +264,32 @@ class PhysicalTransferConfig:
     # In participants order. Equal IDs identify a shared physical NIC, not
     # an assumed device-local link. Required for the analytical RoCE path.
     participant_nic_ids: Tuple[str, ...] = ()
+    # Bilateral GPUDirect bandwidth scenario. The receiver limit is derived
+    # from its HWSpec (HBM, PCIe and network), never from workload timings.
+    destination_hardware_id: Optional[str] = None
+    destination_bandwidth_bytes_s: Optional[float] = None
+    # Ordered variable collective segments: all_gatherv input per rank or
+    # reduce_scatterv output per rank. bytes is their sum, never a mean rank.
+    partition_bytes: Tuple[int, ...] = ()
+    # Explicit directed payloads of one switch collective, in participants
+    # order. Unlike a per-rank uniform all-to-all extent, bytes is the sum
+    # of all nonlocal matrix entries. Empty preserves the existing program.
+    traffic_matrix_bytes: Tuple[Tuple[int, ...], ...] = ()
 
     def __post_init__(self) -> None:
+        if (self.destination_hardware_id is None) != (
+                self.destination_bandwidth_bytes_s is None):
+            raise ValueError("bilateral transfer requires receiver identity and bandwidth")
+        if self.destination_hardware_id is not None:
+            from src.kernel.hardware_ids import canonical_hardware_id
+            canonical_hardware_id(self.destination_hardware_id)
+            value = self.destination_bandwidth_bytes_s
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or value <= 0):
+                raise ValueError("receiver bandwidth must be finite and positive")
+            if (self.operation != "send_recv" or self.link != "infiniband"
+                    or self.backend != "analytical_roofline_v1"):
+                raise ValueError("bilateral transfer requires analytical InfiniBand send_recv")
         if self.implementation not in (
                 None, "sglang_custom_all_reduce_v2",
                 "sglang_flashinfer_allreduce_residual_rmsnorm"):
@@ -308,18 +346,57 @@ class PhysicalTransferConfig:
         if len(participants) != len(set(participants)):
             raise ValueError("transfer participant ranks must be unique")
         object.__setattr__(self, "participants", participants)
+        if not isinstance(self.traffic_matrix_bytes, (tuple, list)):
+            raise TypeError("traffic_matrix_bytes must be a sequence of rows")
+        matrix = self.traffic_matrix_bytes
+        if matrix:
+            if (self.backend != "analytical_roofline_v1"
+                    or self.algorithm != "pairwise" or self.operation != "all_to_all"
+                    or self.link not in ("roce", "pcie") or self.topology != "fully_connected"
+                    or self.direction != "collective" or self.bytes_semantics != "aggregate_input"
+                    or self.ring_order or self.reduction is not None
+                    or self.source_rank is not None or self.destination_rank is not None
+                    or self.destination_hardware_id is not None):
+                raise ValueError("traffic matrix requires one analytical direct-switch collective")
+            if len(participants) < 2 or len(matrix) != len(participants):
+                raise ValueError("traffic matrix must cover every collective participant")
+            if any(not isinstance(row, (tuple, list)) or len(row) != len(participants)
+                   for row in matrix):
+                raise ValueError("traffic matrix must be square in participants order")
+            if any(type(value) is not int or value < 0 for row in matrix for value in row):
+                raise ValueError("traffic matrix entries must be nonnegative integer bytes")
+            matrix = tuple(tuple(row) for row in matrix)
+            if any(matrix[index][index] != 0 for index in range(len(participants))):
+                raise ValueError("traffic matrix diagonal must be zero")
+            if self.bytes <= 0 or sum(map(sum, matrix)) != self.bytes:
+                raise ValueError("traffic matrix must conserve the complete positive payload")
+        object.__setattr__(self, "traffic_matrix_bytes", tuple(matrix))
+        if not isinstance(self.partition_bytes, (tuple, list)):
+            raise TypeError("collective partition_bytes must be a list or tuple")
+        partitions = tuple(self.partition_bytes)
+        if any(type(value) is not int or value < 0 for value in partitions):
+            raise ValueError("collective partitions must be nonnegative integer byte extents")
+        if self.operation in ("all_gatherv", "reduce_scatterv"):
+            if len(partitions) != len(participants) or sum(partitions) != self.bytes:
+                raise ValueError("variable collective partitions must cover its complete payload in participant order")
+            if (self.backend != "analytical_roofline_v1" or self.algorithm != "pairwise"
+                    or self.topology != "fully_connected" or self.ring_order or self.link == "roce"):
+                raise ValueError("variable collectives require analytical pairwise fully-connected transport without a shared NIC")
+        elif partitions:
+            raise ValueError("partition_bytes applies only to variable collectives")
+        object.__setattr__(self, "partition_bytes", partitions)
         if not isinstance(self.participant_nic_ids, (list, tuple)):
             raise TypeError("transfer participant_nic_ids must be a list or tuple")
         nic_ids = tuple(self.participant_nic_ids)
         if any(not isinstance(value, str) or not value.strip() or value != value.strip()
                for value in nic_ids):
             raise ValueError("transfer NIC IDs must be non-empty strings without surrounding whitespace")
-        if self.link == "roce":
+        if self.link == "roce" or self.link == "pcie" and matrix:
             if (self.backend != "analytical_roofline_v1"
                     or len(nic_ids) != len(participants) or not nic_ids):
-                raise ValueError("analytical RoCE requires an explicit NIC ID for every participant")
+                raise ValueError("analytical switch transport requires an explicit port ID for every participant")
         elif nic_ids:
-            raise ValueError("participant_nic_ids currently applies only to analytical RoCE")
+            raise ValueError("participant_nic_ids requires analytical RoCE or an explicit PCIe traffic matrix")
         object.__setattr__(self, "participant_nic_ids", nic_ids)
         for name in ("source_rank", "destination_rank"):
             rank = getattr(self, name)
@@ -420,7 +497,10 @@ def _normalize_compute_shape(kind: KernelKind, variant: str,
             normalized["element_count"] = structured_count
             normalized["elements"] = structured_count
     elif kind is KernelKind.VECTOR:
-        if variant == "flash_mla_metadata":
+        if variant == "fa3_prepare_varlen":
+            if set(normalized) != {"batch", "dtype_bytes"}:
+                raise ValueError("VECTOR/fa3_prepare_varlen requires only batch")
+        elif variant == "flash_mla_metadata":
             fields = {
                 "batch", "kv_block_count", "scheduler_partitions",
                 "scheduler_metadata_ints", "split_metadata_ints",
@@ -606,7 +686,7 @@ def _require_shape_fields(kind: KernelKind, variant: str,
             "activation", "silu", "reduce", "gather", "softmax", "vocab_parallel_embedding", "vllm_logits_row_select", "vllm_logits_fp32_cast", "vllm_logits_gather_reorder", "vllm_rejection_logits_materialize",
             "dsv32_draft_argmax", "dsv32_draft_id_cast", "dsv32_draft_row_select", "dsv32_draft_buffer_copy", "dsv32_draft_token_stack", "dsv32_draft_id_scatter", "dsv32_draft_prepare_next_ids", "dsv32_draft_prepare_sample_indices", "dsv32_draft_seq_rollback", "dsv32_draft_step_metadata",
                 "qkv_rmsnorm_rope",
-                "gemm_reduce", "gemm_elementwise", "flash_mla_metadata",
+                "gemm_reduce", "gemm_elementwise", "flash_mla_metadata", "fa3_prepare_varlen",
                 "fp8_group_quant",
                 "moe_swiglu",
                 "moe_init_routing", "moe_init_routing_v2",
@@ -843,6 +923,8 @@ def _require_shape_fields(kind: KernelKind, variant: str,
             "reduce", "gather", "softmax",
             "gemm_reduce", "gemm_elementwise", "fp8_group_quant"):
         missing = {"element_count"} - set(shape)
+    elif kind is KernelKind.VECTOR and variant == "fa3_prepare_varlen":
+        missing = {"batch"} - set(shape)
     elif variant == "flash_mla_metadata":
         missing = {
             "batch", "kv_block_count", "scheduler_partitions",
@@ -1042,6 +1124,43 @@ def _normalize_request_lengths(
         and normalized["mathematical_program"] == "ascend_0_18_full_fia_softmax_v1")
     native_split_fuse = ("source_program" in normalized
         and normalized["source_program"] == "ascend_0_18_full_fia_split_fuse")
+    sparse_fa3 = ("source_program" in normalized
+        and normalized["source_program"] == "vllm_0_30_fa3_sparse_mla")
+    full_decode_fa3 = (owner == "FLASH_ATTN" and "source_program" in normalized
+        and normalized["source_program"] == "vllm_0_30_fa3_gqa_full_decode")
+    if full_decode_fa3:
+        fields = {"q_lens", "kv_lens", "model_input_q_lens", "model_input_kv_lens",
+            "graph_runtime_mode", "graph_model_input_tokens"}
+        if not fields.issubset(normalized):
+            raise ValueError("FA3 FULL decode requires complete real and physical request metadata")
+        if normalized["graph_runtime_mode"] != "FULL":
+            raise ValueError("FA3 FULL decode requires its actual FULL runtime mode")
+        physical_rows = normalized["graph_model_input_tokens"]
+        if type(physical_rows) is not int or physical_rows <= 0:
+            raise ValueError("FA3 FULL decode physical Q/O rows must be a positive integer")
+        for name in ("q_lens", "kv_lens", "model_input_q_lens", "model_input_kv_lens"):
+            raw = normalized[name]
+            if not isinstance(raw, (list, tuple)):
+                raise TypeError("FA3 FULL decode " + name + " must be a list or tuple")
+            values = tuple(raw)
+            minimum = 0 if name.startswith("model_input_") else 1
+            if (not values or any(type(value) is not int or value < minimum for value in values)):
+                raise ValueError("FA3 FULL decode " + name + " has invalid request lengths")
+            normalized[name] = values
+        real_q, real_kv = normalized["q_lens"], normalized["kv_lens"]
+        model_q, model_kv = normalized["model_input_q_lens"], normalized["model_input_kv_lens"]
+        real_count, padded_count = len(real_q), shape["batch"]
+        if (len(real_kv) != real_count or any(length != 1 for length in real_q)
+                or len(model_q) != padded_count or len(model_kv) != padded_count
+                or not real_count <= padded_count <= physical_rows
+                or physical_rows < sum(real_q)
+                or model_q[:real_count] != real_q or model_kv[:real_count] != real_kv
+                or any(model_q[real_count:]) or any(model_kv[real_count:])
+                or max(model_q) != shape["q_len"] or max(model_kv) != shape["kv_len"]):
+            raise ValueError("FA3 FULL decode must preserve real requests, zero request tails and independent physical Q/O rows")
+        # GPUModelRunner repeats the last real cuQ endpoint for every padding
+        # request. Its final endpoint need not cover all padded Q/O storage.
+        return
     model_input_names = {"model_input_q_lens", "model_input_kv_lens"}
     present_model_input_names = model_input_names & set(normalized)
     if present_model_input_names:
@@ -1152,8 +1271,9 @@ def _normalize_request_lengths(
         if any(isinstance(value, bool) or not isinstance(value, int)
                for value in lengths):
             raise TypeError(f"{owner} {name} must contain integers")
-        empty_context = (name == "kv_lens" and "mathematical_program" in normalized
-            and normalized["mathematical_program"] == "bf16_mla_context_empty_rows_softmax_v1")
+        empty_context = (name == "kv_lens" and (sparse_fa3 or (
+            "mathematical_program" in normalized
+            and normalized["mathematical_program"] == "bf16_mla_context_empty_rows_softmax_v1")))
         if any(value < 0 if empty_context else value <= 0 for value in lengths):
             raise ValueError(f"{owner} {name} must contain positive values")
         expected_maximum = shape[maximum_field]
@@ -1168,7 +1288,10 @@ def _normalize_request_lengths(
     mathematical_empty_causal = ("mathematical_program" in normalized
         and normalized["mathematical_program"] == "bf16_mla_causal_empty_rows_softmax_v1"
         and normalized["causal"] is True)
-    if not (mathematical_cross_attention or mathematical_empty_causal) and any(request_query > request_kv for request_query, request_kv in zip(
+    native_mla_cross_attention = (owner == "FLASH_ATTN" and normalized["causal"] is False
+        and "qk_head_dim" in shape and "v_head_dim" in shape
+        and (shape["qk_head_dim"], shape["v_head_dim"]) == (192, 128))
+    if not (sparse_fa3 or mathematical_cross_attention or mathematical_empty_causal or native_mla_cross_attention) and any(request_query > request_kv for request_query, request_kv in zip(
             normalized["q_lens"], normalized["kv_lens"])):
         raise ValueError(
             f"{owner} each request requires q_lens <= kv_lens: "
@@ -1197,12 +1320,54 @@ def _normalize_request_length_tuple(
     return lengths
 
 
+_KDA_CHUNK_VARIANTS = ("kimi_k3_kda_prefill", "kimi_k3_kda_mixed", "kimi_k3_kda_context_prefill")
+
+
+_KDA_CHUNK_SOURCE_FIELDS = {
+    "source_component", "source_stage", "model_execution_version", "source_compiler",
+    "source_input_layout", "source_norm_backend", "source_metadata_state",
+    "source_initial_state_dtype", "source_output_final_state", "source_out",
+    "source_use_qk_l2norm_in_kernel", "tensor_iterator_source", "metadata_dtype",
+    "chunk_offsets_dtype", "source_use_gather", "source_selected_configs",
+    "source_chunk_indices", "source_chunk_offsets"}
+
+
+def _is_kda_chunk_source(kind, variant, attributes):
+    return (kind is KernelKind.VECTOR and variant in _KDA_CHUNK_VARIANTS
+        and "source_component" in attributes
+        and attributes["source_component"] == "vllm_0_30_kimi_k3_triton_chunk")
+
+
+def _validate_kda_chunk_source_launch(variant, shape, dtype, attributes, launch):
+    from src.kernel.launch_config.nvidia_h200.kda_chunk_launch import select_kda_chunk_stage_launch
+    required = _KDA_CHUNK_SOURCE_FIELDS | {"stage", "query_start_loc", "gate_lower_bound"}
+    if required - set(attributes):
+        raise ValueError("KDA chunk child requires complete source selection facts")
+    if (attributes["stage"] != "chunk" or attributes["metadata_dtype"] != "int32"
+            or attributes["chunk_offsets_dtype"] != "int64"
+            or attributes["source_use_qk_l2norm_in_kernel"] is not True
+            or attributes["source_output_final_state"] is not True
+            or attributes["source_out"] != "original_v"
+            or type(attributes["source_use_gather"]) is not bool):
+        raise ValueError("KDA chunk child requires exact mixed dtype roles and complete source outputs")
+    expected = select_kda_chunk_stage_launch(shape, dtype, variant, attributes, None)
+    if launch != expected:
+        raise ValueError("KDA chunk child requires its exact H200 source launch and execution_variant")
+
+
+
 def _normalize_compute_attributes(kind: KernelKind, variant: str,
                                   attributes: Mapping[str, Any],
                                   shape: Mapping[str, int],
                                   compute_dtype: str):
     normalized = dict(attributes)
     optional = set()
+    sparse_fa3 = (kind is KernelKind.FLASH_ATTN
+        and "source_program" in normalized
+        and normalized["source_program"] == "vllm_0_30_fa3_sparse_mla")
+    full_decode_fa3 = (kind is KernelKind.FLASH_ATTN
+        and "source_program" in normalized
+        and normalized["source_program"] == "vllm_0_30_fa3_gqa_full_decode")
     graph_token_domain_fields = {
         "graph_logical_tokens", "graph_model_input_tokens",
         "graph_runtime_mode", "model_input_shape",
@@ -1220,8 +1385,18 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
         # padded requests (query 0, seq_len 0) carry no attention work.
         optional = {
             "graph_logical_tokens", "graph_model_input_tokens",
-            "graph_runtime_mode", "attention_backend", "mathematical_program",
+            "graph_runtime_mode", "attention_backend", "mathematical_program", "source_program",
         }
+        if "source_program" in normalized:
+            if (not sparse_fa3 or variant != "mla_decode" or compute_dtype != "bf16"
+                    or shape["q_len"] != 1
+                    or (shape["qk_head_dim"], shape["v_head_dim"], shape["kv_lora_rank"]) != (576, 512, 512)
+                    or normalized["causal"] is not True
+                    or normalized["full_cuda_graphs"] is not False
+                    or normalized["max_cudagraph_capture_size"] != 0
+                    or any(name in normalized for name in ("attention_backend", "mathematical_program",
+                        "graph_logical_tokens", "graph_model_input_tokens", "graph_runtime_mode"))):
+                raise ValueError("sparse FA3 source requires its unpadded BF16 Q1 absorbed-MLA domain")
         if "mathematical_program" in normalized:
             programs = {"mla_decode": ("bf16_mla_decode_softmax_v1", "bf16_mla_causal_empty_rows_softmax_v1"),
                 "mla_absorbed_prefill": ("bf16_mla_absorbed_prefill_softmax_v1",),
@@ -1244,7 +1419,30 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
             "model_input_q_lens", "model_input_kv_lens",
             "graph_runtime_mode", "mathematical_program", "ascend_fia_prefill_no_cache", "source_program",
         }
-        if "source_program" in normalized and (normalized["source_program"] != "ascend_0_18_full_fia_split_fuse"
+        if variant == "combine":
+            optional.add("return_softmax_lse")
+        if full_decode_fa3:
+            required |= {"model_input_q_lens", "model_input_kv_lens",
+                "graph_runtime_mode", "graph_model_input_tokens"}
+            if (not required.issubset(normalized)
+                    or variant not in ("decode", "combine") or compute_dtype not in ("bf16", "fp16")
+                    or shape["q_len"] != 1 or shape["head_dim"] != 128
+                    or normalized["causal"] is not True
+                    or normalized["kv_layout"] != "paged_varlen"
+                    or normalized["kv_dist"] != "uniform"
+                    or normalized["graph_runtime_mode"] != "FULL"
+                    or "mathematical_program" in normalized):
+                raise ValueError("FA3 FULL decode requires its complete BF16/FP16 D128 causal paged-varlen source domain")
+        elif sparse_fa3:
+            if (variant != "combine" or compute_dtype != "bf16"
+                    or shape["q_len"] != 1 or shape["head_dim"] != 512
+                    or shape["num_kv_heads"] != 1 or normalized["kv_layout"] != "mla"
+                    or normalized["causal"] is not True
+                    or normalized["kv_dist"] not in ("uniform", "explicit")
+                    or any(name in normalized for name in ("mathematical_program", "model_input_q_lens",
+                        "model_input_kv_lens", "graph_runtime_mode"))):
+                raise ValueError("sparse FA3 combine requires its unpadded BF16 Q1 source domain")
+        elif "source_program" in normalized and (normalized["source_program"] != "ascend_0_18_full_fia_split_fuse"
                 or variant not in ("prefill", "decode")
                 or compute_dtype != "bf16" or "mathematical_program" in normalized):
             raise ValueError("native FIA source requires a compatible BF16 call without a mathematical program")
@@ -1272,6 +1470,9 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
             "routed_weight_dtype", "weight_group_size",
         }
         optional = {"swiglu_limit", "mathematical_program"}
+        if ("mathematical_program" in normalized
+                and normalized["mathematical_program"] == "sglang_0_5_19_fp8_fused_shared_swiglu_v1"):
+            required.add("fused_shared_experts")
         if "swiglu_limit" not in normalized:
             normalized["swiglu_limit"] = None
         limit = normalized["swiglu_limit"]
@@ -1284,12 +1485,35 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
             raise ValueError("clamped routed_experts currently requires MXFP4 weights")
         if "mathematical_program" in normalized and required.issubset(normalized):
             program = normalized["mathematical_program"]
-            if program == "block_fp8_swiglu_v1":
+            if program == "unquantized_bf16_swiglu_v1":
+                valid = (compute_dtype == "bf16" and normalized["routed_weight_dtype"] == "bf16"
+                    and normalized["weight_group_size"] == 0 and normalized["expert_parallel_size"] == 1
+                    and normalized["expert_weight_tile_rows"] is None and limit is None
+                    and normalized["routed_scaling_factor"] == 1.0 and "graph_runtime_mode" not in normalized)
+            elif program == "unquantized_bf16_grouped_swiglu_v1":
+                valid = (compute_dtype == "bf16" and normalized["routed_weight_dtype"] == "bf16"
+                    and normalized["weight_group_size"] == 0
+                    and normalized["expert_weight_tile_rows"] is None and limit is None
+                    and "graph_runtime_mode" not in normalized)
+            elif program == "unquantized_bf16_legacy_grouped_swiglu_v1":
+                valid = (compute_dtype == "bf16" and normalized["routed_weight_dtype"] == "bf16"
+                    and normalized["weight_group_size"] == 0 and normalized["expert_parallel_size"] == 2
+                    and shape["experts"] % 2 == 0 and normalized["routed_scaling_factor"] == 1.0
+                    and normalized["expert_weight_tile_rows"] is None and limit is None
+                    and "graph_runtime_mode" not in normalized)
+            elif program == "block_fp8_swiglu_v1":
                 valid = (compute_dtype == "bf16" and normalized["routed_weight_dtype"] == "fp8"
                     and normalized["weight_group_size"] == 0 and normalized["expert_parallel_size"] == 1
                     and normalized["expert_weight_tile_rows"] is None and limit is None
                     and shape["hidden"] % 128 == shape["intermediate"] % 128 == 0
                     and "graph_runtime_mode" not in normalized)
+            elif program == "sglang_0_5_19_fp8_fused_shared_swiglu_v1":
+                valid = (compute_dtype == "bf16" and normalized["routed_weight_dtype"] == "fp8"
+                    and normalized["weight_group_size"] == 0 and normalized["expert_parallel_size"] == 1
+                    and normalized["expert_weight_tile_rows"] is None and limit is None
+                    and (shape["experts"], shape["topk"], shape["hidden"], shape["intermediate"]) == (256, 8, 7168, 256)
+                    and type(normalized["fused_shared_experts"]) is int and normalized["fused_shared_experts"] == 1
+                    and normalized["routed_scaling_factor"] == 1.0 and "graph_runtime_mode" not in normalized)
             elif program == "block_fp8_replicated_ep_swiglu_v1":
                 valid = (compute_dtype == "bf16" and normalized["routed_weight_dtype"] == "fp8"
                     and normalized["weight_group_size"] == 0 and normalized["expert_parallel_size"] == 8
@@ -1298,9 +1522,15 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
                     and normalized["routed_scaling_factor"] == 2.5 and "graph_runtime_mode" not in normalized)
             elif program == "kimi_ep_marlin_swiglu_v1":
                 valid = (compute_dtype == "bf16" and normalized["routed_weight_dtype"] == "int4"
-                    and normalized["weight_group_size"] == 32 and normalized["expert_parallel_size"] == 8
+                    and normalized["weight_group_size"] == 32
+                    and type(normalized["expert_parallel_size"]) is int
+                    and (normalized["expert_parallel_size"] == 1
+                        or normalized["expert_parallel_size"] >= 2
+                        and shape["experts"] % normalized["expert_parallel_size"] == 0)
                     and normalized["expert_weight_tile_rows"] is None and limit is None
-                    and (shape["experts"], shape["topk"], shape["hidden"], shape["intermediate"]) == (384, 8, 7168, 2048)
+                    and (shape["experts"], shape["topk"], shape["hidden"]) == (384, 8, 7168)
+                    and ((normalized["expert_parallel_size"] == 1 and shape["intermediate"] in (2048, 1024, 512, 256))
+                        or normalized["expert_parallel_size"] >= 2 and shape["intermediate"] == 2048)
                     and normalized["routed_scaling_factor"] == 1.0 and "graph_runtime_mode" not in normalized)
             elif program == "dsv4_mxfp4_w4a16_swiglu_v1":
                 valid = (compute_dtype == "bf16" and normalized["routed_weight_dtype"] == "mxfp4"
@@ -1423,8 +1653,17 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
             # lengths are part of the contract.
             required |= {"swa_kv_lens"}
             optional |= {"compressed_selection", "mathematical_program"}
-            if "mathematical_program" in normalized and normalized["mathematical_program"] != "dsv4_sparse_softmax_flops_bytes_v1":
-                raise ValueError("unknown V4 sparse mathematical program")
+            if "mathematical_program" in normalized:
+                program = normalized["mathematical_program"]
+                if program not in ("dsv4_sparse_softmax_flops_bytes_v1", "vllm_0_30_dspark_swa_noncausal_softmax_v1"):
+                    raise ValueError("unknown V4 sparse mathematical program")
+                if program == "vllm_0_30_dspark_swa_noncausal_softmax_v1":
+                    required.add("num_speculative_tokens")
+                    if (variant != "dsv4_sparse_decode" or compute_dtype != "bf16"
+                            or shape["compress_ratio"] != 1 or shape["window_size"] != 128
+                            or shape["num_query_heads"] not in (64, 128)
+                            or shape["qk_head_dim"] != 512 or shape["v_head_dim"] != 512):
+                        raise ValueError("DSpark sparse math requires BF16 512/512 SWA128 uncompressed decode")
             if "compressed_selection" not in normalized:
                 normalized["compressed_selection"] = "candidate_upper_bound"
         if variant == "dsv4_sparse_decode":
@@ -1465,6 +1704,11 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
                 "cache_layout", "cache_write_semantics", "quantization",
                 "slot_mapping_all_valid",
             }
+            optional = {"mathematical_program"}
+            if "mathematical_program" in normalized:
+                if normalized["mathematical_program"] != "vllm_0_30_dspark_partial_context_insert_v1":
+                    raise ValueError("unknown DSpark partial context insert mathematical program")
+                required.add("valid_token_count")
         elif variant == "dsv4_compressor_state_cache":
             required = {
                 "cache_layout", "cache_write_semantics",
@@ -1475,7 +1719,18 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
     elif kind is KernelKind.VECTOR and variant in (
             "elementwise", "elementwise_pytorch_vec4"):
         required = {"reads", "writes", "operation"}
-        optional = {"helper_launch", "tensor_iterator_source", "copy_dispatch"}
+        optional = {"helper_launch", "tensor_iterator_source", "copy_dispatch", "mathematical_program"}
+        if ("mathematical_program" in normalized
+                and normalized["mathematical_program"] not in ("vllm_0_30_fa3_aot_tail_clear", "vllm_0_30_dspark_typed_role_bytes_v1")) and (
+                normalized["mathematical_program"] != "dense_bf16_source_flops_bytes_v1"
+                or compute_dtype != "bf16" or variant != "elementwise"
+                or "operation" not in normalized
+                or normalized["operation"] not in ("add", "mul", "unary", "copy", "fill", "read", "cast_bf16_float32")):
+            raise ValueError("elementwise source math requires its explicit BF16 program")
+        if ("mathematical_program" in normalized and normalized["mathematical_program"] == "vllm_0_30_dspark_typed_role_bytes_v1"
+                and (variant != "elementwise" or compute_dtype not in ("bool", "int32", "int64", "fp32", "bf16")
+                    or normalized["operation"] not in ("read", "fill"))):
+            raise ValueError("DSpark typed payload requires explicit read/write-only roles in their original dtype")
         materialization_fields = {
             "input_materialization",
             "input_outer_groups",
@@ -1495,6 +1750,8 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
         required = {"has_indexer", "index_rope_interleave"}
         if variant == "dsv32_fused_norm_rope":
             required |= {"mla_cache_dtype", "cache_slot_scope"}
+            if "cache_slot_scope" in normalized and normalized["cache_slot_scope"] == "no_metadata_no_cache_slots":
+                required |= {"source_no_attention_metadata", "index_k_output_present", "topk_active_fill"}
         else:
             required.add("quantize_mqa")
     elif kind is KernelKind.VECTOR and variant == "layernorm":
@@ -1532,6 +1789,10 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
         required = {"stage", "slot_mapping", "cache_capacity_tokens", "rms_norm_eps"}
     elif kind is KernelKind.VECTOR and variant in ("kimi_k3_kda_prefill", "kimi_k3_kda_mixed", "kimi_k3_kda_context_prefill"):
         required = {"stage", "state_indices", "state_pool_slots", "query_start_loc", "has_initial_state", "gate_lower_bound"}
+        if "source_component" in normalized:
+            if not _is_kda_chunk_source(kind, variant, normalized):
+                raise ValueError("KDA chunk requires its exact source component")
+            required |= _KDA_CHUNK_SOURCE_FIELDS
     elif kind is KernelKind.VECTOR and variant == "kimi_k3_kda_decode":
         required = {"stage", "state_indices", "state_pool_slots", "gate_lower_bound"}
     elif kind is KernelKind.VECTOR and variant == "kimi_k3_situ":
@@ -1556,6 +1817,10 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
             optional = {"eagle_source"}
             if "eagle_source" not in normalized:
                 normalized["eagle_source"] = None
+        if operation == "dspark_swa_indices":
+            required |= {"num_speculative_tokens", "kv_lens"}
+        elif operation in ("dspark_greedy_verify", "dspark_roundtrip_prepare"):
+            required |= {"num_speculative_tokens", "accepted_drafts"}
         if operation == "eagle_tree_verify":
             required.add("accepted_drafts")
         elif operation == "eagle_eh_norm":
@@ -1639,6 +1904,17 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
             normalized["materialized_output"] = False
     elif kind is KernelKind.VECTOR and variant == "gemm_reduce":
         required = {"split_k"}
+        optional = {"source_gemm_runtime", "source_gemm_shape"}
+        if (("source_gemm_runtime" in normalized) != ("source_gemm_shape" in normalized)
+                and not (compute_dtype == "bf16" and "source_gemm_shape" in normalized
+                    and "source_gemm_runtime" not in normalized)):
+            raise ValueError("aggregate reducer requires both runtime and parent GEMM shape")
+        if "source_gemm_shape" in normalized:
+            parent = normalized["source_gemm_shape"]
+            if (not isinstance(parent, Mapping) or set(parent) != {"b", "m", "n", "k"}
+                    or any(type(value) is not int or value <= 0 for value in parent.values())
+                    or parent["b"] * parent["m"] * parent["n"] != shape["element_count"]):
+                raise ValueError("aggregate reducer parent shape disagrees with output elements")
     elif kind is KernelKind.VECTOR and variant == "fp8_group_quant":
         required = {"group_size"}
         optional = {"source_program", "input_resource"}
@@ -1655,7 +1931,7 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
         optional = {"helper_launch"}
     elif kind is KernelKind.VECTOR and variant in {
             "rmsnorm", "add_rmsnorm", "rotary", "activation",
-            "silu", "softmax", "flash_mla_metadata",
+            "silu", "softmax", "flash_mla_metadata", "fa3_prepare_varlen",
             "moe_init_routing", "moe_init_routing_v2",
             "moe_init_routing_v3",
             "moe_finalize_routing",
@@ -1674,14 +1950,38 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
     else:
         raise ValueError(
             f"unhandled {kind.value}/{variant} attribute contract")
+    if kind is KernelKind.VECTOR and variant == "fa3_prepare_varlen":
+        optional.add("source_program")
+        if "source_program" in normalized:
+            required |= {"use_dynamic_split", "head_swizzle"}
+            if (normalized["source_program"] != "vllm_0_30_fa3_full_aot_prepare"
+                    or compute_dtype != "int32" or not required.issubset(normalized)
+                    or type(normalized["use_dynamic_split"]) is not bool
+                    or normalized["use_dynamic_split"] != (shape["batch"] <= 992)
+                    or normalized["head_swizzle"] is not True):
+                raise ValueError("FA3 FULL AOT prepare requires INT32, exact dynamic-layout flag and head swizzle")
+    if kind is KernelKind.VECTOR and variant in ("elementwise", "elementwise_pytorch_vec4"):
+        optional.add("mathematical_program")
+        if ("mathematical_program" in normalized
+                and normalized["mathematical_program"] == "vllm_0_30_fa3_aot_tail_clear"):
+            if (variant != "elementwise"
+                    or normalized["mathematical_program"] != "vllm_0_30_fa3_aot_tail_clear"
+                    or compute_dtype != "int32" or not required.issubset(normalized)
+                    or normalized["operation"] != "fill"
+                    or type(normalized["reads"]) is not int or normalized["reads"] != 0
+                    or type(normalized["writes"]) is not int or normalized["writes"] != 1):
+                raise ValueError("FA3 AOT metadata clear requires the declared INT32 fill mathematical program")
     dense_fp16_variants = {"gather", "rmsnorm", "add_rmsnorm", "silu", "rotary"}
     if ((kind is KernelKind.VECTOR and variant in dense_fp16_variants)
             or (kind is KernelKind.KV_CACHE and variant == "paged_kv_cache")):
         optional.add("mathematical_program")
         if ("mathematical_program" in normalized
-                and normalized["mathematical_program"] == "dense_fp16_source_flops_bytes_v1"):
-            if compute_dtype != "fp16":
-                raise ValueError("dense FP16 source math requires homogeneous FP16 storage")
+                and normalized["mathematical_program"] in (
+                    "dense_fp16_source_flops_bytes_v1", "dense_bf16_source_flops_bytes_v1")):
+            source_dtype = {"dense_fp16_source_flops_bytes_v1": "fp16",
+                "dense_bf16_source_flops_bytes_v1": "bf16"}[normalized["mathematical_program"]]
+            if compute_dtype != source_dtype:
+                raise ValueError(f"dense {source_dtype.upper()} source math requires homogeneous {source_dtype.upper()} storage")
             if variant == "silu" and "swiglu_limit" in normalized and normalized["swiglu_limit"] is not None:
                 raise ValueError("dense FP16 source math requires ordinary unclamped SiLU/mul")
             if kind is KernelKind.VECTOR and variant == "rotary":
@@ -1850,7 +2150,7 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
     if kind is KernelKind.VECTOR and variant in ("dsv32_moe_route", "kimi_moe_route"):
         optional.add("source_projection_scope")
         if ("source_projection_scope" in normalized
-                and normalized["source_projection_scope"] not in ("a800_tp1_target_representative_layers_v1", "a800_tp8_pp4_ep8_glm_source_v1", "a800_tp8_pp2_ep8_kimi_source_v1", "a800_tp1_kimi_source_v1")):
+                and normalized["source_projection_scope"] not in ("a800_tp1_target_representative_layers_v1", "a800_tp8_pp4_ep8_glm_source_v1", "a800_tp8_pp2_ep8_kimi_source_v1", "a800_tp1_kimi_source_v1", "vllm_0_30_glm_pcp_source_v1")):
             raise ValueError("target structural route requires its exact source projection scope")
         if ("source_projection_scope" in normalized
                 and normalized["source_projection_scope"] == "a800_tp8_pp4_ep8_glm_source_v1"
@@ -1862,8 +2162,9 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
             raise ValueError("Kimi pipeline source scope cannot authorize another model's router")
     if kind is KernelKind.GEMM:
         optional.add("source_projection_scope")
+        optional.add("source_gemm_runtime")
         if "source_projection_scope" in normalized:
-            if (normalized["source_projection_scope"] not in ("a800_tp1_target_representative_layers_v1", "a800_tp8_pp4_ep8_glm_source_v1")
+            if (normalized["source_projection_scope"] not in ("a800_tp1_target_representative_layers_v1", "a800_tp8_pp4_ep8_glm_source_v1", "vllm_0_30_glm_pcp_source_v1")
                     or variant != "gemm" or compute_dtype != "bf16"
                     or "output_dtype" not in normalized or normalized["output_dtype"] != "fp32"):
                 raise ValueError("target structural GEMM scope requires plain BF16 A/B and FP32 C")
@@ -1873,7 +2174,50 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
         optional.add("output_dtype")
         if "output_dtype" not in normalized:
             normalized["output_dtype"] = None
+        # Schema-defined beta: ordinary value 0 (numeric or lexical).  The
+        # boundary normalizes equivalent representations once so a non-zero
+        # beta can never alias the beta=0 row downstream.  A bool is
+        # rejected before any ordinary-alias test because ``False == 0``
+        # in Python would otherwise let it slip through as the ordinary
+        # value; True is likewise not a numeric beta.
+        optional.add("beta")
+        if "beta" not in normalized:
+            normalized["beta"] = 0
+        beta = normalized["beta"]
+        if isinstance(beta, bool):
+            raise ValueError(
+                "GEMM beta must be a non-negative finite number, not bool")
+        if beta is None or beta == "" or beta == "0" or beta == 0:
+            normalized["beta"] = 0
+        elif isinstance(beta, str):
+            try:
+                beta_value = float(beta)
+            except ValueError:
+                raise ValueError("GEMM beta must be a decimal string") from None
+            if not math.isfinite(beta_value) or beta_value < 0:
+                raise ValueError("GEMM beta must be a non-negative finite decimal")
+            # Preserve integer-valued decimals as ints so downstream key
+            # projections (e.g. the H200 v6 typed beta suffix) see "1"
+            # rather than "1.0"; the typed key stores a canonical decimal.
+            if beta_value.is_integer():
+                beta_value = int(beta_value)
+            normalized["beta"] = beta_value
+        elif isinstance(beta, (int, float)):
+            if not math.isfinite(beta) or beta < 0:
+                raise ValueError("GEMM beta must be a non-negative finite number")
+            if isinstance(beta, float) and beta.is_integer():
+                beta = int(beta)
+            normalized["beta"] = beta
+        else:
+            raise ValueError("GEMM beta must be a non-negative finite number or decimal string")
         output_dtype = normalized["output_dtype"]
+        if "source_gemm_runtime" in normalized:
+            if (normalized["source_gemm_runtime"] != "vllm_0_30_torch_2_13_cu130_cublas13_1_1_fp16_unquantized"
+                    or variant != "gemm" or compute_dtype != "fp16" or shape["b"] != 1
+                    or output_dtype not in (None, "fp16") or normalized["beta"] != 0
+                    or "mathematical_program" in normalized
+                    or any(name in normalized for name in ("model_input_shape", "graph_runtime_mode"))):
+                raise ValueError("observed FP16 GEMM runtime requires its homogeneous eager0.30 ordinary source")
         if variant == "gemm":
             optional.add("mathematical_program")
             if "mathematical_program" in normalized:
@@ -1881,11 +2225,13 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
                 if program == "unquantized_fp32_flops_bytes_v1":
                     if compute_dtype != "fp32" or output_dtype not in (None, "fp32") or shape["b"] != 1:
                         raise ValueError("unquantized FP32 mathematical GEMM requires FP32 A/B/C")
-                elif program == "unquantized_fp16_flops_bytes_v1":
+                elif program in ("unquantized_fp16_flops_bytes_v1", "unquantized_bf16_flops_bytes_v1"):
                     required.update({"weight_dtype", "weight_group_size", "has_bias"})
+                    source_dtype = {"unquantized_fp16_flops_bytes_v1": "fp16",
+                        "unquantized_bf16_flops_bytes_v1": "bf16"}[program]
                     if (not {"weight_dtype", "weight_group_size", "has_bias"}.issubset(normalized)
-                            or compute_dtype != "fp16" or output_dtype not in (None, "fp16") or shape["b"] != 1
-                            or normalized["weight_dtype"] != "fp16"
+                            or compute_dtype != source_dtype or output_dtype not in (None, source_dtype) or shape["b"] != 1
+                            or normalized["weight_dtype"] != source_dtype
                             or type(normalized["weight_group_size"]) is not int or normalized["weight_group_size"] != 0
                             or normalized["has_bias"] is not False):
                         raise ValueError("unquantized FP16 mathematical GEMM requires explicit homogeneous A/B/C, no bias and no weight quantization")
@@ -1896,6 +2242,28 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
                             or normalized["weight_dtype"] != "fp8" or normalized["weight_group_size"] != 128
                             or normalized["has_bias"] is not False):
                         raise ValueError("prequantized block-FP8 MM requires FP8 A/B, FP32 group128 scales and BF16 C")
+                elif program == "packed_fp4_source_v1":
+                    required.update({"weight_dtype", "weight_group_size", "has_bias",
+                        "output_dtype", "compute_format", "weight_matrix_count",
+                        "matrix_row_counts", "input_quantized"})
+                    if not required.issubset(normalized):
+                        raise ValueError("packed-FP4 source GEMM requires its complete operand program")
+                    matrix_count = normalized["weight_matrix_count"]
+                    rows = normalized["matrix_row_counts"]
+                    if (compute_dtype not in ("bf16", "fp8", "fp32") or output_dtype not in ("bf16", "fp32")
+                            or normalized["weight_dtype"] != "mxfp4"
+                            or type(normalized["weight_group_size"]) is not int
+                            or normalized["weight_group_size"] != 32
+                            or normalized["has_bias"] is not False
+                            or normalized["compute_format"] not in ("fp8", "fp4")
+                            or type(matrix_count) is not int or matrix_count < 1
+                            or not isinstance(rows, (tuple, list)) or len(rows) != matrix_count
+                            or any(type(value) is not int or value < 1 for value in rows)
+                            or sum(rows) != shape["b"] * shape["m"]
+                            or shape["k"] % 32
+                            or type(normalized["input_quantized"]) is not bool):
+                        raise ValueError("packed-FP4 source GEMM requires conserved matrix rows, group32 weights and explicit compute format")
+                    normalized["matrix_row_counts"] = tuple(rows)
                 elif program in ("mxfp4_bf16_flops_bytes_v1", "mxfp4_fp8_flops_bytes_v1"):
                     required.update({"weight_dtype", "weight_group_size", "has_bias"})
                     expected_dtype = "fp8" if program == "mxfp4_fp8_flops_bytes_v1" else "bf16"
@@ -1913,7 +2281,7 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
         if output_dtype is not None and (not isinstance(output_dtype, str) or output_dtype not in DTYPE_BYTES):
             raise ValueError("GEMM output_dtype must be a supported explicit dtype or None")
         quantized_mixed = ("mathematical_program" in normalized
-            and normalized["mathematical_program"] in ("mxfp4_fp8_flops_bytes_v1", "block_fp8_quantized_input_fp32_scales_v1"))
+            and normalized["mathematical_program"] in ("mxfp4_fp8_flops_bytes_v1", "block_fp8_quantized_input_fp32_scales_v1", "packed_fp4_source_v1"))
         if not quantized_mixed and output_dtype is not None and output_dtype != compute_dtype and (compute_dtype, output_dtype, variant) != ("bf16", "fp32", "gemm"):
             raise ValueError("mixed-output GEMM supports BF16 inputs and FP32 output only")
         if not quantized_mixed and output_dtype is not None and output_dtype != compute_dtype:
@@ -1935,6 +2303,13 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
                 or not isinstance(limit, (int, float))
                 or not math.isfinite(limit) or limit <= 0):
             raise ValueError("silu swiglu_limit must be finite positive or None")
+    if "packed_weight_storage" in normalized:
+        if (kind is not KernelKind.VECTOR
+                or variant not in ("gather", "vocab_parallel_embedding", "mhc_pre", "mhc_post_pre", "hc_head")
+                or normalized["packed_weight_storage"] != "mxfp4_group32"
+                or compute_dtype != "bf16" or "hidden" not in shape or shape["hidden"] % 32):
+            raise ValueError("packed weight storage requires a supported BF16 vector source with complete group32 weight rows")
+        optional.add("packed_weight_storage")
     missing = required - set(normalized)
     if missing:
         raise ValueError(
@@ -2027,6 +2402,14 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
         if not isinstance(normalized["causal"], bool):
             raise ValueError("FLASH_ATTN causal must be boolean")
         if variant in ("prefill", "decode", "combine", "split_combine"):
+            if "return_softmax_lse" in normalized:
+                if (variant != "combine" or type(normalized["return_softmax_lse"]) is not bool
+                        or shape["head_dim"] != 128 or shape["num_kv_heads"] != shape["num_query_heads"]
+                        or normalized["causal"] is not False or normalized["kv_layout"] != "contiguous"
+                        or normalized["fa_ksteps"] is not None or normalized["fa_eff_mfrac"] != 1.0
+                        or any(name in normalized for name in ("graph_runtime_mode", "model_input_shape",
+                            "model_input_q_lens", "model_input_kv_lens", "graph_logical_tokens", "graph_model_input_tokens"))):
+                    raise ValueError("final split-prefill LSE requires its exact unpadded128-wide combine interface")
             if (isinstance(normalized["fa_eff_mfrac"], bool)
                     or not isinstance(
                         normalized["fa_eff_mfrac"], (int, float))):
@@ -2075,8 +2458,9 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
                     "MLA attention_backend must be 'flashinfer' when given")
             if normalized["kv_layout"] != "mla":
                 raise ValueError("MLA attention requires kv_layout='mla'")
-            if normalized["kv_dist"] != "uniform":
-                raise ValueError("MLA attention requires kv_dist='uniform'")
+            if (normalized["kv_dist"] != "uniform"
+                    and not (sparse_fa3 and normalized["kv_dist"] == "explicit")):
+                raise ValueError("MLA attention requires uniform lengths or an explicit sparse FA3 source")
             if not isinstance(normalized["full_cuda_graphs"], bool):
                 raise TypeError("MLA full_cuda_graphs must be boolean")
             capture = normalized["max_cudagraph_capture_size"]
@@ -2118,6 +2502,9 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
             raise AssertionError(
                 f"unhandled FLASH_ATTN variant: {variant!r}")
         _normalize_request_lengths("FLASH_ATTN", normalized, shape)
+        if (sparse_fa3 and normalized["kv_dist"] == "uniform"
+                and len(set(normalized["kv_lens"])) != 1):
+            raise ValueError("sparse FA3 uniform label requires equal live lengths")
         if variant == "mla_decode" and "mathematical_program" in normalized:
             if (compute_dtype != "bf16" or normalized["causal"] is not True
                     or shape["num_query_heads"] <= 0
@@ -2187,13 +2574,9 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
             if (isinstance(ep_size, bool)
                     or not isinstance(ep_size, int)):
                 raise TypeError("expert_parallel_size must be an integer")
-            if ep_size <= 0 or ep_size > shape["experts"]:
+            if ep_size <= 0:
                 raise ValueError(
-                    "expert_parallel_size must be within [1, experts]")
-            if shape["experts"] % ep_size:
-                raise ValueError(
-                    "expert_parallel_size must divide experts; uneven "
-                    "expert placement is not supported")
+                    "expert_parallel_size must be positive")
             if (isinstance(expert_rank, bool)
                     or not isinstance(expert_rank, int)):
                 raise TypeError("expert_rank must be an integer")
@@ -2208,10 +2591,7 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
                            for value in raw_owned)):
                 raise TypeError("owned_experts must contain integers")
             owned = tuple(raw_owned)
-            owned_count = shape["experts"] // ep_size
-            first_owned = expert_rank * owned_count
-            expected_owned = tuple(
-                range(first_owned, first_owned + owned_count))
+            expected_owned = linear_expert_partition(shape["experts"], ep_size, expert_rank)
             if owned != expected_owned:
                 raise ValueError(
                     "owned_experts disagrees with the canonical contiguous "
@@ -2486,7 +2866,15 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
             raise ValueError(
                 "DSA indexer topk must equal min(topk_capacity, kv_len)")
     elif kind is KernelKind.SPARSE_ATTN:
-        if normalized["causal"] is not True:
+        dspark = ("mathematical_program" in normalized and normalized["mathematical_program"]
+            == "vllm_0_30_dspark_swa_noncausal_softmax_v1")
+        if dspark:
+            if (normalized["causal"] is not False
+                    or type(normalized["num_speculative_tokens"]) is not int
+                    or normalized["num_speculative_tokens"] != 5
+                    or any(type(q) is not int or q != 5 for q in normalized["q_lens"])):
+                raise ValueError("DSpark sparse math requires its explicit noncausal anchor-plus-four-noise block")
+        elif normalized["causal"] is not True:
             raise ValueError("SPARSE_ATTN requires causal=True")
         if normalized["indexer_type"] not in ("full", "shared"):
             raise ValueError("SPARSE_ATTN indexer_type must be full or shared")
@@ -2608,17 +2996,18 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
             # SWA window from the separate full-resolution cache
             # (deepseek_v4/nvidia/flashmla.py).
             swa = tuple(normalized["swa_kv_lens"])
-            expected_swa = tuple(
+            expected_swa = (tuple(q + min(shape["window_size"], kv - q)
+                for q, kv in zip(normalized["q_lens"], normalized["kv_lens"], strict=True)) if dspark else tuple(
                 min(shape["window_size"], kv_len)
-                for kv_len in normalized["kv_lens"])
+                for kv_len in normalized["kv_lens"]))
             if (len(swa) != shape["batch"]
                     or any(isinstance(value, bool)
                            or not isinstance(value, int)
                            or value <= 0 for value in swa)
                     or swa != expected_swa):
                 raise ValueError(
-                    "DSV4 SPARSE_ATTN swa_kv_lens must equal "
-                    "min(window_size, kv_len) per request")
+                    "DSpark SWA lengths must include the trailing context window and complete noncausal block"
+                    if dspark else "DSV4 SPARSE_ATTN swa_kv_lens must equal min(window_size, kv_len) per request")
             normalized["swa_kv_lens"] = swa
         if variant == "dsv4_sparse_decode" and "mathematical_program" in normalized:
             if normalized["split_counts"] is not None:
@@ -2780,13 +3169,26 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
                 for old_len, new_len in zip(old_lens, new_lens, strict=True)
             ) * (512 if stage == "compress" else shape["state_bytes"])
         elif variant == "dsv4_qnorm_rope_kv_insert":
-            if normalized["cache_write_semantics"] != "append":
-                raise ValueError("DSV4 fused cache requires append semantics")
+            partial_context = ("mathematical_program" in normalized and normalized["mathematical_program"]
+                == "vllm_0_30_dspark_partial_context_insert_v1")
+            if (normalized["cache_write_semantics"] != "append" and not (partial_context
+                    and normalized["cache_write_semantics"] == "masked_target_context_overwrite")):
+                raise ValueError("DSV4 fused cache requires append semantics or its exact partial DSpark overwrite program")
             if normalized["cache_layout"] != "paged_dsv4_swa":
                 raise ValueError("DSV4 fused cache requires paged_dsv4_swa")
             if normalized["quantization"] != "fp8_ds_mla":
                 raise ValueError("DSV4 fused cache requires fp8_ds_mla")
-            if normalized["slot_mapping_all_valid"] is not True:
+            partial_context = ("mathematical_program" in normalized and normalized["mathematical_program"]
+                == "vllm_0_30_dspark_partial_context_insert_v1")
+            if partial_context:
+                valid = normalized["valid_token_count"]
+                if (type(valid) is not int or not 1 <= valid <= 6
+                        or shape["seq_len"] != 6 or shape["num_query_heads"] not in (8, 16)
+                        or shape["padded_query_heads"] != 64
+                        or type(normalized["slot_mapping_all_valid"]) is not bool
+                        or normalized["slot_mapping_all_valid"] != (valid == 6)):
+                    raise ValueError("DSpark partial context insert requires full six rows and explicit valid prefix1..6")
+            elif normalized["slot_mapping_all_valid"] is not True:
                 raise ValueError("DSV4 fused cache requires valid token slots")
             if (shape["head_dim"] != 512 or shape["rope_dim"] != 64
                     or shape["cache_token_bytes"] != 584):
@@ -2904,8 +3306,12 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
             raise ValueError("V4 short-context fill requires complete INT32 topk output rows")
     elif kind is KernelKind.VECTOR and variant in (
             "dsv32_draft_argmax", "dsv32_draft_id_cast", "dsv32_draft_row_select", "dsv32_draft_buffer_copy", "dsv32_draft_token_stack", "dsv32_draft_id_scatter", "dsv32_draft_prepare_next_ids", "dsv32_draft_prepare_sample_indices", "dsv32_draft_seq_rollback", "dsv32_draft_step_metadata"):
-        if normalized["sampling_source"] != "vllm_0_30_legacy_full_logits_greedy":
-            raise ValueError("draft sampling requires explicit legacy full-logits greedy source")
+        if normalized["sampling_source"] == "vllm_0_30_dspark_full_vocab_greedy_bf16":
+            if (variant != "dsv32_draft_argmax" or compute_dtype != "bf16"
+                    or not 1 <= shape["rows"] <= 16 or shape["vocab"] != 129280):
+                raise ValueError("DSpark greedy source requires BF16 argmax over 1..16 full 129280-value rows")
+        elif normalized["sampling_source"] != "vllm_0_30_legacy_full_logits_greedy":
+            raise ValueError("draft sampling requires an explicit recognized full-logits greedy source")
         width = (shape["vocab"] if variant == "dsv32_draft_argmax" else
                  shape["proposal_depth"] if variant == "dsv32_draft_token_stack" else
                  shape["sampled_width"] if variant == "dsv32_draft_prepare_next_ids" else
@@ -3093,9 +3499,9 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
         prefill_rows = shape["rows"] - (sequences - 1)
         if (not valid_flags or type(normalized["gate_lower_bound"]) not in (int, float)
                 or normalized["gate_lower_bound"] != -5.0
-                or not 64 <= prefill_rows < 2**31 - (sequences - 1) or prefill_rows % 64
+                or not 64 <= prefill_rows < 2**31 - (sequences - 1)
                 or (shape["heads"], shape["head_dim"]) != (96, 128)):
-            raise ValueError("K3 KDA chunk requires full64-token fresh prefill, 96x128 heads and source gate bound-5")
+            raise ValueError("K3 KDA chunk requires full/tail64-token fresh prefill, 96x128 heads and source gate bound-5")
         elements = (sequences * 96 * 128 * 128 if stage in ("initial_state", "final_state_scatter")
                     else shape["rows"] * 96 * 128)
         if shape["element_count"] != elements:
@@ -3158,10 +3564,54 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
             "logical_and", "sum", "cumsum", "unary", "subtract", "promote_subtract", "promote_add", "where", "where_zero", "where_promote",
             "masked_fill", "row_gather", "rejection", "cast_fp32", "prepare_next_padded", "prepare_inputs_padded", "step_metadata",
             "cast_int64", "promote_concat", "eagle_tree_build", "eagle_tree_verify", "eagle_bonus",
-            "eagle_max", "eagle_eh_norm", "eagle_softmax", "eagle_positions", "eagle_topk1_partial", "eagle_topk1_finalize"}
+            "eagle_max", "eagle_eh_norm", "eagle_softmax", "eagle_positions", "eagle_topk1_partial", "eagle_topk1_finalize",
+            "dspark_aux_mean", "dspark_repeat_hc", "dspark_sigmoid", "dspark_swa_indices", "dspark_zero_query", "dspark_greedy_verify", "dspark_roundtrip_prepare"}
         operation = normalized["operation"]
         if operation not in operations:
             raise ValueError("unsupported MTP eager source operation")
+        if operation == "dspark_roundtrip_prepare":
+            if (normalized["model_execution_version"] != "vllm_0_30_0"
+                    or type(normalized["num_speculative_tokens"]) is not int
+                    or normalized["num_speculative_tokens"] != 5
+                    or type(normalized["accepted_drafts"]) is not int
+                    or not 0 <= normalized["accepted_drafts"] <= 5
+                    or shape["rows"] != 1 or shape["width"] != 6 or shape["source_rows"] != 6
+                    or shape["dtype_bytes"] != 8):
+                raise ValueError("DSpark roundtrip metadata requires vLLM0.30 B1 N6 K5, INT64 positions and explicit A0..5")
+        if operation == "dspark_greedy_verify":
+            if (normalized["model_execution_version"] != "vllm_0_30_0"
+                    or type(normalized["num_speculative_tokens"]) is not int
+                    or normalized["num_speculative_tokens"] != 5
+                    or type(normalized["accepted_drafts"]) is not int
+                    or not 0 <= normalized["accepted_drafts"] <= 5
+                    or shape["rows"] != 1 or shape["width"] != 6 or shape["source_rows"] != 6
+                    or shape["dtype_bytes"] != 4):
+                raise ValueError("DSpark greedy prefix projection requires vLLM0.30 B1 K5, INT32 drafts and explicit A0..5")
+        if operation == "dspark_zero_query":
+            if (normalized["model_execution_version"] != "vllm_0_30_0"
+                    or shape["source_rows"] != shape["rows"] or shape["width"] not in (4096, 8192)
+                    or shape["dtype_bytes"] != 2):
+                raise ValueError("DSpark dummy Q zeros require vLLM0.30 BF16 localheads8/16 x512 and exact rows")
+        if operation == "dspark_swa_indices":
+            kv_lens = normalized["kv_lens"]
+            if (normalized["model_execution_version"] != "vllm_0_30_0"
+                    or type(normalized["num_speculative_tokens"]) is not int
+                    or normalized["num_speculative_tokens"] != 5
+                    or shape["rows"] != 5 * shape["source_rows"] or shape["width"] != 192
+                    or shape["dtype_bytes"] != 4
+                    or not isinstance(kv_lens, (tuple, list)) or len(kv_lens) != shape["source_rows"]
+                    or any(type(kv) is not int or not 5 <= kv < 2**31 for kv in kv_lens)):
+                raise ValueError("DSpark SWA indices require vLLM0.30 all-valid block5, width192 and real KV bounds")
+            normalized["kv_lens"] = tuple(kv_lens)
+        if operation in ("dspark_aux_mean", "dspark_repeat_hc", "dspark_sigmoid"):
+            if normalized["model_execution_version"] != "vllm_0_30_0":
+                raise ValueError("DSpark mathematical primitives require the explicit vLLM0.30 source")
+            expected_source_rows = (4 * shape["rows"] if operation == "dspark_aux_mean"
+                else shape["rows"] // 4 if operation == "dspark_repeat_hc" else shape["rows"])
+            if (shape["source_rows"] != expected_source_rows
+                    or (operation == "dspark_repeat_hc" and shape["rows"] % 4)
+                    or shape["dtype_bytes"] != (4 if operation == "dspark_sigmoid" else 2)):
+                raise ValueError("DSpark primitives require exact hc4 input/output rows and typed storage")
         sglang = normalized["model_execution_version"] == "sglang_0_5_19"
         eagle_operations = {"cast_int64", "promote_concat", "eagle_tree_build", "eagle_tree_verify",
             "eagle_bonus", "eagle_max", "eagle_eh_norm", "eagle_softmax", "eagle_positions", "eagle_topk1_partial", "eagle_topk1_finalize"}
@@ -3217,7 +3667,10 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
             "where": ("int32", "int64"), "where_zero": ("int64",), "where_promote": ("int64",),
             "masked_fill": ("int32", "int64"), "row_gather": ("int32",), "rejection": ("int32",),
             "cast_fp32": ("bf16",), "prepare_next_padded": ("int32",),
-            "prepare_inputs_padded": ("int32",), "step_metadata": ("int64",)}
+            "prepare_inputs_padded": ("int32",), "step_metadata": ("int64",),
+            "dspark_aux_mean": ("bf16",), "dspark_repeat_hc": ("bf16",), "dspark_sigmoid": ("fp32",),
+            "dspark_swa_indices": ("int32",), "dspark_zero_query": ("bf16",),
+            "dspark_greedy_verify": ("int32",), "dspark_roundtrip_prepare": ("int64",)}
         if normalized["model_execution_version"] in ("vllm_0_27_1", "vllm_0_30_0"):
             allowed_dtypes["copy"] = (*allowed_dtypes["copy"], "fp32")
         if sglang and normalized["eagle_source"] in ("topk1_steps1_eager", "topk1_steps2_eager"):
@@ -3331,7 +3784,7 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
             pytorch_int32_int64_cast_launch(shape["element_count"], normalized, variant)
             normalized["copy_dispatch"] = MappingProxyType(dict(normalized["copy_dispatch"]))
     elif kind is KernelKind.VECTOR and variant == "vllm_masked_embedding":
-        if normalized["mask_program"] not in ("vllm_0_11", "vllm_0_24", "vllm_0_30", "vllm_ascend_no_added_vocab"):
+        if normalized["mask_program"] not in ("vllm_0_11", "vllm_0_24", "vllm_0_27_1", "vllm_0_30", "vllm_ascend_no_added_vocab"):
             raise ValueError("masked embedding requires its supported source mask program")
         for key in ("vocab_size", "tensor_parallel_size", "tensor_parallel_rank"):
             if type(normalized[key]) is not int:
@@ -3474,8 +3927,15 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
         if normalized["index_rope_interleave"] is not True:
             raise ValueError("bound GLM V32 target fusion requires interleaved index RoPE")
         if variant == "dsv32_fused_norm_rope":
-            if normalized["mla_cache_dtype"] != "bf16" or normalized["cache_slot_scope"] != "all_rows_valid_slots_projection":
-                raise ValueError("V32 norm/cache fusion requires the explicit BF16 valid-slot projection")
+            if normalized["mla_cache_dtype"] != "bf16" or normalized["cache_slot_scope"] not in (
+                    "all_rows_valid_slots_projection", "outputs_only_no_cache_slots", "no_metadata_no_cache_slots"):
+                raise ValueError("V32 norm/cache fusion requires its explicit BF16 cache/metadata scope")
+            if normalized["cache_slot_scope"] == "no_metadata_no_cache_slots":
+                valid_fill = ((type(normalized["topk_active_fill"]) is int and normalized["topk_active_fill"] == -1)
+                    if normalized["has_indexer"] else normalized["topk_active_fill"] is None)
+                if (normalized["source_no_attention_metadata"] is not True
+                        or normalized["index_k_output_present"] is not False or not valid_fill):
+                    raise ValueError("V32 metadata=None requires absent cache/index-K output and its actual active TopK fill")
         elif normalized["quantize_mqa"] is not False:
             raise ValueError("V32 fused Q supports the explicit unquantized BF16 MQA path")
         if (shape["dtype_bytes"], shape["position_bytes"], shape["rope_cache_bytes"]) != (2, 8, 2):
@@ -3523,6 +3983,7 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
         expected_io = {
             "add": (2, 1),
             "mul": (2, 1),
+            "div": (2, 1),
             # One tensor operand and a Python scalar (x + c, x * c, cumsum).
             "unary": (1, 1),
             # BF16 logits materialized as FP32 (sglang logits_processor).
@@ -3651,8 +4112,11 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
                         or normalized["index_count"] != 0 or normalized["scattered"]
                         or not normalized["materialized_output"]):
                     raise ValueError("logical FP32 copy requires an unindexed materialized one-to-one copy")
-            elif (normalized["mathematical_program"] != "dense_fp16_source_flops_bytes_v1"
-                    or compute_dtype != "fp16" or normalized["gather_factor"] != 1
+            elif (normalized["mathematical_program"] not in (
+                    "dense_fp16_source_flops_bytes_v1", "dense_bf16_source_flops_bytes_v1")
+                    or compute_dtype != {"dense_fp16_source_flops_bytes_v1": "fp16",
+                        "dense_bf16_source_flops_bytes_v1": "bf16"}[normalized["mathematical_program"]]
+                    or normalized["gather_factor"] != 1
                     or normalized["index_bytes"] != 8 or not normalized["materialized_output"]
                     or "rows" not in shape
                     or normalized["index_count"] not in (0, shape["rows"])):
@@ -3853,6 +4317,9 @@ def _normalize_launch_parameters(
         and attributes["graph_logical_tokens"]
         != attributes["graph_model_input_tokens"])
     parameters = dict(launch.parameters)
+    if _is_kda_chunk_source(kind, launch.execution_variant, attributes):
+        # Exact replay already checked all parameters, grid/block and options.
+        return launch
     if (launch.source_program is not None
             and kind not in (
                 KernelKind.GEMM, KernelKind.FLASH_ATTN, KernelKind.VECTOR)):
@@ -3884,6 +4351,13 @@ def _normalize_launch_parameters(
                 and "split_k_count_observed" in launch.parameters):
             # An observed-grid launch whose split count the record omits.
             required.add("split_k_count_observed")
+        if launch.algorithm == "h200_vllm030_torch213_fp16_observed_gemm":
+            required |= {"registers_per_thread", "dynamic_shared_bytes"}
+        if launch.algorithm == "h200_vllm030_torch213_fp16_external_aggregate_gemm":
+            required |= {"registers_per_thread", "dynamic_shared_bytes", "modeled_split_k",
+                "modeled_partial_bytes_per_element", "split_k_count_observed"}
+        if launch.algorithm == "h200_cublaslt129_bf16_external_aggregate_gemm":
+            required |= {"modeled_split_k", "modeled_partial_bytes_per_element", "split_k_count_observed"}
     elif kind is KernelKind.FLASH_ATTN:
         if (launch.source_program is not None
                 and not isinstance(
@@ -3993,6 +4467,18 @@ def _normalize_launch_parameters(
                     "FUSED_MOE dynamic_shared_memory_bytes must be a "
                     "positive integer")
             required.add("dynamic_shared_memory_bytes")
+        occupancy_parameters = {"registers_per_thread", "static_shared_bytes"}
+        present_occupancy = set(parameters) & occupancy_parameters
+        if present_occupancy:
+            if (present_occupancy != occupancy_parameters
+                    or "dynamic_shared_memory_bytes" not in parameters):
+                raise ValueError("FUSED_MOE occupancy launch facts are incomplete")
+            for name in occupancy_parameters:
+                value = parameters[name]
+                if (not value.is_integer() or value < 0
+                        or (name == "registers_per_thread" and value == 0)):
+                    raise ValueError(f"FUSED_MOE {name} must be a valid integer")
+            required.update(occupancy_parameters)
         compiled_program_parameters = {"num_warps", "num_stages"}
         present_compiled_program = (
             set(parameters) & compiled_program_parameters)
@@ -4040,6 +4526,8 @@ def _normalize_launch_parameters(
                 SOURCE_PYTORCH_CPP_EXTENSION_INDEPENDENT_CTA_MEMORY_TASK_PARAMETER,
                 "cann_tiling_key",
             }
+            if launch.algorithm == "vllm_0_11_sm90_source_kv_cache":
+                allowed.update({"registers_per_thread", "static_shared_bytes", "dynamic_shared_bytes"})
             unknown = set(parameters) - allowed
             if unknown:
                 raise ValueError(
@@ -4102,6 +4590,7 @@ def _normalize_launch_parameters(
                 (shape["hidden"] == 128 or shape["hidden"] % 256 == 0)
                 if variant == "rmsnorm" else None,
                 frozenset(parameters),
+                launch.algorithm,
             )
             if vector_schema_cache_key in _VECTOR_PARAMETER_SCHEMA_CACHE:
                 allowed_schemas = _CachedVectorParameterSchemas(
@@ -4460,6 +4949,12 @@ def _normalize_launch_parameters(
                 SOURCE_BOUND_L2_READ_WARPS_PER_CTA_PARAMETER,
             })
         if variant == "gemm_reduce":
+            if launch.algorithm == "h200_cublaslt129_bf16_external_aggregate_reduce":
+                allowed_schemas.append({"split_k_partial_bytes_per_element", "split_k_partial_dram_bytes_per_element",
+                    "modeled_split_k", "modeled_partial_bytes_per_element", "split_k_count_observed"})
+            if launch.algorithm == "h200_vllm030_torch213_fp16_external_aggregate_reduce":
+                allowed_schemas.append({"registers_per_thread", "modeled_split_k",
+                    "modeled_partial_bytes_per_element", "split_k_count_observed"})
             reducer_schema = {
                 "split_k_partial_bytes_per_element",
                 "split_k_partial_dram_bytes_per_element",
@@ -4568,6 +5063,15 @@ def _normalize_launch_parameters(
                     SOURCE_PYTORCH_CPP_EXTENSION_INDEPENDENT_CTA_MEMORY_TASK_PARAMETER}
                 for schema in tuple(allowed_schemas)
             )
+        if (variant in ("rmsnorm", "add_rmsnorm", "silu", "rope", "moe_topk", "moe_align",
+                        "moe_align_small_batch", "moe_count_and_sort", "moe_act_and_mul", "moe_sum")
+                and launch.algorithm == f"vllm_0_11_sm90_source_{variant}"):
+            allowed_schemas.append({"registers_per_thread", "static_shared_bytes", "dynamic_shared_bytes"})
+        if (variant == "elementwise" and launch.algorithm in (
+                "pytorch_2_13_sm90_fill_bf16", "pytorch_2_13_sm90_fill_fp16",
+                "pytorch_2_13_sm90_fill_fp32", "pytorch_2_13_sm90_fill_int32",
+                "pytorch_2_13_sm90_fill_int64")):
+            allowed_schemas.append({"dynamic_shared_bytes"})
         if set(parameters) not in allowed_schemas:
             raise ValueError(
                 f"VECTOR/{variant} launch parameter schema mismatch: "
@@ -4581,6 +5085,9 @@ def _normalize_launch_parameters(
     else:
         raise ValueError(
             f"unhandled {kind.value} launch parameter contract")
+    if (kind is KernelKind.KV_CACHE and launch.execution_variant == "paged_kv_cache"
+            and launch.algorithm == "vllm_0_11_sm90_source_kv_cache"):
+        required = {"registers_per_thread", "static_shared_bytes", "dynamic_shared_bytes"}
     missing = required - set(parameters)
     unknown = set(parameters) - required
     if missing or unknown:
@@ -5404,6 +5911,69 @@ class KernelSpec:
         if self.launch != expected:
             raise ValueError("materialized gather requires its exact source-selected launch")
 
+    def validate_legacy_bf16_external_launch(self, hardware) -> None:
+        """Replay exact published CUDA12.9 geometry; modeled partitions stay explicit."""
+        from src.kernel.launch_config.nvidia_h200.gemm_launch import select_legacy_bf16_external_aggregate_launch
+        main = "h200_cublaslt129_bf16_external_aggregate_gemm"
+        reducer = "h200_cublaslt129_bf16_external_aggregate_reduce"
+        if (self.hardware_id != "nvidia_h200" or self.dtype != "bf16" or self.launch is None
+                or self.execution_support != "supported" or self.launch.tiling is not None
+                or self.launch.source_program is not None or "source_gemm_runtime" in self.attributes
+                or hardware is not None and hardware.hardware_id != self.hardware_id):
+            raise ValueError("legacy BF16 aggregate requires its exact source/hardware/dtype contract")
+        reduction = self.kind is KernelKind.VECTOR and self.variant == "gemm_reduce"
+        if reduction:
+            if self.launch.algorithm != reducer or "source_gemm_shape" not in self.attributes:
+                raise ValueError("legacy BF16 reducer requires its parent GEMM shape")
+            parent = self.attributes["source_gemm_shape"]
+        elif self.kind is KernelKind.GEMM and self.variant == "gemm" and self.launch.algorithm == main:
+            parent = self.shape
+        else:
+            raise ValueError("legacy BF16 aggregate stage disagrees with its algorithm")
+        # This profile is the source-bound ordinary row-major A @ B.T
+        # mathematical ABI; those fixed selector fields are not tile facts.
+        selection = {"a_layout": "row_major", "b_layout": "row_major", "c_layout": "row_major",
+            "trans_a": False, "trans_b": True, "has_bias": False, "epilogue": "none",
+            **self.attributes, "launch_policy": "injected_launch"}
+        expected = select_legacy_bf16_external_aggregate_launch(parent, self.dtype, "gemm",
+            selection, hardware, reducer=reduction)
+        if self.launch != expected or reduction and self.attributes["split_k"] != expected.parameters["modeled_split_k"]:
+            raise ValueError("legacy BF16 aggregate geometry or explicit model assumption differs from its source row")
+
+    def validate_observed_gemm_launch(self, hardware) -> None:
+        """Replay an explicitly bound dense source against the supplied HWSpec."""
+        if hardware.hardware_id != self.hardware_id:
+            raise ValueError("observed GEMM validation requires matching hardware")
+        self._validate_bound_fp16_gemm_launch(hardware)
+
+    def _validate_bound_fp16_gemm_launch(self, hardware) -> None:
+        """Exact source replay, including explicitly modeled external stages."""
+        from src.kernel.launch_config.nvidia_h200.gemm_launch import (
+            select_real_fp16_single_gemm_launch, select_real_fp16_external_gemm_launch)
+        single = "h200_vllm030_torch213_fp16_observed_gemm"
+        main = "h200_vllm030_torch213_fp16_external_aggregate_gemm"
+        reduce = "h200_vllm030_torch213_fp16_external_aggregate_reduce"
+        if (self.hardware_id != "nvidia_h200" or self.dtype != "fp16"
+                or self.execution_support != "supported" or self.launch is None
+                or "source_gemm_runtime" not in self.attributes
+                or self.attributes["source_gemm_runtime"] != "vllm_0_30_torch_2_13_cu130_cublas13_1_1_fp16_unquantized"
+                or self.launch.tiling is not None or self.launch.source_program is not None):
+            raise ValueError("observed FP16 GEMM requires its exact H200 runtime/launch contract")
+        attrs = {**self.attributes, "launch_policy": "injected_launch", "model_execution_version": "vllm_0_30_0"}
+        if self.kind is KernelKind.GEMM and self.variant == "gemm" and self.launch.algorithm in (single, main):
+            selector = select_real_fp16_single_gemm_launch if self.launch.algorithm == single else select_real_fp16_external_gemm_launch
+            expected = selector(self.shape, self.dtype, self.variant, attrs, hardware)
+        elif (self.kind is KernelKind.VECTOR and self.variant == "gemm_reduce"
+                and self.launch.algorithm == reduce and "source_gemm_shape" in self.attributes):
+            expected = select_real_fp16_external_gemm_launch(self.attributes["source_gemm_shape"],
+                self.dtype, "gemm", attrs, hardware, reducer=True)
+            if self.attributes["split_k"] != expected.parameters["modeled_split_k"]:
+                raise ValueError("aggregate reducer split count must match its explicit model assumption")
+        else:
+            raise ValueError("observed FP16 GEMM algorithm/kind disagrees with its source stage")
+        if self.launch != expected:
+            raise ValueError("observed FP16 GEMM launch disagrees with its actual source row")
+
     def __post_init__(self) -> None:
         kind = KernelKind.parse(self.kind)
         object.__setattr__(self, "kind", kind)
@@ -5414,6 +5984,13 @@ class KernelSpec:
             raise TypeError("KernelSpec.shape must be a mapping")
         if not isinstance(self.attributes, Mapping):
             raise TypeError("KernelSpec.attributes must be a mapping")
+        if ("mathematical_program" in self.attributes
+                and self.attributes["mathematical_program"] in (
+                    "dense_bf16_source_flops_bytes_v1", "unquantized_bf16_flops_bytes_v1",
+                    "unquantized_bf16_swiglu_v1", "unquantized_bf16_grouped_swiglu_v1",
+                    "unquantized_bf16_legacy_grouped_swiglu_v1")
+                and (hardware_id != "nvidia_h200" or self.execution_support != "unsupported" or self.launch is not None)):
+            raise ValueError("BF16 source math requires an unbound H200 contract; native launch support is separate")
         if (isinstance(self.anonymous_l2_dirty_bytes, bool)
                 or not isinstance(self.anonymous_l2_dirty_bytes, int)):
             raise TypeError(
@@ -5443,6 +6020,11 @@ class KernelSpec:
             raise ValueError(f"shape dimensions cannot be negative: {normalized_shape}")
         object.__setattr__(self, "shape", _immutable_mapping(normalized_shape))
         object.__setattr__(self, "attributes", _immutable_mapping(self.attributes))
+        if (_is_kda_chunk_source(kind, self.variant, self.attributes)
+                and (hardware_id != "nvidia_h200" or self.dtype != "bf16"
+                    or self.execution_support != "unsupported"
+                    or self.unsupported_reason != "typed_service_unavailable" or self.launch is None)):
+            raise ValueError("KDA chunk child requires its exact partial H200 BF16 source launch")
         if self.execution_support not in ("supported", "unsupported"):
             raise ValueError(
                 "KernelSpec.execution_support must be supported or unsupported")
@@ -5455,14 +6037,65 @@ class KernelSpec:
                 raise ValueError(
                     "unsupported KernelSpec requires unsupported_reason="
                     "'launch_selector_unavailable' or 'typed_service_unavailable'")
-            if self.unsupported_reason == "typed_service_unavailable" and not (
-                    kind is KernelKind.VECTOR and self.variant == "vllm_plain_greedy_sample"
-                    and self.hardware_id == "nvidia_h200" and self.launch is not None
-                    and "stage" in self.attributes and self.attributes["stage"] == "argmax"):
-                raise ValueError("typed-service refusal requires the exact H200 argmax source launch")
+            bound_k3_partial_launch = (
+                kind is KernelKind.VECTOR and self.hardware_id == "nvidia_h200"
+                and self.launch is not None and ((self.variant, self.launch.algorithm) in (
+                    ("kimi_k3_kda_decode", "vllm_0_30_sm90_kda_packed_decode"),
+                    ("kimi_k3_kda_decode", "vllm_0_30_sm90_kda_gated_rmsnorm"),
+                    ("kimi_k3_kda_decode", "vllm_0_30_sm90_kda_causal_conv1d_update"),
+                    ("kimi_k3_situ", "vllm_0_30_sm90_kimi_k3_situ_scalar"))
+                    or (self.variant in ("kimi_k3_kda_prefill", "kimi_k3_kda_mixed", "kimi_k3_kda_context_prefill")
+                        and self.launch.algorithm in ("vllm_0_30_sm90_kda_causal_conv1d_fwd",
+                            "vllm_0_30_sm90_kda_gather_initial_states", "vllm_0_30_sm90_kda_gated_rmsnorm"))))
+            legacy_router_div = (
+                kind is KernelKind.VECTOR and self.variant == "elementwise"
+                and self.hardware_id == "nvidia_h200" and self.launch is not None
+                and self.launch.algorithm == "pytorch_2_8_sm90_moe_selected_weight_div"
+                and "operation" in self.attributes and self.attributes["operation"] == "div")
+            if self.unsupported_reason == "typed_service_unavailable":
+                if _is_kda_chunk_source(kind, self.variant, self.attributes):
+                    _validate_kda_chunk_source_launch(self.variant, self.shape, self.dtype, self.attributes, self.launch)
+                elif bound_k3_partial_launch:
+                    from src.kernel.launch_config.nvidia_h200.vector_launch import select_vector_launch
+                    # These exact algorithms uniquely bind the source wrapper;
+                    # state indices, bounds and activation parameters stay real
+                    # caller facts. Source-component metadata is selection-only.
+                    component = {
+                        "kimi_k3_situ": "vllm_0_30_kimi_k3_ordinary_mlp",
+                        "kimi_k3_kda_decode": "vllm_0_30_kimi_k3_triton_decode",
+                        "kimi_k3_kda_prefill": "vllm_0_30_kimi_k3_triton_fresh_prefill",
+                        "kimi_k3_kda_mixed": "vllm_0_30_kimi_k3_triton_mixed",
+                        "kimi_k3_kda_context_prefill": "vllm_0_30_kimi_k3_triton_context_prefill",
+                    }[self.variant]
+                    source = {**self.attributes, "source_component": component}
+                    expected = select_vector_launch(self.shape, self.dtype, self.variant, source, None)
+                    if self.launch != expected:
+                        raise ValueError("K3 partial source requires its exact H200 launch")
+                elif legacy_router_div:
+                    from src.kernel.launch_config.nvidia_h200.moe_router_launch import select_legacy_router_stage
+                    source = {**self.attributes, "model_execution_version": "vllm_0_11_0",
+                        "source_moe_router_stage": "normalize_div", "source_router_renormalize": True,
+                        "source_input_layout": "contiguous_aligned_16"}
+                    expected = select_legacy_router_stage(self.shape, self.dtype, self.variant, source, None)
+                    if self.launch != expected:
+                        raise ValueError("legacy router division requires its exact H200 broadcast launch")
+                elif not (
+                        kind is KernelKind.VECTOR and self.variant == "vllm_plain_greedy_sample"
+                        and self.hardware_id == "nvidia_h200" and self.launch is not None
+                        and "stage" in self.attributes and self.attributes["stage"] == "argmax"):
+                    raise ValueError("typed-service refusal requires an exact bound H200 source launch")
         else:
             raise AssertionError(
                 f"unhandled execution support: {self.execution_support!r}")
+
+        if (kind is KernelKind.VECTOR and self.variant == "elementwise"
+                and "operation" in self.attributes and self.attributes["operation"] == "div"):
+            if (self.hardware_id != "nvidia_h200" or self.dtype != "fp32"
+                    or self.execution_support != "unsupported"
+                    or self.unsupported_reason != "typed_service_unavailable"
+                    or self.launch is None
+                    or self.launch.algorithm != "pytorch_2_8_sm90_moe_selected_weight_div"):
+                raise ValueError("router division binds only its typed-service-unavailable H200 launch")
 
         compute_kinds = {
             KernelKind.GEMM,
@@ -5481,6 +6114,27 @@ class KernelSpec:
             KernelKind.KV_OFFLOAD,
         }
         if kind in compute_kinds:
+            if ((self.launch is not None and self.launch.algorithm in (
+                    "h200_cublaslt129_bf16_external_aggregate_gemm",
+                    "h200_cublaslt129_bf16_external_aggregate_reduce"))
+                    or kind is KernelKind.VECTOR and self.variant == "gemm_reduce" and self.dtype == "bf16"
+                    and "source_gemm_shape" in self.attributes and "source_gemm_runtime" not in self.attributes):
+                self.validate_legacy_bf16_external_launch(None)
+            if ((kind is KernelKind.GEMM or kind is KernelKind.VECTOR and self.variant == "gemm_reduce")
+                    and ("source_gemm_runtime" in self.attributes or self.launch is not None
+                        and self.launch.algorithm in (
+                            "h200_vllm030_torch213_fp16_observed_gemm",
+                            "h200_vllm030_torch213_fp16_external_aggregate_gemm",
+                            "h200_vllm030_torch213_fp16_external_aggregate_reduce"))):
+                self._validate_bound_fp16_gemm_launch(None)
+            if (kind is KernelKind.VECTOR and self.variant == "dsv32_fused_norm_rope"
+                    and self.attributes["cache_slot_scope"] == "no_metadata_no_cache_slots"
+                    and (self.hardware_id not in ("nvidia_a800", "nvidia_h200")
+                        or self.launch is not None or self.execution_support != "unsupported")):
+                raise ValueError("V32 metadata=None fusion requires its unbound NVIDIA mathematical source")
+            if (self.hardware_id == "nvidia_rtx_pro_5500"
+                    and (self.launch is not None or self.execution_support != "unsupported")):
+                raise ValueError("RTX PRO 5500 parameter scenario requires unbound mathematical execution")
             if self.execution_support == "supported" and self.launch is None:
                 raise ValueError(
                     f"supported {kind.value} requires a complete LaunchConfig")
@@ -5497,6 +6151,24 @@ class KernelSpec:
                     or not self.variant.strip()):
                 raise ValueError(f"{kind.value} requires variant")
             normalized_variant = self.variant.strip().lower()
+            if (kind is KernelKind.VECTOR and normalized_variant == "elementwise"
+                    and "mathematical_program" in self.attributes
+                    and self.attributes["mathematical_program"] == "vllm_0_30_fa3_aot_tail_clear"
+                    and (self.hardware_id != "nvidia_h200" or self.dtype != "int32"
+                        or self.execution_support != "unsupported" or self.launch is not None)):
+                raise ValueError("FA3 AOT metadata clear has only an unbound H200 INT32 mathematical contract")
+            if kind is KernelKind.VECTOR and normalized_variant == "fa3_prepare_varlen":
+                from src.kernel.launch_config.nvidia_h200.flash_attn_launch import select_fa3_prepare_varlen_launch
+                if (self.hardware_id != "nvidia_h200" or self.dtype != "int32"
+                        or "batch" not in self.shape
+                        or self.launch != select_fa3_prepare_varlen_launch(self.shape["batch"])):
+                    raise ValueError("FA3 prepare requires its H200 INT32 source launch")
+            if (kind is KernelKind.KV_CACHE and normalized_variant == "dsv4_qnorm_rope_kv_insert"
+                    and "mathematical_program" in self.attributes
+                    and self.attributes["mathematical_program"] == "vllm_0_30_dspark_partial_context_insert_v1"
+                    and (self.hardware_id != "nvidia_h200" or self.execution_support != "unsupported"
+                        or self.launch is not None)):
+                raise ValueError("DSpark partial context insert requires its H200 unbound mathematical contract")
             if (kind is KernelKind.VECTOR and normalized_variant == "vllm_mtp_eager"
                     and (self.hardware_id != ("nvidia_h200" if self.attributes["model_execution_version"] in ("vllm_0_27_1", "vllm_0_30_0", "sglang_0_5_19") else "nvidia_a800") or self.execution_support != "unsupported"
                         or self.launch is not None)):
@@ -5568,13 +6240,18 @@ class KernelSpec:
                     and "mathematical_program" in self.attributes
                     and (self.launch is not None or self.execution_support != "unsupported")):
                 raise ValueError("logical source math must not claim an actual launch")
+            if "packed_weight_storage" in self.attributes:
+                from src.kernel.hardware_spec import HWSpec
+                if (not HWSpec.source_contract_supported("aggregate_gpu_source_roofline", self.hardware_id)
+                        or self.launch is not None or self.execution_support != "unsupported"):
+                    raise ValueError("packed vector weights require the explicit unbound aggregate GPU source")
             if (kind is KernelKind.GEMM and "mathematical_program" in self.attributes
                     and (self.launch is not None or self.execution_support != "unsupported")):
                 raise ValueError("mathematical GEMM must not claim an actual launch")
             if (kind is KernelKind.GEMM and "mathematical_program" in self.attributes
                     and self.attributes["mathematical_program"] in ("block_fp8_quantized_input_fp32_scales_v1", "batched_fp8_quantized_input_fp32_scales_v1")
-                    and self.hardware_id != "hygon_bw1100"):
-                raise ValueError("prequantized block-FP8 program is scoped to the BW1100 design")
+                    and self.hardware_id not in ("hygon_bw1100", "nvidia_rtx_pro_5500")):
+                raise ValueError("prequantized block-FP8 program is scoped to the declared aggregate GPU design")
             if (kind is KernelKind.GEMM and "mathematical_program" in self.attributes
                     and self.attributes["mathematical_program"] in ("mxfp4_bf16_flops_bytes_v1", "mxfp4_fp8_flops_bytes_v1")
                     and self.hardware_id != "intel_agmf039r47"):
@@ -5587,6 +6264,10 @@ class KernelSpec:
                     and self.hardware_id != "nvidia_h200"):
                 raise ValueError("empty-row MLA context currently binds only the declared H200 SGLang source")
             if (kind is KernelKind.FUSED_MOE and "mathematical_program" in self.attributes
+                    and self.attributes["mathematical_program"] == "sglang_0_5_19_fp8_fused_shared_swiglu_v1"
+                    and self.hardware_id != "nvidia_h200"):
+                raise ValueError("SGLang0.5.19 mathematical experts require the declared H200 source contract")
+            if (kind is KernelKind.FUSED_MOE and "mathematical_program" in self.attributes
                     and self.attributes["mathematical_program"] == "block_fp8_replicated_ep_swiglu_v1"
                     and self.hardware_id != "nvidia_h200"):
                 raise ValueError("EP8 mathematical experts require their H200 source contract")
@@ -5595,9 +6276,13 @@ class KernelSpec:
                     and self.hardware_id not in ("nvidia_a800", "nvidia_h200")):
                 raise ValueError("Kimi EP mathematical experts require an unbound NVIDIA source contract")
             if (kind is KernelKind.FUSED_MOE and "mathematical_program" in self.attributes
+                    and self.attributes["mathematical_program"] == "kimi_ep_marlin_swiglu_v1"
+                    and normalized_shape["intermediate"] in (256, 512, 1024) and self.hardware_id != "nvidia_h200"):
+                raise ValueError("Kimi TP-sharded mathematical experts require the H200 source domain")
+            if (kind is KernelKind.FUSED_MOE and "mathematical_program" in self.attributes
                     and self.attributes["mathematical_program"] == "dsv4_mxfp4_w4a16_swiglu_v1"
-                    and self.hardware_id != "hygon_bw1100"):
-                raise ValueError("V4 TP8 mathematical experts require their declared BW1100 source scope")
+                    and self.hardware_id not in ("hygon_bw1100", "nvidia_rtx_pro_5500")):
+                raise ValueError("V4 TP8 mathematical experts require their declared aggregate GPU source scope")
             if (kind is KernelKind.FUSED_MOE and "mathematical_program" in self.attributes
                     and (self.launch is not None or self.execution_support != "unsupported")):
                 raise ValueError("mathematical experts must not claim an actual launch")
@@ -5620,7 +6305,7 @@ class KernelSpec:
                     and (self.execution_support != "unsupported" or self.hardware_id != "nvidia_h200")):
                 raise ValueError("rejection materialization requires an unbound H200 source contract")
             if (kind is KernelKind.VECTOR and normalized_variant == "vllm_logits_gather_reorder"
-                    and (self.execution_support != "unsupported" or self.hardware_id not in ("nvidia_a800", "nvidia_h200", "metax_c500", "ascend_910b", "hygon_bw1100"))):
+                    and (self.execution_support != "unsupported" or self.hardware_id not in ("nvidia_a800", "nvidia_h200", "metax_c500", "ascend_910b", "hygon_bw1100", "nvidia_rtx_pro_5500"))):
                 raise ValueError("logits gather reorder requires an unbound CUDA-alike source contract")
             if (kind is KernelKind.VECTOR and normalized_variant == "vllm_masked_embedding"
                     and (self.execution_support != "unsupported" or self.hardware_id not in ("nvidia_a800", "nvidia_h200", "metax_c500", "ascend_910b"))):
@@ -5705,6 +6390,7 @@ class KernelSpec:
                         or self.launch.block != (128, 1, 1)
                         or self.launch.tiling is not None or self.launch.cluster is not None
                         or self.launch.source_program is not None
+                        or self.launch.source_program is not None
                         or dict(self.launch.parameters) != {"registers_per_thread": 32.0, "values_per_thread": 4.0}):
                     raise ValueError("integer cast requires its exact A800 Torch 2.8 launch")
             if (kind is KernelKind.VECTOR and normalized_variant == "vllm_embedding_id_widen"
@@ -5783,20 +6469,20 @@ class KernelSpec:
                     if self.launch is None and self.execution_support != "unsupported":
                         raise ValueError("target logits cast requires its exact C500 source launch")
                 elif (self.execution_support != "unsupported" and self.hardware_id not in ("nvidia_a800", "nvidia_h200")) or self.hardware_id not in (
-                        "nvidia_a800", "nvidia_h200", "metax_c500", "ascend_910b", "hygon_bw1100"):
+                        "nvidia_a800", "nvidia_h200", "metax_c500", "ascend_910b", "hygon_bw1100", "nvidia_rtx_pro_5500"):
                     raise ValueError("target logits cast requires an unbound supported source contract")
             if (kind is KernelKind.VECTOR and normalized_variant == "moe_sum"
                     and "routed_weights_dtype" in self.attributes
                     and self.attributes["routed_weights_dtype"] is not None
-                    and (self.hardware_id != "hygon_bw1100" or self.execution_support != "unsupported")):
-                raise ValueError("weighted moe_sum currently binds only BW1100 logical Roofline")
+                    and (self.hardware_id not in ("hygon_bw1100", "nvidia_rtx_pro_5500") or self.execution_support != "unsupported")):
+                raise ValueError("weighted moe_sum currently binds only the declared aggregate GPU logical Roofline")
             if (kind is KernelKind.VECTOR and normalized_variant in ("vllm_logits_row_select", "vllm_logits_gather_reorder")
                     and "model_execution_version" in self.attributes
                     and self.attributes["model_execution_version"] == "vllm_0_27_1"
                     and self.hardware_id != "nvidia_h200"):
                 raise ValueError("DSV3 logits boundary requires its declared H200 source contract")
             if (kind is KernelKind.VECTOR and normalized_variant == "vllm_logits_row_select"
-                    and self.hardware_id not in ("nvidia_a800", "nvidia_h200", "metax_c500", "ascend_910b", "hygon_bw1100")):
+                    and self.hardware_id not in ("nvidia_a800", "nvidia_h200", "metax_c500", "ascend_910b", "hygon_bw1100", "nvidia_rtx_pro_5500")):
                 raise ValueError("target logits row selection requires a supported source contract")
             if (kind is KernelKind.VECTOR and normalized_variant == "vllm_logits_row_select"
                     and "disable_index_broadcast" in self.attributes and self.hardware_id != "metax_c500"):
@@ -5825,13 +6511,18 @@ class KernelSpec:
                         or self.launch.source_program is not None
                         or dict(self.launch.parameters) != {"registers_per_thread": 24.0, "values_per_thread": 8.0}):
                     raise ValueError("target row selection requires its exact A8000.11 vectorized launch")
+            if (kind is KernelKind.VECTOR and self.attributes is not None and "mathematical_program" in self.attributes
+                    and self.attributes["mathematical_program"] == "vllm_0_30_dspark_typed_role_bytes_v1"
+                    and (self.hardware_id != "nvidia_h200" or self.launch is not None
+                        or self.execution_support != "unsupported")):
+                raise ValueError("DSpark typed payload is an unbound H200 mathematical contract")
             if (kind is KernelKind.VECTOR and normalized_variant == "vocab_parallel_embedding"
-                    and (self.execution_support != "unsupported" or self.hardware_id not in ("nvidia_a800", "nvidia_h200", "hygon_bw1100"))):
+                    and (self.execution_support != "unsupported" or self.hardware_id not in ("nvidia_a800", "nvidia_h200", "hygon_bw1100", "nvidia_rtx_pro_5500"))):
                 raise ValueError("vocab embedding requires an unbound NVIDIA CUDA source contract")
             if (kind is KernelKind.VECTOR and normalized_variant in ("dsv32_moe_route", "kimi_moe_route")
                     and (self.execution_support != "unsupported" or (self.hardware_id != "nvidia_h200"
                         and not (self.hardware_id == "nvidia_a800" and "source_projection_scope" in self.attributes
-                            and self.attributes["source_projection_scope"] in ("a800_tp1_target_representative_layers_v1", "a800_tp8_pp4_ep8_glm_source_v1", "a800_tp8_pp2_ep8_kimi_source_v1", "a800_tp1_kimi_source_v1"))))):
+                            and self.attributes["source_projection_scope"] in ("a800_tp1_target_representative_layers_v1", "a800_tp8_pp4_ep8_glm_source_v1", "a800_tp8_pp2_ep8_kimi_source_v1", "a800_tp1_kimi_source_v1", "vllm_0_30_glm_pcp_source_v1"))))):
                 source_model = "GLM V32" if normalized_variant == "dsv32_moe_route" else "Kimi"
                 raise ValueError(f"{source_model} route requires an unbound H200 source contract")
             if (kind is KernelKind.VECTOR and normalized_variant in ("dsv32_moe_route", "kimi_moe_route")
@@ -5839,8 +6530,8 @@ class KernelSpec:
                     and (self.hardware_id != "nvidia_a800" or self.launch is not None or self.execution_support != "unsupported")):
                 raise ValueError("A800 structural routing cannot claim an actual launch")
             if (kind is KernelKind.VECTOR and normalized_variant == "dsv4_moe_route"
-                    and (self.hardware_id not in ("nvidia_h200", "hygon_bw1100")
-                         or (self.hardware_id == "hygon_bw1100" and (self.launch is not None or self.execution_support != "unsupported"))
+                    and (self.hardware_id not in ("nvidia_h200", "hygon_bw1100", "nvidia_rtx_pro_5500")
+                         or (self.hardware_id in ("hygon_bw1100", "nvidia_rtx_pro_5500") and (self.launch is not None or self.execution_support != "unsupported"))
                          or (self.execution_support == "supported"
                              and ("routing_source" not in self.attributes
                                   or self.attributes["routing_source"] is None)))):
@@ -5899,8 +6590,13 @@ class KernelSpec:
             zero_element_count_allowed = (
                 kind is KernelKind.KV_CACHE
                 and normalized_variant == "dsv4_compressed_state_cache")
+            sparse_zero_kv_allowed = (kind is KernelKind.FLASH_ATTN
+                and normalized_variant in ("mla_decode", "combine")
+                and "source_program" in self.attributes
+                and self.attributes["source_program"] == "vllm_0_30_fa3_sparse_mla")
             if any(value <= 0 for name, value in normalized_shape.items()
-                   if not ((zero_allowed or zero_indexer_topk_allowed) and name == "topk")
+                   if not (sparse_zero_kv_allowed and name == "kv_len" and value == 0)
+                   and not ((zero_allowed or zero_indexer_topk_allowed) and name == "topk")
                    and not (zero_element_count_allowed
                             and name == "element_count")):
                 raise ValueError(
@@ -5926,6 +6622,66 @@ class KernelSpec:
                 normalized_attributes = _normalize_compute_attributes(
                     kind, normalized_variant, self.attributes,
                     normalized_shape, self.dtype.strip().lower())
+            legacy_vector_variants = ("rmsnorm", "add_rmsnorm", "silu", "rope")
+            from src.kernel.launch_config.nvidia_h200.source_vector_launch import (
+                LEGACY_FUSED_NORM_GEOMETRY, legacy_fused_norm_geometry)
+            if self.launch is not None and self.launch.algorithm == LEGACY_FUSED_NORM_GEOMETRY:
+                if (self.hardware_id != "nvidia_h200" or kind is not KernelKind.VECTOR
+                        or normalized_variant != "add_rmsnorm"
+                        or self.launch != legacy_fused_norm_geometry(normalized_shape, self.dtype)):
+                    raise ValueError("legacy fused norm geometry requires its exact H200 source launch")
+            legacy_moe_variants = ("moe_topk", "moe_align", "moe_align_small_batch",
+                                   "moe_count_and_sort", "moe_act_and_mul", "moe_sum")
+            if (self.launch is not None and self.launch.algorithm in (
+                    *(f"vllm_0_11_sm90_source_{variant}" for variant in legacy_vector_variants),
+                    *(f"vllm_0_11_sm90_source_{variant}" for variant in legacy_moe_variants),
+                    "vllm_0_11_sm90_source_kv_cache")):
+                if self.hardware_id != "nvidia_h200":
+                    raise ValueError("SM90 compiled source resources require H200 hardware")
+                source_attributes = {"model_execution_version": "vllm_0_11_0",
+                                     "source_input_layout": "contiguous_aligned_16"}
+                if (kind is KernelKind.VECTOR and normalized_variant in legacy_vector_variants
+                        and self.launch.algorithm == f"vllm_0_11_sm90_source_{normalized_variant}"):
+                    from src.kernel.launch_config.nvidia_h200.legacy_vector_resources import select_legacy_vector_resources
+                    if normalized_variant == "rope":
+                        source_attributes["is_neox"] = normalized_attributes["is_neox"]
+                    expected_resources = select_legacy_vector_resources(normalized_shape, self.dtype,
+                        normalized_variant, source_attributes)
+                elif (kind is KernelKind.KV_CACHE and normalized_variant == "paged_kv_cache"
+                        and self.launch.algorithm == "vllm_0_11_sm90_source_kv_cache"):
+                    from src.kernel.launch_config.nvidia_h200.legacy_vector_resources import select_legacy_vector_resources
+                    source_attributes["kv_cache_dtype"] = normalized_attributes["kv_cache_dtype"]
+                    expected_resources = select_legacy_vector_resources(normalized_shape, self.dtype,
+                        normalized_variant, source_attributes)
+                elif (kind is KernelKind.VECTOR and normalized_variant in legacy_moe_variants
+                        and self.launch.algorithm == f"vllm_0_11_sm90_source_{normalized_variant}"):
+                    from src.kernel.launch_config.nvidia_h200.legacy_vector_resources import select_legacy_moe_aux_resources
+                    # This exact0.11 program binds FP32 softmax logits/INT32
+                    # routed IDs. The sum's work fraction remains caller-owned.
+                    source_attributes.update({"source_topk_id_dtype": "int32",
+                        "source_routing": "softmax", "routing_input_dtype": "fp32"})
+                    if normalized_variant == "moe_sum":
+                        source_attributes["work_fraction"] = normalized_attributes["work_fraction"]
+                    expected_resources = select_legacy_moe_aux_resources(normalized_shape, self.dtype,
+                        normalized_variant, source_attributes)
+                else:
+                    raise ValueError("SM90 compiled source algorithm disagrees with kernel kind/variant")
+                if dict(self.launch.parameters) != expected_resources:
+                    raise ValueError("SM90 resource fields disagree with the fixed compiled source")
+            if (kind is KernelKind.FLASH_ATTN and "source_program" in normalized_attributes
+                    and normalized_attributes["source_program"] == "vllm_0_30_fa3_sparse_mla"):
+                if (self.hardware_id != "nvidia_h200" or self.dtype != "bf16"
+                        or self.execution_support != "supported" or self.launch is None
+                        or normalized_variant not in ("mla_decode", "combine")
+                        or self.launch.algorithm != ("vllm_030_fa3_sm90_sparse_mla_partial"
+                            if normalized_variant == "mla_decode" else "vllm_030_fa3_sm90_sparse_mla_combine_partial")
+                        or self.launch.tiling is None
+                        or "kv_page" not in self.launch.tiling.tile_shape
+                        or self.launch.tiling.tile_shape["kv_page"] != 1
+                        or "kv_capacity" not in self.launch.tiling.tile_shape
+                        or self.launch.tiling.tile_shape["kv_capacity"] < normalized_shape["kv_len"]
+                        or self.launch.source_program is not None):
+                    raise ValueError("sparse FA3 source requires its H200 page1 library launch")
             if (kind is KernelKind.FLASH_ATTN and "source_program" in normalized_attributes
                     and normalized_attributes["source_program"] == "ascend_0_18_full_fia_split_fuse"):
                 if (self.hardware_id != "ascend_910b" or self.launch is None
@@ -5941,6 +6697,16 @@ class KernelSpec:
                             if normalized_attributes["ascend_fia_prefill_no_cache"]
                             else normalized_attributes["kv_layout"] not in ("paged", "paged_varlen"))):
                     raise ValueError("FULL FIA SplitFuse requires its source TND binding")
+            if (kind is KernelKind.FLASH_ATTN and normalized_variant == "combine"
+                    and "return_softmax_lse" in normalized_attributes):
+                if (self.hardware_id != "nvidia_h200" or self.dtype != "bf16"
+                        or self.execution_support != "supported" or self.launch is None
+                        or self.launch.algorithm != "vllm_fa3_sm90_mla_prefill_combine_partial"
+                        or self.launch.tiling is None or self.launch.tiling.num_kv_splits <= 1
+                        or self.launch.block != (256, 1, 1)
+                        or dict(self.launch.tiling.tile_shape) != {"rows": 8, "value_head": 128}
+                        or self.launch.tiling.pipeline_depth != 4):
+                    raise ValueError("final split-prefill LSE requires its BF16 H200 FA3 source combine")
             if (kind is KernelKind.FLASH_ATTN and normalized_variant == "mla_prefill"
                     and "return_softmax_lse" in normalized_attributes and normalized_attributes["return_softmax_lse"]
                     and "mathematical_program" not in normalized_attributes
@@ -5953,13 +6719,13 @@ class KernelSpec:
                     and self.hardware_id != "nvidia_h200"
                     and not (self.hardware_id == "intel_agmf039r47"
                         and "mathematical_program" in normalized_attributes
-                        and normalized_attributes["mathematical_program"] == "mxfp4_fp8_flops_bytes_v1")
-                    and not (self.hardware_id == "hygon_bw1100" and self.launch is None
+                        and normalized_attributes["mathematical_program"] in ("mxfp4_fp8_flops_bytes_v1", "packed_fp4_source_v1"))
+                    and not (self.hardware_id in ("hygon_bw1100", "nvidia_rtx_pro_5500") and self.launch is None
                         and self.execution_support == "unsupported")):
                 if (self.hardware_id != "nvidia_a800" or self.launch is not None
                         or self.execution_support != "unsupported"
                         or "source_projection_scope" not in normalized_attributes
-                        or normalized_attributes["source_projection_scope"] not in ("a800_tp1_target_representative_layers_v1", "a800_tp8_pp4_ep8_glm_source_v1")):
+                        or normalized_attributes["source_projection_scope"] not in ("a800_tp1_target_representative_layers_v1", "a800_tp8_pp4_ep8_glm_source_v1", "vllm_0_30_glm_pcp_source_v1")):
                     raise ValueError("mixed-output GEMM requires H200 or explicit unbound A800 structural scope")
             if (kind is KernelKind.GEMM and "source_projection_scope" in normalized_attributes
                     and (self.hardware_id != "nvidia_a800" or self.launch is not None
@@ -5975,7 +6741,7 @@ class KernelSpec:
                 if self.hardware_id != "nvidia_h200" or self.execution_support != "unsupported" or self.launch is not None:
                     raise ValueError("conditional FP8 quantizer source requires unbound H200 execution")
             if kind is KernelKind.VECTOR and normalized_variant == "dsv4_indexer_q_rope_quant":
-                if (self.hardware_id not in ("nvidia_h200", "hygon_bw1100") or self.execution_support != "unsupported" or self.launch is not None):
+                if (self.hardware_id not in ("nvidia_h200", "hygon_bw1100", "nvidia_rtx_pro_5500") or self.execution_support != "unsupported" or self.launch is not None):
                     raise ValueError("V4 indexer Q source projection requires unbound H200 execution")
             if kind is KernelKind.VECTOR and normalized_variant == "dsv4_moe_route":
                 source_bound = normalized_attributes["routing_source"] is not None
@@ -5991,6 +6757,24 @@ class KernelSpec:
                             or self.launch.grid != expected_grid
                             or self.launch.block != (128 if hashed else 32, 1, 1)):
                         raise ValueError("V4 routing launch disagrees with source geometry")
+            if (kind is KernelKind.VECTOR
+                    and not _is_kda_chunk_source(kind, normalized_variant, normalized_attributes)
+                    and self.launch is not None and self.launch.algorithm in (
+                    "pytorch_2_13_sm90_fill_bf16", "pytorch_2_13_sm90_fill_fp16",
+                    "pytorch_2_13_sm90_fill_fp32", "pytorch_2_13_sm90_fill_int32",
+                    "pytorch_2_13_sm90_fill_int64")):
+                elements = normalized_shape["element_count"]
+                if (self.hardware_id != "nvidia_h200" or normalized_variant != "elementwise"
+                        or self.launch.algorithm != f"pytorch_2_13_sm90_fill_{self.dtype.strip().lower()}"
+                        or normalized_attributes["operation"] != "fill"
+                        or normalized_attributes["reads"] != 0 or normalized_attributes["writes"] != 1
+                        or elements >= 2**31
+                        or normalized_shape["dtype_bytes"] * (elements - 1) >= 2**31 - 1
+                        or self.launch.grid != (-(-elements // 1024), 1, 1)
+                        or self.launch.block != (128, 1, 1)
+                        or self.launch.tiling is not None or self.launch.cluster is not None
+                        or dict(self.launch.parameters) != {"dynamic_shared_bytes": 0.0}):
+                    raise ValueError("Torch2.13 SM90 fill requires its exact H200 source launch and complete write")
             _validate_compute_dtype_contract(
                 kind,
                 normalized_variant,
@@ -5998,11 +6782,21 @@ class KernelSpec:
                 normalized_shape,
                 normalized_attributes,
             )
+            if (kind is KernelKind.VECTOR and normalized_variant == "vllm_masked_embedding"
+                    and normalized_attributes["mask_program"] == "vllm_0_27_1"
+                    and (self.hardware_id != "nvidia_h200"
+                        or normalized_attributes["tensor_parallel_size"] not in (4, 8)
+                        or (normalized_attributes["stage"] == "mask_output" and self.dtype != "bf16"))):
+                raise ValueError("vLLM0.27.1 masked embedding requires its unbound H200 BF16 TP4/8 source")
             if (kind is KernelKind.SPARSE_ATTN_INDEXER
                     and normalized_variant in ("dsa_indexer_prefill", "dsa_indexer_decode", "dsa_indexer_mixed")
                     and normalized_attributes["mathematical_program"] is not None
                     and (self.launch is not None or self.execution_support != "unsupported")):
                 raise ValueError("DSA mathematical indexer requires an unbound launch contract")
+            if (kind is KernelKind.SPARSE_ATTN and "mathematical_program" in normalized_attributes
+                    and normalized_attributes["mathematical_program"] == "vllm_0_30_dspark_swa_noncausal_softmax_v1"
+                    and self.hardware_id != "nvidia_h200"):
+                raise ValueError("DSpark sparse source math is restricted to the declared H200 scenario")
             if (kind is KernelKind.SPARSE_ATTN and "mathematical_program" in normalized_attributes
                     and (self.launch is not None or self.execution_support != "unsupported")):
                 raise ValueError("DSA mathematical prefill attention requires an unbound launch contract")
@@ -6133,16 +6927,18 @@ class KernelSpec:
                         "COMMUNICATION requires at least two participants")
                 operation = self.transfer.operation
                 collective_operations = {
-                    "all_reduce", "all_gather", "all_to_all"}
+                    "all_reduce", "all_gather", "all_to_all", "all_gatherv", "reduce_scatterv"}
                 if operation in collective_operations:
                     if self.transfer.direction != "collective":
                         raise ValueError(
                             f"{operation} COMMUNICATION requires collective "
                             "direction")
-                    if self.transfer.bytes_semantics != "per_rank_input":
+                    expected_semantics = ("aggregate_input" if operation == "all_gatherv"
+                        or self.transfer.traffic_matrix_bytes else "per_rank_input")
+                    if self.transfer.bytes_semantics != expected_semantics:
                         raise ValueError(
                             f"{operation} COMMUNICATION requires "
-                            "per_rank_input bytes_semantics")
+                            f"{expected_semantics} bytes_semantics")
                     if (self.transfer.source_rank is not None
                             or self.transfer.destination_rank is not None):
                         raise ValueError(
@@ -6224,7 +7020,7 @@ class KernelSpec:
                     else:
                         raise AssertionError(
                             "validated collective algorithm disappeared")
-                elif operation == "all_to_all":
+                elif operation in ("all_to_all", "all_gatherv", "reduce_scatterv"):
                     if self.transfer.algorithm != "pairwise":
                         raise ValueError(
                             "all_to_all COMMUNICATION currently requires the "
@@ -6236,7 +7032,7 @@ class KernelSpec:
                     if self.transfer.ring_order:
                         raise ValueError(
                             "all_to_all COMMUNICATION does not accept ring_order")
-                    if self.transfer.bytes % len(
+                    if operation == "all_to_all" and not self.transfer.traffic_matrix_bytes and self.transfer.bytes % len(
                             self.transfer.participants):
                         raise ValueError(
                             "all_to_all per-rank input bytes must divide the "
@@ -6256,7 +7052,7 @@ class KernelSpec:
                 else:
                     raise ValueError(
                         f"unhandled COMMUNICATION operation: {operation!r}")
-                if operation == "all_reduce":
+                if operation in ("all_reduce", "reduce_scatterv"):
                     if self.transfer.reduction != "sum":
                         raise ValueError(
                             "all_reduce COMMUNICATION currently requires sum "
@@ -6270,7 +7066,8 @@ class KernelSpec:
                         "COMMUNICATION backend must be "
                         "analytical_roofline_v1 or protobridge")
                 if self.transfer.backend == "analytical_roofline_v1":
-                    if self.transfer.link not in ("nvlink", "metaxlink", "hccs", "infiniband", "roce"):
+                    if (self.transfer.link not in ("nvlink", "metaxlink", "hccs", "infiniband", "roce")
+                            and not (self.transfer.link == "pcie" and self.transfer.traffic_matrix_bytes)):
                         raise ValueError(
                             "analytical Roofline COMMUNICATION models only "
                             "NVLink, MetaXLink, HCCS, InfiniBand or RoCE paths")

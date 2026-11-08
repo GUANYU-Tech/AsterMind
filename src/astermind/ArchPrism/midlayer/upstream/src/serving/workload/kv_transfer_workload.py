@@ -1,9 +1,33 @@
 """Request-scoped PD cache transport, independent of model forward construction."""
 
 from src.serving.deployment.deployment_config import worker_role_phase
+from src.kernel.kernel_spec import DTYPE_BYTES
 from src.serving.deployment.deployment_plan import DeploymentPlan, pd_kv_transfer_rank_pairs
 from .model_config import ModelConfig
 from .workload_graph import WorkloadGraph, WorkloadKind, WorkloadNode
+
+
+def gqa_kv_interval_bytes_per_token(layers, heads, head_dim, cache_dtype):
+    """Payload of one contiguous logical K/V layer/head interval."""
+    if any(type(value) is not int or value <= 0 for value in (layers, heads, head_dim)):
+        raise ValueError("GQA KV interval dimensions must be positive integers")
+    if cache_dtype not in ("bf16", "fp16", "fp32"):
+        raise ValueError("GQA KV cache requires a declared floating-point dtype")
+    return 2 * layers * heads * head_dim * DTYPE_BYTES[cache_dtype]
+
+
+def validate_pd_kv_layout(source, destination, attention_layout):
+    if source.kv_transfer_layout != destination.kv_transfer_layout:
+        raise NotImplementedError("PD KV cache layout conversion is not implemented")
+    layout = source.kv_transfer_layout
+    if source.hardware_id != destination.hardware_id and layout is None:
+        raise ValueError("cross-hardware PD requires explicit cache layouts at both endpoints")
+    if attention_layout not in ("standard_gqa", "mla", "dsa_mla"):
+        raise ValueError("PD KV cache has an unsupported attention format")
+    if layout is not None and ((attention_layout == "standard_gqa" and layout not in ("BLHNC", "BLNHC"))
+            or (attention_layout != "standard_gqa" and layout != "LBHNC")):
+        raise ValueError("declared cache layout is incompatible with the model's attention format")
+    return layout
 
 
 def build_pd_kv_transfer_workload(
@@ -13,6 +37,7 @@ def build_pd_kv_transfer_workload(
     deployment: DeploymentPlan,
     source_pool_name: str,
     destination_pool_name: str,
+    *, source_data_parallel_rank: int | None = None, destination_data_parallel_rank: int | None = None,
 ) -> WorkloadGraph:
     """Build one request-scoped P-to-D KV transfer after routing."""
 
@@ -31,75 +56,20 @@ def build_pd_kv_transfer_workload(
             f"unknown KV destination pool {destination_pool_name!r}")
     source = deployment.worker_pools[source_pool_name]
     destination = deployment.worker_pools[destination_pool_name]
+    layout = validate_pd_kv_layout(source, destination, model.attention_layout)
     if worker_role_phase(source.role) != "prefill":
         raise ValueError("KV transfer source must have a prefill role")
     if worker_role_phase(destination.role) != "decode":
         raise ValueError("KV transfer destination must have a decode role")
-    if (model.model_type in ("glm_moe_dsa", "deepseek_v3")
-            and source.parallel_plan.config.tensor_parallel_size
-                != destination.parallel_plan.config.tensor_parallel_size):
-        raise NotImplementedError(
-            "heterogeneous PD tensor parallel KV transfer has no explicit "
-            "payload contract; residency is not a transfer-size substitute")
-    if model.attention_layout == "dsa_mla":
-        source_parallel = source.parallel_plan.config
-        destination_parallel = destination.parallel_plan.config
-        # The DSA transfer payload is EP-independent: the compressed MLA
-        # ``kv_c||k_pe`` vector and the FP8 index cache are both
-        # num_kv_heads=1 caches replicated on every TP rank and transferred
-        # REPLICATE-style per TP rank pair, while expert parallelism only
-        # shards MoE expert weights and never enters the KV/index-cache path
-        # (pinned vLLM GLM-5.2/DeepSeek-V3.2 semantics: MLAAttentionSpec
-        # num_kv_heads=1, indexer cache 132 B/token per full-indexer layer,
-        # NIXL "cache is duplicated" rank mapping).  EP8 and EP1 therefore
-        # share the identical per-rank payload and identity rank mapping.
-        tp8_ep8 = (
-            source_parallel.enable_expert_parallel
-            and destination_parallel.enable_expert_parallel
-            and source_parallel.expert_parallel_size == 8
-            and destination_parallel.expert_parallel_size == 8
-        )
-        tp8_ep1 = (
-            not source_parallel.enable_expert_parallel
-            and not destination_parallel.enable_expert_parallel
-            and source_parallel.expert_parallel_size == 1
-            and destination_parallel.expert_parallel_size == 1
-        )
-        supported_pd_scope = (
-            source_parallel.tensor_parallel_size == 8
-            and destination_parallel.tensor_parallel_size == 8
-            and (tp8_ep8 or tp8_ep1)
-        )
-        if not supported_pd_scope:
-            raise NotImplementedError(
-                "DSA PD transfer requires a combined compressed MLA and "
-                "FP8 index-cache transfer contract")
-    elif model.model_type == "deepseek_v3":
-        source_parallel = source.parallel_plan.config
-        destination_parallel = destination.parallel_plan.config
-        # DeepSeek-V3 plain-MLA PD transfer payload: the compressed MLA
-        # ``kv_c||k_pe`` vector is a num_kv_heads=1 cache replicated on
-        # every TP rank and transferred REPLICATE-style per TP rank pair,
-        # exactly like the DSA MLA subset above but without the GLM-5.2
-        # FP8 index cache (DeepSeek-V3 has no DSA indexer).  Expert
-        # parallelism only shards MoE expert weights and never enters the
-        # KV path (pinned vLLM DeepSeek-V3 MLAAttentionSpec num_kv_heads=1,
-        # NIXL "cache is duplicated" rank mapping); the validated
-        # DeepSeek-V3 scope is the H200 InferenceX TP8/PP1/EP1 topology.
-        supported_pd_scope = (
-            source_parallel.tensor_parallel_size == 8
-            and destination_parallel.tensor_parallel_size == 8
-            and not source_parallel.enable_expert_parallel
-            and not destination_parallel.enable_expert_parallel
-            and source_parallel.expert_parallel_size == 1
-            and destination_parallel.expert_parallel_size == 1
-        )
-        if not supported_pd_scope:
-            raise NotImplementedError(
-                "DeepSeek-V3 PD transfer requires a compressed MLA "
-                "kv_c||k_pe transfer contract over TP8/EP1 pools")
+    if model.attention_layout in ("mla", "dsa_mla"):
+        # These are complete single-head compressed caches on every TP/PCP
+        # rank. Query heads and routed experts never divide their payload.
+        for endpoint in (source, destination):
+            if model.num_attention_heads % endpoint.parallel_plan.config.tensor_parallel_size:
+                raise ValueError("MLA query heads must be divisible by endpoint TP")
     rank_pairs = pd_kv_transfer_rank_pairs(
-        source, destination, model.num_key_value_heads)
+        source, destination, model.num_key_value_heads, source_data_parallel_rank=source_data_parallel_rank,
+        destination_data_parallel_rank=destination_data_parallel_rank, attention_layout=model.attention_layout)
     routes = [
         route for route in deployment.routes
         if route.payload == "kv"
@@ -111,6 +81,12 @@ def build_pd_kv_transfer_workload(
             "request-scoped KV transfer requires exactly one route from "
             f"{source_pool_name!r} to {destination_pool_name!r}")
     route = routes[0]
+    if source.hardware_id != destination.hardware_id and (
+            route.link != "infiniband"
+            or route.backend != "analytical_roofline_v1"):
+        raise ValueError(
+            "cross-hardware KV requires a declared analytical InfiniBand route; "
+            "device-local fabrics cannot imply physical connectivity")
     source_tensor_parallel_size = (
         source.parallel_plan.config.tensor_parallel_size)
     destination_tensor_parallel_size = (
@@ -126,13 +102,12 @@ def build_pd_kv_transfer_workload(
         overlapping_kv_heads = (
             rank_pair.kv_head_end - rank_pair.kv_head_start)
         if model.attention_layout == "standard_gqa":
-            bytes_per_token = (
-                2 * model.num_hidden_layers * overlapping_kv_heads
-                * model.head_dim * model.dtype_bytes)
+            bytes_per_token = gqa_kv_interval_bytes_per_token(
+                rank_pair.layer_end - rank_pair.layer_start, overlapping_kv_heads,
+                model.head_dim, model.compute_dtype)
         else:
-            bytes_per_token = model.kv_bytes_per_token_per_parallel_rank(
-                source_tensor_parallel_size,
-                source.parallel_plan.config.pipeline_parallel_size)
+            bytes_per_token = model.kv_bytes_per_token_for_layer_range(
+                source_tensor_parallel_size, rank_pair.layer_start, rank_pair.layer_end)
         node_id = (
             base_node_id
             if len(rank_pairs) == 1
@@ -147,6 +122,13 @@ def build_pd_kv_transfer_workload(
             attributes={
                 "algorithm": route.algorithm,
                 "bytes": context_tokens * bytes_per_token,
+                "token_start": 0,
+                "token_end": context_tokens,
+                "bytes_per_token": bytes_per_token,
+                "attention_layout": model.attention_layout,
+                "head_dim": model.head_dim if model.attention_layout == "standard_gqa" else None,
+                "cache_dtype": model.compute_dtype,
+                "cache_layout": layout,
                 "bytes_semantics": "payload",
                 "backend": route.backend,
                 "backend_config_sha256": route.backend_config_sha256,
@@ -161,7 +143,7 @@ def build_pd_kv_transfer_workload(
                 "reduction": None,
                 "resource_id": route.resource_id,
                 "destination_pool": destination_pool_name,
-                "rank_mapping": "kv_head_overlap",
+                "rank_mapping": "kv_head_overlap" if model.attention_layout == "standard_gqa" else "replicated_mla_cache",
                 "source_logical_rank": rank_pair.source_logical_rank,
                 "destination_logical_rank": (
                     rank_pair.destination_logical_rank),
@@ -170,7 +152,17 @@ def build_pd_kv_transfer_workload(
                     destination_tensor_parallel_size),
                 "kv_head_start": rank_pair.kv_head_start,
                 "kv_head_end": rank_pair.kv_head_end,
-                "num_key_value_heads": model.num_key_value_heads,
+                "layer_start": rank_pair.layer_start,
+                "layer_end": rank_pair.layer_end,
+                "num_key_value_heads": model.num_key_value_heads if model.attention_layout == "standard_gqa" else 1,
+                **({"model_num_key_value_heads": model.num_key_value_heads,
+                    "compressed_dim": model.kv_lora_rank + model.qk_rope_head_dim,
+                    "index_head_dim": model.index_head_dim,
+                    "full_indexer_layers": tuple(layer for layer in range(rank_pair.layer_start, rank_pair.layer_end)
+                        if model.indexer_types[layer] == "full") if model.attention_layout == "dsa_mla" else (),
+                    "source_context_parallel_size": source.parallel_plan.config.context_parallel_size,
+                    "destination_context_parallel_size": destination.parallel_plan.config.context_parallel_size}
+                    if model.attention_layout in ("mla", "dsa_mla") else {}),
             },
         ))
     return WorkloadGraph(tuple(nodes))

@@ -14,6 +14,7 @@ from pathlib import Path
 import re
 import signal
 import subprocess
+import sys
 import time
 
 from evaluation.serving.metrics.interactivity_tgs import (
@@ -21,7 +22,7 @@ from evaluation.serving.metrics.interactivity_tgs import (
 )
 
 ROOT = Path(__file__).resolve().parents[3]
-PYTHON = Path('/home/yangxinhao/miniconda3/envs/r2r_qwen3_next/bin/python')
+PYTHON = Path(sys.executable)
 CAPACITIES = (1, 2, 4, 8, 16, 32, 64, 128)
 MODELS = {'glm': ('glm-5.2-fp8', 565248), 'kimi': ('kimi-k2.6', 229376)}
 FIELDS = ('Query Time Stamp [ms]', 'In Token [tokens]', 'Out Token [tokens]', 'Cached hit [tokens]')

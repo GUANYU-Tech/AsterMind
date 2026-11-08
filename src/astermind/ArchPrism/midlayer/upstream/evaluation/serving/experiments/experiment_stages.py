@@ -1316,7 +1316,8 @@ def _production_trace_runtime_measurements(
 ) -> tuple[object, ...]:
     """Return run-local measurements excluded from deterministic replay."""
 
-    measurements = []
+    measurements = [tuple(payload[field] if field in payload else None
+        for field in ("interactive_report", "report_output_costs"))]
     for point in payload["points"]:
         result = point["result"]
         parallelism = result["execution_parallelism"]
@@ -1326,6 +1327,9 @@ def _production_trace_runtime_measurements(
             result["process_peak_rss_bytes"],
             parallelism["parallel_execution_wall_time_s"],
             parallelism["worker_aggregate_phase_s"],
+            point["state_audit_output"] if "state_audit_output" in point else None,
+            tuple(result[field] if field in result else None for field in (
+                "interactive_report", "report_output_costs", "simulation_started_monotonic_s", "simulation_finished_monotonic_s")),
         ))
     return tuple(measurements)
 
@@ -1336,8 +1340,16 @@ def _production_trace_deterministic_projection(
     """Remove wall-clock and RSS observations before replay comparison."""
 
     projected = _json_round_trip(payload)
+    for field in ("interactive_report", "report_output_costs"):
+        if field in projected:
+            projected[field] = None
     for point in projected["points"]:
+        if "state_audit_output" in point:
+            point["state_audit_output"] = None
         result = point["result"]
+        for field in ("interactive_report", "report_output_costs", "simulation_started_monotonic_s", "simulation_finished_monotonic_s"):
+            if field in result:
+                result[field] = None
         result["persistence"]["full_in_memory_result_sha256"] = None
         result["simulation_wall_time_s"] = None
         result["evaluation_wall_time_breakdown_s"] = None
@@ -1366,21 +1378,43 @@ def _rerun_production_trace_aggregate(
             "aggregate Production Trace simulation command is not canonical")
     output_indices = tuple(
         index for index, value in enumerate(simulation_argv)
-        if value == "--output"
+        if value == "--output" or value.startswith("--output=")
     )
     if len(output_indices) != 1:
         raise ValueError(
             "aggregate Production Trace simulation command must contain one "
             "--output")
     output_index = output_indices[0]
-    if output_index + 1 >= len(simulation_argv):
+    output_uses_equals_form = simulation_argv[output_index].startswith("--output=")
+    if not output_uses_equals_form and output_index + 1 >= len(simulation_argv):
         raise ValueError(
             "aggregate Production Trace simulation --output has no path")
     with tempfile.TemporaryDirectory(
             prefix="midlayer-production-trace-validation-") as directory:
         validation_output = Path(directory) / "aggregate.json"
         validation_argv = list(simulation_argv)
-        validation_argv[output_index + 1] = str(validation_output)
+        if output_uses_equals_form:
+            validation_argv[output_index] = "--output=" + str(validation_output)
+        else:
+            validation_argv[output_index + 1] = str(validation_output)
+        for option, filename in (("--interactive-output", "report.html"), ("--state-audit-output", "state-audit.json")):
+            indices = [index for index, value in enumerate(validation_argv) if value == option or value.startswith(option + "=")]
+            if len(indices) > 1:
+                raise ValueError("duplicate replay output option: " + option)
+            if indices:
+                index = indices[0]
+                target = str(Path(directory) / filename)
+                if validation_argv[index] == option:
+                    if index + 1 >= len(validation_argv) or validation_argv[index + 1].startswith("--"):
+                        raise ValueError("missing replay output path: " + option)
+                    validation_argv[index + 1] = target
+                else:
+                    validation_argv[index] = option + "=" + target
+        if "--interactive-report" in validation_argv and "--interactive-output" not in validation_argv:
+            # A boolean flag with the default report path also writes beside
+            # the redirected result; keep the replay hermetic by pinning the
+            # output path explicitly.
+            validation_argv.extend(("--interactive-output", str(Path(directory) / "report.html")))
         completed = subprocess.run(
             validation_argv,
             cwd=str(ROOT),

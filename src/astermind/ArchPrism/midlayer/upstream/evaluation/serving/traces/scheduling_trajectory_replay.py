@@ -1059,10 +1059,29 @@ def predict_scheduling_trajectory_steps(
     expert_routing = sharegpt_compact_evaluation._expected_expert_routing(
         root, cell
     )
+    case_path = sharegpt_compact_evaluation.compact_case_path(root, config, cell)
+    case_manifest = json.loads((case_path / "manifest.json").read_text())
+    runtime_version = case_manifest["runtime"]["runtime_version"]
+    # H200 captures vLLM 0.30 but the current standard prediction contract
+    # intentionally reuses the supported 0.11 dense CUDA model source.
+    source_versions = {
+        ("nvidia_a800", "0.11.0"): ("vllm_0_11_0", "vllm_0_11"),
+        ("metax_c500", "0.24.0"): ("vllm_0_24_0", "vllm_0_24"),
+        ("ascend_910b", "0.18.0"): ("vllm_0_18_0", "vllm_0_18"),
+        ("nvidia_h200", "0.30.0"): ("vllm_0_11_0", "vllm_0_11"),
+    }
+    source_key = (cell.hardware.hardware_id, runtime_version)
+    if source_key not in source_versions:
+        raise ValueError(f"unsupported trajectory source identity: {source_key!r}")
+    model_execution_version, sampler_prefix = source_versions[source_key]
     runtime_inputs = RuntimeInputs(
         expert_routing=expert_routing,
         attention_kv_layout=prediction["attention_kv_layout"],
         attention_kv_distribution=prediction["attention_kv_distribution"],
+        model_execution_version=model_execution_version,
+        target_sampling_source=(
+            f"{sampler_prefix}_plain_greedy_{model.compute_dtype}"
+        ),
         graph_execution=(
             cell.hardware.graph_execution
             if graph_execution_override is None

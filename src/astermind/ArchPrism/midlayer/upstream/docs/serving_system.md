@@ -82,13 +82,27 @@ Production workload + Model + Deployment
 
 Qwen3的`cuda_eager_inplace`场景声明使用vllm_c CUDA RMSNorm：leading-axis有间隔的Q/K view直接读取原storage，仅末维非unit stride才复制；fresh输出在该内部复制之前分配。ROCm的flatten路径、IR native和batch-invariant仍是不同源码程序，不能互相替代，也不由该场景声明推断实际provider。
 
+vLLM0.30 CUDA 场景可显式设置 `RuntimeInputs.norm_source_batch_invariant=False`，CLI 为 `--norm-source-batch-invariant disabled`。执行入口将该声明与当前每个 RMSNorm/add-RMSNorm 的真实 shape、layout 和源码版本交给既有 source-launch lowerer；其他算子及源存储图不变，逐步重复声明同一 Norm 会拒绝。未设置时仍为未知；True 分支尚未支持。False 来自上游 `envs.py` 的 `VLLM_BATCH_INVARIANT=0` 默认值，可用于声明默认场景，不证明历史采集的环境值或原生 provider；运行 provenance 单独保存该范围，不增加时间参数。
+
+同一 CUDA 源码场景在 H200、BF16 analytical 执行中可显式设置 `RuntimeInputs.bf16_gemm_model="tiled_reference"`，CLI 为 `--bf16-gemm-model tiled_reference`。普通无 bias、同质 BF16 Linear/head 复用既有静态 tiler 与 GPU pipeline/resource 模型，表征有限 CTA、共享操作数和流水服务；真实 logical/physical Graph 行、源图身份、通信、依赖与容量保持不变。默认仍用现有数学路径；混合 FP32 输出 router、quantized 和 biased 程序沿各自既有模型。此选项声明固定解析参考程序，split=1、不声称 cuBLAS geometry、实际算法或 provider 已观测，相关假设独立写入 provenance；不得依据 production duration 或 MAPE 调整 tile 或逐 case 选择版本。
+
 模型接入可以选用模型官方实现、Transformers 或目标推理框架的 forward，并绑定准确配置、源码版本及执行分支。适配层替换初始化、权重加载和基础算子接口；模型 forward 保留网络控制流。新增模型优先复用已有虚拟算子，只为新增结构补充接口，不另写一套依赖图或张量释放表。不同来源的融合、量化、KV 和采样行为需要分别声明，不能仅凭模型名称认定等价。
 
 `src/serving/workload/traced_forward.py` 的 `ForwardTrace` 只创建 shape、dtype、stride 和 storage/view 元数据，不创建真实 CPU/GPU Tensor，不执行矩阵乘、排序或随机采样等数值运算。共享算子提交输出分配、alias 和原地写语义后，记录器自动建立读写依赖，并根据同步 CPython forward 的引用与作用域记录生命周期。输出复用既有 `WorkloadGraph`、`MemoryAllocation` 和 `TensorView`；同一源码程序可生成性能图与存储账本。涉及真实张量值的分支需要显式动态输入或条件化适用域。
 
 动态 forward 用于模型接入和首次编译，仿真循环优先复用记录的图结构，绑定当前形状、KV 长度、专家路由和槽位。已验证的无 padding、每请求单 token 的双 rank 捕获程序使用只读绑定帧：静态依赖和节点元数据保留在模板，只有需要生成当前 KernelSpec 的代表节点才物化；显存统计与执行摘要直接读取同一帧的源信息。已验证的 vLLM 0.11、MACA 0.24 和 Ascend 0.18 双 rank、无 padding 普通 decode 热调用直接将当前参数送入冷编译的绑定 recipe，不再构造临时 prefix 图；其他执行结构和 padding 保持同一虚拟 Tensor source program 的既有编译与绑定方式。显式访问公共图时仍得到完整节点元组，旧快照保持不变。KernelPlan 在调用集合、硬件、资源和依赖不变时复用 DAG，只替换当前规格；源码、模板、绑定声明或执行分支变化时重新编译。未覆盖的结构继续使用同一虚拟 forward 的完整编译路径，不跳过工作或降低验收条件。
 
-已关闭的原生绑定结果持有只读 storage 和事件序列；相同不可变输入复用生命周期统计，避免每步重建分配列表、验证全部事件和深度哈希。整个生命周期峰值与 capture 严格窗口峰值分别缓存，保持各自原有统计范围。动态分配、事件、窗口或模板改变时重新校验和计算；普通可变 trace 仍保留原有记录行为。
+`fast` 模式保留逻辑工作图和源存储统计，但省略独立导出的逐调用操作数快照（`TraceMemoryContext`）。这不代表原生操作数端口已完整绑定；相关执行域的等价比较应覆盖工作图、KernelSpec、依赖与 placement、激活统计、逐调用预测及时间线，原生 provider、流量与 normal allocator 的验收仍单独说明。
+
+既有 lowering memo 同时按精确物理 node contract 与 HWSpec 身份缓存 Norm、activation、RoPE 和 KV update 的不可变 source launch recipe，沿用原有有界 LRU。当前 source port、图及分支校验仍逐步执行；shape、layout 或运行开关变化会使用不同契约，非法分支不会继承暖缓存。缓存只减少重复几何构造，不缓存预测时长或删减模型调用。
+
+H200 FA3 GQA 的完整 source-call factory 同样在既有 prediction-cache run scope 内复用不可变 KernelSpec recipe。键保留全部 shape、source attributes、控制参数及其类型，并绑定 HWSpec 身份与 SM 数；可变输入仍调用原 factory 校验和构造。LRU 的256项仅限制仿真器元数据，不是硬件容量或精度参数。该复用不删除任何层或调用，不改变 GPU 价格、Graph/Host 时序、激活统计或 provider 支持范围。
+
+H200 GLM 的 vLLM 0.30 BF16/FP8 source 在 `fast` 模式、TP8/EP1、MTP-off、每请求单 token decode 域内记录完整 source，后续从真实一层前缀绑定当前 embedding、Attention/KV 字段和全部 MoE 路由。完整节点、通信及所有 rank 的存储账本继续保留；模板存储与事件为只读快照，绑定结果关闭后不能继续添加算子或分配。默认详细模式保留原有完整调用表示。该普通 source recipe 独立于双 rank native recipe 的适用域，prefill、mixed 及其他并行/推测配置继续按各自既有 source 路径执行。
+
+该 GLM decode 域首次执行完整 lowering 后复用其调用 DAG；每步先验证所有当前 routing packet，再按精确有序 expert histogram、Attention/KV 几何和 embedding rank/shard 契约合并相同的动态物理类，仍由共同 ordinary lowering dispatcher 生成当前 KernelSpec。调用数量、variant、硬件或资源结构改变时重新编译。时间线仅在已验证不变的结构上复用调度元数据，当前预测时长仍逐步递推；这些缓存均限定在同一实验，不落盘预测或时延 LUT。该优化不增加 normal 容量、实际 provider 或正 prefix-hit replay 的支持承诺。
+
+已关闭的原生绑定结果持有只读 storage 和事件序列；相同不可变输入复用生命周期统计，避免每步重建分配列表、验证全部事件和深度哈希。整个生命周期峰值与 capture 严格窗口峰值分别缓存，保持各自原有统计范围。原生执行内存投影首次完整校验后，只在运行内保留独立的标量与不可变元组事实；每帧仍绑定并验证所有 rank 的当前 KV、槽位和 backing。公开节点、边、存储和 per-call receipt 是独立导出，保持物理 allocation/view ID 与字段等价，不承诺跨快照的 Python 对象身份；修改旧导出不会改写内部模板，非法导出重新提交到公共输入边界仍须被拒绝。未由当帧绑定显式更新的可变嵌套元数据使用完整投影；显式动态元数据每帧读取并独立复制。动态分配、事件、窗口或模板改变时重新校验和计算；普通可变 trace 仍保留原有记录行为。
 
 虚拟Tensor只替换模型建图，不另建性能预测入口。`ServingExecutionContext`将所选预测方法原样传给共同的`lower_workload → KernelPlan → predict_kernel_plan → predict(KernelSpec, HWSpec, method)`，已有普通算子继续复用原launch选择和predictor。方法支持由每个KernelSpec与kernel owner判断：显式无launch的数学程序可以只支持Roofline，Midlayer调用必须在该算子处明确拒绝，不能在Serving入口统一拒绝所有虚拟图，也不能静默换方法或重建另一套模型图。
 
@@ -110,7 +124,24 @@ Flash TP4与Pro TP8的启动存储可通过同一`report_activation_memory.py --
 
 Qwen3-30B-A3B复用dense Qwen的GQA、residual、目标链和TP原语，MoE只增加BF16 GateLinear、显式softmax top-k与typed专家边界。准确config的norm_topk_prob必须是显式boolean；FP32权重、INT32 IDs和第三个INT32 token_expert_indices的包装局部生命周期分别记录。单独路由替换专家recipe里恰好一个旧top-k阶段，不能重复计或无价省略；源码选择服务未绑定时继续拒绝完整价格。普通TP1 embedding沿VocabParallelEmbedding.forward的input_.long()增加一次INT32到独立INT64的转换，TP融合embedding保留其原分支。
 
-Kimi K3通过同一虚拟Tensor/层循环支持TP1普通single-token decode、一条fresh T>=512完整64-token chunk序列，以及一个decode-first请求加一条fresh序列的mixed。静态source profile为vllm_0_30_k3_triton_marlin_bf16，必须给显式KDA state indices/pool capacity和routing输入；fresh还需--k3-prefill-output-source supports_out的条件源码声明。KDA的BF16 conv/FP32 recurrent状态、fresh三次卷积和chunk/scatter、NoPE MLA、AttnRes prefix/block原地写、MXFP4 latent MoE及最终greedy都由虚拟handle连接；没有调用旧K3图builder。prefill attention无实际launch，SiTU、route和chunk/专家callee仍保留原拒绝或未知存储。context、动态Serving state分配、MTP、正常容量及独立全源码验收仍未闭合，不能将全层图当作完整时延。
+Kimi K3通过同一虚拟Tensor/层循环保留完整93层文本模型：69层KDA、24层NoPE MLA、Attention Residual、latent MoE、词表和普通greedy输出。source profile为`vllm_0_30_k3_mxfp4_sync`，保留BF16计算、MXFP4/group32专家权重、KDA BF16 conv/FP32 recurrent状态和MLA KV；普通CPU vLLM0.30 Scheduler桥负责请求准入、连续decode、完成和释放，动态KDA state indices与MLA slots按层/rank绑定。完整请求支持域是H200 colocated TP1 PP1/PP16、fresh prompt至少512 token、每请求1–8个输出token的首轮小规模验证，输入加输出不超过构造期`max_model_len=640`；TP1仅是有测试预算的数学主链，不是单卡容量部署。PP16使用前两个stage和末stage各5层、其余13个stage各6层的默认分区及相邻stage P2P。TP16另有按rank切分权重和混合缓存的容量报告，但尚不支持完整请求或source-memory执行。非64整数长度的KDA尾chunk按完整tile价格近似，masked lane精细服务和更长chunked prefill未验收；多模态、MTP、prefix-cache组合和实际GPU/provider不在范围内。
+
+普通报告入口如下，环境变量必须指向已有独立vLLM0.30 SDK和源码，不下载模型权重；`--prediction-method`显式选择`midlayer`或`roofline`：
+
+```bash
+MIDLAYER_VLLM030_PYTHON=/path/to/.venv-vllm030/bin/python \
+MIDLAYER_VLLM030_SOURCE=/path/to/upstream/vllm/v0.30.0 \
+python scripts/evaluation/serving/report_kimi_k3_serving.py \
+  --layout pp16 --prediction-method midlayer \
+  --prompt-tokens 512 --output-tokens 4 \
+  --output experiment_logs/serving/kimi_k3/pp16_minimal.json
+```
+
+统一Serving CLI通过`--symbolic-forward-source vllm_0_30_k3_mxfp4_sync`选择同一主链。TP1 PP1使用明确标记的数学byte budget，不能声明单卡容量；PP16必须绑定`configs/runtime_memory_policy/nvidia_h200/kimi-k3-pp16.json`并显式设置`--prefill-pp-size 16 --pipeline-ranks-per-node 8`，跨节点链路按实际placement计价。两种布局都要求H200、colocated、EP-off、MLA uniform、analytical launch和版本匹配的plain greedy，不支持静默回退。
+
+重复`--prompt-tokens`可输入少量并发请求；`--layout tp16 --capacity-only`选择另一套容量配置，`--capacity-only`与`--source-memory-only`分别生成原生混合缓存容量计划和已知源码activation账本。所有KernelSpec仍经公共`predict`计价；任何关键价格缺失都会fail closed。完整请求报告只有在输出token齐全、未计价调用为0且时延为正时写出，逐步列出variant覆盖、关键路径贡献、解析FLOPs和仿真wall time；跨rank/调用的预测时间求和仅作诊断，不是阶段时延，source聚合价格未展开的typed logical bytes记为不可用而非零流量。路由是显式seeded assumption，反馈仅使用长度，不是真实数值生成。
+
+PP16的解析容量逐项保留权重、原生混合状态arena、KDA/Marlin工作区、P2P、worker、allocator、fragmentation和framework。KDA按并发相位显式计算q/k、w/u/kg、v_new、chunk_h、FP32 final state/g、Aqk、beta及chunk metadata；varlen chunk数按`floor((tokens+63*requests)/64)`取上界，2048 tokens、两请求为33 chunks，KDA上界为538,706,472 B，KDA+Marlin为1,202,504,400 B。PP按stage分别核算：`worker.intermediate` persistent hidden/residual使用`ceil(start_layer/12)`个AttnRes块并归入framework，最严rank为264,241,152 B；模型临时block-residual使用`ceil(end_layer/12)`个块，PP transient按rank归入activation，最大同为264,241,152 B。容量校验从已知activation峰值扣除PP临时witness后加入其构造上界，避免重复，通信reserve保持128 MiB，无需增加总预留。只有完整绑定策略和全部分项均通过才接受。该结论仅是bounded source预算，不是实机容量或provider验收；H200实测精度与实际GPU运行仍未验证。非64尾chunk近似、TP16仅容量报告等限制不变。
 
 V4的0.30缓存工厂按准确checkpoint匹配Flash/TP4或Pro/TP8，均限定PP/CP/DP1、EP/MTP-off、BF16 compute和fp8_ds_mla cache；从各自compress_ratios的target层建立SWA、compressed KV、indexer及FP32 state groups，不为draft-tail建立额外缓存。相同native allocator与placement校验接收逐rank预算，Scheduler桥接保留真实group/arena对象；错误TP、缺失policy和旧GLM-only入口继续拒绝。源码权重/缓冲与完整normal policy是独立条件，显式不完整测试policy不得升级为正常容量或provider验收。
 
@@ -187,13 +218,13 @@ Qwen/Flash/Pro的启动图还共用`VLLM030WorkerStorage`，记录已知纯文�
 | Prefix cache | **Supported/Partial**：默认 trace-hit 长度模式；显式 token-ID replay 支持原生内容缓存 | 长度模式注入命中量；token 模式由真实 vLLM Scheduler 根据完整块内容维护命中、共享与淘汰 | token 模式须提供真实 prompt 和输出 ID；同步 CPU0.11 已验证 TP/PP、MoE 与多实例 PD；MTP 还需逐步真实 draft；复杂缓存与外部 KV tier/lifecycle replay 不支持 |
 | 多实例路由 | **Supported**：多 P/多 D 的 `least_queued_tokens` | ingress→P 和 P→D 两级路由在决策时读取可见队列，并立即 reservation | 路由是给定部署下的模拟结果，不是 Trace 中的生产路由；暂不支持 cache-aware routing |
 | 部署形式 | **Partial**：colocated、纯 PD、standalone AF、PD+AF 有闭环切片 | role 拆分改变算子 owner，并插入 KV 或 activation transfer 与依赖 | 每个实例独占自己的设备集合；不建模同卡多实例竞争 |
-| TP/PP/EP | **Partial**：已有 TP、PP、TP×PP 与 MoE EP 的明确窄切片；目标 A800 路径固定为 Kimi-K2.6 TP=EP=8/PP2 与 GLM-5.2 TP=EP=8/PP4 | 先分片 shape/expert/rank，再产生 TP collective、8-lane PP P2P 和 pipeline dependency；对称 TP 计算保留一个 rank-local 代表调用，非对称 MoE 按 8 个 EP rank 展开，相同 KernelSpec 的预测仅在单次仿真内精确复用 | 不是任意 TP×PP×EP 组合；对称 TP 代表调用不提供逐 rank 利用率，SP、CP、通用 DP 与 pipeline bubble/overlap 尚未普遍闭合 |
+| TP/PP/EP | **Partial**：已有 TP、PP、TP×PP 与 MoE EP 的明确窄切片；既有 Kimi-K2.6 固定 TP=EP=8/PP2；GLM-5.2 BF16 vLLM0.30 支持合法 TP、连续 PP、DP/EP，以及 PP1 MLA PCP 和源码 SP | 先分片 shape/expert/rank，再产生 TP collective、8-lane PP P2P 和 pipeline dependency；对称 TP 计算保留一个 rank-local 代表调用，非对称 MoE 按 8 个 EP rank 展开，相同 KernelSpec 的预测仅在单次仿真内精确复用 | 支持域依模型与版本；GLM PCP 要求 PP1；PP 的 sparse/decode 程序必须有完整 top-k 生产依赖，pure fresh dense-prefill 可绕过该读取；通信为显式解析场景，真实 provider、数值等价与 pipeline overlap 独立保留 |
 | MTP | **Partial/Projected**：propose/verify、零/部分接受、短输出、handoff 与 replay contract | proposal 数由配置给出，接受数来自 observation replay 或显式假设，并逐 step 推进 token 状态 | 无 observation 时 fixed-count 只是假设；仿真不预测模型质量或真实 acceptance |
 | 通信 | **Partial/Projected**：all-reduce、all-gather、all-to-all、pipeline/activation P2P | 通信作为带 rank、bytes、拓扑和依赖的一级工作负载进入统一时间线 | 当前解析后端可用；外部 ProtoBridge 尚未成为已验证的生产后端 |
 | Host-KV offload | **Partial/Projected**：显式 LOAD/EVICT、容量账本、PCIe 区间和完成事件 | lifecycle 先产生迁移 intent，传输完成后才改变 KV residency | 尚不等于原生 vLLM offload；真实 victim/LRU、prefetch、Ramulator、SSD/Flash 和完整重叠未闭合 |
 | Router CPU dispatch | **Partial/Projected**：多 pool 路由可使用一个串行 CPU dispatch 资源 | 每个 route decision 在进入目标 pool 前预约一段 CPU service interval | 当前只覆盖 Router dispatch；Scheduler、sampling 和 output processing 的通用 CPU 成本尚未闭合 |
 | 模型 | **Partial**：Dense、MoE、MLA/MTP 共用主架构；Qwen3、Qwen3MoE、Llama、GLM4-MoE/MTP 有闭环切片；GLM-5.2 与 Kimi-K2.6 已有固定 A800 多卡 production trace 路径，GLM-5.2 另支持 projected MTP proposer/verifier 路径 | 固定模型语义生成层、attention、expert、MTP 和 KV workload；固定 vLLM 0.11 CPU Scheduler 负责控制面，0.27.1 固定源码负责目标模型执行语义；目标路径使用真实 TP/EP/PP placement 与解析 KV 容量 | 两个目标模型的新增 kernel 均只是 projected analytical，未做真机校准；vLLM GPU MTP/KV-offload execution 和跨硬件 target 路径仍未闭合，不能声称端到端硬件精度支持 |
-| 硬件 | **Partial**：A800、C500、910B 可经过同一 Serving→Kernel 接口 | 每个实例绑定自己的硬件规格和 launch package，Kernel 层返回时间与 limitation | 当前只验证同类硬件实例组；跨硬件 P/D、LPU 等异构部署属于后续方向；结论继承 Kernel 层支持等级 |
+| 硬件 | **Partial**：A800、C500、910B 可经过同一 Serving→Kernel 接口 | 每个实例绑定自己的硬件规格和 launch package，Kernel 层返回时间与 limitation | A800 Prefill→H200 Decode 已有 CPU 解析完整请求与独立容量入口；真实异构网络/provider、其他厂商组合与 LPU 仍待验证，结论继承 Kernel 层支持等级 |
 | 系统指标 | **Supported**：TTFT、TPOT、E2E、CDF/percentile、throughput、SLO goodput、queue、资源利用率和关键路径 | 全部从同一条事件时间线与请求状态派生 | success-only Trace 的指标不能解释生产成功率或可用性；SLO 口径必须显式配置 |
 
 这张表是后文的索引：后文分别解释每项能力为什么需要、状态如何推进、如何落成算子/传输和时间线。未列为 Supported 的组合不能通过“已有相邻 case”推断为支持。
@@ -335,6 +366,27 @@ Transformers 隔离环境在 A800 上实际以 BF16 运行了 tiny `GlmMoeDsaFor
 机器可读的 model × phase × layer-type × validation-level 矩阵由 `target_model_support_matrix()` 返回；production-shape 代表层 manifest 覆盖两模型 Dense/MoE 的 prefill、decode 和 mixed 共 12 个组合。
 
 所有满足当前流式能力边界的 external canonical/production trace 默认使用 `--step-retention auto` 选择 `streaming_aggregate`，包括标准 ShareGPT case 与 Kimi-K2.6/GLM-5.2 production trace：每个 Scheduler step 仍完整执行 workload construction、KernelSpec lowering、统一 predictor 与时间线，但在生成有序 execution-contract hash 后立即释放完整 step IR，不再把所有 graph/plan/prediction/timeline 保留到 trace 结束；显式 `--step-retention full` 只用于需要逐 step artifact 的小规模审计。当前流式能力边界是单个 colocated pool、外部请求源且无 KV lifecycle replay；GLM-5.2 MTP 同时保留逐 step acceptance observation 以生成聚合 token/workload 守恒结果，其他拓扑在 `auto` 下继续使用 full，显式请求 `streaming_aggregate` 则 fail loud。最后一个请求到达后，accelerated 流式执行可通过 `--execution-workers` 并行投影相互独立的 workload、lowering、prediction、timeline 和 artifact contract；Scheduler 仍按原顺序逐 step 真实决策与完成，父进程以固定大小窗口按原顺序累加预测 duration 和有序 hash，并周期性回收 worker 限制长 trace 缓存占用，因此 schedule、指标、逻辑 kernel call 数与 schema 13 artifact contract 保持精确一致且 tail 内存不随 step 总数增长。PD transfer 不保留逐 transfer execution IR，而在 schema 13 streaming aggregate 中保留 trace transfer manifest digest、trace transfer count 与 simulation transfer count，并由 owner validator 穷举校验。流式模式保留 req/s、TTFT、TPOT、latency distribution、SLO goodput、总 step/kernel call 数、transfer counts、cache statistics、并行配置和阶段 wall time，但不物化逐 step artifact、system-resource 或 critical-path 明细，并通过独立 schema 13 aggregate contract 明确标记这一边界。
+
+显式调用 `Simulation` 或 standalone AF `MultiSimulation` 的 Host KV lifecycle 也可选择 `streaming_aggregate`。含 LOAD/EVICT 的步保留完整时间线直到物理完成事件校验和 tier 状态提交，其余步可使用紧凑时间线；完成后每步 IR 立即释放。流式 schema 16 在原有 ordered execution-contract chain 外记录 KV 完成记录哈希、搬运次数与字节数、最终 tier 状态。固定前缀 HBM/Host 比例是带整块取整规则的显式场景假设，Host 加载后两份有效拷贝均计入容量，到请求释放时一并回收；它不代表原生 vLLM 缓存淘汰或未来请求复用。通用 Serving CLI 的 `auto` 选择和外部 lifecycle replay 组合仍遵守上一段的范围约束。
+
+自主 Host KV 的选定来源是本地锁定 vLLM `0.30.0` 的 `SimpleCPUOffloadConnector`，配置为 `kv_both`、`kv_buffer_device=cpu`、`kv_offload_backend=cpu`、`lazy_offload=false`、token-ID prefix caching，CPU 容量以每 rank 字节声明并乘 native world size 传入 connector。其 eager Scheduler 在后续调度步把已形成 hash 的完整 GPU 块提交 store；CPU 与 GPU 可同时保存副本，store 完成仅使 CPU hash 可查且释放临时 pin，不表示 GPU 块已淘汰。查询先看 GPU prefix，再查连续 CPU hash；CPU hit 给目标 GPU 块创建异步 load，完成反馈前请求保持等待状态。CPU 块容量不足时不提交相应 store，GPU/CPU 块由上游引用计数与 free queue 独立管理。Midlayer 已在普通 `Simulation.run()` 中接入真实 Scheduler 的 store metadata、跨请求 CPU prefix 命中、load-only 等待步、逐 rank D2H/H2D 时间线和完成反馈；CPU slot 重用先释放旧 Host 副本，请求结束后的 GPU 源页按原生 pin 状态延迟释放，纯传输尾步走同一 KV offload kernel/timeline。已运行的范围是显式 prompt/output token IDs、单组整块 KV、eager CPU、单 pool Qwen3 TP1/TP2 的宽松/紧 Host 容量短请求及零输出尾步；不据此声称一般容量或实际 GPU 验收。固定比例 Trace 回放不使用此自主策略。
+
+固定比例 Production 入口 `evaluation.serving.experiments.production_trace_fixed_tier_request` 需要显式 `--hbm-percent`、容量、`--max-wall-s` 和数据路径；`--request-index`/`--request-end` 选择半开请求范围，`--arrival-start-s`/`--arrival-end-s` 可另选半开到达窗口。`--max-requests` 限制同时调度的请求数，默认结果用 `streaming_aggregate` 保存摘要；达到墙钟上限时写出已完成请求数、输出 token、步数、Host 命中放置字节及在已完成步边界采样的父进程和 Scheduler 子进程峰值 RSS，并标记 `checkpoint_wall_limit`。完整结果另给 H2D 逐 rank 服务时间与加载门槛跨度。默认保留原始请求长度、命中和到达时间；显式 `--synthetic-output-cap` 仅截短仿真输出长度，并用 synthetic 标签及独立 `canonical_requests` 保存原始输入，不得将其报告为原样 Trace 完成。
+标准 Serving report 的 `--serving-execution-mode` 和单 case runner 的 `--execution-mode` 接受 `accelerated` 与 `fast`；默认 `accelerated` 保留详细解析路径，`reference` 仍是独立的对照实现，不与详细/快速模式混同。`fast` 使用同一 Scheduler、完整虚拟 forward、WorkloadGraph/KernelPlan、launch selection、`midlayer` predictor、时间线和逐 rank source storage report，但不为 prediction 构造 trace-memory snapshot、binding 或 memory-access program，而是将相同 KernelSpec 和 HWSpec 直接交给统一 `predict` 接口。该近似保留请求/token、主要计算/通信、逻辑调用计数和源存储身份/生命周期；逐调用 memory-access 诊断不再可用，需要这些诊断时必须使用详细模式。fast 不改用 Roofline，不读取 production duration，也不复用其他进程或历史运行的预测结果；memory source recipe 的实现签名在整个 run 入口/出口校验一次，所有当步动态 shape、routing 和 KV 参数仍重新绑定。
+
+固定比例 Production 入口也支持显式 `--execution-mode accelerated|fast`，默认保持 `accelerated`。H200 TP8/EP1 的 Kimi K2.6/K2.7 单 token 全 decode 可在同次 fast 实验内复用完整 source：首次执行全部层和 rank，之后以真实第一层 forward 提供当前 Attention KV 长度、slot mapping、cache extent 与输入 metadata，逐 MoE 层重绑当前 routing。完整层、全部 rank 的存储生命周期、collective 依赖和目标链保留；静态节点、KernelCall 和 KernelSpec 对象尽量复用，之前步骤的图与存储记录保持不变。此机制与已有 GLM 同次 source 复用共享绑定路径；prefill/mixed、不同结构或不满足绑定条件时仍执行原始完整 source。缓存归本次执行作用域，不写预测或图 LUT，不读取历史实验缓存。
+
+标准报告在单次调用内传递已解析的 Serving 结果对象，供校验、绘图和报告生成复用，减少重复 JSON 解析与对象构造；原有结果文件、校验和图表仍生成，调用结束后释放对象。外部 CLI wall time包含本次构造、仿真、聚合、写出与报告成本；逐实验离线报告也须计入其完整生成时间，不能用独立事后生成的耗时代替。
+
+fast 的 pinned 0.11 CPU Scheduler 在当前进程内构造，复用同一 device guard、原生 plan/update、容量事件与 source 校验，省去逐步 RPC 和序列化，不减少 Scheduler 工作；`accelerated` 及其他构造入口继续使用隔离进程。`execution_mode=fast` 明确记录该执行选择，受信任的 `scheduler_runtime.bootstrap` 保持原合同，关闭时复查无 CUDA context 或设备句柄，并清理临时模型配置目录。
+
+fast 的 `--execution-workers 1` 保持顺序执行；标准 report 另提供 `--serving-execution-workers`（1–16）。仅在已支持的 colocated Qwen3-MoE TP2/EP2 或 dense Qwen3/Llama TP1/TP2 PP1、depth-two、图捕获和完整 Host 计时域内，最后的请求到达后可并行执行相互独立的 decode step。父进程按原顺序重建 Host 时间、capture replay 历史和审计链；批量 drain 保留跨批 pending 输入历史，source namespace 按完整 run-local key 稳定生成，不把 worker 局部序号当作跨 worker 身份。worker 上限与 CPU affinity 构成资源上限，不增加机器或核数。
+
+`model_profile_layer_mean_v1` 的 SHA256 加权无放回路由保留原概率、随机流、浮点求和顺序和每层 provenance。float profile 使用 `src/serving/workload/profiled_routing.c` 执行同一选择循环，Python 仍生成原始精确整数比例并验证守恒；本地 C 编译器只在临时目录产生执行文件，不形成跨运行预测缓存。其他权重类型继续走原 Python 实现，native 与原始实现的逐项等价由路由测试验证。
+
+单 case 结果在 `simulation_wall_time_s` 之外保存 `simulation_started_monotonic_s` 和 `simulation_finished_monotonic_s`。标准矩阵的 `results.json` 以 `simulation_batch_timing` 记录最早 case 仿真开始至最晚 case 仿真结束的整批纯仿真边界、墙钟和逐 case 分项；外层 `evaluation_wall_time_seconds` 仍包含子进程及结果处理。早完成 case 的后处理可与后续 case 仿真交叠，不能用外层墙钟减去各 case 后处理累计时间来代替该边界。`scripts/evaluation/serving/compare_serving_execution_modes.py --baseline <results.json> --detailed <results.json> --fast <results.json> --output-dir <目录>` 只读取已完成结果，生成逐 case baseline/详细/快速指标、偏差、耗时和守恒摘要，不为加速重新执行或复用旧预测。可选 `--supplement <证据.json>` 合并 S4/S6/S7 的布尔 gate、证据路径及各项优化的工作消除量、收益上限和实际范围，形成完整验收表。
+
+需要逐 rank 工作与状态证据时，单 case runner 的 `--state-audit-output <state_audit.json>` 和标准 report 的 `--serving-state-audit` 会生成独立 sidecar，不改变既有结果 schema。sidecar 汇总每 rank 的 KernelKind 逻辑调用、通信操作与字节、source allocation 的内存域、容量、分配/释放计数和状态链 SHA256，并保留跨 pool 迁移记录；不包含 duration。每个 step 必须提供 source 状态，缺 step、调用总数不符或状态缺失会 fail closed。启用后禁用 immediate projection；支持的 parallel-tail 由 worker 传递逐步 source-state 与逻辑调用快照，父进程按 Scheduler 顺序重建同一审计链，采集成本计入当次仿真。审计批次用于正确性证据，不与未启用审计的 S2 测速批次混用分母。
 
 CPU-only vLLM Scheduler 的 length-only 请求不携带真实 token 内容且显式禁用 content hash，因此 adapter 用紧凑同值序列保存 dummy token IDs；长度、索引、append/extend 与 Scheduler 请求的逐 step 切片结果和物化列表完全一致，只在 vLLM 请求当前 step 的有限 token slice 时生成列表，从而避免长 production trace 为数十亿个无身份 dummy tokens 常驻分配内存。
 
@@ -589,6 +641,18 @@ KV load/evict、Prefill 到 Decode 的 KV handoff、Host offload 和未来的 SS
 
 KV residency 只有在物理迁移完成后才改变。容量账本、迁移 intent 和实际 completion 分开， 才能避免尚未完成的 load 被错误地当成已驻留数据。
 
+异构 PD 的首个解析范围是 vLLM0.30、BF16 standard-GQA Qwen3、A800/H200 两端独立 TP/PP。普通 CLI 使用 `--decode-hardware-config`、`--prefill-tp-size`、`--prefill-pp-size`、`--decode-tp-size`、`--decode-pp-size`；跨硬件需显式 `--transfer-link infiniband --kv-transfer-backend analytical_roofline_v1`。每层/head 区间映射沿各端 physical rank placement，复制源只选择必要副本。P 的 native KV blocks 在传输期间保持额外引用，D 先预留自己的 blocks，全部传输完成后才准入 Decode；`pd_kv_lifecycle` 报告 pool、所有参与 ranks、请求身份、block groups 和关键时刻。传输为两端 HBM/PCIe/网络约束下的流式带宽下界，未知启动和传播成本未计价；继承的 runtime reserve 仍按自身证据等级报告，不由请求完成升级成已验证容量。Dense PD 的 DP 按真实 replica 展开并路由请求；Qwen3MoE 的 TP/EP 与 PP 可在两侧分别选择。额外的 vLLM0.30 `VLLMBackend.from_data_parallel_replicas` 接口协调独立 native CPU Scheduler/KV manager，将真实 `data_parallel_rank` 保留在每条 ScheduledRequest 中；DP>1 的 EP-on/off 路径均已接线，可按模型层区间组合 PP：EP-on 时 EP=TP×DP、SP=TP（TP1 时无额外SP搬运），EP-off 时专家中间维按 TP×DP 切分，通过 DP dispatch/combine 后再做本地 TP 归约。完整 TP2/EP4、TP2/EP-off、TP1/EP2 及 DP2/TP2/PP2/EP4 的 MoE 异构 PD 请求已测。PP 按 DP 副本分别发送 hidden/residual，经独立目的 backing、TP gather 和 runner copy 进入下一 stage；SP restore 的 padding backing 只发送真实行前缀，idle DP 不造 PP payload。SP 的 padded rows 只参与 MoE gate、dispatch、专家计算和 combine，不变成真实请求/KV；idle DP ranks 仍服务其他 replica 的专家。all_gatherv/reduce_scatterv 沿公共 COMMUNICATION、typed participant ports 和显式 pairwise 物理场景计价。普通 PD CLI 的独立 `--prefill-dp-size`/`--decode-dp-size`、TP/PP/EP 已接该协调路径：policy binding 可显式携带 data_parallel_size（省略规范化为1），容量先按全局 DP×PP×TP 推导专家权重和逐 rank 预算，再逐 DP 保留真实 native allocator receipt，并在启动 Scheduler 时严格核对。EP-off 专家 I 按 TP×DP 切分，router/attention/词表仍按本地 TP/PP 复制；KV 不除 DP/EP。source activation reconciliation 使用各 DP 的真实 native backing。0.30/EPLB-off 的 linear placement 支持 base/remainder 不均分和空 expert ranks；权重按真实 owned expert 数计，空 rank 省略零 extent 参数，以真实零贡献 output fill 保留 combine 依赖。各 DP 的 native block count 可不同，公共标量仅表示各 replica 最小值，实际 Scheduler 和 receipts 保留各自容量。完整 EP3/三请求正常容量 CLI 及 empty-expert 的 CPU E2E 已测；MLA PCP 与 GLM BF16 的扩展见下文，任意缓存格式转换仍未实现；MoE EP-off 的 DP 使用共享专家分片/通信，不能按 dense 独立专家副本处理。
+
+PD 中 P 的 `RequestSpec.prefix_hit_tokens` 只描述 P 的 trace 命中。P 完成后先构造 D 端完整-KV请求，再用同一个 `prefix_hit_tokens=0` 的请求做目的预留和交接；保留 P 原请求及 trace/scheduler 命中证据。目的仍按完整 prompt 长度分配和接收 KV，不能减去 P 的命中长度；真实 prompt/output token IDs 与首个输出 seed 保持不变，所有物理 transfer 完成后才准入 D。原生 `token_ids` prefix 命中与 trace 命中分开，D 接收外部 KV 不重复登记成 P 的 cache hit。
+
+GLM-5.2 BF16 的 vLLM0.30 源程序在 A800/H200、MTP-off、显式 sparse-MLA 场景复用上述异构 PD 入口；两侧 TP/PP/DP/EP/CP 独立选择，SP 由框架关系推导。CLI 增加 `--prefill-cp-size` / `--decode-cp-size` 和 `--prefill-pp-layer-partition` / `--decode-pp-layer-partition`（各 stage 的连续层数）。程序接口 `WorkerPoolConfig.pipeline_layer_partition`、`VLLMSchedulerConfig.pipeline_layer_partition` 与容量 policy binding 保留相同分区；pool 与全局显式分区冲突即失败。policy schema2 的可选 CP 与 partition 字段在边界规范化，旧 CP1/None 配置保持原往返语义。
+
+PCP 仅适用于 MLA、DCP1、PP1：每个 prefill 按 2×CP ceil chunks 镜像分配 query，保留绝对 causal 位置；padding 不写 KV，逐层 gather normalized latent/RoPE 与 full-indexer K，再独立插入缓存，最终恢复原 hidden 行序。每个 TP/CP rank 保有完整压缩 cache；DSA full-indexer 层每 token 另有132字节，EP 不改变该 KV 大小。交接按真实 DP owner 和 PP 层区间选源 CP0/TP0 副本，并给每个所需 D TP/CP 副本计传输。CPU Scheduler/allocator 明确按每 DP 投影为真实 CP1 workers；完整 CP 物理副本、原配置/hash 与投影事实分别报告，不伪造 native PCP receipt。
+
+GLM EP-off 的 routed I 按 TP×CP×DP 切分，先 gather/route 再按 DP/CP sum-scatter；idle DP 继续服务专家，不造请求、attention 或 PP payload。EP-on 且 DP>1、TP>1 时 SP=TP：PP1 执行模型级 SP，dense/shared 保留完整权重；PP>1 只有 MoE 内部 SP，dense 保持普通 TP、shared 完整权重，MoE TP gather 恢复真实行后保留 decoder late TP sum。TP1×CP>1×DP>1 的 EP-on 采用显式 `analytical_global_expert_projection` 闭合跨 CP 专家依赖；上游 naive provider 的 DP group 不能证明该全局交换，`native_provider_equivalence=False`，不能升级为 provider 验收。DP1 PCP 的 EP-on 源保留 Runner 与 decoder 两处 TP sum，数值/provider 等价未验证。
+
+CP1 的 GLM PP 使用通用连续层分区和 stage-local TP/DP/EP groups。上游构造器可接受以 shared-indexer 层开头的 stage；PP payload 仍只有 hidden/residual。当前 attention 程序若读取 top-k（sparse、decode 或 mixed），必须有真实生产者，不能凭空补初始化或跨 stage 数据；该依赖不能推成整个 PP 配置非法。BF16 pure fresh dense-MHA prefill 的 q_lens=kv_lens、全部模型行均为 prefill、上下文不超过 checkpoint top-k 时不读取 top-k，现允许 shared-first 分区，例如78层39/39。CLI 在 CP1 省略 `--glm-prefill-attention-source` 可选这一严格按 shape 判断的既有源分支；显式 `force_sparse_mqa` 保留 sparse 依赖检查，PCP 仍须 force_sparse。以 full-indexer 层开头的26/24/28或38/40等分区仍适用原 sparse/decode 程序，数值只是例子。标准 TP-partial send、接收 gather、late sum 均按声明源保留；未新增 top-k 传输协议或声称数值等价。完整请求和正常 allocator 路径的 CPU 通过均不代表真实 GPU/provider、reserve 或精度验收；未知 launch 的源数学模型明确报告 unsupported，未用 production duration 拟合。
+
 Host-KV 的状态变化可以概括为：
 
 ```text
@@ -705,7 +769,7 @@ Goodput 只统计满足给定 SLO 的成功请求，不等同于生产请求成�
 
 - 接入新的 Scheduler 或 Serving 框架；
 - 增加新的模型结构和运行时输入；
-- 增加 DP、SP、CP，以及跨硬件 P/D、LPU 等异构部署；
+- 扩大既有 DP、SP、MLA PCP 与跨硬件 P/D 的模型/版本和 provider 证据，接入 LPU 等部署；
 - 接入更精确的通信、Host memory 与 SSD/Flash 后端；
 - 支持 FP8、FP4 等低精度；
 - 扩展到新的硬件。
@@ -800,3 +864,66 @@ NVIDIA 的 `--stage hardware` 只按已核对的物理 UUID 查询 NVML 规格�
 合法 capture 拉回本地后，`run_llmservingsim.py --target-case <hardware>/<model>/tp1_qps16 --profile-capture <raw模型capture> --hardware-capture <raw硬件capture> --runtime <执行副本> --python <独立CPU环境>/bin/python --output <已有结果根>` 先拒绝用户延期项，再校验成功 capture、硬件/模型/精度/TP、engine block/context、实测表与 acquisition identity，真实运行完整原 case。配置换算只保留已核对的 KV 字节预算；有结构化零净前缀工作量证据时，用独立合成 block-token identity 实例化相同 scheduler-equivalent representative，同时保持 prefix allocation 开启，不能标成 observed zero 或声称复现原 prompt。每例只写自己的结果目录，多个独立 case 可并行，`--report` 汇总当前分母并另列延期历史。报告分别列 LUT compute + analytical network 与 pure analytical compute unavailable；原生 `--network-backend` 只选择网络，不提供这些 dense Transformer 的纯解析计算模式。报告标为 checkpoint，最终 gate 验收由主 agent 承担；延期本身不使其它 gate 自动通过。
 
 Ascend 的显式 `block16_capability=True` 采集适配允许在私有进程中保留目标 block16：它要求同一软件栈的原生 FIA 与 paged-attention 接口分别在 block16/block128 下通过 BF16 数值验证，并绑定原生 `refresh_block_size` 与支持列表函数的源码指纹。适配只替换将配置改成128的 policy 和 backend 支持声明，attention、cache device 算子及 metadata builder 保持原实现；配置范围限定为已验证的 BF16/TP1、32 query heads、8 KV heads、head_dim128 的 Qwen3/Llama。采集 CLI 通过 `--block16-evidence <capability.json>` 显式传入证据；实际缓存必须为16，仍须通过 engine geometry 和完整三阶段 coverage。TND mixed causal 数值控制与原始 block128 表单独保留，不能将 block128 时延改名为 block16。该适配差异必须在比较报告中披露，且不进入 Forward 或共享环境。
+
+### 逻辑权重放置清单
+
+`deployment_weight_placements(model, deployment)` 从 colocated 部署和模型配置生成启动期逻辑清单，不加载权重或分配设备内存。当前支持 unquantized BF16/FP16 Qwen3、Llama 和已有 residency 支持范围内的 Qwen3MoE；TP、受 residency 限制的 PP、Qwen3MoE EP 和多个 colocated 实例使用现有并行推导。TP 超过 KV head 数、跨 PP 的 tied embedding、自定义 PP 分层、其他压缩权重和拆分池等尚不支持，入口会拒绝。对象标识是每池每 rank 的逻辑身份，QKV、gate/up 与 expert 逻辑参数按已有 fused 参数标识对象，`object_view` 标识其中的逻辑视图；真实物理区间、地址、UUID 和物理布局未知。vocabulary 的 `logical_shape` 不含 padding，`storage_shape` 和 shard 区间采用 padded vocabulary；`storage_bytes` 不计同 rank 的 tied alias。总量仅为权重，不含 KV、activation、workspace 或 reserve。
+
+可用 `python scripts/evaluation/serving/report_weight_placement.py --model configs/model/qwen3-8b.json --hardware nvidia_a800 --tp 1 --pp 2 --instance main:2,7 --output experiment_logs/weight_placement/qwen3-8b-pp2.json --table experiment_logs/weight_placement/qwen3-8b-pp2.tsv` 生成 JSON、逐分片 TSV 和每 rank 汇总表；物理 rank 是部署声明的编号而非设备 UUID。单池仿真和多实例仿真构造时分别可通过 `Simulation(..., weight_placement_consumer=callback)` 或 `MultiSimulation(..., weight_placement_consumer=callback)` 在构造校验通过后接收同一清单；不提供 callback 时不生成清单，参数和容量语义不变。
+
+独立的 `dsv4_routed_mxfp4_placements(model, parallelism)` 描述 DeepSeek V4 EP-off routed expert 的 loader 阶段子清单：每个 fused 参数分别列出 MXFP4 packed 值与 UE8M0 scale，记录两段 gate/up 逻辑范围、存储形状、字节数及无 padding 的来源约束。它复用 `dsv4_routed_loader_payload_bytes` 的配置和对齐检查，不声明 post-load Marlin 物理布局，也不包含非 routed 参数、部署绑定或完整模型清单；因此尚不能用于完整容量验收。
+
+`dsv4_postload_inventory_diagnostic(model, parallelism)` 复用既有 SM90 DeepGEMM/Marlin 来源定义，逐项核对完整 target-off 参数 post-load 字节；非 routed 参数保留来源 loader 局部形状，并依据 vLLM 0.30 构造标注复制或 TP 区间；scale 区间以 128×128 block 为单位，sink 另标局部 padding。同一部署清单入口可显式选择 `v4_weight_storage_profile="sm90_deepgemm_marlin"`，仅接受 H200、EP-off、PP1 的来源配置；这不表示运行时已选择该后端。CLI 使用 `--v4-weight-storage-profile sm90_deepgemm_marlin`，仿真回调使用同名参数。post-load 物理 shape 和布局未知；MXFP4 权重的 `local_shape` 是未压缩逻辑分片形状，`loader_shape` 是 packed loader 形状；UE8M0 scale 的 `logical_shape` 和 `local_shape` 表示 scale 网格，`represented_weight_shape` 与 `represented_weight_shard_intervals` 单独给出其覆盖的权重，不伪造 post-load shape。该来源配置的 FP8 scale 从 loader 的 UE8M0 转成 FP32；routed MXFP4 权重保留压缩载荷与 UE8M0 scale，Marlin post-load 物理布局未知。
+## 离线交互执行报告
+
+仿真 CLI `scripts/evaluation/serving/simulation_runner_entrypoint.py` 默认生成离线报告：有 `--output result.json` 时默认输出相邻 `result.html`；未指定结果文件时在 `experiment_logs/serving_reports/<独立运行>/` 输出。可用 `--interactive-report <path>` 指定位置。默认 `--interactive-view swimlanes --interactive-detail-mode summary`，保留全程请求/Forward 和已有资源工作量，不启用 `record_execution_timeline`，也不改 execution mode、workers、retention 或 source-state。没有真实活动区间时 busy/Host 为未知（投影为 null），不能用空数组或 Forward 包络冒充零占用/精确忙碌。支持 `full` 和 `streaming_aggregate` retention；后者通过既有 object-valued projector 包装原 execution digest 与 compact 投影，consumer 解包并保留 state audit snapshot，每步只累计一次。
+
+显式 `--interactive-detail-mode sampled --interactive-max-events 100000` 保留有界逐算子样本；只有详细模式需要物化活动区间。详细 streaming 执行在消费步骤时物化区间，在事件预算内从整个运行过程保留完整步骤样本，优先覆盖不同请求和阶段，其次保留首尾、较大批次并用确定性抽样打破平局；超预算时替换重复覆盖的样本，不按预测时长选择样本，以及覆盖全部执行步骤的资源汇总。标准外部请求结果继续使用既有安全投影；可视化另存 `report.visualization.json`，不包含请求原文、token IDs 或 kernel attributes。该文件是已有执行产物的裁剪投影，不是新的 canonical dataset。
+
+首页先显示模型/硬件及已记录的 TP/PP、完成请求数、吞吐、平均 TTFT/TPOT、全负载模拟跨度与 simulator wall time；全负载跨度不是平均请求 E2E，指标悬停说明该口径。Forward/明细计数在覆盖面板中展开查看。延迟均值只聚合已记录的有限数值，没有 eligible 值时显示不可用。模型主要组别按已保存的 predicted operation duration 累计，包含重叠，不当作端到端关键路径；最高资源需求取逐 rank 全程均值中的最大值，不把卡间需求相加。读写证据覆盖率与未计时 Scheduler 明示。完整配置与成本入口嵌入结果卡片，带宽方向、精确范围和图形设置按需展开；图例和全部展开/折叠控件放在图下。Forward、CPU/Device、资源曲线优先展示，请求/token 数曲线仍与同一时间轴对齐并排在该实例的资源曲线下方。多实例默认折叠、单实例多 rank 默认收起各 rank 细节，选择 Forward 会展开相关实例。选区摘要按完整相交 Forward 统计请求，不把它当作按时间切分后的 token 工作量；悬停读数注明当前 rank 范围。配置先显示关键项，其他参数渐进展开并可按名称搜索。
+
+状态与成本区保留未知信息：未记录的 failure/unsupported 计数、HTML 构建耗时及阶段重叠关系不补零。renderer 返回实际 `page_generation_s` 与字节数，资源记录耗时直接显示在成本入口，完整报告成本仍缺失时明确注明。默认入口集成必须将记录、投影、序列化和 HTML 全部计入完整实验 wall time，不能用 HTML 生成耗时代表完整开销；不能直接累加可能重叠的阶段耗时。可选 `visualization_run_costs` 仅接收有来源的 `html_generation_s`（有限非负秒）和 `scope`；未提供时 HTML 中显示未记录，独立再生成本保存在调用方记录中。
+
+内部测量可显式使用 `--no-interactive-report --no-report-reason "<原因>"`，结果保留 disabled receipt；普通用户无需开启 flag。报告和结果路径不得相同。manifest v9 的结果/设置摘要、标准 Serving 报告保留交互入口；失败或 unsupported 没有完整 timeline 时输出真实状态/配置概要，不能伪造资源曲线。Production fixed-tier 入口也默认生成 compact 报告；其显式 opt-out 同样要求原因。扫参点的报告路径独立。
+
+`<report>.report.json` 保存记录/投影、压缩、HTML/再生 JSON 写入和 producer 总 wall 的实际测量，页面成本区可打开该记录。独立的成本元数据与最终 receipt 写入也单独计时，嵌入页面的总 wall 明确截至结果初次写入；最终 receipt/返回值与外层实验 wall 包括后续元数据更新。记录可能嵌在仿真内或并行发生，不直接相加。默认报告不能只用 HTML 构建约一秒来代表完整开销。compact 模式最多保留 1024 条交接元数据，不保留交接算子 IR；总交接数、净 payload 字节与元数据省略数独立保留。该上限只约束附加细节，全程请求/Forward 索引仍随负载增长。报告保留运行前读取的模型/硬件配置内容地址快照；缺少文件时列出未记录，不在报告再生时读取当前配置来冒充旧输入。
+
+报告顶部的“Experiment configuration / 实验配置”面板展示保存的模型、部署/并行、调度器 requested/effective 值、输入身份、KV 容量、Host 模型、图执行模式与源码/配置来源；提供配置 JSON 下载。大规模 Host 逐步耗时不当作配置重复嵌入；请求原文、token ID 与凭据字段不导出。报告可保留经原始 SHA256 校验的模型/硬件配置文件内容，后续再生无需读取当前工作树文件；不匹配的当前文件不能冒充原运行快照。旧记录缺少的配置明确列出未记录。
+
+交互报告默认英文，右上角按钮切换中文；资源大图和按需展开的 Forward 明细同步语言，切换保留时间范围、筛选与原始数据。UI 翻译在现有 reporting owner 中共享，源码字段、请求身份和原始证据不翻译。全程泳道放入独立的竖向滚动区，顶部时间刻度固定，左侧泳道名称在时间平移中保持定位；实例和 rank 标题可折叠，提供全部折叠/展开。全程导航条始终显示完整运行范围，拖选区平移、拖两端缩放；说明与模型假设收进可展开区域。
+
+HTML 无 CDN、在线字体或服务依赖，可独立复制并用浏览器打开。数据在 HTML 内以 gzip + Base64 保存，打开时由浏览器自动解压，无需解压包或配套文件；需要支持 `DecompressionStream` 的现代浏览器，不支持或数据损坏时显示加载失败并禁用控件。压缩减少磁盘体积，不代表等比例降低浏览器内存。普通滚轮（含触控板横向滚动）左右平移，Alt＋滚轮围绕鼠标位置缩放；拖拽和平移滑条共用预测模拟时间轴。总览、资源大图和 Forward 明细采用同一交互；资源大图的 Shift＋拖动保留框选缩放，普通拖动用于平移；实例、rank、操作筛选及点击详情不重新运行仿真。明细的非连续采样区间、请求/批次覆盖数、事件预算及省略数量在页面显示。请求被覆盖仅表示它至少参与了一个保留明细的批次，不表示它的全部生成过程都被保留；事件预算不足时会明确显示未覆盖数量。请求选择器筛选该请求参与的已保留批次；批次中的操作仍由所有参与请求共享。资源表始终按实例/rank和时间窗口汇总全量工作，不随请求筛选变化。省略区间按步骤画聚合 envelope，包含空隙，不冒充连续忙碌；较早保存的投影没有操作分类时明确显示不可用。批次计算属于所有参与请求，不代表任一请求独占。Host 为被模拟系统的提交/运行时；Midlayer 仿真 wall time 单独显示。未开启 Scheduler Host 模型时，零值字段代表未计入该机制，不是实机观测为零。
+
+默认视图放大已保留样本中请求数最多批次的首层，按实例与 rank 分行展示计算、通信、KV 更新/搬运及 Host 提交，用颜色区分 QKV、Attention、FFN、MoE、归一化及各类通信。分行是按操作类型的展示，不能推断不同类型使用独占硬件队列。HBM 需求行将该操作的逻辑字节均匀分摊到它的已记录区间，并非另有一个被观察到的 HBM 操作。模型瓶颈组行直接显示预测器的 `bottleneck_group`；Roofline 未细分或旧投影未保留该字段时保持未知。下界较大项行比较生产资源输入的计算量/对应峰值和逻辑字节/标称 HBM 带宽，只是独立下界的比较，不包含启动、同步，也不是物理流量预测或跨操作关键路径。
+
+逐操作模型瓶颈组与资源服务时间来自原有预测结果，新生成的可选可视化记录在每步骤汇总所有操作的模型瓶颈组，即使明细超出预算仍保留整步的组别计数和预测操作时长。整步汇总不表示组别在步骤内的执行顺序；跨 rank 或重叠操作累计值可能重复，不能当成端到端瓶颈耗时。已经生成的旧投影若没有预测字段，可直接重绘并显示可用的工作量下界比较；模型瓶颈组标为未保留，不能从总时延反推。
+
+可选记录还保存预测器提供的单算子内部关键路径、支持级别及限制，路径目录最多 4096 项，每步每瓶颈组最多汇总 32 条路径；未提供或超出预算的次数单独计数。路径是模型诊断，不是请求级关键路径，也不能把资源服务时间相加画成实际时间段。旧投影未保存时显示不可用，不从时延推断。
+
+原 `breakdown` 视图的资源图随时间窗口变化，busy 为 Device 区间并集除以窗口，compute 为生产 predictor 的操作量除以对应资源标称容量与窗口，HBM 为 compulsory 逻辑字节需求除以 HBM 带宽容量的解析下界。该 HBM 数值不是物理 transaction 利用率；未提供资源输入的操作计入缺失计数，不补零。汇总模式对窗口内需求按步骤执行 envelope 均匀分摊，busy 仍按记录区间并集统计；这是时间分布近似，不代表瞬时硬件计数器。算力按 kernel dtype 和资源 role 区分，source 内部混合精度仍受原资源合同约束。超过 100% 的需求保留原值，图轴自动扩展。48 个等宽窗口用于资源趋势图，不是新的预测。
+
+互联为生产 owner 输出的算法字节量，按具体 endpoint 与配置链路带宽统计，包含调用的起止、请求净 payload 和发送/接收端；同一物理调用只记录一次，不把多个 endpoint 相加后再除以单端带宽。算法字节不含协议开销或重传，非 ring/未建模 collective 显式不可用。容量分别展示 HWSpec HBM 上限、已配置 KV 预算及已知 source activation 峰值；保持 `complete=False`、`normal_capacity_accepted=False`，不插值成连续精确显存曲线。
+
+默认报告只保存可视化需要的操作类别、层号、shape/dtype、绝对时间端点、预测总时间/启动时间、模型瓶颈组、非零资源服务时间，以及计算量/逻辑字节和模型路径证据。完整 `source_node_ids`、`t_per_group_s`、Host 依赖边和覆盖操作列表不再写入；Host 保留时间、类型、对应 call/graph segment、暴露/重叠时间及批次关联，不支持从此投影恢复完整 Host 依赖链。资源时间的零值仅按显式 sparse 编码约定省略，不表示缺失资源证据为零。未知资源输入及路径仍明确标记不可用。源节点只用于生成操作分类和层号，再丢弃；分类未扩展为硬件预测逻辑。
+
+可视化 JSON 使用报告内的 `visualization_storage` 表去重算子描述、实例/rank/resource 及 call ID；它是可再生报告的存储编码，不改变 execution artifact 或 canonical schema。读取入口接受旧的未压缩投影及新的表引用投影，并拒绝非法引用。绝对端点保留原始数值，不通过相对时间加减重建；HTML 初始化时解析表引用。旁边的 `report.visualization.json` 用于离线再生成，浏览页面时只需 HTML。字段精简不会自动增加明细预算或恢复旧投影已省略的批次。
+
+新增 `--interactive-view swimlanes` 选择端到端泳道：全部 forward 标记、CPU 调度/提交、每实例/rank 的 Device 活动及 Tensor、Vector、L2 BW、HBM BW、Scale-up BW、Scale-out BW 共用一个时间轴，缩放和平移同步。默认仍为原有 `breakdown` 视图。曲线依据全步骤汇总而不是已保存的采样明细；Tensor 将各精度工作量按对应标称容量归一化，Vector 取不同向量资源角色归一化需求的最大值，不把不同执行单元相加。L2/HBM 带宽图均使用 `PredictionInput.memory_paths` 中 `l2_cache` / `dram` 节点的读写字节，直接读取预测器已有缓存/LRU及写回处理后的内存路径，不用必要逻辑字节替代 HBM 流量，也不从资源服务时间倒推字节。H200 泳道图使用独立的显示峰值参考 `microbench/nvidia_h200/references/l2_peak_metadata_sm90.json`：L2 读 6016 B/clk、写 3008 B/clk，按 1.98 GHz 换算为 11.91168 / 5.95584 TB/s；HBM 读写共用公开标称 4.8 TB/s。L2 综合占比取窗口内读占比和写占比的较高值，HBM 综合占比取读写占比之和；读写合计 GB/s 始终是字节流量之和，不把不同分母的百分比相加，也不把 NCU tag-sector 合计峰值当成已证明的同时读写容量。下拉菜单和大图可切换读/写/综合，读数显示各方向百分比、GB/s、峰值分母及合计流量；超 100% 保留。显示参考由 src 导出，报告层只归一化；保存投影固定该参考供离线再生，不改变 HWSpec 或预测定价。未配置独立峰值的硬件继续明确标为模型配置带宽，不冒称标称值；混合硬件报告尚缺逐行硬件身份时不套用 H200 参考。必要逻辑字节只保留为单独参考量。
+
+方向统计要求预测器导出读写方向账本；`MemoryNodeDemand` 只容纳正字节，完整方向账本中省略的下游节点表示已建模的零流量，例如 LRU 命中不再访问 DRAM、脏输出尚未回写。没有方向账本的操作保持未知并单独计数，不补零。统计只用聚合路径，不把 pipeline 内分阶段节点再累加。已有 LRU 在各预测器支持的发射/执行上下文内生效，报告不运行第二套 LRU，也不冒称已经证明了所有算子之间的全程连续缓存状态。通信按配置的链路及 endpoint 统计，单卡无该类链路时显示 N/A。窗口分箱宽度随缩放显示；超过 100% 的需求保留并扩展坐标，不截断。CPU 调度未启用耗时模型时，显示 schedule trace 中的调度/完成事件标记并注明未计时，零时长不画成非零活动；不为绘图自动改变原 case 的 timing mode 或引入额外 Host 定价参数。
+
+Forward 选择器同时显示实例/后端轮次、Prefill/Decode/Mixed、本轮参与 request 数和调度 token 数（input_tokens + output_tokens，不含 padding）。总览增加每轮请求数与 token 数泳道，token 按 Prefill 输入和 Decode 输入堆叠；这些是本轮工作量而不是请求总长度或最终生成 token 总数。资源曲线默认使用可读高度和各自自动纵轴，也可切换固定 0–100% 或更高曲线。每行显示窗口均值、分箱峰值和纵轴刻度；不同自动刻度下不能用曲线高度跨资源比较。悬停给出浮动数值和确切分箱区间，点击固定读数。点击资源名、双击曲线或使用“单独放大”按钮打开大图；支持时间缩放、拖选区间和百分比/GB/s 读数，主视图时间轴同步更新。每点仍是窗口均值，步骤内部的均摊假设不会因放大而变成 kernel 级或硬件瞬时计数器。
+
+`--interactive-detail-mode summary` 为默认，不保留逐算子明细；`sampled` 继续受 `--interactive-max-events` 限制；配合 `--interactive-view swimlanes --interactive-detail-mode all` 则完整记录每次 forward，忽略采样事件上限。全量模式每消费一个步骤就将请求安全投影独立压缩写入 `<report>.iterations/iteration-*.json.gz`，不常驻全程执行 IR；全程汇总和所有 iteration 的轻量索引继续保留。HTML 内嵌这些压缩块，打开只解压总览，点击某次 forward 才解压它，并复用原算子 breakdown 查看器；切换后替换上一轮明细。新视图需要同时支持 `CompressionStream` 和 `DecompressionStream` 的现代浏览器。无明细的采样 forward 明确显示“仅汇总”，不会用相邻样本补造事件。
+
+泳道版的 `.visualization.json` 是带 chunk 文件 SHA256 和原始绝对时间平移量的再生索引，重新生成时必须保留它引用的 `.iterations/`，并校验路径、长度和内容哈希。输出使用新任务目录；已存在的 chunk 不静默覆盖。最终 HTML 独立可复制，浏览不需要旁边的 JSON 或目录。`report_interactive.py` 会识别该索引并重绘，无需重新仿真。源文件中的请求文本、token IDs、kernel attributes 不进入压缩块。泳道存储是现有可视化报告内部编码，canonical 和执行合同不变。
+
+无需重新仿真可更新页面：
+
+```bash
+PYTHONPATH=. /home/yangxinhao/miniconda3/envs/r2r_qwen3_next/bin/python scripts/evaluation/serving/report_interactive.py experiment_logs/<run>/report.visualization.json experiment_logs/<run>/report.html
+```
+
+CPU-only 示例入口 `scripts/evaluation/serving/run_interactive_example.py` 提供 `single`、`tp2`、`pd`（完整 Qwen3-4B）和 `four`（既有四池小模型 fixture），传入 `--output`、`--sdk-python` 和 `--source-root`。SDK Python 保留虚拟环境路径。前三者使用真实 CPU vLLM 0.30、Roofline 和现有 H200 Host launch profile；四池使用既有 vLLM 0.11 token-prefix fixture，未启用 Host 定价。示例使用显式测试 KV 预算，不表示正常容量或实际 provider 验收。`--no-record` 用于同场景结果对照；`state.json` 保留请求完成、token、路由、传输和 activation 状态。真实请求集按有效 case 配置构造原仿真命令后增加报告参数，不根据 case 文件名推断运行时版本。
+
+普通静态模型报告也默认生成独立离线概要；它展示已记录的图规模、串行预测时间、未计价项和配置，不生成 Serving 活动区间。历史 Serving 结果若没有保存可视化投影，报告仅生成 partial 概要，展示已有指标并明确活动区间不可用；缺失均值不会由分位数猜测。保存过的投影按其已声明视图重建，未知视图会报错。

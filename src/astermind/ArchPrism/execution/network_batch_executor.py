@@ -1,16 +1,11 @@
-"""Causal native M-L execution with external collective/P2P completion.
-
-No upstream source is patched. Compact occurrences and eager launch gaps are
-expanded by the pinned M-L helpers. Network operations replace (never add to)
-native COMMUNICATION duration. Ring is a fluid traffic abstraction; it
-does not emulate NCCL protocol or a separate GPU reduction kernel.
-"""
+"""Schedule dev's bound kernel plans on the shared clock and network."""
 from collections import defaultdict
 
 from network_sim.comm.model import TransferRequest
 from orbitserve.runtime.engine.cell_events import DISPATCH, STEP_COMPLETE
 from orbitserve.runtime.engine.network_events import nanoseconds
 from src.kernel.kernel_spec import KernelKind
+from src.serving.kernel_lowering.kernel_plan import KernelPlan
 from src.serving.kernel_lowering.execution_timeline import (
     _plan_schedule_inputs, _logical_schedule,
     call_host_lanes, call_reserved_resource_ids,
@@ -54,7 +49,7 @@ def variable_collective_phases(operation, participants, bytes_by_owner, *, algor
         raise ValueError("variable collective requires one size per distinct participant")
     if any(type(size) is not int or size < 0 for size in sizes):
         raise ValueError("owner payloads must be nonnegative integer bytes")
-    if algorithm != "direct":
+    if algorithm not in ("direct", "pairwise"):
         raise NotImplementedError("ragged collective currently requires explicit direct traffic")
     if operation not in ("all_gatherv", "reduce_scatterv"):
         raise NotImplementedError(f"variable collective not connected: {operation}")
@@ -147,7 +142,7 @@ class NetworkBatchExecutor:
                 raise NotImplementedError("external collectives require equal per-rank inputs and ring")
             if transfer.operation == "all_reduce" and transfer.reduction != "sum":
                 raise NotImplementedError("external ring only supports sum reduction")
-            phases = ring_transfer_phases(transfer.operation, participants, size)
+            phases = ring_transfer_phases(transfer.operation, transfer.ring_order, size)
             def advance(index):
                 if index == len(phases):
                     on_complete()
@@ -161,8 +156,9 @@ class NetworkBatchExecutor:
                             lambda: advance(index + 1), record)
             advance(0)
         elif transfer.operation in ("all_gatherv", "reduce_scatterv"):
-            phases = variable_collective_phases(transfer.operation, participants,
-                                                 transfer.owner_sizes, algorithm=transfer.algorithm)
+            partition_bytes = getattr(transfer, "partition_bytes", getattr(transfer, "owner_sizes", ()))
+            phases = variable_collective_phases(transfer.operation, participants, partition_bytes,
+                                                algorithm=transfer.algorithm)
             def advance_variable(index):
                 if index == len(phases):
                     on_complete()
@@ -185,11 +181,19 @@ class NetworkBatchExecutor:
             raise NotImplementedError("each Cell owns one replica")
         if type(token_count) is not int or token_count <= 0:
             raise ValueError("batch input distribution requires the scheduled token count")
+        if isinstance(components, KernelPlan):
+            plan = components
+            predictions = execution.predict_local_plan(plan)
+            native_timeline = None
+        else:
+            # Explicit older dev roots return the original execution bundle.
+            plan, predictions = components.kernel_plan, components.predictions
+            native_timeline = components.execution_timeline
         self._active.add(pool_name)
         participants = pool.physical_ranks_for_pipeline_stage(0)
 
         def begin_plan():
-            self._start_plan(pool_name, step_id, components, execution, on_complete)
+            self._start_plan(pool_name, step_id, plan, predictions, native_timeline, execution, on_complete)
 
         if len(participants) == 1:
             begin_plan()
@@ -205,25 +209,34 @@ class NetworkBatchExecutor:
                     [(participants[0], rank, token_count * 8) for rank in participants[1:]],
                     distributed, record)
 
-    def _start_plan(self, pool_name, step_id, components, execution, on_complete):
+    def _start_plan(self, pool_name, step_id, plan, predictions, native_timeline, execution, on_complete):
         cell_id = self.cell_id
-        plan = components.kernel_plan
         inputs = _plan_schedule_inputs(plan)
-        logical = tuple(_logical_schedule(plan, *inputs))
         calls = inputs[1]
+        logical = _logical_schedule(plan, *inputs)
         host_end = {}
-        for interval in components.execution_timeline.host_intervals:
-            if interval.event_kind != "eager_submit" or interval.runtime_graph_mode != "NONE":
-                raise NotImplementedError("network path currently supports native eager Host only")
-            key = (interval.call_id, interval.call_occurrence_index)
-            host_end[key] = max(host_end[key] if key in host_end else 0, nanoseconds(interval.end_time_s))
         gaps = None
         if execution.host_launch_profiles:
             from src.serving.kernel_lowering.execution_timeline import _DeviceLaunchGapTracker
+
             gaps = _DeviceLaunchGapTracker(execution.host_launch_profiles)
+            if native_timeline is None:
+                from src.serving.kernel_lowering.execution_timeline import eager_host_ready_times
+
+                logical = tuple(logical)
+                keys = tuple(key for key, _, _, _ in logical)
+                host_end = {key: nanoseconds(end_s) for key, end_s in
+                            eager_host_ready_times(inputs[0], keys, execution.host_launch_profiles).items()}
+        if native_timeline is not None:
+            for interval in native_timeline.host_intervals:
+                if interval.event_kind != "eager_submit" or interval.runtime_graph_mode != "NONE":
+                    raise NotImplementedError("network path currently supports native eager Host only")
+                key = (interval.call_id, interval.call_occurrence_index)
+                host_end[key] = max(host_end[key] if key in host_end else 0, nanoseconds(interval.end_time_s))
         start_ns = nanoseconds(self.loop.now_s)
         batch = {"cell_id": cell_id, "step_id": step_id, "start_time_ns": start_ns,
-                 "end_time_ns": None, "calls": [], "native_batch_duration_s": components.execution_timeline.duration_s,
+                 "end_time_ns": None, "calls": [],
+                 "native_batch_duration_s": None if native_timeline is None else native_timeline.duration_s,
                  "native_communication_duration_charged_s": 0.0,
                  "model": "native M-L compute and eager Host; FlowSim ring and PP payload"}
         self.records.append(batch)
@@ -247,11 +260,12 @@ class NetworkBatchExecutor:
                       tuple((lane, None) for lane in call_host_lanes(call)))) if gaps else 0)
             if execution.host_launch_profiles is not None and key not in host_end:
                 raise ValueError("native eager Host record missing a logical occurrence")
+            local_prediction = None if communication and native_timeline is None else predictions[call.call_id].t_total_s
             record = {"call_id": call.call_id, "occurrence": key[1], "rank": call.rank,
                       "kind": call.kernel_spec.kind.value, "communication": communication,
                       "dependencies": [list(d) for d in sorted(deps)], "position": position,
                       "start_time_ns": None, "end_time_ns": None, "phases": [],
-                      "native_prediction_s": components.predictions[call.call_id].t_total_s,
+                      "native_prediction_s": local_prediction,
                       "host_ready_time_ns": start_ns + (host_end[key] if key in host_end else 0),
                       "launch_gap_ns": gap_ns}
             batch["calls"].append(record)
@@ -262,12 +276,6 @@ class NetworkBatchExecutor:
         if len(tasks) != plan.logical_call_count:
             raise RuntimeError("compact M-L plan was not fully expanded")
         unfinished = len(tasks)
-
-        def finish_batch():
-            self._active.remove(pool_name)
-            on_complete(self.loop.now_s)
-            if self._on_batch_boundary is not None:
-                self._on_batch_boundary()
 
         def finish(key):
             nonlocal unfinished, ready
@@ -288,8 +296,10 @@ class NetworkBatchExecutor:
                 # Break the ready/launch/finish callback cycle after its last task.
                 ready = None
                 batch["end_time_ns"] = end_ns
-                self.loop.schedule(self.loop.now_s, STEP_COMPLETE, f"{cell_id}:step_done",
-                                   finish_batch, owner_id=cell_id)
+                self._active.remove(pool_name)
+                on_complete(self.loop.now_s)
+                if self._on_batch_boundary is not None:
+                    self._on_batch_boundary()
 
         def launch(key):
             task = tasks[key]

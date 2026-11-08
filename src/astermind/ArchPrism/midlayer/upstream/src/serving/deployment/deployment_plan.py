@@ -1,6 +1,6 @@
 """Normalized deployment plan with one ParallelPlan per pool."""
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 from types import MappingProxyType
@@ -26,8 +26,11 @@ class WorkerPool:
     kv_cache: object = None
     collectives: Tuple[CollectiveConfig, ...] = ()
     pipeline_p2p: Tuple[PipelineP2PConfig, ...] = ()
+    kv_transfer_layout: str | None = None
 
     def __post_init__(self) -> None:
+        if self.kv_transfer_layout not in (None, "BLHNC", "BLNHC", "LBHNC"):
+            raise ValueError("unknown declared KV transfer layout")
         pipeline_size = self.parallel_plan.config.pipeline_parallel_size
         for config in self.pipeline_p2p:
             if config.destination_stage >= pipeline_size:
@@ -129,7 +132,7 @@ class WorkerPool:
 
 @dataclass(frozen=True)
 class PDKVTransferRankPair:
-    """One physical P-to-D edge and its contiguous KV-head ownership."""
+    """One physical P-to-D edge and its head/layer interval ownership."""
 
     source_logical_rank: int
     destination_logical_rank: int
@@ -137,83 +140,108 @@ class PDKVTransferRankPair:
     destination_rank: int
     kv_head_start: int
     kv_head_end: int
+    layer_start: int
+    layer_end: int
 
 
 def pd_kv_transfer_rank_pairs(
     source: WorkerPool,
     destination: WorkerPool,
     num_key_value_heads: int,
+    *, source_data_parallel_rank: int | None = None, destination_data_parallel_rank: int | None = None,
+    attention_layout: str = "standard_gqa",
 ) -> Tuple[PDKVTransferRankPair, ...]:
-    """Resolve P-to-D edges from the intersection of TP KV-head owners."""
+    """Intersect cache ownership, selecting each physical source copy once.
+
+    Ordinary GQA shards cache heads over TP. MLA/DSA instead replicate one
+    compressed cache head on every TP/PCP rank, independently of their
+    query-head or expert partitions. PCP's post-gather cache is complete.
+    """
 
     if not isinstance(source, WorkerPool) or not isinstance(
             destination, WorkerPool):
         raise TypeError("PD KV rank mapping requires WorkerPool endpoints")
-    if source.hardware_id != destination.hardware_id:
-        raise NotImplementedError(
-            "cross-hardware PD KV transfer requires a bilateral endpoint/link "
-            "contract; the current predictor prices only one HWSpec")
     source_parallelism = source.parallel_plan.config
     destination_parallelism = destination.parallel_plan.config
+    if attention_layout not in ("standard_gqa", "mla", "dsa_mla"):
+        raise ValueError("PD KV rank mapping requires an explicit supported attention layout")
+    if source.parallel_plan.num_layers != destination.parallel_plan.num_layers:
+        raise ValueError("PD endpoints must describe the same decoder layers")
     for endpoint, parallelism in (
             (source, source_parallelism),
             (destination, destination_parallelism)):
-        if (parallelism.tensor_parallel_size not in (1, 2, 8)
-                or parallelism.pipeline_parallel_size != 1
-                or not parallelism.is_rank_local
-                or parallelism.worker_count
-                != parallelism.tensor_parallel_size):
-            raise NotImplementedError(
-                "PD KV transfer supports independently selected TP=1, TP=2, "
-                "or target TP=8 endpoints with PP=SP=CP=DP=1")
+        if parallelism.context_parallel_size != 1 and attention_layout == "standard_gqa":
+            raise NotImplementedError("vLLM PCP cache ownership is defined only for MLA")
         if len(endpoint.ranks) != parallelism.worker_count:
             raise RuntimeError(
                 f"PD KV transfer endpoint {endpoint.name!r} placement "
                 "disagrees with its parallel plan")
-    if (isinstance(num_key_value_heads, bool)
-            or not isinstance(num_key_value_heads, int)):
+    if isinstance(num_key_value_heads, bool) or not isinstance(num_key_value_heads, int):
         raise TypeError("PD KV transfer num_key_value_heads must be an integer")
     if num_key_value_heads < 1:
-        raise ValueError(
-            "PD KV transfer num_key_value_heads must be positive")
-    source_tp = source_parallelism.tensor_parallel_size
-    destination_tp = destination_parallelism.tensor_parallel_size
-    if num_key_value_heads < max(source_tp, destination_tp):
-        raise NotImplementedError(
-            "PD KV transfer does not yet select a canonical source replica "
-            "when TP exceeds num_key_value_heads")
-    for tp_size in (source_tp, destination_tp):
-        if num_key_value_heads % tp_size:
-            raise ValueError(
-                "num_key_value_heads must be evenly divisible by each PD TP "
-                f"size: heads={num_key_value_heads}, TP={tp_size}")
+        raise ValueError("PD KV transfer num_key_value_heads must be positive")
 
-    source_heads_per_rank = num_key_value_heads // source_tp
-    destination_heads_per_rank = num_key_value_heads // destination_tp
+    selected = []
+    for config, rank in ((source_parallelism, source_data_parallel_rank),
+            (destination_parallelism, destination_data_parallel_rank)):
+        if rank is None:
+            if config.data_parallel_size != 1:
+                raise ValueError("PD transfer must select the actual request's DP replica explicitly")
+            rank = 0
+        if type(rank) is not int or not 0 <= rank < config.data_parallel_size:
+            raise ValueError("PD request DP replica is outside the endpoint placement")
+        selected.append(rank)
+
+    def head_range(lane, tp):
+        if attention_layout in ("mla", "dsa_mla"):
+            return 0, 1
+        if tp <= num_key_value_heads:
+            if num_key_value_heads % tp:
+                raise ValueError("num_key_value_heads must be evenly divisible by TP")
+            width = num_key_value_heads // tp
+            return lane * width, (lane + 1) * width
+        if tp % num_key_value_heads:
+            raise ValueError("replicated KV heads require TP divisible by num_key_value_heads")
+        head = lane // (tp // num_key_value_heads)
+        return head, head + 1
+
+    def owners(endpoint, replica):
+        config = endpoint.parallel_plan.config
+        tp = config.tensor_parallel_size
+        width = config.worker_count // config.data_parallel_size
+        base = replica * width
+        for logical in range(base, base + width):
+            physical = endpoint.ranks[logical]
+            context_stage, lane = divmod(logical - base, tp)
+            stage = context_stage // config.context_parallel_size
+            layers = tuple(i for i, owner in enumerate(
+                endpoint.parallel_plan.layer_to_pipeline_stage) if owner == stage)
+            if not layers or layers != tuple(range(layers[0], layers[-1] + 1)):
+                raise ValueError("PD requires contiguous nonempty PP layer ownership")
+            yield logical, physical, head_range(lane, tp), (layers[0], layers[-1] + 1)
+
     mappings = []
-    for source_logical_rank, source_rank in enumerate(source.ranks):
-        source_head_start = source_logical_rank * source_heads_per_rank
-        source_head_end = source_head_start + source_heads_per_rank
-        for destination_logical_rank, destination_rank in enumerate(
-                destination.ranks):
-            destination_head_start = (
-                destination_logical_rank * destination_heads_per_rank)
-            destination_head_end = (
-                destination_head_start + destination_heads_per_rank)
-            overlap_start = max(source_head_start, destination_head_start)
-            overlap_end = min(source_head_end, destination_head_end)
-            if overlap_start >= overlap_end:
-                continue
-            mappings.append(PDKVTransferRankPair(
-                source_logical_rank=source_logical_rank,
-                destination_logical_rank=destination_logical_rank,
-                source_rank=source_rank,
-                destination_rank=destination_rank,
-                kv_head_start=overlap_start,
-                kv_head_end=overlap_end,
-            ))
+    # Replica choice is local to a PP stage/head interval. Only the first
+    # source copy is sent, while every destination copy receives its data.
+    source_owners = []
+    seen = set()
+    for owner in owners(source, selected[0]):
+        identity = owner[2:]
+        if identity not in seen:
+            seen.add(identity)
+            source_owners.append(owner)
+    for source_logical, source_rank, source_heads, source_layers in source_owners:
+        for destination_logical, destination_rank, destination_heads, destination_layers in owners(destination, selected[1]):
+            head_start = max(source_heads[0], destination_heads[0])
+            head_end = min(source_heads[1], destination_heads[1])
+            layer_start = max(source_layers[0], destination_layers[0])
+            layer_end = min(source_layers[1], destination_layers[1])
+            if head_start < head_end and layer_start < layer_end:
+                mappings.append(PDKVTransferRankPair(
+                    source_logical, destination_logical, source_rank, destination_rank,
+                    head_start, head_end, layer_start, layer_end))
     if not mappings:
-        raise RuntimeError("PD KV transfer produced no KV-head ownership edges")
+        raise RuntimeError("PD KV transfer produced no ownership edges")
     return tuple(mappings)
 
 
@@ -237,6 +265,10 @@ class DeploymentPlan:
     worker_pools: Mapping[str, WorkerPool]
     routes: Tuple[TransferRoute, ...]
     router: RouterConfig = RouterConfig()
+    # A DP request executes on one member pool, not on all replica ranks.
+    # The original pool identity and ordered replicas preserve the full
+    # requested DP placement while each Scheduler uses a local TP/PP plan.
+    data_parallel_groups: Mapping[str, Tuple[str, ...]] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.deployment_id, str) or not self.deployment_id:
@@ -244,6 +276,33 @@ class DeploymentPlan:
         if not isinstance(self.router, RouterConfig):
             raise TypeError("deployment plan router must be a RouterConfig")
         object.__setattr__(self, "worker_pools", MappingProxyType(dict(self.worker_pools)))
+        groups = ({name: (name,) for name in self.worker_pools}
+            if self.data_parallel_groups is None else self.data_parallel_groups)
+        if not isinstance(groups, Mapping):
+            raise TypeError("data_parallel_groups must be a mapping")
+        normalized_groups = {}
+        members = []
+        for group, replicas in groups.items():
+            if not isinstance(group, str) or not group:
+                raise ValueError("DP group identity must be non-empty")
+            if not isinstance(replicas, (list, tuple)) or not replicas:
+                raise ValueError("DP group requires an ordered nonempty replica list")
+            if any(not isinstance(name, str) or name not in self.worker_pools for name in replicas):
+                raise ValueError("DP group references an unknown replica pool")
+            normalized_groups[group] = tuple(replicas)
+            members.extend(replicas)
+            if len(replicas) > 1:
+                pools = tuple(self.worker_pools[name] for name in replicas)
+                first = pools[0]
+                if any(pool.hardware_id != first.hardware_id or pool.role != first.role
+                        or pool.kv_transfer_layout != first.kv_transfer_layout
+                        or pool.parallel_plan.config != first.parallel_plan.config for pool in pools):
+                    raise ValueError("DP replicas must preserve their parent's execution configuration")
+                if first.parallel_plan.config.enable_expert_parallel:
+                    raise ValueError("independent DP pools cannot replace cross-DP expert ownership")
+        if len(members) != len(set(members)) or set(members) != set(self.worker_pools):
+            raise ValueError("DP groups must cover every worker pool exactly once")
+        object.__setattr__(self, "data_parallel_groups", MappingProxyType(normalized_groups))
         if (self.mode == "colocated"
                 and len(self.worker_pools) == 1
                 and self.router.dispatch_service_time_s != 0.0):
@@ -396,6 +455,7 @@ def deployment_plan_manifest(plan: DeploymentPlan) -> dict[str, object]:
             "role": pool.role,
             "hardware_id": pool.hardware_id,
             "ranks": list(pool.ranks),
+            "kv_transfer_layout": pool.kv_transfer_layout,
             "parallelism": asdict(pool.parallel_plan.config),
             "kv_cache": (
                 None if pool.kv_cache is None else asdict(pool.kv_cache)
@@ -434,11 +494,13 @@ def deployment_plan_manifest(plan: DeploymentPlan) -> dict[str, object]:
         )
     ]
     return {
-        "schema_version": 6,
+        "schema_version": 7,
         "deployment_id": plan.deployment_id,
         "mode": plan.mode,
         "router": asdict(plan.router),
         "worker_pools": worker_pools,
+        "data_parallel_groups": {name: list(replicas)
+            for name, replicas in sorted(plan.data_parallel_groups.items())},
         "routes": routes,
     }
 
@@ -446,11 +508,19 @@ def deployment_plan_manifest(plan: DeploymentPlan) -> dict[str, object]:
 def build_deployment_plan(config: DeploymentConfig, *, num_layers: int,
                           num_experts: int = 0,
                           pipeline_layer_partition=None) -> DeploymentPlan:
+    config_fields = asdict(config)
+    # The optional layout's None value denotes the unchanged legacy logical
+    # contract, so preserve pre-extension deployment identities in that case.
+    for pool_fields in config_fields["worker_pools"]:
+        if pool_fields["kv_transfer_layout"] is None:
+            del pool_fields["kv_transfer_layout"]
+        if pool_fields["pipeline_layer_partition"] is None:
+            del pool_fields["pipeline_layer_partition"]
     if pipeline_layer_partition is None:
-        config_identity = asdict(config)
+        config_identity = config_fields
     else:
         config_identity = {
-            "config": asdict(config),
+            "config": config_fields,
             "pipeline_layer_partition": pipeline_layer_partition,
         }
     config_payload = json.dumps(
@@ -461,8 +531,14 @@ def build_deployment_plan(config: DeploymentConfig, *, num_layers: int,
     deployment_id = hashlib.sha256(config_payload).hexdigest()
     next_rank = 0
     pools = {}
+    replica_groups = {}
     used_ranks = set()
     for pool_config in config.worker_pools:
+        partition = pool_config.pipeline_layer_partition
+        if pipeline_layer_partition is not None:
+            if partition is not None and partition != tuple(pipeline_layer_partition):
+                raise ValueError("pool and deployment pipeline layer partitions disagree")
+            partition = pipeline_layer_partition
         if pool_config.ranks:
             ranks = pool_config.ranks
         else:
@@ -472,20 +548,41 @@ def build_deployment_plan(config: DeploymentConfig, *, num_layers: int,
         if overlap:
             raise ValueError(f"physical ranks assigned to multiple pools: {sorted(overlap)}")
         used_ranks.update(ranks)
-        pools[pool_config.name] = WorkerPool(
-            name=pool_config.name,
-            role=pool_config.role,
-            hardware_id=pool_config.hardware_id,
-            ranks=ranks,
-            parallel_plan=build_parallel_plan(
-                pool_config.parallelism,
-                num_layers=num_layers,
-                num_experts=num_experts,
-                pipeline_layer_partition=pipeline_layer_partition),
-            kv_cache=pool_config.kv_cache,
-            collectives=pool_config.collectives,
-            pipeline_p2p=pool_config.pipeline_p2p,
-        )
-    routes = tuple(TransferRoute(**route.__dict__) for route in config.routes)
+        split_dp = (config.mode in ("colocated", "pd_disagg") and num_experts == 0
+            and not pool_config.parallelism.enable_expert_parallel
+            and pool_config.parallelism.data_parallel_size > 1)
+        replica_count = pool_config.parallelism.data_parallel_size if split_dp else 1
+        local_parallel = (replace(pool_config.parallelism, data_parallel_size=1)
+            if split_dp else pool_config.parallelism)
+        names = tuple(f"{pool_config.name}:dp{index}" for index in range(replica_count)) if split_dp else (pool_config.name,)
+        replica_groups[pool_config.name] = names
+        for replica_index, name in enumerate(names):
+            if name in pools:
+                raise ValueError("expanded DP pool identities collide")
+            local_ranks = (ranks[replica_index * local_parallel.worker_count:
+                (replica_index + 1) * local_parallel.worker_count] if split_dp else ranks)
+            pools[name] = WorkerPool(
+                name=name,
+                role=pool_config.role,
+                hardware_id=pool_config.hardware_id,
+                ranks=local_ranks,
+                parallel_plan=build_parallel_plan(
+                    local_parallel,
+                    num_layers=num_layers,
+                    num_experts=num_experts,
+                    pipeline_layer_partition=partition),
+                kv_cache=pool_config.kv_cache,
+                collectives=pool_config.collectives,
+                pipeline_p2p=pool_config.pipeline_p2p,
+                kv_transfer_layout=pool_config.kv_transfer_layout,
+            )
+    routes = []
+    for route in config.routes:
+        if route.source_pool not in replica_groups or route.destination_pool not in replica_groups:
+            raise ValueError("deployment route references an unknown original pool")
+        for source in replica_groups[route.source_pool]:
+            for destination in replica_groups[route.destination_pool]:
+                routes.append(TransferRoute(**replace(route, source_pool=source,
+                    destination_pool=destination).__dict__))
     return DeploymentPlan(
-        deployment_id, config.mode, pools, routes, config.router)
+        deployment_id, config.mode, pools, tuple(routes), config.router, replica_groups)

@@ -21,17 +21,21 @@ def main() -> int:
     parser.add_argument("--trace-off", required=True, type=Path)
     parser.add_argument("--trace-on", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--threshold-percent", type=float, default=3.0)
+    parser.add_argument("--classification-only", action="store_true",
+                        help="write every verdict without requiring a pass")
     args = parser.parse_args()
     if args.output.exists():
         raise ValueError(f"refusing to overwrite output: {args.output}")
     comparison = compare_scheduler_trace_observer_effect(
-        args.trace_off, args.trace_on
+        args.trace_off, args.trace_on, threshold_percent=args.threshold_percent
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(
         json.dumps(comparison, indent=2, sort_keys=True) + "\n"
     )
-    require_observer_effect_passed(comparison)
+    if not args.classification_only:
+        require_observer_effect_passed(comparison)
     print(json.dumps(comparison, indent=2, sort_keys=True))
     return 0
 

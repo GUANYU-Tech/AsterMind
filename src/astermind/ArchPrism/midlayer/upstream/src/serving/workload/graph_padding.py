@@ -21,16 +21,21 @@ _CONFIGURED_MODE_DISPATCH = {
 
 @dataclass(frozen=True)
 class VLLMDenseGraphInputs:
-    """Explicit retained ID tail for a dense captured input buffer.
+    """Explicit prepared/retained IDs for a legacy model input buffer.
 
-    Scheduled IDs remain a separate port. These values declare a source
-    scenario; neither a Scheduler transcript nor a provider is inferred.
+    Scheduled IDs remain a separate optional port; padding never supplies
+    missing target rows. These values declare a source scenario; neither
+    a Scheduler transcript nor a provider is inferred.
     """
 
     request_ids: tuple[str, ...]
     source_kind: str
     source_id: str
     retained_padding_token_ids: tuple[int, ...]
+    fa3_full_max_num_seqs: int | None = None
+    fa3_full_capture_max_seq_len: int | None = None
+    fa3_full_capture_id: str | None = None
+    scheduled_token_ids: tuple[int, ...] | None = None
 
     def __post_init__(self):
         if (not isinstance(self.request_ids, tuple) or not self.request_ids
@@ -43,6 +48,16 @@ class VLLMDenseGraphInputs:
                 or any(type(value) is not int or not 0 <= value < 2**31
                     for value in self.retained_padding_token_ids)):
             raise ValueError("dense graph retained padding requires explicit INT32 token-ID metadata")
+        if self.scheduled_token_ids is not None and (
+                not isinstance(self.scheduled_token_ids, tuple) or not self.scheduled_token_ids
+                or any(type(value) is not int or not 0 <= value < 2**31 for value in self.scheduled_token_ids)):
+            raise ValueError("scheduled source IDs require a nonempty explicit INT32 tuple")
+        fields = (self.fa3_full_max_num_seqs, self.fa3_full_capture_max_seq_len, self.fa3_full_capture_id)
+        if any(value is not None for value in fields):
+            if (any(type(value) is not int or value <= 0 for value in fields[:2])
+                    or not isinstance(fields[2], str) or not fields[2]):
+                raise ValueError("FA3 FULL requires complete explicit capture bounds and identity")
+
 
 
 @dataclass(frozen=True)

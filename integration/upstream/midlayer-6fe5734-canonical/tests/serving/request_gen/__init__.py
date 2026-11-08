@@ -1,1 +1,0 @@
-"""Serving request-generation tests."""

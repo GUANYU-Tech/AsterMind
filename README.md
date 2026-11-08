@@ -12,6 +12,10 @@ src/orbitserve/              Core simulation engine
   serving/                   Model deployment, prefill/decode, KV capacity, and throughput estimation
   runtime/                   Routing, queues, scheduling, KV state, SOC, and request-level execution
   common/                    Policy-free metric DTOs and serialization
+src/astermind/              Cell orchestration and ArchPrism's scheduler, Mid-Layer, and execution
+src/network_sim/            Physical satellite network and shared FlowSim/ns-3 communication
+  physical/                Topology, link availability and terminal acquisition
+  comm/                    Routing, bandwidth sharing and transfer events
 src/experiments/             Manifests, cross-module orchestration, fixed-design evaluation, and output
 src/dse/                     Design enumeration, runtime matrix, static SLO proxy, and frontier analysis
 src/baselines/ground/        Terrestrial serving baselines
@@ -24,15 +28,15 @@ See `CHANGELOG.md` for release history.
 
 ## Mid-Layer and physical-network simulator
 
-The `develop` branch also includes the event-driven Mid-Layer integration in
+The repository also includes the event-driven Mid-Layer integration in
 [`simulator/`](simulator/README.md), with physical resources, FlowSim/ns-3,
 multi-Cell serving and compatible per-rank KV migration. The complete pinned
 Mid-Layer snapshot and its materialized calibration data are included directly
-under `integration/upstream/midlayer-6fe5734-canonical/`; no external Mid-Layer
-repository or Git-LFS download is required for this snapshot.
+under `src/astermind/ArchPrism/midlayer/upstream/`. The snapshot manifest identifies the
+local source and the verified calibration assets.
 
-See [`integration/README.md`](integration/README.md) for the isolated CPU
-Scheduler environment and [`simulator/README.md`](simulator/README.md) for the
+See [`src/astermind/README.md`](src/astermind/README.md) for module boundaries
+and [`simulator/README.md`](simulator/README.md) for the isolated environment,
 supported scope, examples and verification commands. Runtime results, native
 binaries and local environments are not tracked. This integration preserves
 the existing OrbitServe execution path below.

@@ -561,6 +561,25 @@ def _server_plan(args: argparse.Namespace, case: dict[str, Any]) -> dict[str, An
         expert_parallel_argv = ["--enable-expert-parallel"]
     else:
         raise AssertionError("case contract allowed an unsupported EP size")
+    executor_argv: list[str] = []
+    if hardware_id == "ascend_910b" and runtime["runtime_version"] == "0.18.0":
+        # vLLM 0.18 defaults TP1 to UniProcExecutor. The accepted 910B trace
+        # may instead declare MultiprocExecutor; preserve that source fact
+        # when replaying its canonical request schedule.
+        executor_class = runtime["scheduler_pipeline_depth_evidence"][
+            "executor_class"
+        ]
+        executor_backends = {
+            "vllm.v1.executor.multiproc_executor.MultiprocExecutor": "mp",
+            "vllm.v1.executor.uniproc_executor.UniProcExecutor": "uni",
+        }
+        if executor_class not in executor_backends:
+            raise ValueError(
+                f"unsupported 910B vLLM 0.18 executor: {executor_class!r}"
+            )
+        executor_argv = [
+            "--distributed-executor-backend", executor_backends[executor_class]
+        ]
     argv = [
         sys.executable,
         "-m",
@@ -579,6 +598,7 @@ def _server_plan(args: argparse.Namespace, case: dict[str, Any]) -> dict[str, An
         str(runtime["tensor_parallel_size"]),
         "--pipeline-parallel-size",
         str(runtime["pipeline_parallel_size"]),
+        *executor_argv,
         *expert_parallel_argv,
         *model_load_argv,
         "--gpu-memory-utilization",
@@ -619,6 +639,13 @@ def _server_plan(args: argparse.Namespace, case: dict[str, Any]) -> dict[str, An
     diagnostic_nsys = (
         os.environ["MIDLAYER_A800_NSYS_STEP_NVTX"]
         if "MIDLAYER_A800_NSYS_STEP_NVTX" in os.environ else None)
+    graph_trace = (
+        os.environ["MIDLAYER_A800_NSYS_GRAPH_TRACE"]
+        if "MIDLAYER_A800_NSYS_GRAPH_TRACE" in os.environ else "node")
+    if graph_trace not in ("node", "graph"):
+        raise ValueError("A800 Nsight Graph trace must be 'node' or 'graph'")
+    if diagnostic_nsys != "1" and "MIDLAYER_A800_NSYS_GRAPH_TRACE" in os.environ:
+        raise ValueError("A800 Nsight Graph trace mode requires step diagnostics")
     if diagnostic_nsys == "1":
         if hardware_id != "nvidia_a800":
             raise ValueError("A800 Nsight step diagnostics require nvidia_a800")
@@ -644,7 +671,7 @@ def _server_plan(args: argparse.Namespace, case: dict[str, Any]) -> dict[str, An
             raise FileNotFoundError("A800 Nsight diagnostic requires nsys")
         argv = [
             nsys, "profile", "--force-overwrite=true", "--trace=cuda,nvtx,osrt",
-            "--cuda-graph-trace=node", "--trace-fork-before-exec=true",
+            f"--cuda-graph-trace={graph_trace}", "--trace-fork-before-exec=true",
             "--sample=none", "--output", str(output_path), *argv,
         ]
     return {

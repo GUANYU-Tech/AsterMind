@@ -1,7 +1,8 @@
 """Complete-spec GEMM/GEMV physical prediction."""
 
+from src.kernel.prediction_cache import runtime_lru_cache
+
 import dataclasses
-from functools import lru_cache
 import math
 from typing import Tuple
 
@@ -9,7 +10,7 @@ from src.kernel.bank_stream_model import bank_stream_ns, matmul_stream
 from src.kernel.formula import PerformanceFormula
 from src.kernel.hardware_spec import HWSpec
 from src.kernel.kernel_base import KernelPredictor
-from src.kernel.kernel_spec import KernelKind, KernelSpec
+from src.kernel.kernel_spec import DTYPE_BYTES, KernelKind, KernelSpec
 from src.kernel.launch_config.launch_program import (
     CannGemmLaunchProgram,
     CannGemmTilePipelineProgram,
@@ -92,23 +93,81 @@ def _bf16_bmm_math(shape):
     return _unquantized_matmul_math(shape, "bf16", 2, "bmm")
 
 
+def packed_fp4_source_logical_work(kernel: KernelSpec):
+    """Declared packed weights and quantized matrix input, without a launch.
+
+    Matrix rows may describe ordinary batches or ragged experts sharing K/N.
+    The source contract conserves rows; each matrix's weights are read once.
+    Conversion to FP8 is a register-level mathematical operand conversion,
+    never a resident or global-memory FP8 weight copy.
+    """
+    if (kernel.kind is not KernelKind.GEMM or kernel.variant != "gemm"
+            or "mathematical_program" not in kernel.attributes
+            or kernel.attributes["mathematical_program"] != "packed_fp4_source_v1"
+            or kernel.launch is not None or kernel.execution_support != "unsupported"):
+        raise ValueError("packed-FP4 work requires its explicit unbound source program")
+    b, m, n, k = (kernel.shape[name] for name in ("b", "m", "n", "k"))
+    rows = b * m
+    count = kernel.attributes["weight_matrix_count"]
+    compute_format = kernel.attributes["compute_format"]
+    if compute_format == "fp8":
+        input_values = rows * k
+        input_scales = 4 * rows * ((k + 127) // 128)
+        compute_role = "compute_tensor_fp8"
+    elif compute_format == "fp4":
+        input_values = rows * k // 2
+        input_scales = rows * (k // 32)
+        compute_role = "compute_tensor_fp4"
+    else:
+        raise AssertionError("validated packed-FP4 compute format disappeared")
+    activation_bytes = input_values + input_scales
+    input_bytes = DTYPE_BYTES[kernel.dtype] * rows * k
+    if kernel.dtype == "fp8":
+        input_bytes += 4 * rows * ((k + 127) // 128)
+    quant_bytes = (0 if kernel.attributes["input_quantized"] else input_bytes + activation_bytes)
+    weight_values = count * k * n // 2
+    weight_scales = count * n * (k // 32)
+    output_bytes = DTYPE_BYTES[kernel.attributes["output_dtype"]] * rows * n
+    return {"mathematical_tensor_flops": 2 * rows * n * k,
+        "compute_role": compute_role, "matrix_row_counts": kernel.attributes["matrix_row_counts"],
+        "weight_matrix_count": count, "packed_weight_value_bytes": weight_values,
+        "weight_scale_bytes": weight_scales, "activation_value_bytes": input_values,
+        "activation_scale_bytes": input_scales, "output_bytes": output_bytes,
+        "quantization_logical_bytes": quant_bytes,
+        "matrix_logical_bytes": activation_bytes + weight_values + weight_scales + output_bytes,
+        "limitations": ("user_declared_FP4_storage_and_compute_format_scenario_not_native_provider",
+            "group32_E8M0_weight_scales_explicit_not_observed_checkpoint_layout",
+            "no_resident_FP8_weight_copy_or_global_weight_dequantization_tensor",
+            "logical_operand_bytes_not_observed_DRAM_transactions_or_cache_hits",
+            "quantized_input_flag_declares_compute_format_storage_not_numerical_equivalence",
+            "GPU_vector_quantization_requires_explicit_memory_only_approximation")}
+
+
 def unquantized_fp16_gemm_logical_work(kernel: KernelSpec):
+    return _unquantized_16bit_gemm_logical_work(kernel, "fp16", "unquantized_fp16_flops_bytes_v1")
+
+
+def unquantized_bf16_gemm_logical_work(kernel: KernelSpec):
+    return _unquantized_16bit_gemm_logical_work(kernel, "bf16", "unquantized_bf16_flops_bytes_v1")
+
+
+def _unquantized_16bit_gemm_logical_work(kernel: KernelSpec, source_dtype, program):
     """Homogeneous FP16 dense matmul math without a provider or launch.
 
     Reuse the same useful matmul operation and payload counts as ideal BF16
     BMM. This does not bind library layouts, scratch or physical traffic.
     """
     if (kernel.kind is not KernelKind.GEMM or kernel.variant != "gemm"
-            or kernel.dtype != "fp16" or kernel.shape["b"] != 1
+            or kernel.dtype != source_dtype or kernel.shape["b"] != 1
             or "mathematical_program" not in kernel.attributes
-            or kernel.attributes["mathematical_program"] != "unquantized_fp16_flops_bytes_v1"
-            or kernel.attributes["weight_dtype"] != "fp16"
+            or kernel.attributes["mathematical_program"] != program
+            or kernel.attributes["weight_dtype"] != source_dtype
             or kernel.attributes["weight_group_size"] != 0
             or kernel.attributes["has_bias"] is not False
-            or kernel.attributes["output_dtype"] not in (None, "fp16")
+            or kernel.attributes["output_dtype"] not in (None, source_dtype)
             or kernel.execution_support != "unsupported" or kernel.launch is not None):
         raise ValueError("FP16 GEMM logical work requires homogeneous unquantized unbound bias-free FP16 GEMM")
-    return {**_unquantized_matmul_math(kernel.shape, "fp16", 2, "gemm"),
+    return {**_unquantized_matmul_math(kernel.shape, source_dtype, 2, "gemm"),
         "limitations": (
             "ideal_mathematical_FLOPs_and_logical_operand_payload_only",
             "logical_tensor_dtypes_do_not_bind_accumulation_rounding_or_numerical_equivalence",
@@ -462,7 +521,7 @@ def _logical_execution_geometry(
     )
 
 
-@lru_cache(maxsize=256)
+@runtime_lru_cache(maxsize=256)
 def _cached_raster_tile_program_traffic(
         raster: GpuCtaRasterProgram, rows: int, n: int, k: int,
         tile_m: int, tile_n: int, tile_k: int,
@@ -794,7 +853,7 @@ def _cann_gemm_warm_operand_context_covers_trace(
     return operand_bytes + (replays + 1) * output_bytes <= replacement_capacity
 
 
-@lru_cache(maxsize=128)
+@runtime_lru_cache(maxsize=128)
 def _cached_cann_gemm_region_program_traffic(
         rows: int, n: int, k: int, element_bytes: int,
         l2_replacement_capacity_bytes: int,
@@ -7732,13 +7791,74 @@ def bf16_fp32_gemm_logical_work(kernel: KernelSpec):
     return {"logical_bytes": read + write, "write_bytes": write, "demand": demand}
 
 
+def _observed_dense_grid_input(kernel: KernelSpec, hardware):
+    """Nominal resource envelope for a truthful, untiled dense observation.
+
+    Grid/block describe the submitted kernel. They do not identify matrix
+    tiles, active CTA assignments, split K, scratch extents or compiler issue.
+    Only public dense mathematical work and compulsory operand bytes are
+    projected; this is not a completed main/reducer or native program.
+    """
+    if (not HWSpec.source_contract_supported("h200_partial_source_programs", kernel.hardware_id)
+            or kernel.hardware_id != hardware.hardware_id or hardware.kernel_memory_model != "gpu_mshr"
+            or kernel.kind is not KernelKind.GEMM or kernel.variant != "gemm"
+            or kernel.dtype not in ("bf16", "fp16") or kernel.shape["b"] != 1
+            or kernel.launch.tiling is not None
+            or kernel.attributes["output_dtype"] not in (None, kernel.dtype)):
+        raise ValueError("observed dense grid requires its exact untiled homogeneous source contract")
+    m, n, k = (kernel.shape[name] for name in ("m", "n", "k"))
+    width = kernel.shape["dtype_bytes"]
+    read, write = float(width * (m*k + k*n)), float(width * m*n)
+    external = kernel.launch.algorithm in ("h200_vllm030_torch213_fp16_external_aggregate_gemm",
+        "h200_cublaslt129_bf16_external_aggregate_gemm")
+    if external:
+        write = float(kernel.launch.parameters["modeled_split_k"] * m * n
+            * kernel.launch.parameters["modeled_partial_bytes_per_element"])
+    total = read + write
+    demand = build_forward_demand(total, total, True,
+        {"compute_tensor": float(2*m*n*k), "compute_fma": 0.0,
+            "compute_reduction": 0.0, "compute_sfu": 0.0, "compute_alu": 0.0})
+    # Unknown tile staging and cache policy do not establish these services.
+    demand["l1_cache"] = demand["smem"] = demand["xbar"] = 0.0
+    source_limit = ("actual_vllm030_torch213_cublasGemmEx13_1_1_FP16_call_observed_parameter_ABI_unbound"
+        if kernel.launch.algorithm in ("h200_vllm030_torch213_fp16_observed_gemm",
+            "h200_vllm030_torch213_fp16_external_aggregate_gemm") else
+        "standalone_cublaslt129_call_not_target_runtime_binary_equivalence")
+    inp = build_aggregate_gpu_input(kernel, hardware, demand,
+        write_l2_bytes=write, write_dram_bytes=write, limitations=(
+            *(('explicit_API_configured_split_k_model_assumption_not_observed_effective_partition',
+               f'modeled_FP32_partial_writes_final_{kernel.dtype.upper()}_C_owned_by_separate_reducer',
+               'aggregate_only_partial_buffer_ABI_and_CTA_K_mapping_unbound') if external else ()),
+            "observed_grid_block_only_dense_mathematical_resource_projection",
+            "tile_K_partition_split_count_partial_extent_and_reducer_layout_unobserved",
+            "nominal_tensor_math_bound_not_observed_instruction_class_or_mma_efficiency",
+            "compulsory_public_operand_bytes_only_native_replay_cache_and_scratch_traffic_unbound",
+            "finite_observed_grid_not_a_CTA_to_matrix_or_K_partition_mapping",
+            "compiler_residency_pipeline_overlap_and_typed_epilogue_services_unbound",
+            source_limit,
+            "no_tile_or_split_inference_new_rate_or_production_duration_fit",
+            "partial_envelope_not_complete_main_reducer_or_accuracy_acceptance"))
+    return dataclasses.replace(inp, support_level="partial", dram_capacity_multiplier=1.0), total
+
+
 def _model(
         kernel: KernelSpec, hardware, *,
         cold_traffic: bool = False,
         ) -> Tuple[PredictionInput, float]:
+    if kernel.launch is not None and kernel.launch.algorithm == "h200_cublaslt129_bf16_external_aggregate_gemm":
+        kernel.validate_legacy_bf16_external_launch(hardware)
+    if kernel.launch is not None and kernel.launch.algorithm in (
+            "h200_vllm030_torch213_fp16_observed_gemm",
+            "h200_vllm030_torch213_fp16_external_aggregate_gemm"):
+        kernel.validate_observed_gemm_launch(hardware)
     from src.kernel.memory_access_builder import memory_execution_kernel
     if kernel.variant not in ("moe_router", "batched_gemm"):
         kernel = memory_execution_kernel(kernel, hardware)
+    if (kernel.launch is not None and kernel.launch.algorithm in (
+            "h200_cublaslt129_injected_gemm", "h200_vllm030_torch213_fp16_observed_gemm",
+            "h200_vllm030_torch213_fp16_external_aggregate_gemm", "h200_cublaslt129_bf16_external_aggregate_gemm")
+            and kernel.launch.tiling is None):
+        return _observed_dense_grid_input(kernel, hardware)
     if (kernel.attributes["output_dtype"] is not None
             and kernel.attributes["output_dtype"] != kernel.dtype):
         # vLLM 0.30 V4 attention.py torch.mm(out_dtype=torch.float32):
@@ -8221,6 +8341,12 @@ def _model(
             )
     else:
         raise AssertionError(f"unhandled GEMM memory model: {memory_model!r}")
+    if kernel.launch.algorithm == "h200_cublaslt129_injected_gemm":
+        limitations += (
+            "launch_observed_cublaslt_12_9_rank0_32mib_workspace",
+            "launch_target_serving_runtime_equivalence_unverified",
+            "hopper_cluster_tma_persistent_task_mapping_unmodeled",
+        )
     if public_gemm_work is not None:
         limitations+=('gemm_input_storage_unbound_nominal_width_projection',)
     if launch_task_kind in ("aic", "aiv", "mixed"):
@@ -8442,7 +8568,18 @@ class GEMMPredictor(KernelPredictor):
             latency_ns += hardware.fpga_execution["hbm_latency_ns"]
         return prediction_from_ns(latency_ns, "roofline")
 
+    def analytical_without_launch(self, kernel: KernelSpec, hardware):
+        if ("mathematical_program" in kernel.attributes
+                and kernel.attributes["mathematical_program"] in (
+                    "dense_fp16_source_flops_bytes_v1", "unquantized_fp16_flops_bytes_v1")):
+            raise NotImplementedError("dense FP16 mathematical work has no native launch")
+        prediction = self.roofline_without_launch(kernel, hardware)
+        return dataclasses.replace(prediction, bottleneck_group="analytical_gemm_source")
+
     def roofline_without_launch(self, kernel: KernelSpec, hardware):
+        if (kernel.variant == "gemm" and "mathematical_program" in kernel.attributes
+                and kernel.attributes["mathematical_program"] == "packed_fp4_source_v1"):
+            return self._packed_fp4_source_prediction(kernel, hardware)
         if (kernel.variant == "batched_gemm" and "mathematical_program" in kernel.attributes
                 and kernel.attributes["mathematical_program"] == "batched_fp8_quantized_input_fp32_scales_v1"):
             b, m, n, k = (kernel.shape[key] for key in ("b", "m", "n", "k"))
@@ -8481,8 +8618,8 @@ class GEMMPredictor(KernelPredictor):
                 seconds = max(cycles / execution["clock_hz"] / utilization,
                     logical_bytes / hardware.resource_by_role("dram").capacity)
                 return self._mathematical_prediction(hardware, seconds * 1e9)
-            if kernel.attributes["mathematical_program"] == "unquantized_fp16_flops_bytes_v1":
-                work = unquantized_fp16_gemm_logical_work(kernel)
+            if kernel.attributes["mathematical_program"] in ("unquantized_fp16_flops_bytes_v1", "unquantized_bf16_flops_bytes_v1"):
+                work = {"fp16": unquantized_fp16_gemm_logical_work, "bf16": unquantized_bf16_gemm_logical_work}[kernel.dtype](kernel)
                 demand = {role: 0.0 for role in (
                     "compute_tensor", "compute_vector", "compute_reduction", "compute_fma", "compute_sfu", "compute_alu")}
                 demand["compute_tensor"] = float(work["mathematical_tensor_flops"])
@@ -8512,6 +8649,42 @@ class GEMMPredictor(KernelPredictor):
         demand["compute_tensor"] = float(work["mathematical_tensor_flops"])
         logical_bytes = sum(operand["bytes"] for operand in work["operands"])
         return self._mathematical_prediction(hardware, roofline_ns(demand, hardware, logical_bytes))
+
+    def _packed_fp4_source_prediction(self, kernel: KernelSpec, hardware):
+        work = packed_fp4_source_logical_work(kernel)
+        bandwidth = hardware.resource_by_role("dram").capacity
+        quant_s = work["quantization_logical_bytes"] / bandwidth
+        if HWSpec.source_contract_supported("programmed_mxfp4_fp8_expert_service", hardware.hardware_id):
+            if kernel.attributes["compute_format"] != "fp8":
+                raise NotImplementedError("FPGA packed-FP4 source binds its existing FP8 matrix service")
+            execution = hardware.fpga_execution
+            k, n = (kernel.shape[name] for name in ("k", "n"))
+            m_waves = sum((rows + execution["mm_m_parallel"] - 1) // execution["mm_m_parallel"]
+                for rows in work["matrix_row_counts"])
+            cycles = m_waves * ((k + execution["mm_k_parallel"] - 1) // execution["mm_k_parallel"]) \
+                * ((n + execution["mm_n_parallel"] - 1) // execution["mm_n_parallel"])
+            peak = (2 * execution["clock_hz"] * execution["mm_m_parallel"]
+                * execution["mm_k_parallel"] * execution["mm_n_parallel"])
+            utilization = hardware.resource_by_role(work["compute_role"]).capacity / peak
+            compute_s = cycles / execution["clock_hz"] / utilization
+            if not kernel.attributes["input_quantized"]:
+                if kernel.dtype != "bf16" or k % 128:
+                    raise NotImplementedError("FPGA source input conversion requires the existing BF16/group128 quantizer")
+                from src.kernel.kernel_base import predict
+                quant = KernelSpec(KernelKind.VECTOR, hardware.hardware_id,
+                    shape={"element_count": kernel.shape["b"] * kernel.shape["m"] * k,
+                        "rows": kernel.shape["b"] * kernel.shape["m"], "columns": k},
+                    dtype="bf16", variant="fp8_group_quant", attributes={"group_size": 128, "input_resource": "dram"},
+                    execution_support="unsupported", unsupported_reason="launch_selector_unavailable")
+                quant_s = predict(quant, hardware, "roofline").t_total_s
+        elif HWSpec.source_contract_supported("aggregate_gpu_source_roofline", hardware.hardware_id):
+            if not kernel.attributes["input_quantized"] and hardware.gpu_vector_memory_only is not True:
+                raise NotImplementedError("GPU packed-FP4 quantization requires the explicit vector-memory-only scenario")
+            compute_s = work["mathematical_tensor_flops"] / hardware.resource_by_role(work["compute_role"]).capacity
+        else:
+            raise NotImplementedError("packed-FP4 source requires its declared aggregate GPU or programmed FPGA design")
+        matrix_s = max(compute_s, work["matrix_logical_bytes"] / bandwidth)
+        return self._mathematical_prediction(hardware, (quant_s + matrix_s) * 1e9)
 
     def __init__(self):
         self._cached_resource_kernel = None
@@ -8571,11 +8744,17 @@ class GEMMPredictor(KernelPredictor):
         return self._resource_input(kernel,hardware)
 
     def _resource_input(self, kernel: KernelSpec, hardware):
+        if (kernel.launch is None and kernel.variant == "gemm" and kernel.dtype == "bf16"
+                and kernel.attributes["output_dtype"] == "fp32"):
+            raise NotImplementedError("mixed-output source work has no native launch resource-input program")
+        if ("mathematical_program" in kernel.attributes
+                and kernel.attributes["mathematical_program"] == "packed_fp4_source_v1"):
+            raise NotImplementedError("packed-FP4 source has no native launch or resource-input program")
         if ("mathematical_program" in kernel.attributes
                 and kernel.attributes["mathematical_program"] in ("mxfp4_bf16_flops_bytes_v1", "mxfp4_fp8_flops_bytes_v1")):
             raise NotImplementedError("MXFP4 plain MM program has no native launch or resource-input program")
         if ("mathematical_program" in kernel.attributes
-                and kernel.attributes["mathematical_program"] == "unquantized_fp16_flops_bytes_v1"):
+                and kernel.attributes["mathematical_program"] in ("unquantized_fp16_flops_bytes_v1", "unquantized_bf16_flops_bytes_v1")):
             raise NotImplementedError("FP16 mathematical GEMM has no native launch or resource-input program")
         if is_block_fp8_gemm(kernel):
             raise NotImplementedError(
@@ -8609,17 +8788,14 @@ class GEMMPredictor(KernelPredictor):
     def forward_resource_input(self, kernel: KernelSpec, hardware):
         """Expose the measured cold ingress account to traffic capture only."""
         if ("mathematical_program" in kernel.attributes
-                and kernel.attributes["mathematical_program"] == "unquantized_fp16_flops_bytes_v1"):
+                and kernel.attributes["mathematical_program"] in ("unquantized_fp16_flops_bytes_v1", "unquantized_bf16_flops_bytes_v1")):
             raise NotImplementedError("FP16 mathematical GEMM has no native launch or resource-input program")
         return _model(kernel, hardware, cold_traffic=True)
 
     def midlayer(self, kernel: KernelSpec, hardware):
         if ("mathematical_program" in kernel.attributes
-                and kernel.attributes["mathematical_program"] == "unquantized_fp16_flops_bytes_v1"):
+                and kernel.attributes["mathematical_program"] in ("unquantized_fp16_flops_bytes_v1", "unquantized_bf16_flops_bytes_v1")):
             raise NotImplementedError("FP16 mathematical GEMM has no native launch or resource-input program")
-        if (kernel.attributes["output_dtype"] is not None
-            and kernel.attributes["output_dtype"] != kernel.dtype):
-            raise NotImplementedError("mixed-output GEMM supports Roofline only")
         if is_block_fp8_gemm(kernel):
             return predict_block_fp8_gemm(kernel, hardware)
         inp, _ = self.resource_input(kernel, hardware)

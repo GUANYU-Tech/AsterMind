@@ -1,9 +1,0 @@
-{
-  "schema_version": 1,
-  "model_id": "zai-org/GLM-5.2",
-  "revision": "b4734de4facf877f85769a911abafc5283eab3d9",
-  "source_config_sha256": "185f93ee6d12548e16a847e279dc0c3c90b1524c970b0866b42fb545747d859a",
-  "fixture_config_sha256": "185f93ee6d12548e16a847e279dc0c3c90b1524c970b0866b42fb545747d859a",
-  "source_url": "https://huggingface.co/zai-org/GLM-5.2/resolve/b4734de4facf877f85769a911abafc5283eab3d9/config.json",
-  "model_scope": "text"
-}

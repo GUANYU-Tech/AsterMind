@@ -12,6 +12,7 @@ class KVCacheAction(str, Enum):
     RELEASE = "release"
     LOAD = "load"
     EVICT = "evict"
+    STORE = "store"
 
 
 @dataclass(frozen=True)
@@ -25,6 +26,9 @@ class KVCacheEvent:
     source_tier: Optional[str] = None
     destination_tier: Optional[str] = None
     ready_event: Optional[str] = None
+    # Native content-cache loads may read a Host block saved by another
+    # request at the same prefix position. None keeps request-private loads.
+    source_request_id: Optional[str] = None
 
     def __post_init__(self) -> None:
         for name in ("request_id", "tier"):
@@ -47,7 +51,15 @@ class KVCacheEvent:
                     not isinstance(value, str) or not value):
                 raise ValueError(
                     f"KV cache event {name} must be non-empty or null")
-        if self.action in (KVCacheAction.LOAD, KVCacheAction.EVICT):
+        if self.source_request_id is not None:
+            if (not isinstance(self.source_request_id, str)
+                    or not self.source_request_id
+                    or self.source_request_id == self.request_id):
+                raise ValueError("shared KV source request must be distinct and non-empty")
+            if self.action is not KVCacheAction.LOAD:
+                raise ValueError("shared KV source request requires a load event")
+        if self.action in (KVCacheAction.LOAD, KVCacheAction.EVICT,
+                           KVCacheAction.STORE):
             if not self.source_tier or not self.destination_tier:
                 raise ValueError(f"{self.action.value} requires source and destination tiers")
             if self.source_tier.lower() == self.destination_tier.lower():
@@ -78,8 +90,9 @@ def host_kv_transfer_attributes(event, *, cache_config, model_bytes_per_token, s
     projects its exact per-rank payload, not tensor addresses or DMA scratch.
     """
     from .kv_cache_config import KVCacheConfig
-    if not isinstance(event, KVCacheEvent) or event.action not in (KVCacheAction.LOAD, KVCacheAction.EVICT):
-        raise TypeError("Host KV transfer requires a normalized load/evict event")
+    if not isinstance(event, KVCacheEvent) or event.action not in (
+            KVCacheAction.LOAD, KVCacheAction.EVICT, KVCacheAction.STORE):
+        raise TypeError("Host KV transfer requires a normalized load/evict/store event")
     if not isinstance(cache_config, KVCacheConfig):
         raise ValueError("KV offload event requires a configured cache tier plan")
     if type(model_bytes_per_token) is not int or model_bytes_per_token <= 0:
@@ -92,7 +105,7 @@ def host_kv_transfer_attributes(event, *, cache_config, model_bytes_per_token, s
         raise RuntimeError("validated KV offload event lacks endpoints")
     source_is_hbm = source.lower() == "hbm"
     destination_is_hbm = destination.lower() == "hbm"
-    if (event.action is KVCacheAction.EVICT
+    if (event.action in (KVCacheAction.EVICT, KVCacheAction.STORE)
             and source_is_hbm and not destination_is_hbm):
         offload_tier_name = destination.lower()
     elif (event.action is KVCacheAction.LOAD
@@ -156,4 +169,6 @@ def host_kv_transfer_attributes(event, *, cache_config, model_bytes_per_token, s
         "token_end": event.token_end,
         "ready_event": event.ready_event,
     }
+    if event.source_request_id is not None:
+        attributes["source_request_id"] = event.source_request_id
     return attributes

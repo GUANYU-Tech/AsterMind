@@ -86,6 +86,12 @@ def _dsv4_pair_counts(kernel: KernelSpec):
     """Per-row causal capacity, preserving the selected-ID evidence scope."""
     ratio = kernel.shape["compress_ratio"]
     q_lens, kv_lens = kernel.attributes["q_lens"], kernel.attributes["kv_lens"]
+    if ("mathematical_program" in kernel.attributes and kernel.attributes["mathematical_program"]
+            == "vllm_0_30_dspark_swa_noncausal_softmax_v1"):
+        # ComputeDSparkNoncausalSWAIndicesKernel uses one block-anchored
+        # trailing window plus EVERY draft query, including future rows.
+        return {"compressed": 0, "swa": sum(q * live
+            for q, live in zip(q_lens, kernel.attributes["swa_kv_lens"], strict=True))}
     selected = kernel.attributes["selected_kv_lens"]
     if kernel.attributes["compressed_selection"] == "all_completed_states":
         capacities = (kernel.attributes["topk_capacity"],) * len(q_lens)
@@ -143,7 +149,10 @@ def dsv4_attention_roofline_work(kernel: KernelSpec):
             "compute_sfu": primitives["softmax_exp"], "compute_alu": 0},
         "softmax_decomposition": "stable normalized exponentials with one division per output; mathematical baseline, not selected library instructions",
         "actual_provider_bound": False,
-        "limitations": ("per-row selected causal capacities, not checkpoint top-k IDs",
+        "limitations": (("declared DSpark all-valid block-anchored window plus all query rows; physical indices unbound"
+                if "mathematical_program" in kernel.attributes and kernel.attributes["mathematical_program"]
+                    == "vllm_0_30_dspark_swa_noncausal_softmax_v1"
+                else "per-row selected causal capacities, not checkpoint top-k IDs"),
             "padded query-head source geometry, not compiler masked/online/split work",
             "typed max and address/selection services unpriced; no finite-precision equivalence asserted",
             "existing memory role-use projection, not observed physical traffic")}
@@ -315,7 +324,10 @@ def dsv4_decode_attention_index_inputs(kernel: KernelSpec):
         "already_in_c4_materialization_consumer_bytes": overlap,
         "indices_shared_across_query_heads": True, "lengths_shared_across_query_heads": True,
         "selected_ids_or_actual_callee_loads_bound": False,
-        "scope": "all-valid causal active-prefix input payload projection; not native loads, cache traffic or complete attention work"}
+        "scope": ("declared DSpark all-valid block-anchored noncausal indices/length consumer payload; producer and physical indices unbound"
+            if "mathematical_program" in kernel.attributes and kernel.attributes["mathematical_program"]
+                == "vllm_0_30_dspark_swa_noncausal_softmax_v1" else
+            "all-valid causal active-prefix input payload projection; not native loads, cache traffic or complete attention work")}
 
 
 def dsv4_prefill_gather_logical_work(kernel: KernelSpec):
@@ -560,10 +572,14 @@ def _model(kernel: KernelSpec, hardware):
 class SparseAttentionPredictor(KernelPredictor):
     kind = KernelKind.SPARSE_ATTN
 
+    def analytical_without_launch(self, kernel: KernelSpec, hardware):
+        return self.roofline_without_launch(kernel, hardware)
+
     def roofline_without_launch(self, kernel: KernelSpec, hardware):
         if (kernel.variant in ("dsv4_sparse_prefill", "dsv4_sparse_decode")
                 and "mathematical_program" in kernel.attributes
-                and kernel.attributes["mathematical_program"] == "dsv4_sparse_softmax_flops_bytes_v1"):
+                and kernel.attributes["mathematical_program"] in ("dsv4_sparse_softmax_flops_bytes_v1",
+                    "vllm_0_30_dspark_swa_noncausal_softmax_v1")):
             work = dsv4_attention_mathematical_work(kernel)
             if (HWSpec.source_contract_supported("aggregate_gpu_source_roofline", hardware.hardware_id)
                     and hardware.gpu_vector_memory_only):

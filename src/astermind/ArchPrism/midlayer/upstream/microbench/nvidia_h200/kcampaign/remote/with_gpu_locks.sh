@@ -7,7 +7,7 @@
 # failure (a kernel chain or another instance still owns that GPU); nothing
 # runs in that case.  Every GPU use outside launch.sh must go through this.
 set -euo pipefail
-K=/mnt/public/yangxinhao/h200_microbench/kcampaign
+K=${MIDLAYER_H200_PUBLIC_ROOT:?set MIDLAYER_H200_PUBLIC_ROOT}/h200_microbench/kcampaign
 if [ "$#" -lt 4 ] || [ "$3" != "--" ]; then
   echo "usage: with_gpu_locks.sh <gpu_csv> <wait_seconds> -- <command...>" >&2
   exit 2

@@ -25,7 +25,7 @@ EXPECTED_SAMPLES_PER_CELL = 200
 EXPECTED_HARDWARE_NAME = "NVIDIA A800-SXM4-80GB"
 DEFAULT_NVCC = Path("/usr/local/cuda-12.2/bin/nvcc")
 DEFAULT_CUOBJDUMP = Path("/usr/local/cuda-12.2/bin/cuobjdump")
-DEFAULT_NSYS = Path("/share_data/yangxinhao/nsys_2025.6.1/bin/nsys")
+DEFAULT_NSYS = Path(shutil.which("nsys") or "nsys")
 DEFAULT_NVIDIA_SMI = Path("/usr/bin/nvidia-smi")
 MEASUREMENT_FIELDS = (
     "trial", "seq", "nvtx_range", "grid", "block", "duration_ns",

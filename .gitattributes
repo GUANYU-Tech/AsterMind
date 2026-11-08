@@ -9,4 +9,4 @@ src/workloads/**/*.csv    text eol=lf
 src/orbitserve/orbit/data/iers/** -text
 
 # Preserve whitespace markers in the recorded upstream patch.
-network_sim/docs/vendor_changes.patch -whitespace
+src/network_sim/docs/vendor_changes.patch -whitespace

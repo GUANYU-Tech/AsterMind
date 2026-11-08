@@ -31,7 +31,7 @@ ROOT = Path(__file__).resolve().parents[3]
 import sys
 sys.path.insert(0, str(ROOT))
 from evaluation.json_shape import file_sha256 as sha256
-PYTHON = Path('/home/yangxinhao/miniconda3/envs/r2r_qwen3_next/bin/python')
+PYTHON = Path(sys.executable)
 MODEL = ROOT / 'configs/model/deepseek-v3-l32.json'
 HARDWARE = ROOT / 'configs/hardware/nvidia_h200.yaml'
 POLICY = ROOT / ('configs/runtime_memory_policy/inferencex/'

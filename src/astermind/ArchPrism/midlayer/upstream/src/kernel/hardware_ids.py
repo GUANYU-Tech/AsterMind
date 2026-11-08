@@ -7,6 +7,7 @@ CANONICAL_HARDWARE_IDS = frozenset({
     "nvidia_a800",
     "nvidia_h200",
     "hygon_bw1100",
+    "nvidia_rtx_pro_5500",
     "intel_agmf039r47",
     "metax_c500",
     "ascend_910b",

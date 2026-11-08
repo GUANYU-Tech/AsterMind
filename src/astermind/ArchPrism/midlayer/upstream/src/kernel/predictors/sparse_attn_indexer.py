@@ -344,7 +344,16 @@ def _model(kernel: KernelSpec, hardware):
 class SparseAttentionIndexerPredictor(KernelPredictor):
     kind = KernelKind.SPARSE_ATTN_INDEXER
 
+    def analytical_without_launch(self, kernel: KernelSpec, hardware):
+        return self.roofline_without_launch(kernel, hardware)
+
     def roofline_without_launch(self, kernel: KernelSpec, hardware):
+        if HWSpec.source_contract_supported("multistage_attention_indexer_unbound_source_math", hardware.hardware_id) and kernel.variant in (
+                "dsv4_indexer_prefill", "dsv4_indexer_decode"):
+            work = dsv4_indexer_logical_work(kernel)
+            ns = sum(roofline_ns(stage["demand"], hardware, sum(stage["read_write_bytes"].values()))
+                for stage in work["stages"])
+            return prediction_from_ns(ns, "roofline")
         if HWSpec.source_contract_supported("aggregate_gpu_source_roofline", hardware.hardware_id) and kernel.variant in (
                 "dsv4_indexer_prefill", "dsv4_indexer_decode"):
             work = dsv4_indexer_logical_work(kernel)
@@ -370,6 +379,9 @@ class SparseAttentionIndexerPredictor(KernelPredictor):
         return super().roofline_without_launch(kernel, hardware)
 
     def resource_input(self, kernel: KernelSpec, hardware):
+        if (HWSpec.source_contract_supported("multistage_attention_indexer_unbound_source_math", kernel.hardware_id) and kernel.launch is None
+                and kernel.variant in ("dsv4_indexer_prefill", "dsv4_indexer_decode")):
+            raise NotImplementedError("V4 logical indexer provides stage Roofline without a native aggregate resource program")
         if (kernel.variant in ("dsa_indexer_prefill", "dsa_indexer_decode", "dsa_indexer_mixed")
                 and kernel.attributes["mathematical_program"] is not None):
             raise NotImplementedError("DSA mathematical program provides useful stage Roofline only")
@@ -386,8 +398,6 @@ class SparseAttentionIndexerPredictor(KernelPredictor):
             sparse_indexer_source_demands(
                 sparse_indexer_memory_access_program(kernel, hardware), expected_kernel=kernel)
             return prediction_from_ns(0.0, "alias")
-        if kernel.variant in ("dsv4_indexer_prefill", "dsv4_indexer_decode"):
-            raise NotImplementedError("V4 indexer supports useful arithmetic/byte Roofline only; selection/source services remain unbound")
         inp, _ = self.resource_input(kernel, hardware)
         return PerformanceFormula(hardware).predict_kernel(inp)
 

@@ -12,10 +12,16 @@ def has_h200_bf16_controls(kernel):
     return (kernel.kind is KernelKind.FUSED_MOE and kernel.hardware_id=='nvidia_h200'
         and kernel.execution_support=='supported' and kernel.dtype=='bf16' and kernel.variant in ('w1','w2')
         and ('routed_weight_dtype' not in kernel.attributes or kernel.attributes['routed_weight_dtype']=='bf16')
-        and kernel.launch.algorithm in ('triton_grouped_gemm:w1','triton_grouped_gemm:w2','triton_fused_moe_w1','triton_fused_moe_w2'))
+        and (kernel.launch.algorithm in ('triton_grouped_gemm:w1','triton_grouped_gemm:w2','triton_fused_moe_w1','triton_fused_moe_w2')
+            or (kernel.attributes['expert_parallel_size']==1
+                and kernel.launch.algorithm==f'vllm_0_11_sm90_unquantized_{kernel.variant}')))
 
 
 def h200_bf16_naive(kernel):
+    # The0.11 callee always consumes sorted IDs; its small-M launch cap is
+    # independent of the0.24 token-wise assignment optimization.
+    if kernel.launch.algorithm in ('vllm_0_11_sm90_unquantized_w1', 'vllm_0_11_sm90_unquantized_w2'):
+        return False
     return kernel.attributes['expert_parallel_size']==1 and kernel.shape['tokens']*kernel.shape['topk']*4<=kernel.shape['experts']
 
 

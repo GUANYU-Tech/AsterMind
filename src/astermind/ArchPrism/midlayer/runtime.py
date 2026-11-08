@@ -15,7 +15,7 @@ from src.serving.deployment.pd_disagg import build_pd_disagg_plan
 from src.serving.execution import ServingExecutionContext
 from src.serving.parallelism.parallel_config import ParallelConfig
 from src.serving.parallelism.pp import pipeline_layer_ranges_for_model
-from src.serving.backend.vllm import BackendConfig
+from src.serving.backend.vllm import BackendConfig, VLLMSchedulerConfig
 from src.serving.simulation import validate_workload_emission_parallelism
 from src.serving.workload.model_config import load_model_config
 from src.serving.workload.runtime_inputs import ExpertRoutingInput, RuntimeInputs
@@ -23,18 +23,47 @@ from src.serving.workload.runtime_inputs import ExpertRoutingInput, RuntimeInput
 from ..scheduler.factory import create_scheduler
 
 
-# The logical main snapshot predates per-step symbolic source inputs.
-_SOURCE_INPUTS = "source_prompt_lengths" in signature(ServingExecutionContext.execute_step).parameters
+_STEP_PARAMETERS = signature(ServingExecutionContext.execute_step).parameters
+_SOURCE_INPUTS = "embedding_token_ids" in _STEP_PARAMETERS
+_HAS_PLAN_BUILDER = hasattr(ServingExecutionContext, "prepare_step")
 
 
-def execute_scheduled_step(execution, step, source_prompt_lengths):
+def prepare_scheduled_step(execution, step, source_prompt_lengths):
+    """Adapt the Scheduler batch to the dev plan builder."""
     if not _SOURCE_INPUTS:
         return execution.execute_step(step.schedule, kv_cache_events=step.kv_cache_events)
-    return execution.execute_step(
-        step.schedule, kv_cache_events=step.kv_cache_events,
-        embedding_token_ids=step.embedding_token_ids, model_source_inputs=step.model_source_inputs,
-        source_prompt_lengths=source_prompt_lengths,
-    )
+
+    source_inputs = {
+        "embedding_token_ids": step.embedding_token_ids,
+        "model_source_inputs": step.model_source_inputs,
+    }
+    if "source_prompt_lengths" in _STEP_PARAMETERS:
+        return execution.execute_step(
+            step.schedule, kv_cache_events=step.kv_cache_events,
+            source_prompt_lengths=source_prompt_lengths, **source_inputs,
+        )
+
+    # AsterMind supplies length-only requests to the CPU scheduler. When its
+    # MLA bridge omits embedding IDs, use the same synthetic ID as that bridge.
+    if source_inputs["embedding_token_ids"] is None and execution.model.attention_layout != "standard_gqa":
+        source_inputs["embedding_token_ids"] = (
+            (VLLMSchedulerConfig.dummy_token_id,) * step.schedule.token_count
+        )
+
+    runtime = execution.runtime_inputs
+    if execution.model.model_type == "deepseek_v4":
+        execution.runtime_inputs = replace(runtime, v4_source_prompt_lengths=source_prompt_lengths)
+    elif execution.model.model_type in ("glm_moe_dsa", "kimi_k2"):
+        request_ids = (row.request_id for row in step.schedule.requests)
+        prompt_lengths = dict(zip(request_ids, source_prompt_lengths, strict=True))
+        execution.runtime_inputs = replace(
+            runtime, symbolic_source_prompt_lengths_by_request=prompt_lengths,
+        )
+    try:
+        prepare = execution.prepare_step if _HAS_PLAN_BUILDER else execution.execute_step
+        return prepare(step.schedule, kv_cache_events=step.kv_cache_events, **source_inputs)
+    finally:
+        execution.runtime_inputs = runtime
 
 
 @dataclass(frozen=True)
@@ -185,6 +214,8 @@ def create_midlayer_runtime(config: MidlayerCellConfig, *, with_scheduler: bool 
         model, deployment, {config.hardware_id: hardware}, "analytical_launch",
         "midlayer" if model.attention_layout == "standard_gqa" else "roofline",
         _runtime_inputs(config, model), host_launch_profiles=host_profiles,
+        # Older explicit snapshots provide eager Host intervals with the device timeline.
+        materialize_timeline_details=host_profiles is not None,
     )
     if not with_scheduler:
         return {}, execution, storage_enabled

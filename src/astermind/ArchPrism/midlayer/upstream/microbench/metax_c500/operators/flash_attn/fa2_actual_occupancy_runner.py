@@ -3,7 +3,7 @@
 
 The marker suppresses every selected kernel launch.  This runner records only
 the driver-reported resources and occupancy of the function chosen by the
-FlashAttention host selector for the frozen 56-request source geometry.
+FlashAttention host selector for a declared synthetic source geometry.
 """
 
 import argparse
@@ -18,6 +18,7 @@ import sys
 
 
 INTERPOSER = Path(__file__).with_name("fa2_actual_occupancy_interposer.cpp")
+CASES = ("frozen56_split5", "graph_b1_split103", "graph_b1_auto")
 
 
 def _sha256(path):
@@ -59,6 +60,7 @@ def _build(args, build_dir):
 def _worker(argv):
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", required=True, type=int)
+    parser.add_argument("--case", required=True, choices=CASES)
     args = parser.parse_args(argv)
     import flash_attn
     from flash_attn import flash_attn_with_kvcache
@@ -72,21 +74,31 @@ def _worker(argv):
         50, 159, 307, 773, 316, 21, 76)
     if len(kv_lens) != 56:
         raise AssertionError("frozen request vector changed")
+    if args.case in ("graph_b1_split103", "graph_b1_auto"):
+        kv_lens = (729,)
+        page_size = 16
+        max_pages = 512
+        requested_splits = 0 if args.case == "graph_b1_auto" else 103
+    else:
+        page_size = 128
+        max_pages = max((length + page_size - 1) // page_size
+                        for length in kv_lens)
+        requested_splits = 5
     # The parent constrains MACA_VISIBLE_DEVICES to the requested physical
     # device.  The child therefore sees that device at logical ordinal zero;
     # passing the physical ordinal here would select a non-existent device
     # whenever the requested card is not zero.
     torch.cuda.set_device(0)
-    q_heads, kv_heads, head_dim, page_size = 32, 8, 128, 128
-    max_pages = max((length + page_size - 1) // page_size for length in kv_lens)
-    query = torch.empty(56, 1, q_heads, head_dim, dtype=torch.bfloat16,
+    q_heads, kv_heads, head_dim = 32, 8, 128
+    batch = len(kv_lens)
+    query = torch.empty(batch, 1, q_heads, head_dim, dtype=torch.bfloat16,
                         device="cuda")
-    key = torch.empty(56 * max_pages, page_size, kv_heads, head_dim,
+    key = torch.empty(batch * max_pages, page_size, kv_heads, head_dim,
                       dtype=torch.bfloat16, device="cuda")
     value = torch.empty_like(key)
     cache_seqlens = torch.tensor(kv_lens, dtype=torch.int32, device="cuda")
-    block_table = torch.arange(56 * max_pages, dtype=torch.int32,
-                               device="cuda").reshape(56, max_pages)
+    block_table = torch.arange(batch * max_pages, dtype=torch.int32,
+                               device="cuda").reshape(batch, max_pages)
     process = ctypes.CDLL(None)
     begin = process.midlayer_fa_occupancy_begin
     begin.argtypes, begin.restype = [], ctypes.c_int
@@ -100,17 +112,19 @@ def _worker(argv):
         output = flash_attn_with_kvcache(
             query, key, value, cache_seqlens=cache_seqlens,
             softmax_scale=1.0 / (head_dim ** 0.5), causal=True,
-            block_table=block_table, num_splits=5)
+            block_table=block_table, num_splits=requested_splits)
     finally:
         if end() != 0:
             raise RuntimeError(error().decode("utf-8"))
     print(json.dumps({
         "torch": torch.__version__, "flash_attn": flash_attn.__version__,
-        "output_shape": list(output.shape), "device_kernel_submitted": False,
+        "output_shape": list(output.shape),
+        "marked_flash_attn_kernel_submitted": False,
+        "case": args.case,
     }, sort_keys=True))
 
 
-def _parse_capture(path):
+def _parse_capture(path, expected_grid_x):
     records = [json.loads(line) for line in path.read_text().splitlines()]
     if not records or records[-1]["record_type"] != "summary":
         raise ValueError("occupancy capture lacks a summary")
@@ -120,7 +134,8 @@ def _parse_capture(path):
     if len(combine) != 1:
         raise ValueError(f"expected one SplitKV combine launch, got {len(combine)}")
     target, = combine
-    if target["grid"] != [224, 1, 1] or target["block"] != [256, 1, 1]:
+    if (target["grid"] != [expected_grid_x, 1, 1]
+            or target["block"] != [256, 1, 1]):
         raise ValueError(f"frozen reducer geometry changed: {target}")
     if target["resident_ctas_per_ap"] <= 0:
         raise ValueError("runtime did not provide a positive occupancy")
@@ -131,6 +146,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--device", required=True, type=int)
+    parser.add_argument("--case", choices=CASES, default="frozen56_split5")
     parser.add_argument("--maca-path", type=Path, default=Path("/opt/maca"))
     parser.add_argument("--compiler", default="c++")
     args = parser.parse_args(argv)
@@ -151,24 +167,32 @@ def main(argv=None):
     environment["MACA_VISIBLE_DEVICES"] = str(args.device)
     result = _run([
         sys.executable, str(Path(__file__).resolve()), "_worker",
-        "--device", str(args.device)], environment=environment)
+        "--device", str(args.device), "--case", args.case],
+        environment=environment)
     (args.output_dir / "worker_stdout.txt").write_text(result.stdout)
     (args.output_dir / "worker_stderr.txt").write_text(result.stderr)
     worker = json.loads(result.stdout)
-    launches, combine = _parse_capture(capture)
+    launches, combine = _parse_capture(
+        capture, 4 if args.case in ("graph_b1_split103", "graph_b1_auto")
+        else 224)
     report = {
         "schema_version": 1,
         "hardware_id": "metax_c500",
         "mechanism": "flash_attn_splitkv_combine_runtime_occupancy",
         "purpose": "static runtime resource and CTA-admission evidence",
         "production_or_evaluation_duration_consumed": False,
-        "device_kernel_submitted": False,
+        "marked_flash_attn_kernel_submitted": False,
         "software": worker,
-        "frozen_workload": {
-            "batch": 56, "q_len": 1, "kv_lens_count": 56,
-            "head_dim": 128, "num_query_heads": 32,
-            "num_kv_heads": 8, "requested_splits": 5,
-        },
+        "frozen_workload": (
+            {"batch": 1, "q_len": 1, "kv_lens": [729],
+             "block_table_width": 512, "page_size": 16,
+             "head_dim": 128, "num_query_heads": 32,
+             "num_kv_heads": 8,
+             "requested_splits": 0 if args.case == "graph_b1_auto" else 103}
+            if args.case in ("graph_b1_split103", "graph_b1_auto") else
+            {"batch": 56, "q_len": 1, "kv_lens_count": 56,
+             "head_dim": 128, "num_query_heads": 32,
+             "num_kv_heads": 8, "requested_splits": 5}),
         "source": {
             "interposer": str(INTERPOSER),
             "interposer_sha256": _sha256(INTERPOSER),

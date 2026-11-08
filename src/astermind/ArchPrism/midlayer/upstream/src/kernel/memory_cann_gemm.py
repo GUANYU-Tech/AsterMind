@@ -1,8 +1,9 @@
 """CANN non-split matrix payloads, with native format mapping unbound."""
+
+from src.kernel.prediction_cache import runtime_lru_cache, RuntimeCache
 from contextlib import contextmanager
 from contextvars import ContextVar, copy_context
 from collections import OrderedDict
-from functools import lru_cache
 from src.kernel.kernel_spec import KernelKind
 from src.kernel.memory_access import (
     AccessScope, AddressLevel, Coverage, EventKind, EventRef, Granularity, MemoryAccess,
@@ -11,7 +12,7 @@ from src.kernel.memory_access import (
 )
 
 _WORK = ContextVar('cann_gemm_source_work')
-_EXECUTION_KERNELS = OrderedDict()
+_EXECUTION_KERNELS = RuntimeCache()
 
 
 def has_cann_gemm_source(kernel):
@@ -264,7 +265,7 @@ def cann_single_core_tile_demands(program):
     return {**work,'totals':dict(work['totals'])}
 
 
-@lru_cache(maxsize=8)
+@runtime_lru_cache(maxsize=8)
 def _cann_single_core_tile_demands(program):
     from src.kernel.memory_access import tile_template_requested_bytes
     from dataclasses import replace
@@ -470,7 +471,7 @@ def cann_gemm_tile_demands(program):
     return dict(_cann_gemm_tile_demands(program))
 
 
-@lru_cache(maxsize=8)
+@runtime_lru_cache(maxsize=8)
 def _cann_gemm_tile_demands(program):
     from math import prod
     program.__post_init__()
@@ -667,7 +668,7 @@ def cann_deterministic_source_demands(program):
     return {**work,'totals':dict(work['totals'])}
 
 
-@lru_cache(maxsize=8)
+@runtime_lru_cache(maxsize=8)
 def _cann_deterministic_source_demands(program):
     from src.kernel.memory_access import tile_template_requested_bytes
     program.__post_init__()

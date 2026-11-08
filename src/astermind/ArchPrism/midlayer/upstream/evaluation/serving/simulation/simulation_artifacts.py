@@ -6,6 +6,7 @@ from src.serving.kv_cache.kv_capacity import validate_ffn_source_capacity, valid
 
 import hashlib
 import json
+import os
 from pathlib import Path
 from evaluation.serving.experiments.experiment_plan import git_code_identity, load_workload_artifact
 from evaluation.serving.simulation.execution_artifact import performance_timing_status
@@ -322,6 +323,7 @@ def request_safe_aggregate_result(
         payload["mtp_pd_handoff_contract"])
     full_result_sha256 = canonical_json_sha256(payload)
     return {
+        **{key: payload[key] for key in ("interactive_report", "report_output_costs") if key in payload},
         "schema_version": 1,
         "kind": result_kind,
         "persistence": {
@@ -339,6 +341,11 @@ def request_safe_aggregate_result(
         "deployment_plan": payload["deployment_plan"],
         "routing_policy": payload["routing_policy"],
         "kv_handoff_mode": payload["kv_handoff_mode"],
+        **({"pd_kv_lifecycle": {
+            "event_count": len(payload["pd_kv_lifecycle"]),
+            "events_sha256": canonical_json_sha256(payload["pd_kv_lifecycle"]),
+            "request_level_manifest": "omitted",
+        }} if "pd_kv_lifecycle" in payload else {}),
         "kv_capacity": payload["kv_capacity"],
         "kv_lifecycle_replay": aggregate_kv_lifecycle,
         "launch_policy": payload["launch_policy"],
@@ -368,11 +375,15 @@ def request_safe_aggregate_result(
            if "source_activation_memory" in payload else {}),
         "schedule_end_time_s": payload["schedule_end_time_s"],
         "simulation_wall_time_s": payload["simulation_wall_time_s"],
+        "simulation_started_monotonic_s": payload["simulation_started_monotonic_s"],
+        "simulation_finished_monotonic_s": payload["simulation_finished_monotonic_s"],
         "evaluation_wall_time_breakdown_s": (
             payload["evaluation_wall_time_breakdown_s"]),
         "process_peak_rss_bytes": payload["process_peak_rss_bytes"],
         "metrics": aggregate_metrics,
         "request_source": aggregate_request_source,
+        **({"adaptive_tail_worker_grants": payload["adaptive_tail_worker_grants"]}
+           if "adaptive_tail_worker_grants" in payload else {}),
     }
 
 
@@ -639,7 +650,7 @@ def build_execution_provenance(
             "midlayer", "roofline", "roofline_span_floor"):
         protobridge_profiles = {}
         uses_p2p = (
-            args.deployment == "pd_disagg"
+            (args.deployment == "pd_disagg" and args.kv_transfer_backend == "protobridge")
             or (args.collective_backend == "protobridge" and (
                 args.prefill_pp_size > 1 or args.deployment in ("af_disagg", "pd_af_disagg"))))
         if uses_p2p:
@@ -712,8 +723,17 @@ def build_execution_provenance(
         }
     if args.model_source_normalization is not None:
         runtime_manifest["model_source_normalization"] = args.model_source_normalization
+    if args.vllm_async_terminal_guard_source is not None:
+        runtime_manifest["async_terminal_guard_source"] = (
+            args.vllm_async_terminal_guard_source)
     if runtime_inputs.model_execution_version != "legacy":
         runtime_manifest["model_execution_version"] = runtime_inputs.model_execution_version
+        if runtime_inputs.dense_source_input_policy is not None:
+            runtime_manifest["dense_source_input_policy"] = {
+                "value": runtime_inputs.dense_source_input_policy,
+                "capture_limits": runtime_inputs.dense_source_capture_limits,
+                "source_id": "declared-synthetic-canonical-lengths-zero-ids-and-tail-v2",
+                "scope": "known backend IDs retained; unknown scheduled IDs and graph tails explicitly zero; embedding locality approximate, not observed content or native capture certification"}
         runtime_manifest["conditional_model_sources"] = {
             "v4_eager_metadata_source": runtime_inputs.v4_eager_metadata_source,
             "v4_source_max_model_len": runtime_inputs.v4_source_max_model_len,
@@ -724,6 +744,18 @@ def build_execution_provenance(
         }
     if runtime_inputs.symbolic_forward_source is not None:
         runtime_manifest["symbolic_forward_source"] = runtime_inputs.symbolic_forward_source
+        if runtime_inputs.bf16_gemm_model is not None:
+            runtime_manifest["bf16_gemm_model"] = {
+                "value": runtime_inputs.bf16_gemm_model,
+                "scope": "ordinary homogeneous unbiased BF16 Linear/head; fixed analytical tile program, native cuBLAS provider unobserved",
+                "source_reference": "existing analytical_cublas_tiling and GPU pipeline resource model; no production duration inputs",
+            }
+        if runtime_inputs.norm_source_batch_invariant is not None:
+            runtime_manifest["norm_source_batch_invariant"] = {
+                "value": runtime_inputs.norm_source_batch_invariant,
+                "scope": "explicit upstream default-source assumption; capture flag and native provider unobserved",
+                "source_reference": "vLLM0.30 envs.py VLLM_BATCH_INVARIANT default 0; model_executor/layers/layernorm.py",
+            }
         if runtime_inputs.maca_copy_runtime_source is not None:
             runtime_manifest["maca_copy_runtime_source"] = {
                 "source": runtime_inputs.maca_copy_runtime_source,
@@ -737,17 +769,18 @@ def build_execution_provenance(
         runtime_manifest["glm_prefill_attention_source"] = runtime_inputs.glm_prefill_attention_source
     if runtime_inputs.symbolic_workspace_initial_capacity_bytes is not None:
         runtime_manifest["symbolic_workspace_initial_capacity_bytes"] = runtime_inputs.symbolic_workspace_initial_capacity_bytes
+    if args.vllm_step_inputs is not None:
+        runtime_manifest["vllm_step_source_inputs"] = {
+            step_id: asdict(state) for step_id, state in args.vllm_step_inputs.items()}
+        runtime_manifest["vllm_step_token_scope"] = (
+            "explicit caller per-step scheduled/padding input scenarios; source_kind/source_id preserved; "
+            "not inferred numerical model output or GPU observation")
     if args.glm_mtp_step_inputs is not None:
         runtime_manifest["glm_mtp_step_source_inputs"] = {
             step_id: asdict(state) for step_id, state in args.glm_mtp_step_inputs.items()}
         runtime_manifest["glm_mtp_initial_target_token_ids"] = tuple(args.glm_mtp_initial_target_token_ids)
         runtime_manifest["glm_mtp_token_scope"] = (
             "explicit caller draft scenarios; executed target IDs come from BackendStep's CPU length-only protocol; not numerical model output")
-    if args.sglang_step_inputs is not None:
-        runtime_manifest["sglang_step_source_inputs"] = {
-            step_id: None if state is None else asdict(state) for step_id, state in args.sglang_step_inputs.items()}
-        runtime_manifest["sglang_step_source_scope"] = (
-            "explicit caller source states bound by source-mirrored Scheduler step; not numerical model output or native runtime")
     if runtime_inputs.v4_source_max_batched_tokens is not None:
         runtime_manifest["conditional_model_sources"]["v4_source_max_batched_tokens"] = runtime_inputs.v4_source_max_batched_tokens
     if runtime_inputs.v4_indexer_selection_source is not None:
@@ -775,26 +808,53 @@ def build_execution_provenance(
 def file_provenance(path: str | Path) -> dict[str, object]:
     resolved = Path(path).resolve()
     try:
-        payload = resolved.read_bytes()
+        digest = hashlib.sha256()
+        size = 0
+        with resolved.open("rb") as stream:
+            before = os.fstat(stream.fileno())
+            while True:
+                chunk = stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                size += len(chunk)
+            stream.seek(0)
+            verification = hashlib.sha256()
+            verified_size = 0
+            while True:
+                chunk = stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                verification.update(chunk)
+                verified_size += len(chunk)
+            after = os.fstat(stream.fileno())
+        named = resolved.stat()
+        fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+        if (tuple(getattr(before, field) for field in fields)
+                != tuple(getattr(after, field) for field in fields)
+                or tuple(getattr(after, field) for field in fields)
+                != tuple(getattr(named, field) for field in fields)
+                or size != after.st_size or verified_size != size
+                or digest.digest() != verification.digest() or Path(path).resolve() != resolved):
+            raise RuntimeError(f"provenance input changed while hashing: {resolved}")
     except OSError as error:
         raise RuntimeError(
             f"cannot read provenance input file: {resolved}") from error
     return {
         "path": str(resolved),
-        "sha256": hashlib.sha256(payload).hexdigest(),
-        "size_bytes": len(payload),
+        "sha256": digest.hexdigest(),
+        "size_bytes": size,
     }
 
 
 def launch_data_provenance(hardware_ids: tuple[str, ...], *, repository_root: Path = ROOT) -> dict:
     launch_data = {}
     for hardware_id in hardware_ids:
-        # Match the explicit projection in select_launch_config.py. Keep the
-        # requested hardware as the key and the actual source in the path.
-        source_id = "nvidia_a800" if hardware_id == "nvidia_h200" else hardware_id
+        # Each hardware owns its observed LUT. H200 may share analytical
+        # launch code with A800, but its injected choices use H200 data.
         launch_data[hardware_id] = directory_provenance(
-            repository_root / "launch_data" / source_id,
-            allowed_suffixes=(".json",),
+            repository_root / "launch_data" / hardware_id,
+            allowed_suffixes=(".json", ".zst"),
         )
     return launch_data
 
@@ -811,13 +871,14 @@ def directory_provenance(
     if (not isinstance(allowed_suffixes, tuple)
             or not allowed_suffixes
             or any(not isinstance(suffix, str) or not suffix
-                   for suffix in allowed_suffixes)):
+                   for suffix in allowed_suffixes)
+            or ("*" in allowed_suffixes and allowed_suffixes != ("*",))):
         raise ValueError(
             "provenance allowed_suffixes must be non-empty strings")
     files = tuple(
         candidate
         for candidate in sorted(resolved.rglob("*"))
-        if candidate.is_file() and candidate.suffix in allowed_suffixes
+        if candidate.is_file() and (allowed_suffixes == ("*",) or candidate.suffix in allowed_suffixes)
     )
     if not files:
         raise RuntimeError(
@@ -867,10 +928,6 @@ def vllm_step_index(step: BackendStep) -> int:
 
 def mtp_acceptance_outcomes_manifest(args, result, deployment) -> dict | None:
     if args.mtp_acceptance_policy == "disabled":
-        return None
-    if args.backend == "sglang_mirror":
-        # The outcome manifest is the vLLM acceptance-replay schema, whose
-        # step identity is a native vLLM Scheduler step.
         return None
     if args.mtp_acceptance_policy in ("fixed_count", "maximum_entropy"):
         source_kind = "explicit_assumption"
@@ -1503,7 +1560,8 @@ def execution_repository_identity(repository_at_start: dict[str, object]) -> dic
 
 
 
-def source_activation_capacity_manifest(memory, plans, policy, deployment, model, hardware_by_id):
+def source_activation_capacity_manifest(memory, plans, policy, deployment, model, hardware_by_id,
+        source_workspace_budget=None):
     """Join executed source lifetimes to existing budgets without filling gaps."""
     if memory is None:
         return {"status": ("not_applicable_debug_capacity" if policy is None else "unavailable_source_activation_report"),
@@ -1523,4 +1581,5 @@ def source_activation_capacity_manifest(memory, plans, policy, deployment, model
             "normal_capacity_accepted": False, **known_ffn}
     return {"status": "executed_source_peaks_fit_existing_budget",
         **validate_source_activation_capacity(memory, plans=plans.values(), policy_config=policy,
-            pool_ranks={name: deployment.worker_pools[name].ranks for name in plans}), **known_ffn}
+            pool_ranks={name: deployment.worker_pools[name].ranks for name in plans},
+            source_workspace_budget=source_workspace_budget), **known_ffn}

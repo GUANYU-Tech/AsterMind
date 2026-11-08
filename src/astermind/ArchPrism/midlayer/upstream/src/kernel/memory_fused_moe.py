@@ -1,8 +1,9 @@
 """Grouped expert interfaces with explicit routed and formatted layout limits."""
+
+from src.kernel.prediction_cache import runtime_lru_cache
 from dataclasses import dataclass
 from contextlib import contextmanager
 from contextvars import ContextVar, copy_context
-from functools import lru_cache
 from math import prod
 from src.kernel.kernel_spec import KernelKind,KernelSpec
 from src.kernel.model_contract import SOURCE_FUSED_MOE_W2_ROUTED_WEIGHT_PROGRAM_PARAMETER
@@ -17,11 +18,22 @@ from src.kernel.memory_access import (
 _SOURCE_WORK = ContextVar('fused_moe_source_work')
 
 
+def _count_sort_source_algorithm(kernel):
+    if kernel.hardware_id == 'nvidia_h200':
+        from src.kernel.launch_config.nvidia_h200.moe_aux_launch import COUNT_SORT_VALID_GLOBAL_ALGORITHM
+        if kernel.launch.algorithm == COUNT_SORT_VALID_GLOBAL_ALGORITHM:
+            routed = kernel.shape['tokens'] * kernel.shape['topk']
+            return (kernel.launch.grid == (1, min(-(-routed // 256), 65535), 1)
+                and kernel.launch.block == (256, 1, 1) and kernel.launch.tiling is None)
+    return kernel.launch.algorithm in ('moe_count_and_sort', 'observed_moe_aux:moe_count_and_sort')
+
+
 def has_moe_count_sort_source(kernel,hardware):
     from src.kernel.launch_config.select_launch_config import moe_count_sort_source_program
     return (kernel.kind is KernelKind.VECTOR and kernel.variant=='moe_count_and_sort'
         and kernel.execution_support=='supported' and hardware.kernel_memory_model=='gpu_mshr'
-        and kernel.launch.algorithm in ('moe_count_and_sort','observed_moe_aux:moe_count_and_sort')
+        and kernel.hardware_id==hardware.hardware_id
+        and _count_sort_source_algorithm(kernel)
         and moe_count_sort_source_program(kernel.hardware_id)=='cuda_moe_count_sort_int32_unmasked')
 
 
@@ -104,7 +116,7 @@ def moe_count_sort_source_demands(program, *, expected_kernel=None):
     tokens,topk,experts=map(int,header[1:]);routed=tokens*topk
     if min(tokens,topk,experts)<=0:raise ValueError('Count-and-sort requires positive routed/expert domains')
     if expected_kernel is not None and (expected_kernel.kind is not KernelKind.VECTOR or expected_kernel.variant!='moe_count_and_sort'
-            or expected_kernel.launch.algorithm not in ('moe_count_and_sort','observed_moe_aux:moe_count_and_sort')
+            or not _count_sort_source_algorithm(expected_kernel)
             or moe_count_sort_source_program(expected_kernel.hardware_id)!='cuda_moe_count_sort_int32_unmasked'
             or expected_kernel.hardware_id!=program.hardware_id or (tokens,topk,experts)!=tuple(expected_kernel.shape[name] for name in ('tokens','topk','experts'))):
         raise ValueError('Count-and-sort source differs from its actual kernel')
@@ -362,7 +374,7 @@ def _native_moe_recipe(header,parents,ready,scope,visibility):
         tuple(sorted(ready.items())),scope,visibility)
 
 
-@lru_cache(maxsize=512)
+@runtime_lru_cache(maxsize=512)
 def _native_moe_view_template(shape,dtype,width,offset,strides,coordinate_map):
     if strides is None:
         return LogicalSelectionView('view','allocation',shape,dtype,width,
@@ -370,7 +382,7 @@ def _native_moe_view_template(shape,dtype,width,offset,strides,coordinate_map):
     return TensorView('view','allocation',offset,shape,strides,dtype,width)
 
 
-@lru_cache(maxsize=256)
+@runtime_lru_cache(maxsize=256)
 def _native_moe_access_template(access_id,operation,iteration_axes,view_axes,
         input_ready,dependencies,evidence_refs,*,unmapped=False,constant_value=None):
     return TileAccessTemplate(access_id,access_id,operation,iteration_axes,view_axes,
@@ -384,12 +396,12 @@ def _native_moe_access(access_id,view_id,*args,**kwargs):
         _replace_source_identity(template,view_id=view_id))
 
 
-@lru_cache(maxsize=128)
+@runtime_lru_cache(maxsize=128)
 def _native_moe_axis(name,extent):
     return TileAxis(name,extent,1)
 
 
-@lru_cache(maxsize=8)
+@runtime_lru_cache(maxsize=8)
 def _cached_native_moe_recipe(header,parent_items,ready_items,scope,visibility):
     # Complete immutable arguments include every actual caller, operand and
     # readiness reference. Only repeated construction of that exact recipe
@@ -493,7 +505,7 @@ def native_grouped_moe_demands(program):
     return dict(_native_grouped_moe_demands(program))
 
 
-@lru_cache(maxsize=8)
+@runtime_lru_cache(maxsize=8)
 def _native_grouped_moe_demands(program):
     if program.hardware_id=='nvidia_h200' and program.scopes and program.scopes[0].op_ids[-1]=='naive':
         from src.kernel.memory_fused_moe_naive import h200_naive_demands

@@ -315,6 +315,43 @@ def launch_policy(attributes: Mapping[str, object]) -> str:
     return normalized
 
 
+def fused_moe_local_expert_count(experts: int, attributes: Mapping[str, object]) -> int:
+    """Resolve a launch's local count without inventing a physical rank.
+
+    The legacy equal-shard interface needs only E and EP: every rank has
+    exactly E/EP experts. Uneven placement needs an explicit owned interval
+    or rank; its base/remainder partition follows the canonical source rule.
+    Optional ownership facts, when present, must agree with that rule.
+    """
+    from src.kernel.kernel_spec import linear_expert_partition
+
+    ep_size = require_positive_integer(attributes, "expert_parallel_size")
+    if "expert_rank" in attributes:
+        expected = linear_expert_partition(experts, ep_size, attributes["expert_rank"])
+    else:
+        expected = None
+    if "owned_experts" in attributes:
+        raw_owned = attributes["owned_experts"]
+        if (not isinstance(raw_owned, (list, tuple))
+                or any(type(expert) is not int for expert in raw_owned)):
+            raise TypeError("FUSED_MOE owned_experts must contain integer expert IDs")
+        owned = tuple(raw_owned)
+        if expected is not None:
+            valid = owned == expected
+        else:
+            valid = any(owned == linear_expert_partition(experts, ep_size, rank)
+                for rank in range(ep_size))
+        if not valid:
+            raise ValueError("FUSED_MOE owned_experts must match canonical linear expert placement")
+        return len(owned)
+    if expected is not None:
+        return len(expected)
+    local_experts, remainder = divmod(experts, ep_size)
+    if remainder:
+        raise ValueError("uneven FUSED_MOE launch requires explicit expert ownership or rank")
+    return local_experts
+
+
 def select_gpu_fused_moe_launch(
     shape: Mapping[str, int],
     variant: str,
@@ -331,10 +368,9 @@ def select_gpu_fused_moe_launch(
     if block_threads <= 0:
         raise ValueError("FUSED_MOE block_threads must be positive")
     ep_size = require_positive_integer(attributes, "expert_parallel_size")
-    if experts % ep_size:
-        raise ValueError(
-            "expert_parallel_size must be positive and divide experts")
-    local_experts = experts // ep_size
+    local_experts = fused_moe_local_expert_count(experts, attributes)
+    if local_experts == 0:
+        raise NotImplementedError("empty expert ranks have a zero contribution rather than a grouped GEMM launch")
     if tokens <= local_experts:
         tile_m, tile_n, tile_k = 16, 32, 64
         group_size_m = 1

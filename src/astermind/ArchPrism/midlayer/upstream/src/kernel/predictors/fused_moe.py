@@ -1,9 +1,11 @@
 """Complete-spec fused-MoE grouped-projection prediction."""
 
+from src.kernel.prediction_cache import RuntimeCache, runtime_lru_cache
+
 import dataclasses
 import math
 from dataclasses import dataclass
-from functools import lru_cache
+from types import MethodType
 from typing import Optional, Tuple
 
 from src.kernel.formula import PerformanceFormula
@@ -15,6 +17,7 @@ from src.kernel.kernel_spec import (
 )
 from src.kernel.predictors.vector import clamped_silu_source_arithmetic, silu_source_arithmetic, VectorPredictor
 from src.kernel.predictors.gemm_block_fp8 import _block_fp8_matmul_payloads
+from src.kernel.predictors.gemm import _unquantized_matmul_math
 from src.kernel.cache_traffic_sim import (
     simulate_cann_grouped_moe_operands,
     simulate_moe_tile_program,
@@ -22,15 +25,19 @@ from src.kernel.cache_traffic_sim import (
 from src.kernel.launch_config.fused_moe_tiling import (
     CANN_GROUPED_MATMUL_K_PROGRAM_PARAMETER_NAMES,
     cann_grouped_matmul_k_program,
+    fused_moe_output_relayout_sources,
+    observed_fused_moe_output_relayout_bytes,
 )
 from src.kernel.model_contract import (
     AnalyticalPhase,
+    PredictionDiagnostics,
     AnalyticalPhaseLedger,
     CannGroupedMatmulEnvelopeDemand,
     ComputeDemand,
     ComputeExactRequestDemand,
     GpuGroupedGemmPipelineEnvelopeDemand,
     MemoryAccessClassDemand,
+    MemoryAccessClassService,
     MemoryAccessClassSignature,
     MemoryNodeDemand,
     MemoryPathDemand,
@@ -54,7 +61,14 @@ from src.kernel.predictors.common import (
     npu_launch_floor_contract,
     prediction_from_ns,
     roofline_ns,
+    sum_serial_kernel_predictions,
     validated_l2_miss_rate,
+    merge_operand_read_paths,
+    attach_recurrent_matmul_pipeline,
+    attach_single_panel_matmul_pipeline,
+    attach_async_copy_ring_capacity,
+    attach_finite_async_copy_progress_floor,
+    attach_coalesced_async_copy_progress_floor,
 )
 
 
@@ -617,6 +631,20 @@ def _routing(kernel: KernelSpec):
     return fused_moe_routing(kernel)
 
 
+def _gpu_uses_naive_assignment(kernel):
+    from src.kernel.memory_fused_moe_naive import has_h200_bf16_controls, h200_bf16_naive
+    return has_h200_bf16_controls(kernel) and h200_bf16_naive(kernel)
+
+
+def _gpu_valid_tile_rows(kernel, counts):
+    """Keep token-wise routes separate when the source skips expert sorting."""
+    if _gpu_uses_naive_assignment(kernel):
+        return (1,) * sum(counts)
+    tm, _, _ = _tile(kernel)
+    return tuple(min(tm, count - start) for count in counts
+                 for start in range(0, count, tm))
+
+
 def _source_w2_routed_weight_program(kernel: KernelSpec) -> Optional[bool]:
     """Return whether C500 selected W2's routed-weight source program.
 
@@ -873,7 +901,7 @@ def _cann_mn_block_index(
     return m_index, n_index
 
 
-@lru_cache(maxsize=256)
+@runtime_lru_cache(maxsize=256)
 def _cann_mn_block_order(
         block_dim_m: int, block_dim_n: int) -> Tuple[Tuple[int, int], ...]:
     """Return one immutable CANN diagonal order for a launch tile grid."""
@@ -916,7 +944,7 @@ def _cann_grouped_matmul_work(kernel: KernelSpec) -> _CannGroupedMatmulWork:
             "CANN GroupedMatmul local expert rows cannot exceed global rows")
     routed_rows = sum(local_counts)
     expected_tile = (
-        min(128, ((routed_rows + 15) // 16) * 16), 256, 64)
+        min(128, ((expected_global_rows + 15) // 16) * 16), 256, 64)
     if (tile_m, tile_n, tile_k) != expected_tile:
         raise ValueError(
             "CANN 8.5.1 BF16 GroupedMatmul requires exact base tile "
@@ -1199,88 +1227,123 @@ def _gpu_exact_grouped_operand_service(kernel: KernelSpec, hardware):
     return matches[0] if matches else None
 
 
+def _native_memory_service_catalog(hardware):
+    """Index only plain native records for one synchronous selector call."""
+    from types import GetSetDescriptorType
+    hw_fields, service_fields = vars(HWSpec), vars(MemoryAccessClassService)
+    if (type(hardware) is not HWSpec
+            or HWSpec.__getattribute__ is not object.__getattribute__
+            or MemoryAccessClassService.__getattribute__ is not object.__getattribute__
+            or "memory_access_class_services" in hw_fields or "service" in service_fields
+            or "__dict__" not in hw_fields or "__dict__" not in service_fields
+            or type(hw_fields["__dict__"]) is not GetSetDescriptorType
+            or type(service_fields["__dict__"]) is not GetSetDescriptorType
+            or hw_fields["__dict__"].__objclass__ is not HWSpec
+            or service_fields["__dict__"].__objclass__ is not MemoryAccessClassService
+            or type(_NVIDIA_E128_H2048_8250_ACTIVE_8318_MAX_SERVICE_BY_VARIANT) is not dict
+            or type(_NVIDIA_E8_H4096_EXACT_W2_SERVICE_BY_TOPOLOGY) is not dict):
+        return None
+    namespace = vars(hardware)
+    if ("memory_access_class_services" not in namespace
+            or type(namespace["memory_access_class_services"]) is not tuple):
+        return None
+    table = namespace["memory_access_class_services"]
+    if any(type(record) is not MemoryAccessClassService
+            or "service" not in vars(record) or type(vars(record)["service"]) is not str
+            for record in table):
+        return None
+    groups = {}
+    for record in table:
+        if record.service not in groups:
+            groups[record.service] = []
+        groups[record.service].append(record)
+    catalog = {name: tuple(records) for name, records in groups.items()}
+    return namespace, table, catalog, frozenset(catalog)
+
+
 def _nvidia_source_depth_operand_service(kernel: KernelSpec, hardware):
     """Select full-source services for statically bounded launch depths."""
+
+    # All indexed reads precede metadata callbacks. The final post-metadata
+    # query below deliberately retains its live ordinary scan.
+    catalog = _native_memory_service_catalog(hardware)
+
+    def _services_for(name):
+        nonlocal catalog
+        if (catalog is not None and type(name) is str
+                and "memory_access_class_services" in catalog[0]
+                and catalog[0]["memory_access_class_services"] is catalog[1]):
+            return catalog[2][name] if name in catalog[2] else ()
+        catalog = None
+        return tuple(service for service in hardware.memory_access_class_services
+            if service.service == name)
+
+    def _declared_names(names):
+        nonlocal catalog
+        if (catalog is not None and type(names) in (tuple, set, frozenset)
+                and all(type(name) is str for name in names)
+                and "memory_access_class_services" in catalog[0]
+                and catalog[0]["memory_access_class_services"] is catalog[1]):
+            return set(catalog[3].intersection(names))
+        catalog = None
+        return {service.service for service in hardware.memory_access_class_services
+            if service.service in names}
 
     service_names = (
         _NVIDIA_EIGHT_EXPERT_68_ACTIVE_72_MAX_W1_SERVICE,
         _NVIDIA_EIGHT_EXPERT_132_ACTIVE_136_MAX_W1_SERVICE,
     )
-    declared_w1_names = {
-        service.service
-        for service in hardware.memory_access_class_services
-        if service.service in service_names}
+    declared_w1_names = _declared_names(service_names)
     if declared_w1_names and declared_w1_names != set(service_names):
         raise ValueError(
             "NVIDIA grouped FUSED_MOE source-depth service family must be "
             "complete")
-    deep_w2_services = tuple(
-        service for service in hardware.memory_access_class_services
-        if service.service == _NVIDIA_E512_DEEP_W2_SERVICE)
+    deep_w2_services = _services_for(_NVIDIA_E512_DEEP_W2_SERVICE)
     if len(deep_w2_services) > 1:
         raise ValueError(
             "NVIDIA grouped FUSED_MOE repeats its deep W2 source service")
-    e128_deep_w2_services = tuple(
-        service for service in hardware.memory_access_class_services
-        if service.service == _NVIDIA_E128_DEEP_W2_SERVICE)
+    e128_deep_w2_services = _services_for(_NVIDIA_E128_DEEP_W2_SERVICE)
     if len(e128_deep_w2_services) > 1:
         raise ValueError(
             "NVIDIA grouped FUSED_MOE repeats its E128 deep W2 source service")
-    e128_h4096_deep_w1_services = tuple(
-        service for service in hardware.memory_access_class_services
-        if service.service
-        == _NVIDIA_E128_H4096_4156_ACTIVE_4222_MAX_W1_SERVICE)
+    e128_h4096_deep_w1_services = _services_for(_NVIDIA_E128_H4096_4156_ACTIVE_4222_MAX_W1_SERVICE)
     if len(e128_h4096_deep_w1_services) > 1:
         raise ValueError(
             "NVIDIA grouped FUSED_MOE repeats its E128 H4096 4156/4222 "
             "W1 source service")
     e128_h2048_names = set(
         _NVIDIA_E128_H2048_8250_ACTIVE_8318_MAX_SERVICE_BY_VARIANT.values())
-    declared_e128_h2048_names = {
-        service.service
-        for service in hardware.memory_access_class_services
-        if service.service in e128_h2048_names}
+    declared_e128_h2048_names = _declared_names(e128_h2048_names)
     if (declared_e128_h2048_names
             and declared_e128_h2048_names != e128_h2048_names):
         raise ValueError(
             "NVIDIA grouped FUSED_MOE E128 H2048 exact source service "
             "family must be complete")
-    e8_h6144_deep_w2_services = tuple(
-        service for service in hardware.memory_access_class_services
-        if service.service == _NVIDIA_E8_H6144_DEEP_W2_SERVICE)
+    e8_h6144_deep_w2_services = _services_for(_NVIDIA_E8_H6144_DEEP_W2_SERVICE)
     if len(e8_h6144_deep_w2_services) > 1:
         raise ValueError(
             "NVIDIA grouped FUSED_MOE repeats its E8 H6144 deep W2 "
             "source service")
-    e8_h6144_260_active_264_w2_services = tuple(
-        service for service in hardware.memory_access_class_services
-        if service.service == _NVIDIA_E8_H6144_260_ACTIVE_264_MAX_W2_SERVICE)
+    e8_h6144_260_active_264_w2_services = _services_for(_NVIDIA_E8_H6144_260_ACTIVE_264_MAX_W2_SERVICE)
     if len(e8_h6144_260_active_264_w2_services) > 1:
         raise ValueError(
             "NVIDIA grouped FUSED_MOE repeats its E8 H6144 260/264 W2 "
             "source service")
-    e8_h6144_deep_w1_services = tuple(
-        service for service in hardware.memory_access_class_services
-        if service.service == _NVIDIA_E8_H6144_DEEP_W1_SERVICE)
+    e8_h6144_deep_w1_services = _services_for(_NVIDIA_E8_H6144_DEEP_W1_SERVICE)
     if len(e8_h6144_deep_w1_services) > 1:
         raise ValueError(
             "NVIDIA grouped FUSED_MOE repeats its E8 H6144 deep W1 "
             "source service")
     e8_h4096_exact_w2_names = set(
         _NVIDIA_E8_H4096_EXACT_W2_SERVICE_BY_TOPOLOGY.values())
-    declared_e8_h4096_exact_w2_names = {
-        service.service
-        for service in hardware.memory_access_class_services
-        if service.service in e8_h4096_exact_w2_names}
+    declared_e8_h4096_exact_w2_names = _declared_names(e8_h4096_exact_w2_names)
     if (declared_e8_h4096_exact_w2_names
             and declared_e8_h4096_exact_w2_names
             != e8_h4096_exact_w2_names):
         raise ValueError(
             "NVIDIA grouped FUSED_MOE E8 H4096 exact W2 source service "
             "family must be complete")
-    e512_h4096_deep_w1_services = tuple(
-        service for service in hardware.memory_access_class_services
-        if service.service == _NVIDIA_E512_H4096_DEEP_W1_SERVICE)
+    e512_h4096_deep_w1_services = _services_for(_NVIDIA_E512_H4096_DEEP_W1_SERVICE)
     if len(e512_h4096_deep_w1_services) > 1:
         raise ValueError(
             "NVIDIA grouped FUSED_MOE repeats its E512 H4096 deep W1 "
@@ -1289,10 +1352,7 @@ def _nvidia_source_depth_operand_service(kernel: KernelSpec, hardware):
         _NVIDIA_E256_H7168_DEEP_W1_SERVICE,
         _NVIDIA_E256_H7168_DEEP_W2_SERVICE,
     }
-    declared_e256_h7168_names = {
-        service.service
-        for service in hardware.memory_access_class_services
-        if service.service in e256_h7168_names}
+    declared_e256_h7168_names = _declared_names(e256_h7168_names)
     if (declared_e256_h7168_names
             and declared_e256_h7168_names != e256_h7168_names):
         raise ValueError(
@@ -1302,27 +1362,19 @@ def _nvidia_source_depth_operand_service(kernel: KernelSpec, hardware):
         _NVIDIA_E256_H7168_MID_WORKSPACE_W1_SERVICE,
         _NVIDIA_E256_H7168_MID_WORKSPACE_W2_SERVICE,
     }
-    declared_e256_h7168_mid_workspace_names = {
-        service.service
-        for service in hardware.memory_access_class_services
-        if service.service in e256_h7168_mid_workspace_names}
+    declared_e256_h7168_mid_workspace_names = _declared_names(e256_h7168_mid_workspace_names)
     if (declared_e256_h7168_mid_workspace_names
             and declared_e256_h7168_mid_workspace_names
             != e256_h7168_mid_workspace_names):
         raise ValueError(
             "NVIDIA grouped FUSED_MOE E256 H7168 mid-workspace source "
             "service family must be complete")
-    e256_h7168_2166_w2_services = tuple(
-        service for service in hardware.memory_access_class_services
-        if service.service
-        == _NVIDIA_E256_H7168_2166_ACTIVE_2300_MAX_W2_SERVICE)
+    e256_h7168_2166_w2_services = _services_for(_NVIDIA_E256_H7168_2166_ACTIVE_2300_MAX_W2_SERVICE)
     if len(e256_h7168_2166_w2_services) > 1:
         raise ValueError(
             "NVIDIA grouped FUSED_MOE repeats its E256 H7168 2166/2300 "
             "W2 source service")
-    e256_h7168_2166_w1_services = tuple(
-        service for service in hardware.memory_access_class_services
-        if service.service == _NVIDIA_E256_H7168_2166_EXACT_W1_SERVICE)
+    e256_h7168_2166_w1_services = _services_for(_NVIDIA_E256_H7168_2166_EXACT_W1_SERVICE)
     if len(e256_h7168_2166_w1_services) > 1:
         raise ValueError(
             "NVIDIA grouped FUSED_MOE repeats its E256 H7168 2166/2300 "
@@ -1331,18 +1383,13 @@ def _nvidia_source_depth_operand_service(kernel: KernelSpec, hardware):
         _NVIDIA_E8_H6144_8_ACTIVE_9_MAX_W1_SERVICE,
         _NVIDIA_E8_H6144_8_ACTIVE_9_MAX_W2_SERVICE,
     }
-    declared_e8_h6144_short_names = {
-        service.service
-        for service in hardware.memory_access_class_services
-        if service.service in e8_h6144_short_names}
+    declared_e8_h6144_short_names = _declared_names(e8_h6144_short_names)
     if (declared_e8_h6144_short_names
             and declared_e8_h6144_short_names != e8_h6144_short_names):
         raise ValueError(
             "NVIDIA grouped FUSED_MOE E8 H6144 8/9 source service family "
             "must be complete")
-    deep_h2880_services = tuple(
-        service for service in hardware.memory_access_class_services
-        if service.service == _NVIDIA_DEEP_H2880_W1_W2_SERVICE)
+    deep_h2880_services = _services_for(_NVIDIA_DEEP_H2880_W1_W2_SERVICE)
     if len(deep_h2880_services) > 1:
         raise ValueError(
             "NVIDIA grouped FUSED_MOE repeats its deep H2880 source service")
@@ -1350,10 +1397,7 @@ def _nvidia_source_depth_operand_service(kernel: KernelSpec, hardware):
         _NVIDIA_E32_H2880_32_ACTIVE_36_MAX_W1_SERVICE,
         _NVIDIA_E32_H2880_32_ACTIVE_36_MAX_W2_SERVICE,
     }
-    declared_e32_h2880_short_names = {
-        service.service
-        for service in hardware.memory_access_class_services
-        if service.service in e32_h2880_short_names}
+    declared_e32_h2880_short_names = _declared_names(e32_h2880_short_names)
     if (declared_e32_h2880_short_names
             and declared_e32_h2880_short_names != e32_h2880_short_names):
         raise ValueError(
@@ -1363,10 +1407,7 @@ def _nvidia_source_depth_operand_service(kernel: KernelSpec, hardware):
         _NVIDIA_E32_H2880_143_ACTIVE_160_MAX_W1_SERVICE,
         _NVIDIA_E32_H2880_143_ACTIVE_160_MAX_W2_SERVICE,
     }
-    declared_e32_h2880_names = {
-        service.service
-        for service in hardware.memory_access_class_services
-        if service.service in e32_h2880_names}
+    declared_e32_h2880_names = _declared_names(e32_h2880_names)
     if (declared_e32_h2880_names
             and declared_e32_h2880_names != e32_h2880_names):
         raise ValueError(
@@ -1376,10 +1417,7 @@ def _nvidia_source_depth_operand_service(kernel: KernelSpec, hardware):
         _NVIDIA_E512_1001_ACTIVE_1144_MAX_W1_SERVICE,
         _NVIDIA_E512_1001_ACTIVE_1144_MAX_W2_SERVICE,
     }
-    declared_e512_mid_depth_names = {
-        service.service
-        for service in hardware.memory_access_class_services
-        if service.service in e512_mid_depth_names}
+    declared_e512_mid_depth_names = _declared_names(e512_mid_depth_names)
     if (declared_e512_mid_depth_names
             and declared_e512_mid_depth_names != e512_mid_depth_names):
         raise ValueError(
@@ -1389,10 +1427,7 @@ def _nvidia_source_depth_operand_service(kernel: KernelSpec, hardware):
         _NVIDIA_BM64_E128_574_ACTIVE_638_MAX_W1_SERVICE,
         _NVIDIA_BM64_E128_574_ACTIVE_638_MAX_W2_SERVICE,
     }
-    declared_e128_bm64_names = {
-        service.service
-        for service in hardware.memory_access_class_services
-        if service.service in e128_bm64_names}
+    declared_e128_bm64_names = _declared_names(e128_bm64_names)
     if (declared_e128_bm64_names
             and declared_e128_bm64_names != e128_bm64_names):
         raise ValueError(
@@ -1402,10 +1437,7 @@ def _nvidia_source_depth_operand_service(kernel: KernelSpec, hardware):
         _NVIDIA_E128_H2880_1084_ACTIVE_1150_EXACT_W1_SERVICE,
         _NVIDIA_E128_H2880_1084_ACTIVE_1150_EXACT_W2_SERVICE,
     }
-    declared_e128_h2880_1084_names = {
-        service.service
-        for service in hardware.memory_access_class_services
-        if service.service in e128_h2880_1084_names}
+    declared_e128_h2880_1084_names = _declared_names(e128_h2880_1084_names)
     if (declared_e128_h2880_1084_names
             and declared_e128_h2880_1084_names != e128_h2880_1084_names):
         raise ValueError(
@@ -1415,10 +1447,7 @@ def _nvidia_source_depth_operand_service(kernel: KernelSpec, hardware):
         _NVIDIA_BM16_H2880_31_ACTIVE_SERVICE,
         _NVIDIA_BM16_H2880_53_ACTIVE_SERVICE,
     }
-    declared_bm16_h2880_names = {
-        service.service
-        for service in hardware.memory_access_class_services
-        if service.service in bm16_h2880_names}
+    declared_bm16_h2880_names = _declared_names(bm16_h2880_names)
     if (declared_bm16_h2880_names
             and declared_bm16_h2880_names != bm16_h2880_names):
         raise ValueError(
@@ -1428,10 +1457,7 @@ def _nvidia_source_depth_operand_service(kernel: KernelSpec, hardware):
         _NVIDIA_BM16_E256_16_ACTIVE_241_MAX_W2_SERVICE,
         _NVIDIA_BM16_E512_20_ACTIVE_482_MAX_W2_SERVICE,
     }
-    declared_sparse_w2_names = {
-        service.service
-        for service in hardware.memory_access_class_services
-        if service.service in sparse_w2_names}
+    declared_sparse_w2_names = _declared_names(sparse_w2_names)
     if (declared_sparse_w2_names
             and declared_sparse_w2_names != sparse_w2_names):
         raise ValueError(
@@ -1441,10 +1467,7 @@ def _nvidia_source_depth_operand_service(kernel: KernelSpec, hardware):
         _NVIDIA_BM16_E128_88_ACTIVE_128_MAX_W1_SERVICE,
         _NVIDIA_BM16_E128_88_ACTIVE_128_MAX_W2_SERVICE,
     }
-    declared_e128_shallow_names = {
-        service.service
-        for service in hardware.memory_access_class_services
-        if service.service in e128_shallow_names}
+    declared_e128_shallow_names = _declared_names(e128_shallow_names)
     if (declared_e128_shallow_names
             and declared_e128_shallow_names != e128_shallow_names):
         raise ValueError(
@@ -1454,10 +1477,7 @@ def _nvidia_source_depth_operand_service(kernel: KernelSpec, hardware):
         _NVIDIA_BM16_E128_177_ACTIVE_248_MAX_W1_SERVICE,
         _NVIDIA_BM16_E128_177_ACTIVE_248_MAX_W2_SERVICE,
     }
-    declared_e128_mid_depth_names = {
-        service.service
-        for service in hardware.memory_access_class_services
-        if service.service in e128_mid_depth_names}
+    declared_e128_mid_depth_names = _declared_names(e128_mid_depth_names)
     if (declared_e128_mid_depth_names
             and declared_e128_mid_depth_names != e128_mid_depth_names):
         raise ValueError(
@@ -1467,10 +1487,7 @@ def _nvidia_source_depth_operand_service(kernel: KernelSpec, hardware):
         _NVIDIA_BM16_E8_7_ACTIVE_8_MAX_W1_SERVICE,
         _NVIDIA_BM16_E8_7_ACTIVE_8_MAX_W2_SERVICE,
     }
-    declared_e8_shallow_names = {
-        service.service
-        for service in hardware.memory_access_class_services
-        if service.service in e8_shallow_names}
+    declared_e8_shallow_names = _declared_names(e8_shallow_names)
     if (declared_e8_shallow_names
             and declared_e8_shallow_names != e8_shallow_names):
         raise ValueError(
@@ -1480,10 +1497,7 @@ def _nvidia_source_depth_operand_service(kernel: KernelSpec, hardware):
         _NVIDIA_BM16_E8_H6144_7_ACTIVE_8_MAX_W1_SERVICE,
         _NVIDIA_BM16_E8_H6144_7_ACTIVE_8_MAX_W2_SERVICE,
     }
-    declared_e8_h6144_names = {
-        service.service
-        for service in hardware.memory_access_class_services
-        if service.service in e8_h6144_names}
+    declared_e8_h6144_names = _declared_names(e8_h6144_names)
     if (declared_e8_h6144_names
             and declared_e8_h6144_names != e8_h6144_names):
         raise ValueError(
@@ -3568,7 +3582,7 @@ def _cann_grouped_operand_services(kernel: KernelSpec, hardware):
             b_dram_miss_service = (
                 _CANN_OPERAND_B_K2880_STRIDED_DRAM_MISS_SERVICE)
     expected_source_program = cann_grouped_matmul_k_program(
-        tile_m, sum(local_counts))
+        tile_m, int(kernel.shape["tokens"]) * int(kernel.shape["topk"]))
     source_k6144_m1_program_matches = (
         expected_source_program is not None
         and all(
@@ -3800,6 +3814,10 @@ def _gpu_grouped_tile_program_traffic(
     group_size_m = int(kernel.launch.parameters["group_size_m"])
     if group_size_m <= 0 or not any(local_counts):
         return None
+    if _gpu_uses_naive_assignment(kernel):
+        # The histogram does not retain token-order expert IDs. It cannot
+        # supply this unsorted source's per-route cache-reuse sequence.
+        return None
     traffic = simulate_moe_tile_program(
         m_tiles=m_tiles, n_tiles=n_tiles, group_size_m=group_size_m,
         k_extent=projection_k, block_k=tile_k,
@@ -3855,9 +3873,7 @@ def _gpu_traffic_components(
     if global_routed_rows != expected_routed_rows:
         raise ValueError(
             "FUSED_MOE routing count sum disagrees with tokens * topk")
-    global_populated_m_tiles = sum(
-        math.ceil(count / tile_m)
-        for count in global_counts if count > 0)
+    global_populated_m_tiles = len(_gpu_valid_tile_rows(kernel, global_counts))
     if global_populated_m_tiles <= 0:
         raise ValueError(
             "FUSED_MOE routing must contain at least one populated M tile")
@@ -3865,9 +3881,7 @@ def _gpu_traffic_components(
         raise ValueError(
             "FUSED_MOE populated M tiles exceed the configured launch grid")
     routed_rows = sum(local_counts)
-    populated_m_tiles = sum(
-        math.ceil(count / tile_m)
-        for count in local_counts if count > 0)
+    populated_m_tiles = len(_gpu_valid_tile_rows(kernel, local_counts))
     active_experts = sum(1 for count in local_counts if count > 0)
 
     # A is reloaded for each N tile, but token_mask admits only real routed
@@ -4017,6 +4031,21 @@ def _gpu_grouped_gemm_pipeline_envelope(
     if signature != expected:
         return None
     variant, _, projection_k, projection_n = _projection(kernel)
+    # A tile/thread match does not identify the compiled operand ring. An
+    # observed launch may use a different stage count or register footprint
+    # than the source program measured by this envelope.
+    parameters = kernel.launch.parameters
+    if ("dynamic_shared_memory_bytes" in parameters
+            and parameters["dynamic_shared_memory_bytes"]
+            != mechanism["dynamic_shared_memory_bytes_per_cta"]):
+        return None
+    if ("registers_per_thread" in parameters
+            and parameters["registers_per_thread"]
+            != mechanism["registers_per_thread_by_variant"][variant]):
+        return None
+    if (kernel.launch.tiling.pipeline_depth is not None
+            and kernel.launch.tiling.pipeline_depth != mechanism["pipeline_depth"]):
+        return None
     resident_ctas_by_variant = mechanism[
         "resident_ctas_per_sm_by_variant"]
     if set(resident_ctas_by_variant) != {"w1", "w2"}:
@@ -4036,8 +4065,7 @@ def _gpu_grouped_gemm_pipeline_envelope(
     if projection_k % tile_k:
         return None
     _, local_counts = _routing(kernel)
-    populated_m_tiles = sum(
-        math.ceil(rows / tile_m) for rows in local_counts if rows > 0)
+    populated_m_tiles = len(_gpu_valid_tile_rows(kernel, local_counts))
     active_ctas = populated_m_tiles * math.ceil(projection_n / tile_n)
     if active_ctas == 0:
         if traffic.dram_read_bytes != 0.0:
@@ -4050,6 +4078,162 @@ def _gpu_grouped_gemm_pipeline_envelope(
         resident_ctas_per_sm=resident_ctas_per_sm,
         dram_read_bytes=traffic.dram_read_bytes,
     )
+
+
+def _grouped_task_memory_bytes(kernel):
+    """Partition source operand/output bytes in grouped program order.
+
+    The routing census supplies each M tile's valid rows. The Triton group
+    permutation selects M before N inside each group; empty reserved programs
+    perform no matrix work. This is logical task order, not observed placement.
+    """
+    tm, tn, _ = _tile(kernel)
+    _, _, k, n = _projection(kernel)
+    _, counts = _routing(kernel)
+    rows = _gpu_valid_tile_rows(kernel, counts)
+    group_size = int(kernel.launch.parameters["group_size_m"])
+    reserved_m = math.ceil(int(kernel.launch.parameters["padded_rows"]) / tm)
+    element_bytes = _gpu_operand_element_bytes(kernel)
+    output_bytes = int(kernel.shape["dtype_bytes"])
+    a_replay, b_replay = _gpu_operand_replay_factors(kernel)
+    result = []
+    for first in range(0, len(rows), group_size):
+        width = min(reserved_m - first, group_size)
+        for column in range(0, n, tn):
+            for row in rows[first:min(first + width, len(rows))]:
+                result.append(((row * a_replay + tn * b_replay) * k * element_bytes,
+                               row * min(tn, n - column) * output_bytes))
+    return tuple(result)
+
+
+def _compulsory_weight_request_topology(counts, *, tile_m, tile_n,
+        projection_k, projection_n, element_bytes, group_size_m, wave_width):
+    """Count first-touch requests sharing one cold weight stream per wave.
+
+    Later waves are free in this optimistic progress work, including any
+    cache eviction/reload. This changes neither cache replay nor DRAM bytes.
+    The grouped source order and uniform populated wave remain analytical.
+    """
+    experts = tuple(e for e,count in enumerate(counts)
+                    for _ in range(math.ceil(count/tile_m)))
+    programs = tuple((expert, column)
+        for first in range(0,len(experts),group_size_m)
+        for column in range(0,projection_n,tile_n)
+        for expert in experts[first:first+group_size_m])
+    seen = set()
+    requesting_bytes = unique_bytes = 0
+    maximum_fanout = 0
+    for first in range(0,len(programs),wave_width):
+        pending = {}
+        for key in programs[first:first+wave_width]:
+            if key not in seen:
+                if key not in pending:
+                    pending[key] = 0
+                pending[key] += 1
+        for key,count in pending.items():
+            _,column = key
+            payload = min(tile_n,projection_n-column)*projection_k*element_bytes
+            requesting_bytes += count*payload
+            unique_bytes += payload
+            maximum_fanout = max(maximum_fanout,count)
+        seen.update(pending)
+    return requesting_bytes, unique_bytes, maximum_fanout
+
+
+def _attach_resident_operand_pipeline(inp, kernel, hardware):
+    """Use source-known stages in a capacity-conserving resident CTA schedule."""
+    depth = kernel.launch.tiling.pipeline_depth
+    if (depth is None or inp.pipeline_plan is not None
+            or kernel.attributes["expert_parallel_size"] != 1
+            or hardware.gpu_store_completion_scope != "l2"
+            or "dynamic_shared_memory_bytes" not in kernel.launch.parameters):
+        return inp
+    shared = kernel.launch.parameters["dynamic_shared_memory_bytes"]
+    tm, tn, tk = _tile(kernel)
+    panel = (tm + tn) * tk * _gpu_operand_element_bytes(kernel)
+    if shared != depth * panel or shared > hardware.max_smem_per_block_bytes:
+        return inp
+    if "registers_per_thread" in kernel.launch.parameters:
+        registers = kernel.launch.parameters["registers_per_thread"]
+        shared += kernel.launch.parameters["static_shared_bytes"]
+        if shared > hardware.max_smem_per_block_bytes:
+            raise ValueError("FUSED_MOE observed CTA exceeds block shared capacity")
+        warps = math.ceil(kernel.launch.block_size / hardware.parallel_width)
+        unit = hardware.register_allocation_unit_per_warp
+        registers_per_warp = math.ceil(registers * hardware.parallel_width / unit) * unit
+        residents = min(hardware.max_blocks_per_unit,
+            hardware.max_smem_per_unit_bytes // int(shared),
+            hardware.max_regs_per_unit // (warps * registers_per_warp),
+            hardware.max_threads_per_unit // kernel.launch.block_size,
+            hardware.max_warps_per_unit // warps)
+        if residents < 1:
+            raise ValueError("FUSED_MOE observed CTA exceeds unit capacity")
+    elif shared > hardware.max_smem_per_unit_bytes // 2:
+        # The shared allocation alone proves at most one CTA/SM. Older callers
+        # carry no register observation, so smaller allocations stay aggregate.
+        residents = 1
+    else:
+        return inp
+    if {d.resource_role for d in inp.compute_demands} != {"compute_tensor"}:
+        return inp
+    reads = tuple(path for path in inp.memory_paths if path.access_kind == "read")
+    writes = tuple(path for path in inp.memory_paths if path.access_kind == "write")
+    if len(writes) != 1 or writes[0].access_class_demands:
+        return inp
+    if len(reads) == 1 and reads[0].name == "operand_read":
+        # The gather binder already conserves and joins A/B requests, with
+        # their existing typed services. Reuse that exact ingress rather than
+        # discarding its evidence or requiring a second untyped merge.
+        merged = reads[0]
+    elif len(reads) == 2 and not any(path.access_class_demands for path in reads):
+        merged = merge_operand_read_paths(reads)
+    else:
+        return inp
+    _, _, k, n = _projection(kernel)
+    counts, _ = _routing(kernel)
+    tasks = len(_gpu_valid_tile_rows(kernel, counts)) * math.ceil(n / tn)
+    inp = dataclasses.replace(inp, memory_paths=(merged, *writes))
+    if not merged.access_class_demands:
+        inp = attach_async_copy_ring_capacity(inp, hardware,
+            read_path_name=merged.name, dtype=kernel.dtype, tile_m=tm, tile_k=tk,
+            panel_bytes=panel, buffer_slots=depth, resident_ctas_per_unit=residents,
+            k_tiles=math.ceil(k / tk))
+    output_relayout_bytes = 0.0
+    if "registers_per_thread" in kernel.launch.parameters:
+        per_task_bytes = observed_fused_moe_output_relayout_bytes(kernel, hardware)
+        if per_task_bytes is not None:
+            output_relayout_bytes = tasks * per_task_bytes
+            output_bytes = next(node.bytes for node in writes[0].nodes
+                                if node.resource_role == "l2_cache")
+            demand = dict(inp.demand_per_resource)
+            # build_forward_demand already counts two SMEM transfers per
+            # global byte. Keep its coarse operand proxy, replacing only the
+            # valid-output contribution by the source's full padded tile.
+            demand["smem"] += output_relayout_bytes - 2 * output_bytes
+            inp = dataclasses.replace(inp, demand_per_resource=demand,
+                limitations=inp.limitations + (
+                    "moe_output_full_tile_shared_relayout_before_global_store",
+                    "moe_output_conversion_and_shared_bank_barrier_services_unpriced",))
+    if depth == 1 and output_relayout_bytes == 0:
+        coarse = attach_single_panel_matmul_pipeline(inp, hardware,
+            task_count=tasks, dtype=kernel.dtype, tile_m=tm, tile_k=tk,
+            panel_bytes=tn * tk * _gpu_operand_element_bytes(kernel),
+            resident_ctas_per_unit=residents, row_stride_bytes=k * _gpu_operand_element_bytes(kernel),
+            read_path_name=merged.name, write_path_name=writes[0].name)
+        if coarse is not inp:
+            return coarse
+    inp = attach_recurrent_matmul_pipeline(inp, hardware,
+        task_count=tasks, k_tiles=math.ceil(k / tk), buffer_slots=depth,
+        read_path_name=merged.name, write_path_name=writes[0].name,
+        resident_ctas_per_unit=residents, output_relayout_bytes=output_relayout_bytes,
+        task_memory_bytes=_grouped_task_memory_bytes(kernel))
+    return dataclasses.replace(inp, limitations=inp.limitations + (
+        "moe_uniform_cta_worker_assignment_is_analytical",
+        "moe_resident_cta_lanes_share_unit_capacity_equally",
+        "moe_source_ordered_valid_rows_partition_operand_and_output_bytes",
+        "moe_task_downstream_cache_ratios_remain_aggregate_approximations",
+        "moe_store_retirement_at_l2_with_aggregate_dram_drain",
+    ))
 
 
 def _metax_grouped_operand_pipeline_envelope(
@@ -4875,6 +5059,42 @@ def _architecture_input(inp: PredictionInput, kernel: KernelSpec, hardware):
         raise ValueError(f"unknown kernel_memory_model: {memory_model!r}")
 
 
+def _apply_h200_fused_moe_w2_active_sm_clock(
+        inp: PredictionInput, kernel: KernelSpec, hardware) -> PredictionInput:
+    """Use the independent active clock only for its source launch domain."""
+
+    clock = hardware.h200_fused_moe_w2_active_sm_clock
+    if clock is None:
+        return inp
+    source = clock["source_launch"]
+    if (kernel.dtype != source["dtype"]
+            or kernel.variant != source["variant"]
+            or kernel.launch.algorithm != source["algorithm"]
+            or kernel.launch.block_size != source["threads_per_cta"]
+            or not source["grid_min"] <= kernel.launch.grid_size
+            <= source["grid_max"]
+            or _tile(kernel) != (
+                source["tile_m"], source["tile_n"], source["tile_k"])):
+        return inp
+    if any(kernel.shape[name] != source[name] for name in (
+            "experts", "hidden", "intermediate")):
+        return inp
+    params = kernel.launch.parameters
+    required = ("group_size_m", "dynamic_shared_memory_bytes")
+    if (not set(required).issubset(params)
+            or any(params[name] != source[name] for name in required)):
+        return inp
+    if kernel.shape["intermediate"] // source["tile_k"] != 12:
+        raise ValueError("H200 W2 clock scope disagrees with K rounds")
+    return dataclasses.replace(
+        inp,
+        sm_freq_hz=clock["sm_clock_hz"],
+        limitations=(*inp.limitations,
+                     "h200_modal_w2_active_sm_clock_provisional",
+                     "h200_w2_probe_register_routing_output_difference"),
+    )
+
+
 def _apply_metax_bm32_fused_moe_mma_occupancy(
         inp: PredictionInput, kernel: KernelSpec, hardware) -> PredictionInput:
     """Apply the independent C500 BM32 Tensor occupancy mechanism.
@@ -4965,6 +5185,9 @@ def _undeclared_grouped_operand_tile_class(
     return launch_class not in declared_classes
 
 
+_native_has_memory_access_class_service = HWSpec.has_memory_access_class_service
+
+
 def _attach_gpu_gather_service(
         inp: PredictionInput, kernel: KernelSpec, hardware,
         *, traffic: _GpuGroupedGemmTraffic, routed_rows: float,
@@ -4994,8 +5217,23 @@ def _attach_gpu_gather_service(
     full_group_services = (
         {} if nvidia_source_depth_service is not None
         else _gpu_full_group_operand_services(kernel, hardware))
+    has_service = hardware.has_memory_access_class_service
+    if (type(hardware) is HWSpec
+            and type(has_service) is MethodType
+            and has_service.__func__ is _native_has_memory_access_class_service
+            and has_service.__self__ is hardware
+            and type(hardware.memory_access_class_services) is tuple
+            and all(type(item) is MemoryAccessClassService
+                and type(item.service) is str
+                for item in hardware.memory_access_class_services)):
+        # These queries are nonempty source constants. The native method
+        # scans the same immutable records for every name; index them once
+        # for this construction only. Rebuild after any HWSpec mutation.
+        service_names = frozenset(
+            item.service for item in hardware.memory_access_class_services)
+        has_service = service_names.__contains__
     declared_grouped_service = any(
-        hardware.has_memory_access_class_service(service)
+        has_service(service)
         for service in (
             _GROUPED_OPERAND_SERVICE,
             _GROUPED_OPERAND_PIPELINE_SERVICE,
@@ -5123,9 +5361,9 @@ def _attach_gpu_gather_service(
         ))
     grouped_service = (
         combined_service is not None or split_services is not None)
-    legacy_service = hardware.has_memory_access_class_service(
+    legacy_service = has_service(
         "indirect_row_gather")
-    metax_fallback_family = hardware.has_memory_access_class_service(
+    metax_fallback_family = has_service(
         _METAX_GROUPED_OPERAND_LONG_K_SERVICE)
     if (declared_grouped_service and legacy_service
             and not metax_fallback_family):
@@ -5838,7 +6076,7 @@ def _dsv4_marlin_sm_count(kernel: KernelSpec, hardware):
     return int(sm_count)
 
 
-@lru_cache(maxsize=256)
+@runtime_lru_cache(maxsize=256)
 def _marlin_source_extra_partials(m_blocks, size_n, size_k, thread_k, thread_n, grid_blocks):
     """Two-tile Stream-K control only, not a selected native launch."""
     n_tiles, k_tiles = size_n // thread_n, size_k // thread_k
@@ -6615,8 +6853,9 @@ def _fp8_block_model(kernel: KernelSpec, hardware) -> Tuple[PredictionInput, flo
 
 
 def kimi_ep_marlin_logical_work(kernel: KernelSpec):
-    """Useful EP8 W4A16 matrices plus the complete unmasked SiLU source.
+    """Useful EP-off I shards or EP8 W4A16 matrices and unmasked SiLU.
 
+    EP-off retains all384 experts at the producer's actual local I. EP8
     DP/SP1 keeps token rows replicated while the linear expert map masks
     each rank's assignments. Ordinary (unclamped) apply_moe_activation still
     consumes every token/top-k row, including rows no local GEMM wrote.
@@ -6631,16 +6870,21 @@ def kimi_ep_marlin_logical_work(kernel: KernelSpec):
             or kernel.attributes["mathematical_program"] != "kimi_ep_marlin_swiglu_v1"
             or kernel.attributes["routed_weight_dtype"] != "int4"
             or kernel.attributes["weight_group_size"] != 32
-            or kernel.attributes["expert_parallel_size"] != 8
+            or kernel.attributes["expert_parallel_size"] not in (1, 8)
             or kernel.attributes["routed_scaling_factor"] != 1.0
             or kernel.attributes["swiglu_limit"] is not None
-            or (kernel.shape["experts"], kernel.shape["topk"], kernel.shape["hidden"],
-                kernel.shape["intermediate"]) != (384, 8, 7168, 2048)):
+            or (kernel.shape["experts"], kernel.shape["topk"], kernel.shape["hidden"]) != (384, 8, 7168)
+            or (kernel.attributes["expert_parallel_size"], kernel.shape["intermediate"]) not in (
+                (1, 2048), (1, 1024), (1, 512), (1, 256), (8, 2048))
+            or kernel.shape["intermediate"] in (512, 1024) and not HWSpec.source_contract_supported("kimi_grouped_marlin_source_math", kernel.hardware_id)
+            or kernel.shape["intermediate"] == 256 and not HWSpec.source_contract_supported("kimi_marlin_i256_source_math", kernel.hardware_id)):
         raise ValueError("Kimi EP Marlin work requires its exact unbound BF16/INT4 source program")
     tokens, topk, hidden, width = (kernel.shape[name] for name in ("tokens", "topk", "hidden", "intermediate"))
     counts, local = _routing(kernel)
     rank = kernel.attributes["expert_rank"]
-    owned = tuple(range(rank * 48, (rank + 1) * 48))
+    ep = kernel.attributes["expert_parallel_size"]
+    local_experts = 384 // ep
+    owned = tuple(range(rank * local_experts, (rank + 1) * local_experts))
     if (tuple(kernel.attributes["owned_experts"]) != owned or sum(counts) != tokens * topk
             or any(count > tokens for count in counts)
             or local != tuple(count if index in owned else 0 for index, count in enumerate(counts))):
@@ -6674,7 +6918,8 @@ def kimi_ep_marlin_logical_work(kernel: KernelSpec):
         "fp32_router_weight_uses": 4 * routed, "local_weighted_output": 2 * routed * hidden},
         tensor=2 * routed * width * hidden, scalar=routed * hidden)
     reduction = stage("map_aware_sum", {"local_intermediate_input": 2 * routed * hidden,
-        "int32_topk_id_uses": 4 * full_rows, "int32_expert_map_uses": 4 * full_rows,
+        "int32_topk_id_uses": 4 * full_rows if ep > 1 else 0,
+        "int32_expert_map_uses": 4 * full_rows if ep > 1 else 0,
         "bf16_output": 2 * tokens * hidden}, scalar=routed * hidden)
     return {"global_routed_rows": full_rows, "local_routed_rows": routed, "active_local_experts": active,
         "matrix_stages": (w13, w2), "activation": activation, "weighted_sum": reduction,
@@ -6689,12 +6934,78 @@ def kimi_ep_marlin_logical_work(kernel: KernelSpec):
             "callee_workspace_compiler_lifetimes_rounded_arithmetic_and_runtime_unbound")}
 
 
+def unquantized_bf16_experts_logical_work(kernel: KernelSpec):
+    """Useful BF16 expert stages; routing is an already supplied producer.
+
+    Reuse the ordinary typed matmul and SiLU work. Weights are read once per
+    active expert, never replaced by one shared dense matrix. This is not a
+    claim about native padding, backend choice or deployed launch geometry.
+    """
+    if (kernel.kind is not KernelKind.FUSED_MOE or kernel.variant != "routed_experts"
+            or not HWSpec.source_contract_supported("unbound_bf16_expert_source_math", kernel.hardware_id) or kernel.dtype != "bf16"
+            or kernel.attributes["mathematical_program"] not in (
+                "unquantized_bf16_swiglu_v1", "unquantized_bf16_grouped_swiglu_v1",
+                "unquantized_bf16_legacy_grouped_swiglu_v1")
+            or kernel.launch is not None or kernel.execution_support != "unsupported"):
+        raise ValueError("BF16 experts require their unbound H200 mathematical program")
+    tokens, topk, hidden, width = (kernel.shape[name] for name in ("tokens", "topk", "hidden", "intermediate"))
+    counts, local = _routing(kernel)
+    ep_size, rank = (kernel.attributes[name] for name in ("expert_parallel_size", "expert_rank"))
+    from src.kernel.kernel_spec import linear_expert_partition
+    owned = linear_expert_partition(kernel.shape["experts"], ep_size, rank)
+    if (tuple(kernel.attributes["owned_experts"]) != owned
+            or local != tuple(count if index in owned else 0 for index, count in enumerate(counts))
+            or sum(counts) != tokens * topk):
+        raise ValueError("BF16 experts require conserved assignments and exact linear ownership")
+    mapped = ep_size > 1
+    full_rows, routed = tokens * topk, sum(local)
+    legacy = kernel.attributes["mathematical_program"] == "unquantized_bf16_legacy_grouped_swiglu_v1"
+    matrices = []
+    for stage, k, n in (("w13", hidden, 2 * width), ("w2", width, hidden)):
+        work = tuple(_unquantized_matmul_math({"b": 1, "m": count, "n": n, "k": k},
+            "bf16", 2, stage) for count in local if count)
+        operands = tuple(operand for part in work for operand in part["operands"])
+        if legacy and full_rows > routed:
+            #0.11's expert_id==-1 branch runs inside both GEMMs. It writes
+            # zeros for valid nonlocal rows, then returns before A/B loads.
+            # W13 has2*I columns;W2 hasH. This is not0.30's full W2 prezero.
+            elements = (full_rows - routed) * n
+            operands += ({"role": stage + "_nonlocal_zero", "dtype": "bf16", "elements": elements,
+                "bytes": 2 * elements, "access": "write"},)
+        matrices.append({"stage": stage,
+            "mathematical_tensor_flops": sum(part["mathematical_tensor_flops"] for part in work),
+            "operands": operands, "logical_bytes": sum(operand["bytes"] for operand in operands)})
+    return {"routed_rows": routed, "active_experts": sum(count > 0 for count in local),
+        "matrix_stages": matrices, "quantization_inputs": (),
+        **_expert_swiglu_reduction_work(tokens, topk, hidden, width, routed, full_rows if mapped else routed, "bf16"),
+        #0.30 filters nonlocal assignments before W1/W2. It zeroes the
+        # entire routed output before W2; W1 does not initialize nonlocal
+        # activation rows. Count the real separate zero, including rows W2
+        # subsequently overwrites, rather than inventing per-GEMM zeros.
+        "output_initialization_bytes": 2 * full_rows * hidden if mapped and not legacy else 0,
+        "source_stage_order": ("w13", "silu_mul", *(("zero_output",) if mapped and not legacy else ()), "w2", "weighted_sum"),
+        "actual_provider_bound": False, "complete_source_service": False}
+
+
+def _expert_swiglu_reduction_work(tokens, topk, hidden, width, routed, vector_rows, dtype):
+    """Shared mathematical activation and FP32-route weighted output work."""
+    elements = vector_rows * width
+    return {"activation": {"elements": elements, "logical_bytes": 6 * elements,
+            "source_arithmetic": silu_source_arithmetic(elements, dtype, has_clamp=False),
+            "exp_operations": elements, "reciprocal_operations": 0},
+        "weighted_sum": {"multiply_flops": routed * hidden,
+            "addition_flops": tokens * (topk - 1) * hidden,
+            "logical_bytes": 2 * vector_rows * hidden + 4 * routed + 2 * tokens * hidden},
+        "routing_id_payload_read_bytes": 4 * tokens * topk,
+        "global_routed_rows": tokens * topk, "vector_rows": vector_rows}
+
+
 def block_fp8_experts_logical_work(kernel: KernelSpec):
     """Declared useful W13 -> SwiGLU -> W2 -> weighted sum program.
 
-    EP8 uses the explicitly declared mapped full-row program: nonlocal
-    projection rows are zero-written; activation, its quantizer and top-k
-    reduction still process all replicated assignment slots.
+    EP8 filters nonlocal assignment blocks. Activation and its quantizer
+    process every slot; the whole W2 output is zeroed before local writes.
+    Unwritten W1 activation values are not asserted to be initialized.
     Per-expert matmul operands are logical role uses, not measured DRAM or
     provider padding/metadata. Quantization reuses the independent source
     program; routing logits/selection remain a separate required producer.
@@ -6729,32 +7040,122 @@ def block_fp8_experts_logical_work(kernel: KernelSpec):
                     if name not in payload:
                         payload[name] = 0
                     payload[name] += value
-        if replicated_ep:
-            # The mapped Triton source writes zeros for nonlocal expert rows
-            # in each projection, then runs its full unmasked vector stages.
-            payload["nonlocal_zero_output"] = 2 * (full_rows - routed) * n
         matrices.append({"stage": stage, "mathematical_fp8_flops": 2 * routed * k * n,
             "payload_bytes": payload, "logical_bytes": sum(payload.values())})
     vector_rows = full_rows if replicated_ep else routed
-    elements = vector_rows * width
     return {"routed_rows": routed, "active_experts": sum(count > 0 for count in local),
         "matrix_stages": matrices,
         "quantization_inputs": ((tokens, hidden), (vector_rows, width)),
-        "activation": {"elements": elements, "logical_bytes": 6 * elements,
-            "source_arithmetic": silu_source_arithmetic(elements, kernel.dtype, has_clamp=False),
-            "exp_operations": elements, "reciprocal_operations": 0},
-        "weighted_sum": {"multiply_flops": routed * hidden,
-            "addition_flops": tokens * (topk - 1) * hidden,
-            "logical_bytes": 2 * vector_rows * hidden + 4 * routed + 2 * tokens * hidden},
-        "routing_id_payload_read_bytes": 4 * full_rows,
-        "global_routed_rows": full_rows, "vector_rows": vector_rows,
-        "source_stage_order": ("quantize_input", "w13", "silu_mul", "quantize_activated", "w2", "weighted_sum"),
+        **_expert_swiglu_reduction_work(tokens, topk, hidden, width, routed, vector_rows, kernel.dtype),
+        "output_initialization_bytes": 2 * full_rows * hidden if replicated_ep else 0,
+        "source_stage_order": ("quantize_input", "w13", "silu_mul", "quantize_activated",
+            *(("zero_output",) if replicated_ep else ()), "w2", "weighted_sum"),
         "actual_provider_bound": False, "complete_source_service": False,
         "limitations": ("useful_unpadded_mathematical_tensor_program_only",
             "per_expert_operand_role_payload_not_observed_DRAM_or_cache_traffic",
             "scale_application_cast_comparison_address_and_alignment_services_unpriced",
             "internal_allocation_workspace_padding_compiler_and_backend_unbound",
             "routing_probability_scale_already_in_weights_no_duplicate_output_scale")}
+
+
+def sglang0519_fp8_fused_shared_logical_work(kernel: KernelSpec):
+    """Declared0.5.19 CUTLASS useful math and role payloads, without launch.
+
+    Preserve the external256-expert histogram. The final routed column is
+    one shared expert with every token, constructed only inside this callee
+    work account. Quantization follows this caller's own unrounded CUDA JIT
+    source, not a vLLM quantizer identity or a different SGLang recipe.
+    """
+    if (kernel.kind is not KernelKind.FUSED_MOE or kernel.variant != "routed_experts"
+            or not HWSpec.source_contract_supported("sglang_0_5_19_symbolic_fused_shared_moe", kernel.hardware_id)
+            or kernel.dtype != "bf16" or kernel.launch is not None or kernel.execution_support != "unsupported"
+            or kernel.attributes["mathematical_program"] != "sglang_0_5_19_fp8_fused_shared_swiglu_v1"
+            or (kernel.shape["experts"], kernel.shape["topk"], kernel.shape["hidden"], kernel.shape["intermediate"]) != (256, 8, 7168, 256)
+            or kernel.attributes["expert_parallel_size"] != 1 or kernel.attributes["expert_rank"] != 0
+            or kernel.attributes["routed_weight_dtype"] != "fp8" or kernel.attributes["weight_group_size"] != 0
+            or kernel.attributes["fused_shared_experts"] != 1 or kernel.attributes["routed_scaling_factor"] != 1.0
+            or kernel.attributes["swiglu_limit"] is not None):
+        raise ValueError("SGLang0.5.19 experts require their exact no-launch fused-shared source program")
+    tokens, hidden, width = (kernel.shape[name] for name in ("tokens", "hidden", "intermediate"))
+    counts, local = _routing(kernel)
+    if (counts != local or tuple(kernel.attributes["owned_experts"]) != tuple(range(256))
+            or sum(counts) != tokens * 8 or any(count > tokens for count in counts)):
+        raise ValueError("SGLang routed histogram must retain256 conserved distinct-expert assignments")
+    expert_rows = (*counts, tokens)
+    routes = tokens * 9
+    stages = []
+
+    def stage(name, payload, *, fp8_flops=0, scalar=0, sfu=0):
+        demand = {role: 0 for role in ("compute_tensor", "compute_vector", "compute_reduction",
+            "compute_fma", "compute_sfu", "compute_alu")}
+        demand.update(compute_fma=scalar, compute_sfu=sfu)
+        value = {"stage": name, "payload_bytes": payload, "logical_bytes": sum(payload.values()),
+            "mathematical_fp8_flops": fp8_flops, "demand": demand}
+        stages.append(value)
+        return value
+
+    def quantize(name, rows, columns):
+        elements = rows * columns
+        groups = elements // 128
+        # CUDA JIT source: raw_scale=amax*(1/448), quant_scale=448/amax,
+        # followed by one value multiply. Abs/max/cast/clamp stay unpriced.
+        value = stage(name, {"bf16_input": 2 * elements, "fp8_output": elements,
+            "fp32_scale_output": 4 * groups}, scalar=elements + 2 * groups)
+        value.update(elements=elements, groups=groups, source_group_size=128,
+            source_scale_ue8m0=False, source_column_major=False, source_fuse_silu=False,
+            source_masked_m=None)
+        return value
+
+    stage("prepare_route_maps", {"int32_topk_ids": 4 * routes,
+        "int32_input_map": 4 * routes, "int32_output_map": 4 * routes})
+    quantize("quantize_input", tokens, hidden)
+    shuffle = stage("shuffle_input_and_scales", {"fp8_input_row_uses": routes * hidden,
+        "fp8_shuffled_output": routes * hidden, "fp32_scale_row_uses": 4 * routes * (hidden // 128),
+        "fp32_shuffled_scales": 4 * routes * (hidden // 128), "int32_input_map": 4 * routes})
+    shuffle["source_requested_map_bytes"] = 4 * routes * -(-hidden // 4096)
+    for name, reduction, columns in (("w13", hidden, 2 * width), ("w2", width, hidden)):
+        payload = {}
+        for count in expert_rows:
+            if count:
+                operands, scales = _block_fp8_matmul_payloads(1, count, columns, reduction)
+                for role, amount in {**operands, **scales}.items():
+                    if role not in payload:
+                        payload[role] = 0
+                    payload[role] += amount
+        stage(name, payload, fp8_flops=2 * routes * reduction * columns)
+        if name == "w13":
+            elements = routes * width
+            common = silu_source_arithmetic(elements, kernel.dtype, has_clamp=False)
+            # This JIT source has no runtime alpha/beta multiply/add. Reuse
+            # the common primitives, removing those two absent operations.
+            arithmetic = {**common,
+                "mathematical_primitives": {**common["mathematical_primitives"],
+                    "fp32_multiply": elements, "fp32_add": elements},
+                "baseline_demand": {**common["baseline_demand"],
+                    "compute_fma": common["baseline_demand"]["compute_fma"] - 2 * elements},
+                "source_expression": "(gate / (1 + exp(-gate))) * up"}
+            activation = stage("silu_mul", {"gate_up_input": 4 * elements,
+                "activated_output": 2 * elements}, scalar=arithmetic["baseline_demand"]["compute_fma"],
+                sfu=arithmetic["baseline_demand"]["compute_sfu"])
+            activation.update(elements=elements, source_arithmetic=arithmetic)
+            quantize("quantize_activated", routes, width)
+    stage("router_weight_cast", {"fp32_weights": 4 * routes, "bf16_weights": 2 * routes})
+    stage("shuffle_weighted_sum", {"bf16_expert_output": 2 * routes * hidden,
+        "bf16_router_weights": 2 * routes, "bf16_result": 2 * tokens * hidden,
+        "int32_output_map": 4 * routes}, scalar=2 * routes * hidden)
+    return {"routed_histogram": counts, "routed_rows": tokens * 8, "shared_rows": tokens,
+        "expert_rows": expert_rows, "effective_topk": 9, "all_expert_rows": routes,
+        "source_stage_order": tuple(item["stage"] for item in stages), "stages": tuple(stages),
+        "logical_bytes": sum(item["logical_bytes"] for item in stages),
+        "actual_provider_bound": False, "complete_source_service": False,
+        "limitations": ("exact_declared_sglang0519_cutlass_caller_math_not_actual_provider",
+            "useful_unpadded_FP8_matrix_work_not_issued_MMA_or_runtime_allocation",
+            "per_expert_role_payload_not_observed_DRAM_or_cache_traffic",
+            "quant_abs_max_shuffle_conversion_clamp_address_and_PDL_services_unpriced",
+            "logical_map_role_footprints_not_replayed_lane_loads_or_observed_DRAM",
+            "integer_offsets_problem_descriptors_scratch_compiler_and_native_launch_unbound",
+            "weight_scale_application_and_finite_precision_services_unpriced",
+            "FP32_router_weights_materialize_BF16_before_weighted_sum_not_a_second_output_scale")}
 
 
 def kimi_k3_marlin_expert_logical_work(kernel: KernelSpec):
@@ -6828,11 +7229,57 @@ def kimi_k3_marlin_expert_logical_work(kernel: KernelSpec):
     }
 
 
+def kimi_k3_marlin_expert_roofline_work(kernel: KernelSpec):
+    source = kimi_k3_marlin_expert_logical_work(kernel)
+    routed, active = source["routed_rows"], source["active_experts"]
+    tokens, topk = kernel.shape["tokens"], kernel.shape["topk"]
+    hidden, intermediate = kernel.shape["hidden"], kernel.shape["intermediate"]
+    operands = {operand["role"]: operand for operand in source["operands"]}
+
+    def demand(tensor=0, fma=0, sfu=0):
+        return {"compute_tensor": float(tensor), "compute_vector": 0.0,
+                "compute_reduction": 0.0, "compute_fma": float(fma),
+                "compute_sfu": float(sfu), "compute_alu": 0.0}
+
+    def stage(name, roles, stage_demand):
+        return {"stage": name, "demand": stage_demand,
+                "logical_bytes": sum(operands[role]["bytes"] for role in roles)}
+
+    activation_values = routed * intermediate
+    stages = (
+        stage("route_alignment", ("topk_ids",), demand()),
+        stage("w13", ("latent_per_route", "w13_active_weights", "w13_active_scales", "w13_output"),
+              demand(tensor=4 * routed * hidden * intermediate,
+                     fma=4 * active * hidden * intermediate)),
+        stage("situ_and_mul", ("situ_input", "situ_output"),
+              demand(fma=8 * activation_values, sfu=3 * activation_values)),
+        stage("weighted_w2", ("w2_input", "w2_active_weights", "w2_active_scales",
+                              "topk_weights", "weighted_w2_output"),
+              demand(tensor=2 * routed * hidden * intermediate,
+                     fma=2 * active * hidden * intermediate + routed * hidden)),
+        stage("topk_sum", ("combine_input", "combined_latent"),
+              demand(fma=routed * hidden)),
+    )
+    return {"stages": stages, "logical_bytes": sum(item["logical_bytes"] for item in stages),
+            "source": source["source"], "source_stages": source["source_stages"],
+            "tensor_flops_live": source["tensor_flops_live"],
+            "dequantization_math": "two_BF16_multiplies_per_active_weight_value_once",
+            "topk_source_additions": routed * hidden,
+            "topk_minimal_additions": tokens * hidden * (topk - 1),
+            "price_composition": "sum_serial_stage_rooflines",
+            "limitations": source["limitations"] + (
+                "active_weight_dequantization_math_excludes_M_padding_reloads_and_native_issue_services",
+                "public_role_bytes_and_live_math_are_an_analytical_lower_bound_not_native_latency_acceptance")}
+
+
 def _model(
         kernel: KernelSpec, hardware, *, attach_pipeline: bool = True,
         ) -> Tuple[PredictionInput, float]:
+    if (kernel.variant == "routed_experts" and "mathematical_program" in kernel.attributes
+            and kernel.attributes["mathematical_program"] == "sglang_0_5_19_fp8_fused_shared_swiglu_v1"):
+        raise NotImplementedError("SGLang0.5.19 mathematical experts have no native launch/resource schedule")
     if kernel.variant == "kimi_k3_marlin_experts":
-        raise NotImplementedError("K3 Marlin SiTU compiler services and alignment/scratch traffic remain unbound")
+        raise NotImplementedError("K3 Marlin native launch and resource schedule remain unbound")
     _validate_expert_parallel_launch(kernel)
     if kernel.variant.lower() == "routed_experts":
         return _routed_experts_model(kernel, hardware)
@@ -6870,18 +7317,17 @@ def _model(
 
     routed_rows = float(sum(local_counts))
     if cann_tensor_work is None:
-        tile_m, tile_n, _ = _tile(kernel)
-        populated_m_tiles = sum(
-            math.ceil(count / tile_m)
-            for count in local_counts if count > 0)
+        tile_m, tile_n, tile_k = _tile(kernel)
+        populated_m_tiles = len(_gpu_valid_tile_rows(kernel, local_counts))
         # Triton masks operand loads and output stores at the logical M/N
         # boundaries, but tl.dot still issues the complete tile.  Price the
         # physical MMA fragments rather than only the unpadded routed rows.
+        # Masked K-tail loads supply zeros but still execute a complete dot.
         tensor_flops = float(
             2
             * populated_m_tiles
             * tile_m
-            * projection_k
+            * (math.ceil(projection_k / tile_k) * tile_k)
             * math.ceil(projection_n / tile_n)
             * tile_n)
     else:
@@ -6896,9 +7342,17 @@ def _model(
     }
     validated_l2_miss_rate(dram_bytes, l2_total)
     demand = build_forward_demand(l2_total, dram_bytes, False, flops)
+    active_workgroups = None
+    if memory_model == "gpu_mshr":
+        # max-EM reserves expert padding that need not be populated. Triton
+        # returns before operand loads/MMA/stores beyond num_tokens_post_padded.
+        # Use the same actual routing census as traffic and tensor work for
+        # capacity; retain the original physical launch in PredictionInput.
+        global_counts, _ = _routing(kernel)
+        active_workgroups = len(_gpu_valid_tile_rows(kernel, global_counts)) * math.ceil(projection_n / tile_n)
     eta, wave_efficiency, active_units = (
         launch_wave_geometry(
-            kernel, hardware)
+            kernel, hardware, active_workgroups=active_workgroups)
     )
     dram_efficiency = hardware.dram_protocol_efficiency_l1cached
     if memory_model == "npu_tile":
@@ -6937,7 +7391,12 @@ def _model(
             "moe_physical_worker_assignment_unavailable",
             "moe_l2_residency_order_unavailable",
             "moe_load_compute_store_buffer_lifecycle_unavailable",
+            "moe_early_return_metadata_service_unmodeled",
         )
+        if _gpu_uses_naive_assignment(kernel):
+            limitations += (
+                "moe_naive_assignment_preserves_one_matrix_tile_per_route",
+                "moe_naive_token_order_expert_ids_unbound_compulsory_dram_lower_bound",)
     else:
         raise AssertionError(
             f"unhandled FUSED_MOE memory model: {memory_model!r}")
@@ -7014,6 +7473,8 @@ def _model(
         limitations=limitations,
     )
     normalized = _architecture_input(inp, kernel, hardware)
+    normalized = _apply_h200_fused_moe_w2_active_sm_clock(
+        normalized, kernel, hardware)
     if memory_model != "gpu_mshr":
         raise AssertionError(
             f"unhandled FUSED_MOE memory model: {memory_model!r}")
@@ -7037,6 +7498,38 @@ def _model(
             raise AssertionError("GPU grouped-GEMM traffic is missing")
         structured = _split_gpu_grouped_gemm_memory_paths(
             structured, gpu_traffic)
+        tm, tn, tk = _tile(kernel)
+        depth = kernel.launch.tiling.pipeline_depth
+        parameters = kernel.launch.parameters
+        valid_rows = _gpu_valid_tile_rows(kernel, global_counts)
+        if (depth is not None and valid_rows
+                and all(1 <= row <= tm for row in valid_rows)
+                and "dynamic_shared_memory_bytes" in parameters
+                and parameters["dynamic_shared_memory_bytes"]
+                == depth * (tm + tn) * tk * _gpu_operand_element_bytes(kernel)):
+            structured = attach_finite_async_copy_progress_floor(
+                structured, hardware, read_path_name="weight_read",
+                dtype=kernel.dtype, tile_m=tm, tile_k=tk,
+                panel_bytes=tn * tk * _gpu_operand_element_bytes(kernel),
+                buffer_slots=depth,
+                row_stride_bytes=projection_k * _gpu_operand_element_bytes(kernel))
+            service_name = (f"coalesced_async_copy_threads{kernel.launch.block_size}"
+                f"_slots{depth}_b{tn*tk*_gpu_operand_element_bytes(kernel)}_fanout1")
+            if (kernel.attributes["expert_parallel_size"] == 1
+                    and not _gpu_uses_naive_assignment(kernel)
+                    and parameters["dynamic_shared_memory_bytes"] > hardware.max_smem_per_unit_bytes/2
+                    and any(s.service == service_name for s in hardware.memory_access_class_services)):
+                requesting, unique, maximum = _compulsory_weight_request_topology(
+                    local_counts, tile_m=tm, tile_n=tn,
+                    projection_k=projection_k,projection_n=projection_n,
+                    element_bytes=_gpu_operand_element_bytes(kernel),
+                    group_size_m=int(parameters["group_size_m"]),
+                    wave_width=int(hardware.num_compute_units))
+                structured = attach_coalesced_async_copy_progress_floor(
+                    structured,hardware,read_path_name="weight_read",dtype=kernel.dtype,
+                    tile_m=tm,tile_k=tk,panel_bytes=tn*tk*_gpu_operand_element_bytes(kernel),
+                    buffer_slots=depth,row_stride_bytes=projection_k*_gpu_operand_element_bytes(kernel),
+                    requesting_B_bytes=requesting,unique_B_bytes=unique,maximum_fanout=maximum)
         if routed_rows > 0:
             structured = _attach_gpu_gather_service(
                 structured,
@@ -7048,11 +7541,11 @@ def _model(
                 projection_n=projection_n,
                 element_bytes=_gpu_operand_element_bytes(kernel),
             )
-    structured = dataclasses.replace(
-        structured,
-        pipeline_plan=pipeline_plan,
-        phase_ledger=_grouped_matmul_phase_ledger(structured),
-    )
+    structured = dataclasses.replace(structured, pipeline_plan=pipeline_plan)
+    if pipeline_plan is None:
+        structured = _attach_resident_operand_pipeline(structured, kernel, hardware)
+    structured = dataclasses.replace(structured,
+        phase_ledger=_grouped_matmul_phase_ledger(structured))
     return structured, compulsory
 
 
@@ -7064,7 +7557,30 @@ class FusedMoEPredictor(KernelPredictor):
         self._cached_resource_hardware = None
         self._cached_resource_value = None
 
+    def analytical_without_launch(self, kernel: KernelSpec, hardware):
+        if (kernel.variant == "routed_experts" and "mathematical_program" in kernel.attributes
+                and kernel.attributes["mathematical_program"] == "sglang_0_5_19_fp8_fused_shared_swiglu_v1"):
+            return dataclasses.replace(self.roofline_without_launch(kernel, hardware),
+                bottleneck_group="analytical_sglang_source")
+        if (kernel.variant == "kimi_k3_marlin_experts"
+                or (kernel.variant == "routed_experts" and "mathematical_program" in kernel.attributes)):
+            prediction = self.roofline_without_launch(kernel, hardware)
+            return dataclasses.replace(prediction, bottleneck_group="analytical_marlin_source")
+        return super().analytical_without_launch(kernel, hardware)
+
     def resource_input(self, kernel: KernelSpec, hardware):
+        if (kernel.variant == "routed_experts" and "mathematical_program" in kernel.attributes
+                and kernel.attributes["mathematical_program"] == "sglang_0_5_19_fp8_fused_shared_swiglu_v1"):
+            raise NotImplementedError("SGLang0.5.19 mathematical experts have no native launch/resource schedule")
+        if (kernel.variant == "routed_experts" and "mathematical_program" in kernel.attributes
+                and kernel.attributes["mathematical_program"] == "kimi_ep_marlin_swiglu_v1"):
+            raise NotImplementedError("Kimi mathematical expert shards have no native launch/resource schedule")
+        from src.kernel.prediction_cache import _retain_public_resource_input
+        value = _routed_public_resource_input(self, kernel, hardware)
+        _retain_public_resource_input(kernel, hardware, value)
+        return value
+
+    def _source_resource_input(self, kernel: KernelSpec, hardware):
         from src.kernel.memory_fused_moe import has_fused_moe_source, fused_moe_source_work
         from src.kernel.memory_fused_moe import has_native_grouped_moe_analytical_work
         from src.kernel.memory_fused_moe_fp8 import has_fp8_fused_moe_source, fp8_fused_source_demands
@@ -7120,6 +7636,19 @@ class FusedMoEPredictor(KernelPredictor):
 
     def roofline_without_launch(self, kernel: KernelSpec, hardware):
         if kernel.variant == "routed_experts" and "mathematical_program" in kernel.attributes:
+            if kernel.attributes["mathematical_program"] == "sglang_0_5_19_fp8_fused_shared_swiglu_v1":
+                work = sglang0519_fp8_fused_shared_logical_work(kernel)
+                bandwidth = float(hardware.resource_by_role("dram").capacity)
+                fp8_capacity = float(hardware.resource_by_role("compute_tensor_fp8").capacity)
+                times = {part["stage"]: (max(part["mathematical_fp8_flops"] / fp8_capacity,
+                    part["logical_bytes"] / bandwidth) if part["mathematical_fp8_flops"] else
+                    roofline_ns(part["demand"], hardware, part["logical_bytes"]) * 1e-9)
+                    for part in work["stages"]}
+                prediction = prediction_from_ns(sum(times.values()) * 1e9, "roofline")
+                return dataclasses.replace(prediction, t_per_group=times,
+                    diagnostics=PredictionDiagnostics(compute_time_s={}, memory=(), memory_access_classes=(),
+                        memory_arbitration=(), pipeline=None, critical_path=work["source_stage_order"],
+                        support_level="partial", limitations=work["limitations"]))
             if kernel.attributes["mathematical_program"] == "dsv4_mxfp4_w4a16_swiglu_v1":
                 work = dsv4_marlin_moe_source_work(kernel)
                 if (HWSpec.source_contract_supported("aggregate_gpu_source_roofline", hardware.hardware_id)
@@ -7141,7 +7670,9 @@ class FusedMoEPredictor(KernelPredictor):
                 work = kimi_ep_marlin_logical_work(kernel)
                 return prediction_from_ns(sum(roofline_ns(part["demand"], hardware, part["logical_bytes"])
                     for part in work["stages"]), "roofline")
-            work = block_fp8_experts_logical_work(kernel)
+            bf16 = kernel.attributes["mathematical_program"] in ("unquantized_bf16_swiglu_v1",
+                "unquantized_bf16_grouped_swiglu_v1", "unquantized_bf16_legacy_grouped_swiglu_v1")
+            work = unquantized_bf16_experts_logical_work(kernel) if bf16 else block_fp8_experts_logical_work(kernel)
             vector = VectorPredictor()
             seconds = 0.0
             for rows, columns in work["quantization_inputs"]:
@@ -7152,8 +7683,10 @@ class FusedMoEPredictor(KernelPredictor):
                     launch=None, execution_support="unsupported", unsupported_reason="launch_selector_unavailable")
                 seconds += vector.roofline_without_launch(quant, hardware).t_total_s
             bandwidth = float(hardware.resource_by_role("dram").capacity)
+            seconds += work["output_initialization_bytes"] / bandwidth
             for stage in work["matrix_stages"]:
-                seconds += max(stage["mathematical_fp8_flops"] / float(hardware.resource_by_role("compute_tensor_fp8").capacity),
+                seconds += max(stage["mathematical_tensor_flops" if bf16 else "mathematical_fp8_flops"]
+                    / float(hardware.resource_by_role("compute_tensor" if bf16 else "compute_tensor_fp8").capacity),
                     stage["logical_bytes"] / bandwidth)
             demand = {role: 0 for role in ("compute_tensor", "compute_vector", "compute_reduction", "compute_fma", "compute_sfu", "compute_alu")}
             activation = work["activation"]
@@ -7166,13 +7699,53 @@ class FusedMoEPredictor(KernelPredictor):
                 reduction["logical_bytes"] + work["routing_id_payload_read_bytes"]) * 1e-9
             return prediction_from_ns(seconds * 1e9, "roofline")
         if kernel.variant == "kimi_k3_marlin_experts":
-            kimi_k3_marlin_expert_logical_work(kernel)
-            raise NotImplementedError("K3 Marlin SiTU compiler services and alignment/scratch traffic remain unbound")
+            work = kimi_k3_marlin_expert_roofline_work(kernel)
+            return prediction_from_ns(sum(roofline_ns(stage["demand"], hardware,
+                stage["logical_bytes"]) for stage in work["stages"]), "roofline")
         return super().roofline_without_launch(kernel, hardware)
 
     def midlayer(self, kernel: KernelSpec, hardware):
-        if kernel.variant == "routed_experts" and kernel.attributes["swiglu_limit"] is not None:
-            raise NotImplementedError("clamped routed experts supports Roofline only")
+        if (kernel.variant == "routed_experts" and kernel.attributes["swiglu_limit"] is not None
+                and kernel.attributes["expert_parallel_size"] == 1):
+            work = dsv4_marlin_moe_roofline_work(kernel, hardware)
+            limitations = (
+                "v4_marlin_M_padded_tensor_live_scalar_serial_roofline_only",
+                "declared_routing_not_checkpoint_assignment",
+                "marlin_integer_atomic_metadata_consumer_scratch_unbound",
+                "marlin_dequantization_compiler_and_provider_services_unbound",
+                "bf16_router_weight_math_counted_packed_multiply_and_conversion_service_unpriced",
+                "logical_stages_share_one_declared_aggregate_launch_boundary")
+            formula = PerformanceFormula(hardware)
+            stages = []
+            for stage in work["stages"]:
+                total = sum(stage["read_write_bytes"].values())
+                demand = build_forward_demand(total, total, False, stage["demand"])
+                inp = build_aggregate_gpu_input(kernel, hardware, demand,
+                    write_l2_bytes=stage["read_write_bytes"]["write"],
+                    write_dram_bytes=stage["read_write_bytes"]["write"],
+                    limitations=limitations)
+                stages.append((stage["stage"], formula.predict_kernel(dataclasses.replace(
+                    _with_graph_regime(inp, kernel), include_dispatch_overhead=False))))
+            aggregate_inp = _with_graph_regime(self.resource_input(kernel, hardware)[0], kernel)
+            aggregate_execution = formula.predict_kernel(dataclasses.replace(
+                aggregate_inp, include_dispatch_overhead=False))
+            aggregate_full = formula.predict_kernel(aggregate_inp)
+            launch_seconds = max(0.0, aggregate_full.t_total_s - aggregate_execution.t_total_s)
+            aggregate_launch = dataclasses.replace(aggregate_full,
+                t_total_s=launch_seconds,
+                t_per_group={"aggregate_launch": launch_seconds},
+                bottleneck_group="aggregate_launch",
+                t_per_resource={"aggregate_launch": launch_seconds},
+                diagnostics=dataclasses.replace(aggregate_full.diagnostics,
+                    compute_time_s={},
+                    memory=(),
+                    memory_access_classes=(),
+                    memory_arbitration=(),
+                    pipeline=None,
+                    critical_path=("aggregate_launch",),
+                    limitations=aggregate_full.diagnostics.limitations + (
+                        "aggregate_launch_boundary_is_exposed_increment_not_another_physical_kernel",)))
+            return sum_serial_kernel_predictions((("aggregate_launch", aggregate_launch), *stages))
         inp, _ = self.resource_input(kernel, hardware)
         return PerformanceFormula(hardware).predict_kernel(
             _with_graph_regime(inp, kernel))
@@ -7224,6 +7797,9 @@ def _expert_axis_class(counts, owned_experts):
     of its experts stayed empty, and the multiset of the counts outside it.
     """
 
+    if not owned_experts:
+        return (0, -1, (), 0, tuple(sorted((count for count in counts if count), reverse=True)),
+            sum(count == 0 for count in counts))
     shard_first = owned_experts[0]
     shard_last = owned_experts[-1]
     if shard_last - shard_first != len(owned_experts) - 1:
@@ -7322,3 +7898,347 @@ def prediction_equivalence_attributes(kernel: KernelSpec):
         tuple(attributes["owned_experts"]),
     )
     return equivalence
+
+
+class _RoutedHardwareData:
+    """Retain every native HW data edge, including nested configuration data."""
+
+    def __init__(self, hardware):
+        from src.kernel.hardware_spec import Resource, ResourceGroup
+        from src.kernel.model_contract import MemoryAccessClassSignature
+        allowed = (HWSpec, Resource, ResourceGroup, MemoryAccessClassService,
+            MemoryAccessClassSignature)
+        self.rows, self.records, self.supported = [], [], True
+        seen, pending = set(), [hardware]
+        while pending:
+            value = pending.pop()
+            kind = type(value)
+            if kind in (str, int, float, bool, bytes, type(None)):
+                continue
+            if id(value) in seen:
+                continue
+            seen.add(id(value))
+            if kind is dict:
+                keys, values = tuple(value), tuple(value.values())
+                self.rows.append((value, kind, keys, values))
+                pending.extend(keys)
+                pending.extend(values)
+            elif kind is list:
+                self.rows.append((value, kind, (), tuple(value)))
+                pending.extend(value)
+            elif kind is tuple:
+                pending.extend(value)
+            elif kind in allowed:
+                state = vars(value)
+                self.records.append((value, kind, state))
+                pending.append(state)
+            else:
+                self.supported = False
+                break
+
+    def unchanged(self):
+        if not self.supported:
+            return False
+        for value, kind, state in self.records:
+            if type(value) is not kind or vars(value) is not state:
+                return False
+        for value, kind, keys, values in self.rows:
+            if type(value) is not kind or len(value) != len(values):
+                return False
+            if kind is dict:
+                if (any(actual is not old for actual, old in zip(value, keys))
+                        or any(actual is not old for actual, old in zip(value.values(), values))):
+                    return False
+            elif any(actual is not old for actual, old in zip(value, values)):
+                return False
+        return True
+
+
+def _routed_source_constant(value, active=()):
+    """Snapshot native mutable source constants/defaults without object repr."""
+    from enum import Enum
+    from types import MappingProxyType
+    kind = type(value)
+    if kind in (str, int, bool, bytes, type(None)):
+        return kind, value
+    if kind is float:
+        return kind, value.hex()
+    if value is Ellipsis or value is dataclasses.MISSING or value is dataclasses._HAS_DEFAULT_FACTORY:
+        # Generated dataclass constructors use these only as identity tokens.
+        return kind, id(value)
+    if isinstance(value, type):
+        return type, value
+    if any(value is parent for parent in active):
+        raise TypeError("cyclic routed source dependency")
+    active = (*active, value)
+    if isinstance(value, Enum):
+        return kind, _routed_source_constant(vars(value), active)
+    if kind in (dict, MappingProxyType):
+        return kind, tuple((_routed_source_constant(key, active), _routed_source_constant(item, active))
+            for key, item in value.items())
+    if kind in (tuple, list):
+        return kind, tuple(_routed_source_constant(item, active) for item in value)
+    if kind in (set, frozenset):
+        return kind, frozenset(_routed_source_constant(item, active) for item in value)
+    raise TypeError("unsupported mutable routed source dependency")
+
+
+class _RoutedPublicSource:
+    """Canonical Python bindings, functions and descriptor layouts for reuse.
+
+    A changed source disables this optimization, rather than granting the new
+    implementation the old expert-axis equivalence proof.
+    """
+
+    def __init__(self):
+        from importlib import import_module
+        from functools import cached_property
+        from types import FunctionType
+        self.modules = tuple(import_module(name) for name in (
+            __name__, "src.kernel.predictors.common", "src.kernel.hardware_spec",
+            "src.kernel.kernel_spec", "src.kernel.model_contract",
+            "src.kernel.launch_config.launch_config", "src.kernel.launch_config.tiling_spec",
+            "src.kernel.launch_config.fused_moe_tiling",
+            "src.kernel.memory_access", "src.kernel.memory_access_builder",
+            "src.kernel.memory_fused_moe", "src.kernel.memory_routed_moe",
+            "src.kernel.memory_fused_moe_naive",
+            "src.kernel.memory_moe_alignment", "src.kernel.memory_path_solver")) + fused_moe_output_relayout_sources()
+        self.namespaces = ()
+        self.classes, self.functions = [], []
+        classes, functions = set(), set()
+        for module in self.modules:
+            for value in vars(module).values():
+                if isinstance(value, type):
+                    classes.update(value.__mro__)
+                elif type(value) is FunctionType:
+                    functions.add(value)
+        for cls in classes:
+            self.classes.append((cls, cls.__mro__, self._class_members(cls)))
+            for member in vars(cls).values():
+                if isinstance(member, (classmethod, staticmethod)):
+                    member = member.__func__
+                elif isinstance(member, property):
+                    functions.update(f for f in (member.fget, member.fset, member.fdel)
+                        if type(f) is FunctionType)
+                elif isinstance(member, cached_property):
+                    member = member.func
+                if type(member) is FunctionType:
+                    functions.add(member)
+        pending = list(functions)
+        while pending:
+            function = pending.pop()
+            if "__wrapped__" in vars(function):
+                wrapped = vars(function)["__wrapped__"]
+                if type(wrapped) is FunctionType and wrapped not in functions:
+                    functions.add(wrapped)
+                    pending.append(wrapped)
+        self.functions = tuple((function, function.__code__, function.__defaults__,
+            None if function.__kwdefaults__ is None else dict(function.__kwdefaults__))
+            for function in functions)
+        self.defaults, self.unsupported_defaults = [], []
+        for function in functions:
+            # Imported ABC methods (for example MutableMapping.pop) are not
+            # called by the routed builder; their opaque stdlib sentinels do
+            # not become dependencies of this source-specific reuse proof.
+            if not function.__module__.startswith("src.kernel."):
+                continue
+            try:
+                snapshot = _routed_source_constant((function.__defaults__, function.__kwdefaults__))
+            except TypeError:
+                self.unsupported_defaults.append(function.__qualname__)
+            else:
+                self.defaults.append((function, snapshot))
+        # Mutable semantic reads in this exact routed source path. Other
+        # fused/common pipeline tables are outside the admitted branch. These
+        # dtype, identity and service-schema tables affect constructors and
+        # validation even when no final traffic quantity reads them directly.
+        from src.kernel import hardware_spec, kernel_spec, memory_access, model_contract
+        self.constants = tuple((module, name, _routed_source_constant(vars(module)[name]))
+            for module, names in ((hardware_spec, ("_SOURCE_CONTRACT_HARDWARE",)),
+                (kernel_spec, ("DTYPE_BYTES",)),
+                (memory_access, ("_SOURCE_IDENTITY_FIELDS",)),
+                (model_contract, ("TYPED_COMPUTE_SERVICES_BY_ROLE", "_TYPED_COMPUTE_SERVICES",
+                    "COMPUTE_EXACT_REQUEST_SERVICES_BY_ROLE", "_COMPUTE_EXACT_REQUEST_SERVICES",
+                    "MEMORY_EXACT_REQUEST_SERVICES_BY_ROLE"))) for name in names)
+
+    @staticmethod
+    def _class_members(cls):
+        members = dict(vars(cls))
+        if "__slotnames__" in members:
+            if type(members["__slotnames__"]) is not list or members["__slotnames__"]:
+                return None
+            del members["__slotnames__"]
+        return members
+
+    def seal(self):
+        self.namespaces = tuple((module, self._namespace(module)) for module in self.modules)
+
+    @staticmethod
+    def _namespace(module):
+        # These tokens memoize the source inspection itself. Their issuer's
+        # function and every inspected namespace remain guarded separately.
+        ignored = ("_default_source_epoch", "_default_source_rule", "_source_binding_epoch",
+            "_source_recipe_signature", "_source_recipe_epoch")
+        return {name: value for name, value in vars(module).items()
+            if module.__name__ != "src.kernel.memory_access_builder" or name not in ignored}
+
+    def unchanged(self):
+        if self.unsupported_defaults:
+            return False
+        try:
+            data_unchanged = (all(_routed_source_constant((function.__defaults__,
+                    function.__kwdefaults__)) == snapshot for function, snapshot in self.defaults)
+                and all(name in vars(module) and _routed_source_constant(vars(module)[name]) == snapshot
+                    for module, name, snapshot in self.constants))
+        except TypeError:
+            return False
+        return (data_unchanged and all(len(self._namespace(module)) == len(old)
+                and all(name in vars(module) and vars(module)[name] is value
+                    for name, value in old.items()) for module, old in self.namespaces)
+            and all(cls.__mro__ == mro and self._class_members(cls) == members
+                for cls, mro, members in self.classes)
+            and all(function.__code__ is code and function.__defaults__ is defaults
+                and function.__kwdefaults__ == keywords
+                for function, code, defaults, keywords in self.functions))
+
+
+def _routed_public_contract(value):
+    """Only canonical recursively immutable specs receive value keys."""
+    from types import MappingProxyType
+    from src.kernel.launch_config import LaunchConfig, TilingSpec
+    from src.kernel.kernel_spec import L2ExecutionContext
+    kind = type(value)
+    if kind in (str, int, bool, bytes, type(None)):
+        return kind, value
+    if kind is float and math.isfinite(value):
+        return kind, value.hex()
+    if kind is KernelKind:
+        return kind, value.value
+    if kind is tuple:
+        return kind, tuple(_routed_public_contract(item) for item in value)
+    if kind is MappingProxyType:
+        return kind, tuple((_routed_public_contract(key), _routed_public_contract(item))
+            for key, item in value.items())
+    if kind in (KernelSpec, LaunchConfig, TilingSpec, L2ExecutionContext):
+        if not kind.__dataclass_params__.frozen:
+            raise TypeError("mutable routed resource contract")
+        return kind, tuple((field.name, _routed_public_contract(getattr(value, field.name)))
+            for field in dataclasses.fields(value))
+    raise TypeError("noncanonical routed resource contract")
+
+
+def _routed_public_resource_input(predictor, kernel, hardware):
+    from contextvars import copy_context
+    from types import MappingProxyType
+    from src.kernel.prediction_cache import _RUNTIME_CACHES
+    from src.kernel.memory_access_builder import _PREDICTION_MEMORY_BINDINGS
+    context = copy_context()
+    eligible = (_RUNTIME_CACHES in context and context[_RUNTIME_CACHES] is not None
+        and _PREDICTION_MEMORY_BINDINGS not in context
+        and type(predictor) is FusedMoEPredictor and type(kernel) is KernelSpec
+        and set(vars(predictor)) == {"_cached_resource_kernel", "_cached_resource_hardware",
+            "_cached_resource_value"}
+        and type(hardware) is HWSpec and kernel.hardware_id == hardware.hardware_id
+        and hardware.supports_source_contract("vllm_0_30_marlin_w4a16_ep1_public_resource_reuse")
+        and hardware.kernel_memory_model == "gpu_mshr"
+        and kernel.kind is KernelKind.FUSED_MOE and kernel.variant == "routed_experts"
+        and kernel.execution_support == "supported" and kernel.dtype == "bf16"
+        and kernel.launch is not None and kernel.launch.algorithm == "vllm_marlin_moe_w4a16_aggregate"
+        and kernel.attributes["expert_parallel_size"] == 1
+        and kernel.attributes["routed_weight_dtype"] == "int4"
+        and kernel.attributes["weight_group_size"] == 32
+        and kernel.attributes["swiglu_limit"] is None
+        and kernel.attributes["expert_weight_tile_rows"] is None
+        and "mathematical_program" not in kernel.attributes)
+    if not eligible:
+        # In particular a mutated HW object can leave the admitted memory
+        # model/identity domain. Never let the older one-object cache mask
+        # the current constructor's rejection or newly supported behavior.
+        if (predictor._cached_resource_kernel is kernel
+                and predictor._cached_resource_hardware is hardware
+                and type(kernel) is KernelSpec and kernel.variant == "routed_experts"
+                and _RUNTIME_CACHES in context and context[_RUNTIME_CACHES] is not None
+                and _PREDICTION_MEMORY_BINDINGS not in context):
+            predictor._cached_resource_kernel = None
+            predictor._cached_resource_hardware = None
+            predictor._cached_resource_value = None
+        return predictor._source_resource_input(kernel, hardware)
+    if not _ROUTED_PUBLIC_SOURCE.unchanged():
+        _ROUTED_PUBLIC_REUSE.clear()
+        predictor._cached_resource_kernel = None
+        predictor._cached_resource_hardware = None
+        predictor._cached_resource_value = None
+        return predictor._source_resource_input(kernel, hardware)
+    try:
+        # Prove the original as well as the substituted attributes: a mapping
+        # proxy alone does not freeze a nested custom or mutable payload.
+        _routed_public_contract(kernel)
+        counts, local_counts = _routing(kernel)
+        tile_m, _, _ = _tile(kernel)
+        routed_rows = sum(local_counts)
+        active_experts = sum(count > 0 for count in local_counts)
+        padded_rows = sum(math.ceil(count / tile_m) * tile_m for count in local_counts if count > 0)
+        if (counts != kernel.attributes["tokens_per_expert"]
+                or local_counts != kernel.attributes["local_tokens_per_expert"] or counts != local_counts
+                or any(type(count) is not int or count < 0 for count in counts)
+                or type(kernel.attributes["expert_parallel_size"]) is not int
+                or type(kernel.attributes["expert_rank"]) is not int or kernel.attributes["expert_rank"] != 0
+                or kernel.attributes["owned_experts"] != tuple(range(kernel.shape["experts"]))
+                or routed_rows != kernel.shape["tokens"] * kernel.shape["topk"] or active_experts == 0
+                or tile_m not in (8, 16, 32, 48, 64) or kernel.launch.parameters["padded_rows"] != padded_rows):
+            raise TypeError("unproven EP1 routed resource class")
+        # This public-input class is deliberately separate from prediction
+        # equivalence: retained traffic consumes rows, active weight operands
+        # and padded M rows only. Source metadata/scratch and expert order do
+        # not enter the returned tuple; all other spec/launch fields stay exact.
+        attributes = {name: value for name, value in kernel.attributes.items()
+            if name not in ("tokens_per_expert", "local_tokens_per_expert", "owned_experts")}
+        fields = tuple((field.name, _routed_public_contract(
+            (MappingProxyType(attributes), (routed_rows, active_experts, padded_rows)) if field.name == "attributes"
+            else getattr(kernel, field.name))) for field in dataclasses.fields(kernel))
+    except TypeError:
+        predictor._cached_resource_kernel = None
+        predictor._cached_resource_hardware = None
+        predictor._cached_resource_value = None
+        return predictor._source_resource_input(kernel, hardware)
+    identity = id(hardware)
+    if identity in _ROUTED_PUBLIC_REUSE:
+        retained, guard, entries = _ROUTED_PUBLIC_REUSE[identity]
+        if retained is not hardware:
+            raise RuntimeError("routed public hardware identity collision")
+        if not guard.unchanged():
+            del _ROUTED_PUBLIC_REUSE[identity]
+            predictor._cached_resource_kernel = None
+            predictor._cached_resource_hardware = None
+            predictor._cached_resource_value = None
+        elif fields in entries:
+            inp, compulsory = entries[fields]
+            return dataclasses.replace(inp, demand_per_resource=dict(inp.demand_per_resource),
+                resource_time_overrides_ns=dict(inp.resource_time_overrides_ns)), compulsory
+    # The older one-object evaluator cache is not scoped to this experiment
+    # and has no live HW proof. Every new run/class must construct its own
+    # current input, even when the caller retained the same predictor object.
+    predictor._cached_resource_kernel = None
+    predictor._cached_resource_hardware = None
+    predictor._cached_resource_value = None
+    value = predictor._source_resource_input(kernel, hardware)
+    if identity not in _ROUTED_PUBLIC_REUSE:
+        guard = _RoutedHardwareData(hardware)
+        if not guard.supported:
+            return value
+        if len(_ROUTED_PUBLIC_REUSE) >= 4:
+            _ROUTED_PUBLIC_REUSE.popitem(last=False)
+        entries = {}
+        _ROUTED_PUBLIC_REUSE[identity] = hardware, guard, entries
+    inp, compulsory = value
+    if len(entries) >= 128:
+        entries.clear()
+    entries[fields] = dataclasses.replace(inp,
+        demand_per_resource=dict(inp.demand_per_resource),
+        resource_time_overrides_ns=dict(inp.resource_time_overrides_ns)), compulsory
+    return value
+
+
+_ROUTED_PUBLIC_REUSE = RuntimeCache()
+_ROUTED_PUBLIC_SOURCE = _RoutedPublicSource()
+_ROUTED_PUBLIC_SOURCE.seal()

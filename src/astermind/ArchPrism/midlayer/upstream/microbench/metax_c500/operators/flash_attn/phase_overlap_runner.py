@@ -92,9 +92,12 @@ MACA_PATH = Path("/opt/maca")
 TARGET_LIBSTDCXX_PATH = Path("/lib/x86_64-linux-gnu/libstdc++.so.6")
 MXCC_PATH = MACA_PATH / "mxgpu_llvm/bin/mxcc"
 MX_SMI_PATH = Path("/opt/mxdriver/bin/mx-smi")
-HOST_GLOBAL_LOCK_PATH = Path(
-    "/mnt/disk2/yxh/midlayer_hw_model/profiler_output/.locks/"
-    "metax_c500_mcprofiler.lock")
+def _host_global_lock_path():
+    if "MIDLAYER_C500_MCPROFILER_LOCK" not in os.environ:
+        raise ValueError(
+            "MIDLAYER_C500_MCPROFILER_LOCK is required for mcProfiler execution"
+        )
+    return Path(os.environ["MIDLAYER_C500_MCPROFILER_LOCK"])
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
 RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}")
@@ -175,7 +178,7 @@ def _capture_contract_payload(
         "mcprofiler_executable_sha256": mcprofiler_sha256,
         "python_executable": str(python_executable),
         "port": port,
-        "host_global_lock_path": str(HOST_GLOBAL_LOCK_PATH),
+        "host_global_lock_path": str(_host_global_lock_path()),
         "holder_pid": os.getpid(),
     }
 
@@ -200,7 +203,7 @@ def _verify_capture_contract(path):
             or port <= 0 or port > 65535
             or not isinstance(payload["host_global_lock_path"], str)
             or payload["host_global_lock_path"]
-            != str(HOST_GLOBAL_LOCK_PATH)
+            != str(_host_global_lock_path())
             or not isinstance(holder_pid, int) or isinstance(holder_pid, bool)
             or holder_pid <= 0):
         raise ValueError("capture contract identity is invalid")
@@ -1603,9 +1606,10 @@ def capture_profile(args):
         repository_root, dict(os.environ))
     mcprofiler_version = _parse_mcprofiler_version(
         version_stdout.read_text(encoding="utf-8"))
-    HOST_GLOBAL_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = _host_global_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
     records = []
-    with HOST_GLOBAL_LOCK_PATH.open("a+b") as lock_stream:
+    with lock_path.open("a+b") as lock_stream:
         try:
             fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
@@ -1694,7 +1698,7 @@ def capture_profile(args):
         },
         "profile_preflight": profile_preflight,
         "host_global_lock": {
-            "path": str(HOST_GLOBAL_LOCK_PATH),
+            "path": str(_host_global_lock_path()),
             "method": "fcntl.flock(LOCK_EX|LOCK_NB)",
             "holder_pid": capture_contract["holder_pid"],
             "acquired_monotonic_raw_ns": acquired,
@@ -1857,7 +1861,7 @@ def _verify_final_artifacts(artifact_root, expected_final_manifest_sha256):
             or isinstance(lock["acquired_monotonic_raw_ns"], bool)
             or not isinstance(lock["released_monotonic_raw_ns"], int)
             or isinstance(lock["released_monotonic_raw_ns"], bool)
-            or lock["path"] != str(HOST_GLOBAL_LOCK_PATH)
+            or lock["path"] != str(_host_global_lock_path())
             or lock["method"] != "fcntl.flock(LOCK_EX|LOCK_NB)"
             or lock["holder_pid"] != capture_contract["holder_pid"]
             or lock["acquired_monotonic_raw_ns"]

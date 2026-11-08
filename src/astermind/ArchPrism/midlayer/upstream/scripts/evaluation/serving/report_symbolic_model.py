@@ -5,7 +5,8 @@ import argparse
 from pathlib import Path
 import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT))
 
 from evaluation.serving.metrics.symbolic_model import write_symbolic_model_report, write_symbolic_serving_report
 from src.serving.workload.runtime_inputs import ExpertRoutingInput
@@ -17,12 +18,20 @@ def main():
     source.add_argument("--model")
     source.add_argument("--serving-result", type=Path)
     source.add_argument("--serving-matrix-output", type=Path)
-    parser.add_argument("--hardware-config", type=Path, default=Path("configs/hardware/nvidia_h200.yaml"),
+    parser.add_argument("--hardware-config", type=Path, default=ROOT / "configs/hardware/nvidia_h200.yaml",
         help="target HWSpec for the static model report; matrix hardware comes from each frozen case")
     parser.add_argument("--case", action="append", default=[])
-    parser.add_argument("--jobs", type=int, default=4)
+    parser.add_argument("--jobs", type=int, default=0,
+        help="parallel Serving case workers; 0 uses one worker per selected case (default)")
     parser.add_argument("--serving-timing-mode", choices=("device_only", "device_plus_launch",
         "device_plus_launch_plus_scheduler"), default="device_only")
+    parser.add_argument("--serving-execution-mode", choices=("accelerated", "fast"),
+        default="accelerated")
+    parser.add_argument("--serving-execution-workers", type=int, default=0,
+        help="per-case streaming tail workers; 0 selects the CPU-aware default")
+    parser.add_argument("--serving-state-audit", action="store_true")
+    parser.add_argument("--h200-serving-scenario", choices=("analytical_bf16_v1",),
+        help="explicit H200 analytical BF16/Host scenario with declared TP2 zero-ID locality approximation")
     parser.add_argument("--serving-python", type=Path, default=Path(sys.executable))
     parser.add_argument("--vllm-sdk-python", type=Path)
     parser.add_argument("--vllm-source-root", type=Path)
@@ -80,6 +89,8 @@ def main():
     parser.add_argument("--expert-routing-source-id", help="explicit synthetic routing assumption identity")
     parser.add_argument("--expert-routing-seed", type=int)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--interactive-report", action="store_true",
+        help="also write the offline HTML report plus its visualization projection")
     args = parser.parse_args()
     mtp_inputs = (args.max_requests, args.source_block_size_tokens, args.mtp_verified_tokens,
         args.mtp_accepted_tokens, args.mtp_proposer_tokens, args.mtp_acceptance_source_id,
@@ -106,7 +117,10 @@ def main():
             args.case, args.jobs, args.serving_python.resolve(strict=True),
             args.vllm_sdk_python.absolute(), args.vllm_source_root.resolve(strict=True),
             load_compact_case, h200_version=None if args.h200_capture_version == "none" else args.h200_capture_version,
-            reuse_completed=args.reuse_completed_virtual, serving_timing_mode=args.serving_timing_mode)
+            reuse_completed=args.reuse_completed_virtual, serving_timing_mode=args.serving_timing_mode,
+            execution_mode=args.serving_execution_mode, state_audit=args.serving_state_audit,
+            execution_workers=args.serving_execution_workers, interactive_report=args.interactive_report,
+            h200_scenario=args.h200_serving_scenario)
         write_virtual_serving_evaluation_report(result_path, args.output)
         print(result_path)
         return 0
@@ -201,6 +215,7 @@ def main():
         parser.error("Qwen3 source does not consume V4-only source inputs")
     result = write_symbolic_model_report(args.model, tuple(args.query_lengths),
         tuple(args.context_lengths), args.output, upstream_root=args.upstream_vllm_root,
+        report=args.interactive_report,
         hardware_config=args.hardware_config,
         source_profile=source_profile, tensor_parallel_size=1 if args.tensor_parallel_size is None else args.tensor_parallel_size,
         expert_parallel_size=args.expert_parallel_size,

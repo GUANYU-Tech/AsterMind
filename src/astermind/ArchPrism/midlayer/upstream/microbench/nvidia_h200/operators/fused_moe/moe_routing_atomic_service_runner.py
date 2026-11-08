@@ -37,9 +37,11 @@ import time
 ROOT = Path(__file__).resolve().parents[4]
 SOURCE = Path(__file__).with_name("moe_routing_atomic_service.cu")
 RUNNER = Path(__file__)
-VLLM_MOE_BINARY = Path(
-    "/mnt/public/yangxinhao/envs/vllm024/lib/python3.12/site-packages/vllm/"
-    "_moe_C_stable_libtorch.abi3.so")
+VLLM_MOE_BINARY = (
+    Path(os.environ["MIDLAYER_H200_PUBLIC_ROOT"])
+    / "envs/vllm024/lib/python3.12/site-packages/vllm/"
+    "_moe_C_stable_libtorch.abi3.so"
+)
 DEVICE_NAME = "NVIDIA H200"
 BOOST_MHZ = 1980
 SM_COUNT = 132

@@ -6,11 +6,11 @@ from enum import Enum
 from typing import Mapping
 
 from src.kernel.kernel_base import predict, prediction_equivalence_fields
-from src.kernel.kernel_spec import KernelPrediction, KernelSpec
+from src.kernel.kernel_spec import KernelKind, KernelPrediction, KernelSpec
 from src.kernel.memory_access_builder import (memory_prediction_source_epoch, memory_prediction_source_scope,
     prediction_memory_program_reuse, bound_prediction_numeric_reuse_key)
 
-from .kernel_plan import KernelPlan, hardware_for_call
+from .kernel_plan import KernelCall, KernelPlan, hardware_for_call, _bound_kernel_spec_projection
 
 
 _NONE_CONTRACT = ("none",)
@@ -19,6 +19,8 @@ _NONE_CONTRACT = ("none",)
 # of the type alone, so caching its answer cannot change any frozen contract.
 _CONTRACT_FREEZERS: dict = {}
 _CONTRACT_DATACLASS_FIELD_NAMES: dict = {}
+_PLAN_GROUP_ORDER_SOURCE = (KernelPlan.topological_order, KernelPlan.topological_order.__code__)
+_PLAN_GROUP_HARDWARE_SOURCE = (hardware_for_call, hardware_for_call.__code__)
 
 
 def _freeze_none(value):
@@ -67,6 +69,10 @@ def _freeze_mapping(value):
 
 
 def _freeze_tuple(value):
+    # Native shape/index tuples need no per-element type dispatch. Subclasses
+    # retain ordinary iteration and mixed values retain their exact type tags.
+    if type(value) is tuple and all(type(item) is int for item in value):
+        return ("tuple", tuple(("int", item) for item in value))
     return ("tuple", tuple(freeze_contract_value(item) for item in value))
 
 
@@ -186,6 +192,7 @@ class KernelPredictionMemo:
         self._execution_source_epoch = None
         self._hardware_objects = {}
         self._contract_keys_by_spec_identity = OrderedDict()
+        self._plan_identity_groups = OrderedDict()
         self._hit_count = 0
         self._miss_count = 0
 
@@ -300,22 +307,102 @@ class KernelPredictionMemo:
         return contract_key
 
 
-def _predict_with_memory(kernel_spec, hardware, method, bindings):
-    if bindings is None:
+    def plan_identity_groups(self, plan, hardware_by_id):
+        """Reuse grouping membership, never prices or mutable spec contents.
+
+        The existing binder proves which call slots changed. Unchanged groups
+        retain their exact KernelSpec identities; all groups still enter the
+        ordinary contract-key and prediction memo on every invocation.
+        Source-bound memory groups keep their complete existing path.
+        """
+        if (type(hardware_by_id) is not dict
+                or KernelPlan.topological_order is not _PLAN_GROUP_ORDER_SOURCE[0]
+                or KernelPlan.topological_order.__code__ is not _PLAN_GROUP_ORDER_SOURCE[1]
+                or hardware_for_call is not _PLAN_GROUP_HARDWARE_SOURCE[0]
+                or hardware_for_call.__code__ is not _PLAN_GROUP_HARDWARE_SOURCE[1]):
+            return None
+        binding = _bound_kernel_spec_projection(plan)
+        if binding is None:
+            return None
+        template, changed = binding
+        identity = id(template)
+        if identity not in self._plan_identity_groups:
+            if (template.memory_context is not None
+                    or any(type(call) is not KernelCall or type(call.kernel_spec) is not KernelSpec
+                        or call.memory_source is not None or call.memory_bindings is not None
+                        for call in template.calls)):
+                return None
+            positions = {call.call_id: index for index, call in enumerate(template.calls)}
+            groups = {}
+            for call in template.topological_order():
+                key = id(call.kernel_spec)
+                if key not in groups:
+                    groups[key] = (call.kernel_spec, [])
+                groups[key][1].append(positions[call.call_id])
+            rows = tuple((spec, frozenset(indices), tuple(indices),
+                tuple(template.calls[index].call_id for index in indices))
+                for spec, indices in groups.values())
+            self._plan_identity_groups[identity] = (template, template.calls, template._topological_calls, rows)
+            if len(self._plan_identity_groups) > 128:
+                self._plan_identity_groups.popitem(last=False)
+        retained, calls, order, rows = self._plan_identity_groups[identity]
+        if retained is not template:
+            raise RuntimeError("prediction grouping template identity collision")
+        if calls is not template.calls or order is not template._topological_calls:
+            del self._plan_identity_groups[identity]
+            return None
+        self._plan_identity_groups.move_to_end(identity)
+        changed = frozenset(changed)
+        result = []
+        for spec, members, indices, names in rows:
+            touched = members & changed
+            if touched:
+                names = tuple(template.calls[index].call_id for index in indices if index not in touched)
+            if names:
+                hardware = hardware_for_call(template.calls[indices[0]], hardware_by_id)
+                result.append((spec, hardware, names))
+        updates = {}
+        for index in changed:
+            call = plan.calls[index]
+            if call.memory_source is not None or call.memory_bindings is not None:
+                return None
+            key = id(call.kernel_spec)
+            if key not in updates:
+                updates[key] = (call.kernel_spec, hardware_for_call(call, hardware_by_id), [])
+            updates[key][2].append(call.call_id)
+        result.extend(updates.values())
+        return result
+
+
+def _predict_with_memory(kernel_spec, hardware, method, memory_bindings):
+    if memory_bindings is None:
         return predict(kernel_spec, hardware, method)
-    return predict(kernel_spec, hardware, method, memory_bindings=bindings)
+    return predict(kernel_spec, hardware, method, memory_bindings=memory_bindings)
 
 
 @memory_prediction_source_scope()
 def predict_kernel_plan(plan: KernelPlan, hardware_by_id: Mapping[str, object],
                         method: str = "midlayer",
-                        memo: KernelPredictionMemo | None = None):
+                        memo: KernelPredictionMemo | None = None, *,
+                        include_communication: bool = True):
     if memo is not None and not isinstance(memo, KernelPredictionMemo):
         raise TypeError("kernel prediction memo must be KernelPredictionMemo")
-    ordered_calls = plan.topological_order()
+    retained_groups = None if memo is None else memo.plan_identity_groups(plan, hardware_by_id)
+    ordered_calls = () if retained_groups is not None else plan.topological_order()
+    from .attention_memory_bindings import fa3_plan_call_groups, predict_fa3_plan_call
+    fa3_groups = fa3_plan_call_groups(ordered_calls)
+    if not include_communication:
+        ordered_calls = tuple(call for call in ordered_calls if call.kernel_spec.kind is not KernelKind.COMMUNICATION)
+        if retained_groups is not None:
+            retained_groups = [group for group in retained_groups if group[0].kind is not KernelKind.COMMUNICATION]
     if memo is None:
         predictions = {}
         for call in ordered_calls:
+            if call.call_id in fa3_groups:
+                predictions[call.call_id] = predict_fa3_plan_call(
+                    call, fa3_groups[call.call_id], hardware_for_call(call, hardware_by_id), method,
+                    _predict_with_memory)
+                continue
             predictions[call.call_id] = _predict_with_memory(
                 call.kernel_spec,
                 hardware_for_call(call, hardware_by_id), method, call.memory_bindings)
@@ -329,6 +416,10 @@ def predict_kernel_plan(plan: KernelPlan, hardware_by_id: Mapping[str, object],
     predictions = {}
     for call in ordered_calls:
         hardware = hardware_for_call(call, hardware_by_id)
+        if call.call_id in fa3_groups:
+            predictions[call.call_id] = predict_fa3_plan_call(
+                call, fa3_groups[call.call_id], hardware, method, memo.predict)
+            continue
         if call.memory_bindings is not None:
             predictions[call.call_id] = memo.predict(
                 call.kernel_spec, hardware, method, memory_bindings=call.memory_bindings)
@@ -342,7 +433,7 @@ def predict_kernel_plan(plan: KernelPlan, hardware_by_id: Mapping[str, object],
         identity_groups[identity_key][2].append(call.call_id)
 
     groups = {}
-    for kernel_spec, hardware, call_ids in identity_groups.values():
+    for kernel_spec, hardware, call_ids in (identity_groups.values() if retained_groups is None else retained_groups):
         contract_key = memo.contract_key(kernel_spec)
         group_key = (method, id(hardware), contract_key)
         if group_key not in groups:

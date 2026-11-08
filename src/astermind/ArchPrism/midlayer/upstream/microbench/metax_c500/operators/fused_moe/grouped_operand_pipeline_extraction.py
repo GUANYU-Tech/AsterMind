@@ -439,11 +439,8 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--capture-baseline-commit",
         default="712d214963d4f427d712ac9515c0895f54691e11")
-    parser.add_argument(
-        "--remote-snapshot",
-        default=(
-            "/mnt/disk2/yxh/execution_snapshots/"
-            "c500-moe-bm16-mechanism-712d21496-20260918"))
+    parser.add_argument("--remote-snapshot", required=True)
+    parser.add_argument("--capture-worktree", type=Path, required=True)
     parser.add_argument(
         "--empty-wave-slot-ns", type=float, default=None,
         help=(
@@ -476,8 +473,7 @@ def main(argv=None) -> int:
             "owner": "wt-c500-moe-duration worker",
             "remote_snapshot": arguments.remote_snapshot,
             "container": "yxh_c500_profile",
-            "worktree": (
-                "/share_data/yangxinhao/chip_modeling/wt-c500-moe-duration"),
+            "worktree": str(arguments.capture_worktree),
             "branch": "wt-c500-moe-duration",
         },
     }

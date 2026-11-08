@@ -35,12 +35,16 @@ scripts/kernel_dataset/nvidia_h200/flash_attn_runner.py ``mla`` layout (vLLM
 """
 
 import json
+import os
 from pathlib import Path
 
 RUNNER = "scripts/kernel_dataset/nvidia_h200/kc_kda_runner.py"
 OUT = Path(__file__).with_name("plans")
 FAMILY = "kda"
-FLA_PYDEPS = "/mnt/public/yangxinhao/envs/fla052_pydeps"
+if "MIDLAYER_H200_PUBLIC_ROOT" not in os.environ:
+    raise SystemExit("MIDLAYER_H200_PUBLIC_ROOT must name the H200 dependency root")
+FLA_PYDEPS = str(
+    Path(os.environ["MIDLAYER_H200_PUBLIC_ROOT"]) / "envs/fla052_pydeps")
 # vLLM 0.24 FLA_CHUNK_SIZE and fla 0.5.2 chunk_kda default chunk_size.
 CHUNK_SIZE = 64
 

@@ -30,6 +30,11 @@ class RankGroups:
             "sequence": self.sequence,
             "context": self.context,
             "data": self.data,
+            # MoE EP-off dispatch flattens DP and PCP while keeping TP
+            # lanes independent. This composes existing physical axes.
+            "data_context": (_deduplicate(tuple(sorted({member for context_rank in context_group
+                for data_group in self.data if context_rank in data_group for member in data_group}))
+                for context_group in self.context) if dimension == "data_context" else ()),
         }
         if dimension not in dimensions:
             raise ValueError(f"unknown parallel dimension: {dimension!r}")
@@ -78,7 +83,7 @@ def build_rank_groups(config: ParallelConfig) -> RankGroups:
 
     tensor = vary(3)
     if config.enable_expert_parallel:
-        expert = vary_axes((0, 3))
+        expert = vary_axes((0, 2, 3))
     else:
         expert = tuple((rank,) for rank in range(config.worker_count))
     sp_size = config.sequence_parallel_size

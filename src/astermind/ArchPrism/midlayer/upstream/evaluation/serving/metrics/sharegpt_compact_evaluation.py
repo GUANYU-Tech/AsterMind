@@ -153,7 +153,6 @@ from evaluation.serving.metrics.compact_case_evaluation import (
 )
 
 from evaluation.serving.metrics.compact_suite_driver import (
-    _MAX_CASE_JOBS,
     run_official_metrics_evaluation,
     _official_alignment_inputs,
     _case_alignment_inputs,

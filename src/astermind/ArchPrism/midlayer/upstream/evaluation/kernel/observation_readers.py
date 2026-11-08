@@ -336,9 +336,60 @@ def _observed_h200_fa3_splits(
     return recorded_splits
 
 
+_LEGACY_H200_BF16_REDUCER_SYMBOL = 'void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, __nv_bfloat16, float, __nv_bfloat16, (bool)0, float, __nv_bfloat16, __nv_bfloat16, (bool)1, (bool)0, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T10 *, T9 *, T5 *, const T6 *, const T6 *, const T11 *, const T4 *, T11 *, void *, long, T6 *, int *, T6 *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *, const T6 *)'
+
+
+def legacy_h200_bf16_aggregate_projection(op_attributes, metrics, hardware=None):
+    """Project only the exact six captured CUDA12.9 program/geometry pairs.
+
+    The returned launch states modeled_split_k; effective split stays unknown.
+    No counter or duration participates. Hardware-aware callers must be H200.
+    """
+    if (not isinstance(op_attributes, Mapping) or "dtype" not in op_attributes
+            or op_attributes["dtype"] != "bf16"):
+        return None
+    shape = {name: _positive_int(op_attributes, field, "GEMM Attr")
+             for name, field in (("b", "B"), ("m", "M"), ("n", "N"), ("k", "K"))}
+    if shape["b"] != 1 or shape["k"] != 7168:
+        return None
+    if (shape["m"], shape["n"]) == (12, 4608):
+        main_symbol = "nvjet_tst_64x16_64x16_4x1_v_bz_splitK_TNT"
+    elif shape["n"] == 20480 and shape["m"] in (1, 2, 4, 6, 8):
+        main_symbol = "nvjet_tst_192x8_64x8_1x1_h_bz_splitK_TNT"
+    else:
+        return None
+    name = metrics["kernel_name"]
+    if name not in (main_symbol, _LEGACY_H200_BF16_REDUCER_SYMBOL):
+        return None
+    ordinary = {"has_bias": False, "a_layout": "row_major", "b_layout": "row_major",
+                "c_layout": "row_major", "layout": "row_major", "trans_a": False,
+                "trans_b": True, "epilogue": "none", "alpha": 1}
+    for key, expected in ordinary.items():
+        if key in op_attributes:
+            actual = op_attributes[key]
+            if actual != expected or (type(expected) is bool and type(actual) is not bool):
+                raise ValueError("legacy BF16 aggregate has conflicting explicit " + key)
+    if "beta" in op_attributes and (isinstance(op_attributes["beta"], bool)
+            or op_attributes["beta"] not in (None, "", "0", 0)):
+        raise ValueError("legacy BF16 aggregate has conflicting explicit beta")
+    if "output_dtype" in op_attributes and op_attributes["output_dtype"] not in (None, "bf16"):
+        raise ValueError("legacy BF16 aggregate has conflicting explicit output_dtype")
+    from src.kernel.launch_config.nvidia_h200.gemm_launch import select_legacy_bf16_external_aggregate_launch
+    reducer = name == _LEGACY_H200_BF16_REDUCER_SYMBOL
+    launch = select_legacy_bf16_external_aggregate_launch(shape, "bf16", "gemm", {
+        "has_bias": False, "launch_policy": "injected_launch", "a_layout": "row_major",
+        "b_layout": "row_major", "c_layout": "row_major", "trans_a": False,
+        "trans_b": True, "epilogue": "none", "beta": 0, "output_dtype": None}, hardware, reducer=reducer)
+    actual_grid = tuple(metrics["grid_" + axis] for axis in ("x", "y", "z"))
+    actual_block = tuple(metrics["block_" + axis] for axis in ("x", "y", "z"))
+    if launch.grid != actual_grid or launch.block != actual_block:
+        raise ValueError("legacy BF16 aggregate observation disagrees with its published exact geometry")
+    return launch
+
+
 def observed_nvjet_gemm_split_k(
-        op_attributes: Mapping, metrics: Mapping) -> int:
-    """Return the K-split count of one cuBLASLt ``nvjet`` launch.
+        op_attributes: Mapping, metrics: Mapping) -> Optional[int]:
+    """Return an observed K-split count, or None for six explicit aggregate rows.
 
     Hopper ``nvjet`` kernels keep ``grid.z == 1`` and launch the output tile
     grid in thread-block clusters; the symbol states the tile, the cluster
@@ -350,6 +401,8 @@ def observed_nvjet_gemm_split_k(
     this derivation; no duration or counter is read.
     """
 
+    if legacy_h200_bf16_aggregate_projection(op_attributes, metrics) is not None:
+        return None  # Effective K partitions are not observed for this model.
     symbol = parse_nvjet_gemm_symbol(metrics["kernel_name"])
     if symbol is None:
         raise ValueError("nvjet split-K derivation requires an nvjet symbol")
@@ -383,14 +436,14 @@ def observed_nvjet_gemm_split_k(
     return 1
 
 
-def _gemm_tensor_split(metrics: Mapping, op_attributes) -> int:
+def _gemm_tensor_split(metrics: Mapping, op_attributes) -> Optional[int]:
     if parse_nvjet_gemm_symbol(metrics["kernel_name"]) is not None:
         return observed_nvjet_gemm_split_k(op_attributes, metrics)
     return metrics["grid_z"]
 
 
-def observed_gemm_split_k(kernel_records, op_attributes=None) -> int:
-    """Return the split count carried by a case's tensor GEMM launch.
+def observed_gemm_split_k(kernel_records, op_attributes=None) -> Optional[int]:
+    """Return observed split count; exact six aggregate cases keep it unknown.
 
     A split-K reducer's own grid does not encode how many partial matrices it
     consumes.  The immediately preceding tensor launch does, so evaluation
@@ -403,6 +456,13 @@ def observed_gemm_split_k(kernel_records, op_attributes=None) -> int:
     if not isinstance(kernel_records, (list, tuple)) or not kernel_records:
         raise TypeError(
             "GEMM split-K derivation requires a non-empty kernel sequence")
+    exact = [legacy_h200_bf16_aggregate_projection(op_attributes, extract_ncu_metrics(record))
+             for record in kernel_records]
+    if any(launch is not None for launch in exact):
+        if (len(exact) != 2 or any(launch is None for launch in exact)
+                or exact[0].execution_variant != "gemm" or exact[1].execution_variant != "gemm_reduce"):
+            raise ValueError("legacy BF16 aggregate requires its exact main then reducer pair")
+        return None  # Not modeled_split_k: this API reports observed partitions.
     tensor_splits = []
     for ordinal, record in enumerate(kernel_records):
         if not isinstance(record, Mapping):
@@ -441,6 +501,8 @@ def observed_gemm_split_k_partial_bytes(
     """
 
     split_k = observed_gemm_split_k(kernel_records, op_attributes)
+    if split_k is None:
+        return 4  # Exact pair above exposes FP32 partial type; extent remains modeled.
     if split_k == 1:
         return 0
     tensor_ordinals = []

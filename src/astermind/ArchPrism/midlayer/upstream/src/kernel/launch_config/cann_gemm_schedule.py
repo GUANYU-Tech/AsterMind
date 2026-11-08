@@ -1,7 +1,8 @@
 """Source-derived CANN GEMM scheduling primitives shared with prediction."""
 
+from src.kernel.prediction_cache import runtime_lru_cache
+
 from dataclasses import dataclass
-from functools import lru_cache
 import math
 
 from src.kernel.launch_config.launch_program import CannGemmLaunchProgram
@@ -243,7 +244,7 @@ def cann_gemm_persistent_descriptor_trace(
     )
 
 
-@lru_cache(maxsize=8)
+@runtime_lru_cache(maxsize=8)
 def cann_gemm_source_tile_assignments(
         m_tiles: int, n_tiles: int, m_l2_regions: int, n_l2_regions: int,
         m_l2_block: int, n_l2_block: int,

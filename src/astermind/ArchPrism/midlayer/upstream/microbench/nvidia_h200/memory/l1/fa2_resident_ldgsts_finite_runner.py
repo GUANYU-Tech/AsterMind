@@ -44,8 +44,11 @@ from staged_ldgsts_l2_runner import (  # noqa: E402
 
 SOURCE_PATH = Path(__file__).with_name("fa2_resident_ldgsts_finite.cu")
 REPORT_PATH = Path(__file__).with_name("fa2_resident_ldgsts_finite_report.py")
-NSYS = Path("/mnt/public/yangxinhao/tools/nsys_2025.6.1/bin/nsys")
-NSYS_HOME = Path("/mnt/public/yangxinhao/h200_microbench/home")
+NSYS = Path(shutil.which("nsys") or "nsys")
+NSYS_HOME = (
+    Path(os.environ["MIDLAYER_H200_HOME"])
+    if "MIDLAYER_H200_HOME" in os.environ else Path.home()
+)
 REPEATS = (1, 2, 4, 8, 16, 32, 64)
 WARMUP_LAUNCHES = 10
 SAMPLES = 7

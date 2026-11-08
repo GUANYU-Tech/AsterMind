@@ -17,7 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "memory"))
 import clock_gated_capture as gate  # noqa: E402
 
-NVCC = Path("/mnt/public/yangxinhao/tools/cuda-12.9/bin/nvcc")
+NVCC = gate.NVCC
 SOURCE = Path(__file__).with_name("d2d_copy.cu")
 RUNNER = Path(__file__).resolve()
 PROCESSES = 2

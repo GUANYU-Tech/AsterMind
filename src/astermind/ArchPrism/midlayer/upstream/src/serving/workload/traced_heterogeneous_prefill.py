@@ -20,7 +20,8 @@ from .workload_graph import WorkloadGraph
 
 
 def trace_flash_heterogeneous_prefill(model, *, input_ids, root_seed=0, layer_count=None, state_observer=None,
-        rank_start=0, max_context_tokens=None, request_q_lens=None, namespace=None):
+        rank_start=0, max_context_tokens=None, request_q_lens=None, namespace=None,
+        gpu_hardware_id="hygon_bw1100"):
     """Trace fresh explicit prompts on all eight TP ranks.
 
     The unchanged checkpoint supplies the complete layer stack by default;
@@ -64,7 +65,7 @@ def trace_flash_heterogeneous_prefill(model, *, input_ids, root_seed=0, layer_co
         "heterogeneous_roce_switch0", "analytical_roofline_v1")
         for operation in ("all_reduce", "all_gather"))
     deployment = build_deployment_plan(DeploymentConfig("colocated", (
-        WorkerPoolConfig("prefill_gpu", "prefill", "hygon_bw1100",
+        WorkerPoolConfig("prefill_gpu", "prefill", gpu_hardware_id,
             parallelism=ParallelConfig(tensor_parallel_size=8), ranks=tuple(range(rank_start, rank_start + 8)),
             collectives=collectives),)), num_layers=model.num_hidden_layers, num_experts=model.num_experts)
     pool = deployment.worker_pools["prefill_gpu"]

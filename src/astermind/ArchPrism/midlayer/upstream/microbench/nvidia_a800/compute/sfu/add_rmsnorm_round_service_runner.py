@@ -22,13 +22,11 @@ OUTPUT_ROOT = REPOSITORY_ROOT / "profiler_output/microbench/nvidia_a800"
 SOURCE_PATH = Path(__file__).with_name("add_rmsnorm_round_service.cu")
 RUNNER_PATH = Path(__file__).resolve()
 DEFAULT_NVCC = Path("/usr/local/cuda-12.2/bin/nvcc")
-DEFAULT_CUOBJDUMP = Path(
-    "/home/yangxinhao/miniconda3/envs/r2r_qwen3_next/lib/python3.10/"
-    "site-packages/triton/backends/nvidia/bin/cuobjdump")
+DEFAULT_CUOBJDUMP = Path(shutil.which("cuobjdump") or "cuobjdump")
 DEFAULT_NVIDIA_SMI = Path("/usr/bin/nvidia-smi")
-DEFAULT_PRODUCTION_BINARY = Path(
-    "/share_data/yangxinhao/chip_modeling/vllm_src_3ver/a800/vllm/"
-    "_C.abi3.so")
+DEFAULT_PRODUCTION_BINARY = (
+    Path(os.environ["MIDLAYER_A800_VLLM_SOURCE"]) / "_C.abi3.so"
+)
 EXPECTED_NVCC_SHA256 = (
     "6b05c8048bff95eb892bcd53cc55fd4fe231aa27bb9dd7289661e746408d8b7d")
 EXPECTED_CUOBJDUMP_SHA256 = (

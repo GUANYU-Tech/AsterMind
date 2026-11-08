@@ -1348,7 +1348,8 @@ def backend_step_from_output_manifest(
             for request_id in sorted(step.generated_tokens)
         },
     }
-    if raw != expected:
+    normalized = {**raw, "schedule": json_round_trip(asdict(step.schedule))}
+    if normalized != expected:
         raise ValueError("serialized BackendStep derived fields disagree")
     return step
 
@@ -1650,9 +1651,27 @@ def interval_union_duration_from_output(
     return total_s + union_end - union_start
 
 
+_LEGACY_SCHEDULED_REQUEST_OUTPUT_FIELDS = frozenset((
+    "request_id", "phase", "input_tokens", "output_tokens", "computed_tokens",
+    "recomputed_tokens", "prefix_replay_tokens", "resumed_from_preemption",
+    "trace_prefix_hit_tokens", "scheduler_prefix_hit_tokens", "prefix_scheduler_delta_tokens",
+    "raw_model_output_tokens", "mtp_proposed_tokens", "mtp_verified_tokens", "mtp_accepted_tokens",
+    "mtp_rejected_tokens", "mtp_proposer_tokens", "mtp_next_proposed_tokens", "mtp_proposer_mode",
+    "mtp_acceptance_source_kind", "mtp_acceptance_source_id", "content_prefix_hit_tokens",
+))
+_SCHEDULED_REQUEST_OUTPUT_FIELDS = _LEGACY_SCHEDULED_REQUEST_OUTPUT_FIELDS | {"data_parallel_rank"}
+
+
 def schedule_step_from_output_manifest(
     raw: dict[str, Any],
 ) -> ScheduleStep:
+    """Read the existing output contract, normalizing legacy DP ownership.
+
+    Prior output manifests have the complete fixed legacy request field set
+    and represent rank0. Current manifests additionally serialize the explicit
+    data_parallel_rank. All other missing/extra fields remain invalid; this
+    does not relax the separate canonical dataset schema or mutate input.
+    """
     if not isinstance(raw, dict):
         raise TypeError("serialized ScheduleStep must be an object")
     schedule_fields = fields(ScheduleStep)
@@ -1666,23 +1685,32 @@ def schedule_step_from_output_manifest(
         raise TypeError(
             "serialized ScheduleStep requests must be a non-empty list")
     request_fields = fields(ScheduledRequest)
-    expected_request_fields = {field.name for field in request_fields}
+    if {field.name for field in request_fields} != _SCHEDULED_REQUEST_OUTPUT_FIELDS:
+        raise RuntimeError("ScheduledRequest output reader requires an explicit field-contract update")
     requests = []
+    normalized_requests = []
     for raw_request in raw_requests:
-        if (not isinstance(raw_request, dict)
-                or set(raw_request) != expected_request_fields):
+        if not isinstance(raw_request, dict):
             raise ValueError(
                 "serialized ScheduledRequest fields disagree with the "
                 "canonical contract")
+        supplied_fields = set(raw_request)
+        if supplied_fields == _LEGACY_SCHEDULED_REQUEST_OUTPUT_FIELDS:
+            normalized_request = {**raw_request, "data_parallel_rank": 0}
+        elif supplied_fields == _SCHEDULED_REQUEST_OUTPUT_FIELDS:
+            normalized_request = dict(raw_request)
+        else:
+            raise ValueError("serialized ScheduledRequest fields disagree with the canonical contract")
         request = ScheduledRequest(**{
-            field.name: raw_request[field.name]
+            field.name: normalized_request[field.name]
             for field in request_fields
             if field.init
         })
-        if json_round_trip(asdict(request)) != raw_request:
+        if json_round_trip(asdict(request)) != normalized_request:
             raise ValueError(
                 "serialized ScheduledRequest derived fields disagree")
         requests.append(request)
+        normalized_requests.append(normalized_request)
     schedule_kwargs = {}
     for field in schedule_fields:
         if not field.init:
@@ -1695,7 +1723,8 @@ def schedule_step_from_output_manifest(
             raise AssertionError(
                 f"unknown ScheduleStep constructor field: {field.name!r}")
     schedule = ScheduleStep(**schedule_kwargs)
-    if json_round_trip(asdict(schedule)) != raw:
+    normalized = {**raw, "requests": normalized_requests}
+    if json_round_trip(asdict(schedule)) != normalized:
         raise ValueError("serialized ScheduleStep derived fields disagree")
     return schedule
 

@@ -1,7 +1,7 @@
 """Lower the explicitly scoped Flash GPU/FPGA mathematical MoE design."""
 from math import prod
 from src.kernel.hardware_spec import HWSpec
-from src.kernel.kernel_spec import DTYPE_BYTES, KernelKind, KernelSpec, PhysicalTransferConfig
+from src.kernel.kernel_spec import DTYPE_BYTES, KernelKind, KernelSpec, PhysicalTransferConfig, linear_expert_partition
 from src.serving.workload.traced_heterogeneous_moe import COMPONENT
 from src.serving.workload.workload_graph import WorkloadKind
 
@@ -12,6 +12,11 @@ def is_heterogeneous_moe(node):
 
 def validate_heterogeneous_transfer(node, deployment):
     a = node.attributes
+    if (is_heterogeneous_moe(node) and "heterogeneous_forward_scope" in a
+            and a["heterogeneous_forward_scope"] == "gpu_decode_only"
+            and a["gpu_decode_scheme"] == "dp8_ep8"):
+        _validate_gpu_ep_transfer(node, deployment)
+        return
     if (not is_heterogeneous_moe(node) or node.kind is not WorkloadKind.P2P
             or node.pool_name != "experts" or node.rank not in deployment.worker_pools["experts"].ranks
             or a["backend"] != "analytical_roofline_v1" or a["link"] != "roce"
@@ -31,6 +36,39 @@ def validate_heterogeneous_transfer(node, deployment):
     expected = tuple("gpu-nic:" + str(r // 2) if r < 8 else "fpga-nic:" + str(r - 8) for r in endpoints)
     if a["participant_nic_ids"] != expected:
         raise ValueError("heterogeneous transfer lost the user-declared shared physical NICs")
+
+
+def _validate_gpu_ep_transfer(node, deployment):
+    """A concrete hop in the declared all-gatherv/sum-scatter ring."""
+    a, pools = node.attributes, deployment.worker_pools
+    if set(pools) != {"decode_gpu"}:
+        raise ValueError("GPU EP ring cannot contain an FPGA or another device pool")
+    pool, ring = pools["decode_gpu"], (0, 2, 4, 6, 1, 3, 5, 7)
+    source, destination, phase = a["source_rank"], a["destination_rank"], a["collective_phase"]
+    operation, stage, shape = a["collective_operation"], a["collective_stage"], a["payload_shape"]
+    if (node.kind is not WorkloadKind.P2P or node.pool_name != pool.name or node.rank != source
+            or source not in ring or destination != ring[(ring.index(source) + 1) % 8]
+            or source // 2 == destination // 2 or type(phase) is not int or not 0 <= phase < 7
+            or operation not in ("all_gatherv", "reduce_scatterv")
+            or not HWSpec.source_contract_supported("aggregate_gpu_source_roofline", pool.hardware_id)
+            or a["backend"] != "analytical_roofline_v1" or a["link"] != "roce"
+            or a["algorithm"] != "send_recv" or a["operation"] != "send_recv"
+            or a["direction"] != "point_to_point" or a["topology"] != "point_to_point"
+            or a["bytes_semantics"] != "payload" or a["participants"] != (source, destination)
+            or a["participant_nic_ids"] != ("flash-d-nic:" + str(source // 2), "flash-d-nic:" + str(destination // 2))
+            or a["resource_id"] != "flash-d-roce-switch0" or a["native_provider_bound"] is not False
+            or a["collective_software_startup_bound"] is not False):
+        raise ValueError("GPU EP transfer lost its declared ring, shared NIC or analytical-only contract")
+    expected_stage = {"hidden": "bf16", "topk_weights": "fp32", "topk_ids": "int32", "partial_output": "bf16"}
+    if (stage not in expected_stage or a["payload_dtype"] != expected_stage[stage] or node.dtype != a["payload_dtype"]
+            or (operation == "reduce_scatterv") != (stage == "partial_output")
+            or not isinstance(shape, tuple) or len(shape) != 2 or any(type(size) is not int or size <= 0 for size in shape)
+            or a["bytes"] != prod(shape) * DTYPE_BYTES[node.dtype]
+            or a["nic_hbm_role_bytes"] != (a["bytes"], a["bytes"]) or a["nic_hbm_service_bound"] is not False):
+        raise ValueError("GPU EP stage or typed payload bytes disagree")
+    owner = ring[(ring.index(source) - phase - (operation == "reduce_scatterv")) % 8]
+    if type(a["collective_segment_owner"]) is not int or a["collective_segment_owner"] != owner:
+        raise ValueError("GPU EP ring forwarded the wrong collective segment")
 
 
 def validate_heterogeneous_pd_transfer(node, deployment):
@@ -200,7 +238,7 @@ def heterogeneous_moe_specs(node, hardware_id):
             attributes = {"swiglu_limit": a["swiglu_limit"]}
         elif variant == "gather":
             attributes = {key: a[key] for key in ("gather_factor", "index_count", "index_bytes", "scattered", "materialized_output")}
-            if HWSpec.source_contract_supported("aggregate_gpu_source_roofline", hardware_id):
+            if HWSpec.source_contract_supported("aggregate_gpu_source_roofline", hardware_id) and dtype == "bf16":
                 attributes["mathematical_program"] = "materialized_bf16_gather_bytes_v1"
         elif variant == "moe_sum":
             attributes = {"work_fraction": a["work_fraction"], "routed_weights_dtype": "fp32"}
@@ -216,6 +254,46 @@ def heterogeneous_moe_specs(node, hardware_id):
 def validate_heterogeneous_graph(graph, deployment):
     if not graph.nodes or not all(is_heterogeneous_moe(n) for n in graph.nodes):
         raise ValueError("heterogeneous mathematical boundary requires its complete scoped graph")
+    if set(deployment.worker_pools) == {"decode_gpu"}:
+        pool = deployment.worker_pools["decode_gpu"]
+        c = pool.parallel_plan.config
+        schemes = {n.attributes["gpu_decode_scheme"] for n in graph.nodes}
+        if len(schemes) != 1 or not schemes <= {"tp8", "dp8_ep8"}:
+            raise ValueError("Flash D-only graph must bind one explicit GPU parallel scheme")
+        scheme = next(iter(schemes))
+        axes = ((c.tensor_parallel_size, c.data_parallel_size, c.enable_expert_parallel) ==
+            ((8, 1, False) if scheme == "tp8" else (1, 8, True)))
+        if (deployment.mode != "colocated" or not HWSpec.source_contract_supported(
+                    "aggregate_gpu_source_roofline", pool.hardware_id)
+                or pool.ranks != tuple(range(8)) or not axes
+                or c.pipeline_parallel_size != 1 or c.context_parallel_size != 1
+                or c.sequence_parallel_size != 1
+                or any(n.pool_name != pool.name
+                    or n.attributes["heterogeneous_forward_scope"] != "gpu_decode_only"
+                    or n.attributes["gpu_decode_microbatch"] != 1 for n in graph.nodes)):
+            raise ValueError("Flash D-only requires its explicit eight GPU pool and parallel axes")
+        for node in graph.nodes:
+            if node.kind is WorkloadKind.P2P:
+                if scheme != "dp8_ep8":
+                    raise ValueError("TP8 cannot import an EP dispatch hop")
+                _validate_gpu_ep_transfer(node, deployment)
+            elif node.kind is WorkloadKind.COLLECTIVE:
+                if scheme != "tp8" or node.attributes["participant_nic_ids"] != tuple(
+                        "flash-d-nic:" + str(r // 2) for r in pool.ranks):
+                    raise ValueError("D-only collective lost the shared physical NIC mapping")
+            elif node.kind is WorkloadKind.FUSED_MOE and scheme == "dp8_ep8":
+                a, experts, tokens, topk = node.attributes, node.shape["experts"], node.shape["tokens"], node.shape["topk"]
+                owned = tuple(linear_expert_partition(experts, 8, node.rank))
+                global_counts, local_counts = a["tokens_per_expert"], a["local_tokens_per_expert"]
+                if (a["expert_parallel_size"] != 8 or a["expert_rank"] != node.rank or a["owned_experts"] != owned
+                        or len(global_counts) != experts or sum(global_counts) != tokens * topk
+                        or any(type(count) is not int or not 0 <= count <= tokens for count in global_counts)
+                        or local_counts != tuple(count if e in owned else 0 for e, count in enumerate(global_counts))
+                        or len(a["gpu_decode_global_row_request_ids"]) != tokens
+                        or sorted(a["gpu_decode_global_row_request_ids"]) != list(range(tokens))
+                        or a["output_is_reduced"] is not False):
+                    raise ValueError("GPU EP expert ownership, routing or global row order disagrees")
+        return
     if "prefill_gpu" in deployment.worker_pools:
         pool = deployment.worker_pools["prefill_gpu"]
         c = pool.parallel_plan.config
@@ -281,3 +359,111 @@ def validate_heterogeneous_graph(graph, deployment):
                 and all(n.pool_name in ("prefill_gpu", "decode_gpu")
                     and n.attributes["heterogeneous_request_id"] == "fixed_batch" for n in graph.nodes))):
         raise ValueError("heterogeneous boundary must contain actual GPU/FPGA exchanges")
+
+
+def lower_flash_fp4_decode_scenario(graph, deployment, hardware_by_id):
+    """Lower the explicitly tagged FP4 source through existing kernel owners."""
+    from dataclasses import replace
+    from .kernel_plan import KernelCall, KernelPlan
+    from src.serving.workload.traced_flash_decode_scenario import COMPONENT as scenario_component
+    if not graph.nodes or any(n.attributes["source_component"] != scenario_component for n in graph.nodes):
+        raise ValueError("FP4 switch lowering requires one complete scenario source")
+    pools = deployment.worker_pools
+    gpu_id = pools["decode_gpu"].hardware_id
+    if not HWSpec.source_contract_supported("aggregate_gpu_source_roofline", gpu_id):
+        raise ValueError("FP4 scenario GPU is outside its declared hardware domain")
+    node_calls, calls = {}, []
+    for node_id in graph.topological_order():
+        node = graph.node(node_id)
+        if node.pool_name not in pools or node.rank not in pools[node.pool_name].ranks:
+            raise ValueError("FP4 decode node rank/pool placement disagrees")
+        hardware_id = pools[node.pool_name].hardware_id
+        a = node.attributes
+        hardware = hardware_by_id[hardware_id]
+        if a["scenario_gpu_hardware_id"] != gpu_id:
+            raise ValueError("FP4 source GPU identity differs from its deployment")
+        scheme = a["scenario_scheme"]
+        config = pools["decode_gpu"].parallel_plan.config
+        if (scheme not in ("tp8_ep8", "dp8_ep8", "dp8_fpga")
+                or (config.tensor_parallel_size, config.data_parallel_size, config.enable_expert_parallel)
+                    != ((8, 1, True) if scheme == "tp8_ep8" else (1, 8, True))
+                or ("experts" in pools) != (scheme == "dp8_fpga")):
+            raise ValueError("FP4 decode parallel axes and expert placement disagree")
+        dependencies = tuple(identifier for n in graph.predecessors(node.node_id) for identifier in node_calls[n])
+        if node.kind in (WorkloadKind.LINEAR, WorkloadKind.LM_HEAD, WorkloadKind.ROUTER):
+            shape = {name: node.shape[name] for name in ("b", "m", "n", "k")}
+            b, m = shape["b"], shape["m"]
+            row_counts = a["scenario_matrix_row_counts"] if "scenario_matrix_row_counts" in a else (m,) * b
+            output = a["output_dtype"] if "output_dtype" in a and a["output_dtype"] is not None else "bf16"
+            compute = a["scenario_gpu_compute_format"] if node.pool_name == "decode_gpu" else "fp8"
+            hardware.resource_by_role("compute_tensor_" + compute)
+            specs = (KernelSpec(KernelKind.GEMM, hardware_id, shape=shape, dtype=node.dtype, variant="gemm",
+                attributes={"mathematical_program": "packed_fp4_source_v1", "weight_dtype": "mxfp4",
+                    "weight_group_size": 32, "has_bias": False, "output_dtype": output,
+                    "compute_format": compute, "weight_matrix_count": len(row_counts),
+                    "matrix_row_counts": row_counts, "input_quantized": node.dtype == "fp8" and compute == "fp8"},
+                execution_support="unsupported", unsupported_reason="launch_selector_unavailable"),)
+        elif node.kind is WorkloadKind.COLLECTIVE:
+            if "traffic_matrix_bytes" in a:
+                participants, matrix = tuple(a["participants"]), a["traffic_matrix_bytes"]
+            else:
+                participants = tuple(a["participants"])
+                count, payload = len(participants), a["bytes"]
+                if a["operation"] not in ("all_reduce", "all_gather"):
+                    raise ValueError("unknown tensor direct collective")
+                # Full-mesh broadcast-and-local-sum all-reduce; source-sized
+                # all-gather. No ring traffic multiplier or switch reduction.
+                matrix = tuple(tuple(0 if i == j else payload for j in range(count)) for i in range(count))
+            pcie = a["scenario_gpu_direct_link"] == "pcie" and a["scenario_scheme"] != "dp8_fpga"
+            if pcie:
+                hardware.analytical_link_bandwidth_bytes_s("pcie")
+            if pcie:
+                if participants != tuple(range(8)):
+                    raise ValueError("PCIe switch scenario requires the8 GPU endpoints")
+                projected = [list(row) + [0, 0] for row in matrix] + [[0] * 10 for _ in range(2)]
+                # Two four-GPU PCIe5 switches; each has one x16 upstream
+                # link to a common nonblocking root. GPU ports and these
+                # shared uplinks service the same streamed payload in parallel.
+                projected[8][9] = sum(matrix[i][j] for i in range(4) for j in range(4, 8))
+                projected[9][8] = sum(matrix[i][j] for i in range(4, 8) for j in range(4))
+                matrix, participants = tuple(map(tuple, projected)), tuple(range(10))
+                nic_ids = tuple("pcie-gpu:" + str(r) for r in range(8)) + ("pcie-uplink:0", "pcie-uplink:1")
+            else:
+                nic_ids = tuple("gpu-nic:" + str(r // 2) if r < 8 else "fpga-nic:" + str(r - 8)
+                    for r in participants)
+            transfer = PhysicalTransferConfig(algorithm="pairwise", bytes=sum(map(sum, matrix)),
+                direction="collective", link="pcie" if pcie else "roce", topology="fully_connected",
+                participants=participants, operation="all_to_all", bytes_semantics="aggregate_input",
+                backend="analytical_roofline_v1", resource_id="flash-direct-switch",
+                participant_nic_ids=nic_ids, traffic_matrix_bytes=matrix)
+            specs = (KernelSpec(KernelKind.COMMUNICATION, hardware_id, transfer=transfer),)
+        else:
+            old = replace(node, attributes={**a, "source_component": COMPONENT})
+            specs = heterogeneous_moe_specs(old, hardware_id)
+            if (node.pool_name == "decode_gpu" and node.variant in (
+                    "embedding", "vocab_parallel_embedding", "mhc_pre", "mhc_post_pre", "hc_head")):
+                specs = tuple(replace(spec, attributes={**spec.attributes,
+                    "packed_weight_storage": "mxfp4_group32"}) for spec in specs)
+        ids = []
+        for ordinal, spec in enumerate(specs):
+            identifier = node.node_id + f":kernel-{ordinal}"
+            resource = spec.transfer.resource_id if spec.kind is KernelKind.COMMUNICATION else (
+                spec.transfer.link if spec.transfer is not None else "compute")
+            calls.append(KernelCall(identifier, spec, node.pool_name, node.rank, resource,
+                (node.node_id,), dependencies if ordinal == 0 else (ids[-1],)))
+            ids.append(identifier)
+        if (node.kind is WorkloadKind.COLLECTIVE and "operation" in a
+                and a["operation"] == "all_reduce"):
+            local_sums = []
+            for rank in a["participants"]:
+                identifier = node.node_id + f":local-sum-rank-{rank}"
+                spec = KernelSpec(KernelKind.VECTOR, hardware_id, dtype=node.dtype, variant="reduce",
+                    shape={"element_count": a["bytes"] // DTYPE_BYTES[node.dtype]},
+                    attributes={"reduction_factor": len(a["participants"])},
+                    execution_support="unsupported", unsupported_reason="launch_selector_unavailable")
+                calls.append(KernelCall(identifier, spec, node.pool_name, rank, "compute", (node.node_id,), (ids[-1],)))
+                local_sums.append(identifier)
+            node_calls[node.node_id] = tuple(local_sums)
+        else:
+            node_calls[node.node_id] = (ids[-1],)
+    return KernelPlan(calls)

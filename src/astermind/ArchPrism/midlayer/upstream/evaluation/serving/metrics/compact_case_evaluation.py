@@ -359,6 +359,7 @@ def build_simulation_argv(
         "--hardware-config", str(hardware_path),
         "--deployment", str(prediction["deployment"]),
         "--backend", str(prediction["backend"]),
+        "--vllm-scheduler-version", str(prediction["scheduler_version"]),
         "--prediction-method", str(prediction["prediction_method"]),
         "--execution-mode", execution_mode,
         "--serving-timing-mode", serving_timing_mode,
@@ -617,7 +618,11 @@ def evaluate_validated_case(
         "performance_timing_status": forward_provenance[
             "performance_timing_status"
         ],
-        "accuracy_claim_status": forward_provenance["accuracy_claim_status"],
+        "accuracy_claim_status": (
+            "provisional_observer_effect"
+            if common["observation_quality"]["status"] == "provisional"
+            else forward_provenance["accuracy_claim_status"]
+        ),
         "forward_provenance": forward_provenance,
         "timing_components": _timing_components(True, elapsed),
         "process_peak_rss_bytes": process_peak_rss_bytes,
@@ -749,6 +754,7 @@ def _cell_context(
             "alignment_consumed_by_forward": False,
         },
         "alignment": dict(alignment_result),
+        "observation_quality": _observation_quality(manifest),
         "alignment_files": {
             "alignment_steps": {
                 "status": alignment["status"],
@@ -762,6 +768,35 @@ def _cell_context(
             _observed_scheduler_progress(case.scheduler_steps, len(case.requests))
         )
     return context
+
+
+def _observation_quality(manifest: Mapping[str, object]) -> dict[str, object]:
+    """Label capture differences without excluding completed predictions."""
+
+    if manifest["schema_version"] != 7:
+        return {"status": "legacy_contract", "formal_allowed": True,
+                "failed_metrics": [], "metric_delta_percent": None,
+                "threshold_percent": None, "source_archive_id": None}
+    capture = _mapping(manifest["capture"], "manifest capture")
+    validation = _mapping(capture["observer_effect_validation"],
+                          "capture observer effect validation")
+    deltas = _mapping(validation["metric_delta_percent"],
+                      "observer effect deltas")
+    capture_failed = sorted(field for field, value in deltas.items()
+                            if value > validation["threshold_percent"])
+    if validation["passed"] != (not capture_failed):
+        raise ValueError("validated observer quality is inconsistent")
+    failed = sorted(field for field, value in deltas.items() if value > 5.0)
+    return {
+        "status": "accepted" if not failed else "provisional",
+        "formal_allowed": True,
+        "failed_metrics": failed,
+        "metric_delta_percent": dict(deltas),
+        "threshold_percent": 5.0,
+        "source_archive_id": validation["source_archive_id"],
+        "capture_validation_threshold_percent": validation["threshold_percent"],
+        "capture_validation_passed": validation["passed"],
+    }
 
 
 def _observed_scheduler_progress(
@@ -1235,7 +1270,7 @@ def _process_peak_rss_bytes() -> int:
 
 
 def _validate_execution_mode(execution_mode: object) -> str:
-    if execution_mode not in ("accelerated", "reference"):
+    if execution_mode not in ("accelerated", "reference", "fast"):
         raise ValueError(
-            "execution_mode must be 'accelerated' or 'reference'")
+            "execution_mode must be 'accelerated', 'reference', or 'fast'")
     return str(execution_mode)

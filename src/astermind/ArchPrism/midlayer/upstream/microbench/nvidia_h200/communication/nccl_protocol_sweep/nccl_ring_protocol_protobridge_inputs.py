@@ -46,9 +46,11 @@ from src.kernel.launch_config.communication_profile import (  # noqa: E402
     development_protobridge_inputs_for,
 )
 from src.kernel.predictors.protobridge import adapter  # noqa: E402
-from src.kernel.predictors.protobridge.whitebox_surrogate_v2 import (  # noqa: E402
-    TheoryDerivedSurrogate,
+from src.kernel.predictors.protobridge.upstream import (  # noqa: E402
+    load_upstream_module,
 )
+
+TheoryDerivedSurrogate = load_upstream_module().TheoryDerivedSurrogate
 
 HARDWARE_ID = "nvidia_h200"
 HARDWARE_CONFIG = "configs/hardware/nvidia_h200.yaml"

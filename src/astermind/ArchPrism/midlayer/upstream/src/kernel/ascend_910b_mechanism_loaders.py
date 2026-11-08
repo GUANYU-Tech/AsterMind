@@ -581,6 +581,12 @@ AIC_MTE2_PAGED_GQA128_STRIDE_REFERENCE = Path(
 AIC_MTE2_PAGED_GQA128_STRIDE_REFERENCE_SHA256 = (
     "db1e0225b4e3fbdce4f5b1a341f381d908b47cc4908d93b317a66cd3d07bffc4")
 
+SPLIT_FUSE_MTE2_SHORT_TAIL_REFERENCE = Path(
+    "microbench/ascend_910b/references/"
+    "split_fuse_mte2_short_tail_cann_8_5_1.json")
+SPLIT_FUSE_MTE2_SHORT_TAIL_REFERENCE_SHA256 = (
+    "3967ce6d45f04d027469ef318a70fa35a473ccccc0ba7e009bccf2ff0bc26398")
+
 
 AIC_MTE2_FIA_MLA_STRIDED_SERVICE_REFERENCE = Path(
     "microbench/ascend_910b/references/"
@@ -9287,6 +9293,84 @@ def load_aic_mte2_paged_gqa128_stride_service(repository_root):
         "evidence_sha256": AIC_MTE2_PAGED_GQA128_STRIDE_REFERENCE_SHA256,
         "production_or_evaluation_duration_consumed": False,
     }
+
+
+def load_split_fuse_mte2_short_tail_service(repository_root):
+    """Load finite paged-KV ingress times from the independent 24-AIC probe."""
+
+    path = repository_root / SPLIT_FUSE_MTE2_SHORT_TAIL_REFERENCE
+    payload = path.read_bytes()
+    if hashlib.sha256(payload).hexdigest() != (
+            SPLIT_FUSE_MTE2_SHORT_TAIL_REFERENCE_SHA256):
+        raise ValueError("SplitFuse short-tail reference SHA256 mismatch")
+    value = json.loads(payload)
+    owner = "SplitFuse short-tail reference"
+    require_exact_fields(owner, value, {
+        "schema_version", "hardware_id", "software_revision", "mechanism",
+        "production_or_evaluation_duration_consumed", "scope",
+        "services_ns", "provenance",
+    })
+    expected = {
+        "schema_version": "midlayer.ascend.split_fuse_mte2_short_tail.v1",
+        "hardware_id": "ascend_910b",
+        "software_revision": "cann_8.5.1",
+        "mechanism": "bf16_paged_kv_128x128_stride1024_finite_ingress",
+        "production_or_evaluation_duration_consumed": False,
+    }
+    for name, expected_value in expected.items():
+        if value[name] != expected_value:
+            raise ValueError(f"{owner}.{name} changed")
+    scope = value["scope"]
+    if scope != {
+            "active_aic_groups": 24,
+            "rows": 128,
+            "columns": 128,
+            "source_row_stride_elements": 1024,
+            "descriptor_counts": [3, 4, 5, 7],
+            "issue_modes": ["drained", "two_slot_overlap"],
+            "timed_launches_per_process": 256,
+            "process_count": 3}:
+        raise ValueError(f"{owner}.scope changed")
+    services = value["services_ns"]
+    if not isinstance(services, dict) or set(services) != {"3", "4", "5", "7"}:
+        raise ValueError(f"{owner}.services_ns has the wrong counts")
+    normalized = {}
+    for count in (3, 4, 5, 7):
+        arms = services[str(count)]
+        require_exact_fields(f"{owner}.services_ns[{count}]", arms,
+                             {"drained", "two_slot_overlap"})
+        normalized_arms = {}
+        for mode, values in arms.items():
+            require_exact_fields(f"{owner}.{count}.{mode}", values,
+                                 {"first_touch_ns", "same_address_replay_ns"})
+            cold = values["first_touch_ns"]
+            warm = values["same_address_replay_ns"]
+            if (any(isinstance(item, bool) or not isinstance(item, (int, float))
+                    or not math.isfinite(float(item)) or item <= 0
+                    for item in (cold, warm)) or cold <= warm):
+                raise ValueError(f"{owner}.{count}.{mode} has invalid service")
+            normalized_arms[mode] = (float(warm), float(cold))
+        if (normalized_arms["two_slot_overlap"][1]
+                > 1.05 * normalized_arms["drained"][1]):
+            raise ValueError(f"{owner}.{count} overlap gate failed")
+        normalized[count] = normalized_arms
+    provenance = value["provenance"]
+    require_exact_fields(f"{owner}.provenance", provenance,
+                         {"raw_path", "raw_sha256", "binary_sha256",
+                          "source_sha256"})
+    raw_path = provenance["raw_path"]
+    if (not isinstance(raw_path, str)
+            or not raw_path.startswith(
+                "profiler_output/microbench/ascend_910b/")
+            or ".." in raw_path.split("/")):
+        raise ValueError(f"{owner}.raw_path is invalid")
+    digests = (provenance["raw_sha256"], provenance["binary_sha256"],
+               *provenance["source_sha256"].values())
+    if any(not isinstance(digest, str) or len(digest) != 64
+           or any(character not in "0123456789abcdef" for character in digest)
+           for digest in digests):
+        raise ValueError(f"{owner}.provenance has invalid SHA256")
+    return normalized
 
 
 def load_aic_mte2_fia_mla_strided_service(repository_root):

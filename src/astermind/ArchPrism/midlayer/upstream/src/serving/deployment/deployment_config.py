@@ -85,7 +85,11 @@ class CollectiveConfig:
                 raise ValueError(
                     f"{self.operation} {self.algorithm} collective requires "
                     f"{expected_topology} topology")
-        elif self.operation == "all_to_all":
+        elif self.operation == 'broadcast':
+            if (self.algorithm != 'direct' or self.topology != 'fully_connected'
+                    or self.backend != 'analytical_roofline_v1' or self.link != 'nvlink'):
+                raise ValueError('source PP broadcast requires an explicit analytical direct NVLink fabric')
+        elif self.operation in ("all_to_all", "all_gatherv", "reduce_scatterv"):
             if self.algorithm != "pairwise":
                 raise ValueError(
                     "all_to_all collective requires the pairwise algorithm")
@@ -95,6 +99,9 @@ class CollectiveConfig:
         else:
             raise ValueError(
                 f"unknown collective operation: {self.operation!r}")
+        if self.operation in ("all_gatherv", "reduce_scatterv") and (
+                self.backend != "analytical_roofline_v1" or self.link == "roce"):
+            raise ValueError("variable collectives require an analytical direct pairwise fabric")
         if self.backend not in ("analytical_roofline_v1", "protobridge"):
             raise ValueError(
                 "collective backend must be analytical_roofline_v1 or "
@@ -109,11 +116,12 @@ class CollectiveConfig:
                     "collective backend_config_sha256 must be a lowercase "
                     "SHA256")
         if self.backend == "analytical_roofline_v1":
-            if self.link not in ("nvlink", "metaxlink", "hccs", "roce"):
+            if self.link not in ("nvlink", "metaxlink", "hccs", "infiniband", "roce"):
                 raise ValueError(
-                    "analytical Roofline collective supports declared NVLink, MetaXLink, HCCS or RoCE")
+                    "analytical Roofline collective supports declared NVLink, MetaXLink, HCCS, InfiniBand or RoCE")
             if (self.operation in ("all_reduce", "all_gather")
-                    and self.algorithm != "ring"):
+                    and self.algorithm != "ring"
+                    and not (self.link == "roce" and self.algorithm == "mesh")):
                 raise ValueError(
                     "analytical Roofline all_reduce/all_gather requires the "
                     "ring algorithm")
@@ -246,8 +254,14 @@ class WorkerPoolConfig:
     kv_cache: Optional[KVCacheConfig] = None
     collectives: Tuple[CollectiveConfig, ...] = ()
     pipeline_p2p: Tuple[PipelineP2PConfig, ...] = ()
+    # Explicit logical cache-layout scenario, not an observed GPU provider.
+    # None retains the legacy same-hardware logical payload contract only.
+    kv_transfer_layout: Optional[str] = None
+    pipeline_layer_partition: Optional[Tuple[int, ...]] = None
 
     def __post_init__(self) -> None:
+        if self.kv_transfer_layout not in (None, "BLHNC", "BLNHC", "LBHNC"):
+            raise ValueError("unknown declared KV transfer layout")
         for field in ("name", "role"):
             value = getattr(self, field)
             if not isinstance(value, str) or not value.strip():
@@ -257,6 +271,11 @@ class WorkerPoolConfig:
         object.__setattr__(self, "hardware_id", canonical_hardware_id(self.hardware_id))
         if not isinstance(self.parallelism, ParallelConfig):
             raise TypeError("worker pool parallelism must be a ParallelConfig")
+        if self.pipeline_layer_partition is not None:
+            partition = self.pipeline_layer_partition
+            if (not isinstance(partition, tuple) or len(partition) != self.parallelism.pipeline_parallel_size
+                    or any(type(count) is not int or count <= 0 for count in partition)):
+                raise ValueError("worker pipeline partition requires one positive integer layer count per stage")
         if self.kv_cache is not None and not isinstance(
                 self.kv_cache, KVCacheConfig):
             raise TypeError("worker pool kv_cache must be a KVCacheConfig or null")

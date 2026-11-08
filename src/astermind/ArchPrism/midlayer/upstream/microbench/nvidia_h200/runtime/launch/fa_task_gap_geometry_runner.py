@@ -28,9 +28,10 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import shutil
 import time
 
-NSYS = '/mnt/public/yangxinhao/tools/nsys_2025.6.1/bin/nsys'
+NSYS = shutil.which('nsys') or 'nsys'
 GRIDS = (8, 16, 32, 48, 64)
 BODY_CYCLES = (4096, 32768)
 GEOMETRIES = (1, 0)

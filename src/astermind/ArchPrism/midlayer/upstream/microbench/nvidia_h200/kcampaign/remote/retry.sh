@@ -3,7 +3,7 @@
 # Extra windows for cases excluded at assembly (spread / launch identity / clock), as in the
 # WP9 retry rounds; assembly keeps the newest three accepted windows. One process per GPU
 # (launch.sh takes gpu<N>.proc.lock and forces --concurrency 1).
-K=/mnt/public/yangxinhao/h200_microbench/kcampaign
+K=${MIDLAYER_H200_PUBLIC_ROOT:?set MIDLAYER_H200_PUBLIC_ROOT}/h200_microbench/kcampaign
 GPU=$1; WIDS=$2; shift 2
 for pair in "$@"; do
   PLAN=${pair%%:*}; IDS=${pair#*:}

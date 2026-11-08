@@ -61,7 +61,7 @@ eager 对齐采集沿用 A800 raw 的 engine 参数（eager、chunked prefill、
 
 ## 环境与 GPU 纪律
 
-h200-tmp 无外网；vLLM 0.30.0 与 0.11.0 分别位于 `/mnt/public/yangxinhao/envs/vllm030`、`vllm011`（由 wheelhouse 离线安装），仓库 import 但 vLLM 不带的 `zstandard` 位于 `/mnt/public/yangxinhao/envs/midlayer_pydeps_cp312` 并追加到 `PYTHONPATH`。执行副本由 `scripts/experiments/deploy_nvidia_h200_serving_capture.sh` 从干净 commit 导出到 `/mnt/public/yangxinhao/src/midlayer_h200_serving_capture/<sha>/`（含 `SOURCE_COMMIT` 与现编 `build/lru_sim.so`）。每张 GPU 同一时刻只允许一个进程：每个 GPU stage 以升序对所占每张卡的 `/mnt/public/yangxinhao/h200_microbench/kcampaign/runs/gpu<N>.proc.lock` 取 `flock -x`，与 kernel campaign 共用同一把锁；GPU 0 属于其他实例，编排器拒绝使用。`run_nvidia_h200_sharegpt_capture.py plan --runtime-version <v> --gpus <list> --pairs <n>` 打印按 lane 分配的 detached 启动命令（TP2/EP2 case 走 GPU 对，TP1 case 走单卡）。
+h200-tmp 无外网；采集依赖根由 `MIDLAYER_H200_PUBLIC_ROOT` 或等价的 `--public-root` 显式指定，下文记为 `<public-root>`。vLLM 0.30.0 与 0.11.0 分别位于 `<public-root>/envs/vllm030`、`vllm011`（由 wheelhouse 离线安装），仓库 import 但 vLLM 不带的 `zstandard` 位于 `<public-root>/envs/midlayer_pydeps_cp312` 并追加到 `PYTHONPATH`。执行副本由 `scripts/experiments/deploy_nvidia_h200_serving_capture.sh` 从干净 commit 导出到 `<public-root>/src/midlayer_h200_serving_capture/<sha>/`（含 `SOURCE_COMMIT` 与现编 `build/lru_sim.so`）。每张 GPU 同一时刻只允许一个进程：每个 GPU stage 以升序对所占每张卡的 `<public-root>/h200_microbench/kcampaign/runs/gpu<N>.proc.lock` 取 `flock -x`，与 kernel campaign 共用同一把锁；GPU 0 属于其他实例，编排器拒绝使用。`run_nvidia_h200_sharegpt_capture.py plan --runtime-version <v> --public-root <public-root> --gpus <list> --pairs <n>` 打印按 lane 分配的 detached 启动命令（TP2/EP2 case 走 GPU 对，TP1 case 走单卡）。
 
 ## Smoke 结果（2026-09-26，GPU 3，qwen3-4b/tp1_qps4）
 

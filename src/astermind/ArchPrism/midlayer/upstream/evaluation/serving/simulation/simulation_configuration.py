@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar, copy_context
 from pathlib import Path
 from src.kernel.hardware_ids import EVALUATED_HARDWARE_IDS
 from evaluation.serving.experiments.experiment_plan import vllm_bench_arrival_process, vllm_bench_arrival_times
@@ -23,6 +26,53 @@ from src.serving.workload.model_config import is_validated_qwen3_pipeline_model_
 
 
 ROOT = Path(__file__).resolve().parents[3]
+
+
+_CLI_HARDWARE_IDENTITIES = ContextVar("midlayer_cli_hardware_identities")
+_CLI_NATIVE_HARDWARE_TYPE = HWSpec
+
+
+@contextmanager
+def _cli_hardware_identity_scope():
+    """Own validated immutable IDs for one CLI call, joining nested parsing."""
+    if _CLI_HARDWARE_IDENTITIES in copy_context():
+        yield
+        return
+    identities = {}
+    token = _CLI_HARDWARE_IDENTITIES.set(identities)
+    try:
+        yield
+    finally:
+        _CLI_HARDWARE_IDENTITIES.reset(token)
+        identities.clear()
+
+
+def _cli_hardware_id(config_path, constructor):
+    """Reuse only native fully validated file identities in the current CLI.
+
+    Different paths and changed files require complete HWSpec validation.
+    Keep standalone helpers and custom constructors on their original path.
+    File stats are private invalidation tokens, never provenance identities.
+    """
+    context = copy_context()
+    if (_CLI_HARDWARE_IDENTITIES not in context
+            or constructor is not _CLI_NATIVE_HARDWARE_TYPE
+            or not isinstance(config_path, (str, Path))):
+        return constructor(config_path).hardware_id
+    path = Path(config_path)
+    resolved = path.resolve()
+    before = path.stat()
+    stamp = (before.st_dev, before.st_ino, before.st_size,
+        before.st_mtime_ns, before.st_ctime_ns)
+    identities = context[_CLI_HARDWARE_IDENTITIES]
+    if resolved not in identities or identities[resolved][0] != stamp:
+        identity = constructor(config_path).hardware_id
+        after = path.stat()
+        if (path.resolve() != resolved or stamp != (after.st_dev, after.st_ino,
+                after.st_size, after.st_mtime_ns, after.st_ctime_ns)):
+            raise ValueError("hardware configuration changed during CLI validation")
+        identities[resolved] = (stamp, identity)
+    return identities[resolved][1]
 
 
 REQUEST_PATH_PROFILE_BY_HARDWARE = {
@@ -91,7 +141,7 @@ def tensor_collective_configs(
         raise TypeError("tensor parallel size must be an integer")
     if tensor_parallel_size == 1:
         return ()
-    if tensor_parallel_size in (2, 4, 8):
+    if tensor_parallel_size in (2, 4, 8) or (backend == "analytical_roofline_v1" and tensor_parallel_size > 1):
         if tensor_parallel_size == 4 and backend != "analytical_roofline_v1":
             raise NotImplementedError(
                 "TP=4 tensor collectives exist only for the analytical "
@@ -201,6 +251,97 @@ def bind_tensor_collective_profiles(args, hardware_id: str) -> None:
         f"unknown collective backend: {args.collective_backend!r}")
 
 
+def gqa_pd_cli_scope(args) -> bool:
+    """Explicit eager0.30 GQA PD geometry, independently on both sides."""
+    if (args.deployment != "pd_disagg" or args.backend != "vllm"
+            or args.vllm_scheduler_version != "0.30.0"
+            or args.symbolic_forward_source != "cuda_eager_inplace"
+            or args.decode_hardware_config is None or args.decode_tp_size is None
+            or args.prefill_cp_size != 1 or args.decode_cp_size != 1
+            or args.graph_mode != "NONE"
+            or args.mtp_num_speculative_tokens or args.vllm_async_scheduling):
+        return False
+    model = load_model_config(args.model)
+    if (model.model_type not in ("qwen3", "qwen3_moe")
+            or model.compute_dtype != "bf16" or model.weight_dtype != "bf16"):
+        return False
+    for path, tp, pp, dp, ep in ((args.hardware_config, args.prefill_tp_size, args.prefill_pp_size,
+            args.prefill_dp_size, args.prefill_expert_parallel),
+            (args.decode_hardware_config, args.decode_tp_size, args.decode_pp_size,
+                args.decode_dp_size, args.decode_expert_parallel)):
+        if (_cli_hardware_id(path, HWSpec) not in ("nvidia_a800", "nvidia_h200")
+                or tp < 1 or pp < 1 or pp > model.num_hidden_layers
+                or model.num_attention_heads % tp or model.hidden_size % tp
+                or model.intermediate_size % tp
+                or (model.num_key_value_heads % tp and tp % model.num_key_value_heads)):
+            return False
+        if ep and model.model_type != "qwen3_moe":
+            return False
+        if model.model_type == "qwen3_moe" and (
+                model.num_shared_experts or (not ep and model.moe_intermediate_size % (tp * dp))):
+            return False
+    return True
+
+
+def glm_bf16_cli_source_scope(args) -> bool:
+    """Explicit BF16 GLM source shapes and self-contained pipeline stages."""
+    from src.serving.parallelism.pp import pipeline_layer_ranges, pipeline_layer_ranges_for_model
+    if (args.deployment not in ("pd_disagg", "colocated") or args.backend != "vllm"
+            or args.vllm_scheduler_version != "0.30.0"
+            or args.symbolic_forward_source != "vllm_0_30_v32_bf16_sync_explicit_allreduce"
+            or (args.deployment == "pd_disagg" and (args.decode_hardware_config is None or args.decode_tp_size is None))
+            or args.graph_mode != "NONE" or args.mtp_num_speculative_tokens
+            or args.vllm_async_scheduling
+            or args.attention_kv_layout != "mla" or args.attention_kv_distribution != "uniform"
+            or args.glm_indexer_selection_source != "declared_causal_topk"
+            or args.glm_prefill_attention_source not in (None, "force_sparse_mqa")
+            or args.collective_backend != "analytical_roofline_v1"
+            or args.target_sampling_source != "vllm_0_30_plain_greedy_bf16"):
+        return False
+    model = load_model_config(args.model)
+    if model.model_type != "glm_moe_dsa" or model.compute_dtype != "bf16" or model.weight_dtype != "bf16":
+        return False
+    endpoints = ((args.hardware_config, args.prefill_tp_size, args.prefill_cp_size,
+        args.prefill_dp_size, args.prefill_expert_parallel, args.prefill_pp_size, args.prefill_pp_layer_partition),)
+    if args.deployment == "pd_disagg":
+        endpoints += ((args.decode_hardware_config, args.decode_tp_size, args.decode_cp_size,
+            args.decode_dp_size, args.decode_expert_parallel, args.decode_pp_size, args.decode_pp_layer_partition),)
+    for path, tp, cp, dp, ep, pp, partition in endpoints:
+        hardware_id = _cli_hardware_id(path, HWSpec)
+        if (tp < 1 or cp < 1 or dp < 1 or pp < 1 or pp > model.num_hidden_layers
+                or (cp > 1 and pp > 1) or hardware_id not in ("nvidia_a800", "nvidia_h200")
+                or model.num_attention_heads % tp or model.hidden_size % tp
+                or model.intermediate_size % tp or model.moe_intermediate_size % tp
+                or (not ep and model.moe_intermediate_size % (tp * cp * dp))):
+            return False
+        if cp > 1 and args.glm_prefill_attention_source != "force_sparse_mqa":
+            return False
+        if partition is not None and (len(partition) != pp or sum(partition) != model.num_hidden_layers
+                or any(type(count) is not int or count <= 0 for count in partition)):
+            return False
+        ranges = (pipeline_layer_ranges_for_model(model, pp) if partition is None and args.deployment == "colocated"
+            else pipeline_layer_ranges(model.num_hidden_layers, pp, partition))
+        if (args.glm_prefill_attention_source == "force_sparse_mqa"
+                and any(model.indexer_types[start] != "full" for start, _ in ranges)):
+            return False
+    return True
+
+
+def mla_pcp_pd_cli_scope(args) -> bool:
+    """PD spelling retained for existing callers of the BF16 GLM source."""
+    return args.deployment == "pd_disagg" and glm_bf16_cli_source_scope(args)
+
+
+def moe_data_collective_configs(pool_name, hardware_id, data_parallel_size, backend, *, model):
+    """Explicit analytical shared-expert DP scenario, including TP1."""
+    if data_parallel_size == 1 or model.num_experts == 0:
+        return ()
+    if backend != "analytical_roofline_v1" or hardware_id not in ("nvidia_a800", "nvidia_h200"):
+        raise NotImplementedError("shared expert DP CLI requires its explicit CUDA analytical fabric scenario")
+    return tuple(CollectiveConfig(operation, "pairwise", "nvlink", "fully_connected",
+        f"nvlink:{pool_name}:expert-fabric", backend) for operation in ("all_gatherv", "reduce_scatterv"))
+
+
 def uses_development_protobridge(args) -> bool:
     sizes = [args.prefill_tp_size]
     if args.decode_tp_size is not None:
@@ -210,12 +351,11 @@ def uses_development_protobridge(args) -> bool:
     uses_collectives = (
         args.collective_backend == "protobridge"
         and any(size > 1 for size in sizes))
-    # Pure PD still uses its development send_recv service. AF and PD+AF
-    # honor the explicit analytical/ProtoBridge selection.
+    # KV routes and intra-pool collectives have independent backends.
     uses_p2p = (
         (args.collective_backend == "protobridge"
-         and args.prefill_pp_size > 1)
-        or args.deployment == "pd_disagg"
+         and (args.prefill_pp_size > 1 or args.decode_pp_size > 1))
+        or (args.deployment == "pd_disagg" and args.kv_transfer_backend == "protobridge")
         or (args.deployment in ("af_disagg", "pd_af_disagg") and args.collective_backend == "protobridge"))
     return uses_collectives or uses_p2p
 
@@ -429,7 +569,9 @@ def require_expected_sha256(
     expected: str | None,
     actual: str,
 ) -> None:
-    del label, expected, actual
+    if expected is not None and expected != actual:
+        raise ValueError(
+            f"{label} SHA256 mismatch: expected {expected}, actual {actual}")
 
 
 def validate_expected_sha256_args(parser, args) -> None:
@@ -1007,7 +1149,7 @@ def ascend018_colocated_ep2_cli_scope(args, model):
 def ascend018_dense_cli_scope(args, model):
     """Ascend0.18 model projection with the existing CPU0.11 Scheduler."""
     return (args.backend == "vllm" and args.vllm_scheduler_version == "0.11.0"
-        and HWSpec(args.hardware_config).hardware_id == "ascend_910b"
+        and _cli_hardware_id(args.hardware_config, HWSpec) == "ascend_910b"
         and model.model_type in ("qwen3", "llama") and not model.num_experts
         and model.compute_dtype == model.weight_dtype == "bf16"
         and model.hidden_act == "silu" and model.rms_norm_eps is not None
@@ -1086,7 +1228,7 @@ def normalize_default_model_source(args):
             or args.attention_kv_distribution != "uniform"):
         return
     model = load_model_config(args.model)
-    hardware_id = HWSpec(args.hardware_config).hardware_id
+    hardware_id = _cli_hardware_id(args.hardware_config, HWSpec)
     source, sampler, version = None, None, None
     if args.vllm_scheduler_version == "0.11.0":
         if (model.model_type == "glm4_moe" and model.compute_dtype == model.weight_dtype == "bf16"
@@ -1181,7 +1323,7 @@ def normalize_default_vllm011_source(args):
     if (dense_disagg or dense_pipeline) and model.num_experts and not moe_disagg:
         return
     moe = vllm011_moe_cli_scope(args, model)
-    hardware_id = HWSpec(args.hardware_config).hardware_id
+    hardware_id = _cli_hardware_id(args.hardware_config, HWSpec)
     ascend018 = (ascend018_dense_cli_scope(args, model)
         or ascend018_colocated_ep2_cli_scope(args, model))
     metax024 = (hardware_id == "metax_c500"
@@ -1268,6 +1410,44 @@ def normalize_mtp_draft_token_ids(args, parser):
         parser.error(str(error))
 
 
+def normalize_vllm_step_cli_source(args, parser):
+    """Bind target input ports using the existing source-frame dataclass."""
+    args.vllm_step_inputs = None
+    declarations = args.vllm_step_source_input
+    if declarations is None:
+        return
+    from src.serving.workload.graph_padding import VLLMDenseGraphInputs
+    model = load_model_config(args.model)
+    if (args.backend != "vllm" or args.vllm_scheduler_version != "0.30.0"
+            or args.deployment != "colocated" or args.additional_colocated_hardware_config
+            or args.prefill_tp_size not in (1, 2) or args.prefill_pp_size != 1
+            or _cli_hardware_id(args.hardware_config, HWSpec) != "nvidia_h200"
+            or args.symbolic_forward_source != "cuda_eager_inplace"
+            or args.mtp_num_speculative_tokens or args.glm_mtp_step_inputs is not None
+            or model.compute_dtype != model.weight_dtype or model.compute_dtype != "bf16"
+            or model.model_type not in ("qwen3", "llama", "qwen3_moe")):
+        parser.error("target step source ports require ordinary H2000.30 BF16 TP1/2 PP1 MTP-off target source")
+    frames = {}
+    for step_id, encoded in declarations:
+        parts = step_id.split(":")
+        if (len(parts) != 3 or parts[:2] != ["main", "vllm"] or not parts[2].isascii()
+                or not parts[2].isdecimal() or str(int(parts[2])) != parts[2] or step_id in frames):
+            parser.error("target step source ports require unique canonical main:vllm:<index> identities")
+        try:
+            state = decode_typed_step_source_json(encoded, VLLMDenseGraphInputs)
+            if (state.scheduled_token_ids is None
+                    or any(token >= model.vocab_size for token in (*state.scheduled_token_ids, *state.retained_padding_token_ids))):
+                raise ValueError("target step source must declare scheduled IDs and in-vocabulary retained padding")
+            if args.graph_mode == "NONE" and (state.retained_padding_token_ids or state.fa3_full_capture_id is not None):
+                raise ValueError("eager target ports cannot consume captured padding or capture identity")
+        except (TypeError, ValueError) as error:
+            parser.error(str(error))
+        frames[step_id] = state
+    if "main:vllm:0" not in frames:
+        parser.error("target step source ports require the initial main:vllm:0 frame")
+    args.vllm_step_inputs = frames
+
+
 def normalize_glm_mtp_cli_source(args, parser):
     """Decode explicit instances of the existing V32 source-input contract."""
     args.glm_mtp_step_inputs = None
@@ -1280,7 +1460,7 @@ def normalize_glm_mtp_cli_source(args, parser):
     if (args.backend != "vllm" or args.vllm_scheduler_version != "0.30.0"
             or args.deployment != "colocated" or args.additional_colocated_hardware_config
             or args.prefill_tp_size not in (1, 8) or args.prefill_pp_size != 1 or args.enable_expert_parallel
-            or HWSpec(args.hardware_config).hardware_id != "nvidia_h200"
+            or _cli_hardware_id(args.hardware_config, HWSpec) != "nvidia_h200"
             or model.model_type != "glm_moe_dsa" or model.num_hidden_layers != 78
             or model.mtp_architecture != "glm_moe_dsa_mtp" or model.num_mtp_layers != 1
             or model.compute_dtype != "bf16" or model.weight_dtype not in ("bf16", "fp8")
@@ -1316,115 +1496,6 @@ def normalize_glm_mtp_cli_source(args, parser):
     args.glm_mtp_step_inputs = frames
 
 
-def normalize_sglang_cli_source(args, parser):
-    args.sglang_request_token_transcripts = None
-    args.sglang_step_inputs = None
-    declarations = args.sglang_request_token_transcript
-    if declarations is not None:
-        transcripts = {}
-        for request_id, prompt_ids, output_ids in declarations:
-            if not request_id or request_id in transcripts:
-                parser.error("SGLang token transcripts require unique nonempty request IDs")
-            try:
-                prompt = tuple(int(value) for value in prompt_ids.split(","))
-                output = () if output_ids == "" else tuple(int(value) for value in output_ids.split(","))
-            except ValueError:
-                parser.error("SGLang token transcripts require comma-separated integer IDs")
-            if any(not 0 <= token < 2**31 for token in (*prompt, *output)):
-                parser.error("SGLang token transcript IDs must be nonnegative INT32 values")
-            transcripts[request_id] = (prompt, output)
-        args.sglang_request_token_transcripts = transcripts
-    if ((declarations is None) != (args.sglang_token_transcript_source_id is None)
-            or (args.sglang_token_transcript_source_id is not None and not args.sglang_token_transcript_source_id.strip())):
-        parser.error("SGLang token transcripts require an explicit nonempty source identity")
-    selected = args.symbolic_forward_source in SGLANG_VIRTUAL_TARGET_SOURCES
-    if declarations is None and not selected and args.sglang_step_source_input is None:
-        return
-    model = load_model_config(args.model)
-    if (args.backend != "sglang_mirror" or args.sglang_source_version != "v0.5.19"
-            or declarations is None or args.deployment != "colocated"
-            or model.model_id != "deepseek-ai/DeepSeek-V3" or model.model_type != "deepseek_v3"
-            or model.num_hidden_layers != 61 or (model.compute_dtype, model.weight_dtype) != ("bf16", "fp8")
-            or HWSpec(args.hardware_config).hardware_id != "nvidia_h200"
-            or args.prefill_tp_size != 8 or args.prefill_pp_size != 1 or args.enable_expert_parallel
-            or args.additional_colocated_hardware_config
-            or args.graph_mode not in ("NONE", "FULL_DECODE_ONLY")
-            or args.mtp_num_speculative_tokens not in (0, 1, 2) or args.vllm_async_scheduling or args.enable_prefix_caching
-            or args.scheduler_pipeline_depth != 1 or args.serving_timing_mode != "device_only"
-            or args.attention_kv_layout != "mla" or args.attention_kv_distribution != "uniform"
-            or args.expert_routing_policy is None or args.kv_lifecycle_replay is not None
-            or args.launch_policy != "analytical_launch" or args.prediction_method not in ("roofline", "midlayer")
-            or args.vllm_scheduler_version != "0.11.0"
-            or any(value is not None for value in (args.vllm_sdk_python, args.vllm_source_root, args.vllm_cache_layout))
-            or args.v4_eager_metadata or args.v4_routing_source is not None or args.v4_weight_storage_profile is not None
-            or args.v4_source_use_deep_gemm is not None or args.v4_indexer_selection_source is not None
-            or args.symbolic_forward_source not in (None, *SGLANG_VIRTUAL_TARGET_SOURCES)
-            or args.target_sampling_source not in (None, "sglang_0_5_19_plain_greedy_fp32")):
-        parser.error("virtual SGLang CLI requires 0.5.19 H200 V3 FP8 TP8/PP1/EP-off with explicit transcripts and plain FP32 greedy; other source domains remain unbound")
-    if any(token >= model.vocab_size for pair in args.sglang_request_token_transcripts.values() for ids in pair for token in ids):
-        parser.error("SGLang transcript IDs exceed the selected checkpoint vocabulary")
-    if args.sglang_step_source_input is not None:
-        from src.serving.workload.traced_sglang import SGLangEagleChainState, SGLangGraphInputs, SGLangPrefillInputs
-        constructors = {"none": None, "prefill": SGLangPrefillInputs, "graph": SGLangGraphInputs, "eagle": SGLangEagleChainState}
-        frames = {}
-        for step_id, kind, encoded in args.sglang_step_source_input:
-            if kind not in constructors:
-                parser.error("SGLang step kind must be none, prefill, graph or eagle")
-            parts = step_id.split(":")
-            if (len(parts) != 3 or parts[:2] != ["main", "sglang"] or not parts[2].isascii()
-                    or not parts[2].isdecimal() or str(int(parts[2])) != parts[2] or step_id in frames):
-                parser.error("SGLang step inputs need unique canonical main:sglang:<index> identities")
-            try:
-                state = decode_typed_step_source_json(encoded, constructors[kind])
-                if state is not None and any(request not in args.sglang_request_token_transcripts for request in state.request_ids):
-                    raise ValueError("SGLang step states require transcripts for every declared request")
-                if args.mtp_num_speculative_tokens:
-                    if not isinstance(state, SGLangEagleChainState) or state.proposal_depth != args.mtp_num_speculative_tokens:
-                        raise ValueError("SGLang EAGLE requires depth-matched source states for every step")
-                    if args.graph_mode != "NONE":
-                        if args.mtp_num_speculative_tokens != 2:
-                            raise ValueError("SGLang EAGLE graph requires its existing two-step source")
-                        batch = len(state.request_ids)
-                        if state.phase == "verify":
-                            if args.graph_capture_sizes is None:
-                                raise ValueError("SGLang EAGLE graph requires explicit token-row buckets")
-                            from src.serving.workload.traced_sglang import resolve_eagle_capture_batch
-                            resolve_eagle_capture_batch(state, args.graph_capture_sizes)
-                elif isinstance(state, SGLangEagleChainState):
-                    raise ValueError("SGLang EAGLE source state requires its explicit proposal depth")
-                if isinstance(state, SGLangGraphInputs) and args.graph_mode != "FULL_DECODE_ONLY":
-                    raise ValueError("SGLang graph inputs require FULL_DECODE_ONLY")
-                if isinstance(state, SGLangEagleChainState):
-                    tokens = (*state.bonus_token_ids, *state.draft_token_ids, *state.target_argmax_ids, *state.draft_top1_ids)
-                    if state.target_graph_inputs is not None:
-                        tokens += (*state.target_graph_inputs.retained_padding_token_ids,
-                            *state.extend_graph_inputs.retained_padding_token_ids)
-                    if state.prefill_next_prompt_token_ids is not None:
-                        tokens += tuple(token for token in state.prefill_next_prompt_token_ids if token is not None)
-                elif isinstance(state, SGLangGraphInputs):
-                    tokens = state.retained_padding_token_ids
-                else:
-                    tokens = ()
-                if any(token >= model.vocab_size for token in tokens):
-                    raise ValueError("SGLang step token IDs exceed the selected checkpoint vocabulary")
-            except (TypeError, ValueError, NotImplementedError) as error:
-                parser.error(str(error))
-            frames[step_id] = state
-        if "main:sglang:0" not in frames:
-            parser.error("SGLang step source inputs require an explicit first frame")
-        args.sglang_step_inputs = frames
-    elif args.graph_mode != "NONE" or args.mtp_num_speculative_tokens:
-        parser.error("SGLang graph or EAGLE CLI requires explicit per-step source inputs")
-    if args.symbolic_forward_source is None:
-        args.symbolic_forward_source = SGLANG_VIRTUAL_TARGET_SOURCES[0]
-        args.model_source_normalization = {
-            "selection": "default_existing_supported_source", "model_execution_version": "sglang_0_5_19",
-            "scope": "declared target source with explicit caller token transcripts and per-step states when required",
-            "token_input_scope": "explicit caller token transcript, not computed or checkpoint-observed token outputs",
-            "sampling_scope": "declared plain FP32 greedy source, not an observed provider"}
-    args.target_sampling_source = "sglang_0_5_19_plain_greedy_fp32"
-
-
 def ordinary_colocated_ep2_cli_scope(args, model, hardware_ids, *, ascend_full=False):
     graph_supported = ((args.graph_mode in ("NONE", "FULL")
             and args.graph_uniform_decode_query_len == 1
@@ -1433,7 +1504,7 @@ def ordinary_colocated_ep2_cli_scope(args, model, hardware_ids, *, ascend_full=F
             and shared_dense_graph_cli_scope(args)))
     return (model.model_type == "qwen3_moe" and model.compute_dtype == model.weight_dtype == "bf16"
             and args.backend == "vllm" and args.vllm_scheduler_version == "0.11.0"
-            and HWSpec(args.hardware_config).hardware_id in hardware_ids
+            and _cli_hardware_id(args.hardware_config, HWSpec) in hardware_ids
             and args.deployment == "colocated" and not args.additional_colocated_hardware_config
             and args.prefill_tp_size == 2 and args.prefill_pp_size == 1 and args.enable_expert_parallel
             and is_validated_qwen3_moe_ep2_model_scope(model)
@@ -1480,7 +1551,7 @@ def vllm011_dense_disagg_cli_scope(args):
     if args.graph_mode != "NONE":
         if (args.deployment not in ("af_disagg", "pd_af_disagg")
                 or args.vllm_scheduler_version != "0.11.0"
-                or HWSpec(args.hardware_config).hardware_id != "nvidia_a800"
+                or _cli_hardware_id(args.hardware_config, HWSpec) != "nvidia_a800"
                 or not shared_dense_graph_cli_scope(args)):
             return False
         model = load_model_config(args.model)
@@ -1499,7 +1570,7 @@ def vllm011_dense_disagg_cli_scope(args):
     if args.deployment not in ("pd_disagg", "pd_af_disagg"):
         return False
     if (args.decode_hardware_config is None or args.decode_tp_size not in (1, 2)
-            or HWSpec(args.decode_hardware_config).hardware_id != "nvidia_a800"):
+            or _cli_hardware_id(args.decode_hardware_config, HWSpec) != "nvidia_a800"):
         return False
     if args.deployment == "pd_disagg":
         return True
@@ -1508,9 +1579,10 @@ def vllm011_dense_disagg_cli_scope(args):
 
 def vllm011_dense_pipeline_cli_scope(args):
     return (args.backend == "vllm" and args.vllm_scheduler_version == "0.11.0"
-        and HWSpec(args.hardware_config).hardware_id == "nvidia_a800"
+        and _cli_hardware_id(args.hardware_config, HWSpec) == "nvidia_a800"
         and args.deployment == "colocated" and args.prefill_pp_size > 1
         and args.prefill_tp_size in (1, 2)
+        and not load_model_config(args.model).tie_word_embeddings
         and not args.additional_colocated_hardware_config and not args.enable_expert_parallel
         and not args.vllm_async_scheduling and args.scheduler_pipeline_depth == 1
         and (not args.enable_prefix_caching or args.prefix_cache_mode == "token_ids")
@@ -1546,7 +1618,7 @@ def vllm011_moe_cli_scope(args, model):
     if args.deployment == "pd_disagg":
         return (args.prefill_tp_size == args.decode_tp_size == 1 and not args.enable_expert_parallel
             and args.decode_hardware_config is not None
-            and HWSpec(args.decode_hardware_config).hardware_id == "nvidia_a800")
+            and _cli_hardware_id(args.decode_hardware_config, HWSpec) == "nvidia_a800")
     return False
 
 
@@ -1570,11 +1642,18 @@ def vllm011_multi_colocated_cli_scope(args):
 
 
 def vllm030_cli_scheduler_settings(args, *, tp_size, pp_size, scheduler_dtype,
-                                  gpu_memory_utilization, request_stream_identity):
+                                  gpu_memory_utilization, request_stream_identity,
+                                  enable_expert_parallel=None, cp_size=1, dp_size=1, pipeline_layer_partition=None,
+                                  scheduler_host_profile=None, engine_core_host_round_profile=None):
+    enabled = args.enable_expert_parallel if enable_expert_parallel is None else enable_expert_parallel
     return VLLMSchedulerConfig(args.model, tensor_parallel_size=tp_size,
-        pipeline_parallel_size=pp_size, dtype=scheduler_dtype, max_model_len=args.max_model_len,
-        enable_expert_parallel=args.enable_expert_parallel, gpu_memory_utilization=gpu_memory_utilization,
-        enable_chunked_prefill=args.enable_chunked_prefill, enable_prefix_caching=False, scheduler_version="0.30.0",
+        pipeline_parallel_size=pp_size, context_parallel_size=cp_size, data_parallel_size=dp_size,
+        pipeline_layer_partition=pipeline_layer_partition,
+        dtype=scheduler_dtype, max_model_len=args.max_model_len,
+        enable_expert_parallel=enabled, gpu_memory_utilization=gpu_memory_utilization,
+        enable_chunked_prefill=args.enable_chunked_prefill, enable_prefix_caching=args.enable_prefix_caching,
+        prefix_cache_mode=args.prefix_cache_mode, async_scheduling=args.vllm_async_scheduling, scheduler_version="0.30.0",
+        scheduler_host_profile=scheduler_host_profile, engine_core_host_round_profile=engine_core_host_round_profile,
         mtp_num_speculative_tokens=args.mtp_num_speculative_tokens, mtp_acceptance_policy=args.mtp_acceptance_policy,
         mtp_fixed_accepted_tokens=args.mtp_fixed_accepted_tokens, mtp_acceptance_source_id=args.mtp_acceptance_source_id,
         mtp_acceptance_assumption=args.mtp_acceptance_assumption,

@@ -1,7 +1,8 @@
 """Logical workload DAG containing compute, communication, and transfers."""
 
+from src.kernel.prediction_cache import runtime_lru_cache
+
 from collections import deque
-from functools import lru_cache
 from os.path import commonprefix
 
 from dataclasses import dataclass, field, replace
@@ -63,8 +64,10 @@ class WorkloadNode:
             del derived.__dict__["_field_update_capsule"]
         return derived
 
-    def with_updates(self, shape_updates, attribute_updates):
+    def with_updates(self, shape_updates, attribute_updates, *, node_id=None, compose=False):
         """Derive owned fields and record their actual immutable write facts."""
+        if type(compose) is not bool:
+            raise TypeError("source write composition must be an explicit boolean")
         native = (type(self) is WorkloadNode and type(shape_updates) is dict
             and type(attribute_updates) is dict
             and all(type(key) is str and key for key in (*shape_updates, *attribute_updates))
@@ -72,10 +75,13 @@ class WorkloadNode:
             and type(self.shape) is MappingProxyType and type(self.attributes) is MappingProxyType
             and all(type(key) is str and type(value) is int for key, value in self.shape.items())
             and all(type(key) is str for key in self.attributes))
+        identity = self.node_id if node_id is None else node_id
+        if not isinstance(identity, str) or not identity:
+            raise ValueError("workload node_id must be a non-empty string")
         if not native:
             shape = dict(self.shape); shape.update(shape_updates)
             attributes = dict(self.attributes); attributes.update(attribute_updates)
-            return replace(self, shape=shape, attributes=attributes)
+            return replace(self, node_id=identity, shape=shape, attributes=attributes)
         shape = self.shape
         if shape_updates:
             values = dict(self.shape); values.update(shape_updates)
@@ -83,10 +89,21 @@ class WorkloadNode:
         attributes = dict(self.attributes); attributes.update(attribute_updates)
         derived = object.__new__(WorkloadNode)
         derived.__dict__.update(self.__dict__)
+        object.__setattr__(derived, "node_id", identity)
         object.__setattr__(derived, "shape", shape)
         object.__setattr__(derived, "attributes", MappingProxyType(attributes))
-        capsule = (_NODE_FIELD_UPDATE_MARKER, weakref.ref(self), weakref.ref(derived),
-            tuple(shape_updates), tuple(attribute_updates), shape, derived.attributes)
+        # Keep the original recorded node alive only through its source owner.
+        # Chained annotation passes must not lose their write facts when an
+        # intermediate derived node is released.
+        # Complete source bindings retain their immediate template parent.
+        # Only explicit repeated-body/annotation composition flattens writes.
+        lineage = _workload_node_field_updates_read(self) if compose else None
+        parent, shapes, attrs = ((self, (), ()) if lineage is None else lineage)
+        capsule = (_NODE_FIELD_UPDATE_MARKER, weakref.ref(parent), weakref.ref(derived),
+            tuple(dict.fromkeys((*shapes, *shape_updates))),
+            tuple(dict.fromkeys((*attrs, *attribute_updates))), shape, derived.attributes,
+            (parent.kind, parent.pool_name, parent.dtype, parent.variant, parent.rank,
+                parent.shape, parent.attributes))
         object.__setattr__(derived, "_field_update_capsule", capsule)
         return derived
 
@@ -155,15 +172,18 @@ def _workload_node_field_updates_read(node):
     if type(node) is not WorkloadNode or "_field_update_capsule" not in node.__dict__:
         return None
     capsule = node.__dict__["_field_update_capsule"]
-    if type(capsule) is not tuple or len(capsule) != 7 or capsule[0] is not _NODE_FIELD_UPDATE_MARKER:
+    if type(capsule) is not tuple or len(capsule) != 8 or capsule[0] is not _NODE_FIELD_UPDATE_MARKER:
         return None
-    _, parent_reference, node_reference, shapes, attributes, shape, attrs = capsule
+    _, parent_reference, node_reference, shapes, attributes, shape, attrs, signature = capsule
     if (type(parent_reference) is not weakref.ReferenceType or type(node_reference) is not weakref.ReferenceType
             or type(shapes) is not tuple or type(attributes) is not tuple
             or node_reference() is not node or node.shape is not shape or node.attributes is not attrs):
         return None
     parent = parent_reference()
-    if type(parent) is not WorkloadNode:
+    if (type(parent) is not WorkloadNode
+            or any(getattr(current, name) is not expected for current in (node, parent)
+                for name, expected in zip(("kind", "pool_name", "dtype", "variant", "rank"), signature[:5]))
+            or parent.shape is not signature[5] or parent.attributes is not signature[6]):
         return None
     return parent, shapes, attributes
 
@@ -180,7 +200,8 @@ _NODE_UPDATE_CLASS_MEMBERS = tuple(vars(WorkloadNode).items())
 _NODE_UPDATE_FUNCTION_SOURCE = tuple((name, globals()[name], globals()[name].__code__,
     globals()[name].__defaults__, globals()[name].__kwdefaults__) for name in (
         "_node_update_source_unchanged", "_workload_node_field_updates", "_workload_node_field_updates_read"))
-_NODE_UPDATE_METHOD_SOURCE = tuple((member, member.__code__, member.__defaults__, member.__kwdefaults__)
+_NODE_UPDATE_METHOD_SOURCE = tuple((member, member.__code__, member.__defaults__,
+    None if member.__kwdefaults__ is None else dict(member.__kwdefaults__))
     for member in vars(WorkloadNode).values() if type(member) is FunctionType)
 
 
@@ -343,11 +364,28 @@ class WorkloadGraph:
             self, "_topological_node_ids", self._compute_topological_order())
 
     def __getattribute__(self, name):
-        if name == "nodes":
+        if name in ("nodes", "edges", "block_repeats"):
             state = object.__getattribute__(self, "__dict__")
             if "_native_source_frame" in state:
-                return state["_native_source_frame"].public_nodes()
+                frame = state["_native_source_frame"]
+                return frame.public_nodes() if name == "nodes" else frame.public_topology(name)
         return object.__getattribute__(self, name)
+
+    @property
+    def source_model_execution_version(self):
+        """Optional validated caller context, separate from recorded nodes."""
+        return self.__dict__["_source_model_execution_version"] if "_source_model_execution_version" in self.__dict__ else None
+
+    def bind_model_execution_version(self, version):
+        """Bind caller provenance without rewriting immutable source frames."""
+        if not isinstance(version, str) or not version:
+            raise ValueError("model source version must be explicit and nonempty")
+        if self.source_model_execution_version is not None and self.source_model_execution_version != version:
+            raise ValueError("workload graph source version disagrees with its actual model caller")
+        if any("source_model_execution_version" in node.attributes
+                and node.attributes["source_model_execution_version"] != version for node in self.nodes):
+            raise ValueError("workload node source version disagrees with its actual model caller")
+        object.__setattr__(self, "_source_model_execution_version", version)
 
     def with_nodes(self, nodes: Iterable[WorkloadNode]):
         """Bind validated nodes to the same complete, ordered dependency DAG."""
@@ -362,6 +400,8 @@ class WorkloadGraph:
             raise ValueError("graph binding must preserve every node ID and its order")
         derived = object.__new__(WorkloadGraph)
         derived.__dict__.update(self.__dict__)
+        object.__setattr__(derived, "edges", self.edges)
+        object.__setattr__(derived, "block_repeats", self.block_repeats)
         if "_ep_source_binding" in derived.__dict__:
             del derived.__dict__["_ep_source_binding"]
         if "_native_source_frame" in derived.__dict__:
@@ -442,7 +482,7 @@ def _relative_layer_id(value, layer):
 _SOURCE_REPEAT_TOPOLOGY_CACHE_SIZE = 32
 
 
-@lru_cache(maxsize=_SOURCE_REPEAT_TOPOLOGY_CACHE_SIZE)
+@runtime_lru_cache(maxsize=_SOURCE_REPEAT_TOPOLOGY_CACHE_SIZE)
 def _source_repeat_structure(nodes, edges):
     """Compile only the exact relative DAG; physical contracts remain live."""
     labels = tuple(_source_layer(name) for name, _ in nodes)
@@ -464,7 +504,7 @@ def _source_repeat_structure(nodes, edges):
                 for source, destination, kind in incoming[label])))) for label in ordered))
 
 
-@lru_cache(maxsize=_SOURCE_REPEAT_TOPOLOGY_CACHE_SIZE)
+@runtime_lru_cache(maxsize=_SOURCE_REPEAT_TOPOLOGY_CACHE_SIZE)
 def _source_repeat_layout(nodes, edges, candidates):
     """Compile index-only recurrence layout for an exact DAG and live groups."""
     layer_labels, layer_entries, _ = _source_repeat_structure(nodes, edges)
@@ -578,7 +618,8 @@ class _SourceLayerCompaction:
 
     def __init__(self, graph, contracts, compact):
         self.predecessors = graph._predecessors_by_id
-        self.edges = graph.edges
+        from .traced_forward import _source_bound_topology
+        self.edges = _source_bound_topology(graph)[0]
         self.ranks = tuple(node.rank for node in graph.nodes)
         layers = {}
         for node in graph.nodes:
@@ -596,9 +637,10 @@ class _SourceLayerCompaction:
         return tuple(left == right for left, right in zip(signatures, signatures[1:]))
 
     def bind(self, graph, contracts):
+        from .traced_forward import _source_bound_topology
         if (type(graph) is not WorkloadGraph or graph.block_repeats
                 or graph._predecessors_by_id is not self.predecessors
-                or graph.edges is not self.edges
+                or _source_bound_topology(graph)[0] is not self.edges
                 or len(graph.nodes) != len(contracts)
                 or any(node.rank != rank for node, rank in zip(graph.nodes, self.ranks, strict=True))
                 or self._relations(contracts) != self.relations):

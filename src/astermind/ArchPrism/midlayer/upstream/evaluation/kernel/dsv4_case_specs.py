@@ -366,7 +366,7 @@ def _v4attn_attention_spec(runner_args: Mapping, evidence: Mapping,
 
 def _v4attn_compressor_spec(runner_args: Mapping, evidence: Mapping,
                             kernel_records, hardware_id: str,
-                            hardware) -> KernelSpec:
+                            hardware) -> tuple[KernelSpec, ...]:
     context = "V4ATTN compressor case"
     layer_type = _non_empty_string(runner_args, "layer-type", context)
     if layer_type not in _DSV4_LAYER_COMPRESS_RATIOS:
@@ -449,9 +449,21 @@ def _v4attn_compressor_spec(runner_args: Mapping, evidence: Mapping,
         "state_old_lens": old_lens,
         "state_new_lens": new_lens,
     }
-    return _selected_spec(
+    if ratio == 128:
+        # The source always submits compress and store, including a decode
+        # step that completes no state. Keep the full input-token grids and
+        # the empty initialized scratch/output payloads as separate facts.
+        compress = _selected_spec(KernelKind.KV_CACHE, hardware_id,
+            {**shape, "element_count": boundary_states * _DSV4_HEAD_DIM, "dtype_bytes": 4},
+            "fp32", "dsv4_compressed_state_cache",
+            {**attributes, "finish_stage": "compress"}, hardware)
+        store = _selected_spec(KernelKind.KV_CACHE, hardware_id, shape,
+            "uint8", "dsv4_compressed_state_cache",
+            {**attributes, "finish_stage": "store"}, hardware)
+        return (compress, store)
+    return (_selected_spec(
         KernelKind.KV_CACHE, hardware_id, shape, "uint8",
-        "dsv4_compressed_state_cache", attributes, hardware)
+        "dsv4_compressed_state_cache", attributes, hardware),)
 
 
 def _v4attn_mhc_spec(runner_args: Mapping, evidence: Mapping,
@@ -493,8 +505,8 @@ def build_v4attn_case_specs(op_attributes: Mapping, kernel_records,
         spec = _v4attn_attention_spec(
             runner_args, evidence, kernel_records, hardware_id, hardware)
     elif stage == "compressor":
-        spec = _v4attn_compressor_spec(
-            runner_args, evidence, kernel_records, hardware_id, hardware)
+        return list(_v4attn_compressor_spec(
+            runner_args, evidence, kernel_records, hardware_id, hardware))
     elif stage in ("mhc_pre", "mhc_post_pre"):
         spec = _v4attn_mhc_spec(
             runner_args, evidence, kernel_records, hardware_id, hardware)

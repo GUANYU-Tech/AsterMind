@@ -75,6 +75,22 @@ _EVENT_FIELDS = {
 }
 
 
+def kv_lifecycle_replay_event_payload(event: KVCacheEvent) -> dict[str, object]:
+    """Serialize a request-private event in the unchanged v1 replay shape."""
+
+    if not isinstance(event, KVCacheEvent):
+        raise TypeError("KV lifecycle replay payload requires a KVCacheEvent")
+    if event.action not in (KVCacheAction.LOAD, KVCacheAction.EVICT):
+        raise ValueError("KV lifecycle replay accepts only LOAD/EVICT intents")
+    if event.source_request_id is not None:
+        raise ValueError("KV lifecycle replay cannot encode shared Host sources")
+    payload = asdict(event)
+    del payload["source_request_id"]
+    if set(payload) != _EVENT_FIELDS:
+        raise RuntimeError("KV lifecycle replay event payload changed fields")
+    return payload
+
+
 def _require_mapping(value: object, name: str) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         raise TypeError(f"{name} must be a mapping")
@@ -479,7 +495,8 @@ class KVLifecycleReplay:
                 "step_index": step.step_index,
                 "step_id": step.step_id,
                 "schedule_step_sha256": step.schedule_step_sha256,
-                "events": tuple(asdict(event) for event in step.events),
+                "events": tuple(kv_lifecycle_replay_event_payload(event)
+                                for event in step.events),
             } for step in self.steps),
         }
 

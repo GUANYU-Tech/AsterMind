@@ -49,6 +49,21 @@ NVIDIA_H200_GEMM_OBSERVED_LAUNCH_FIELDS = (
     "reducer_grid_x", "reducer_grid_y", "reducer_block_x", "reducer_block_y",
     "partial_dtype", "output_dtype",
 )
+# v6 typed-call extension (H200 only, backward compatible): real beta,
+# output storage dtype, and batched-GEMM program axes become physical key
+# fields so typed requests never alias ordinary rows.  Empty beta means 0;
+# empty output_dtype means the input dtype; batch 1 with empty strides is an
+# ordinary single-matrix call.
+NVIDIA_H200_GEMM_V6_EXTENSION_FIELDS = (
+    "beta", "output_dtype_key", "batch_count",
+    "stride_a", "stride_b", "stride_c",
+)
+# The v6 physical selection key is the 13 shared GEMM workload key fields
+# followed by the typed-call extension.
+NVIDIA_H200_GEMM_V6_SELECTION_KEY_FIELDS = (
+    *GEMM_LAUNCH_SELECTION_KEY_FIELDS,
+    *NVIDIA_H200_GEMM_V6_EXTENSION_FIELDS,
+)
 GEMM_LAUNCH_CSV_FIELDS = (
     *GEMM_LAUNCH_SELECTION_KEY_FIELDS,
     *GEMM_LAUNCH_FIELDS,
@@ -58,7 +73,10 @@ GEMM_LAUNCH_MANIFEST_FILENAME = "gemm_launch_selection.manifest.json"
 GEMM_LAUNCH_SCHEMA_VERSION = 2
 NVIDIA_A800_GEMM_LAUNCH_SCHEMA_VERSION = 3
 ASCEND_910B_GEMM_LAUNCH_SCHEMA_VERSION = 3
-NVIDIA_H200_GEMM_LAUNCH_SCHEMA_VERSION = 4
+# v5 is the tiled-grid era of the H200 artifact (its rows carry no typed
+# extension); v6 adds the typed-call key block.
+NVIDIA_H200_GEMM_OBSERVED_SCHEMA_VERSION = 5
+NVIDIA_H200_GEMM_LAUNCH_SCHEMA_VERSION = 6
 GEMM_LAUNCH_ARTIFACT_TYPE = "gemm_launch_selection"
 GEMM_BOOLEAN_ENCODING = "lowercase_true_false"
 GEMM_NULL_ENCODING = "empty_string"
@@ -66,6 +84,7 @@ GEMM_LAUNCH_COMPRESSION = "zstd"
 GEMM_LAUNCH_COMPRESSION_LEVEL = 1
 _GEMM_LAUNCH_SOFTWARE_REVISIONS = {
     "nvidia_a800": "cuda_12.2",
+    "nvidia_h200": "cuda_12.9",
     "metax_c500": "maca_3.7.2_mcblas_10",
     "ascend_910b": "cann_8.5.1",
 }
@@ -177,7 +196,7 @@ _LAUNCH_CACHE_ROLES = ("l1_cache", "l2_cache")
 _ALLOWED_REDUCTIONS = {
     "none", "in_place", "fp32_external", "output_dtype_external",
 }
-_ALLOWED_LAUNCH_OBSERVABILITY = {"grid_block_only"}
+_ALLOWED_LAUNCH_OBSERVABILITY = {"grid_block_only", "tiled_grid"}
 _ALLOWED_OBSERVED_DTYPES = {"fp32", "bf16", "fp16"}
 _ALLOWED_CTA_RASTER_CONVENTIONS = {
     "none", "cublaslt_m_group", "cutlass_n_group",
@@ -228,7 +247,7 @@ class CublasCtaRasterSelection(NamedTuple):
 
 
 class ObservedGridLaunchSelection(NamedTuple):
-    """Launch geometry a profiler recorded without tile or split facts.
+    """Recorded main/reducer geometry, with observability stated per row.
 
     ``grid``/``block`` are the main kernel's launch dimensions and
     ``reducer_grid``/``reducer_block`` those of the separate split-K reducer
@@ -239,9 +258,9 @@ class ObservedGridLaunchSelection(NamedTuple):
     observability: str
     grid: tuple[int, int, int]
     block_threads: int
-    reducer_grid: tuple[int, int]
-    reducer_block: tuple[int, int]
-    partial_dtype: str
+    reducer_grid: tuple[int, int] | None
+    reducer_block: tuple[int, int] | None
+    partial_dtype: str | None
     output_dtype: str
 
 
@@ -276,7 +295,41 @@ def gemm_launch_csv_fields(hardware_id: str) -> tuple[str, ...]:
     return (*GEMM_LAUNCH_SELECTION_KEY_FIELDS, *gemm_launch_fields(hardware_id))
 
 
+def gemm_launch_csv_fields_for_schema(
+        hardware_id: str, schema_version: int,
+        ) -> tuple[str, ...]:
+    """CSV columns one hardware/schema-version artifact is allowed to carry.
+
+    v4/v5-era H200 artifacts predate the typed-call extension; their CSV
+    stops at the observed-grid block.  v6 candidates must declare the full
+    block.
+    """
+
+    layout = gemm_launch_record_layout(hardware_id)
+    extension_fields = layout.extension_fields
+    if (hardware_id == "nvidia_h200"
+            and schema_version != layout.schema_version):
+        extension_fields = extension_fields[
+            :len(NVIDIA_H200_GEMM_OBSERVED_LAUNCH_FIELDS)]
+    key_fields = (GEMM_LAUNCH_SELECTION_KEY_FIELDS
+                  if (hardware_id != "nvidia_h200"
+                      or schema_version != layout.schema_version)
+                  else NVIDIA_H200_GEMM_V6_SELECTION_KEY_FIELDS)
+    return (*key_fields, *GEMM_LAUNCH_FIELDS, *extension_fields)
+
+
 def gemm_launch_schema_version(hardware_id: str) -> int:
+    """Return the schema version a canonical on-disk artifact must carry.
+
+    The H200 canonical artifact is now the v6 typed-call extension; the
+    v5 router observation is the historical predecessor.  Both v5 and v6
+    artifacts remain loadable, but new canonical data must be v6.
+    ``gemm_launch_record_layout`` keeps returning the v6 layout for
+    in-memory candidate construction.
+    """
+
+    if canonical_hardware_id(hardware_id) == "nvidia_h200":
+        return NVIDIA_H200_GEMM_LAUNCH_SCHEMA_VERSION
     return gemm_launch_record_layout(hardware_id).schema_version
 
 
@@ -466,8 +519,18 @@ def _validate_manifest(
         _require_non_empty_string(
             manifest["consumption_scope"],
             f"{manifest_path}.consumption_scope")
-    if (manifest["schema_version"] != gemm_launch_schema_version(hardware_id)
-            or manifest["artifact_type"] != GEMM_LAUNCH_ARTIFACT_TYPE
+    supported_versions = {gemm_launch_schema_version(hardware_id)}
+    if hardware_id == "nvidia_h200":
+        # v4 contains only the original router rows, with the same columns;
+        # v5 is the tiled-grid era (its rows carry no typed extension);
+        # v6 is the candidate typed-call extension.
+        supported_versions.update(
+            {4, NVIDIA_H200_GEMM_OBSERVED_SCHEMA_VERSION,
+             NVIDIA_H200_GEMM_LAUNCH_SCHEMA_VERSION})
+    if manifest["schema_version"] not in supported_versions:
+        raise ValueError(
+            f"{manifest_path} artifacts require schema v5 or later")
+    if (manifest["artifact_type"] != GEMM_LAUNCH_ARTIFACT_TYPE
             or manifest["hardware_id"] != hardware_id
             or manifest["software_revision"] != software_revision
             or manifest["compression"] != GEMM_LAUNCH_COMPRESSION
@@ -475,10 +538,37 @@ def _validate_manifest(
             or manifest["null_encoding"] != GEMM_NULL_ENCODING
             or manifest["duration_consumed"] is not False):
         raise ValueError(f"{manifest_path} identity or evidence boundary differs")
-    if manifest["selection_key_fields"] != list(
-            GEMM_LAUNCH_SELECTION_KEY_FIELDS):
+    expected_key_fields = list(GEMM_LAUNCH_SELECTION_KEY_FIELDS)
+    if hardware_id == "nvidia_h200":
+        if manifest["schema_version"] == NVIDIA_H200_GEMM_LAUNCH_SCHEMA_VERSION:
+            # v6 candidates must declare the full typed-call key extension.
+            expected_key_fields = list(NVIDIA_H200_GEMM_V6_SELECTION_KEY_FIELDS)
+        elif manifest["schema_version"] == NVIDIA_H200_GEMM_OBSERVED_SCHEMA_VERSION:
+            # v5-era artifacts predate the typed extension; their keys stay
+            # at the shared 13-field identity.
+            expected_key_fields = list(GEMM_LAUNCH_SELECTION_KEY_FIELDS)
+        else:
+            # v4-era artifacts predate the typed extension; their keys stay
+            # at the shared 13-field identity.  Anything else must not
+            # smuggle a v6 typed key identity: fail closed rather than guess.
+            if manifest["schema_version"] != 4:
+                raise ValueError(
+                    f"{manifest_path} selection key fields differ for schema "
+                    f"v{manifest['schema_version']}")
+    if manifest["selection_key_fields"] != expected_key_fields:
         raise ValueError(f"{manifest_path} selection key fields differ")
-    if manifest["launch_fields"] != list(gemm_launch_fields(hardware_id)):
+    expected_launch_fields = list(gemm_launch_fields(hardware_id))
+    if (hardware_id == "nvidia_h200"
+            and manifest["schema_version"] in supported_versions
+            and manifest["schema_version"] != NVIDIA_H200_GEMM_LAUNCH_SCHEMA_VERSION):
+        # v4/v5-era artifacts predate the typed extension; their launch_fields
+        # stop at the observed-grid block.  v6 candidates must declare the
+        # full extension block.
+        expected_launch_fields = list(
+            gemm_launch_csv_fields_for_schema(
+                hardware_id, manifest["schema_version"])[
+                    len(expected_key_fields):])
+    if manifest["launch_fields"] != expected_launch_fields:
         raise ValueError(f"{manifest_path} launch fields differ")
     if manifest["semantic_context_fields"] != list(
             GEMM_SEMANTIC_CONTEXT_FIELDS):
@@ -533,7 +623,10 @@ def _validate_manifest(
             raise ValueError(f"{manifest_path} repeats evidence kind {kind!r}")
         seen_kinds.add(kind)
         _require_sha256(source["sha256"], f"{context}.sha256")
-    if (evidence_sources[0]["kind"] != "expanded_evidence"
+    primary_kinds = {"expanded_evidence"}
+    if hardware_id == "nvidia_h200" and manifest["schema_version"] == 5:
+        primary_kinds.add("compact_rank0_launch_facts")
+    if (evidence_sources[0]["kind"] not in primary_kinds
             or evidence_sources[0]["sha256"] != manifest["evidence_sha256"]):
         raise ValueError(
             f"{manifest_path} primary evidence source SHA256 differs")
@@ -542,7 +635,7 @@ def _validate_manifest(
 
 def _parse_csv(
         csv_bytes: bytes, expected_row_count: int, csv_path: Path,
-        hardware_id: str,
+        hardware_id: str, schema_version: int,
         ) -> dict[tuple[object, ...], GemmLaunchSelection]:
     layout = gemm_launch_record_layout(hardware_id)
     try:
@@ -561,7 +654,7 @@ def _parse_csv(
     if not lines:
         raise ValueError(f"{csv_path} is empty")
     header = lines[0].split(",")
-    csv_fields = gemm_launch_csv_fields(hardware_id)
+    csv_fields = gemm_launch_csv_fields_for_schema(hardware_id, schema_version)
     if header != list(csv_fields):
         raise ValueError(f"{csv_path} header differs from the canonical schema")
     result: dict[tuple[object, ...], GemmLaunchSelection] = {}
@@ -607,41 +700,115 @@ def _parse_csv(
         has_bias = _parse_boolean(row[12], f"{context}.has_bias")
         if has_bias != (epilogue == "bias"):
             raise ValueError(f"{context} has_bias conflicts with epilogue")
-        tile_m = optional_positive(row[13], "tile_m", line_number)
-        tile_n = optional_positive(row[14], "tile_n", line_number)
-        tile_k = optional_positive(row[15], "tile_k", line_number)
+        v6_extension = None
+        if hardware_id == "nvidia_h200" and schema_version >= 6:
+            v6_extension = _parse_h200_v6_extension(
+                row[len(NVIDIA_H200_GEMM_V6_SELECTION_KEY_FIELDS)
+                    - len(NVIDIA_H200_GEMM_V6_EXTENSION_FIELDS):
+                    len(NVIDIA_H200_GEMM_V6_SELECTION_KEY_FIELDS)],
+                context)
+        launch_offset = (len(GEMM_LAUNCH_SELECTION_KEY_FIELDS)
+                         if schema_version < 6
+                         else len(NVIDIA_H200_GEMM_V6_SELECTION_KEY_FIELDS))
+        tile_m = optional_positive(row[launch_offset], "tile_m", line_number)
+        tile_n = optional_positive(row[launch_offset + 1], "tile_n", line_number)
+        tile_k = optional_positive(row[launch_offset + 2], "tile_k", line_number)
         tile = (tile_m, tile_n, tile_k)
         if ((tile_m is None or tile_n is None or tile_k is None)
                 and (tile_m is not None or tile_n is not None
                      or tile_k is not None)):
             raise ValueError(f"{context} tile must be fully present or fully null")
-        pipeline_depth = optional_positive(row[16], "pipeline_depth", line_number)
+        pipeline_depth = optional_positive(row[launch_offset + 3], "pipeline_depth", line_number)
         if tile[0] is None and pipeline_depth is not None:
             raise ValueError(f"{context} untiled launch must not declare a pipeline")
-        reduction = row[18]
+        reduction = row[launch_offset + 5]
         if reduction not in _ALLOWED_REDUCTIONS:
             raise ValueError(f"{context} has unsupported reduction {reduction!r}")
         observed_grid = None
         if layout.extension == "observed_grid":
             observed_grid = _parse_observed_grid(
-                row[len(GEMM_LAUNCH_CSV_FIELDS):], context, variant)
+                row[launch_offset + len(GEMM_LAUNCH_FIELDS):],
+                context, variant)
+            if schema_version == 4 and observed_grid.observability != "grid_block_only":
+                raise ValueError("H200 tiled-grid observations require schema v5")
+        if (observed_grid is not None
+                and observed_grid.observability == "grid_block_only"):
+            # v5-era grid-block-only rows (the published router artifact)
+            # are bound to the FP32-external reduction contract.  v6
+            # grid-block-only rows may carry their real reduction facts
+            # (including "none") so a capture that cannot see the tile can
+            # still record what it observed without inventing tiling.  In
+            # both eras unknown tile/pipeline/split facts must stay null;
+            # only the reducer geometry/partial dtype that were actually
+            # observed may be present, and they must agree with the row's
+            # reduction kind.
             if (any(value is not None for value in tile)
-                    or pipeline_depth is not None or row[17] != ""
-                    or reduction != "fp32_external"):
+                    or pipeline_depth is not None or row[launch_offset + 4] != ""):
                 raise ValueError(
                     f"{context} grid-block-only launch must leave tile, "
-                    "pipeline and split null and reduce FP32 partials "
-                    "externally")
+                    "pipeline and split null")
+            if schema_version < 6 and reduction != "fp32_external":
+                raise ValueError(
+                    f"{context} grid-block-only launch must reduce FP32 "
+                    "partials externally")
+            if reduction in ("fp32_external", "output_dtype_external"):
+                if observed_grid.reducer_grid is None:
+                    raise ValueError(
+                        f"{context} grid-block-only external reduction lacks "
+                        "the observed reducer geometry")
+            elif observed_grid.reducer_grid is not None:
+                raise ValueError(
+                    f"{context} grid-block-only launch declares a reducer "
+                    "without an external reduction")
             split_k = None
         else:
-            split_k = positive(row[17], "split_k", line_number)
+            split_k = positive(row[launch_offset + 4], "split_k", line_number)
             if ((split_k == 1) != (reduction == "none")
                     or tile[0] is None and split_k != 1):
                 raise ValueError(f"{context} split/reduction contract differs")
+            if observed_grid is not None:
+                if tile[0] is None or pipeline_depth is None:
+                    raise ValueError(f"{context} tiled-grid launch lacks tiling")
+                external = reduction in ("fp32_external", "output_dtype_external")
+                if external != (observed_grid.reducer_grid is not None):
+                    raise ValueError(f"{context} observed reducer differs from reduction")
+                if observed_grid.output_dtype != dtype:
+                    raise ValueError(f"{context} tiled-grid output dtype differs")
+                expected_partial = (
+                    "fp32" if reduction == "fp32_external"
+                    else dtype if reduction == "output_dtype_external" else None)
+                if observed_grid.partial_dtype != expected_partial:
+                    raise ValueError(f"{context} partial dtype differs from reduction")
+        if (observed_grid is not None
+                and observed_grid.observability == "grid_block_only"
+                and schema_version >= 6 and reduction == "none"):
+            # A v6 grid-block-only row may record its true reduction kind
+            # (including "none"); without a reducer launch the row must not
+            # carry reducer geometry or an FP32 partial dtype, because both
+            # facts describe the split-K reduction the launch did not have.
+            if (observed_grid.reducer_grid is not None
+                    or observed_grid.partial_dtype is not None):
+                raise ValueError(
+                    f"{context} grid-block-only launch declares a reducer "
+                    "without an external reduction")
+        if (observed_grid is not None and v6_extension is not None
+                and observed_grid.observability == "grid_block_only"):
+            # A grid-only observation records the true output storage of
+            # the launch; the v6 typed key must state the same storage or
+            # the row silently mis-describes the captured call.
+            _, out_dtype_key, _, *_ = v6_extension
+            observed_output = observed_grid.output_dtype
+            effective_key_dtype = out_dtype_key or dtype
+            if effective_key_dtype != observed_output:
+                raise ValueError(
+                    f"{context} grid-only output_dtype_key differs from the "
+                    "observed output dtype")
         key = (
             dtype, variant, b, m, n, k, a_layout, b_layout, c_layout,
             trans_a, trans_b, epilogue, has_bias,
         )
+        if v6_extension is not None:
+            key = (*key, *v6_extension)
         if previous_key is not None and key <= previous_key:
             raise ValueError(f"{context} physical keys are not strictly sorted")
         previous_key = key
@@ -711,6 +878,62 @@ def _parse_csv(
     return result
 
 
+def _parse_h200_v6_extension(values: list[str], context: str) -> tuple:
+    """Parse the v6 typed-call key extension (H200 only).
+
+    ``beta`` is empty (0) or a positive decimal; ``output_dtype_key`` is
+    empty (input dtype) or one of bf16/fp16/fp32; ``batch_count`` is a
+    positive integer (1 for ordinary calls); strides are empty or positive
+    integers and must be present exactly when batch_count > 1.  Physically
+    equivalent spellings are normalized at this single boundary so two
+    different lexical forms of the same beta (for example ``.5`` and
+    ``0.5``) never alias distinct LUT rows.
+    """
+    if len(values) != len(NVIDIA_H200_GEMM_V6_EXTENSION_FIELDS):
+        raise AssertionError("H200 v6 extension columns disappeared")
+    beta_text = values[0]
+    if beta_text != "":
+        try:
+            beta_value = float(beta_text)
+        except ValueError:
+            raise ValueError(
+                f"{context}.beta must be a decimal string") from None
+        _require_h200_decimal(beta_text, f"{context}.beta")
+        if not (beta_value > 0.0):
+            raise ValueError(f"{context}.beta must be positive")
+        normalized = f"{beta_value:g}"
+        beta_text = "" if normalized == "0" else normalized
+    out_dtype = values[1]
+    if out_dtype not in ("", "bf16", "fp16", "fp32"):
+        raise ValueError(f"{context}.output_dtype_key is unsupported")
+    batch = _parse_positive_integer(values[2], f"{context}.batch_count")
+    strides = []
+    for field, value in zip(("stride_a", "stride_b", "stride_c"),
+                            values[3:]):
+        if value == "":
+            strides.append(None)
+        else:
+            strides.append(_parse_positive_integer(
+                value, f"{context}.{field}"))
+    if batch > 1 and any(s is None for s in strides):
+        raise ValueError(f"{context} batched call requires all strides")
+    if batch == 1 and any(s is not None for s in strides):
+        raise ValueError(f"{context} ordinary call must not declare strides")
+    return (beta_text, out_dtype, batch, *strides)
+
+
+def _require_h200_decimal(value: str, context: str) -> None:
+    if not value or not value.isascii():
+        raise ValueError(f"{context} must be a decimal string")
+    seen_dot = False
+    for char in value:
+        if char == "." and not seen_dot:
+            seen_dot = True
+            continue
+        if not char.isdigit():
+            raise ValueError(f"{context} must be a decimal string")
+
+
 def _parse_observed_grid(
         values: list[str], context: str, variant: str,
         ) -> ObservedGridLaunchSelection:
@@ -719,22 +942,35 @@ def _parse_observed_grid(
     observability = values[0]
     if observability not in _ALLOWED_LAUNCH_OBSERVABILITY:
         raise ValueError(f"{context}.launch_observability is unsupported")
-    if variant != "gemm":
+    if variant not in ("gemm", "gemv", "batched_gemm"):
+        raise ValueError(f"{context} observed launch must be a GEMM/GEMV key")
+    if observability == "grid_block_only" and variant not in ("gemm", "batched_gemm"):
         raise ValueError(f"{context} grid-block-only launch must be a GEMM")
-    integers = tuple(
+    main = tuple(
         _parse_positive_integer(value, f"{context}.{field}")
         for field, value in zip(
-            NVIDIA_H200_GEMM_OBSERVED_LAUNCH_FIELDS[1:9], values[1:9]))
-    partial_dtype, output_dtype = values[9], values[10]
-    if (partial_dtype not in _ALLOWED_OBSERVED_DTYPES
+            NVIDIA_H200_GEMM_OBSERVED_LAUNCH_FIELDS[1:5], values[1:5]))
+    reducer_values = values[5:9]
+    if all(value == "" for value in reducer_values):
+        reducer_grid = reducer_block = None
+    elif any(value == "" for value in reducer_values):
+        raise ValueError(f"{context} reducer geometry is only partly present")
+    else:
+        reducer = tuple(_parse_positive_integer(value, f"{context}.reducer")
+                        for value in reducer_values)
+        reducer_grid, reducer_block = reducer[:2], reducer[2:]
+    partial_dtype = None if values[9] == "" else values[9]
+    output_dtype = values[10]
+    if ((partial_dtype is not None and partial_dtype not in _ALLOWED_OBSERVED_DTYPES)
             or output_dtype not in _ALLOWED_OBSERVED_DTYPES):
         raise ValueError(f"{context} observed partial/output dtype differs")
-    if partial_dtype != "fp32":
-        raise ValueError(
-            f"{context} FP32 external reduction needs FP32 partials")
+    if observability == "grid_block_only" and (
+            partial_dtype is not None or reducer_grid is not None) and (
+            partial_dtype != "fp32" or reducer_grid is None):
+        raise ValueError(f"{context} grid-block-only needs an FP32 reducer")
     return ObservedGridLaunchSelection(
-        observability, integers[0:3], integers[3],
-        integers[4:6], integers[6:8], partial_dtype, output_dtype)
+        observability, main[:3], main[3],
+        reducer_grid, reducer_block, partial_dtype, output_dtype)
 
 
 def load_gemm_launch_selection_files(
@@ -754,7 +990,8 @@ def load_gemm_launch_selection_files(
         manifest, expected_hardware, software_revision, csv_bytes,
         compressed_csv_bytes,
         manifest_path, hardware_contract)
-    return _parse_csv(csv_bytes, row_count, csv_path, expected_hardware)
+    return _parse_csv(csv_bytes, row_count, csv_path, expected_hardware,
+                      manifest["schema_version"])
 
 
 @lru_cache(maxsize=None)

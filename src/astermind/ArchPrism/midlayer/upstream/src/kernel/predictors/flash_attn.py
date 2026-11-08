@@ -1,5 +1,7 @@
 """Complete-spec fused-attention physical prediction."""
 
+from src.kernel.prediction_cache import RuntimeCache
+
 from collections import OrderedDict
 from functools import wraps
 import dataclasses
@@ -10,7 +12,7 @@ import statistics
 import struct
 import threading
 from types import MappingProxyType
-from typing import Optional, Tuple
+from typing import NamedTuple, Optional, Tuple
 
 from src.kernel.formula import PerformanceFormula, small_kernel_span_floor_s
 from src.kernel.kernel_base import KernelPredictor
@@ -46,7 +48,7 @@ from src.kernel.predictors.common import (
     validated_l2_miss_rate,
 )
 from src.kernel.memory_flash_attention import (
-    has_fa3_prefill_source,fa3_prefill_source_demands,fa3_prefill_source_work,current_fa3_prefill_source_work,
+    has_fa3_prefill_source,fa3_prefill_source_work,current_fa3_prefill_source_work,
     has_fa3_combine_source,fa3_combine_source_work,current_fa3_combine_source_work,
     cann_split_fuse_stack_geometry,has_cann_tnd_source,cann_tnd_source_demands,cann_tnd_source_work,current_cann_tnd_source_work,
     has_metax_varlen_source,metax_varlen_source_work,current_metax_varlen_source_work,
@@ -56,7 +58,7 @@ from src.kernel.memory_flash_attention import (
     metax_mla_source_work,current_metax_mla_source_work,metax_mla_scheduler_work,
     has_grouped_mla_source,grouped_mla_source_work,current_grouped_mla_source_work,
 )
-from src.kernel.memory_access_builder import fa3_combine_prediction_work,fa3_prefill_memory_access_program,cann_tnd_memory_access_program,dense_attention_memory_access_program,dense_attention_prediction_work,metax_mla_prediction_work,grouped_mla_prediction_work,cann_attention_memory_access_program
+from src.kernel.memory_access_builder import fa3_combine_prediction_work,fa3_prefill_prediction_work,cann_tnd_memory_access_program,dense_attention_memory_access_program,dense_attention_prediction_work,metax_mla_prediction_work,grouped_mla_prediction_work,cann_attention_memory_access_program
 from src.kernel.cache_traffic_sim import simulate_attention_prefill_residency
 from src.kernel.model_contract import (
     PredictionDiagnostics,
@@ -544,6 +546,7 @@ class _CannSplitFuseWork:
     attention_elements: int
     final_output_elements: int
     workspace_output_elements: int
+    rescale_output_elements: int
     mask_mte2_bytes: int
     mmad_attention_elements: int
     kv_replay_positions: int
@@ -3254,6 +3257,7 @@ def _cann_split_fuse_work(kernel: KernelSpec):
     attention_elements = 0
     final_output_elements = 0
     workspace_output_elements = 0
+    rescale_output_elements = 0
     mask_mte2_bytes = 0
     mmad_attention_elements = 0
     kv_replay_positions = 0
@@ -3292,6 +3296,7 @@ def _cann_split_fuse_work(kernel: KernelSpec):
         """Account for repeated identical head-bundle tasks without CTAs."""
 
         nonlocal task_count
+        nonlocal rescale_output_elements
         nonlocal empty_task_count, empty_output_elements, empty_dup_operations
         if attended_kv == 0:
             # Only the independent FULL cached tail reaches this branch.
@@ -3344,6 +3349,12 @@ def _cann_split_fuse_work(kernel: KernelSpec):
          task_mask_bytes,
          exp_invocations_per_subblock,
          task_stack_count) = task_geometry_cache[geometry_key]
+        # block_epilogue_rescale_o.hpp keeps the first PV result and, for
+        # every subsequent KV stack, executes go *= dm followed by go += lo.
+        # These output-wise operations are distinct from score softmax and
+        # the terminal Div/Cast, even when the accumulator stays in UB.
+        rescale_output_elements += (
+            repeat_count * task_final_output_elements * (task_stack_count - 1))
         start_task = task_count % worker_count
         worker_run_key = (start_task, repeat_count)
         if worker_run_key not in worker_run_counts_cache:
@@ -3384,7 +3395,8 @@ def _cann_split_fuse_work(kernel: KernelSpec):
                 aiv_worker = 2 * worker + aiv_worker_offset
                 aiv_generic_operations[aiv_worker] += worker_task_count * (
                     4 * subblock_attention_elements
-                    + subblock_output_elements)
+                    + subblock_output_elements
+                    + 2 * subblock_output_elements * (task_stack_count - 1))
                 aiv_exp_operations[aiv_worker] += (
                     worker_task_count * subblock_attention_elements)
                 aiv_exp_invocations[aiv_worker] += (
@@ -3486,7 +3498,8 @@ def _cann_split_fuse_work(kernel: KernelSpec):
     if sum(aic_mmad_attention_elements) != mmad_attention_elements:
         raise AssertionError("CANN SplitFuse AIC work is not conserved")
     if sum(aiv_generic_operations) != (
-            4 * attention_elements + final_output_elements + empty_dup_operations):
+            4 * attention_elements + final_output_elements + empty_dup_operations
+            + 2 * rescale_output_elements):
         raise AssertionError(
             "CANN SplitFuse generic AIV work is not conserved")
     if sum(aiv_exp_operations) != attention_elements:
@@ -3501,6 +3514,7 @@ def _cann_split_fuse_work(kernel: KernelSpec):
         attention_elements=attention_elements,
         final_output_elements=final_output_elements,
         workspace_output_elements=workspace_output_elements,
+        rescale_output_elements=rescale_output_elements,
         mask_mte2_bytes=mask_mte2_bytes,
         mmad_attention_elements=mmad_attention_elements,
         kv_replay_positions=kv_replay_positions,
@@ -3550,7 +3564,8 @@ def _cann_split_fuse_vector_service_demands(work: _CannSplitFuseWork):
         for service, operations_by_worker, invocations_by_worker in typed_work
     )
     expected_operations = float(
-        5 * work.attention_elements + 2 * work.final_output_elements + work.empty_dup_operations)
+        5 * work.attention_elements + 2 * work.final_output_elements
+        + work.empty_dup_operations + 2 * work.rescale_output_elements)
     if not math.isclose(
             math.fsum(demand.operations for demand in demands),
             expected_operations, rel_tol=0.0, abs_tol=0.0):
@@ -3581,7 +3596,8 @@ def _attach_cann_split_fuse_vector_schedule(
             "CANN SplitFuse requires exactly one Vector compute demand")
     vector = vector_demands[0]
     expected_operations = float(
-        5 * work.attention_elements + 2 * work.final_output_elements + work.empty_dup_operations)
+        5 * work.attention_elements + 2 * work.final_output_elements
+        + work.empty_dup_operations + 2 * work.rescale_output_elements)
     if not math.isclose(
             vector.operations, expected_operations,
             rel_tol=0.0, abs_tol=0.0):
@@ -3901,6 +3917,10 @@ def _attach_cann_split_fuse_pipeline(
 def _grouped_mla_tile(kernel: KernelSpec):
     """Return explicit A800 grouped-MLA launch semantics, if present."""
 
+    if (kernel.launch is not None
+            and kernel.launch.algorithm == "vllm_030_fa3_sm90_gqa_prefill_partial"):
+        # This GQA tile also names qk_head/value_head but has no MLA KV axis.
+        return None
     tiling = kernel.launch.tiling
     if tiling is None:
         return None
@@ -12382,7 +12402,8 @@ def _model_uncached(
                 flops["compute_vector"] = float(
                     5 * split_fuse_work.attention_elements
                     + 2 * split_fuse_work.final_output_elements
-                    + split_fuse_work.empty_dup_operations)
+                    + split_fuse_work.empty_dup_operations
+                    + 2 * split_fuse_work.rescale_output_elements)
             else:
                 cann_vector_lower_bound = (
                     _cann_standard_decode_vector_lower_bound(kernel))
@@ -13028,10 +13049,11 @@ def _model_uncached(
 #     every later one to the first CTA that asks);
 #   * prefill (hdim 192 / 128, kBlockM = kBlockN = 128, IntraWGOverlap,
 #     no inter-warpgroup scheduler barrier because kHeadDim > 128): both MMA
-#     warpgroups wait on the same K/V stage, so they run in lockstep; per KV
-#     block each issues QK (m64n128k16 SS x 12) then PV of the previous block
-#     (m64n128k16 RS x 8), waits for QK, runs one online-softmax step while
-#     its PV drains:  II = QK(2 WG) + max(PV(2 WG), softmax(2 WG));
+#     warpgroups share the K/V two-slot ring. Per KV block each issues QK
+#     (m64n128k16 SS x 12), rescales old O, then issues the previous block's
+#     PV (m64n128k16 RS x 8). QK wait1 releases K; softmax and PV wait0
+#     precede P reuse. Separate QK192 and V/O128 widths retain conversion,
+#     shared output staging and actual request/split tails in the recurrence;
 #   * decode (hdim 64 / 512, kBlockM = kBlockN = 64, LargeHeadDimV, no
 #     intra-WG overlap, paged cp.async producer): the softmax warpgroup runs
 #     QK+QV (m64n64k16 SS x 36) alone, one softmax step alone, then both
@@ -13046,13 +13068,29 @@ def _model_uncached(
 # capacity, CTA dispatch cost and span floor); no FlashAttention duration.
 # ---------------------------------------------------------------------------
 _FA3_PREFILL_ALGORITHM = "vllm_fa3_sm90_mla_prefill"
+_FA3_PREFILL_SPLIT_ALGORITHM = "vllm_fa3_sm90_mla_prefill_split_partial"
+_FA3_PREFILL_COMBINE_ALGORITHM = "vllm_fa3_sm90_mla_prefill_combine_partial"
 _FA3_DECODE_ALGORITHM = "vllm_fa3_sm90_mla_decode"
 _FA3_COMBINE_ALGORITHM = "vllm_fa3_sm90_combine"
+_FA3_GQA_PREFILL_030_ALGORITHM = "vllm_030_fa3_sm90_gqa_prefill_partial"
+_FA3_GQA_OBSERVED_030_ALGORITHM = "vllm_030_fa3_sm90_gqa_observed_partial"
+_FA3_GQA_OBSERVED_SPLIT_030_ALGORITHM = "vllm_030_fa3_sm90_gqa_observed_split_partial"
+_FA3_GQA_COMBINE_030_ALGORITHM = "vllm_030_fa3_sm90_gqa_combine_partial"
+_FA3_GQA_TMA_030_ALGORITHM = "vllm_030_fa3_sm90_gqa_tma_partial"
+_FA3_GQA_TMA_SPLIT_030_ALGORITHM = "vllm_030_fa3_sm90_gqa_tma_split_partial"
+_FA3_GQA_TMA_COMBINE_030_ALGORITHM = "vllm_030_fa3_sm90_gqa_tma_combine_partial"
+_FA3_SPARSE_MLA_030_ALGORITHM = "vllm_030_fa3_sm90_sparse_mla_partial"
+_FA3_SPARSE_MLA_COMBINE_030_ALGORITHM = "vllm_030_fa3_sm90_sparse_mla_combine_partial"
 _FLASHINFER_MLA_PREFILL_ALGORITHM = "flashinfer_mla_hopper_sm90_paged"
 _FLASHINFER_MLA_THREADS = 256
 _FA3_ALGORITHMS = frozenset((
     _FA3_PREFILL_ALGORITHM, _FA3_DECODE_ALGORITHM, _FA3_COMBINE_ALGORITHM,
-    _FLASHINFER_MLA_PREFILL_ALGORITHM))
+    _FLASHINFER_MLA_PREFILL_ALGORITHM, _FA3_GQA_PREFILL_030_ALGORITHM,
+    _FA3_GQA_OBSERVED_030_ALGORITHM, _FA3_GQA_OBSERVED_SPLIT_030_ALGORITHM,
+    _FA3_GQA_COMBINE_030_ALGORITHM, _FA3_GQA_TMA_030_ALGORITHM,
+    _FA3_GQA_TMA_SPLIT_030_ALGORITHM, _FA3_GQA_TMA_COMBINE_030_ALGORITHM,
+    _FA3_PREFILL_SPLIT_ALGORITHM, _FA3_PREFILL_COMBINE_ALGORITHM,
+    _FA3_SPARSE_MLA_030_ALGORITHM, _FA3_SPARSE_MLA_COMBINE_030_ALGORITHM))
 _FA3_ELEMENT_BYTES = 2
 # The absorbed MLA decode tile (tile_size_fwd_sm90(64, 512)); the combine
 # follows only that kernel, so its split derivation reuses this kBlockN.
@@ -13066,9 +13104,9 @@ _FA3_COMBINE_REGISTERS_PER_THREAD = 46
 _FA3_PREPARE_MAX_BATCHES_1CTA = 992
 
 
-# An observed H200 FlashAttention-3 launch outside the derived MLA template
-# (non-MLA FA3 main/combine and its prepare/fill helpers).  The FA2 (SM80)
-# and MetaX templates describe different kernels, so no method prices it.
+# An observed H200 FlashAttention-3 launch outside the derived MLA decode and
+# uniform fresh GQA prefill templates.  The FA2 (SM80) and MetaX templates
+# describe different kernels, so no method prices it.
 FA3_UNMODELED_OBSERVATION_ALGORITHM = "observed_vllm_fa3_sm90_unmodeled"
 
 
@@ -13079,8 +13117,8 @@ def is_fa3_launch(kernel: KernelSpec) -> bool:
 def _require_modeled_fa3_observation(kernel: KernelSpec) -> None:
     if kernel.launch.algorithm == FA3_UNMODELED_OBSERVATION_ALGORITHM:
         raise NotImplementedError(
-            "H200 FlashAttention-3 has a derived template only for the "
-            "absorbed MLA decode (hdim 64/512) and its split combine; this "
+            "H200 FlashAttention-3 has derived templates for absorbed MLA "
+            "decode and uniform fresh BF16 D128 GQA prefill; this "
             f"{kernel.variant} launch ({kernel.attributes['kv_layout']}) is "
             "unsupported")
 
@@ -13094,8 +13132,10 @@ def _fa3_mechanisms(hardware):
 
 
 def _fa3_lengths(kernel: KernelSpec) -> tuple[tuple[int, ...], tuple[int, ...]]:
-    q_lens = tuple(int(value) for value in kernel.attributes["q_lens"])
-    kv_lens = tuple(int(value) for value in kernel.attributes["kv_lens"])
+    full = ("source_program" in kernel.attributes
+        and kernel.attributes["source_program"] == "vllm_0_30_fa3_gqa_full_decode")
+    q_lens = tuple(int(value) for value in kernel.attributes["model_input_q_lens" if full else "q_lens"])
+    kv_lens = tuple(int(value) for value in kernel.attributes["model_input_kv_lens" if full else "kv_lens"])
     if len(q_lens) != len(kv_lens) or not q_lens:
         raise ValueError("FA3 request lengths must pair one-to-one")
     return q_lens, kv_lens
@@ -13104,16 +13144,24 @@ def _fa3_lengths(kernel: KernelSpec) -> tuple[tuple[int, ...], tuple[int, ...]]:
 def _fa3_decode_splits(q_lens, kv_lens, query_heads: int,
                        static_splits: int, num_sms: int) -> tuple[int, ...]:
     """prepare_varlen_num_blocks_kernel dynamic splits (PackGQA, one KV head)."""
+    return _fa3_request_tile_splits(
+        q_lens, kv_lens, static_splits, num_sms, block_m=64,
+        block_n=_FA3_DECODE_BLOCK_N, ratio=query_heads, kv_heads=1)
+
+
+def _fa3_request_tile_splits(q_lens, kv_lens, static_splits, num_sms, *,
+                             block_m, block_n, ratio, kv_heads):
+    """Pinned prepare's FP32 task count, after static source launch selection."""
     def f32(value):
         return struct.unpack("f", struct.pack("f", value))[0]
 
-    block_m = 64
     if static_splits == 1 or len(q_lens) > _FA3_PREPARE_MAX_BATCHES_1CTA:
         return tuple(1 for _ in q_lens)
-    m_blocks = [math.ceil(q * query_heads / block_m) for q in q_lens]
-    n_blocks = [math.ceil(k / _FA3_DECODE_BLOCK_N) for k in kv_lens]
+    m_blocks = [math.ceil(q * ratio / block_m) for q in q_lens]
+    n_blocks = [math.ceil(k / block_n) for k in kv_lens]
     total = sum(m * n for m, n in zip(m_blocks, n_blocks))
-    per_sm = math.ceil(f32(f32(f32(float(total) * f32(1.1)) * 1.0) / float(num_sms)))
+    per_sm = math.ceil(f32(f32(f32(f32(float(total)) * f32(1.1))
+                              * f32(float(kv_heads))) / f32(float(num_sms))))
     return tuple(max(min(math.ceil(n / per_sm), static_splits), 1) for n in n_blocks)
 
 
@@ -13141,6 +13189,10 @@ def _fa3_prefill_tiles(kernel: KernelSpec) -> list[int]:
     for q_len, kv_len in zip(q_lens, kv_lens):
         num_m = math.ceil(q_len / block_m)
         num_n = math.ceil(kv_len / block_n)
+        if not kernel.attributes["causal"]:
+            # Noncausal context has no triangular mask or LPT head swizzle.
+            tiles.extend([num_n] * (num_m * heads))
+            continue
         blocks = []
         for m_block in range(num_m):
             causal_max = math.ceil(
@@ -13160,6 +13212,862 @@ def _fa3_prefill_tiles(kernel: KernelSpec) -> list[int]:
                 tiles.extend([blocks[m_block]] * section_heads)
             section_start += section_heads
     return tiles
+
+
+def _fa3_gqa_prefill_030_tile_blocks(kernel: KernelSpec) -> tuple[int, ...]:
+    """Causal KV blocks for each packed-Q tile in the v0.30 varlen scheduler."""
+
+    q_lens, kv_lens = _fa3_lengths(kernel)
+    if (len(q_lens) != kernel.shape["batch"] or q_lens != kv_lens
+            or any(length != kernel.shape["q_len"] for length in q_lens)):
+        raise ValueError("vLLM 0.30 GQA prefill requires uniform fresh requests")
+    ratio = kernel.shape["num_query_heads"] // kernel.shape["num_kv_heads"]
+    block_m = kernel.launch.tiling.tile_shape["q"]
+    block_n = kernel.launch.tiling.tile_shape["kv"]
+    q_len = q_lens[0]
+    per_head = tuple(
+        ((min(q_len * ratio, (m_block + 1) * block_m) - 1)
+         // ratio // block_n + 1)
+        for m_block in range(math.ceil(q_len * ratio / block_m)))
+    # flash_prepare_scheduler.cu reduces its 32-MiB head grouping budget by
+    # the GQA ratio and chooses 16/8/4/2/1 heads per L2 section.  The causal
+    # LPT scheduler walks M blocks in reverse within each section and cycles
+    # through that section's KV heads at every M block.
+    divisor = next((candidate for candidate in (1, 2, 4, 8, 16)
+                    if ratio <= candidate), 16)
+    max_kv_blocks_in_l2 = ((32 * 1024 * 1024) // divisor
+                           // (block_n * (kernel.shape["head_dim"] * 2) * 2))
+    n_blocks = math.ceil(q_len / block_n)
+    heads_in_l2 = next((candidate for candidate in (16, 8, 4, 2)
+                        if n_blocks * candidate <= max_kv_blocks_in_l2), 1)
+    kv_heads = kernel.shape["num_kv_heads"]
+    heads_in_l2 = min(heads_in_l2, kv_heads)
+    per_request = tuple(
+        blocks
+        for section in range(0, kv_heads, heads_in_l2)
+        for blocks in reversed(per_head)
+        for _ in range(min(heads_in_l2, kv_heads - section)))
+    return per_request * len(q_lens)
+
+
+def _fa3_gqa_prefill_030_source_work(kernel: KernelSpec, hardware):
+    """Source-bound GQA tile work and public Q/K/V extents for both APIs."""
+
+    hardware.require_v030_fa3_gqa_prefill_source_launch(kernel)
+    selected = kernel.launch
+    from src.kernel.memory_access_builder import (
+        logical_interface_memory_access_program)
+    from src.kernel.memory_path_solver import public_attention_source_work
+    public_work = public_attention_source_work(
+        logical_interface_memory_access_program(kernel, hardware),
+        expected_kernel=kernel, hardware=hardware)
+    q_len = kernel.shape["q_len"]
+    total_q = kernel.shape["batch"] * q_len
+    if (public_work["query_bytes"] != total_q * kernel.shape["num_query_heads"] * 128 * 2
+            or public_work["key_bytes"] != total_q * kernel.shape["num_kv_heads"] * 128 * 2
+            or public_work["value_bytes"] != public_work["key_bytes"]):
+        raise ValueError("vLLM 0.30 GQA public Q/K/V extents disagree with source")
+    blocks = _fa3_gqa_prefill_030_tile_blocks(kernel)
+    tile = selected.tiling.tile_shape
+    tensor_flops = (4 * tile["q"] * tile["kv"] * tile["qk_head"]
+                    * sum(blocks))
+    logical_l2_read_bytes = (
+        sum(blocks) * tile["kv"] * (tile["qk_head"] + tile["value_head"]) * 2
+        + len(blocks) * tile["q"] * tile["qk_head"] * 2)
+    return {
+        "selected": selected, "public_work": public_work,
+        "blocks": blocks, "tensor_flops": tensor_flops,
+        "logical_l2_read_bytes": logical_l2_read_bytes,
+    }
+
+
+def _fa3_gqa_prefill_030_partial_prediction(kernel: KernelSpec, hardware):
+    """Retain the public source binding and price the missing source stages."""
+
+    _fa3_gqa_prefill_030_source_work(kernel, hardware)
+    tile = kernel.launch.tiling
+    execution = dataclasses.replace(
+        kernel, launch=dataclasses.replace(
+            kernel.launch, algorithm=_FA3_GQA_OBSERVED_030_ALGORITHM,
+            tiling=dataclasses.replace(tile, tile_shape={
+                "q": tile.tile_shape["q"], "kv": tile.tile_shape["kv"],
+                "head_dim": kernel.shape["head_dim"]})))
+    # The retained CUDA12.9 GQA4 prefill binary places wait0 before all EX2
+    # and local-sum work in its steady loop (native PCs c1f0/c320). Only
+    # the older explicit source-bound prefill family consumes this evidence;
+    # normal source factories still need their actual compiler/caller binding.
+    compiled_wait0 = (kernel.shape["num_query_heads"]
+                      == 4 * kernel.shape["num_kv_heads"])
+    prediction = _fa3_gqa_observed_prediction(
+        execution, hardware, compiled_wait0_before_online=compiled_wait0)
+    return dataclasses.replace(
+        prediction, diagnostics=dataclasses.replace(
+            prediction.diagnostics,
+            limitations=prediction.diagnostics.limitations + (
+                "vllm_030_fa3_gqa_one_int32_semaphore_fill_priced_separately",)))
+
+
+def _fa3_gqa_partial_source_work(q_lens, kv_lens, *, heads, kv_heads,
+                                  block_m, block_n, splits, causal):
+    """Structural split-output work, including empty and masked ranges.
+
+    A nonempty main M tile stores O for all its valid rows, including
+    rows whose own causal prefix is empty in that split. An empty tile
+    stores only -inf LSE. Combine prefetches its first three O stages;
+    later loads stop at each row's last finite-LSE split. The owned
+    combine copies assign one row per thread (M16/K64 or M8/K128).
+    Counts assume finite unmasked attention operands; they do not bind
+    physical scratch aliases/readiness or override native validity guards.
+    """
+    ratio = heads // kv_heads
+    lse_rows, stored_o_rows, weighted_o_rows, loaded_o_rows = 0, 0, 0, 0
+    max_valid_splits = 0
+
+    def ceil_sum(end, width):
+        # Sum ceil(x / width) for positive integers x <= end.
+        full, tail = divmod(end, width)
+        return width * full * (full + 1) // 2 + tail * (full + 1)
+
+    for q, kv, count in zip(q_lens, kv_lens, splits):
+        if count == 1:
+            continue
+        panels_per_split = math.ceil(math.ceil(kv / block_n) / count)
+        width = panels_per_split * block_n
+        live = math.ceil(kv / width)
+        max_valid_splits = max(max_valid_splits, live)
+        lse_rows += q * heads * count
+        if causal:
+            # Every q row sees keys [0, kv-q+qidx+1). Count in closed
+            # form rather than enumerating heads * Q output rows.
+            lower = kv - q
+            finite_rows = ceil_sum(kv, width) - ceil_sum(lower, width)
+            prefetched = min(3, count)
+            low_end = min(kv, prefetched * width)
+            low_count = max(low_end - lower, 0)
+            read_rows = (prefetched * low_count + ceil_sum(kv, width)
+                         - ceil_sum(max(lower, low_end), width))
+            for m in range(math.ceil(q * ratio / block_m)):
+                valid = min(block_m, q * ratio - m * block_m)
+                last_q = (m * block_m + valid - 1) // ratio
+                stored_o_rows += valid * kv_heads * math.ceil(
+                    (kv - q + last_q + 1) / width)
+        else:
+            finite_rows = q * live
+            read_rows = q * max(live, min(3, count))
+            stored_o_rows += q * heads * live
+        weighted_o_rows += heads * finite_rows
+        loaded_o_rows += heads * read_rows
+    return {"partial_lse_rows": lse_rows,
+            "materialized_partial_output_rows": stored_o_rows,
+            "weighted_partial_output_rows": weighted_o_rows,
+            "combine_partial_output_read_rows": loaded_o_rows,
+            "max_valid_splits": max_valid_splits}
+
+
+class _Fa3GqaSourceTask(NamedTuple):
+    """One source task, without a detailed memory/control graph or a price.
+
+    The two first-panel fields are absent for an empty split. Packed query
+    tails remain live extents; no query or KV row is fabricated to fill a tile.
+    """
+
+    batch_index: int
+    kv_head_index: int
+    q_block_index: int
+    split_index: int
+    packed_q_start: int
+    packed_q_rows: int
+    kv_block_start: int
+    kv_block_stop: int
+    read_kv_rows: int
+    first_panel_kv_rows: Optional[int]
+    first_causal_all_masked_rows: Optional[int]
+
+    @property
+    def panel_count(self):
+        return max(self.kv_block_stop - self.kv_block_start, 0)
+
+
+def _fa3_gqa_source_tasks(q_lens, kv_lens, *, heads, kv_heads, block_m,
+                          block_n, head_dim, splits, causal, value_head_dim=None):
+    """Stream compact geometry in the retained model's head-section/LPT order.
+
+    Masked-row counts describe mathematical eligibility in the first descending
+    panel, not the compiled Check_inf flag. That flag still belongs to the
+    hardware source program. Caller batch order is preserved; this is not the
+    original GPU scheduler's global metadata sort or CTA ticket assignment.
+    No observation duration or service is consumed.
+    """
+    value_head_dim = head_dim if value_head_dim is None else value_head_dim
+    ratio = heads // kv_heads
+    for batch, (q, kv, split) in enumerate(zip(q_lens, kv_lens, splits)):
+        total_n = math.ceil(kv / block_n)
+        n_per_split = math.ceil(total_n / split)
+        per_head = []
+        for m in range(math.ceil(q * ratio / block_m)):
+            start = m * block_m
+            rows = min(block_m, q * ratio - start)
+            last_q = (start + rows - 1) // ratio
+            causal_n = min(total_n, max(0, math.ceil(
+                (last_q + 1 + kv - q) / block_n))) if causal else total_n
+            row = []
+            for s in range(split):
+                lo = s * n_per_split
+                hi = min((s + 1) * n_per_split, causal_n)
+                if hi > lo:
+                    live_kv = min(kv, hi * block_n) - lo * block_n
+                    first_kv = min(block_n, kv - (hi - 1) * block_n)
+                    first_masked = min(rows, max(
+                        ((hi - 1) * block_n - kv + q) * ratio - start, 0)) if causal else 0
+                else:
+                    live_kv, first_kv, first_masked = 0, None, None
+                row.append((m, s, start, rows, lo, hi, live_kv,
+                            first_kv, first_masked))
+            per_head.append(row)
+        if causal and split == 1:
+            divisor = next((v for v in (1, 2, 4, 8, 16) if ratio <= v), 16)
+            budget = ((32 * 1024 * 1024) // divisor
+                      // (block_n * (head_dim + value_head_dim) * 2))
+            group = min(kv_heads, next(
+                (v for v in (16, 8, 4, 2) if total_n * v <= budget), 1))
+            for first_head in range(0, kv_heads, group):
+                for row in reversed(per_head):
+                    for head in range(first_head, min(first_head + group, kv_heads)):
+                        yield _Fa3GqaSourceTask(batch, head, *row[0])
+        else:
+            m_order = tuple(reversed(per_head)) if causal else tuple(per_head)
+            for head in range(kv_heads):
+                for s in range(split):
+                    for row in m_order:
+                        yield _Fa3GqaSourceTask(batch, head, *row[s])
+
+
+def _fa3_gqa_observed_work(kernel: KernelSpec, hardware):
+    """Packed GQA tile panels and partial O/LSE extents from pinned FA3.
+
+    Work follows tile_scheduler.hpp and mainloop_fwd_sm90_tma_gmma_ws.hpp.
+    Neither the NCU traffic counters nor any production duration is read.
+    The physical cache reuse and within-CTA service remain explicit partial
+    estimates; the variable per-request split and causal prefix are retained.
+    """
+
+    q_lens, kv_lens = _fa3_lengths(kernel)
+    heads = kernel.shape["num_query_heads"]
+    kv_heads = kernel.shape["num_kv_heads"]
+    ratio, d = heads // kv_heads, kernel.shape["head_dim"]
+    tile = kernel.launch.tiling.tile_shape
+    # A combine observation retains its own tile, while its source input is
+    # the same dynamic split schedule of the sibling main. For all recorded
+    # GQA split calls the main uses the single-warpgroup decode tile or the
+    # 128x128 causal/mixed tile.
+    combine = kernel.launch.algorithm in (
+        _FA3_GQA_COMBINE_030_ALGORITHM, _FA3_GQA_TMA_COMBINE_030_ALGORITHM,
+        _FA3_PREFILL_COMBINE_ALGORITHM)
+    paged_tma = kernel.launch.algorithm in (
+        _FA3_GQA_TMA_030_ALGORITHM, _FA3_GQA_TMA_SPLIT_030_ALGORITHM,
+        _FA3_GQA_TMA_COMBINE_030_ALGORITHM)
+    if combine:
+        one_wg = (max(q_lens) * ratio <= 64
+                  and kernel.launch.algorithm != _FA3_PREFILL_COMBINE_ALGORITHM)
+        block_m = 128 if d == 256 else (64 if one_wg else (192 if d == 64 else 128))
+        paged = kernel.attributes["kv_layout"] in ("paged", "paged_varlen", "chunked_prefill")
+        causal = kernel.attributes["causal"] and (max(q_lens) > 1 or paged and d == 128)
+        paged = paged and not paged_tma
+        if kernel.launch.algorithm == _FA3_PREFILL_COMBINE_ALGORITHM:
+            block_n = 128
+        elif d == 64:
+            block_n = 192 if one_wg else (128 if causal else (160 if paged else 192))
+        elif d == 128:
+            block_n = 128 if causal or paged else (176 if one_wg else 160)
+        else:
+            block_n = 80
+    else:
+        block_m, block_n = tile["q"], tile["kv"]
+    splits = hardware.fa3_gqa_observed_source_splits(
+        kernel, block_m=block_m, block_n=block_n)
+    output_rows = heads * sum(q_lens)
+    # epilogue_fwd.hpp: Split+Varlen uses the per-request dynamic count.
+    # A dynamic count of one writes final BF16 O/LSE directly even when
+    # the compiled template is Split; combine returns before reading it.
+    split_rows = heads * sum(q for q, s in zip(q_lens, splits) if s > 1)
+    partial_rows = heads * sum(q * s for q, s in zip(q_lens, splits) if s > 1)
+    partial_work = _fa3_gqa_partial_source_work(
+        q_lens, kv_lens, heads=heads, kv_heads=kv_heads,
+        block_m=block_m, block_n=block_n, splits=splits,
+        causal=kernel.attributes["causal"] and max(q_lens) > 1)
+    if combine:
+        # Each value-column CTA reloads LSE, while only k_block0 writes the
+        # final LSE. D256 spans two128-column combine tiles.
+        value_blocks = math.ceil(d / tile["value_head"])
+        partial_o_reads = partial_work["combine_partial_output_read_rows"] * d * 4
+        partial_lse_reads = partial_rows * value_blocks * 4
+        read_bytes = partial_o_reads + partial_lse_reads
+        return {"blocks": (), "tensor_flops": 0,
+                **partial_work,
+                "scalar_flops": (2 * d * partial_work["weighted_partial_output_rows"]
+                                 + 4 * partial_rows * value_blocks),
+                "sfu_ops": partial_rows * value_blocks,
+                "partial_output_read_bytes": partial_o_reads,
+                "partial_lse_read_bytes": partial_lse_reads,
+                "logical_l2_read_bytes": read_bytes,
+                "read_bytes": read_bytes,
+                "minimum_physical_read_bytes": read_bytes,
+                "tma_kv_expected_transaction_bytes": 0,
+                "tma_kv_padding_read_bytes": 0,
+                # Keep the native O/LSE tensor union separate from the
+                # one INT32 reset, which executes before split/row bypass.
+                "write_bytes": split_rows * (d * 2 + 4),
+                "semaphore_reset_bytes": 4,
+                "scores": partial_rows, "output_rows": split_rows,
+                "splits": splits, "block_m": tile["rows"],
+                "block_n": tile["value_head"], "head_dim": d}
+    causal = kernel.attributes["causal"] and max(q_lens) > 1
+    blocks = []
+    logical_reads = issued_kv_bytes = live_kv_bytes = 0
+    for task in _fa3_gqa_source_tasks(
+            q_lens, kv_lens, heads=heads, kv_heads=kv_heads,
+            block_m=block_m, block_n=block_n, head_dim=d,
+            splits=splits, causal=causal):
+        panels = task.panel_count
+        blocks.append(panels)
+        if panels:
+            # A paged TMA descriptor is bounded by its physical page, not
+            # the logical request length. An eligible page contains each
+            # full N tile, including the masked logical KV tail. cp.async
+            # instead skips K tails and zero-fills V tails without reading.
+            rows_read = panels * block_n if paged_tma else task.read_kv_rows
+            kv_bytes = rows_read * d * 4
+            issued_kv_bytes += kv_bytes
+            live_kv_bytes += task.read_kv_rows * d * 4
+            logical_reads += task.packed_q_rows * d * 2 + kv_bytes
+    split_output = kernel.launch.algorithm in (
+        _FA3_GQA_OBSERVED_SPLIT_030_ALGORITHM, _FA3_GQA_TMA_SPLIT_030_ALGORITHM)
+    partial_output_bytes = partial_work["materialized_partial_output_rows"] * d * 4 if split_output else 0
+    partial_lse_bytes = partial_rows * 4 if split_output else 0
+    partial_write_bytes = partial_output_bytes + partial_lse_bytes
+    direct_write_bytes = (output_rows - split_rows if split_output else output_rows) * (d * 2 + 4)
+    scores = sum(blocks) * block_m * block_n
+    read_bytes = (heads * sum(q_lens) * d * 2
+                  + kv_heads * sum(kv_lens) * d * 4)
+    # Public operand payload remains logical for the caller ABI. The cold
+    # read floor additionally includes every physically addressed KV-tail
+    # row. Q descriptor over-read inside a flattened root is still unbound.
+    minimum_physical_reads = (heads * sum(q_lens) * d * 2
+        + kv_heads * sum(math.ceil(kv / block_n) * block_n
+                         for q, kv in zip(q_lens, kv_lens) if q > 0) * d * 4
+        if paged_tma else read_bytes)
+    return {"blocks": tuple(blocks), "tensor_flops": 4 * d * scores,
+            **partial_work,
+            "logical_l2_read_bytes": logical_reads,
+            "read_bytes": read_bytes,
+            "minimum_physical_read_bytes": minimum_physical_reads,
+            "tma_kv_expected_transaction_bytes": issued_kv_bytes if paged_tma else 0,
+            "tma_kv_padding_read_bytes": issued_kv_bytes - live_kv_bytes if paged_tma else 0,
+            "write_bytes": partial_write_bytes + direct_write_bytes,
+            "partial_write_bytes": partial_write_bytes,
+            "partial_output_bytes": partial_output_bytes,
+            "partial_lse_bytes": partial_lse_bytes,
+            "direct_write_bytes": direct_write_bytes,
+            "semaphore_reset_bytes": 0,
+            "scores": scores, "output_rows": output_rows,
+            "splits": splits, "block_m": block_m,
+            "block_n": block_n, "head_dim": d}
+
+
+def _fa3_gqa_register_services(hardware):
+    """Source-sized H200 register chains; no FA2 launch or CTA-overlap factors.
+
+    The existing independent H200 probe measures two lane-local rows of 32
+    values: max+quad shuffle and the local dependent-add chain. These
+    primitives match Softmax<2>'s register geometry. Composition remains an
+    approximation to its compiler schedule, not a whole native-softmax rate.
+    Conversion uses the actual 32 packed BF16 instruction sites and the issue
+    capacity. Neither the old conversion loop nor the fused exp loop whose
+    repeated inputs overflow is used as a FA3 service.
+    """
+    if not hardware.supports_source_contract("vllm_0_30_fa3_gqa_fresh_prefill"):
+        raise ValueError("FA3 register services require H200 mechanism evidence")
+    model = hardware.register_reduction_dependency_cycles
+    if model is None:
+        raise NotImplementedError("H200 register-chain evidence is required")
+    if model["threads_per_cta"] != 128 or model["quad_reduction_width"] != 4:
+        raise ValueError("FA3 register-chain thread/quad geometry differs")
+    entries = tuple(entry for entry in model["entries"]
+        if (entry["lane_local_rows_per_thread"],
+            entry["score_values_per_lane_local_row"]) == (2, 32))
+    if len(entries) != 1:
+        raise ValueError("FA3 requires one measured two-row/32-value chain")
+    entry = entries[0]
+    clock = hardware.nominal_sm_freq_hz
+    # First reduce_max assigns the first element, then performs 31 local
+    # comparisons + 2 quad comparisons instead of the probe's 32 + 2.
+    first_max = entry["fp32_max_quad4_cycles"] * 33 / 34
+    first_sum = entry["fp32_local_sum_cycles"] * 31 / 32
+    return {
+        "first_online": (first_max + first_sum) / clock,
+        "online": (entry["fp32_max_quad4_cycles"]
+                   + entry["fp32_local_sum_cycles"]) / clock,
+        "quad_sum": entry["fp32_quad4_sum_cycles"] / clock,
+    }
+
+
+def _fa3_gqa_capacity_task_cost(panels, q_rows, first_kv_rows, *, qk, pv,
+                               first_online, online, conversion, rescale,
+                               finalize, copy_bps, smem_bps, latency, page_lookup,
+                               copy_issue, kv_tma, full_kv_tiles, warp_groups, output_dtype_bytes,
+                               qk_completion, head_dim, block_n,
+                               online_after_pv_wait=False,
+                               q_copy_issue_per_four_rows=0.0,
+                               q_copy_fixed_issue=0.0, value_head_dim=None):
+    """Source K/V two-slot schedule with register or per-WG shared P.
+
+    Services are seconds derived from existing HW capacities, not operator
+    durations. Tensor and vector work each share one SM resource; Tensor
+    enqueue/control instructions are explicitly idealized. Persistent tasks
+    remain serial at their output boundary, so next-task prefetch is not priced.
+    """
+    value_head_dim = head_dim if value_head_dim is None else value_head_dim
+    if ((warp_groups, head_dim, value_head_dim, block_n) not in (
+            (1, 128, 128, 128), (2, 128, 128, 128), (3, 64, 64, 128), (2, 256, 256, 80),
+            (2, 128, 128, 160), (1, 128, 128, 176), (1, 64, 64, 192),
+            (3, 64, 64, 160), (3, 64, 64, 192), (2, 192, 128, 128))
+            or output_dtype_bytes not in (2, 4)):
+        raise ValueError("FA3 source schedule requires bound WG/head geometry and 16-bit/FP32 output")
+    if type(online_after_pv_wait) is not bool:
+        raise ValueError("FA3 compiled online/PV order must be explicit bool")
+    if type(kv_tma) is not bool:
+        raise ValueError("FA3 KV TMA mode must be an explicit boolean")
+    if type(full_kv_tiles) is not bool or full_kv_tiles and not kv_tma:
+        raise ValueError("FA3 full physical KV tiles require explicit TMA mode")
+    if online_after_pv_wait and (warp_groups, head_dim, block_n) != (2, 128, 128):
+        raise ValueError("FA3 compiled online/PV order is bound to two-WG D128")
+    if not 0 < q_rows <= 64 * warp_groups:
+        raise ValueError("FA3 live query rows exceed its consumer tile")
+    for service in (q_copy_issue_per_four_rows, q_copy_fixed_issue):
+        if (isinstance(service, bool) or not isinstance(service, (int, float))
+                or not math.isfinite(service) or service < 0):
+            raise ValueError("FA3 Q-copy issue services must be finite nonnegative seconds")
+    if panels == 0:
+        return 0.0
+    rescale_before_pv = head_dim > 128
+    scheduler_token = head_dim <= 128 and warp_groups >= 2
+    p_shared = head_dim == 64 and warp_groups == 3 and block_n in (160, 192)
+    # These noncausal D64 tiles use SS PV. Each WG has its own single P
+    # partition; LargeHeadDimV=false removes the PFull/PEmpty named barriers.
+    # STSM/fence/syncwarp follows that WG's old PV wait0, not another WG.
+    p_partition_bytes = 64 * block_n * 2 if p_shared else 0
+    p_store_s = p_partition_bytes / smem_bps
+    pv_completion = max(pv, p_store_s)
+    producer = memory = tensor = vector = 0.0
+    k_ready, v_ready = [0.0, 0.0], [0.0, 0.0]
+    k_release, v_release = [0.0, 0.0], [0.0, 0.0]
+    p_ready = [0.0] * warp_groups
+
+    def copy(byte_count, gate, issue):
+        nonlocal producer, memory
+        start = max(producer, gate)
+        producer = start + issue
+        memory = max(memory, start) + byte_count / copy_bps
+        return max(memory, producer) + latency
+
+    def mma(request, service, completion):
+        nonlocal tensor
+        start = max(tensor, request)
+        tensor = start + service
+        return max(tensor, start + completion)
+
+    def scalar(request, service):
+        nonlocal vector
+        vector = max(vector, request) + service
+        return vector
+
+    # The page-entry load feeds the pointer shuffle and cp.async issue.
+    # Its cache tier is a declared L2-hit approximation, not an observation.
+    producer += page_lookup
+    row_bytes = head_dim * 2
+    v_row_bytes = value_head_dim * 2
+    # Paged TMA descriptors cover allocated physical pages. Their first
+    # masked panel still transfers a full tile; cp.async skips/zero-fills
+    # its logical tail. Contiguous TMA retains a live-byte lower bound,
+    # since a root descriptor can read beyond a logical request boundary.
+    # Keep the task's live geometry unchanged in all three cases.
+    first_read_rows = block_n if full_kv_tiles else first_kv_rows
+    k_ready[0] = copy(first_read_rows * row_bytes, 0.0, copy_issue)
+    # PackGQAManager uses eight lanes per row. A live four-row warp group
+    # copies D/64 vectors. PackGQA's pointer SHFL precedes the live-row
+    # predicate, so its full-tile issue joins the fixed producer control
+    # budget. Only the copy issue and global payload shrink with the Q tail.
+    # Charge this ingress once/task, rather than once per KV panel.
+    q_issue = math.ceil(q_rows / 4) * q_copy_issue_per_four_rows + q_copy_fixed_issue
+    q_ready = copy(q_rows * row_bytes, 0.0, q_issue)
+    for wg in range(warp_groups):
+        qk_done = mma(max(q_ready, k_ready[0]), qk, qk_completion)
+        k_release[0] = max(k_release[0], qk_done)
+        first_done = scalar(qk_done, first_online)
+        converted = scalar(first_done, conversion)
+        p_ready[wg] = converted if rescale_before_pv else scalar(converted, rescale)
+        p_ready[wg] = max(p_ready[wg], converted + p_store_s)
+
+    token = 0.0
+    for panel in range(1, panels):
+        slot, previous = panel % 2, (panel - 1) % 2
+        # Source loads the next page table before waiting for its K slot;
+        # previous-V pointers are retained, rather than looked up again.
+        producer += page_lookup
+        k_ready[slot] = copy(block_n * row_bytes, k_release[slot], copy_issue)
+        previous_rows = first_read_rows if panel == 1 else block_n
+        v_ready[previous] = copy(previous_rows * v_row_bytes, v_release[previous], copy_issue)
+        released_k = released_v = 0.0
+        for wg in range(warp_groups):
+            request = max(p_ready[wg], q_ready, k_ready[slot],
+                          token if scheduler_token else 0.0)
+            qk_done = mma(request, qk, qk_completion)
+            pv_enqueue = max(request, p_ready[wg], v_ready[previous])
+            if rescale_before_pv:
+                # QK dimensions above128 disable the WG scheduler token
+                # and scale old O after QK enqueue, before the old-panel PV.
+                pv_enqueue = max(pv_enqueue, scalar(request, rescale))
+            pv_done = mma(pv_enqueue, pv, pv_completion)
+            token = pv_enqueue  # ideal enqueue, not PV retirement
+            wait1 = max(qk_done, pv_enqueue)
+            released_k = max(released_k, wait1)
+            online_done = scalar(max(wait1, pv_done) if online_after_pv_wait else wait1, online)
+            # The compiled variant publishes V-empty directly after wait0,
+            # before most online arithmetic. Keep that release distinct from
+            # the conservative aggregate placement of its online work.
+            released_v = max(released_v, pv_done if online_after_pv_wait
+                             else max(online_done, pv_done))
+            converted = scalar(max(online_done, pv_done), conversion)
+            p_ready[wg] = converted if rescale_before_pv else scalar(converted, rescale)
+            # The previous PV has retired before conversion can overwrite
+            # this WG's P. No global P-ready gate couples the other WGs.
+            p_ready[wg] = max(p_ready[wg], converted + p_store_s)
+        k_release[slot], v_release[previous] = released_k, released_v
+
+    last = (panels - 1) % 2
+    last_rows = first_read_rows if panels == 1 else block_n
+    v_ready[last] = copy(last_rows * v_row_bytes, v_release[last], copy_issue)
+    done = 0.0
+    for wg in range(warp_groups):
+        request = max(p_ready[wg], v_ready[last])
+        if rescale_before_pv:
+            request = max(request, scalar(p_ready[wg], rescale))
+        pv_done = mma(request, pv, pv_completion)
+        finalized = scalar(request, finalize)
+        rescaled = scalar(max(finalized, pv_done), rescale)
+        # Varlen epilogue constructs/converts the16-bit shared staging before
+        # its runtime split branch, even when global partial O remains FP32.
+        # P has block_n/2 FP32 values/thread; O has value_head_dim/2.
+        stored = scalar(rescaled, conversion * value_head_dim / block_n)
+        done = max(done, stored)
+    # Varlen epilogue_fwd.hpp first synchronizes every consumer and stages
+    # the complete converted tile in shared memory, even for a packed-Q
+    # tail or a runtime split output. Split partial O then comes directly
+    # from FP32 registers; only final16-bit O is reloaded from shared.
+    # These source stages use bandwidth lower bounds, not a borrowed
+    # barrier latency or a measured whole-epilogue service.
+    staging_bytes = 64 * warp_groups * value_head_dim * 2
+    done += staging_bytes / smem_bps
+    if output_dtype_bytes == 2:
+        done += staging_bytes / smem_bps
+    completed = copy(q_rows * (value_head_dim * output_dtype_bytes + 4), done, 0.0)
+    # P writes/SS reads share aggregate SM capacity, but prebooking another
+    # WG's future store would invent an all-WG barrier. Keep local readiness
+    # above and separately retain the total shared-byte capacity floor.
+    shared_bytes = (2 * panels * warp_groups * p_partition_bytes
+                    + staging_bytes * (2 if output_dtype_bytes == 2 else 1))
+    return max(completed, shared_bytes / smem_bps)
+
+
+def _fa3_gqa_task_stage_cost(panels: int, qk: float, pv: float, softmax: float) -> float:
+    """SM90 IntraWGOverlap prologue, steady iterations and PV drain.
+
+    mainloop_fwd_sm90_tma_gmma_ws.hpp first computes QK+softmax without
+    an earlier PV, then overlaps each following softmax with the previous
+    PV, and finally waits for the last PV. An empty split does no MMA work.
+    """
+    if panels == 0:
+        return 0.0
+    return qk + softmax + (panels - 1) * (qk + max(pv, softmax)) + pv
+
+
+def _validate_fa3_gqa_public_operands(kernel, hardware, work):
+    """Consume actual public Q/cache/O operands without claiming scratch ABI."""
+    if kernel.variant == "combine":
+        return
+    from src.kernel.memory_access_builder import logical_interface_memory_access_program
+    from src.kernel.memory_path_solver import public_attention_source_work
+    public = public_attention_source_work(logical_interface_memory_access_program(kernel, hardware),
+        expected_kernel=kernel, hardware=hardware)
+    if public["read_bytes"] != work["read_bytes"]:
+        raise ValueError("FA3 GQA public Q/K/V payload differs from the source call")
+
+
+def _fa3_gqa_observed_prediction(kernel: KernelSpec, hardware, *,
+                               compiled_wait0_before_online=False):
+    """Coarse source-stage critical path using independent hardware rates."""
+
+    work = _fa3_gqa_observed_work(kernel, hardware)
+    _validate_fa3_gqa_public_operands(kernel, hardware, work)
+    clock, dram_clock = hardware.nominal_sm_freq_hz, hardware.nominal_dram_freq_hz
+    def capacity(role, active):
+        return hardware.resource_by_role(role).effective_capacity(
+            active, sm_freq_hz=clock, dram_freq_hz=dram_clock)
+    def per_sm_capacity(role):
+        resource = hardware.resource_by_role(role)
+        aggregate = capacity(role, 1)
+        return (aggregate / hardware.num_compute_units
+                if resource.scope == "shared" else aggregate)
+    active = min(kernel.launch.grid_size, int(hardware.num_compute_units))
+    combine = kernel.launch.algorithm in (
+        _FA3_GQA_COMBINE_030_ALGORITHM, _FA3_GQA_TMA_COMBINE_030_ALGORITHM,
+        _FA3_PREFILL_COMBINE_ALGORITHM)
+    if type(compiled_wait0_before_online) is not bool:
+        raise ValueError("FA3 compiler order must be explicit bool")
+    if compiled_wait0_before_online and combine:
+        raise ValueError("compiled PV/online order does not apply to combine")
+    if combine:
+        l2_s = (work["read_bytes"] + work["write_bytes"]
+                + work["semaphore_reset_bytes"]) / capacity("l2_cache", active)
+        scalar_s = (work["scalar_flops"] / capacity("compute_fma", active)
+                    + work["sfu_ops"] / capacity("compute_sfu", active))
+        # flash_fwd_combine_kernel.h has four cp.async stages, with three
+        # partial-O loads prefetched before the first dependent compute.
+        rounds = (2 + math.ceil(max(work["max_valid_splits"] - 3, 0) / 3)
+                  if work["output_rows"] > 0 else 0)
+        dependency_s = rounds * hardware.l2_latency_ns * 1e-9
+        execution_s = max(l2_s, scalar_s, dependency_s)
+        groups = {"fa3_gqa_combine_l2": l2_s,
+                  "fa3_gqa_combine_scalar": scalar_s,
+                  "fa3_gqa_combine_partial_rounds": dependency_s}
+    else:
+        bm, bn, d = work["block_m"], work["block_n"], work["head_dim"]
+        # Every owned D64/D128/D256 nonlocal tile has IntraWGOverlap=true,
+        # including the64-row/single-consumer tile. Async PV overlaps the
+        # next softmax, but the first softmax and last PV cannot disappear.
+        qk = (2 * bm * bn * d) / per_sm_capacity("compute_tensor")
+        pv = qk
+        # FA3's quad Allreduce<4> uses floating max/sum and shuffles, not
+        # the separate CUB block-reduction service measured for RMSNorm.
+        # Charge the register arithmetic at the FP32 lane capacity; retain
+        # instruction/shuffle dependency latency as an explicit limitation.
+        softmax = (bm * bn / per_sm_capacity("compute_sfu")
+                   + (4 * bm * bn + bm * d) / per_sm_capacity("compute_fma"))
+        kv_tma = kernel.launch.algorithm in (
+            _FA3_GQA_TMA_030_ALGORITHM, _FA3_GQA_TMA_SPLIT_030_ALGORITHM)
+        full_kv_tiles = kv_tma
+        kv_tma = kv_tma or kernel.attributes["kv_layout"] == "contiguous"
+        capacity_schedule = (
+            kernel.launch.algorithm in (_FA3_GQA_OBSERVED_030_ALGORITHM,
+                                        _FA3_GQA_OBSERVED_SPLIT_030_ALGORITHM,
+                                        _FA3_GQA_TMA_030_ALGORITHM,
+                                        _FA3_GQA_TMA_SPLIT_030_ALGORITHM)
+            and kernel.dtype.lower() in ("bf16", "fp16")
+            and ((d == 128 and (bm, bn) in (
+                    (64, 128), (128, 128), (128, 160), (64, 176)))
+                 or (d == 64 and ((bm == 192 and bn == 128 and kernel.attributes["causal"])
+                     or (bm, bn) in ((64, 192), (192, 160), (192, 192))))
+                 or (d == 256 and bm == 128 and bn == 80))
+            and kernel.attributes["kv_layout"] in (
+                "contiguous", "paged", "paged_varlen", "chunked_prefill"))
+        if compiled_wait0_before_online and not (
+                capacity_schedule and not kv_tma
+                and kernel.dtype.lower() == "bf16" and bm == bn == d == 128
+                and kernel.attributes["causal"]
+                and kernel.shape["num_query_heads"] == 4 * kernel.shape["num_kv_heads"]
+                and kernel.launch.algorithm == _FA3_GQA_OBSERVED_030_ALGORITHM):
+            raise ValueError("compiled PV/online order requires bound GQA4 unsplit prefill")
+        if capacity_schedule:
+            warp_groups = bm // 64
+            if kernel.launch.block_size != (warp_groups + 1) * 128:
+                raise ValueError("FA3 consumer geometry differs from its source block")
+            q_lens, kv_lens = _fa3_lengths(kernel)
+            memo, costs = {}, []
+            if bn == 128:
+                registers = _fa3_gqa_register_services(hardware)
+            else:
+                # Wider/narrower N tiles do not match the measured N128
+                # two-row/32-value register chains. Count their
+                # its max, local sum and quad instructions at issue capacity;
+                # dependency/completion latency remains explicitly unbound.
+                issue = per_sm_capacity("warp_issue")
+                row_values = bn // 4
+                first_max = (2 * (row_values - 1) + 8) * 4 / issue
+                local_sum = 2 * (row_values - 1) * 4 / issue
+                registers = {"first_online": first_max + local_sum,
+                             "online": first_max + local_sum + 8 / issue,
+                             "quad_sum": 32 / issue}
+            if kernel.dtype.lower() == "bf16" and bn == 128:
+                mechanisms = hardware.fa3_mla_mechanisms
+                if mechanisms is None:
+                    raise NotImplementedError("H200 BF16 QK instruction-batch evidence is required")
+                # Same SS m64n128k16 instruction, d/16 K16 slices per WG.
+                # The isolated fence/commit/wait0 batch is a retirement
+                # approximation, not additional Tensor busy time.
+                qk_completion = (mechanisms["wgmma_gemm_cycles"][("ss_n128_kmajor", d // 16, 1)]
+                                 / hardware.nominal_sm_freq_hz)
+            else:
+                # FP16 and BF16 non-N128 have no matching measured wait0
+                # completion. Neither borrows the BF16 N128 opcode's
+                # latency. Retain the explicit per-WG Tensor-capacity
+                # ready lower bound until independently bound.
+                qk_completion = qk / warp_groups
+            # Source scale/exp work keeps its hardware-capacity estimate.
+            # Max and local sum are replaced by the measured dependent chains,
+            # so their former two scalar operations/score are removed here.
+            scale_exp = (64 * bn / per_sm_capacity("compute_sfu")
+                         + (2 * 64 * bn + 256) / per_sm_capacity("compute_fma"))
+            services = dict(qk=qk / warp_groups, pv=pv / warp_groups,
+                kv_tma=kv_tma, full_kv_tiles=full_kv_tiles,
+                warp_groups=warp_groups, head_dim=d, block_n=bn,
+                online_after_pv_wait=compiled_wait0_before_online,
+                qk_completion=qk_completion,
+                first_online=registers["first_online"] + scale_exp,
+                # Four lanes each retain the two row states. Steady online
+                # max rescaling adds exp2 plus three arithmetic operations
+                # per lane-local row. No fused exp/local-sum service is added.
+                online=(registers["online"] + scale_exp
+                        + 256 / per_sm_capacity("compute_sfu")
+                        + 3 * 256 / per_sm_capacity("compute_fma")),
+                conversion=bn / per_sm_capacity("warp_issue"),
+                # One FP32 FMUL per O value cannot consume the two-FLOP FMA
+                # peak as if each multiply also performed an addition. Each
+                # warp instruction updates32 values: retain its issue floor.
+                rescale=max(64 * d / per_sm_capacity("compute_fma"),
+                            2 * d / per_sm_capacity("warp_issue")),
+                finalize=(registers["quad_sum"]
+                          + 2 * 256 / per_sm_capacity("compute_sfu")
+                          + 3 * 256 / per_sm_capacity("compute_fma")),
+                copy_bps=per_sm_capacity("l2_cache"),
+                smem_bps=per_sm_capacity("smem"),
+                latency=hardware.l2_latency_ns * 1e-9,
+                # half_t forces kBlockH=1. In the packed D128 source domain
+                # Q therefore uses128 producer threads/cp.async. Each live
+                # four-row group issues2LDGSTS. The2SHFL per four tile rows
+                # precede the live-row predicate even on a Q tail; all4
+                # producer warps execute QueryEmpty sync, cpasync barrier
+                # arrive and Q arrive.
+                # This is an issue floor, not a borrowed BF16/TMA completion.
+                q_copy_issue_per_four_rows=(2 / per_sm_capacity("warp_issue")
+                    if kernel.dtype.lower() == "fp16" and d == 128
+                        and kernel.shape["num_query_heads"] > kernel.shape["num_kv_heads"] else 0.0),
+                q_copy_fixed_issue=((bm // 2 + 12) / per_sm_capacity("warp_issue")
+                    if kernel.dtype.lower() == "fp16" and d == 128
+                        and kernel.shape["num_query_heads"] > kernel.shape["num_kv_heads"] else 0.0),
+                # PagedKVManager uses eight threads/row,16 rows/producer
+                # group and N/16 row pointers per thread. Each row needs
+                # two pointer SHFL and d/64 vector LDGSTS instructions.
+                # The bound CUDA12.9 GQA4 binary additionally forms each
+                # of eight lane-column64 addresses with a low/high pair:
+                # LEA+IMAD.X in first K, IADD3+IMAD.X in steady K/V and
+                # last V. Page LDG below does not include those16 sites.
+                # Other compiler/WG domains retain their partial budget.
+                # Tails retain this full-panel instruction budget.
+                # A single elected TMA producer issues one bulk load, not
+                # the four-warp LDGSTS/pointer-shuffle sequence above.
+                # Descriptor/barrier control remains a separate limitation.
+                copy_issue=((1 if kv_tma else
+                    ((2 + d // 64) * (bn // 16)
+                     + (16 if compiled_wait0_before_online else 0)) * 4)
+                    / per_sm_capacity("warp_issue")),
+                page_lookup=(0.0 if kernel.attributes["kv_layout"] == "contiguous" else
+                    hardware.l2_latency_ns * 1e-9
+                    + (1 if kv_tma else 4) / per_sm_capacity("warp_issue")))
+            for task in _fa3_gqa_source_tasks(q_lens, kv_lens,
+                    heads=kernel.shape["num_query_heads"], kv_heads=kernel.shape["num_kv_heads"],
+                    block_m=bm, block_n=bn, head_dim=d, splits=work["splits"],
+                    causal=kernel.attributes["causal"] and max(q_lens) > 1):
+                output_dtype_bytes = 4 if work["splits"][task.batch_index] > 1 else 2
+                key = (task.panel_count, task.packed_q_rows, task.first_panel_kv_rows,
+                       output_dtype_bytes)
+                if key not in memo:
+                    memo[key] = _fa3_gqa_capacity_task_cost(*key[:3],
+                        output_dtype_bytes=output_dtype_bytes, **services)
+                costs.append(memo[key])
+        else:
+            costs = [_fa3_gqa_task_stage_cost(panels, qk, pv, softmax)
+                     for panels in work["blocks"]]
+        cta_loads = _fa3_list_schedule(costs, active)
+        chain_s = max(load for load, _ in cta_loads)
+        l2_s = work["logical_l2_read_bytes"] / capacity("l2_cache", active)
+        dram_s = (work["minimum_physical_read_bytes"] + work["write_bytes"]) / capacity("dram", active)
+        # The new schedule already includes the L2-ready latency. Retain only
+        # the additional cold-start latency, rather than charge that part twice.
+        cold_ns = (hardware.dram_latency_ns - hardware.l2_latency_ns
+                   if capacity_schedule else hardware.dram_latency_ns)
+        if cold_ns < 0:
+            raise ValueError("FA3 cold DRAM latency must include its L2-ready prefix")
+        # Only the CTA chain includes an L2-ready prefix already. Byte-only
+        # bandwidth floors contain no ready latency: retain their full cold
+        # DRAM prefix even when a new source schedule is available.
+        execution_s = max(cold_ns * 1e-9 + chain_s,
+                          hardware.dram_latency_ns * 1e-9 + max(l2_s, dram_s))
+        groups = {"fa3_gqa_stage_chain": chain_s,
+                  "fa3_gqa_l2_tile_reads": l2_s,
+                  "fa3_gqa_compulsory_dram": dram_s}
+    dispatch_s = hardware.cta_dispatch_cost_ns(kernel.launch.grid_size) * 1e-9
+    floor_s = small_kernel_span_floor_s(
+        hardware, kernel.launch.grid_size, kernel.variant, graph_replayed_launch(kernel))
+    bottleneck = max(groups, key=groups.__getitem__)
+    groups["cta_dispatch"] = dispatch_s
+    groups["launch_span_floor"] = floor_s
+    return KernelPrediction(
+        t_total_s=max(dispatch_s + execution_s, floor_s),
+        t_per_group=groups, t_launch_s=dispatch_s,
+        bottleneck_group=bottleneck, t_per_resource=groups,
+        diagnostics=PredictionDiagnostics(
+            compute_time_s={}, memory=(), memory_access_classes=(),
+            memory_arbitration=(), pipeline=None, critical_path=(bottleneck,),
+            support_level="partial", limitations=(
+                "fa3_gqa_source_stages_at_aggregate_hardware_capacity",
+                "fa3_gqa_physical_l1_tma_reuse_unbound",
+                "fa3_gqa_unique_operands_assumed_dram_cold",
+                "fa3_gqa_cta_barrier_and_instruction_latency_unbound") + (
+                    ("fa3_gqa_page_table_L2_hit_assumed_not_observed",
+                     "fa3_gqa_tail_copy_uses_full_panel_issue_budget",
+                     "fa3_gqa_full_tile_output_shared_staging_at_capacity",
+                     "fa3_gqa_producer_consumer_warp_issue_contention_unbound",
+                     ("fa3_gqa_QK_retirement_uses_isolated_batch_approximation_PV_unbound"
+                      if kernel.dtype.lower() == "bf16" and work["block_n"] == 128 else
+                      "fa3_gqa_QK_ready_at_Tensor_capacity_lower_bound_PV_unbound"),
+                     "fa3_gqa_producer_address_ALU_and_next_task_prefetch_unpriced")
+                    if not combine and capacity_schedule else ()) + (
+                    ("fa3_gqa_nonN128_register_chains_at_issue_capacity_lower_bound",
+                     "fa3_gqa_nonN128_native_dependency_and_retirement_unbound")
+                    if not combine and capacity_schedule and work["block_n"] != 128 else ()) + (
+                    ("fa3_gqa_P_shared_single_partition_per_WG_waits_own_PV_retirement",
+                     "fa3_gqa_P_shared_STSM_warp_fence_without_global_P_barrier",
+                     "fa3_gqa_P_shared_read_write_at_local_and_aggregate_capacity_lower_bound")
+                    if not combine and capacity_schedule and work["head_dim"] == 64
+                        and work["block_m"] == 192 and work["block_n"] in (160, 192) else ()) + (
+                    ("fa3_gqa_D256_N80_register_chains_at_issue_capacity_lower_bound",
+                     "fa3_gqa_D256_O_rescale_before_PV_without_WG_scheduler_token",
+                     "fa3_gqa_D256_native_retirement_and_compiler_latency_unbound")
+                    if not combine and capacity_schedule and work["head_dim"] == 256 else ()) + (
+                    ("fa3_gqa_contiguous_TMA_KV_live_byte_ready_lower_bound",
+                     "fa3_gqa_contiguous_TMA_root_extent_cross_request_reads_unbound")
+                    if not combine and capacity_schedule
+                        and kernel.attributes["kv_layout"] == "contiguous" else ()) + (
+                    ("fa3_gqa_FP16_QK_ready_at_Tensor_capacity_lower_bound",
+                     *( ("fa3_gqa_FP16_Q_cp_async_load_shuffle_and_control_issue_lower_bound",
+                         "fa3_gqa_FP16_Q_address_and_barrier_completion_latency_unbound")
+                        if work["head_dim"] == 128
+                            and kernel.shape["num_query_heads"] > kernel.shape["num_kv_heads"] else
+                        ("fa3_gqa_FP16_Q_cp_async_issue_address_and_sync_unbound",)),
+                     "fa3_gqa_FP16_packed_conversion_latency_and_numeric_validation_unbound",
+                     "fa3_gqa_FP16_native_WGMMA_completion_and_compiler_schedule_unbound")
+                    if not combine and capacity_schedule and kernel.dtype.lower() == "fp16" else ()) + (
+                    ("fa3_gqa_cuda129_GQA4_prefill_wait0_before_exp_observed",
+                     "fa3_gqa_cuda129_GQA4_KV_lane_address_issue_lower_bound",
+                     "fa3_gqa_early_max_prefix_conservatively_aggregated_after_wait0",
+                     "fa3_gqa_compiler_order_not_bound_to_normal_source_factory")
+                    if compiled_wait0_before_online else ()) + (
+                    ("fa3_gqa_paged_TMA_KV_reads_full_physical_tiles",
+                     "fa3_gqa_TMA_elected_producer_descriptor_and_barrier_latency_unbound",
+                     "fa3_gqa_TMA_Q_global_extent_and_transaction_bytes_unbound")
+                    if not combine and kernel.launch.algorithm in (
+                        _FA3_GQA_TMA_030_ALGORITHM, _FA3_GQA_TMA_SPLIT_030_ALGORITHM)
+                    else ())))
 
 
 
@@ -13214,48 +14122,190 @@ def _fa3_kernel_prediction(kernel: KernelSpec, hardware, execution_s: float,
     )
 
 
-def _fa3_prefill_prediction(kernel: KernelSpec, hardware) -> KernelPrediction:
+def _fa3_mla_prefill_capacity_costs(kernel, hardware, splits):
+    """Expanded192/128 source tasks, with separate QK and V/O widths.
+
+    Both source templates have two consumers, RS P and no WG scheduler
+    token. Split forces PackGQA/kBlockH1 even for a dynamic-one request,
+    so its Q ingress uses128-thread cp.async while K/V remain TMA. The
+    unsplit equal-head template uses one elected TMA producer warp.
+    """
     mechanisms = _fa3_mechanisms(hardware)
-    wgmma = mechanisms["wgmma_gemm_cycles"]
-    softmax = mechanisms["softmax_step_cycles"]
-    clock_hz = mechanisms["measured_sm_clock_hz"]
+    clock = hardware.nominal_sm_freq_hz
+    def per_sm(role):
+        resource = hardware.resource_by_role(role)
+        rate = resource.effective_capacity(1, sm_freq_hz=clock,
+            dram_freq_hz=hardware.nominal_dram_freq_hz)
+        return rate / hardware.num_compute_units if resource.scope == "shared" else rate
+    registers = _fa3_gqa_register_services(hardware)
+    split_template = kernel.launch.tiling.num_kv_splits > 1
+    issue = per_sm("warp_issue")
+    scale_exp = 64 * 128 / per_sm("compute_sfu") + (2 * 64 * 128 + 256) / per_sm("compute_fma")
+    services = dict(qk=2 * 64 * 128 * 192 / per_sm("compute_tensor"),
+        pv=2 * 64 * 128 * 128 / per_sm("compute_tensor"),
+        first_online=registers["first_online"] + scale_exp,
+        online=registers["online"] + scale_exp + 256 / per_sm("compute_sfu")
+            + 3 * 256 / per_sm("compute_fma"),
+        conversion=128 / issue,
+        rescale=max(64 * 128 / per_sm("compute_fma"), 256 / issue),
+        finalize=registers["quad_sum"] + 2 * 256 / per_sm("compute_sfu")
+            + 3 * 256 / per_sm("compute_fma"),
+        copy_bps=per_sm("l2_cache"), smem_bps=per_sm("smem"),
+        latency=hardware.l2_latency_ns * 1e-9, page_lookup=0.,
+        copy_issue=1 / issue, kv_tma=True, full_kv_tiles=False,
+        warp_groups=2, head_dim=192, value_head_dim=128, block_n=128,
+        qk_completion=mechanisms["wgmma_gemm_cycles"][("ss_n128_kmajor", 12, 1)] / clock,
+        # Three16-byte copies/lane span192 BF16 columns. Pointer SHFL
+        # runs over the full M128 tile; row predicates only skip copies.
+        q_copy_issue_per_four_rows=3 / issue if split_template else 0.,
+        q_copy_fixed_issue=(64 + 12) / issue if split_template else 1 / issue)
+    q, kv = _fa3_lengths(kernel)
+    heads = kernel.shape["num_query_heads"]
+    tasks = _fa3_gqa_source_tasks(q, kv, heads=heads, kv_heads=heads,
+        block_m=128, block_n=128, head_dim=192, value_head_dim=128,
+        splits=splits, causal=kernel.attributes["causal"])
+    memo, costs = {}, []
+    for task in tasks:
+        if not task.panel_count:
+            costs.append(0.)
+            continue
+        output_width = 4 if splits[task.batch_index] > 1 else 2
+        key = (task.panel_count, task.packed_q_rows, task.first_panel_kv_rows, output_width)
+        if key not in memo:
+            memo[key] = _fa3_gqa_capacity_task_cost(*key[:3],
+                output_dtype_bytes=output_width, **services)
+        costs.append(memo[key])
+    return costs
+
+
+def _fa3_mla_prefill_capacity_diagnostics(prediction):
+    return dataclasses.replace(prediction, diagnostics=dataclasses.replace(
+        prediction.diagnostics, limitations=prediction.diagnostics.limitations + (
+            "fa3_mla_prefill_source_two_slot_QK192_VO128_capacity_schedule",
+            "fa3_mla_prefill_O_rescale_before_PV_without_WG_scheduler_token",
+            "fa3_mla_prefill_register_reduction_composition_and_QK_retirement_approximation",
+            "fa3_mla_prefill_PV_ready_at_Tensor_capacity_lower_bound",
+            "fa3_mla_prefill_contiguous_TMA_live_byte_tail_and_cold_input_assumptions",
+            "fa3_mla_prefill_producer_control_barrier_and_native_compiler_latency_unbound")))
+
+
+def _fa3_prefill_prediction(kernel: KernelSpec, hardware) -> KernelPrediction:
     tile = kernel.launch.tiling.tile_shape
     if (tile["q"], tile["kv"], tile["qk_head"], tile["value_head"]) != (
             128, 128, 192, 128):
         raise NotImplementedError("FA3 prefill template covers 128x128 hdim 192/128")
-    qk = wgmma[("ss_n128_kmajor", tile["qk_head"] // 16, 2)]
-    pv = wgmma[("rs_n128_mnmajor", tile["kv"] // 16, 2)]
-    step = softmax[("32x32", 2)]
-    chain_ii = qk + max(pv, step)
-    tiles = _fa3_prefill_tiles(kernel)
-    workers = kernel.launch.grid[0]
-    active = min(workers, len(tiles))
-    # K and V tile of one KV block, consumed once per CTA (both warpgroups
-    # read the same stage); all active CTAs share the L2 read capacity.
     work = current_fa3_prefill_source_work(kernel)
-    kv_block_bytes = (work['native_kv_panel_bytes'] if work is not None else tile["kv"] * (
-        tile["qk_head"] + tile["value_head"]) * _FA3_ELEMENT_BYTES)
-    l2_bytes_per_clk = hardware.resource_by_role("l2_cache").effective_capacity(
-        active, sm_freq_hz=clock_hz,
-        dram_freq_hz=hardware.nominal_dram_freq_hz) / clock_hz
-    l2_ii = active * kv_block_bytes / l2_bytes_per_clk
-    ii = max(chain_ii, l2_ii)
-    costs = [qk + step + (blocks - 1) * ii + pv for blocks in tiles]
-    loads = _fa3_list_schedule(costs, workers)
-    critical_cycles = max(load for load, _ in loads)
-    first_load_s = hardware.dram_latency_ns * 1e-9
-    execution_s = critical_cycles / clock_hz + first_load_s
-    total_blocks = sum(tiles)
+    if work is None:
+        raise NotImplementedError("FA3 prefill requires its validated Q/K/V and O/LSE source boundary")
+    q, _ = _fa3_lengths(kernel)
+    costs = _fa3_mla_prefill_capacity_costs(kernel, hardware, (1,) * len(q))
+    workers = kernel.launch.grid[0]
+    active = min(workers, len(costs))
+    def capacity(role):
+        return hardware.resource_by_role(role).effective_capacity(active,
+            sm_freq_hz=hardware.nominal_sm_freq_hz,
+            dram_freq_hz=hardware.nominal_dram_freq_hz)
+    critical_s = max(load for load, _ in _fa3_list_schedule(costs, workers))
+    # Both O and FP32 LSE are unconditional outputs of this source kernel.
+    # Returning LSE to a caller changes the interface, not its device work.
+    # Their payload shares L2 with Q/K/V; the aggregate capacity check does
+    # not serialize every CTA's stores after the last CTA's matrix work.
+    payload_bytes = sum(work['totals'][role] for role in ('query', 'key', 'value', 'output', 'lse'))
+    payload_s = payload_bytes / capacity("l2_cache")
+    cold_s = (hardware.dram_latency_ns - hardware.l2_latency_ns) * 1e-9
+    if cold_s < 0:
+        raise ValueError("FA3 cold DRAM latency must include its L2-ready prefix")
+    dram_s = (work['projected_read_bytes'] + work['totals']['output']
+              + work['totals']['lse']) / capacity("dram")
+    execution_s = max(cold_s + critical_s,
+                      hardware.dram_latency_ns * 1e-9 + max(payload_s, dram_s))
     groups = {
-        "fa3_tensor_softmax_chain": total_blocks * chain_ii / active / clock_hz,
-        "fa3_l2_kv_stream": total_blocks * l2_ii / active / clock_hz,
-        "fa3_critical_cta": critical_cycles / clock_hz,
-        "fa3_first_load": first_load_s,
+        "fa3_prefill_stage_chain": critical_s,
+        "fa3_prefill_payload_l2": payload_s,
+        "fa3_prefill_compulsory_dram": dram_s,
     }
-    bottleneck = ("fa3_tensor_softmax_chain" if chain_ii >= l2_ii
-                  else "fa3_l2_kv_stream")
-    return _fa3_kernel_prediction(
-        kernel, hardware, execution_s, groups, bottleneck)
+    bottleneck = max(groups, key=groups.__getitem__)
+    return _fa3_mla_prefill_capacity_diagnostics(_fa3_kernel_prediction(
+        kernel, hardware, execution_s, groups, bottleneck))
+
+
+def _fa3_split_prefill_work(kernel: KernelSpec, hardware):
+    """Expanded192/128 context: split-local tasks and actual O/LSE bytes."""
+    tile = kernel.launch.tiling
+    if (kernel.launch.algorithm != _FA3_PREFILL_SPLIT_ALGORITHM
+            or kernel.attributes["causal"] or kernel.dtype != "bf16"
+            or (kernel.shape["qk_head_dim"], kernel.shape["v_head_dim"],
+                kernel.shape["kv_lora_rank"]) != (192, 128, 512)
+            or dict(tile.tile_shape) != {"q": 128, "kv": 128, "qk_head": 192, "value_head": 128}
+            or tile.num_kv_splits <= 1 or tile.pipeline_depth != 2
+            or kernel.launch.block != (384, 1, 1)
+            or kernel.launch.grid != (int(hardware.num_compute_units), 1, 1)):
+        raise ValueError("FA3 split prefill differs from its owned192/128 context source")
+    q_lens, kv_lens = _fa3_lengths(kernel)
+    heads = kernel.shape["num_query_heads"]
+    splits = _fa3_request_tile_splits(
+        q_lens, kv_lens, tile.num_kv_splits, int(hardware.num_compute_units),
+        block_m=128, block_n=128, ratio=1, kv_heads=heads)
+    tasks, logical_reads = [], 0
+    for q, kv, split in zip(q_lens, kv_lens, splits):
+        num_m, num_n = math.ceil(q / 128), math.ceil(kv / 128)
+        per_split = math.ceil(num_n / split)
+        # Noncausal scheduler: M varies fastest, then split, then head.
+        for _ in range(heads):
+            for s in range(split):
+                panels = max(0, min((s + 1) * per_split, num_n) - s * per_split)
+                valid_kv = max(0, min(kv, (s + 1) * per_split * 128) - s * per_split * 128)
+                for m in range(num_m):
+                    tasks.append(panels)
+                    if panels:
+                        logical_reads += (min(128, q - m * 128) * 192 * 2
+                                          + valid_kv * (192 + 128) * 2)
+    partial_rows = heads * sum(q * s for q, s in zip(q_lens, splits) if s > 1)
+    direct_rows = heads * sum(q for q, s in zip(q_lens, splits) if s == 1)
+    partial_work = _fa3_gqa_partial_source_work(
+        q_lens, kv_lens, heads=heads, kv_heads=heads,
+        block_m=128, block_n=128, splits=splits, causal=False)
+    partial_output_bytes = partial_work["materialized_partial_output_rows"] * 128 * 4
+    partial_lse_bytes = partial_rows * 4
+    partial_write_bytes = partial_output_bytes + partial_lse_bytes
+    direct_write_bytes = direct_rows * (128 * 2 + 4)
+    scores = sum(tasks) * 128 * 128
+    return {"blocks": tuple(tasks), "splits": splits,
+            **partial_work,
+            "tensor_flops": 2 * scores * (192 + 128), "scores": scores,
+            "read_bytes": heads * (sum(q_lens) * 192 + sum(kv_lens) * (192 + 128)) * 2,
+            "logical_l2_read_bytes": logical_reads,
+            "write_bytes": partial_write_bytes + direct_write_bytes,
+            "partial_write_bytes": partial_write_bytes,
+            "partial_output_bytes": partial_output_bytes,
+            "partial_lse_bytes": partial_lse_bytes,
+            "direct_write_bytes": direct_write_bytes}
+
+
+def _fa3_split_prefill_prediction(kernel: KernelSpec, hardware) -> KernelPrediction:
+    work = _fa3_split_prefill_work(kernel, hardware)
+    costs = _fa3_mla_prefill_capacity_costs(kernel, hardware, work["splits"])
+    active = min(kernel.launch.grid[0], len(work["blocks"]))
+    def capacity(role):
+        return hardware.resource_by_role(role).effective_capacity(
+            active, sm_freq_hz=hardware.nominal_sm_freq_hz,
+            dram_freq_hz=hardware.nominal_dram_freq_hz)
+    critical_s = max(load for load, _ in _fa3_list_schedule(costs, kernel.launch.grid[0]))
+    groups = {"fa3_split_prefill_critical_cta": critical_s,
+              "fa3_split_prefill_l2": (work["logical_l2_read_bytes"] + work["write_bytes"]) / capacity("l2_cache"),
+              "fa3_split_prefill_cold_dram": (work["read_bytes"] + work["write_bytes"]) / capacity("dram")}
+    bottleneck = max(groups, key=groups.__getitem__)
+    cold_s = (hardware.dram_latency_ns - hardware.l2_latency_ns) * 1e-9
+    if cold_s < 0:
+        raise ValueError("FA3 cold DRAM latency must include its L2-ready prefix")
+    execution_s = max(cold_s + critical_s, hardware.dram_latency_ns * 1e-9
+        + max(groups["fa3_split_prefill_l2"], groups["fa3_split_prefill_cold_dram"]))
+    prediction = _fa3_mla_prefill_capacity_diagnostics(
+        _fa3_kernel_prediction(kernel, hardware, execution_s, groups, bottleneck))
+    return dataclasses.replace(prediction, diagnostics=dataclasses.replace(
+        prediction.diagnostics, limitations=prediction.diagnostics.limitations + (
+            "fa3_split_prefill_scratch_aggregate_without_shared_native_bindings",
+            "fa3_split_prefill_cta_memory_and_barrier_overlap_unbound")))
 
 
 def _fa3_decode_chain_cycles(mechanisms) -> float:
@@ -13263,6 +14313,195 @@ def _fa3_decode_chain_cycles(mechanisms) -> float:
     return (wgmma[("ss_n64_kmajor", 36, 1)]
             + mechanisms["softmax_step_cycles"][("16x64", 1)]
             + wgmma[("rs_n256_mnmajor", 4, 2)])
+
+
+def _fa3_decode_tile_blocks(kernel: KernelSpec, hardware, *, program=None):
+    """KV panels per real packed-Q task, including multiple M tiles.
+
+    Public memory bindings still establish the request extents. The source
+    scheduler then partitions each M tile and dynamic K split separately;
+    a128-head request is two64-row tasks, not one double-width task.
+    """
+    from src.kernel.memory_access_builder import logical_interface_memory_access_program
+    from src.kernel.memory_flash_attention import logical_mla_request_extents
+    from src.kernel.memory_path_solver import logical_interface_source_bytes
+
+    if program is None:
+        program = logical_interface_memory_access_program(kernel, hardware)
+    logical_interface_source_bytes(program, expected_kernel=kernel)
+    q_lens, kv_lens, heads = logical_mla_request_extents(program)
+    tile = kernel.launch.tiling
+    bm, bn = tile.tile_shape["q"], tile.tile_shape["kv"]
+    splits = _fa3_decode_splits(q_lens, kv_lens, heads,
+                               tile.num_kv_splits, int(hardware.num_compute_units))
+    tasks = []
+    causal = kernel.attributes["causal"] and max(q_lens) > 1
+    for q, kv, split in zip(q_lens, kv_lens, splits):
+        num_n = math.ceil(kv / bn)
+        per_split = math.ceil(num_n / split)
+        num_m = math.ceil(q * heads / bm)
+        m_order = range(num_m - 1, -1, -1) if causal else range(num_m)
+        for s in range(split):
+            for m in m_order:
+                last_q = (min((m + 1) * bm, q * heads) - 1) // heads
+                upper = (min(num_n, math.ceil((last_q + 1 + kv - q) / bn))
+                         if causal else num_n)
+                tasks.append(max(0, min((s + 1) * per_split, upper) - s * per_split))
+    return tuple(tasks)
+
+
+def _fa3_sparse_mla_work(kernel: KernelSpec, hardware):
+    """Page1 FA3: capacity selects static splits, used counts price work.
+
+    Selected physical indices remain caller inputs. Read bytes below are
+    an explicit cold-per-query projection, never observed unique/cache-hit
+    bytes or a claim that the sparse cache was materialized densely.
+    """
+    combine = kernel.launch.algorithm == _FA3_SPARSE_MLA_COMBINE_030_ALGORITHM
+    tile = kernel.launch.tiling
+    dimensions = ({"rows", "value_head", "kv_page", "kv_capacity"} if combine else
+                  {"q", "kv", "qk_head", "value_head", "kv_page", "kv_capacity"})
+    if (not hardware.supports_source_contract("vllm_0_30_fa3_sparse_mla") or kernel.dtype != "bf16"
+            or kernel.launch.algorithm not in (
+                _FA3_SPARSE_MLA_030_ALGORITHM, _FA3_SPARSE_MLA_COMBINE_030_ALGORITHM)
+            or set(tile.tile_shape) != dimensions or tile.tile_shape["kv_page"] != 1):
+        raise ValueError("FA3 sparse MLA requires its page1 BF16 source program")
+    q, used = _fa3_lengths(kernel)
+    heads, batch = kernel.shape["num_query_heads"], kernel.shape["batch"]
+    if (any(value != 1 for value in q) or len(q) != batch
+            or min(used) < 0 or max(used) > tile.tile_shape["kv_capacity"]
+            or kernel.attributes["causal"] is not True or kernel.attributes["kv_layout"] != "mla"
+            or kernel.attributes["kv_dist"] not in ("uniform", "explicit")
+            or kernel.attributes["kv_dist"] == "uniform" and len(set(used)) != 1
+            or kernel.attributes["kv_dist"] == "explicit" and (
+                "source_program" not in kernel.attributes
+                or kernel.attributes["source_program"] != "vllm_0_30_fa3_sparse_mla")
+            or any(name in kernel.attributes for name in (
+                "graph_logical_tokens", "graph_model_input_tokens", "graph_runtime_mode",
+                "model_input_shape", "model_input_q_lens", "model_input_kv_lens"))):
+        raise ValueError("FA3 sparse MLA requires truthful nonnegative per-token used lengths")
+    if (not combine and (kernel.attributes["full_cuda_graphs"] is not False
+                         or kernel.attributes["max_cudagraph_capture_size"] != 0)):
+        raise ValueError("FA3 sparse MLA graph/zero-row contract is unbound")
+    static = tile.num_kv_splits
+    if not any(used) and static > 1:
+        raise NotImplementedError("FA3 sparse MLA all-zero dynamic prepare has a source zero divisor")
+    if (kernel.launch.parameters != {
+            "unpadded_flops": 0.0, "mma_smem_bytes_per_flop": 0.0,
+            "split_scratch_dram_bytes_per_element": 4.0 if static > 1 else 0.0,
+            "page_table_bytes_per_kv_panel": 0.0}
+            or kernel.launch.source_program is not None):
+        raise ValueError("FA3 sparse MLA source demand must own its index and scratch work")
+    splits = _fa3_request_tile_splits(q, used, static, int(hardware.num_compute_units),
+        block_m=64, block_n=64, ratio=heads, kv_heads=1)
+    # Equal-width split ranges can leave trailing splits empty. store_zero
+    # writes -inf LSE for those rows without initializing partial O.
+    nonempty_splits = tuple(math.ceil(math.ceil(length / 64) /
+        math.ceil(math.ceil(length / 64) / count)) if length else 0 for length, count in zip(used, splits))
+    partial_rows = heads * sum(count for count in splits if count > 1)
+    valid_partial_rows = heads * sum(live for live, count in zip(nonempty_splits, splits) if count > 1)
+    split_rows = heads * sum(count > 1 for count in splits)
+    if combine:
+        expected_grid = ((math.ceil(heads / 8), 4, batch)
+                         if 2 * math.ceil(batch / 8) >= batch else
+                         (math.ceil(batch * heads / 8) + batch, 4, 1))
+        if (kernel.variant != "combine" or kernel.shape["head_dim"] != 512
+                or kernel.shape["num_kv_heads"] != 1 or static <= 1
+                or tile.tile_shape["rows"] != 8 or tile.tile_shape["value_head"] != 128
+                or tile.pipeline_depth != 4 or kernel.launch.block != (256, 1, 1)
+                or kernel.launch.grid != expected_grid):
+            raise ValueError("FA3 sparse MLA combine differs from source")
+        output_bytes, lse_bytes = split_rows * 512 * 2, split_rows * 4
+        # First three O stages are prefetched before LSE validity is known;
+        # subsequent loads stop at the last finite LSE split.
+        partial_output = heads * 512 * 4 * sum(
+            max(live, min(count, 3)) for live, count in zip(nonempty_splits, splits) if count > 1)
+        # Four value-column CTAs read LSE; only column0 writes final LSE.
+        partial_lse_reads = partial_rows * 4 * 4
+        return {"blocks": (), "splits": splits, "tensor_flops": 0,
+                # Two arithmetic operations per weighted partial O value;
+                # LSE scalar work is a mathematical projection, not SASS.
+                "scalar_flops": 2 * valid_partial_rows * 512 + 4 * partial_rows,
+                "sfu_ops": 4 * partial_rows,
+                "scores": partial_rows, "read_bytes": partial_output + partial_lse_reads,
+                "logical_l2_read_bytes": partial_output + partial_lse_reads,
+                "write_bytes": output_bytes + lse_bytes + 4,
+                "output_bytes": output_bytes, "lse_bytes": lse_bytes,
+                "partial_output_bytes": partial_output, "partial_lse_read_bytes": partial_lse_reads,
+                "valid_partial_output_bytes": valid_partial_rows * 512 * 4,
+                "nonempty_splits": nonempty_splits,
+                "semaphore_reset_bytes": 4,
+                "active_ctas": math.ceil(heads / 8) * 4 * sum(count > 1 for count in splits)}
+    if (kernel.variant != "mla_decode"
+            or (kernel.shape["qk_head_dim"], kernel.shape["v_head_dim"],
+                kernel.shape["kv_lora_rank"]) != (576, 512, 512)
+            or any(tile.tile_shape[name] != value for name, value in (
+                ("q", 64), ("kv", 64), ("qk_head", 64), ("value_head", 512)))
+            or tile.pipeline_depth != 2 or kernel.launch.block != (384, 1, 1)
+            or kernel.launch.grid != (int(hardware.num_compute_units), 1, 1)):
+        raise ValueError("FA3 sparse MLA main differs from source")
+    blocks, logical_reads, lookup_bytes = [], 0, 0
+    for length, count in zip(used, splits):
+        num_n = math.ceil(length / 64)
+        per_split = math.ceil(num_n / count)
+        for s in range(count):
+            panels = max(0, min((s + 1) * per_split, num_n) - s * per_split)
+            valid_k = max(0, min(length, (s + 1) * per_split * 64) - s * per_split * 64)
+            for m in range(math.ceil(heads / 64)):
+                blocks.append(panels)
+                if panels:
+                    logical_reads += min(64, heads - 64 * m) * 576 * 2 + valid_k * 576 * 2
+                    lookup_bytes += valid_k * 4
+    partial_write = valid_partial_rows * 512 * 4 + partial_rows * 4
+    direct_write = (batch * heads - split_rows) * (512 * 2 + 4)
+    scores = sum(blocks) * 64 * 64
+    return {"blocks": tuple(blocks), "splits": splits,
+            "tensor_flops": 2 * scores * (576 + 512), "scores": scores,
+            "scalar_flops": 4 * scores, "sfu_ops": scores,
+            "read_bytes": sum(length > 0 for length in used) * heads * 576 * 2 + sum(used) * (576 * 2 + 4),
+            "logical_l2_read_bytes": logical_reads + lookup_bytes,
+            "write_bytes": partial_write + direct_write,
+            "partial_output_bytes": valid_partial_rows * 512 * 4,
+            "partial_lse_bytes": partial_rows * 4,
+            "partial_write_bytes": partial_write, "direct_write_bytes": direct_write,
+            "page_lookup_bytes": lookup_bytes, "nonempty_splits": nonempty_splits,
+            "task_count": len(blocks), "empty_tasks": blocks.count(0),
+            "active_ctas": sum(value > 0 for value in blocks)}
+
+
+def _fa3_sparse_mla_prediction(kernel: KernelSpec, hardware) -> KernelPrediction:
+    work = _fa3_sparse_mla_work(kernel, hardware)
+    clock = hardware.nominal_sm_freq_hz
+    active = min(max(work["active_ctas"], 1), int(hardware.num_compute_units))
+    def capacity(role):
+        return hardware.resource_by_role(role).effective_capacity(
+            active, sm_freq_hz=clock, dram_freq_hz=hardware.nominal_dram_freq_hz)
+    groups = {"fa3_sparse_l2_projection": (work["logical_l2_read_bytes"] + work["write_bytes"]) / capacity("l2_cache")}
+    if kernel.variant == "combine":
+        rounds = (2 + math.ceil(max(max(work["nonempty_splits"]) - 3, 0) / 3)
+                  if work["active_ctas"] else 0)
+        waves = math.ceil(work["active_ctas"] / hardware.num_compute_units)
+        groups["fa3_sparse_combine_rounds"] = waves * rounds * hardware.l2_latency_ns * 1e-9
+        groups["fa3_sparse_combine_scalar"] = work["scalar_flops"] / capacity("compute_fma")
+        groups["fa3_sparse_combine_sfu"] = work["sfu_ops"] / capacity("compute_sfu")
+        latency = 0.0
+    else:
+        mechanisms = _fa3_mechanisms(hardware)
+        # Matching matrix/softmax fragments only. In particular, do NOT
+        # use the independently measured page16 decode_ring for page1.
+        chain = _fa3_decode_chain_cycles(mechanisms) / mechanisms["measured_sm_clock_hz"]
+        loads = _fa3_list_schedule([n * chain for n in work["blocks"]], kernel.launch.grid[0])
+        groups["fa3_sparse_cta_chain"] = max(load for load, _ in loads)
+        groups["fa3_sparse_cold_read_projection"] = (work["read_bytes"] + work["write_bytes"]) / capacity("dram")
+        latency = hardware.dram_latency_ns * 1e-9 if work["read_bytes"] else 0.0
+    bottleneck = max(groups, key=groups.__getitem__)
+    prediction = _fa3_kernel_prediction(kernel, hardware, latency + groups[bottleneck], groups, bottleneck)
+    return dataclasses.replace(prediction, diagnostics=dataclasses.replace(
+        prediction.diagnostics, limitations=prediction.diagnostics.limitations + (
+            "fa3_sparse_global_indices_alias_and_readiness_unbound",
+            "fa3_sparse_page1_integer_and_memory_overlap_unbound",
+            "fa3_sparse_selected_cache_reuse_unobserved",
+            "fa3_sparse_cta_residency_and_overlap_unbound")))
 
 
 def _fa3_decode_prediction(kernel: KernelSpec, hardware) -> KernelPrediction:
@@ -13279,9 +14518,8 @@ def _fa3_decode_prediction(kernel: KernelSpec, hardware) -> KernelPrediction:
             "the paged ring was measured")
     workers = kernel.launch.grid[0]
     from src.kernel.memory_access_builder import logical_interface_memory_access_program
-    from src.kernel.memory_flash_attention import fa3_mla_decode_source_tiles
     program=logical_interface_memory_access_program(kernel,hardware)
-    tiles = [blocks for blocks in fa3_mla_decode_source_tiles(program,expected_kernel=kernel,num_sms=workers)
+    tiles = [blocks for blocks in _fa3_decode_tile_blocks(kernel, hardware, program=program)
              if blocks > 0]
     active = min(workers, len(tiles))
     ring = mechanisms["decode_ring_by_grid"]
@@ -13473,12 +14711,23 @@ def _flashinfer_mla_plan_prologue_s(hardware) -> float:
 
 def _fa3_midlayer(kernel: KernelSpec, hardware) -> KernelPrediction:
     algorithm = kernel.launch.algorithm
+    if algorithm in (_FA3_SPARSE_MLA_030_ALGORITHM, _FA3_SPARSE_MLA_COMBINE_030_ALGORITHM):
+        return _fa3_sparse_mla_prediction(kernel, hardware)
+    if algorithm in (_FA3_GQA_OBSERVED_030_ALGORITHM,
+                     _FA3_GQA_OBSERVED_SPLIT_030_ALGORITHM, _FA3_GQA_COMBINE_030_ALGORITHM,
+                     _FA3_GQA_TMA_030_ALGORITHM, _FA3_GQA_TMA_SPLIT_030_ALGORITHM,
+                     _FA3_GQA_TMA_COMBINE_030_ALGORITHM, _FA3_PREFILL_COMBINE_ALGORITHM):
+        return _fa3_gqa_observed_prediction(kernel, hardware)
+    if algorithm == _FA3_GQA_PREFILL_030_ALGORITHM:
+        return _fa3_gqa_prefill_030_partial_prediction(kernel, hardware)
     if algorithm == _FLASHINFER_MLA_PREFILL_ALGORITHM:
         if kernel.variant == "mla_decode":
             return _flashinfer_mla_decode_prediction(kernel, hardware)
         return _flashinfer_mla_prefill_prediction(kernel, hardware)
     if algorithm == _FA3_PREFILL_ALGORITHM:
         return _fa3_prefill_prediction(kernel, hardware)
+    if algorithm == _FA3_PREFILL_SPLIT_ALGORITHM:
+        return _fa3_split_prefill_prediction(kernel, hardware)
     if algorithm == _FA3_DECODE_ALGORITHM:
         return _fa3_decode_prediction(kernel, hardware)
     if algorithm == _FA3_COMBINE_ALGORITHM:
@@ -13490,10 +14739,47 @@ def _fa3_resource_input(kernel: KernelSpec, hardware):
     """Aggregate FA3 demand (Roofline/Oracle input); no schedule attached."""
 
     algorithm = kernel.launch.algorithm
+    source_limits = ()
     q_lens, kv_lens = _fa3_lengths(kernel)
     heads = int(kernel.shape["num_query_heads"])
     tile = kernel.launch.tiling.tile_shape
-    if algorithm == _FA3_COMBINE_ALGORITHM:
+    if algorithm in (_FA3_SPARSE_MLA_030_ALGORITHM, _FA3_SPARSE_MLA_COMBINE_030_ALGORITHM):
+        work = _fa3_sparse_mla_work(kernel, hardware)
+        source_limits = (
+            "fa3_sparse_global_indices_alias_and_readiness_unbound",
+            "fa3_sparse_selected_cache_reuse_unobserved",
+        )
+        read_bytes, write_bytes = float(work["read_bytes"]), float(work["write_bytes"])
+        scores = float(work["scores"])
+        flops = {"compute_tensor": float(work["tensor_flops"]), "compute_reduction": 0.0,
+                 "compute_fma": float(work["scalar_flops"]), "compute_alu": 0.0,
+                 "compute_sfu": float(work["sfu_ops"]), "warp_issue": 0.0}
+    elif algorithm in (_FA3_GQA_OBSERVED_030_ALGORITHM,
+                     _FA3_GQA_OBSERVED_SPLIT_030_ALGORITHM, _FA3_GQA_COMBINE_030_ALGORITHM,
+                     _FA3_GQA_TMA_030_ALGORITHM, _FA3_GQA_TMA_SPLIT_030_ALGORITHM,
+                     _FA3_GQA_TMA_COMBINE_030_ALGORITHM, _FA3_PREFILL_COMBINE_ALGORITHM):
+        work = _fa3_gqa_observed_work(kernel, hardware)
+        _validate_fa3_gqa_public_operands(kernel, hardware, work)
+        read_bytes = float(work["read_bytes"])
+        write_bytes = float(work["write_bytes"] + work["semaphore_reset_bytes"])
+        scores = float(work["scores"])
+        flops = {"compute_tensor": float(work["tensor_flops"]),
+                 "compute_reduction": 0.0,
+                 "compute_fma": (float(work["scalar_flops"]) if kernel.variant == "combine" else 4 * scores),
+                 "compute_alu": 0.0,
+                 "compute_sfu": (float(work["sfu_ops"]) if kernel.variant == "combine" else scores),
+                 "warp_issue": 0.0}
+    elif algorithm == _FA3_GQA_PREFILL_030_ALGORITHM:
+        work = _fa3_gqa_prefill_030_source_work(kernel, hardware)
+        public_work = work["public_work"]
+        read_bytes = float(public_work["read_bytes"])
+        write_bytes = float(public_work["write_bytes"])
+        scores = float(sum(work["blocks"]) * tile["q"] * tile["kv"])
+        flops = {"compute_tensor": float(work["tensor_flops"]),
+                 "compute_reduction": 2 * scores, "compute_fma": 0.0,
+                 "compute_alu": 3 * scores, "compute_sfu": scores,
+                 "warp_issue": 0.0}
+    elif algorithm == _FA3_COMBINE_ALGORITHM:
         work=current_fa3_combine_source_work(kernel)
         if work is None:
             work=fa3_combine_prediction_work(kernel,hardware)
@@ -13502,6 +14788,13 @@ def _fa3_resource_input(kernel: KernelSpec, hardware):
         flops = {"compute_tensor": 0.0, "compute_reduction": 0.0,
                  "compute_fma": read_bytes / 4, "compute_alu": 0.0,
                  "compute_sfu": 0.0, "warp_issue": 0.0}
+    elif algorithm == _FA3_PREFILL_SPLIT_ALGORITHM:
+        work = _fa3_split_prefill_work(kernel, hardware)
+        read_bytes, write_bytes = float(work["read_bytes"]), float(work["write_bytes"])
+        scores = float(work["scores"])
+        flops = {"compute_tensor": float(work["tensor_flops"]), "compute_reduction": 0.0,
+                 "compute_fma": 4 * scores, "compute_alu": 0.0,
+                 "compute_sfu": scores, "warp_issue": 0.0}
     elif algorithm == _FA3_PREFILL_ALGORITHM:
         blocks = sum(_fa3_prefill_tiles(kernel))
         issued = 2.0 * blocks * tile["q"] * tile["kv"] * (
@@ -13509,15 +14802,16 @@ def _fa3_resource_input(kernel: KernelSpec, hardware):
         if has_fa3_prefill_source(kernel):
             work = current_fa3_prefill_source_work(kernel)
             if work is None:
-                work = fa3_prefill_source_demands(fa3_prefill_memory_access_program(kernel,hardware),expected_kernel=kernel)
+                work = fa3_prefill_prediction_work(kernel,hardware)
             read_bytes = float(work['projected_read_bytes'])
-            write_bytes = float(work['projected_write_bytes'])
+            write_bytes = float(work['projected_write_bytes'] + work['unpriced_lse_write_bytes'])
         else:
             from src.kernel.memory_access_builder import logical_interface_memory_access_program
             from src.kernel.memory_path_solver import logical_interface_source_traffic
             program=logical_interface_memory_access_program(kernel,hardware)
             _,read_bytes,write_bytes=logical_interface_source_traffic(program,expected_kernel=kernel,hardware=hardware)
-        if ("return_softmax_lse" in kernel.attributes and kernel.attributes["return_softmax_lse"]):
+        if (not has_fa3_prefill_source(kernel)
+                and "return_softmax_lse" in kernel.attributes and kernel.attributes["return_softmax_lse"]):
             # vLLM MLA context merges consume one FP32 LSE per live query/head.
             # This is an output of the same attention call, not a second launch.
             write_bytes += float(heads * sum(q_lens) * 4)
@@ -13543,10 +14837,9 @@ def _fa3_resource_input(kernel: KernelSpec, hardware):
                  "compute_sfu": scores, "warp_issue": 0.0}
     elif algorithm == _FA3_DECODE_ALGORITHM:
         from src.kernel.memory_access_builder import logical_interface_memory_access_program
-        from src.kernel.memory_flash_attention import fa3_mla_decode_source_tiles
         from src.kernel.memory_path_solver import logical_interface_source_traffic
         program=logical_interface_memory_access_program(kernel,hardware)
-        tiles=fa3_mla_decode_source_tiles(program,expected_kernel=kernel,num_sms=int(hardware.num_compute_units))
+        tiles = _fa3_decode_tile_blocks(kernel, hardware, program=program)
         blocks = sum(tiles)
         issued = 2.0 * blocks * tile["q"] * tile["kv"] * (
             tile["qk_head"] + 2 * tile["value_head"])
@@ -13585,14 +14878,14 @@ def _fa3_resource_input(kernel: KernelSpec, hardware):
             hardware,
             "fa3_aggregate_demand_without_source_schedule",
             "production_duration_calibration_not_used",
-        ),
+        ) + source_limits,
     )
     return inp, dram_bytes
 # --- end wp10 FA3 template --------------------------------------------------
 
 
 _MODEL_CACHE_SIZE = 8
-_model_cache = OrderedDict()
+_model_cache = RuntimeCache()
 _model_cache_lock = threading.Lock()
 
 
@@ -13649,7 +14942,7 @@ def _model(kernel: KernelSpec, hardware, *, attach_pipeline: bool = True):
         with fa3_combine_source_work(kernel,work):
             return _cached_source_model(kernel,hardware,attach_pipeline=attach_pipeline)
     if has_fa3_prefill_source(kernel):
-        work = fa3_prefill_source_demands(fa3_prefill_memory_access_program(kernel,hardware),expected_kernel=kernel)
+        work = fa3_prefill_prediction_work(kernel,hardware)
         with fa3_prefill_source_work(kernel,work):
             return _cached_source_model(kernel,hardware,attach_pipeline=attach_pipeline)
     if has_cann_tnd_source(kernel):
@@ -13777,10 +15070,14 @@ def kimi_k3_nope_context_attention_logical_work(kernel: KernelSpec):
             "output_target": kernel.attributes["output_target"] if "output_target" in kernel.attributes else "chunk_partial",
             "operands": tuple(operands), "mathematical_tensor_flops": 2 * heads * q * k * (192 + 128),
             "unmasked_score_elements": heads * q * k, "lse_elements": heads * q,
-            "demand": None, "source_launch": None, "in_place_roles": (),
+            "demand": {"compute_tensor": float(2 * heads * q * k * (192 + 128)),
+                       "compute_vector": 0.0, "compute_reduction": 0.0,
+                       "compute_fma": float(4 * heads * q * k),
+                       "compute_sfu": float(heads * q * k + 2 * heads * q), "compute_alu": 0.0},
+            "source_launch": None, "in_place_roles": (),
             "limitations": ("BF16 tensor roles and FP32 LSE, no score/probability materialization assertion",
-                            "noncausal context backend tile/split/softmax/compiler services remain unbound",
-                            "logical source work is not an actual provider or complete Roofline time")}
+                            "ideal_stable_softmax_exp_reciprocal_and_log_not_native_tile_split_or_compiler_services",
+                            "logical source work is not an actual provider or native latency acceptance")}
 
 
 def _softmax_mathematical_work(pairs, rows, qk_dim, value_dim, payload):
@@ -13943,7 +15240,8 @@ def mla_prefill_mathematical_work(kernel: KernelSpec):
 
 class FlashAttentionPredictor(KernelPredictor):
     def analytical_without_launch(self, kernel: KernelSpec, hardware):
-        if "mathematical_program" in kernel.attributes:
+        if ("mathematical_program" in kernel.attributes
+                or kernel.variant == "kimi_k3_nope_context_attention"):
             prediction = self.roofline_without_launch(kernel, hardware)
             return dataclasses.replace(prediction, bottleneck_group="analytical_attention")
         return super().analytical_without_launch(kernel, hardware)
@@ -13973,26 +15271,62 @@ class FlashAttentionPredictor(KernelPredictor):
                 work["argument_payload_bytes"]), "roofline")
         if kernel.variant != "kimi_k3_nope_context_attention":
             return super().roofline_without_launch(kernel, hardware)
-        kimi_k3_nope_context_attention_logical_work(kernel)
-        raise NotImplementedError("K3 noncausal context attention backend softmax/tile/split services remain unbound")
+        work = kimi_k3_nope_context_attention_logical_work(kernel)
+        logical_bytes = sum(operand["bytes"] for operand in work["operands"])
+        return prediction_from_ns(roofline_ns(work["demand"], hardware, logical_bytes), "roofline")
 
     kind = KernelKind.FLASH_ATTN
 
     def resource_input(self, kernel: KernelSpec, hardware):
+        from src.kernel.memory_flash_attention import current_fa3_split_prefill_prediction_work
+        current_fa3_split_prefill_prediction_work(kernel, hardware)
+        from src.kernel.memory_flash_attention import current_fa3_sparse_mla_prediction_work
+        sparse_source_work = current_fa3_sparse_mla_prediction_work(kernel, hardware)
         if "mathematical_program" in kernel.attributes:
             raise NotImplementedError("mathematical attention provides useful Roofline only, without a native resource schedule")
-        return _model(kernel, hardware)
+        from src.kernel.memory_access_builder import _standalone_resource_input_scope
+        with _standalone_resource_input_scope(kernel):
+            value = _model(kernel, hardware)
+        if sparse_source_work is not None:
+            inp, compulsory = value
+            limits = tuple(item for item in inp.limitations
+                if item != "fa3_sparse_global_indices_alias_and_readiness_unbound")
+            value = dataclasses.replace(inp, limitations=limits + (
+                "fa3_sparse_caller_snapshot_aliases_and_readiness_validated",
+                "fa3_sparse_device_snapshot_truth_and_index_conversion_unbound",)), compulsory
+        from src.kernel.prediction_cache import _retain_public_resource_input
+        _retain_public_resource_input(kernel, hardware, value)
+        return value
 
     def midlayer(self, kernel: KernelSpec, hardware):
-        if ("return_softmax_lse" in kernel.attributes and kernel.attributes["return_softmax_lse"]):
+        from src.kernel.memory_flash_attention import current_fa3_split_prefill_prediction_work
+        split_source_work = current_fa3_split_prefill_prediction_work(kernel, hardware)
+        from src.kernel.memory_flash_attention import current_fa3_sparse_mla_prediction_work
+        sparse_source_work = current_fa3_sparse_mla_prediction_work(kernel, hardware)
+        if ("return_softmax_lse" in kernel.attributes and kernel.attributes["return_softmax_lse"]
+                and not (kernel.dtype == "bf16" and (has_fa3_prefill_source(kernel)
+                    or kernel.variant == "combine" and split_source_work is not None))):
             raise NotImplementedError("explicit MLA prefill LSE currently has a Roofline source contract only")
+        if split_source_work is not None:
+            prediction = _fa3_midlayer(kernel, hardware)
+            limitations = tuple(item for item in prediction.diagnostics.limitations
+                if item != "fa3_split_prefill_scratch_aggregate_without_shared_native_bindings")
+            return dataclasses.replace(prediction, diagnostics=dataclasses.replace(prediction.diagnostics,
+                limitations=limitations + ("fa3_split_prefill_source_aliases_and_readiness_validated",)))
+        if sparse_source_work is not None:
+            prediction = _fa3_midlayer(kernel, hardware)
+            limits = tuple(item for item in prediction.diagnostics.limitations
+                if item != "fa3_sparse_global_indices_alias_and_readiness_unbound")
+            return dataclasses.replace(prediction, diagnostics=dataclasses.replace(prediction.diagnostics,
+                limitations=limits + ("fa3_sparse_caller_snapshot_aliases_and_readiness_validated",
+                    "fa3_sparse_device_snapshot_truth_and_index_conversion_unbound",)))
         if is_fa3_launch(kernel):
             if has_fa3_combine_source(kernel):
                 work=fa3_combine_prediction_work(kernel,hardware)
                 with fa3_combine_source_work(kernel,work):
                     return _fa3_midlayer(kernel,hardware)
             if has_fa3_prefill_source(kernel):
-                work = fa3_prefill_source_demands(fa3_prefill_memory_access_program(kernel,hardware),expected_kernel=kernel)
+                work = fa3_prefill_prediction_work(kernel,hardware)
                 with fa3_prefill_source_work(kernel,work):
                     return _fa3_midlayer(kernel,hardware)
             return _fa3_midlayer(kernel, hardware)

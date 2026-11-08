@@ -1,0 +1,100 @@
+{
+  "hardware_id": "nvidia_h200",
+  "production_or_evaluation_duration_consumed": false,
+  "kind": "discrete_operand_ring_observation",
+  "excluded": "No duration, per-case price, register throughput, barrier service or launch selection inferred from error.",
+  "classes": [
+    {
+      "signature": {
+        "dtype": "bf16",
+        "tile_shape": {
+          "m": 32,
+          "n": 256,
+          "k": 128
+        },
+        "group_size_m": 16,
+        "threads_per_cta": 128,
+        "registers_per_thread": 233,
+        "static_shared_bytes": 0,
+        "dynamic_shared_bytes": 73728
+      },
+      "operand_ring_slots": 1,
+      "physical_derivation": "One physical A/B shared panel, fixed shared addresses and a wait-all at the loop backedge. No rotating shared index. Register HMMA may overlap the last prefetched loads; the coarse common model retains matrix completion as its conservative buffer release.",
+      "evidence": {
+        "input_manifest_path": "profiler_output/kernel_dataset/nvidia_h200/moe_barrier_source_20261107/FUSEDMOE_TOK256_E128_TOPK16_H2048_INT768/input.json",
+        "input_manifest_sha256": "4c84bacf865bb9575916a082b2e6f541f4d85b917fbcb21bddd51ed2cd12016d",
+        "static_summary_path": "profiler_output/kernel_dataset/nvidia_h200/moe_barrier_source_20261107/FUSEDMOE_TOK256_E128_TOPK16_H2048_INT768/operand_ring_summary.json",
+        "static_summary_sha256": "7b8bd975ddfaa0f7931af07ed854a00be4f472880ec37da99d824826655b0c92"
+      }
+    },
+    {
+      "signature": {
+        "dtype": "bf16",
+        "tile_shape": {
+          "m": 32,
+          "n": 256,
+          "k": 128
+        },
+        "group_size_m": 16,
+        "threads_per_cta": 128,
+        "registers_per_thread": 237,
+        "static_shared_bytes": 0,
+        "dynamic_shared_bytes": 73728
+      },
+      "operand_ring_slots": 1,
+      "physical_derivation": "One physical A/B shared panel, fixed shared addresses and a wait-all at the loop backedge. No rotating shared index. Register HMMA may overlap the last prefetched loads; the coarse common model retains matrix completion as its conservative buffer release.",
+      "evidence": {
+        "input_manifest_path": "profiler_output/kernel_dataset/nvidia_h200/moe_barrier_source_20261107/FUSEDMOE_TOK256_E128_TOPK16_H2048_INT768/input.json",
+        "input_manifest_sha256": "4c84bacf865bb9575916a082b2e6f541f4d85b917fbcb21bddd51ed2cd12016d",
+        "static_summary_path": "profiler_output/kernel_dataset/nvidia_h200/moe_barrier_source_20261107/FUSEDMOE_TOK256_E128_TOPK16_H2048_INT768/operand_ring_summary.json",
+        "static_summary_sha256": "7b8bd975ddfaa0f7931af07ed854a00be4f472880ec37da99d824826655b0c92"
+      }
+    },
+    {
+      "signature": {
+        "dtype": "bf16",
+        "tile_shape": {
+          "m": 32,
+          "n": 64,
+          "k": 128
+        },
+        "group_size_m": 1,
+        "threads_per_cta": 128,
+        "registers_per_thread": 71,
+        "static_shared_bytes": 0,
+        "dynamic_shared_bytes": 49152
+      },
+      "operand_ring_slots": 2,
+      "physical_derivation": "Two physical A/B panels: uniform indices increment and reset above1. Shared strides equal the complete A/B panel bytes and conserve the full observed allocation. Existing analytical worker/capacity schedule is unchanged.",
+      "evidence": {
+        "input_manifest_path": "profiler_output/kernel_dataset/nvidia_h200/moe_barrier_source_20261107/FUSEDMOE_TOK64_E8_TOPK2_H6144_INT16384/input.json",
+        "input_manifest_sha256": "d82d8d4f42094d606c1a0ff8b549f24b304b3ba9e0abfddae254a00eed559050",
+        "static_summary_path": "profiler_output/kernel_dataset/nvidia_h200/moe_barrier_source_20261107/FUSEDMOE_TOK64_E8_TOPK2_H6144_INT16384/operand_ring_summary.json",
+        "static_summary_sha256": "f108264ef09d8e536b799eaaa786a60432ea005a0c3274246d197b5060144ea6"
+      }
+    },
+    {
+      "signature": {
+        "dtype": "bf16",
+        "tile_shape": {
+          "m": 32,
+          "n": 64,
+          "k": 128
+        },
+        "group_size_m": 1,
+        "threads_per_cta": 128,
+        "registers_per_thread": 80,
+        "static_shared_bytes": 0,
+        "dynamic_shared_bytes": 49152
+      },
+      "operand_ring_slots": 2,
+      "physical_derivation": "Two physical A/B panels: uniform indices increment and reset above1. Shared strides equal the complete A/B panel bytes and conserve the full observed allocation. Existing analytical worker/capacity schedule is unchanged.",
+      "evidence": {
+        "input_manifest_path": "profiler_output/kernel_dataset/nvidia_h200/moe_barrier_source_20261107/FUSEDMOE_TOK64_E8_TOPK2_H6144_INT16384/input.json",
+        "input_manifest_sha256": "d82d8d4f42094d606c1a0ff8b549f24b304b3ba9e0abfddae254a00eed559050",
+        "static_summary_path": "profiler_output/kernel_dataset/nvidia_h200/moe_barrier_source_20261107/FUSEDMOE_TOK64_E8_TOPK2_H6144_INT16384/operand_ring_summary.json",
+        "static_summary_sha256": "f108264ef09d8e536b799eaaa786a60432ea005a0c3274246d197b5060144ea6"
+      }
+    }
+  ]
+}

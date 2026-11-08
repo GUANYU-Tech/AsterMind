@@ -40,6 +40,7 @@ from evaluation.json_shape import require_positive_metric as _positive_int
 from evaluation.kernel.observation_readers import (
     _non_empty_string,
     observed_nvjet_gemm_split_k,
+    legacy_h200_bf16_aggregate_projection,
 )
 
 
@@ -204,6 +205,19 @@ def _normalize_gemm(op_attributes: Mapping, kdata: Mapping,
         "n": _positive_int(op_attributes, "N", "GEMM Attr"),
         "k": _positive_int(op_attributes, "K", "GEMM Attr"),
     }
+    if hardware_id == "nvidia_h200":
+        aggregate = legacy_h200_bf16_aggregate_projection(op_attributes, metrics, hardware)
+        if aggregate is not None:
+            if case_split_k is not None:
+                raise ValueError("legacy BF16 aggregate must not claim an observed effective split")
+            if aggregate.execution_variant == "gemm":
+                return KernelSpec(KernelKind.GEMM, hardware_id, shape, dtype="bf16", variant="gemm",
+                    launch=aggregate, attributes={"output_dtype": None})
+            return KernelSpec(KernelKind.VECTOR, hardware_id,
+                {"element_count": shape["b"] * shape["m"] * shape["n"], "dtype_bytes": 2},
+                dtype="bf16", variant="gemm_reduce", launch=aggregate,
+                attributes={"source_gemm_shape": shape,
+                    "split_k": int(aggregate.parameters["modeled_split_k"])})
     non_tensor = is_non_tensor(
         "GEMM", runtime_name, ascend_op_type=metrics["op_type"])
     if non_tensor and "gemv" not in lowered:

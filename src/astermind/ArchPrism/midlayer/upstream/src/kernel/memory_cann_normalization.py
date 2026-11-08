@@ -1,7 +1,8 @@
 """CANN normalization's out-of-place outputs and logical GM interfaces."""
+
+from src.kernel.prediction_cache import runtime_lru_cache
 from contextlib import contextmanager
 from contextvars import ContextVar, copy_context
-from functools import lru_cache
 from src.kernel.kernel_spec import KernelKind
 from src.kernel.memory_access import (
     AccessScope, AddressLevel, Coverage, EventKind, EventRef, Granularity, MemoryAccess,
@@ -280,7 +281,7 @@ def cann_normalization_tile_demands(program):
     return dict(_cann_normalization_tile_demands(program))
 
 
-@lru_cache(maxsize=8)
+@runtime_lru_cache(maxsize=8)
 def _cann_normalization_tile_demands(program):
     from src.kernel.memory_access import requested_bytes,tile_template_requested_bytes
     from src.kernel.memory_path_solver import logical_requested_bytes

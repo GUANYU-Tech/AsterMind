@@ -5,7 +5,7 @@
 # /mnt/public/yangxinhao/h200_microbench/dsr1_mtpoff/bin/.  Evaluation only.
 # Usage: nvidia_h200_export_nsys_windows.sh <capture dir>
 set -u
-B=/mnt/public/yangxinhao; D=$B/h200_microbench/dsr1_mtpoff
+B=${MIDLAYER_H200_PUBLIC_ROOT:?set MIDLAYER_H200_PUBLIC_ROOT}; D=$B/h200_microbench/dsr1_mtpoff
 for f in $1/window_*.nsys-rep; do
   s=${f%.nsys-rep}.sqlite
   [ -f $s ] || $B/tools/nsys_2025.6.1/bin/nsys export --type sqlite --output $s $f > /dev/null 2>&1

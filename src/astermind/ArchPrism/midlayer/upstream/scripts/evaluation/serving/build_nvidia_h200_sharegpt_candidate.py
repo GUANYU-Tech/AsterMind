@@ -7,7 +7,7 @@ the same two converters as the canonical A800 cases, unchanged in schema:
 
 1. ``sharegpt_raw_adapter`` normalizes ``raw/ShareGPT-*`` (operators,
    Scheduler sidecar, Nsight) into a compact case with ``alignment_steps``;
-2. ``scheduler_capture_candidate`` (``midlayer.scheduler_capture_candidate.v5``)
+2. ``scheduler_capture_candidate`` (H200 compact schema v7)
    binds the no-profiler trace-on ground truth, its Scheduler trace and the
    measured observer-effect gate, producing ``requests.csv``, ``metrics.json``,
    ``scheduler_steps.jsonl.zst`` and ``manifest.json``.
@@ -19,10 +19,9 @@ Candidates are written below ``--work-root`` (each stage under its own
 The trace-on run defaults to ``<case>/trace_on/``.  A trace-on repeated with
 ``run_nvidia_h200_sharegpt_capture.py rerun-trace-on --tag <tag>`` lives in
 ``<case>/trace_on_<tag>/`` next to its record ``case_capture.trace_on_<tag>.json``
-and is selected explicitly with ``--trace-on-dir-name trace_on_<tag>``; the
-representative's gate directory is selected independently with
-``--observer-representative-trace-on-dir-name``.  The selected directory names
-are recorded by the v5 writer in ``manifest.json`` (``capture.run_id``,
+and is selected explicitly with ``--trace-on-dir-name trace_on_<tag>``.  Each
+H200 candidate uses its own observer gate from that run.  The selected directory
+names are recorded in ``manifest.json`` (``capture.run_id``,
 ``scheduler_provenance.capture_run_id`` and each accepted ``raw_sources``
 ``relative_path``) and echoed in the printed summary.
 """
@@ -200,6 +199,8 @@ def main() -> int:
         raise ValueError("H200 candidates must not be written into serving_dataset/")
     contract = _case_contract(case_dir)
     own_gate = args.observer_representative_case_dir is None
+    if not own_gate:
+        raise ValueError("H200 candidates require their own observer-effect evidence")
     if own_gate and args.observer_representative_trace_on_dir_name is not None:
         raise ValueError(
             "--observer-representative-trace-on-dir-name requires "

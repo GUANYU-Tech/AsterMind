@@ -16,7 +16,7 @@
 #           6144 ws 8 (GLM-5.2), then a repeat of custom AR ws 8 and dispatch
 #           hidden 7168 ws 8 for repeatability (~10-15 min total)
 #
-# Output: /mnt/public/yangxinhao/h200_microbench/collectives_8gpu/<mode>_<stamp>/
+# Output: ${MIDLAYER_H200_PUBLIC_ROOT:?set MIDLAYER_H200_PUBLIC_ROOT}/h200_microbench/collectives_8gpu/<mode>_<stamp>/
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 SRC=$(cd "$HERE/../../../.." && pwd)
@@ -26,19 +26,19 @@ if [ "${1:-}" != "--locked" ]; then
 fi
 MODE=$2
 COMMIT=$(cat "$SRC/DEPLOYED_COMMIT")
-PY=/mnt/public/yangxinhao/envs/vllm030/bin/python
+PY=${MIDLAYER_H200_PUBLIC_ROOT:?set MIDLAYER_H200_PUBLIC_ROOT}/envs/vllm030/bin/python
 STAMP=$(date +%Y%m%d_%H%M%S)
-OUT=/mnt/public/yangxinhao/h200_microbench/collectives_8gpu/${MODE}_${STAMP}
+OUT=${MIDLAYER_H200_PUBLIC_ROOT:?set MIDLAYER_H200_PUBLIC_ROOT}/h200_microbench/collectives_8gpu/${MODE}_${STAMP}
 mkdir -p "$OUT"
 exec > >(tee -a "$OUT/job.log") 2>&1
 
-export HOME=/mnt/public/yangxinhao/h200_microbench/home
-export XDG_CACHE_HOME=/mnt/public/yangxinhao/cache
-export TRITON_CACHE_DIR=/mnt/public/yangxinhao/cache/triton_coll8
-export VLLM_CACHE_ROOT=/mnt/public/yangxinhao/cache/vllm_coll8
-export TORCHINDUCTOR_CACHE_DIR=/mnt/public/yangxinhao/cache/inductor_coll8
-export PATH=/mnt/public/yangxinhao/tools/cuda-12.9/bin:$PATH
-export CUDA_HOME=/mnt/public/yangxinhao/tools/cuda-12.9
+export HOME=${MIDLAYER_H200_PUBLIC_ROOT:?set MIDLAYER_H200_PUBLIC_ROOT}/h200_microbench/home
+export XDG_CACHE_HOME=${MIDLAYER_H200_PUBLIC_ROOT:?set MIDLAYER_H200_PUBLIC_ROOT}/cache
+export TRITON_CACHE_DIR=${MIDLAYER_H200_PUBLIC_ROOT:?set MIDLAYER_H200_PUBLIC_ROOT}/cache/triton_coll8
+export VLLM_CACHE_ROOT=${MIDLAYER_H200_PUBLIC_ROOT:?set MIDLAYER_H200_PUBLIC_ROOT}/cache/vllm_coll8
+export TORCHINDUCTOR_CACHE_DIR=${MIDLAYER_H200_PUBLIC_ROOT:?set MIDLAYER_H200_PUBLIC_ROOT}/cache/inductor_coll8
+export PATH=${MIDLAYER_H200_PUBLIC_ROOT:?set MIDLAYER_H200_PUBLIC_ROOT}/tools/cuda-12.9/bin:$PATH
+export CUDA_HOME=${MIDLAYER_H200_PUBLIC_ROOT:?set MIDLAYER_H200_PUBLIC_ROOT}/tools/cuda-12.9
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 unset VLLM_FLASHINFER_ALLREDUCE_BACKEND
 

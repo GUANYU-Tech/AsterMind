@@ -918,7 +918,7 @@ def _parse_forward_coverage(text, rows):
 
 def _run_one_kernel_card(
         card, root, case_jobs=None, case_timing_dir=None,
-        semantic_output_dir=None):
+        semantic_output_dir=None, report_output_dir=None):
     """Run single-kernel eval for one card.
 
     Returns ``(status, summary_str, rows, forward_coverage)`` where rows is
@@ -941,6 +941,14 @@ def _run_one_kernel_card(
     if semantic_output_dir is not None:
         semantic_output_path = Path(semantic_output_dir) / f"{card}.json"
         cmd.extend(("--semantic-output", str(semantic_output_path)))
+    from evaluation.reporting.kernel_overview import default_kernel_report_path
+    if report_output_dir is not None:
+        report_path = Path(report_output_dir) / (card + ".html")
+        cmd.extend(("--interactive-report", "--report-output", str(report_path)))
+    else:
+        # Report-only default: never materialize an HTML report path (and its
+        # empty report directory) when the per-card run does not write one.
+        report_path = None
     rc, text = _run(cmd, root, quiet=True)
     if rc != 0:
         return FAIL, f"run_kernel_evaluation.py exited {rc}", [], None
@@ -971,7 +979,7 @@ def _run_one_kernel_card(
 
 def run_kernel_matrix(
         root, jobs, case_jobs=None, case_timing_dir=None,
-        semantic_output_dir=None):
+        semantic_output_dir=None, report_output_dir=None):
     """Run the default single-kernel hardware matrix in parallel; return
     {card: (status, summary, rows)}. ``jobs`` bounds card concurrency and
     ``case_jobs`` bounds each card's independent Kernel case workers. Prints
@@ -995,7 +1003,7 @@ def run_kernel_matrix(
         res = _run_one_kernel_card(
             card, root, case_jobs=case_jobs,
             case_timing_dir=case_timing_dir,
-            semantic_output_dir=semantic_output_dir)
+            semantic_output_dir=semantic_output_dir, report_output_dir=report_output_dir)
         return res, time.time() - t0
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -1456,6 +1464,9 @@ def main():
     ap.add_argument("--kernel-semantic-output-dir", type=Path, default=None,
                     help="Directory for one complete semantic result artifact per "
                         "Kernel hardware card.")
+    ap.add_argument("--with-html", action="store_true",
+                    help="Also write the offline interactive HTML kernel report "
+                        "and its projections (default: Markdown-only).")
     ap.add_argument("--dump-json", default=None,
                     help="Also serialize the full structured results (single-kernel "
                          "matrix rows + per-card serving rows incl. _roofline / "
@@ -1535,6 +1546,9 @@ def main():
     print("=" * 70)
 
     kernel_matrix = None
+    kernel_report_directory = None if args.part not in ("kernel", "both") else (
+        Path(__file__).resolve().parents[2]
+        / "experiment_logs/evaluation/kernel/reports")
     serving_result = None
     serving_all_cards = None
     t_start = time.time()
@@ -1550,12 +1564,24 @@ def main():
             f"\n{'#'*70}\n#  {part_label} · single-kernel accuracy "
             f"(default production matrix, cross-hw)\n{'#'*70}")
         t0 = time.time()
+        kernel_report_directory = kernel_report_directory if args.with_html else None
+        if kernel_report_directory is not None:
+            kernel_report_directory.mkdir(parents=True, exist_ok=True)
         kernel_matrix = run_kernel_matrix(
             ROOT, args.kernel_jobs,
             case_jobs=args.kernel_case_jobs,
             case_timing_dir=args.kernel_case_timing_dir,
-            semantic_output_dir=args.kernel_semantic_output_dir)
+            semantic_output_dir=args.kernel_semantic_output_dir, report_output_dir=kernel_report_directory)
         kernel_secs = time.time() - t0
+        if args.with_html:
+            from evaluation.reporting.kernel_overview import write_kernel_matrix_overview
+            kernel_overview_payload = {"kernel_matrix": {card: {"status": status, "summary": summary,
+                "rows": [list(row) for row in rows], "forward_coverage": coverage}
+                for card, (status, summary, rows, coverage) in kernel_matrix.items()},
+                "kernel_reports": {card: {"status": "available" if (kernel_report_directory / (card + ".html")).is_file() else "unavailable",
+                    "path": str(kernel_report_directory / (card + ".html"))} for card in kernel_matrix}}
+            kernel_overview = write_kernel_matrix_overview(kernel_overview_payload, vars(args), kernel_report_directory / "matrix.html")
+            print("Kernel matrix HTML report: " + kernel_overview["path"])
         # Print the cross-hardware tables IMMEDIATELY, before the (slow) Serving
         # part runs — the single-kernel results should be visible right away.
         _print_kernel_matrix(kernel_matrix)
@@ -1735,6 +1761,11 @@ def main():
                        "forward_coverage": coverage}
                 for card, (status, summary, rows, coverage)
                 in kernel_matrix.items()}
+        if kernel_matrix is not None:
+            dump["kernel_reports"] = {card: {
+                "status": "available" if (kernel_report_directory / (card + ".html")).is_file() else "unavailable",
+                "path": str(kernel_report_directory / (card + ".html"))}
+                for card in kernel_matrix} if kernel_report_directory is not None else {}
         if serving_all_cards is not None:
             dump["serving"] = {
                 card_name: {"status": status, "summary": summary, "rows": srows}

@@ -68,17 +68,17 @@ class ParallelConfig:
             raise ParallelConfigError(
                 "the pinned vLLM EP contract does not yet support EPLB")
         if (self.enable_expert_parallel
-                and self.tensor_parallel_size * self.data_parallel_size == 1):
+                and self.tensor_parallel_size * self.data_parallel_size * self.context_parallel_size == 1):
             raise ParallelConfigError(
-                "expert parallelism requires TP * DP greater than one")
+                "expert parallelism requires TP * DP * PCP greater than one")
 
     @property
     def expert_parallel_size(self) -> int:
-        """vLLM EP reuses the DP x TP ranks within one pipeline stage."""
+        """vLLM0.30 EP reuses DP x PCP x TP ranks at one PP stage."""
 
         if not self.enable_expert_parallel:
             return 1
-        return self.tensor_parallel_size * self.data_parallel_size
+        return self.tensor_parallel_size * self.data_parallel_size * self.context_parallel_size
 
     @property
     def worker_count(self) -> int:

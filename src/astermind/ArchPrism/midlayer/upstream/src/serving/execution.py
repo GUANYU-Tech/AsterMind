@@ -14,10 +14,12 @@ from src.serving.kernel_lowering.execution_timeline import (
     ExecutionResourceCalendar,
     _common_id_prefix,
     _normalize_id,
-    _plan_structure_key,
+    _cached_plan_structure_key,
+    _translate_segment_ids,
     build_execution_timeline,
     build_plan_structure_runtime_graph_segments,
     build_runtime_graph_segments,
+    with_earliest_ready_resource_order,
     call_host_lanes,
     iter_call_occurrences,
 )
@@ -25,16 +27,19 @@ from src.serving.kernel_lowering.kernel_predict import (
     KernelPredictionMemo,
     predict_kernel_plan,
 )
+from src.serving.kernel_lowering.kernel_plan import KernelCall, KernelPlan
 from src.serving.kernel_lowering.lower_workload import (
     KernelLoweringMemo,
     lower_workload,
 )
-from src.serving.kv_cache.kv_cache_events import KVCacheEvent
+from src.serving.kv_cache.kv_cache_events import (
+    KVCacheAction, KVCacheEvent, host_kv_transfer_attributes,
+)
 from src.serving.schedule.schedule_step import ScheduleStep
 from src.serving.workload.model_config import ModelConfig
 from src.serving.workload.graph_padding import VLLMDenseGraphInputs
-from src.serving.workload.runtime_inputs import RuntimeInputs, V32PaddedMTPInputs
-from src.serving.workload.workload_graph import WorkloadGraph
+from src.serving.workload.runtime_inputs import RuntimeInputs, V32PaddedMTPInputs, DSparkSourceInputs
+from src.serving.workload.workload_graph import WorkloadGraph, WorkloadKind, WorkloadNode
 from src.kernel.predictors.common import graph_replayed_launch
 from src.serving.host_timing import (
     HostLaunchProfile,
@@ -42,6 +47,11 @@ from src.serving.host_timing import (
     RuntimePrepareEvent,
     RuntimeGraphSegmentDescriptor,
 )
+from src.serving.runtime_prepare import runtime_prepare_source_signature
+
+
+_SOURCE_CAPTURE_NORMALIZATION_SOURCE = tuple((function, function.__code__)
+    for function in (_normalize_id, _translate_segment_ids))
 
 
 _METADATA_COLLECTION_LOCK = RLock()
@@ -80,6 +90,7 @@ class ServingExecutionComponents:
     predictions: Mapping[str, object]
     execution_timeline: object
     source_activation_memory: Mapping[str, object] | None = None
+    source_state_summary: Mapping[str, object] | None = None
 
 
 def bind_model_source_input_frames(runtime_inputs, frames):
@@ -89,15 +100,19 @@ def bind_model_source_input_frames(runtime_inputs, frames):
     if (not isinstance(frames, Mapping) or not frames
             or any(not isinstance(step_id, str) or not step_id for step_id in frames)):
         raise ValueError("per-step source binding requires nonempty named explicit frames")
-    if runtime_inputs.mtp_draft_sampling_source in ("vllm_0_30_legacy_full_logits_greedy",
+    if runtime_inputs.symbolic_forward_source == "vllm_0_30_v4_dspark":
+        valid = all(isinstance(state, DSparkSourceInputs) for state in frames.values())
+    elif runtime_inputs.mtp_draft_sampling_source in ("vllm_0_30_legacy_full_logits_greedy",
             "vllm_0_27_1_eager_full_logits_greedy"):
         valid = all(isinstance(state, V32PaddedMTPInputs) for state in frames.values())
     elif (runtime_inputs.symbolic_forward_source == "cuda_eager_inplace"
-            and runtime_inputs.model_execution_version == "vllm_0_30_0" and runtime_inputs.graph_execution.enabled):
+            and runtime_inputs.model_execution_version == "vllm_0_30_0"):
         # None explicitly declares an eager step; it does not reuse a tail
         # from an earlier captured step or skip a missing frame key.
         valid = (any(isinstance(state, VLLMDenseGraphInputs) for state in frames.values())
-            and all(state is None or isinstance(state, VLLMDenseGraphInputs) for state in frames.values()))
+            and all(isinstance(state, VLLMDenseGraphInputs)
+                and (runtime_inputs.graph_execution.enabled or state.scheduled_token_ids is not None)
+                or state is None and runtime_inputs.graph_execution.enabled for state in frames.values()))
     else:
         valid = False
     if not valid:
@@ -178,6 +193,7 @@ def _runtime_graph_mode(
 
 
 _RUNTIME_PREPARE_EVENTS_CACHE_LIMIT = 8192
+_SOURCE_CAPTURE_SEGMENTS_CACHE_LIMIT = 256
 
 
 def _source_capture_host_segments(plan, regions, *, sync_before_replay):
@@ -235,6 +251,57 @@ def _source_capture_host_segments(plan, regions, *, sync_before_replay):
     return descriptors, "FULL" if covered == total else "PIECEWISE"
 
 
+def _cached_source_capture_host_segments(cache, plan, regions, *, sync_before_replay,
+        normalize_prefix=None):
+    """Reuse exact source-to-Host boundaries within one execution context.
+
+    The schedule structure alone omits the source IDs of fused calls and
+    repeated layers. Both those identities and the actual capture regions
+    participate, so changing a later layer or rank still executes validation.
+    No prediction, allocation, or per-step timing is retained here.
+    Summary callers can request the timeline's normalized identifier space;
+    its prefix and current normalization implementation also enter the key.
+    """
+    if not isinstance(sync_before_replay, bool):
+        raise TypeError("runtime Graph segment sync_before_replay must be a bool")
+    if normalize_prefix is not None and type(normalize_prefix) is not str:
+        raise TypeError("source capture normalization prefix must be a string")
+    normalization_source = None
+    if normalize_prefix is not None:
+        from src.serving.kernel_lowering import execution_timeline as timeline
+        normalize, translate = timeline._normalize_id, timeline._translate_segment_ids
+        if (any(function is not original or function.__code__ is not code
+                or function.__defaults__ is not None or function.__kwdefaults__ is not None
+                for function, (original, code) in zip((normalize, translate),
+                    _SOURCE_CAPTURE_NORMALIZATION_SOURCE, strict=True))
+                or type(plan) is not KernelPlan
+                or any(type(call) is not KernelCall or type(call.call_id) is not str for call in plan.calls)):
+            segments, mode = _source_capture_host_segments(plan, regions,
+                sync_before_replay=sync_before_replay)
+            return translate(segments, lambda call_id: normalize(call_id, normalize_prefix)), mode
+        normalization_source = _SOURCE_CAPTURE_NORMALIZATION_SOURCE
+    key = (
+        _source_capture_host_segments, iter_call_occurrences, call_host_lanes,
+        normalization_source, normalize_prefix,
+        _cached_plan_structure_key(plan, plan.topological_order(), ""),
+        tuple((call.call_id, call.source_node_ids) for call in plan.calls),
+        tuple((repeat.block_id, repeat.trace_node_ids) for repeat in plan.block_repeats),
+        regions, sync_before_replay,
+    )
+    if key in cache:
+        cache.move_to_end(key)
+        return cache[key]
+    result = _source_capture_host_segments(plan, regions, sync_before_replay=sync_before_replay)
+    if normalize_prefix is not None:
+        segments, mode = result
+        result = (translate(segments,
+            lambda call_id: normalize(call_id, normalize_prefix)), mode)
+    cache[key] = result
+    if len(cache) > _SOURCE_CAPTURE_SEGMENTS_CACHE_LIMIT:
+        cache.popitem(last=False)
+    return result
+
+
 def _cached_runtime_prepare_events(
     cache: OrderedDict,
     builder,
@@ -243,21 +310,20 @@ def _cached_runtime_prepare_events(
 ):
     """Return prepare events for one plan, cached per normalized structure.
 
-    The builder output is a pure function of the prefix-normalized plan
-    structure (``_plan_structure_key`` covers every input the builder
-    reads: identifiers, ranks, lanes, kinds, variants, transfer
-    operations, and repeat layout), so it is cached per structure.  The
+    The builder output depends on the prefix-normalized scheduling topology
+    and the explicitly consumed source fields (stage, dtype and TP/source
+    program identity). Both enter this owner-specific cache key. The
     summary timeline consumes the normalized form directly; the detailed
     timeline gets keys remapped to the current step's identifier prefix.
     Returns ``(events, normalized_events, events_token)`` with exactly one
     of the two event forms populated."""
 
     prefix = _common_id_prefix(kernel_plan)
-    structure_key = _plan_structure_key(
+    structure_key = (_cached_plan_structure_key(
+        kernel_plan,
         kernel_plan.topological_order(),
-        kernel_plan.block_repeats,
         prefix,
-    )
+    ), runtime_prepare_source_signature(kernel_plan, prefix))
     if structure_key in cache:
         cached = cache[structure_key]
         cache.move_to_end(structure_key)
@@ -327,7 +393,8 @@ class ServingExecutionContext:
             ]
         ] | None = None,
         materialize_timeline_details: bool = True,
-        model_source_inputs_by_step: Mapping[str, V32PaddedMTPInputs | VLLMDenseGraphInputs | None] | None = None,
+        model_source_inputs_by_step: Mapping[str, V32PaddedMTPInputs | VLLMDenseGraphInputs | DSparkSourceInputs | None] | None = None,
+        collect_source_state: bool = False,
     ) -> None:
         if not isinstance(model, ModelConfig):
             raise TypeError("Serving execution model must be ModelConfig")
@@ -344,34 +411,24 @@ class ServingExecutionContext:
         runtime_inputs = bind_ordinary_forward_source(model, deployment, runtime_inputs)
         if runtime_inputs.symbolic_forward_source is None:
             raise ValueError("Serving requires a bound virtual model source and its declared runtime inputs")
-        if execution_mode not in ("accelerated", "reference"):
+        if execution_mode not in ("accelerated", "reference", "fast"):
             raise ValueError(
                 f"unknown Serving execution mode: {execution_mode!r}")
-        if (execution_mode == "accelerated"
+        if (execution_mode in ("accelerated", "fast")
                 and runtime_inputs.expert_routing.source_kind
                 == "replay_observation"):
             raise NotImplementedError(
                 "per-layer expert routing replay requires reference execution")
-        self.model = model
-        self.deployment = deployment
-        self.hardware_by_id = dict(hardware_by_id)
-        self.launch_policy = launch_policy
-        self.prediction_method = prediction_method
+        self._initialize_workload_state(model, deployment, hardware_by_id, launch_policy,
+            prediction_method, execution_mode, materialize_timeline_details)
+        self._traced_device_source = False
         self.runtime_inputs = runtime_inputs
         self.model_source_inputs_by_step = bind_model_source_input_frames(runtime_inputs, model_source_inputs_by_step)
         self._source_workspace_capacity_by_pool = {}
-        self.execution_mode = execution_mode
-        if not isinstance(materialize_timeline_details, bool):
-            raise TypeError(
-                "timeline detail materialization flag must be boolean")
-        self.materialize_timeline_details = materialize_timeline_details
-        self._executed_workloads = 0
-        self._phase_wall_time_s = {
-            "workload_construction": 0.0,
-            "kernel_lowering": 0.0,
-            "kernel_prediction": 0.0,
-            "timeline_construction": 0.0,
-        }
+        self._dspark_request_progress = {}
+        if type(collect_source_state) is not bool:
+            raise TypeError("source state collection must be boolean")
+        self.collect_source_state = collect_source_state
         if host_launch_profiles is None:
             self.host_launch_profiles = None
         else:
@@ -387,17 +444,210 @@ class ServingExecutionContext:
                 "runtime prepare profiles and event builder must be supplied together")
         self.runtime_prepare_event_builder = runtime_prepare_event_builder
         self._runtime_prepare_events_cache: OrderedDict = OrderedDict()
+        self._source_capture_segments_cache: OrderedDict = OrderedDict()
         self._source_capture_ports = {}
         from src.serving.workload.traced_forward import SourceProgramCache
         self._source_program_cache = SourceProgramCache()
         self._recorded_source_program_bound = False
-        accelerated = execution_mode == "accelerated"
-        if accelerated:
-            self._lowering_memo = KernelLoweringMemo()
-            self._prediction_memo = KernelPredictionMemo()
+
+    def _initialize_workload_state(self, model, deployment, hardware_by_id, launch_policy,
+            prediction_method, execution_mode, materialize_timeline_details):
+        if (not isinstance(model, ModelConfig) or not isinstance(deployment, DeploymentPlan)
+                or not isinstance(hardware_by_id, Mapping) or not hardware_by_id):
+            raise TypeError("workload execution requires ModelConfig, DeploymentPlan and nonempty hardware mapping")
+        if execution_mode not in ("accelerated", "reference", "fast"):
+            raise ValueError(f"unknown Serving execution mode: {execution_mode!r}")
+        if type(materialize_timeline_details) is not bool:
+            raise TypeError("timeline detail materialization flag must be boolean")
+        self.model, self.deployment = model, deployment
+        self.hardware_by_id = dict(hardware_by_id)
+        self.launch_policy, self.prediction_method = launch_policy, prediction_method
+        self.execution_mode = execution_mode
+        self.materialize_timeline_details = materialize_timeline_details
+        self._device_resource_order = "source"
+        self._resource_order_wall_time_s = 0.0
+        self._executed_workloads = 0
+        self._phase_wall_time_s = dict.fromkeys(("workload_construction", "kernel_lowering",
+            "kernel_prediction", "timeline_construction"), 0.0)
+        accelerated = execution_mode in ("accelerated", "fast")
+        self._lowering_memo = KernelLoweringMemo() if accelerated else None
+        self._prediction_memo = KernelPredictionMemo() if accelerated else None
+
+    @classmethod
+    def for_traced_device_sources(cls, model, deployment, hardware_by_id, *,
+            launch_policy="analytical_launch", prediction_method="roofline",
+            execution_mode="accelerated", materialize_timeline_details=False,
+            device_resource_order="source"):
+        """Explicit actual-source factory; no ordinary runtime source is inferred.
+
+        It shares source-body programs, workload execution, exact lowering
+        recipes and the timeline with ordinary Serving. The builder owns its
+        live source bindings; this entry does not bind an ordinary prefix.
+        """
+        if device_resource_order not in ("source", "earliest_ready"):
+            raise ValueError("device resource order must be source or earliest_ready")
+        context = object.__new__(cls)
+        context._initialize_workload_state(model, deployment, hardware_by_id, launch_policy,
+            prediction_method, execution_mode, materialize_timeline_details)
+        context._traced_device_source = True
+        context._device_resource_order = device_resource_order
+        context.runtime_inputs = None
+        context.model_source_inputs_by_step = None
+        context.collect_source_state = False
+        context.host_launch_profiles = None
+        context.host_runtime_prepare_profiles = None
+        context.runtime_prepare_event_builder = None
+        return context
+
+    def _prepare_dspark_progress(self, schedule, state, token_ids):
+        """Validate logical request progress before source construction/memos.
+
+        This ledger binds declared token scenarios, not native cache pointers.
+        It stores scalar/ID facts only and advances after a successful step.
+        """
+        from src.serving.workload.runtime_inputs import DSparkFirstProposalInputs
+        from src.serving.schedule.schedule_step import BackendStep
+        if not isinstance(state, DSparkFirstProposalInputs):
+            if any((schedule.pool_name, request.request_id) in self._dspark_request_progress
+                    for request in schedule.requests):
+                raise ValueError("DSpark logical request cannot lose its explicit source state")
+            return None
+        BackendStep(schedule, generated_tokens={request.request_id: (request.raw_model_output_tokens if state.delivered_token_count is None else state.delivered_token_count) for request in schedule.requests}, embedding_token_ids=token_ids,
+            embedding_token_source="vllm_explicit_request_token_ids", model_source_inputs=state)
+        if state.request_ids != tuple(request.request_id for request in schedule.requests):
+            raise ValueError("DSpark logical progress request identity disagrees with schedule")
+        key = (schedule.pool_name, state.request_ids[0])
+        identity = (state.source_id, state.draft_model.config_sha256)
+        if state.is_verification:
+            if key not in self._dspark_request_progress:
+                raise ValueError("DSpark verification has no successfully completed predecessor")
+            previous = self._dspark_request_progress[key]
+            if (previous["finished"] or previous["identity"] != identity
+                    or previous["step_id"] != state.predecessor_step_id or schedule.step_id == state.predecessor_step_id
+                    or previous["retained_kv_tokens"] != state.previous_retained_kv_tokens
+                    or previous["anchor_token_ids"] != state.previous_anchor_token_ids
+                    or previous["draft_token_ids"] != state.previous_draft_token_ids):
+                raise ValueError("DSpark predecessor/cache identity, live length or proposal transcript changed")
+            completion = previous["completion_time_s"]
+            retained_tokens = previous["retained_token_ids"] + token_ids[:state.accepted_drafts + 1]
+            emitted = (*previous["emitted_token_ids"],
+                *(ids[0] for ids in state.previous_draft_token_ids[:state.accepted_drafts]), state.anchor_token_ids[0])
         else:
-            self._lowering_memo = None
-            self._prediction_memo = None
+            if key in self._dspark_request_progress:
+                raise ValueError("DSpark first proposal cannot reset an existing logical request")
+            completion = 0.0
+            retained_tokens = token_ids
+            emitted = state.anchor_token_ids
+        if state.delivered_token_count is not None:
+            raw_count=1 if state.accepted_drafts is None else state.accepted_drafts+1
+            emitted=emitted[:len(emitted)-raw_count+state.delivered_token_count]
+        if len(retained_tokens) != state.retained_kv_tokens:
+            raise ValueError("DSpark retained token history does not conserve live KV length")
+        return key, state, identity, completion, retained_tokens, emitted
+
+    def _commit_dspark_progress(self, prepared, step_id, result, origin_time_s):
+        if prepared is None:
+            return result
+        key, state, identity, previous_completion, retained_tokens, emitted = prepared
+        completion = origin_time_s + result.execution_timeline.duration_s
+        if completion < previous_completion:
+            raise RuntimeError("DSpark request completion precedes its required prior step")
+        receipt = {
+            "request_id": key[1], "pool_name": key[0], "step_id": step_id,
+            "predecessor_step_id": state.predecessor_step_id,
+            "source_id": state.source_id, "scope": "declared_logical_request_progress",
+            "retained_kv_tokens": state.retained_kv_tokens,
+            "target_input_rows": len(state.target_positions),
+            "accepted_drafts": state.accepted_drafts,
+            "rejected_drafts": None if state.accepted_drafts is None else 5 - state.accepted_drafts,
+            "sampled_valid_count": 1 if state.accepted_drafts is None else state.accepted_drafts + 1,
+            "emitted_token_ids": emitted, "retained_token_ids": retained_tokens,
+            "delivered_token_count": (1 if state.accepted_drafts is None else state.accepted_drafts+1)
+                if state.delivered_token_count is None else state.delivered_token_count,
+            "next_anchor_token_ids": state.anchor_token_ids,
+            "next_draft_token_ids": state.draft_token_ids,
+            "request_finished": state.finish_request,
+            "completion_time_s": completion,
+            "native_cross_step_cache_alias_bound": False,
+            "checkpoint_logits_numerically_computed": False,
+            "normal_capacity_accepted": False,
+        }
+        summary = {} if result.source_state_summary is None else dict(result.source_state_summary)
+        if "dspark_progress" in summary:
+            raise ValueError("DSpark progress receipt cannot overwrite an existing source receipt")
+        summary["dspark_progress"] = receipt
+        result = replace(result, source_state_summary=summary)
+        self._dspark_request_progress[key] = {
+            "identity": identity, "step_id": step_id,
+            "retained_kv_tokens": state.retained_kv_tokens,
+            "anchor_token_ids": state.anchor_token_ids, "draft_token_ids": state.draft_token_ids,
+            "retained_token_ids": retained_tokens, "emitted_token_ids": emitted,
+            "completion_time_s": completion, "finished": state.finish_request,
+        }
+        return result
+
+
+    def _independent_decode_workspace_capacities(self, schedule):
+        """Certify unchanged *represented* V32 workspace for one decode.
+
+        The complete current source requests only its fixed q_concat arena
+        during ordinary q1 decode. Indexer FP8 gather is prefill-only; native
+        selector/library scratch remains explicitly unbound. This reads real
+        completed-Forward capacities and never initializes or advances state.
+        """
+        from src.serving.workload import traced_models, traced_forward
+        runtime, model = self.runtime_inputs, self.model
+        if (type(self) is not ServingExecutionContext or type(schedule) is not ScheduleStep
+                or type(model) is not ModelConfig or type(runtime) is not RuntimeInputs
+                or model.model_type != "glm_moe_dsa" or model.compute_dtype != "bf16"
+                or model.weight_dtype not in ("bf16", "fp8")
+                or runtime.serving_framework != "vllm" or runtime.model_execution_version != "vllm_0_30_0"
+                or runtime.symbolic_forward_source != {
+                    "bf16": "vllm_0_30_v32_bf16_sync_explicit_allreduce",
+                    "fp8": "vllm_0_30_v32_fp8_sync_explicit_allreduce"}[model.weight_dtype]
+                or runtime.graph_execution.enabled
+                or runtime.mtp_draft_sampling_source is not None or runtime.mtp_proposer_execution_source is not None
+                or runtime.model_source_inputs is not None or self.model_source_inputs_by_step is not None
+                or runtime.symbolic_workspace_initial_capacity_bytes is None
+                or runtime.glm_indexer_selection_source != "declared_causal_topk"
+                or runtime.glm_prefill_attention_source not in (None, "force_sparse_mqa")
+                or runtime.target_sampling_source not in (None, "vllm_0_30_plain_greedy_bf16",
+                    "vllm_0_30_plain_sampler_bf16")
+                or self.deployment.mode != "colocated" or len(self.deployment.worker_pools) != 1
+                or schedule.pool_name not in self.deployment.worker_pools
+                or not schedule.requests
+                or any(request.phase != "decode" or request.scheduled_tokens != 1
+                    or request.mtp_proposer_mode != "disabled"
+                    or any((request.mtp_proposed_tokens, request.mtp_verified_tokens, request.mtp_accepted_tokens,
+                        request.mtp_proposer_tokens, request.mtp_next_proposed_tokens)) for request in schedule.requests)):
+            return None
+        pool = self.deployment.worker_pools[schedule.pool_name]
+        parallel = pool.parallel_plan.config
+        if (pool.hardware_id != "nvidia_h200" or len(pool.ranks) != 8 or len(set(pool.ranks)) != 8
+                or parallel.tensor_parallel_size != 8 or parallel.expert_parallel_size != 1
+                or any(value != 1 for value in (parallel.pipeline_parallel_size, parallel.sequence_parallel_size,
+                    parallel.context_parallel_size, parallel.data_parallel_size))):
+            return None
+        batch_limit, model_limit = runtime.symbolic_source_max_batched_tokens, runtime.symbolic_source_max_model_len
+        if (type(batch_limit) is not int or type(model_limit) is not int
+                or batch_limit <= 0 or batch_limit != model_limit
+                or not len(schedule.requests) <= batch_limit <= model.max_position_embeddings
+                or any(request.computed_tokens + 1 > model_limit for request in schedule.requests)
+                or schedule.pool_name not in self._source_workspace_capacity_by_pool
+                or "bf16" not in traced_forward.DTYPE_BYTES
+                or type(traced_forward.DTYPE_BYTES["bf16"]) is not int or traced_forward.DTYPE_BYTES["bf16"] != 2
+                or not traced_models._DENSE_METADATA_SOURCE_CONTRACT.unchanged()):
+            return None
+        capacities = self._source_workspace_capacity_by_pool[schedule.pool_name]
+        # DeepseekV32Attention.__init__ uses BF16[B,64,kv_lora+rope].
+        # ForwardWorkspace rounds each requested port to its 256-byte lane
+        # alignment, and grows only when that total exceeds current capacity.
+        needed = 2 * batch_limit * 64 * (model.kv_lora_rank + model.qk_rope_head_dim)
+        needed = -(-needed // 256) * 256
+        if (type(capacities) is not tuple or len(capacities) != 8
+                or any(type(capacity) is not int or capacity < needed for capacity in capacities)):
+            return None
+        return capacities
 
     def _add_side_stream_fork_node_boundary(self, kernel_plan, predictions):
         """Charge SGLang's per-layer side-stream fork on every graph node.
@@ -410,11 +660,11 @@ class ServingExecutionContext:
         fork boundary on top of the pure-chain node the kernel prices assume.
         """
 
-        if self.runtime_inputs.serving_framework != "sglang":
+        if self.runtime_inputs is None or self.runtime_inputs.serving_framework != "sglang":
             return predictions
         replayed = [
             call for call in kernel_plan.calls
-            if graph_replayed_launch(call.kernel_spec)]
+            if call.call_id in predictions and graph_replayed_launch(call.kernel_spec)]
         if not replayed:
             return predictions
         if self.model.model_type != "deepseek_v3" or not self.model.q_lora_rank:
@@ -434,6 +684,36 @@ class ServingExecutionContext:
             )
         return adjusted
 
+    def prepare_step(
+        self, schedule: ScheduleStep, *,
+        kv_cache_events: tuple[KVCacheEvent, ...] = (),
+        embedding_token_ids: tuple[int, ...] | None = None,
+        model_source_inputs: object | None = None,
+    ) -> KernelPlan:
+        """Build the bound plan for an executor that owns the event clock."""
+        return self.execute_step(
+            schedule, kv_cache_events=kv_cache_events,
+            embedding_token_ids=embedding_token_ids, model_source_inputs=model_source_inputs,
+            _plan_only=True,
+        )
+
+    def _predict_plan(self, kernel_plan: KernelPlan, *, include_communication: bool = True):
+        started = time.perf_counter()
+        predictions = predict_kernel_plan(
+            kernel_plan, self.hardware_by_id, self.prediction_method, self._prediction_memo,
+            include_communication=include_communication,
+        )
+        predictions = self._add_side_stream_fork_node_boundary(kernel_plan, predictions)
+        self._phase_wall_time_s["kernel_prediction"] += time.perf_counter() - started
+        return predictions
+
+    @_metadata_collection_scope()
+    def predict_local_plan(self, kernel_plan: KernelPlan):
+        """Use the run-local predictor and memo for calls timed by the device."""
+        predictions = self._predict_plan(kernel_plan, include_communication=False)
+        self._executed_workloads += 1
+        return predictions
+
     @_metadata_collection_scope()
     def execute_step(
         self,
@@ -441,16 +721,99 @@ class ServingExecutionContext:
         *,
         kv_cache_events: tuple[KVCacheEvent, ...] = (),
         origin_time_s: float = 0.0,
+        device_floor_s: float = 0.0,
         shared_resource_calendar: ExecutionResourceCalendar | None = None,
         runtime_prepare_events: Mapping[
             tuple[str, int, str, int], tuple[RuntimePrepareEvent, ...]] | None = None,
         embedding_token_ids: tuple[int, ...] | None = None,
         model_source_inputs: object | None = None,
-        source_prompt_lengths: tuple[int, ...] | None = None,
-    ) -> ServingExecutionComponents:
+        source_launch_inputs: Mapping[str, object] | None = None,
+        require_timeline_details: bool = False,
+        _plan_only: bool = False,
+    ) -> ServingExecutionComponents | KernelPlan:
+        if self.runtime_inputs is None:
+            raise ValueError("schedule execution requires explicit RuntimeInputs; use the actual traced-source builder")
         # A receipt belongs only to a successfully completed current step.
-        # Reset before validation so failures never expose a preceding bind.
         self._recorded_source_program_bound = False
+        if self.runtime_inputs.dense_source_input_policy is not None:
+            pool = self.deployment.worker_pools[schedule.pool_name]
+            parallel = pool.parallel_plan.config
+            if (self.runtime_inputs.dense_source_input_policy != "declared_zero_tp2"
+                    or self.deployment.mode != "colocated" or len(self.deployment.worker_pools) != 1
+                    or pool.hardware_id != "nvidia_h200" or parallel.tensor_parallel_size != 2
+                    or not parallel.is_rank_local or parallel.pipeline_parallel_size != 1
+                    or self.model.model_type not in ("qwen3", "llama", "qwen3_moe")
+                    or self.model.compute_dtype != self.model.weight_dtype or self.model.compute_dtype != "bf16"
+                    or schedule.is_transfer_only or self.model_source_inputs_by_step is not None
+                    or self.runtime_inputs.model_source_inputs is not None):
+                raise ValueError("declared zero inputs require the ordinary H200 BF16 TP2 source without competing frames")
+            # Preserve explicit backend frames and known IDs. Only absent
+            # content receives the selected synthetic approximation.
+            if model_source_inputs is None:
+                if embedding_token_ids is None:
+                    embedding_token_ids = (self.runtime_inputs.embedding_token_ids
+                        if self.runtime_inputs.embedding_token_ids is not None else (0,) * schedule.token_count)
+                shape = self.runtime_inputs.graph_execution.resolve(schedule.token_count,
+                    uniform_decode=all(request.phase == "decode" and request.scheduled_tokens ==
+                        self.runtime_inputs.graph_execution.uniform_decode_query_len for request in schedule.requests))
+                if shape.runtime_mode != "NONE":
+                    full = shape.runtime_mode == "FULL"
+                    max_requests, max_model_len = self.runtime_inputs.dense_source_capture_limits
+                    source_id = "declared-synthetic-canonical-lengths-zero-ids-and-tail-v2"
+                    model_source_inputs = VLLMDenseGraphInputs(tuple(request.request_id for request in schedule.requests),
+                        "declared_synthetic", source_id, (0,) * shape.padding_tokens,
+                        max_requests if full else None, max_model_len if full else None,
+                        source_id if full else None, scheduled_token_ids=embedding_token_ids)
+        if schedule.is_transfer_only:
+            if source_launch_inputs is not None:
+                raise ValueError("transfer-only steps cannot bind compute source launches")
+            if (self.runtime_inputs.model_execution_version != "vllm_0_30_0"
+                    or self.launch_policy != "analytical_launch"
+                    or self.deployment.mode != "colocated"
+                    or len(self.deployment.worker_pools) != 1
+                    or self.model.model_type != "qwen3"
+                    or self.model.attention_layout != "standard_gqa"
+                    or embedding_token_ids is not None
+                    or model_source_inputs is not None
+                    or not kv_cache_events):
+                raise NotImplementedError(
+                    "transfer-only Host KV step requires the native Qwen3 "
+                    "SimpleCPU eager scope")
+            pool = self.deployment.worker_pools[schedule.pool_name]
+            if pool.kv_cache is None:
+                raise ValueError("transfer-only Host KV step needs a tier plan")
+            parallel = pool.parallel_plan.config
+            if (pool.hardware_id != "nvidia_a800"
+                    or parallel.tensor_parallel_size not in (1, 2)
+                    or len(pool.ranks) != parallel.tensor_parallel_size
+                    or parallel.pipeline_parallel_size != 1
+                    or parallel.enable_expert_parallel
+                    or not parallel.is_rank_local):
+                raise NotImplementedError(
+                    "transfer-only SimpleCPU step requires A800 TP1/TP2 PP1")
+            intents = tuple(event for event in kv_cache_events
+                            if event.action is KVCacheAction.STORE)
+            if (not intents or any(event.action not in (
+                    KVCacheAction.STORE, KVCacheAction.RELEASE)
+                    for event in kv_cache_events)):
+                raise ValueError("transfer-only step requires stores and releases")
+            attributes = tuple(host_kv_transfer_attributes(
+                event, cache_config=pool.kv_cache,
+                model_bytes_per_token=self.model.kv_bytes_per_token_per_parallel_rank(
+                    parallel.tensor_parallel_size, parallel.pipeline_parallel_size),
+                scheduled_request_ids=set()) for event in intents)
+            nodes = tuple(WorkloadNode(
+                (f"{schedule.step_id}:kv-offload:{entry['ready_event']}"
+                 + (f":tp-rank-{rank}" if len(pool.ranks) > 1 else "")),
+                WorkloadKind.KV_OFFLOAD, pool.name, {}, rank=rank,
+                attributes=entry)
+                for rank in pool.ranks for entry in attributes)
+            return self.execute_workload(
+                WorkloadGraph(nodes, ()), origin_time_s=origin_time_s,
+                shared_resource_calendar=shared_resource_calendar,
+                runtime_graph_mode="NONE",
+                require_timeline_details=True, _plan_only=_plan_only)
+        # Reset before validation so failures never expose a preceding bind.
         # Token ownership is per scheduled step, unlike the run's immutable
         # execution/source settings. Never retain a preceding step's IDs.
         if self.model_source_inputs_by_step is not None:
@@ -459,6 +822,22 @@ class ServingExecutionContext:
             if schedule.step_id not in self.model_source_inputs_by_step:
                 raise ValueError("scheduled step is absent from explicitly bound model-source inputs")
             model_source_inputs = self.model_source_inputs_by_step[schedule.step_id]
+        if isinstance(model_source_inputs, VLLMDenseGraphInputs) and model_source_inputs.scheduled_token_ids is not None:
+            declared_ids = model_source_inputs.scheduled_token_ids
+            if (self.runtime_inputs.symbolic_forward_source != "cuda_eager_inplace"
+                    or self.runtime_inputs.model_execution_version != "vllm_0_30_0"
+                    or model_source_inputs.request_ids != tuple(request.request_id for request in schedule.requests)
+                    or len(declared_ids) != schedule.token_count
+                    or any(token >= self.model.vocab_size for token in declared_ids)):
+                raise ValueError("scheduled source IDs must match the current versioned target request order, rows and vocabulary")
+            if embedding_token_ids is not None and embedding_token_ids != declared_ids:
+                raise ValueError("scheduled source IDs conflict with known backend input IDs")
+            embedding_token_ids = declared_ids
+            if not self.runtime_inputs.graph_execution.enabled:
+                if (model_source_inputs.retained_padding_token_ids
+                        or model_source_inputs.fa3_full_capture_id is not None):
+                    raise ValueError("eager source IDs cannot silently consume captured padding or capture identity")
+                model_source_inputs = None
         framed_mtp = (self.runtime_inputs.mtp_draft_sampling_source == "vllm_0_30_legacy_full_logits_greedy"
             or (self.runtime_inputs.mtp_draft_sampling_source == "vllm_0_27_1_eager_full_logits_greedy"
                 and isinstance(self.runtime_inputs.model_source_inputs, V32PaddedMTPInputs)))
@@ -472,14 +851,6 @@ class ServingExecutionContext:
                         if request.mtp_proposer_mode == "padded"} != {len(model_source_inputs.draft_input_token_ids)}):
                 raise ValueError("padded MTP per-step source state disagrees with scheduled requests, padded rows or draft depth")
         step_inputs = {}
-        if source_prompt_lengths is not None:
-            if (len(source_prompt_lengths) != len(schedule.requests)
-                    or any(type(length) is not int or length < 1 for length in source_prompt_lengths)):
-                raise ValueError("prompt lengths must cover the scheduled requests in order")
-            if self.model.model_type == "deepseek_v4":
-                step_inputs["v4_source_prompt_lengths"] = source_prompt_lengths
-            elif self.model.model_type in ("kimi_k2", "glm_moe_dsa"):
-                step_inputs["symbolic_source_prompt_lengths"] = source_prompt_lengths
         if embedding_token_ids is not None:
             step_inputs["embedding_token_ids"] = embedding_token_ids
         if model_source_inputs is not None or self.runtime_inputs.model_source_inputs is not None:
@@ -490,15 +861,38 @@ class ServingExecutionContext:
         if schedule.pool_name in self._source_workspace_capacity_by_pool:
             runtime = replace(runtime, symbolic_workspace_initial_capacity_bytes=
                 self._source_workspace_capacity_by_pool[schedule.pool_name])
+        elif (runtime.symbolic_forward_source == "vllm_0_30_v32_bf16_sync_explicit_allreduce"
+                and runtime.symbolic_workspace_initial_capacity_bytes is not None
+                and len(self.deployment.worker_pools) > 1):
+            # PCP PD can have different physical rank counts at its endpoints.
+            # An explicitly global constructor tuple follows deployment pool
+            # order, then each pool's ordered physical ranks; no zero/history
+            # is synthesized for an endpoint absent from that declaration.
+            capacities = runtime.symbolic_workspace_initial_capacity_bytes
+            total = sum(len(pool.ranks) for pool in self.deployment.worker_pools.values())
+            if len(capacities) == total:
+                offset = 0
+                for name, pool in self.deployment.worker_pools.items():
+                    if name == schedule.pool_name:
+                        runtime = replace(runtime, symbolic_workspace_initial_capacity_bytes=
+                            capacities[offset:offset + len(pool.ranks)])
+                        break
+                    offset += len(pool.ranks)
+        dspark_progress = self._prepare_dspark_progress(schedule, runtime.model_source_inputs, embedding_token_ids)
+        if _plan_only and dspark_progress is not None:
+            raise NotImplementedError("DSpark requires completion-aware source progress")
+        if dspark_progress is not None:
+            device_floor_s = max(device_floor_s, dspark_progress[3])
         source_storage, source_graph, source_capture_active = None, None, False
         source_memory_context = None
+        source_state_summary = None
         source_capture_mode = "NONE"
         source_capture_regions = []
         recorded_source_program_bound = False
 
         def observe_source(source, graph):
             nonlocal source_storage, source_graph, source_capture_active, source_capture_mode
-            nonlocal recorded_source_program_bound, source_memory_context
+            nonlocal recorded_source_program_bound, source_memory_context, source_state_summary
             from src.serving.kv_cache.activation_memory import symbolic_forward_storage_report
             from src.serving.workload.traced_forward import ForwardTrace, ForwardCollectiveGroup
             if source_storage is not None:
@@ -511,9 +905,25 @@ class ServingExecutionContext:
                 and source._recorded_graph is not None and source.graph is graph)
             source_storage = symbolic_forward_storage_report(source, graph,
                 source_profile=runtime.symbolic_forward_source)
+            if runtime.symbolic_forward_source == 'vllm_0_30_v4_dspark':
+                source_storage['scope']='retained_source_history_known_storage_envelope_not_current_step_or_normal_worker_peak'
+                source_storage['limitations']=(*source_storage['limitations'],'retained_history_not_a_per_step_activation_measurement')
             source_graph = graph
-            from src.serving.kernel_lowering.memory_bindings import snapshot_trace_memory
-            source_memory_context = snapshot_trace_memory(source, graph)
+            if self.collect_source_state:
+                from src.serving.kv_cache.activation_memory import source_forward_state_summary
+                source_state_summary = source_forward_state_summary(source, graph)
+            if self.execution_mode != "fast":
+                from src.serving.kernel_lowering.memory_bindings import _snapshot_execution_memory
+                if runtime.symbolic_forward_source == "vllm_0_30_v4_dspark":
+                    # The proposer retains its complete source history. Snapshot
+                    # its real writer chronology, then select only this round.
+                    # Old producers remain readiness facts, never priced calls.
+                    from src.serving.kernel_lowering.memory_bindings import TraceMemoryContext
+                    history = _snapshot_execution_memory(source, source.graph)
+                    source_memory_context = TraceMemoryContext(tuple(history._by_node[node.node_id]
+                        for node in graph.nodes))
+                else:
+                    source_memory_context = _snapshot_execution_memory(source, graph)
             if runtime.graph_execution.enabled:
                 from src.serving.kv_cache.activation_memory import source_capture_activation_peak
                 traces = (source,) if isinstance(source, ForwardTrace) else source.traces
@@ -555,7 +965,8 @@ class ServingExecutionContext:
                             canonical = dict(zip(local_nodes, canonical_nodes, strict=True))
                             for index, nodes in enumerate(capture["source_segments"]):
                                 segment_nodes = tuple(canonical[node] for node in nodes)
-                                segment_pools = {graph.node(node).pool_name for node in segment_nodes}
+                                from src.serving.workload.traced_forward import _source_bound_pool_names
+                                segment_pools = _source_bound_pool_names(graph, segment_nodes)
                                 if len(segment_pools) != 1:
                                     raise ValueError("a local source capture segment must belong to exactly one worker pool")
                                 source_capture_regions.append((next(iter(segment_pools)), trace.rank,
@@ -580,7 +991,14 @@ class ServingExecutionContext:
         workload = build_symbolic_workload(schedule, self.model, self.deployment,
             launch_policy=self.launch_policy, kv_cache_events=kv_cache_events,
             runtime_inputs=runtime, hardware_by_id=self.hardware_by_id, trace_observer=observe_source,
-            source_program_cache=self._source_program_cache)
+            # GLM's new source/compiled-plan representation belongs to fast
+            # mode. Detailed execution preserves its complete call layout,
+            # including equality between PD pools and colocated references.
+            # MTP's run-owned proposer history is needed in either mode and
+            # does not enable a compiled-plan template in the MTP dispatcher.
+            source_program_cache=(self._source_program_cache
+                if self.model.model_type not in ("glm_moe_dsa", "kimi_k2") or self.execution_mode == "fast"
+                or runtime.mtp_draft_sampling_source == "vllm_0_30_legacy_full_logits_greedy" else None))
         if source_graph is not workload or source_storage is None:
             raise RuntimeError("symbolic step lost the storage facts of its actual forward graph")
         self._phase_wall_time_s["workload_construction"] += (
@@ -588,6 +1006,7 @@ class ServingExecutionContext:
         components = self.execute_workload(
             workload,
             origin_time_s=origin_time_s,
+            device_floor_s=device_floor_s,
             shared_resource_calendar=shared_resource_calendar,
             runtime_graph_mode=(source_capture_mode
                 if runtime.graph_execution.enabled
@@ -595,8 +1014,11 @@ class ServingExecutionContext:
             runtime_prepare_events=runtime_prepare_events,
             recorded_source_bound=recorded_source_program_bound,
             source_memory_context=source_memory_context,
+            source_launch_inputs=source_launch_inputs,
             source_capture_regions=(tuple(source_capture_regions)
                 if source_capture_active and self.host_launch_profiles is not None else None),
+            require_timeline_details=require_timeline_details,
+            _plan_only=_plan_only,
         )
         if runtime.symbolic_workspace_initial_capacity_bytes is not None:
             # The synchronous source has no surviving external arena aliases
@@ -609,20 +1031,66 @@ class ServingExecutionContext:
                     runtime.symbolic_workspace_initial_capacity_bytes, capacities, strict=True)):
                 raise RuntimeError("source workspace capacity cannot shrink across forward calls")
             self._source_workspace_capacity_by_pool[schedule.pool_name] = capacities
+        if _plan_only:
+            self._recorded_source_program_bound = recorded_source_program_bound
+            return components
         result = (components if source_storage is None else
             replace(components, source_activation_memory={**source_storage,
                 **({"host_capture_timing": {"source_runtime_mode": source_capture_mode,
                     "step_host_coverage_mode": components.execution_timeline.runtime_graph_mode,
                     "scope": "source capture regions replay; every uncovered call remains eager; not compiler/provider acceptance"}}
                     if source_capture_active and self.host_launch_profiles is not None else {})}))
+        if source_state_summary is not None:
+            result = replace(result, source_state_summary=source_state_summary)
+        result = self._commit_dspark_progress(dspark_progress, schedule.step_id, result, origin_time_s)
         self._recorded_source_program_bound = recorded_source_program_bound
         return result
 
+    @_metadata_collection_scope()
+    def execute_source_workload(self, source_builder, *, retire_source=None,
+            shared_resource_calendar: ExecutionResourceCalendar | None = None,
+            require_timeline_details: bool = False) -> ServingExecutionComponents:
+        """Construct a real source graph under the common run-local executor.
+
+        The factory returns its actual graph and placement; dynamic source
+        inputs are consumed afresh. No runtime/provider identity is inferred.
+        """
+        if not callable(source_builder):
+            raise TypeError("traced-source execution requires a callable source builder")
+        if not self._traced_device_source:
+            raise ValueError("source builder execution requires the explicit actual-source factory")
+        if retire_source is not None and not callable(retire_source):
+            raise TypeError("source retirement must be an explicit callable")
+        started = time.perf_counter()
+        built = source_builder()
+        primary_error = None
+        try:
+            if (type(built) is not tuple or len(built) != 2
+                    or not isinstance(built[0], WorkloadGraph) or not isinstance(built[1], DeploymentPlan)):
+                raise TypeError("source builder must return its WorkloadGraph and DeploymentPlan")
+            workload, deployment = built
+            self._phase_wall_time_s["workload_construction"] += time.perf_counter() - started
+            return self.execute_workload(workload, shared_resource_calendar=shared_resource_calendar,
+                require_timeline_details=require_timeline_details, traced_deployment=deployment)
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            if retire_source is not None:
+                try:
+                    retire_source()
+                except BaseException as cleanup_error:
+                    if primary_error is not None:
+                        raise primary_error from cleanup_error
+                    raise
+
+    @_metadata_collection_scope()
     def execute_workload(
         self,
         workload: WorkloadGraph,
         *,
         origin_time_s: float = 0.0,
+        device_floor_s: float = 0.0,
         shared_resource_calendar: ExecutionResourceCalendar | None = None,
         runtime_graph_mode: str | None = None,
         runtime_graph_segments: tuple[
@@ -634,18 +1102,83 @@ class ServingExecutionContext:
         require_timeline_details: bool = False,
         recorded_source_bound: bool = False,
         source_memory_context=None,
-    ) -> ServingExecutionComponents:
+        traced_deployment: DeploymentPlan | None = None,
+        source_launch_inputs: Mapping[str, object] | None = None,
+        _plan_only: bool = False,
+    ) -> ServingExecutionComponents | KernelPlan:
         if type(recorded_source_bound) is not bool:
             raise TypeError("recorded source binding flag must be boolean")
         if not isinstance(require_timeline_details, bool):
             raise TypeError("require_timeline_details must be boolean")
         materialize_details = self.materialize_timeline_details or require_timeline_details
+        if traced_deployment is not None and (not self._traced_device_source
+                or not isinstance(traced_deployment, DeploymentPlan)):
+            raise ValueError("placement override requires the explicit actual-source factory")
+        deployment = self.deployment if traced_deployment is None else traced_deployment
+        if shared_resource_calendar is not None and not isinstance(shared_resource_calendar, ExecutionResourceCalendar):
+            raise TypeError("shared resource calendar must be ExecutionResourceCalendar")
+        if self._device_resource_order == "earliest_ready":
+            if (origin_time_s != 0.0 or device_floor_s != 0.0
+                    or self.host_launch_profiles is not None or self.host_runtime_prepare_profiles is not None
+                    or self.runtime_prepare_event_builder is not None or runtime_prepare_events is not None
+                    or runtime_graph_mode is not None or runtime_graph_segments is not None
+                    or source_capture_regions is not None
+                    or shared_resource_calendar is not None and shared_resource_calendar.reservations):
+                raise ValueError("earliest_ready requires time-zero device-only execution with an empty calendar")
         if not isinstance(workload, WorkloadGraph):
             raise TypeError(
                 "Serving execution workload must be WorkloadGraph")
+        from src.serving.workload.traced_models import _retained_full_execution_context
+        source_context = _retained_full_execution_context(workload)
+        bound_annotations = (source_context is not None and self.runtime_inputs is not None
+            and source_context == (self.hardware_by_id[source_context[0].hardware_id], self.runtime_inputs.graph_execution,
+                self.runtime_inputs.norm_source_batch_invariant, self.runtime_inputs.bf16_gemm_model))
+        if self.runtime_inputs is not None and self.runtime_inputs.bf16_gemm_model is not None:
+            if (self.launch_policy != "analytical_launch"
+                    or self.model.compute_dtype != "bf16" or self.model.weight_dtype != "bf16"
+                    or any(not hardware.supports_source_contract("h200_partial_source_programs")
+                        for hardware in self.hardware_by_id.values())):
+                raise ValueError("tiled BF16 reference requires homogeneous BF16 analytical H200 execution")
+        if self.runtime_inputs is not None and self.runtime_inputs.bf16_gemm_model is not None and not bound_annotations:
+            # Keep source identity, repeats, tensors, dependencies and physical
+            # Graph rows. Mixed-output routers and quantized programs retain
+            # their own existing model; the option declares ordinary BF16 only.
+            workload = workload.with_nodes(
+                node.with_attributes({**node.attributes, "bf16_gemm_model": self.runtime_inputs.bf16_gemm_model})
+                if node.kind in (WorkloadKind.LINEAR, WorkloadKind.LM_HEAD)
+                and node.dtype == "bf16" and node.attributes["weight_dtype"] == "bf16"
+                and node.attributes["weight_group_size"] == 0 and node.attributes["has_bias"] is False
+                and "weight_quantization" not in node.attributes
+                and ("output_dtype" not in node.attributes or node.attributes["output_dtype"] in (None, "bf16"))
+                else node for node in workload.nodes)
+        if (self.runtime_inputs is not None
+                and self.runtime_inputs.norm_source_batch_invariant is False and not bound_annotations):
+            norm_inputs = {
+                node.node_id: {
+                    "shape": dict(node.shape),
+                    "attributes": {
+                        "model_execution_version": node.attributes["model_execution_version"],
+                        "source_input_layout": node.attributes["source_input_layout"],
+                        "source_batch_invariant": False,
+                    },
+                }
+                for node in workload.nodes
+                if node.kind is WorkloadKind.NORM
+                and node.variant in ("rmsnorm", "add_rmsnorm")
+            }
+            if source_launch_inputs is not None:
+                if norm_inputs.keys() & source_launch_inputs.keys():
+                    raise ValueError("runtime Norm declaration conflicts with per-step source launch inputs")
+                norm_inputs.update(source_launch_inputs)
+            source_launch_inputs = norm_inputs
         if source_capture_regions is not None and (self.host_launch_profiles is None or runtime_graph_segments is not None
                 or runtime_graph_mode not in ("FULL", "PIECEWISE")):
             raise ValueError("source capture Host regions require their own explicit captured-mode Host segment binding")
+        if _plan_only and (self._device_resource_order != "source"
+                or self.host_runtime_prepare_profiles is not None
+                or self.runtime_prepare_event_builder is not None or runtime_prepare_events is not None
+                or (self.host_launch_profiles is not None and runtime_graph_mode != "NONE")):
+            raise NotImplementedError("external event execution requires source order and device-only or eager Host timing")
         started = time.perf_counter()
         # This complete raw-source MoE domain need not have a recorded-prefix
         # cache hit. lower_workload still validates every EP port and routing
@@ -653,10 +1186,13 @@ class ServingExecutionContext:
         # DAG before folding; nonuniform layers retain their actual calls.
         kernel_plan = lower_workload(
             workload,
-            self.deployment,
+            deployment,
             self.hardware_by_id,
             self._lowering_memo,
-            compact_source_layers=(self._lowering_memo is not None and not materialize_details
+            source_launch_inputs=source_launch_inputs,
+            source_memory_context=source_memory_context,
+            compact_source_layers=(source_launch_inputs is None and self._lowering_memo is not None and not materialize_details
+                and self.runtime_inputs is not None
                 and (self.model.num_experts == 0 or recorded_source_bound
                     or (self.model.model_type == "qwen3_moe" and self.model.num_experts == 128
                         and self.model.compute_dtype == self.model.weight_dtype == "bf16"
@@ -682,17 +1218,15 @@ class ServingExecutionContext:
             kernel_plan = bind_trace_memory(kernel_plan, source_memory_context)
         self._phase_wall_time_s["kernel_lowering"] += (
             time.perf_counter() - started)
-        started = time.perf_counter()
-        predictions = predict_kernel_plan(
-            kernel_plan,
-            self.hardware_by_id,
-            self.prediction_method,
-            self._prediction_memo,
-        )
-        predictions = self._add_side_stream_fork_node_boundary(
-            kernel_plan, predictions)
-        self._phase_wall_time_s["kernel_prediction"] += (
-            time.perf_counter() - started)
+        if _plan_only:
+            return kernel_plan
+        predictions = self._predict_plan(kernel_plan)
+        started_order = time.perf_counter()
+        if self._device_resource_order == "earliest_ready":
+            kernel_plan = with_earliest_ready_resource_order(kernel_plan, predictions)
+        order_wall_s = time.perf_counter() - started_order
+        self._resource_order_wall_time_s += order_wall_s
+        self._phase_wall_time_s["timeline_construction"] += order_wall_s
         normalized_runtime_prepare_events = None
         runtime_prepare_events_token = None
         if self.runtime_prepare_event_builder is not None:
@@ -739,8 +1273,21 @@ class ServingExecutionContext:
                     host_profile.runtime_name == "CANN"
                     and host_profile.framework_name == "torch_npu")
                 if source_capture_regions is not None:
-                    runtime_graph_segments, runtime_graph_mode = _source_capture_host_segments(
-                        kernel_plan, source_capture_regions, sync_before_replay=sync_before_replay)
+                    if self.execution_mode in ("accelerated", "fast"):
+                        source_prefix = (_common_id_prefix(kernel_plan)
+                            if not materialize_details else None)
+                        runtime_graph_segments, runtime_graph_mode = _cached_source_capture_host_segments(
+                            self._source_capture_segments_cache, kernel_plan, source_capture_regions,
+                            sync_before_replay=sync_before_replay, normalize_prefix=source_prefix)
+                        if source_prefix is not None:
+                            # The source cache validated every rank, source
+                            # boundary and repeated occurrence in its exact
+                            # key. Consume its normalized result directly.
+                            plan_structure_runtime_graph_segments = runtime_graph_segments, source_prefix
+                            runtime_graph_segments = None
+                    else:
+                        runtime_graph_segments, runtime_graph_mode = _source_capture_host_segments(
+                            kernel_plan, source_capture_regions, sync_before_replay=sync_before_replay)
                 elif materialize_details:
                     runtime_graph_segments = build_runtime_graph_segments(
                         workload,
@@ -770,6 +1317,7 @@ class ServingExecutionContext:
             kernel_plan,
             predictions,
             origin_time_s=origin_time_s,
+            device_floor_s=device_floor_s,
             shared_resource_calendar=shared_resource_calendar,
             host_launch_profiles=self.host_launch_profiles,
             host_runtime_prepare_profiles=(
@@ -804,13 +1352,13 @@ class ServingExecutionContext:
                 "kernel_prediction": None,
             }
         return {
-            "execution_mode": "accelerated",
+            "execution_mode": self.execution_mode,
             "kernel_lowering": self._memo_stats(self._lowering_memo),
             "kernel_prediction": self._memo_stats(self._prediction_memo),
         }
 
     def performance_stats(self) -> dict[str, object]:
-        return {
+        result = {
             "executed_workloads": self._executed_workloads,
             "phase_wall_time_s": dict(self._phase_wall_time_s),
             "parallel_worker_count": 0,
@@ -820,6 +1368,15 @@ class ServingExecutionContext:
                 name: 0.0 for name in self._phase_wall_time_s
             },
         }
+        if self._traced_device_source:
+            result["resource_ordering_wall_time_s"] = self._resource_order_wall_time_s
+            if self._lowering_memo is not None:
+                result["compiled_source_lowering"] = {
+                    "physical_class_hits": self._lowering_memo.module_contract_hits,
+                    "physical_class_misses": self._lowering_memo.module_contract_misses,
+                    "call_recipe_hits": self._lowering_memo.call_template_hits,
+                    "call_recipe_misses": self._lowering_memo.call_template_misses}
+        return result
 
     @staticmethod
     def _memo_stats(memo: object) -> dict[str, int]:

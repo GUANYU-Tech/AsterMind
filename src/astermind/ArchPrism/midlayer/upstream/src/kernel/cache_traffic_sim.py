@@ -4,6 +4,8 @@ Python wrapper for the C LRU simulation library (lru_sim.so).
 Provides the validated combined GEMM/MoE simulations used by predictors.
 Typical performance: ~100M cache ops/s on single core.
 """
+
+from src.kernel.prediction_cache import runtime_lru_cache, RuntimeCache
 import ctypes
 import dataclasses
 import functools
@@ -353,6 +355,40 @@ def simulate_lru_trace_stateful_dual_accounted(
     return tuple(int(value) for value in output)
 
 
+@functools.lru_cache(maxsize=512)
+def _simulate_cann_gemm_persistent_stateful_dual_accounted_validated(
+        aic_workers, worker_grid_m, worker_grid_n, worker_grid_k,
+        single_core_m, single_core_n, single_core_k, base_m, base_n, base_k,
+        a_l1_k_tiles, b_l1_k_tiles, step_m, step_n, rows, n, k,
+        element_bytes, capacity_bytes, initial_dirty_bytes):
+    """Memoize the pure native replay after public contract validation."""
+    output = np.zeros(7, dtype=np.int64)
+    _lib.simulate_cann_gemm_persistent_stateful_dual_accounted(
+        ctypes.c_int32(aic_workers),
+        ctypes.c_int32(worker_grid_m),
+        ctypes.c_int32(worker_grid_n),
+        ctypes.c_int32(worker_grid_k),
+        ctypes.c_int32(single_core_m),
+        ctypes.c_int32(single_core_n),
+        ctypes.c_int32(single_core_k),
+        ctypes.c_int32(base_m),
+        ctypes.c_int32(base_n),
+        ctypes.c_int32(base_k),
+        ctypes.c_int32(a_l1_k_tiles),
+        ctypes.c_int32(b_l1_k_tiles),
+        ctypes.c_int32(step_m),
+        ctypes.c_int32(step_n),
+        ctypes.c_int64(rows),
+        ctypes.c_int64(n),
+        ctypes.c_int64(k),
+        ctypes.c_int32(element_bytes),
+        ctypes.c_int64(capacity_bytes),
+        ctypes.c_int64(initial_dirty_bytes),
+        output.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+    )
+    return tuple(int(value) for value in output)
+
+
 def simulate_cann_gemm_persistent_stateful_dual_accounted(
         *, aic_workers: int, worker_grid_m: int, worker_grid_n: int,
         worker_grid_k: int, single_core_m: int, single_core_n: int,
@@ -408,31 +444,12 @@ def simulate_cann_gemm_persistent_stateful_dual_accounted(
     )
     if any(value > np.iinfo(np.int32).max for value in int32_values):
         raise ValueError("CANN persistent program exceeds the C ABI range")
-    output = np.zeros(7, dtype=np.int64)
-    _lib.simulate_cann_gemm_persistent_stateful_dual_accounted(
-        ctypes.c_int32(aic_workers),
-        ctypes.c_int32(worker_grid_m),
-        ctypes.c_int32(worker_grid_n),
-        ctypes.c_int32(worker_grid_k),
-        ctypes.c_int32(single_core_m),
-        ctypes.c_int32(single_core_n),
-        ctypes.c_int32(single_core_k),
-        ctypes.c_int32(base_m),
-        ctypes.c_int32(base_n),
-        ctypes.c_int32(base_k),
-        ctypes.c_int32(a_l1_k_tiles),
-        ctypes.c_int32(b_l1_k_tiles),
-        ctypes.c_int32(step_m),
-        ctypes.c_int32(step_n),
-        ctypes.c_int64(rows),
-        ctypes.c_int64(n),
-        ctypes.c_int64(k),
-        ctypes.c_int32(element_bytes),
-        ctypes.c_int64(capacity_bytes),
-        ctypes.c_int64(initial_dirty_bytes),
-        output.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+    return _simulate_cann_gemm_persistent_stateful_dual_accounted_validated(
+        aic_workers, worker_grid_m, worker_grid_n, worker_grid_k,
+        single_core_m, single_core_n, single_core_k, base_m, base_n, base_k,
+        a_l1_k_tiles, b_l1_k_tiles, step_m, step_n, rows, n, k,
+        element_bytes, capacity_bytes, initial_dirty_bytes,
     )
-    return tuple(int(value) for value in output)
 
 
 # ─── Combined swizzle search for GEMM ───
@@ -628,7 +645,7 @@ def simulate_gemm_source_order(
     return traffic.l2_bytes, traffic.dram_bytes
 
 
-@functools.lru_cache(maxsize=512)
+@runtime_lru_cache(maxsize=512)
 def _simulate_gemm_n_major_cached(
         mt: int, nt: int, k_steps: int, a_tile_bytes: int,
         b_tile_bytes: int, c_tile_bytes: int, wave_size: int,
@@ -850,7 +867,7 @@ _lib.simulate_moe_ab.argtypes = [
 ]
 
 
-_moe_full_cache: dict = {}
+_moe_full_cache: dict = RuntimeCache()
 
 
 def simulate_moe_full(mt: int, nt: int, gsm: int,
@@ -1025,7 +1042,7 @@ _lib.simulate_cann_grouped_moe_operands.argtypes = [
 ]
 
 
-_cann_grouped_moe_cache: dict = {}
+_cann_grouped_moe_cache: dict = RuntimeCache()
 
 
 def simulate_cann_grouped_moe_operands(
@@ -1324,7 +1341,7 @@ _lib.simulate_moe_tile_program.argtypes = [
     ctypes.POINTER(ctypes.c_int64),   # out[6]
 ]
 
-_moe_tile_program_cache: dict = {}
+_moe_tile_program_cache: dict = RuntimeCache()
 
 
 def simulate_moe_tile_program(

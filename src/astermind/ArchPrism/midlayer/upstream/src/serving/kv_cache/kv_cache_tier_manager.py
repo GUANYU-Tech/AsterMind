@@ -1,4 +1,4 @@
-"""Modeled Host-tier residency for request-private, full KV blocks."""
+"""Modeled Host-tier residency for full KV blocks and shared prefix loads."""
 
 from dataclasses import dataclass
 import math
@@ -77,8 +77,9 @@ class KVCacheTransferCompletion:
                 raise ValueError(
                     f"KV transfer completion {name} must be non-empty")
         object.__setattr__(self, "action", KVCacheAction(self.action))
-        if self.action not in (KVCacheAction.LOAD, KVCacheAction.EVICT):
-            raise ValueError("KV transfer completion requires load or evict")
+        if self.action not in (KVCacheAction.LOAD, KVCacheAction.EVICT,
+                               KVCacheAction.STORE):
+            raise ValueError("KV transfer completion requires load, evict or store")
         if isinstance(self.bytes, bool) or not isinstance(self.bytes, int):
             raise TypeError("KV transfer completion bytes must be an integer")
         if self.bytes <= 0:
@@ -151,7 +152,7 @@ class _KVCacheInflightTransfer:
 
 
 class KVCacheTierManager:
-    """Track one HBM tier and one Host tier without copying scheduler policy.
+    """Track HBM and Host residency, including completed dual-copy stores.
 
     The caller remains responsible for request admission, batching,
     preemption, and production victim selection.  This manager owns block
@@ -159,12 +160,19 @@ class KVCacheTierManager:
     its LRU preparation API is a modeled fixture helper.
     """
 
-    def __init__(self, config: KVCacheConfig) -> None:
+    def __init__(
+        self, config: KVCacheConfig, *, fixed_prefix_hbm_percent: int | None = None,
+    ) -> None:
         if not isinstance(config, KVCacheConfig):
             raise TypeError("KV tier manager requires KVCacheConfig")
         if config.offload_policy != "lru":
             raise ValueError(
                 "modeled Host KV offload currently requires policy 'lru'")
+        if fixed_prefix_hbm_percent is not None and (
+                type(fixed_prefix_hbm_percent) is not int
+                or not 0 <= fixed_prefix_hbm_percent <= 100):
+            raise ValueError("fixed prefix HBM percent must be an integer from 0 to 100")
+        self.fixed_prefix_hbm_percent = fixed_prefix_hbm_percent
         tiers_by_name = {
             tier.name.lower(): tier for tier in config.tiers
         }
@@ -198,6 +206,10 @@ class KVCacheTierManager:
                     f"KV tier {tier.name!r} capacity must be an exact block "
                     "multiple")
         self._resident_tier: dict[_KVCacheBlock, str] = {}
+        self._host_replicas: set[_KVCacheBlock] = set()
+        self._host_alias_source: dict[_KVCacheBlock, _KVCacheBlock] = {}
+        self._saw_store = False
+        self._saw_shared_load = False
         self._used_bytes = {"hbm": 0, "host": 0}
         self._reserved_bytes = {"hbm": 0, "host": 0}
         self._last_touch: dict[_KVCacheBlock, int] = {}
@@ -210,6 +222,24 @@ class KVCacheTierManager:
     @property
     def block_bytes(self) -> int:
         return self._block_bytes
+
+    @property
+    def block_size_tokens(self) -> int:
+        return self._block_size_tokens
+
+    def fixed_prefix_block_counts(self, effective_hit_tokens: int) -> tuple[int, int]:
+        """Round HBM blocks to nearest integer, ties upward; Host gets the rest."""
+
+        percent = self.fixed_prefix_hbm_percent
+        if percent is None:
+            raise ValueError("fixed prefix placement is not configured")
+        if (type(effective_hit_tokens) is not int
+                or effective_hit_tokens < 0
+                or effective_hit_tokens % self._block_size_tokens):
+            raise ValueError("effective prefix hit must be non-negative full blocks")
+        blocks = effective_hit_tokens // self._block_size_tokens
+        hbm_blocks = (blocks * percent + 50) // 100
+        return hbm_blocks, blocks - hbm_blocks
 
     def allocate(
         self,
@@ -241,7 +271,7 @@ class KVCacheTierManager:
             raise ValueError(
                 f"KV capacity intent references unknown tier {tier!r}")
         if event.action is KVCacheAction.ALLOCATE:
-            if tier != "hbm":
+            if tier != "hbm" and self.fixed_prefix_hbm_percent is None:
                 raise NotImplementedError(
                     "modeled KV allocation currently requires the HBM tier")
             conflicts = tuple(
@@ -275,15 +305,49 @@ class KVCacheTierManager:
                     f"{inflight!r}")
             wrong_tier = tuple(
                 block for block in blocks
-                if self._resident_tier[block] != tier)
+                if (self._resident_tier[block] != tier
+                    and not (tier == "host"
+                        and self._resident_tier[block] == "hbm"
+                        and block in self._host_replicas)))
             if wrong_tier:
                 raise ValueError(
                     "KV release tier disagrees with current residency: "
                     f"{wrong_tier!r}")
+            pinned_sources = tuple(
+                source for source in blocks
+                if any(alias_source == source
+                       and (alias in self._inflight_by_block
+                            or self._resident_tier[alias] == "host")
+                       for alias, alias_source in self._host_alias_source.items()))
+            if pinned_sources:
+                raise ValueError(
+                    "cannot release Host source with an unfinished shared load: "
+                    f"{pinned_sources!r}")
             self._used_bytes[tier] -= expected_bytes
             if self._used_bytes[tier] < 0:
                 raise RuntimeError("KV tier used-byte ledger became negative")
             for block in blocks:
+                if block in self._host_alias_source:
+                    del self._host_alias_source[block]
+                retains_host = (block in self._host_replicas
+                    and self._saw_store and tier == "hbm")
+                if not retains_host:
+                    for alias, source in tuple(self._host_alias_source.items()):
+                        if source == block:
+                            del self._host_alias_source[alias]
+                if block in self._host_replicas:
+                    self._host_replicas.remove(block)
+                    if tier == "host":
+                        # The CPU pool evicted a stored copy while its GPU
+                        # source block is still owned by a live request.
+                        continue
+                    if self._saw_store:
+                        # Native eager stores survive request completion as
+                        # CPU prefix-cache entries. A later CPU eviction must
+                        # explicitly release this Host-resident block.
+                        self._resident_tier[block] = "host"
+                        continue
+                    self._used_bytes["host"] -= self._block_bytes
                 del self._resident_tier[block]
                 del self._last_touch[block]
         else:
@@ -302,21 +366,26 @@ class KVCacheTierManager:
 
         if not isinstance(event, KVCacheEvent):
             raise TypeError("KV transfer intent must be a KVCacheEvent")
-        if event.action not in (KVCacheAction.LOAD, KVCacheAction.EVICT):
-            raise ValueError("KV transfer intent requires load or evict")
+        if event.action not in (KVCacheAction.LOAD, KVCacheAction.EVICT,
+                                KVCacheAction.STORE):
+            raise ValueError("KV transfer intent requires load, evict or store")
+        if (event.action is KVCacheAction.STORE
+                and self.fixed_prefix_hbm_percent is not None):
+            raise ValueError("native store cannot combine with fixed prefix tiers")
         pool_name, ranks = self._transfer_owner(pool_name, ranks)
-        block = self._block(
+        blocks = self._blocks(
             event.request_id, event.token_start, event.token_end)
-        if event.bytes != self._block_bytes:
+        transfer_bytes = len(blocks) * self._block_bytes
+        if event.bytes != transfer_bytes:
             raise ValueError(
-                "KV transfer intent bytes disagree with one full block")
+                "KV transfer intent bytes disagree with its full blocks")
         if event.tier != "host":
             raise NotImplementedError(
                 "modeled KV transfer intent currently requires the Host tier")
         if event.action is KVCacheAction.LOAD:
             expected_source = "host"
             expected_destination = "hbm"
-        elif event.action is KVCacheAction.EVICT:
+        elif event.action in (KVCacheAction.EVICT, KVCacheAction.STORE):
             expected_source = "hbm"
             expected_destination = "host"
         else:
@@ -329,23 +398,49 @@ class KVCacheTierManager:
         if source != expected_source or destination != expected_destination:
             raise ValueError(
                 "KV transfer intent direction disagrees with its action")
-        if block not in self._resident_tier:
-            raise ValueError("KV transfer source block is not resident")
-        if self._resident_tier[block] != source:
-            raise ValueError("KV transfer source disagrees with residency")
-        if block in self._inflight_by_block:
+        shared_sources = ()
+        if event.action is KVCacheAction.LOAD and event.source_request_id is not None:
+            shared_sources = self._blocks(
+                event.source_request_id, event.token_start, event.token_end)
+            if any(block in self._resident_tier for block in blocks):
+                raise ValueError("shared KV load destination is already resident")
+            if any(source_block not in self._resident_tier
+                   or self._resident_tier[source_block] != "host"
+                   for source_block in shared_sources):
+                raise ValueError("shared KV load source is not Host-resident")
+            if any(source_block in self._inflight_by_block
+                   for source_block in shared_sources):
+                raise ValueError("shared KV load source is still in flight")
+        else:
+            if any(block not in self._resident_tier for block in blocks):
+                raise ValueError("KV transfer source block is not resident")
+            if any(self._resident_tier[block] != source for block in blocks):
+                raise ValueError("KV transfer source disagrees with residency")
+        if any(block in self._inflight_by_block for block in blocks):
             raise ValueError("cannot transfer an in-flight KV block")
+        if (event.action is KVCacheAction.STORE
+                and any(block in self._host_replicas for block in blocks)):
+            raise ValueError("cannot store a KV block that already has a Host copy")
         ready_event = event.ready_event
         if ready_event is None:
             raise RuntimeError("validated KV transfer intent lacks ready_event")
         if ready_event in self._seen_ready_events:
             raise ValueError("KV transfer ready_event values must be unique")
-        self._require_destination_capacity(destination)
-        self._reserved_bytes[destination] += self._block_bytes
+        self._require_destination_capacity(destination, len(blocks))
+        if shared_sources:
+            self._saw_shared_load = True
+            for block, source_block in zip(blocks, shared_sources, strict=True):
+                self._resident_tier[block] = "host"
+                self._host_alias_source[block] = source_block
+                self._touch(block)
+        self._reserved_bytes[destination] += transfer_bytes
         self._inflight_by_event[ready_event] = _KVCacheInflightTransfer(
             event, pool_name, ranks)
-        self._inflight_by_block[block] = ready_event
+        for block in blocks:
+            self._inflight_by_block[block] = ready_event
         self._seen_ready_events.add(ready_event)
+        if event.action is KVCacheAction.STORE:
+            self._saw_store = True
         return event
 
     def assert_quiescent(self) -> None:
@@ -357,6 +452,8 @@ class KVCacheTierManager:
         if any(self._reserved_bytes[tier] for tier in self._reserved_bytes):
             raise RuntimeError(
                 "KV tier manager has reserved capacity at run completion")
+        if self._host_alias_source:
+            raise RuntimeError("KV tier manager retains shared load request aliases")
 
     def touch(
         self,
@@ -412,6 +509,29 @@ class KVCacheTierManager:
             block, KVCacheAction.LOAD, "host", "hbm",
             pool_name=pool_name, ranks=ranks)
 
+    def prepare_store(
+        self,
+        request_id: str,
+        token_start: int,
+        token_end: int,
+        *,
+        pool_name: str,
+        ranks: tuple[int, ...],
+    ) -> KVCacheEvent:
+        block = self._block(request_id, token_start, token_end)
+        if block not in self._resident_tier:
+            raise ValueError("cannot store a non-resident KV block")
+        if self._resident_tier[block] != "hbm":
+            raise ValueError("KV store requires an HBM-resident source block")
+        if block in self._host_replicas:
+            raise ValueError("KV block is already stored in Host")
+        if block in self._inflight_by_block:
+            raise ValueError("cannot store an in-flight KV block")
+        self._require_destination_capacity("host")
+        return self._prepare_transfer(
+            block, KVCacheAction.STORE, "hbm", "host",
+            pool_name=pool_name, ranks=ranks)
+
     def complete_transfer(
         self,
         completion: KVCacheTransferCompletion,
@@ -446,27 +566,41 @@ class KVCacheTierManager:
                 or completion.link != self._tiers_by_name["host"].link):
             raise ValueError(
                 "KV transfer completion provenance disagrees with its intent")
-        block = self._block(
+        blocks = self._blocks(
             event.request_id, event.token_start, event.token_end)
         source = event.source_tier
         destination = event.destination_tier
         if source is None or destination is None:
             raise RuntimeError("in-flight KV transfer lacks tier endpoints")
-        if self._resident_tier[block] != source:
+        if any(self._resident_tier[block] != source for block in blocks):
             raise RuntimeError("in-flight KV source residency changed")
-        self._used_bytes[source] -= self._block_bytes
-        self._reserved_bytes[destination] -= self._block_bytes
-        self._used_bytes[destination] += self._block_bytes
+        retain_source_copy = (event.action is KVCacheAction.STORE
+            or (self.fixed_prefix_hbm_percent is not None
+                and event.action is KVCacheAction.LOAD)
+            or (event.action is KVCacheAction.LOAD
+                and event.source_request_id is not None))
+        if not retain_source_copy:
+            self._used_bytes[source] -= event.bytes
+        self._reserved_bytes[destination] -= event.bytes
+        self._used_bytes[destination] += event.bytes
         if min(
                 self._used_bytes[source],
                 self._reserved_bytes[destination]) < 0:
             raise RuntimeError("KV tier capacity ledger became negative")
-        self._resident_tier[block] = destination
+        for block in blocks:
+            if event.action is not KVCacheAction.STORE:
+                self._resident_tier[block] = destination
+            if retain_source_copy and event.source_request_id is None:
+                self._host_replicas.add(block)
         del self._inflight_by_event[ready_event]
-        del self._inflight_by_block[block]
+        for block in blocks:
+            del self._inflight_by_block[block]
         if event.action is KVCacheAction.LOAD:
-            self._touch(block)
+            for block in blocks:
+                self._touch(block)
         elif event.action is KVCacheAction.EVICT:
+            pass
+        elif event.action is KVCacheAction.STORE:
             pass
         else:
             raise RuntimeError(
@@ -495,19 +629,29 @@ class KVCacheTierManager:
                 inflight_ready_event = self._inflight_by_block[block]
             else:
                 inflight_ready_event = None
-            residency.append({
+            row = {
                 "request_id": block.request_id,
                 "token_start": block.token_start,
                 "token_end": block.token_end,
                 "tier": self._resident_tier[block],
                 "inflight_ready_event": inflight_ready_event,
-            })
-        return {
-            "schema_version": 2,
+            }
+            if (self.fixed_prefix_hbm_percent is not None or self._saw_store
+                    or block in self._host_alias_source):
+                row["valid_copies"] = (
+                    ("hbm", "host") if (block in self._host_replicas
+                        or (block in self._host_alias_source
+                            and self._resident_tier[block] == "hbm"))
+                    else (self._resident_tier[block],))
+            residency.append(row)
+        manifest = {
+            "schema_version": (4 if self._saw_store or self._saw_shared_load else
+                               3 if self.fixed_prefix_hbm_percent is not None else 2),
             "configured_policy": "lru",
             "victim_policy_validation": (
                 "external_transfer_intent_not_validated"),
-            "validation_status": "modeled_request_private_full_blocks",
+            "validation_status": ("modeled_shared_prefix_full_blocks"
+                if self._saw_shared_load else "modeled_request_private_full_blocks"),
             "block_size_tokens": self._block_size_tokens,
             "block_bytes": self._block_bytes,
             "tiers": {
@@ -516,14 +660,19 @@ class KVCacheTierManager:
                     "used_bytes": self._used_bytes[tier],
                     "reserved_bytes": self._reserved_bytes[tier],
                     "resident_blocks": sum(
-                        resident == tier
-                        for resident in self._resident_tier.values()),
+                        resident == tier and (tier != "host"
+                            or block not in self._host_alias_source)
+                        for block, resident in self._resident_tier.items())
+                        + (len(self._host_replicas) if tier == "host" else 0),
                 }
                 for tier in ("hbm", "host")
             },
             "residency": residency,
             "inflight_ready_events": tuple(sorted(self._inflight_by_event)),
         }
+        if self.fixed_prefix_hbm_percent is not None:
+            manifest["fixed_prefix_hbm_percent"] = self.fixed_prefix_hbm_percent
+        return manifest
 
     def _block(
         self,

@@ -17,12 +17,13 @@ from pathlib import Path
 
 from src.serving.kv_cache.kv_capacity import load_runtime_memory_policy
 import subprocess
+import sys
 
 from evaluation.serving.experiments.inferencex_comparison import sha256
 
 
 ROOT = Path(__file__).resolve().parents[3]
-PYTHON = Path('/home/yangxinhao/miniconda3/envs/r2r_qwen3_next/bin/python')
+PYTHON = Path(sys.executable)
 GROUPS = ('colocated_mtp_off', 'colocated_mtp_on', 'pd_mtp_off', 'pd_mtp_on')
 DATA_ROOT = ROOT / 'serving_dataset/synthetic/inferencex_style/dsv3_h200_8k1024_closedloop_tp8_ep1'
 MODEL = ROOT / 'configs/model/deepseek-v3.json'
@@ -74,7 +75,7 @@ def mtp_settings(profile: str, concurrency: int):
         raise ValueError(
             f'MTP profile {profile!r} has no measured acceptance for C={concurrency}')
     return depth, rates[concurrency], source, status
-MAX_WORKERS = 4
+MAX_WORKERS = os.cpu_count() or 1
 # Expert-routing inputs.  "uniform" is the seeded uniform assumption.
 # "dsr1_profile" samples each MoE layer's routed experts from the DeepSeek-R1
 # per-layer expert-selection frequencies in
@@ -193,16 +194,15 @@ def build_suite_command(group: str, csv_path: Path, policy: Path,
           else GRAPH_CONFIGS[graph_config]),
     ]
     if stack == 'sglang':
-        if deployment != 'colocated':
-            raise ValueError('the SGLang stack is mirrored for colocated only')
-        version, tokens, source = SGLANG_STACK[mtp]
-        index = cmd.index('--backend')
-        cmd[index + 1] = 'sglang_mirror'
-        cmd.extend(['--sglang-source-version', version,
-                    '--sglang-max-total-num-tokens', str(tokens),
-                    '--sglang-max-total-num-tokens-source', source,
-                    '--sglang-max-running-requests', '256'])
-    elif stack != 'vllm':
+        # The sglang stack setting was served by the now-deleted
+        # sglang_scheduler_mirror backend; reject before any job launch.
+        # The real-SGLang replay path lives in
+        # scripts/evaluation/serving/agentx_session_simulate.py --backend sglang.
+        raise ValueError(
+            'sglang stack settings require the deleted sglang_scheduler_mirror '
+            'backend; use scripts/evaluation/serving/agentx_session_simulate.py '
+            '--backend sglang for the real-SGLang scheduler replay')
+    if stack != 'vllm':
         raise ValueError(f'unknown execution stack: {stack!r}')
     if deployment == 'colocated':
         cmd.extend(['--deployment', 'colocated', '--pipeline-ranks-per-node', '8'])
@@ -304,7 +304,7 @@ def load_suite(path, *, case_loader):
                     raise ValueError('case token generation disagrees with 8K/1K recipe')
                 for deployment in ('colocated', 'pd_disagg'):
                     policy_path = case_path / manifest['runtime_memory_policies'][deployment]['path']
-                    load_runtime_memory_policy(policy_path)
+                    source_policies = load_runtime_memory_policy(policy_path)
                     # The production policy loader validates all fields; bind each
                     # pool to the selected model/hardware and concurrency here too.
                     raw_policy = json.loads(policy_path.read_text(), object_pairs_hook=_unique_object)
@@ -315,7 +315,12 @@ def load_suite(path, *, case_loader):
                         binding = entry['binding']
                         expected_binding = {
                             'deployment': deployment,
-                            'expert_parallel_size': 1, 'hardware_config_sha256': sha256(HARDWARE),
+                            'expert_parallel_size': 1,
+                            # Capture provenance is pinned by the dataset manifest.
+                            # Production capacity validates live HWSpec fields, not
+                            # the bytes of an older hardware YAML snapshot.
+                            'hardware_config_sha256': source_policies.policy_for_pool(
+                                entry['pool_name']).binding.hardware_config_sha256,
                             'hardware_id': 'nvidia_h200', 'kv_block_size_tokens': 16,
                             'max_batched_tokens': 32768, 'max_model_len': 9216, 'max_requests': c,
                             'model_config_sha256': sha256(MODEL), 'pipeline_parallel_size': 1,
@@ -394,6 +399,16 @@ def main(*, case_loader):
         return
     if args.output_dir is None:
         parser.error('--output-dir is required to execute')
+    # Preflight: reject selected unsupported SGLang points before launching
+    # any job.  The 30-job plan and input binding checks above are
+    # unaffected; explicit vLLM selections still run.
+    for setting, concurrency, _case in jobs:
+        if setting['stack'] == 'sglang':
+            parser.error(
+                f"setting {setting['id']!r} (concurrency {concurrency}) "
+                "requires the deleted sglang_scheduler_mirror backend; "
+                "use scripts/evaluation/serving/agentx_session_simulate.py "
+                "--backend sglang for the real-SGLang scheduler replay")
     root = args.output_dir.resolve()
     if not root.is_relative_to(ROOT / 'experiment_logs'):
         parser.error('--output-dir must be under experiment_logs')

@@ -15,7 +15,7 @@
 # Remote copy: /mnt/public/yangxinhao/h200_microbench/dsr1_mtpoff/bin/.
 # Usage: nvidia_h200_deepseek_r1_tp8_day2.sh <source commit> [off|on|ar ...]   (default: off on ar)
 set -u
-B=/mnt/public/yangxinhao; D=$B/h200_microbench/dsr1_mtpoff
+B=${MIDLAYER_H200_PUBLIC_ROOT:?set MIDLAYER_H200_PUBLIC_ROOT}; D=$B/h200_microbench/dsr1_mtpoff
 COMMIT=$1; shift
 STEPS=${*:-off on ar}
 OUT=$D/day2; mkdir -p $OUT

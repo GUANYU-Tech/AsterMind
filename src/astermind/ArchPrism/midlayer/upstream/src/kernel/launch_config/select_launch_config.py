@@ -44,10 +44,10 @@ class HardwareLaunchDeclaration:
 _HARDWARE_LAUNCH_DECLARATIONS = {
     "nvidia_a800": HardwareLaunchDeclaration(
         package="src.kernel.launch_config.nvidia_a800"),
-    # H200 projects the source-backed A800 launch package except for the
-    # selectors its own package provides (see ``owned``).
+    # Every H200 request resolves within its own hardware package. Missing
+    # source bindings remain explicit gaps, never another device's launch.
     "nvidia_h200": HardwareLaunchDeclaration(
-        package="src.kernel.launch_config.nvidia_a800",
+        package="src.kernel.launch_config.nvidia_h200",
         own_package="src.kernel.launch_config.nvidia_h200",
         # Launch selectors H200 owns itself: the Hopper vLLM 0.24 stack
         # launches kernels (DeepGEMM FP8, FP8 Triton MoE tiles, FA3 MLA)
@@ -55,7 +55,7 @@ _HARDWARE_LAUNCH_DECLARATIONS = {
         # function) listed here the hardware's own module defines the
         # selector and an ``owns_<function>`` predicate over the same
         # arguments; requests inside that domain use the own selector, all
-        # others the projected package.
+        # others still resolve within the H200 package.
         owned=(
             ("vector_launch", "select_vector_launch"),
             # wp11_moe_fp8: vLLM 0.24 FP8 block-quantized Triton fused MoE.
@@ -133,6 +133,12 @@ def _require_launch_hardware(hardware_id: str) -> str:
 
 
 def _launch_function(canonical_id: str, module_name: str, function_name: str):
+    if canonical_id == "nvidia_h200":
+        module = import_module(f"{_HARDWARE_PACKAGES[canonical_id]}.{module_name}")
+        if function_name not in vars(module):
+            raise NotImplementedError(
+                f"H200 source interface {module_name}.{function_name} is not bound")
+        return getattr(module, function_name)
     projected = getattr(
         import_module(f"{_HARDWARE_PACKAGES[canonical_id]}.{module_name}"),
         function_name)
@@ -230,7 +236,11 @@ def select_collective_launch(
 
     # Every hardware package declares its profiled collective library as
     # ``COLLECTIVE_RULES``; one shared engine selects from that data.
-    rules = import_module(_HARDWARE_PACKAGES[canonical_id]).COLLECTIVE_RULES
+    package = import_module(_HARDWARE_PACKAGES[canonical_id])
+    if canonical_id == "nvidia_h200" and "COLLECTIVE_RULES" not in vars(package):
+        raise NotImplementedError(
+            "H200 collective algorithm/protocol observations are not bound")
+    rules = package.COLLECTIVE_RULES
     selection = select_declared_collective(
         rules,
         communication_library=communication_library,
@@ -351,6 +361,10 @@ def select_launch_config(
         raise TypeError("launch attributes must be a mapping")
 
     normalized_variant = variant.strip().lower()
+    if normalized_variant == "fa3_prepare_varlen":
+        if kind is not KernelKind.VECTOR or dtype.strip().lower() != "int32":
+            raise ValueError("FA3 prepare launch requires VECTOR/INT32 source metadata")
+        return hardware.fa3_prepare_varlen_launch(shape["batch"])
     if (kind is KernelKind.VECTOR
             and normalized_variant in (
                 "kv_cache", "kvcache", "paged_kv_cache")):
@@ -424,6 +438,75 @@ def select_launch_config(
             f"{canonical_id} {kind.value} selector did not declare "
             "LaunchConfig.execution_variant")
     return launch
+
+
+def select_workload_source_launch_recipe(hardware_id, shape, dtype, variant, attributes, hardware):
+    """Select physical source stages beside an existing logical cost model.
+
+    One logical math operation may have several native submissions. Return
+    their existing LaunchConfig descriptors rather than mislabeling an
+    aggregate launch or changing its analytical timing/support declaration.
+    """
+    canonical_id = _require_launch_hardware(hardware_id)
+    if hardware is None:
+        raise ValueError("source recipe requires an explicit matching HWSpec")
+    _require_launch_hardware_spec(canonical_id, hardware, "source recipe")
+    if canonical_id != "nvidia_h200":
+        raise NotImplementedError("workload source recipe bridge currently owns H200 only")
+    if variant == "vllm_mtp_eager":
+        return _launch_function(canonical_id, "mtp_launch", "select_mtp_eager_stage_recipe")(
+            shape, dtype, attributes, hardware)
+    if variant == "mla_decode":
+        return _launch_function(canonical_id, "flashmla_dense_launch", "select_dense_flashmla_decode_recipe")(
+            shape, dtype, attributes, hardware)
+    if variant == "dspark_prepare_query":
+        return _launch_function(canonical_id, "dspark_launch", "select_dspark_prepare_query_recipe")(
+            shape, dtype, attributes, hardware)
+    if variant == "dspark_noncausal_indices":
+        return _launch_function(canonical_id, "dspark_launch", "select_dspark_noncausal_indices_recipe")(
+            shape, dtype, attributes, hardware)
+    if variant == "dspark_primitive":
+        return _launch_function(canonical_id, "dspark_launch", "select_dspark_primitive_recipe")(
+            shape, dtype, attributes, hardware)
+    if variant == "marlin_routed_experts":
+        return _launch_function(canonical_id, "marlin_launch", "select_marlin_prepared_expert_launch_recipe")(
+            shape, dtype, attributes, hardware)
+    if variant == "routed_experts":
+        if attributes["routed_weight_dtype"] == "fp8":
+            return _launch_function(canonical_id, "moe_fp8_launch", "select_source_fp8_moe_recipe")(
+                shape, dtype, attributes, hardware)
+        if attributes["routed_weight_dtype"] == "bf16":
+            return _launch_function(canonical_id, "moe_source_launch", "select_source_expert_launch_recipe")(
+                shape, dtype, attributes, hardware)
+        raise NotImplementedError("expert source recipe requires exact BF16 or block128 FP8 weight storage")
+    if variant == "dsv4_indexer_q_rope_quant":
+        launch = _launch_function(canonical_id, "v4_indexer_launch", "select_v4_indexer_q_launch")(
+            shape, dtype, attributes, hardware)
+        return (("q_rope_quant", launch),)
+    if variant == "dsv4_short_context_topk":
+        return _launch_function(canonical_id, "v4_indexer_launch", "select_v4_short_context_indexer_recipe")(
+            shape, dtype, attributes, hardware)
+    if variant in ("dsv4_indexer_prefill", "dsv4_indexer_decode"):
+        if ((variant == "dsv4_indexer_prefill" and shape["num_decode_tokens"] != 0)
+                or (variant == "dsv4_indexer_decode" and shape["num_prefill_tokens"] != 0)):
+            raise ValueError("V4 source recipe phase disagrees with its actual token partition")
+        return _launch_function(canonical_id, "v4_indexer_launch", "select_v4_prepared_indexer_recipe")(
+            shape, dtype, attributes, hardware)
+    if variant in ("dsa_indexer_decode", "dsa_indexer_prefill", "dsa_indexer_mixed"):
+        decode, prefill = shape["num_decode_tokens"], shape["num_prefill_tokens"]
+        if ((variant == "dsa_indexer_decode" and prefill != 0)
+                or (variant == "dsa_indexer_prefill" and decode != 0)
+                or (variant == "dsa_indexer_mixed" and (decode <= 0 or prefill <= 0))):
+            raise ValueError("DSA source recipe phase disagrees with its actual token partition")
+        return _launch_function(canonical_id, "dsa_launch", "select_dsa_prepared_indexer_recipe")(
+            shape, dtype, attributes, hardware)
+    if variant in ("dsa_sparse_decode", "dsa_sparse_prefill", "dsa_sparse_mixed"):
+        if attributes["source_kv_cache_layout"] == "paged_bf16_rows_576":
+            return _launch_function(canonical_id, "flashmla_sparse_launch", "select_dsa_bf16_flashmla_attention_recipe")(
+                shape, dtype, attributes, hardware)
+        return _launch_function(canonical_id, "flashmla_sparse_launch", "select_dsa_flashmla_attention_recipe")(
+            shape, dtype, attributes, hardware)
+    raise NotImplementedError("workload source recipe variant is not bound")
 
 
 def select_flash_attn_copy_launches(
@@ -532,6 +615,27 @@ def select_flash_attn_output_fill_launches(
                 "FlashAttention output fill selector must emit elementwise "
                 "launches")
     return selections
+
+
+def select_source_flash_attn_partial_launch(hardware_id, shape, dtype, variant, attributes, hardware):
+    """Ask the existing H200 fresh-prefill owner for its partial main.
+
+    This source domain owns no general setup/copy/fill ABI. In particular,
+    the one-INT32 scheduler reset remains an explicit small omission in the
+    existing partial predictor, rather than an invented ATen build identity.
+    """
+    canonical_id = _require_launch_hardware(hardware_id)
+    _require_launch_hardware_spec(canonical_id, hardware, "partial attention source")
+    if (canonical_id != "nvidia_h200" or variant != "prefill" or dtype != "bf16"
+            or attributes["source_component"] != "symbolic_gqa_mathematical"
+            or attributes["source_model_execution_version"] != "vllm_0_30_0"
+            or attributes["launch_policy"] != "analytical_launch"):
+        return None
+    owns = _launch_function(canonical_id, "flash_attn_launch", "owns_select_flash_attn_launch")
+    if not owns(shape, dtype, variant, attributes, hardware):
+        return None
+    return _launch_function(canonical_id, "flash_attn_launch", "select_flash_attn_launch")(
+        shape, dtype, variant, attributes, hardware)
 
 
 def normalize_flash_attn_execution_attributes(
@@ -701,6 +805,7 @@ def select_fused_moe_recipe(
     hardware_id: str,
     shape: Mapping[str, int],
     hardware,
+    selection_attributes: Mapping[str, object] | None = None,
 ) -> tuple[str, ...]:
     """Return one hardware-owned full fused-MoE kernel sequence."""
 
@@ -710,17 +815,25 @@ def select_fused_moe_recipe(
     _require_launch_hardware_spec(canonical_id, hardware, "recipe")
     if not isinstance(shape, Mapping):
         raise TypeError("fused-MoE recipe shape must be a mapping")
-    recipe = _launch_function(
-        canonical_id, "fused_moe_launch", "select_fused_moe_recipe")(shape, hardware=hardware)
+    selector = _launch_function(
+        canonical_id, "fused_moe_launch", "select_fused_moe_recipe")
+    if canonical_id == "nvidia_h200":
+        recipe = selector(shape, hardware=hardware, attributes=selection_attributes)
+    else:
+        recipe = selector(shape, hardware=hardware)
     if not isinstance(recipe, tuple) or not recipe:
         raise TypeError("fused-MoE recipe must be a non-empty tuple")
     if any(not isinstance(item, str) or not item for item in recipe):
         raise TypeError("fused-MoE recipe entries must be non-empty strings")
     if recipe.count("w1") != 1 or recipe.count("w2") != 1:
         raise ValueError("fused-MoE recipe must contain exactly one w1 and w2")
+    helper_roles = ({"logits_cast", "normalize_sum", "normalize_div",
+                     "expert_ids_long", "expert_map_lookup"}
+        if canonical_id == "nvidia_h200" and selection_attributes is not None
+        and selection_attributes["model_execution_version"] == "vllm_0_11_0" else set())
     invalid = [
         item for item in recipe
-        if item not in ("w1", "w2") and not item.startswith("moe_")
+        if item not in ("w1", "w2") and not item.startswith("moe_") and item not in helper_roles
     ]
     if invalid:
         raise ValueError(f"invalid fused-MoE recipe entries: {invalid}")
@@ -731,6 +844,7 @@ def select_fused_moe_cast_roles(
     hardware_id: str,
     shape: Mapping[str, int],
     hardware,
+    selection_attributes: Mapping[str, object] | None = None,
 ) -> tuple[str, ...]:
     """Return the typed Cast invocations in one hardware FusedMoE recipe.
 
@@ -747,8 +861,10 @@ def select_fused_moe_cast_roles(
     _require_launch_hardware_spec(canonical_id, hardware, "cast-role")
     if not isinstance(shape, Mapping):
         raise TypeError("fused-MoE cast-role shape must be a mapping")
-    roles = _launch_function(
-        canonical_id, "fused_moe_launch", "select_fused_moe_cast_roles")(shape, hardware=hardware)
+    selector = _launch_function(
+        canonical_id, "fused_moe_launch", "select_fused_moe_cast_roles")
+    roles = (selector(shape, hardware=hardware, attributes=selection_attributes)
+        if canonical_id == "nvidia_h200" else selector(shape, hardware=hardware))
     if not isinstance(roles, tuple):
         raise TypeError("fused-MoE cast roles must be a tuple")
     allowed_roles = {"topk_ids", "expert_tokens"}
@@ -758,7 +874,7 @@ def select_fused_moe_cast_roles(
             f"{sorted(allowed_roles)}, got {roles!r}")
     if len(set(roles)) != len(roles):
         raise ValueError("fused-MoE cast roles cannot repeat")
-    recipe = select_fused_moe_recipe(canonical_id, shape, hardware)
+    recipe = select_fused_moe_recipe(canonical_id, shape, hardware, selection_attributes)
     if recipe.count("moe_cast") != len(roles):
         raise ValueError(
             "fused-MoE recipe cast count disagrees with typed cast roles")
@@ -769,6 +885,7 @@ def select_fused_moe_reduce_work_fractions(
     hardware_id: str,
     shape: Mapping[str, int],
     hardware,
+    selection_attributes: Mapping[str, object] | None = None,
 ) -> tuple[float, ...]:
     """Return hardware-source-derived work shares for ``moe_reduce`` calls."""
 
@@ -780,13 +897,14 @@ def select_fused_moe_reduce_work_fractions(
     if not isinstance(shape, Mapping):
         raise TypeError("fused-MoE reduction shape must be a mapping")
     recipe = select_fused_moe_recipe(
-        canonical_id, shape, hardware=hardware)
+        canonical_id, shape, hardware=hardware, selection_attributes=selection_attributes)
     expected_count = recipe.count("moe_reduce")
     if expected_count == 0:
         return ()
-    fractions = _launch_function(
-        canonical_id, "fused_moe_launch", "select_fused_moe_reduce_work_fractions")(
-        shape, hardware=hardware)
+    selector = _launch_function(
+        canonical_id, "fused_moe_launch", "select_fused_moe_reduce_work_fractions")
+    fractions = (selector(shape, hardware=hardware, attributes=selection_attributes)
+        if canonical_id == "nvidia_h200" else selector(shape, hardware=hardware))
     if not isinstance(fractions, tuple):
         raise TypeError(
             "fused-MoE reduction work fractions must be a tuple")
@@ -810,3 +928,18 @@ def select_fused_moe_reduce_work_fractions(
             f"recipe_count={expected_count}, "
             f"fraction_count={len(normalized)}")
     return normalized
+
+
+_SOURCE_LAUNCH_FUNCTIONS = {"select_kda_chunk_stage_launch": "kda_chunk_launch"}
+
+
+def source_launch_function(hardware_id, name):
+    """Resolve one closed source API through its hardware-owned package."""
+    from src.kernel.hardware_spec import HWSpec
+    canonical = _require_launch_hardware(hardware_id)
+    if not HWSpec.source_contract_supported("h200_partial_source_programs", canonical):
+        raise ValueError("source launch API requires its declared hardware capability")
+    if name not in _SOURCE_LAUNCH_FUNCTIONS:
+        raise ValueError("unknown source launch API")
+    module = import_module(f"{_OWN_PACKAGES[canonical]}.{_SOURCE_LAUNCH_FUNCTIONS[name]}")
+    return getattr(module, name)

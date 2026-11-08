@@ -489,7 +489,7 @@ class _Leaf:
                 x.dtype, "silu", inputs, (output,), attributes)
             return output
         if self.operation == "embedding":
-            width, = self.geometry
+            width, vocab_size = self.geometry
             count = prod(x.shape)
             name = self.name
             # VocabParallelEmbedding.forward's TP1 branch passes input_.long()
@@ -506,8 +506,10 @@ class _Leaf:
             elif x.dtype != "int64":
                 raise ValueError("reference embedding requires INT32/INT64 source IDs")
             output = _Tensor((count, width))
-            self.ledger.emit(name, "gather", {"elements": count * width, "rows": count, "hidden": width},
-                "bf16", "embedding", (x,), (output,), {"index_bytes": 8})
+            self.ledger.emit(name, "gather", {"elements": count * width, "rows": count, "hidden": width,
+                "source_rows": -(-vocab_size // 64) * 64}, "bf16", "embedding", (x,), (output,), {
+                    "index_bytes": 8, "embedding_source": "vllm_0_30_unquantized_tp1",
+                    "model_execution_version": "vllm_0_30_0", "source_operation": "embedding"})
             return output
         if self.operation == "rotary":
             heads, kv_heads, width, cache = self.geometry
@@ -657,7 +659,7 @@ def qwen3_source_reference(upstream_root, config_path, *, query_lengths, kv_leng
     for helper in ("_maybe_add_hidden_state", "collect_remote_aux_hidden_states"):
         setattr(model, helper, source.forward("EagleModelMixin", helper).__get__(model))
     embedding, _, _ = model_fields.call("self.embed_tokens", "VocabParallelEmbedding")
-    model.embed_tokens = _Leaf(ledger, "embedding", "embedding", embedding[1])
+    model.embed_tokens = _Leaf(ledger, "embedding", "embedding", embedding[1], embedding[0])
     norm, norm_kw, _ = model_fields.call("self.norm", "RMSNorm")
     model.norm = _Leaf(ledger, "final-norm", "norm", norm[0], model_fields.keyword(norm_kw, "eps"))
     model.layers = []

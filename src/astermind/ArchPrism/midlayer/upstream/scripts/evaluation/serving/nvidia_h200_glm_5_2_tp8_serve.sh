@@ -25,7 +25,7 @@ set -euo pipefail
 : "${VLLM_MOE_ROUTING_SIMULATION_STRATEGY:?must be set (uniform_random)}"
 : "${GLM52_KV_CACHE_DTYPE:?must be set (fp8_ds_mla or auto)}"
 : "${GLM52_PORT:?must be set}"
-B=/mnt/public/yangxinhao
+B=${MIDLAYER_H200_PUBLIC_ROOT:?set MIDLAYER_H200_PUBLIC_ROOT}
 MODEL=$B/models/GLM-5.2-FP8-config
 export HOME=$B/h200_microbench/home XDG_CACHE_HOME=$B/cache/xdg HF_HOME=$B/cache/hf \
        VLLM_CACHE_ROOT=$B/cache/vllm_glm52 TRITON_CACHE_DIR=$B/cache/triton_glm52 \

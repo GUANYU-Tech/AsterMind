@@ -74,6 +74,14 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--output", required=True)
     parser.add_argument("--scheduler-trace-output")
     parser.add_argument("--scheduler-request-add-output")
+    parser.add_argument(
+        "--diagnostic-request-count", type=int,
+        help="replay this many leading canonical requests as a diagnostic run",
+    )
+    parser.add_argument(
+        "--diagnostic-output-token-cap", type=int,
+        help="cap each diagnostic request at 4–8 output tokens; requires a diagnostic prefix",
+    )
     parser.add_argument("--a800-compilation-counter-output")
     parser.add_argument(
         "--target-hardware-id",
@@ -110,6 +118,13 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         raise ValueError("max_dispatch_lag_ms must be positive")
     if args.server_wait_seconds <= 0:
         raise ValueError("server_wait_seconds must be positive")
+    if args.diagnostic_request_count is not None and args.diagnostic_request_count < 8:
+        raise ValueError("diagnostic request count must be at least eight for warmup")
+    if args.diagnostic_output_token_cap is not None:
+        if args.diagnostic_request_count is None:
+            raise ValueError("diagnostic output cap requires diagnostic request count")
+        if not 4 <= args.diagnostic_output_token_cap <= 8:
+            raise ValueError("diagnostic output cap must be between four and eight")
     output_path = Path(args.output)
     if output_path.exists():
         raise ValueError(f"refusing to overwrite existing output: {output_path}")
@@ -201,7 +216,19 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             target_hardware_id=args.target_hardware_id,
             target_runtime_version=args.runtime_version,
         )
+    if (args.diagnostic_request_count is not None
+            and args.diagnostic_request_count >= case["requests_row_count"]):
+        raise ValueError("diagnostic request count must be below canonical count")
+    if (args.diagnostic_request_count is not None
+            and case["identity"]["hardware_id"] != "nvidia_a800"):
+        raise ValueError("diagnostic request prefix currently supports A800 only")
     server_plan = _server_plan(args, case)
+    if (args.diagnostic_request_count is not None
+            and server_plan["scheduler_trace"]["enabled"]):
+        # The plugin closes its trace after this many formal requests.  The
+        # canonical file identity remains bound to the full request stream.
+        server_plan["environment"]["MIDLAYER_SCHEDULER_TRACE_REQUEST_COUNT"] = (
+            str(args.diagnostic_request_count))
     result = build_ground_truth(
         model=args.model,
         dataset=args.dataset,
@@ -209,6 +236,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         case=case,
         server_plan=server_plan,
         dry_run=True,
+        diagnostic_request_count=args.diagnostic_request_count,
+        diagnostic_output_token_cap=args.diagnostic_output_token_cap,
     )
     output_path = Path(args.output)
     if args.dry_run:
@@ -296,6 +325,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             case=case,
             server_plan=server_plan,
             dry_run=False,
+            diagnostic_request_count=args.diagnostic_request_count,
+            diagnostic_output_token_cap=args.diagnostic_output_token_cap,
             benchmark_boundary_callback=mark_benchmark_boundary,
         )
         measured["server"]["runtime"] = result["server"]["runtime"]
@@ -333,7 +364,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             _wait_for_scheduler_trace_output(scheduler_trace["output_path"])
             result["scheduler_trace"] = _scheduler_trace_summary(
                 scheduler_trace["output_path"],
-                case["requests_row_count"],
+                (args.diagnostic_request_count if args.diagnostic_request_count is not None
+                 else case["requests_row_count"]),
                 max_result_consumption_gap_ns=max_result_consumption_gap_ns,
             )
             benchmark_clock = result["metrics"]["benchmark_clock"]

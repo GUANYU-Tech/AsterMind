@@ -1,7 +1,0 @@
-# Historical Timeloop generation inputs live under archive/simulator_legacy/.
-schema_version: 1
-hardware_id: ucb_gemmini
-kernel:
-  pipeline: null
-serving:
-  suites: {}

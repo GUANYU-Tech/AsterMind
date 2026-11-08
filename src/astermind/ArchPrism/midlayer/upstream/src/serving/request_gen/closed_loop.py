@@ -133,6 +133,50 @@ class ClosedLoopClients:
         self._last_chain_arrival_s[client] = finish_time_s
         return self._visible(successor)
 
+    def successors_of(
+        self,
+        request_id: str,
+        finish_time_s: float,
+    ) -> Tuple[RequestSpec, ...]:
+        """Successors injected by one finish, fan-out aware.
+
+        This is the single completion contract the single-pool engine
+        consumes: it is called exactly once per finished request and must
+        return every successor stamped at a causal instant (the finish
+        instant itself, or ``finish_time_s +`` a recorded external gap).
+        The default client issues exactly one successor per finish (or none
+        at chain end); fan-out controllers (e.g. AgentX sessions) override
+        this to return every concurrently-arriving successor.
+
+        The legacy ``notify_finished`` hook is kept as the inherited
+        single-successor adapter: the engine never calls it directly.
+        """
+
+        successor = self.notify_finished(request_id, finish_time_s)
+        if successor is None:
+            return ()
+        return (successor,)
+
+    def notify_finished_batch(
+        self,
+        finished,
+    ):
+        """Process a whole step's finish set through ``successors_of``.
+
+        Accepts either a list of ``(request_id, finish_time_s)`` pairs (a
+        per-step view) or a single ``(request_id, finish_time_s)`` pair
+        passed positionally (the engine's per-finish contract).  Returns
+        every successor stamped at its causal instant.
+        """
+
+        if (isinstance(finished, tuple) and len(finished) == 2
+                and isinstance(finished[0], str)):
+            finished = (finished,)
+        successors: list = []
+        for request_id, finish_time_s in finished:
+            successors.extend(self.successors_of(request_id, finish_time_s))
+        return successors
+
     def effective_request_stream(self) -> RequestStream:
         """Rebuild the canonical stream at the injected arrival times.
 

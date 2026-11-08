@@ -23,7 +23,7 @@
     {
       "hardware_id": "nvidia_h200",
       "hardware_config_path": "configs/hardware/nvidia_h200.yaml",
-      "hardware_config_sha256": "1b67bb9e4c555976a9d96386967bf50ca36bf11287ad33aedff5adca8ebf406a",
+      "hardware_config_sha256": "2dc939911eb7d3ea1bbb3cc746a44f64f430f6ce8fadf81aa5f4bf38d290c1fe",
       "graph_execution": {
         "configured_mode": "FULL_AND_PIECEWISE",
         "piecewise_eager_workload_kinds": [
@@ -97,71 +97,71 @@
       "hardware_id": "nvidia_h200",
       "model_id": "qwen3-4b",
       "case_id": "tp1_qps4",
-      "manifest_sha256": "4eed48b128414a43b614c62123c62c712cd89414672a30408b5b390f358201b8",
+      "manifest_sha256": "840b575cdeccc6aa077019f1208d9cfc5cd6201f0bb4ae74ba994a06b454644a",
       "requests_sha256": "639df2b6aa0675df84a61f787fc2757506d5525eb2f7dc4d7e0badedca475d0f"
     },
     {
       "hardware_id": "nvidia_h200",
       "model_id": "qwen3-4b",
       "case_id": "tp1_qps16",
-      "manifest_sha256": "effb3c2617ea8be5af77addb13e1a794fcfb63b20e8d48090247ba6f99af47d6",
+      "manifest_sha256": "8ed1ef69aa62c812e24a429742450fa4e4e658d1724bdb082ca92ac939e9a761",
       "requests_sha256": "ab02b9d540e9fd6d35d8fb612a2df32a5868f4bbe19696c103b32ec3139b78a4"
     },
     {
       "hardware_id": "nvidia_h200",
       "model_id": "qwen3-4b",
       "case_id": "tp1_qps64",
-      "manifest_sha256": "b10fb214e364bc7e4d1176692dd97b95b17656faf7b98812be2f10509b9063f3",
+      "manifest_sha256": "eaffe4c9ba87ec65f2041504bdda7fbe39ad4800e8b1487bb5618dd58afa9970",
       "requests_sha256": "e169977d6b55bc410d2be544f028b99d767fd5980c72f708954e53903747a563"
     },
     {
       "hardware_id": "nvidia_h200",
       "model_id": "qwen3-8b",
       "case_id": "tp1_qps4",
-      "manifest_sha256": "65a9d1a4afef906f87d2eda5d4ccf15b0dd1f03e81a7316e3308acb2daa2934a",
+      "manifest_sha256": "50f485441f32c004d91a552bd5cdc1c5bcebd1a8549ccf8bb27c38124994e31e",
       "requests_sha256": "a42ae9abb7cc196040213b27636eb480214cd9bc8a3361fbc1ac5f825193d47d"
     },
     {
       "hardware_id": "nvidia_h200",
       "model_id": "qwen3-8b",
       "case_id": "tp1_qps16",
-      "manifest_sha256": "021a3fa805c3532646864e0376ccd81713f2beb85c9b5e108ce278ce8197c7df",
+      "manifest_sha256": "d052bffa8fb146a72568d69098448fa0dd4ea2df8e41b4e176f083e4efaa36c8",
       "requests_sha256": "aefc90b259581b642ef1ff8f692c0dae11e6c82dd2f394b12bff7585771d7cc8"
     },
     {
       "hardware_id": "nvidia_h200",
       "model_id": "qwen3-8b",
       "case_id": "tp1_qps64",
-      "manifest_sha256": "60cc45a30b939376bd2b43bb32af79b766ef2e834544fdc412bcac21aab463e3",
+      "manifest_sha256": "1f41cf0315b50618924ee6489ea7c6be5a69de4e9d820a8168ab7099466a497b",
       "requests_sha256": "cb36b79edf5b2ff22c8c91f3eaf2557b9c66dc680a3c7f63edba7f769731b780"
     },
     {
       "hardware_id": "nvidia_h200",
       "model_id": "llama-3.1-8b",
       "case_id": "tp1_qps4",
-      "manifest_sha256": "030931bac339995bde881cc8033c38b780a4c487ce43d0518db2c6f50846b070",
+      "manifest_sha256": "bf6cde8472a055353b5b1b28959e015191417766ad3439f8746188ab9448e6bf",
       "requests_sha256": "11bec2ddf6f24cc9cf62ab937fafde1973029998d8e19c303ea0e8490403a727"
     },
     {
       "hardware_id": "nvidia_h200",
       "model_id": "llama-3.1-8b",
       "case_id": "tp1_qps16",
-      "manifest_sha256": "e0d902f202d1f1acc59c1c4977612954b2cc2a5b1d29f25a89470b334f795ef8",
+      "manifest_sha256": "3f95c98f69c1672d76d09019c4964010d9f0873442f11bb1a2aa87111b4b674e",
       "requests_sha256": "f85c5db9b6e568906fd119d406f1be91c135afed551b4b0c00d5fdb1932a04eb"
     },
     {
       "hardware_id": "nvidia_h200",
       "model_id": "llama-3.1-8b",
       "case_id": "tp1_qps64",
-      "manifest_sha256": "1bf14bf900c64c9a97beaf26544d02b49c1edbfe5faa1895bc3acba4ce11b23c",
+      "manifest_sha256": "c86487c5076659342e7502d7cd388230f9189c1c462fbe750d06fb4a2e732d28",
       "requests_sha256": "6e626cda89cc4a59ad75291d345354085089f97680873c9150947dc5acc26d3a"
     }
   ],
   "prediction_contract": {
     "semantics": "current_pinned_vllm_not_capture_replay",
     "backend": "vllm",
-    "scheduler_version": "0.11.0",
-    "scheduler_source_commit": "b8b302cde434df8c9289a2b465406b47ebab1c2d",
+    "scheduler_version": "0.30.0",
+    "scheduler_source_commit": "ced6857afa0ea7b2e3f0846a62e1394e90f15607",
     "deployment": "colocated",
     "compute_dtype": "bf16",
     "prediction_method": "midlayer",

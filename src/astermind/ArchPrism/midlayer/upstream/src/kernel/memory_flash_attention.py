@@ -1,7 +1,8 @@
 """Dense FA2 external tensor interfaces; launch replay remains a projection."""
+
+from src.kernel.prediction_cache import runtime_lru_cache
 from dataclasses import replace
 from math import prod,ceil
-from functools import lru_cache
 from contextlib import contextmanager
 from contextvars import ContextVar,copy_context
 
@@ -1411,7 +1412,7 @@ def _fa2_split_families(header,parents,ready,scope,visibility):
         tuple(sorted(ready.items())),scope,visibility)
 
 
-@lru_cache(maxsize=8)
+@runtime_lru_cache(maxsize=8)
 def _cached_fa2_split_families(header,parent_items,ready_items,scope,visibility):
     # Cache the complete actual invocation, rather than individual requests.
     # A ragged batch can exceed a small per-request cache before its first
@@ -1545,7 +1546,7 @@ def _fa2_split_tile_recipe(header,parents,ready,scope,visibility):
         tuple(ready.items()),scope,visibility)
 
 
-@lru_cache(maxsize=8)
+@runtime_lru_cache(maxsize=8)
 def _cached_fa2_split_tile_recipe(header,parent_items,ready_items,scope,visibility):
     # A source is checked by several consumers within one prediction. Reuse
     # that exact immutable recipe, including every actual storage, actor and
@@ -3299,7 +3300,7 @@ def _cann_tnd_native_recipe(header,parents,ready,scope,visibility, *, force_one_
         tuple(sorted(ready.items())),scope,visibility,force_one_head)
 
 
-@lru_cache(maxsize=8)
+@runtime_lru_cache(maxsize=8)
 def _cached_cann_tnd_native_recipe(header,parent_items,ready_items,scope,visibility,force_one_head):
     """CANN8.5.1 regular BF16/NOLSEOUT: QK -> Vec1 -> PV -> Vec2.
 
@@ -3533,7 +3534,7 @@ def _cann_tnd_native_demands(program):
     return {**work,'totals':dict(work['totals'])}
 
 
-@lru_cache(maxsize=8)
+@runtime_lru_cache(maxsize=8)
 def _validated_cann_tnd_native_demands(program):
     from src.kernel.memory_access import _tile_template_requested_bytes
     program.__post_init__()
@@ -3661,6 +3662,13 @@ def _fa3_prefill_layouts(header):
         # unsplit has no dynamic-split vector and Sort is explicitly false.
         ('scheduler_metadata',(1+(1+int(header[6]=='causal' and max(lengths)>1))*(-(-batch//4)*4),),'int32',4),
         ('output',(tokens,heads,128),header[4],2),('lse',(heads,tokens),'fp32',4))
+
+
+def fa3_prefill_storage_layouts(kernel):
+    """Existing native extents for actual model allocation owners."""
+    if not has_fa3_prefill_source(kernel):
+        raise ValueError('FA3 public layouts require the existing unsplit source')
+    return _fa3_prefill_layouts(_fa3_prefill_header(kernel))
 
 
 def standalone_fa3_prefill_bindings(kernel, *, call_id,binding_id):
@@ -3848,7 +3856,8 @@ def build_fa3_prefill_source(kernel,bindings,granularity, *, program_id):
     if dict(kernel.launch.tiling.tile_shape) != {'q':128,'kv':128,'qk_head':192,'value_head':128}:
         raise ValueError('FA3 prefill requires its actual128x128/192/128 source tile')
     header = _fa3_prefill_header(kernel);layouts = _fa3_prefill_layouts(header);roles = tuple(row[0] for row in layouts)
-    if (bindings.read_views,bindings.write_views) != (roles[:5],roles[6:]):raise ValueError('FA3 prefill data/metadata roles mismatch')
+    if ((bindings.read_views,bindings.write_views) != (roles[:5],roles[6:])
+            or len(bindings.input_ready) != len(roles[:5])):raise ValueError('FA3 prefill data/metadata roles or readiness arity mismatch')
     views = unique_by(bindings.views,'view_id')
     _validate_fa3_prefill_parents(header,views)
     scope = AccessScope(program_id,header,bindings.call_id,(),bindings.rank,bindings.stream,'logical-fa3-prefill-query-blocks')
@@ -3872,10 +3881,23 @@ def build_fa3_prefill_source(kernel,bindings,granularity, *, program_id):
 def _validate_fa3_prefill_parents(header,views):
     layouts = _fa3_prefill_layouts(header)
     if set(views) != {role for role,_,_,_ in layouts}:raise ValueError('FA3 prefill requires every public/metadata parent')
-    if len({view.allocation_id for view in views.values()}) != len(views):raise ValueError('FA3 prefill native alias ABI is unbound')
+    aliases={}
+    for role,view in views.items():
+        if view.allocation_id not in aliases:aliases[view.allocation_id]=[]
+        aliases[view.allocation_id].append(role)
+    for roles in aliases.values():
+        if len(roles)==1:continue
+        q,k=views['cu_query'],views['cu_key']
+        if (set(roles)!={'cu_query','cu_key'} or header[1]!=header[5]
+                or (q.offset_bytes,q.shape,q.strides_bytes)!=(k.offset_bytes,k.shape,k.strides_bytes)):
+            raise ValueError('FA3 prefill native alias ABI is unbound')
     for role,shape,dtype,width in layouts:
         view = views[role]
         if (view.shape,view.dtype,view.element_bytes) != (shape,dtype,width):raise ValueError('FA3 prefill storage shape/dtype mismatch')
+        if (not isinstance(view,TensorView)
+                or role in ('query','key','value','output') and view.strides_bytes[-1]!=width
+                or role in ('cu_query','cu_key') and view.strides_bytes!=(4,)):
+            raise ValueError('FA3 prefill requires source-contiguous channels and length arrays')
         if role=='scheduler_metadata' and (not isinstance(view,TensorView) or view.strides_bytes!=(4,)):
             raise ValueError('FA3 prefill scheduler requires its actual contiguous typed parent')
 
@@ -3946,6 +3968,54 @@ def fa3_prefill_source_demands(program,*,expected_kernel=None,expected_bindings=
         'scheduler_metadata_read_bytes':None if scheduler_unknown else scheduler_read}
 
 
+def fa3_prefill_prediction_work(kernel,hardware,bindings):
+    """Exact priced source payloads without scheduler/tile graph expansion."""
+    from src.kernel.memory_access_builder import ElementwiseBindings
+    from src.kernel.memory_access import validate_storage_bindings,validate_input_readiness,Strided
+    if kernel.hardware_id!=hardware.hardware_id or not has_fa3_prefill_source(kernel):
+        raise ValueError('FA3 prefill requires its existing unsplit source ABI')
+    if dict(kernel.launch.tiling.tile_shape)!={'q':128,'kv':128,'qk_head':192,'value_head':128}:
+        raise ValueError('FA3 prefill requires its actual128x128/192/128 source tile')
+    if not isinstance(bindings,ElementwiseBindings):
+        raise TypeError('FA3 prefill requires actual typed caller operands')
+    bindings.__post_init__()
+    header=_fa3_prefill_header(kernel);layouts=_fa3_prefill_layouts(header)
+    roles=tuple(role for role,*_ in layouts)
+    if ((bindings.read_views,bindings.write_views)!=(roles[:5],roles[6:])
+            or len(bindings.input_ready)!=5):
+        raise ValueError('FA3 prefill data/metadata roles or readiness arity mismatch')
+    parents=unique_by(bindings.views,'view_id');_validate_fa3_prefill_parents(header,parents)
+    for view in parents.values():
+        if (not isinstance(view,TensorView)
+                or view.region()!=Strided(view.offset_bytes,view.shape,view.strides_bytes,view.element_bytes)):
+            raise ValueError('FA3 prefill actual parent geometry was corrupted')
+    validate_storage_bindings(bindings.allocations,bindings.views,bindings.events,
+        Coverage(Granularity.KERNEL,Semantics.LOGICAL,Ordering.PARTIAL,False,
+            ('Actual FA3 prefill parents/readiness; detailed control program remains an explicit export.',)))
+    events=unique_by(bindings.events,'event_id')
+    for role,ready in zip(bindings.read_views,bindings.input_ready,strict=True):
+        validate_input_readiness(parents[role],ready,unmapped=True,views=parents,events=events,
+            visibility_domain=bindings.visibility_domain)
+    q,kv=kernel.attributes['q_lens'],kernel.attributes['kv_lens'];heads=kernel.shape['num_query_heads']
+    tokens=sum(q);visits=0
+    for length,keys in zip(q,kv,strict=True):
+        # Same per-M causal key prefix as _fa3_prefill_tile_recipe, counting
+        # typed values rather than instantiating its tile/queue objects.
+        full,tail=divmod(length,128)
+        if kernel.attributes['causal']:
+            empty=max(0,min(full,(length-keys)//128))
+            visits+=128*(full*(full+1)-empty*(empty+1))//2+(keys-length)*(full-empty)+int(tail>0)*keys
+        else:
+            visits+=(full+int(tail>0))*keys
+    totals={'query':tokens*heads*192*2,'key':visits*heads*192*2,
+        'value':visits*heads*128*2,'output':tokens*heads*128*2,'lse':tokens*heads*4}
+    return {'totals':totals,
+        'projected_read_bytes':sum(prod(parents[role].shape)*parents[role].element_bytes
+            for role in ('query','key','value')),
+        'projected_write_bytes':totals['output'],'unpriced_lse_write_bytes':totals['lse'],
+        'native_kv_panel_bytes':128*(192+128)*2}
+
+
 _FA3_PREFILL_WORK = ContextVar('fa3_prefill_source_work')
 
 
@@ -3985,7 +4055,7 @@ def _fa3_combine_geometry(header):
     if len(header)!=9 or header[0]!='fa3_split_combine' or header[6] not in ('causal','noncausal') or header[8] not in ('bf16','fp16','float16'):raise ValueError('FA3 combine source header mismatch')
     q,kv=tuple(map(int,header[1].split(','))),tuple(map(int,header[2].split(',')))
     heads,static,sms=map(int,header[3:6])
-    if len(set(q))!=1 or q[0]*heads>64 or static<=1:
+    if len(set(q))!=1 or not 1<=q[0]<=512 or heads<=0 or static<=1:
         raise ValueError('FA3 combine requires its owned uniform packed-query domain')
     if int(header[7])<sum(q):raise ValueError('FA3 combine allocation cannot shrink logical rows')
     splits=fa3_decode_dynamic_splits(q,kv,heads,static,sms)
@@ -4057,7 +4127,7 @@ def _fa3_combine_recipe(header,parents,ready,scope,visibility,storage_prefix,dev
     return _cached_fa3_combine_recipe(header,tuple(sorted(parents.items())),tuple(sorted(ready.items())),scope,visibility,storage_prefix,device)
 
 
-@lru_cache(maxsize=8)
+@runtime_lru_cache(maxsize=8)
 def _cached_fa3_combine_recipe(header,parent_records,ready_records,scope,visibility,storage_prefix,device):
     parents,ready=dict(parent_records),dict(ready_records)
     q,kv,heads,static,splits=_fa3_combine_geometry(header)
@@ -4437,3 +4507,1255 @@ def fa3_mla_decode_source_tiles(program,*,expected_kernel,num_sms):
     q_lens,kv_lens,heads=logical_mla_request_extents(program)
     return fa3_mla_decode_partition_blocks(q_lens,kv_lens,heads,expected_kernel.launch.tiling.num_kv_splits,
         num_sms,expected_kernel.launch.tiling.tile_shape['kv'])
+
+
+def fa3_split_prefill_tensor_parent_plan(main, combine, hardware, *, binding_id):
+    """Plan the pinned BF16192/128 split call's public tensor parents.
+
+    This is a storage/producer plan, not a MemoryAccessProgram or input-ready
+    declaration. Actual main/combine access events must establish readiness.
+    Reserved partial O may be prefetched without being numerically valid.
+    Scheduler/control buffers and their prepare/reset edges are separate.
+    """
+    from src.kernel.predictors.flash_attn import (
+        _fa3_split_prefill_work, _fa3_gqa_observed_work)
+    from src.kernel.kernel_spec import KernelKind, KernelSpec
+
+    if not isinstance(main, KernelSpec) or not isinstance(combine, KernelSpec):
+        raise TypeError('Split-prefill parent planning requires normalized KernelSpecs')
+    if (not binding_id or main.kind is not KernelKind.FLASH_ATTN
+            or combine.kind is not KernelKind.FLASH_ATTN
+            or main.variant != 'mla_prefill' or combine.variant != 'combine'
+            or main.execution_support != 'supported' or combine.execution_support != 'supported'
+            or main.hardware_id != hardware.hardware_id
+            or combine.hardware_id != hardware.hardware_id
+            or main.launch.algorithm != 'vllm_fa3_sm90_mla_prefill_split_partial'
+            or combine.launch.algorithm != 'vllm_fa3_sm90_mla_prefill_combine_partial'
+            or main.dtype != combine.dtype or main.dtype != 'bf16'
+            or main.launch.tiling.num_kv_splits != combine.launch.tiling.num_kv_splits
+            or main.shape['num_query_heads'] != combine.shape['num_query_heads']
+            or tuple(main.attributes['q_lens']) != tuple(combine.attributes['q_lens'])
+            or tuple(main.attributes['kv_lens']) != tuple(combine.attributes['kv_lens'])):
+        raise ValueError('Split-prefill parents require one matching source call')
+    for kernel in (main, combine):
+        if (kernel.attributes['causal'] is not False
+                or any(name in kernel.attributes for name in (
+                    'graph_logical_tokens', 'graph_model_input_tokens', 'graph_runtime_mode',
+                    'model_input_shape', 'model_input_q_lens', 'model_input_kv_lens'))):
+            raise ValueError('Split-prefill parents require unpadded source requests')
+    if (main.attributes['full_cuda_graphs'] is not False
+            or main.attributes['max_cudagraph_capture_size'] != 0):
+        raise ValueError('Split-prefill parents require an eager source call')
+    mw = _fa3_split_prefill_work(main, hardware)
+    cw = _fa3_gqa_observed_work(combine, hardware)
+    if mw['splits'] != cw['splits']:
+        raise ValueError('Split-prefill main and combine have different dynamic splits')
+    q_lens = tuple(main.attributes['q_lens'])
+    kv_lens = tuple(main.attributes['kv_lens'])
+    tokens, keys, heads = sum(q_lens), sum(kv_lens), main.shape['num_query_heads']
+    static = main.launch.tiling.num_kv_splits
+    # flash_api.cpp varlen allocations: O is token-major; LSE is head-major.
+    layouts = (('query', (tokens, heads, 192), 'bf16', 2),
+        ('key', (keys, heads, 192), 'bf16', 2),
+        ('value', (keys, heads, 128), 'bf16', 2),
+        ('partial_output', (static, heads, tokens, 128), 'fp32', 4),
+        ('partial_lse', (static, heads, tokens), 'fp32', 4),
+        ('output', (tokens, heads, 128), 'bf16', 2),
+        ('lse', (heads, tokens), 'fp32', 4))
+    parents = {role: TensorView(role, f'{binding_id}.{role}', 0, shape,
+        dense_strides(shape, width), dtype, width) for role, shape, dtype, width in layouts}
+    views = list(parents.values())
+    main_writes, combine_reads, combine_writes, final_producers = [], [], [], []
+
+    def subview(role, parent_role, offset, shape, strides):
+        parent = parents[parent_role]
+        view = TensorView(role, parent.allocation_id, offset, shape, strides,
+            parent.dtype, parent.element_bytes)
+        views.append(view)
+        return role
+
+    prefix = 0
+    for request, (q, kv, count) in enumerate(zip(q_lens, kv_lens, mw['splits'], strict=True)):
+        output = subview(f'output.r{request}', 'output', prefix * heads * 128 * 2,
+            (q, heads, 128), parents['output'].strides_bytes)
+        lse = subview(f'lse.r{request}', 'lse', prefix * 4,
+            (heads, q), parents['lse'].strides_bytes)
+        producer = 'main' if count == 1 else 'combine'
+        final_producers.extend(((output, producer), (lse, producer)))
+        if count == 1:
+            main_writes.extend((output, lse))
+        else:
+            # Noncausal ranges are consecutive; all M tiles share the same
+            # finite-LSE split prefix, including the last partial Q tile.
+            panels = -(-kv // 128)
+            per_split = -(-panels // count)
+            valid = -(-panels // per_split)
+            strides_o = parents['partial_output'].strides_bytes
+            strides_lse = parents['partial_lse'].strides_bytes
+            partial_lse = subview(f'partial_lse.r{request}', 'partial_lse', prefix * 4,
+                (count, heads, q), strides_lse)
+            partial_o = subview(f'partial_output.valid.r{request}', 'partial_output', prefix * 128 * 4,
+                (valid, heads, q, 128), strides_o)
+            main_writes.extend((partial_o, partial_lse))
+            combine_reads.append(partial_lse)
+            # First three prefetches are unconditional; a prefetch view is
+            # not evidence of a main WRITE or finite-LSE validity.
+            prefetch = min(3, count)
+            combine_reads.append(subview(f'partial_output.prefetch.r{request}', 'partial_output',
+                prefix * 128 * 4, (prefetch, heads, q, 128), strides_o))
+            if valid > prefetch:
+                combine_reads.append(subview(f'partial_output.tail.r{request}', 'partial_output',
+                    prefix * 128 * 4 + prefetch * strides_o[0],
+                    (valid - prefetch, heads, q, 128), strides_o))
+            combine_writes.extend((output, lse))
+        prefix += q
+    return {'views': tuple(views), 'main_reads': ('query', 'key', 'value'),
+        'main_writes': tuple(main_writes), 'combine_reads': tuple(combine_reads),
+        'combine_writes': tuple(combine_writes), 'final_producers': tuple(final_producers),
+        'dynamic_splits': mw['splits'], 'readiness_bound': False}
+
+
+def _fa3_split_prefill_combine_geometry(header):
+    from src.kernel.predictors.flash_attn import _fa3_request_tile_splits
+    if len(header)!=9 or header[0]!='fa3_split_prefill_combine' or header[6]!='noncausal' or header[8]!='bf16':
+        raise ValueError('FA3 split-prefill combine requires its own source header')
+    q,kv=tuple(map(int,header[1].split(','))),tuple(map(int,header[2].split(',')))
+    heads,static,sms=map(int,header[3:6])
+    if (not q or len(q)!=len(kv) or len(q)>992 or min(*q,*kv,heads,sms)<=0 or static<=1 or static>256
+            or any(a>b for a,b in zip(q,kv,strict=True))
+            or int(header[7])!=sum(q)):
+        raise ValueError('FA3 split-prefill combine requires actual unpadded paired requests')
+    splits=_fa3_request_tile_splits(q,kv,static,sms,block_m=128,block_n=128,ratio=1,kv_heads=heads)
+    return q,kv,heads,static,splits
+
+
+def _fa3_split_prefill_combine_header(main,combine,hardware):
+    fa3_split_prefill_tensor_parent_plan(main,combine,hardware,binding_id='source_admission')
+    return ('fa3_split_prefill_combine',','.join(map(str,main.attributes['q_lens'])),
+        ','.join(map(str,main.attributes['kv_lens'])),str(main.shape['num_query_heads']),
+        str(main.launch.tiling.num_kv_splits),str(int(hardware.num_compute_units)),
+        'noncausal',str(sum(main.attributes['q_lens'])),'bf16')
+
+
+def _fa3_split_prefill_combine_layouts(header):
+    q,kv,heads,static,splits=_fa3_split_prefill_combine_geometry(header)
+    tokens=int(header[7]);batch=len(q) if tokens==sum(q) else tokens
+    rounded=-(-batch//4)*4
+    # Q1 disables causal in flash_api. Speculative Q>1 adds head swizzle.
+    vectors=2+int(q[0]>1 and header[6]=='causal')
+    layouts=[('cu_query',(batch+1,),'int32',4),
+        ('scheduler_metadata',(vectors*rounded+1,),'int32',4),
+        ('dynamic_splits',(batch,),'int32',4),('semaphore',(1,),'int32',4),
+        ('partial_output',(static,heads,tokens,128),'fp32',4),
+        ('partial_lse',(static,heads,tokens),'fp32',4),
+        ('output',(tokens,heads,128),header[8],2),('lse',(heads,tokens),'fp32',4)]
+    for request,(length,count) in enumerate(zip(q,splits,strict=True)):
+        if count>1:
+            layouts.extend(((f'partial_output.r{request}',(count,heads,length,128),'fp32',4),
+                (f'partial_lse.r{request}',(count,heads,length),'fp32',4)))
+    return tuple(layouts)
+
+
+def standalone_fa3_split_prefill_combine_bindings(main,combine,hardware,*,call_id,binding_id):
+    return _standalone_fa3_split_prefill_combine_bindings(
+        _fa3_split_prefill_combine_header(main,combine,hardware),call_id,binding_id)
+
+
+def _standalone_fa3_split_prefill_combine_bindings(header,call_id,binding_id):
+    from src.kernel.memory_access_builder import ElementwiseBindings
+    q,kv,heads,static,splits=_fa3_split_prefill_combine_geometry(header)
+    layouts=_fa3_split_prefill_combine_layouts(header);allocations=[];views=[];events=[];ready=[]
+    roots={};tokens=int(header[7]);batch=len(q) if tokens==sum(q) else tokens
+    rounded=-(-batch//4)*4;vectors=2+int(q[0]>1 and header[6]=='causal')
+    for role,shape,dtype,width in layouts:
+        if role in ('dynamic_splits','semaphore'):
+            identity=roots['scheduler_metadata'];offset=(rounded if role=='dynamic_splits' else vectors*rounded)*4
+            strides=(4,)
+        elif '.r' in role:
+            base,request_text=role.split('.r');request=int(request_text);identity=roots[base]
+            offset=sum(q[:request])*(128 if base=='partial_output' else 1)*4
+            strides=((heads*tokens*128*4,tokens*128*4,128*4,4) if base=='partial_output'
+                else (heads*tokens*4,tokens*4,4))
+        else:
+            identity=f'{binding_id}.{role}';roots[role]=identity;offset=0;strides=dense_strides(shape,width)
+            allocation=MemoryAllocation(identity,'logical-local-device','logical-fa3-native',None,
+                AddressLevel.OBJECT,None,None,f'{identity}.allocated',None)
+            allocations.append(allocation)
+            events.append(ProgramEvent(allocation.allocated_event,EventKind.ALLOCATED,identity,None,None,()))
+        views.append(TensorView(role,identity,offset,shape,strides,dtype,width))
+    read_roles=('cu_query','dynamic_splits',*(role for role,_,_,_ in layouts if '.r' in role))
+    by_role=unique_by(views,'view_id');by_allocation=unique_by(allocations,'allocation_id')
+    for role in read_roles:
+        view=by_role[role];allocation=by_allocation[view.allocation_id]
+        # Only valid dynamic-split/request subviews are available. Reserved
+        # static slots and bypassed request partials are never initialized.
+        event=ProgramEvent(f'{binding_id}.{role}.available',EventKind.LOGICAL_AVAILABLE,view.allocation_id,
+            Unmapped(view.shape,view.dtype,view.element_bytes,f'{binding_id}.{role}.declared_native_input'),
+            'fa3-visible',(EventRef(allocation.allocated_event,EventKind.ALLOCATED),))
+        events.append(event);ready.append(EventRef(event.event_id,event.kind))
+    return ElementwiseBindings(binding_id,call_id,tuple(allocations),tuple(views),tuple(events),
+        read_roles,('output','lse','semaphore'),tuple(ready),0,'offline','fa3-visible')
+
+
+def _validate_fa3_split_prefill_parent_geometry(role,view,expected):
+    """Preserve caller row/head pitches accepted by flash_api.cpp.
+
+    Native scratch and LSE remain fresh dense allocations. Public tensors
+    may be channel slices of a larger projection; no materializing copy is
+    implied by their non-dense outer dimensions.
+    """
+    from src.kernel.memory_access import Strided
+    if (not isinstance(view,TensorView)
+            or (view.shape,view.dtype,view.element_bytes)!=(expected.shape,expected.dtype,expected.element_bytes)
+            or view.region()!=Strided(view.offset_bytes,view.shape,view.strides_bytes,view.element_bytes)):
+        raise ValueError('Split-prefill prediction parent shape/encoding/stride differs')
+    if role in ('query','key','value','output'):
+        rows,heads,channels=view.shape
+        row_stride,head_stride,inner_stride=view.strides_bytes
+        if (inner_stride!=view.element_bytes or view.offset_bytes%view.element_bytes
+                or head_stride<channels*view.element_bytes
+                or row_stride<(heads-1)*head_stride+channels*view.element_bytes):
+            raise ValueError('Split-prefill public parent requires nonoverlapping rows and contiguous channels')
+    elif role in ('cu_query','cu_key'):
+        if view.strides_bytes!=(4,) or view.offset_bytes%4:
+            raise ValueError('Split-prefill cumulative lengths require contiguous INT32 storage')
+    elif (view.offset_bytes,view.strides_bytes)!=(expected.offset_bytes,expected.strides_bytes):
+        raise ValueError('Split-prefill native scratch shape/encoding/stride/offset differs')
+
+
+def _validate_fa3_split_prefill_combine_parents(header,parents):
+    reference=_standalone_fa3_split_prefill_combine_bindings(header,'geometry','geometry')
+    expected=unique_by(reference.views,'view_id')
+    if set(parents)!=set(expected):raise ValueError('FA3 combine native parents mismatch')
+    actual_aliases={};expected_aliases={}
+    for role,view in parents.items():
+        other=expected[role]
+        _validate_fa3_split_prefill_parent_geometry(role,view,other)
+        if view.allocation_id not in actual_aliases:actual_aliases[view.allocation_id]=[]
+        if other.allocation_id not in expected_aliases:expected_aliases[other.allocation_id]=[]
+        actual_aliases[view.allocation_id].append(role);expected_aliases[other.allocation_id].append(role)
+    if sorted(actual_aliases.values())!=sorted(expected_aliases.values()):
+        raise ValueError('FA3 combine requires actual native parent/subview aliases')
+
+
+def _fa3_split_prefill_combine_recipe(header,parent_records,ready_records,scope,visibility,storage_prefix,device):
+    parents,ready=dict(parent_records),dict(ready_records)
+    q,kv,heads,static,splits=_fa3_split_prefill_combine_geometry(header)
+    selected=[];allocations=[];events=[];families=[];offset=0
+    evidence=('Pinned flash_fwd_combine_kernel.h: rows8/value128/stages4; head-major packed rows.',
+        'LSE is loaded independently by each value-column CTA; final LSE is stored only by k_block==0.',
+        'First min(3,dynamic_splits) partial-O loads are unconditional; tail loads and scale reads wait on the actual INT32 max-valid-split READ.',
+        'Max-valid-split is derived from non-minus-infinity LSE values, may be -1, and remains unbound without actual READ values.',
+        'Scratch views name logical versions of staged values, not simultaneous native SRAM capacity or physical ring addresses.',
+        'Epilogue store_zero writes minus-infinity LSE and may leave partial-O indeterminate; boundary availability permits native loads, not an assertion that all O slots were written or numerically valid.',
+        'Only positive normalized LSE scales contribute to register accumulation; indeterminate O from empty splits is never assigned a value.')
+    def dep(name,kind=EventKind.READ_READY,axes=()):return TileDependency(name,kind,axes)
+    def coordinate(axis,*terms,offset=0):
+        return LogicalCoordinateBinding(axis,tuple(LogicalCoordinateTerm(i,c) for i,c in terms),offset)
+    def child(identity,role,shape,mapping):
+        parent=parents[role]
+        view=LogicalSelectionView(identity,parent.allocation_id,shape,parent.dtype,parent.element_bytes,
+            f'fa3_combine.{identity}',role,mapping)
+        selected.append(view);return view
+    def scratch(identity,shape,dtype,width):
+        allocation_id=f'{storage_prefix}.{identity}'
+        allocation=MemoryAllocation(allocation_id,device,'logical-fa3-versioned-state',
+            prod(shape)*width,AddressLevel.OBJECT,None,None,f'{allocation_id}.allocated',None)
+        view=TensorView(identity,allocation_id,0,shape,dense_strides(shape,width),dtype,width)
+        allocations.append(allocation);selected.append(view)
+        events.append(ProgramEvent(allocation.allocated_event,EventKind.ALLOCATED,allocation_id,None,None,()))
+        return view
+    for request,(length,count) in enumerate(zip(q,splits,strict=True)):
+        if count<=1:
+            identity=f'{scope.scope_id}.r{request}.bypass'
+            controls=[]
+            for role,shape,mapping in (
+                    ('cu_query',(2,),(coordinate(0,(0,1),offset=request),)),
+                    ('dynamic_splits',(1,),(coordinate(0,offset=request),))):
+                view=child(identity+'.'+role,role,shape,mapping)
+                controls.append(TileAccessTemplate(role,view.view_id,Operation.READ,('row_block','column'),
+                    (None,),(ready[role],),(),evidence,unmapped=True))
+            family_scope=replace(scope,scope_id=identity,op_ids=(*header,str(request),'bypass'))
+            families.append(TileProgram(identity,family_scope,(TileAxis('row_block',length*heads,8),TileAxis('column',1,1)),
+                tuple(controls),visibility,evidence))
+            offset+=length;continue
+        pre=min(3,count)
+        for packed in range(length*heads):
+            query,head=packed%length,packed//length
+            for column in range(1):
+                identity=f'{scope.scope_id}.r{request}.row{packed}.col{column}'
+                accesses=[];axes=[TileAxis('split',count,1),TileAxis('preload',pre,1),
+                    TileAxis('compute_prefix',pre,1,'last_valid',0,True,count-1)]
+                def access(name,view,operation,loops,view_axes,dependencies=(),input_refs=(),unmapped=False,constant=None):
+                    accesses.append(TileAccessTemplate(name,view.view_id,operation,loops,view_axes,input_refs,
+                        dependencies,evidence,unmapped=unmapped,constant_value=constant))
+                cu=child(identity+'.cu_query','cu_query',(2,),(coordinate(0,(0,1),offset=request),))
+                ds=child(identity+'.dynamic_splits','dynamic_splits',(1,),(coordinate(0,offset=request),))
+                access('cu_query',cu,Operation.READ,(),(None,),input_refs=(ready['cu_query'],),unmapped=True)
+                access('dynamic_splits',ds,Operation.READ,(),(None,),input_refs=(ready['dynamic_splits'],),unmapped=True)
+                controls=(dep('cu_query'),dep('dynamic_splits'))
+                lse=child(identity+'.partial_lse',f'partial_lse.r{request}',(count,),(
+                    coordinate(0,(0,1)),coordinate(1,offset=head),coordinate(2,offset=query)))
+                access('partial_lse',lse,Operation.READ,('split',),('split',),controls,
+                    (ready[f'partial_lse.r{request}'],),True)
+                scale=scratch(identity+'.scale',(count,),'fp32',4)
+                last=scratch(identity+'.max_valid',(1,),'int32',4)
+                reduced=(dep('partial_lse',axes=('split',)),)
+                access('scale_write',scale,Operation.WRITE,(),(None,),reduced)
+                access('max_valid_write',last,Operation.WRITE,(),(None,),reduced)
+                access('last_valid',last,Operation.READ,(),(None,),(dep('max_valid_write',EventKind.WRITE_VISIBLE),))
+                first=child(identity+'.O_prefix',f'partial_output.r{request}',(pre,128),(
+                    coordinate(0,(0,1)),coordinate(1,offset=head),coordinate(2,offset=query),
+                    coordinate(3,(1,1),offset=column*128)))
+                access('O_preload',first,Operation.READ,('preload',),('preload',None),controls,
+                    (ready[f'partial_output.r{request}'],),True)
+                prefix=scratch(identity+'.staged_prefix',(pre,128),'fp32',4)
+                access('prefix_stage',prefix,Operation.WRITE,(),(None,None),(dep('O_preload',axes=('preload',)),))
+                access('prefix_compute',prefix,Operation.READ,('compute_prefix',),('compute_prefix',None),
+                    (dep('last_valid'),dep('prefix_stage',EventKind.WRITE_VISIBLE)))
+                # A strided contained view keeps the complete scale producer;
+                # no guessed scale sign or max-valid value is inserted.
+                scale_prefix=TensorView(identity+'.scale_prefix',scale.allocation_id,0,(pre,),(4,),'fp32',4)
+                selected.append(scale_prefix)
+                access('scale_prefix',scale_prefix,Operation.READ,('compute_prefix',),('compute_prefix',),
+                    (dep('last_valid'),dep('scale_write',EventKind.WRITE_VISIBLE)))
+                output_deps=[*controls,dep('last_valid'),dep('prefix_compute',axes=('compute_prefix',)),dep('scale_prefix',axes=('compute_prefix',))]
+                if count>pre:
+                    tail=count-pre;axes.append(TileAxis('tail',tail,1,'last_valid',pre,True,count-1))
+                    rest=child(identity+'.O_tail',f'partial_output.r{request}',(tail,128),(
+                        coordinate(0,(0,1),offset=pre),coordinate(1,offset=head),coordinate(2,offset=query),
+                        coordinate(3,(1,1),offset=column*128)))
+                    tail_state=scratch(identity+'.staged_tail',(tail,128),'fp32',4)
+                    access('O_tail',rest,Operation.READ,('tail',),('tail',None),(*controls,dep('last_valid')),
+                        (ready[f'partial_output.r{request}'],),True)
+                    access('tail_stage',tail_state,Operation.WRITE,('tail',),('tail',None),
+                        (dep('last_valid'),dep('O_tail')))
+                    access('tail_compute',tail_state,Operation.READ,('tail',),('tail',None),
+                        (dep('last_valid'),dep('tail_stage',EventKind.WRITE_VISIBLE)))
+                    scale_tail=TensorView(identity+'.scale_tail',scale.allocation_id,pre*4,(tail,),(4,),'fp32',4)
+                    selected.append(scale_tail)
+                    access('scale_tail',scale_tail,Operation.READ,('tail',),('tail',),
+                        (dep('last_valid'),dep('scale_write',EventKind.WRITE_VISIBLE)))
+                    output_deps.extend((dep('tail_compute',axes=('tail',)),dep('scale_tail',axes=('tail',))))
+                parent=parents['output']
+                output=TensorView(identity+'.output',parent.allocation_id,
+                    parent.offset_bytes+(offset+query)*parent.strides_bytes[0]+head*parent.strides_bytes[1],
+                    (128,),(parent.strides_bytes[2],),parent.dtype,parent.element_bytes)
+                selected.append(output)
+                access('output',output,Operation.WRITE,(),(None,),tuple(output_deps),unmapped=True)
+                if column==0:
+                    parent=parents['lse']
+                    final_lse=TensorView(identity+'.lse',parent.allocation_id,
+                        parent.offset_bytes+head*parent.strides_bytes[0]+(offset+query)*parent.strides_bytes[1],
+                        (1,),(parent.strides_bytes[1],),parent.dtype,parent.element_bytes)
+                    selected.append(final_lse)
+                    access('lse',final_lse,Operation.WRITE,(),(None,),reduced,unmapped=True)
+                family_scope=replace(scope,scope_id=identity,op_ids=(*header,str(request),str(packed),str(column)))
+                families.append(TileProgram(identity,family_scope,tuple(axes),tuple(accesses),visibility,evidence))
+        offset+=length
+    # The last grid CTA resets the semaphore before any virtual-batch, row,
+    # or split early return, including calls in which every request bypasses.
+    identity=f'{scope.scope_id}.reset';family_scope=replace(scope,scope_id=identity,op_ids=(*header,'reset'))
+    reset=TileAccessTemplate('semaphore_reset','semaphore',Operation.WRITE,(),(None,),(),(),evidence,
+        unmapped=True,constant_value=ConstantValue.ZERO)
+    families.append(TileProgram(identity,family_scope,(TileAxis('reset',1,1),),(reset,),visibility,evidence))
+    return tuple(allocations),tuple(selected),tuple(events),tuple(families)
+
+
+def fa3_split_prefill_call_storage_layouts(main,combine,hardware):
+    """Source-owned public/workspace extents, without allocations or readiness."""
+    header=_fa3_split_prefill_combine_header(main,combine,hardware)
+    plan=fa3_split_prefill_tensor_parent_plan(main,combine,hardware,binding_id='layout_only')
+    data=tuple((view.view_id,view.shape,view.dtype,view.element_bytes)
+        for view in plan['views'] if view.view_id in ('query','key','value'))
+    return (*data,('cu_key',(main.shape['batch']+1,),'int32',4),
+        *_fa3_split_prefill_combine_layouts(header))
+
+
+def standalone_fa3_split_prefill_call_bindings(main,combine,hardware,*,call_id,binding_id,scheduler_metadata_precomputed):
+    from src.kernel.memory_access_builder import ElementwiseBindings
+    if type(scheduler_metadata_precomputed) is not bool:
+        raise TypeError('Split-prefill metadata lifetime must be an actual caller boolean')
+    base=standalone_fa3_split_prefill_combine_bindings(main,combine,hardware,call_id=call_id,binding_id=binding_id)
+    plan=fa3_split_prefill_tensor_parent_plan(main,combine,hardware,binding_id=binding_id)
+    allocations=list(base.allocations);views=list(base.views)
+    # Only real external Q/K/V and cumulative-length inputs are available.
+    # Scheduler fields and partials below acquire actual prepare/main writers.
+    events=[event for event in base.events if event.kind is EventKind.ALLOCATED
+        or event.event_id==f'{binding_id}.cu_query.available']
+    for view in plan['views']:
+        if view.view_id not in ('query','key','value'):
+            continue
+        allocations.append(MemoryAllocation(view.allocation_id,'logical-local-device','logical-fa3-call',None,
+            AddressLevel.OBJECT,None,None,view.allocation_id+'.allocated',None))
+        views.append(view)
+    identity=binding_id+'.cu_key'
+    allocations.append(MemoryAllocation(identity,'logical-local-device','logical-fa3-call',None,
+        AddressLevel.OBJECT,None,None,identity+'.allocated',None))
+    views.append(TensorView('cu_key',identity,0,(main.shape['batch']+1,),(4,),'int32',4))
+    allocated={event.event_id for event in events}
+    for allocation in allocations:
+        if allocation.allocated_event not in allocated:
+            events.append(ProgramEvent(allocation.allocated_event,EventKind.ALLOCATED,allocation.allocation_id,None,None,()))
+    by_role=unique_by(views,'view_id')
+    for role in ('query','key','value','cu_key'):
+        view=by_role[role]
+        events.append(ProgramEvent(f'{binding_id}.{role}.available',EventKind.LOGICAL_AVAILABLE,view.allocation_id,
+            Unmapped(view.shape,view.dtype,view.element_bytes,f'{binding_id}.{role}.external_input'),
+            base.visibility_domain,(EventRef(view.allocation_id+'.allocated',EventKind.ALLOCATED),)))
+    reads=('query','key','value','cu_query','cu_key')
+    if scheduler_metadata_precomputed:
+        meta=by_role['scheduler_metadata']
+        view=TensorView('prepared_query',meta.allocation_id,meta.offset_bytes,(main.shape['batch'],),(4,),'int32',4)
+        views.append(view);by_role['prepared_query']=view
+        reads+=('prepared_query','dynamic_splits','semaphore')
+        for role in reads[-3:]:
+            view=by_role[role]
+            events.append(ProgramEvent(f'{binding_id}.{role}.available',EventKind.LOGICAL_AVAILABLE,view.allocation_id,
+                Unmapped(view.shape,view.dtype,view.element_bytes,f'{binding_id}.{role}.caller_precomputed_input'),
+                base.visibility_domain,(EventRef(meta.allocation_id+'.allocated',EventKind.ALLOCATED),),view.view_id))
+    return ElementwiseBindings(binding_id,call_id,tuple(allocations),tuple(views),tuple(events),reads,
+        ('output','lse','semaphore'),tuple(EventRef(f'{binding_id}.{role}.available',EventKind.LOGICAL_AVAILABLE)
+            for role in reads),base.rank,base.stream,base.visibility_domain)
+
+
+def build_fa3_split_prefill_call_source(main,combine,hardware,bindings,granularity,*,program_id,scheduler_metadata_precomputed):
+    from src.kernel.memory_access_builder import ElementwiseBindings
+    from src.kernel.memory_access import TileWriteSource
+    if not isinstance(bindings,ElementwiseBindings):
+        raise TypeError('Split-prefill whole call requires actual typed caller operands')
+    if granularity not in (Granularity.OP,Granularity.KERNEL,Granularity.TILE):
+        raise ValueError('Unknown split-prefill call granularity')
+    header=_fa3_split_prefill_combine_header(main,combine,hardware)
+    q,kv,heads,static,splits=_fa3_split_prefill_combine_geometry(header)
+    expected=standalone_fa3_split_prefill_call_bindings(main,combine,hardware,
+        call_id=bindings.call_id,binding_id=bindings.binding_id,scheduler_metadata_precomputed=scheduler_metadata_precomputed)
+    if ((bindings.read_views,bindings.write_views)!=(expected.read_views,expected.write_views)
+            or len(bindings.input_ready)!=len(bindings.read_views)):
+        raise ValueError('Split-prefill whole-call operand/readiness roles mismatch')
+    parents=unique_by(bindings.views,'view_id');reference=unique_by(expected.views,'view_id')
+    if set(parents)!=set(reference):
+        raise ValueError('Split-prefill whole call lost an actual public/control parent')
+    for role,view in parents.items():
+        other=reference[role]
+        _validate_fa3_split_prefill_parent_geometry(role,view,other)
+    # Preserve all native alias classes while allowing real caller identities.
+    actual_aliases={};reference_aliases={}
+    for role,view in parents.items():
+        if view.allocation_id not in actual_aliases:actual_aliases[view.allocation_id]=[]
+        if reference[role].allocation_id not in reference_aliases:reference_aliases[reference[role].allocation_id]=[]
+        actual_aliases[view.allocation_id].append(role)
+        reference_aliases[reference[role].allocation_id].append(role)
+    if sorted(actual_aliases.values())!=sorted(reference_aliases.values()):
+        raise ValueError('Split-prefill whole-call native parent aliases differ')
+    allocations=list(bindings.allocations);selected=[];events=list(bindings.events);families=[]
+    allocation_map=unique_by(allocations,'allocation_id')
+    ready=dict(zip(bindings.read_views,bindings.input_ready,strict=True))
+    visibility=bindings.visibility_domain
+    scope=AccessScope(program_id,header,bindings.call_id,(),bindings.rank,bindings.stream,'logical-fa3-split-call')
+    evidence=('Pinned source_803020 noncausal192/128 varlen split library call; no duration inputs.',
+        'Prepare dynamic-split output depends on all request Q/K endpoint reads; numeric values are not fabricated.',
+        'Main emits FP32 LSE for every dynamic task, including empty minus-infinity writes; partial O only for nonempty tasks.',
+        'Native scheduler worker assignment, queue/barrier service and issued-thread multiplicity remain unbound.')
+
+    def publish(view,family,access_id):
+        event=ProgramEvent(family.tile_program_id+'.'+access_id+'.written',EventKind.LOGICAL_AVAILABLE,view.allocation_id,
+            Unmapped(view.shape,view.dtype,view.element_bytes,view.view_id+'.actual_source_write'),visibility,
+            (EventRef(allocation_map[view.allocation_id].allocated_event,EventKind.ALLOCATED),),view.view_id,
+            (TileWriteSource(family.tile_program_id,access_id),))
+        events.append(event)
+        return EventRef(event.event_id,event.kind)
+
+    def child(identity,role,shape,mapping):
+        parent=parents[role]
+        view=LogicalSelectionView(identity,parent.allocation_id,shape,parent.dtype,parent.element_bytes,
+            'fa3_split_call.'+identity,role,mapping)
+        selected.append(view)
+        return view
+
+    def coord(axis,*terms,offset=0):
+        return LogicalCoordinateBinding(axis,tuple(LogicalCoordinateTerm(index,scale) for index,scale in terms),offset)
+
+    meta=parents['scheduler_metadata'];batch=len(q)
+    prepared=(parents['prepared_query'] if scheduler_metadata_precomputed else
+        TensorView(program_id+'.prepared_query',meta.allocation_id,meta.offset_bytes,(batch,),(4,),'int32',4))
+    if not scheduler_metadata_precomputed:selected.append(prepared)
+    fields={'prepared_query':prepared,'dynamic_splits':parents['dynamic_splits'],'semaphore':parents['semaphore']}
+    prep_id=program_id+'.prepare';prep_accesses=[]
+    for role in ('cu_query','cu_key'):
+        view=child(prep_id+'.'+role,role,(batch,2),(coord(0,(0,1),(1,1)),))
+        prep_accesses.append(TileAccessTemplate(role,view.view_id,Operation.READ,('request',),('request',None),
+            (ready[role],),(),evidence,unmapped=True))
+    reductions=tuple(TileDependency(role,EventKind.READ_READY,('request',)) for role in ('cu_query','cu_key'))
+    prep_accesses.extend((
+        TileAccessTemplate('prepared_query.write',prepared.view_id,Operation.WRITE,(),(None,),(),
+            (TileDependency('cu_query',EventKind.READ_READY,('request',)),),evidence,unmapped=True),
+        TileAccessTemplate('dynamic_splits.write',fields['dynamic_splits'].view_id,Operation.WRITE,(),(None,),(),
+            reductions,evidence,unmapped=True),
+        TileAccessTemplate('semaphore.zero',fields['semaphore'].view_id,Operation.WRITE,(),(None,),(),(),
+            evidence,unmapped=True,constant_value=ConstantValue.ZERO)))
+    prep=TileProgram(prep_id,replace(scope,scope_id=prep_id,op_ids=(*header,'prepare')),
+        (TileAxis('request',batch,1),),tuple(prep_accesses),visibility,evidence)
+    if scheduler_metadata_precomputed:
+        # The caller supplies prepared metadata; this call does not create
+        # another prepare or assert a producer inside the current library call.
+        # Discard the unsubmitted prepare-only selections, never its inputs.
+        selected[:]=[view for view in selected if not view.view_id.startswith(prep_id+'.')]
+        field_ready={role:ready[role] for role in fields}
+    else:
+        families.append(prep)
+        field_ready={role:publish(view,prep,role+'.write' if role!='semaphore' else 'semaphore.zero')
+            for role,view in fields.items()}
+    source_writes={request:[] for request in range(batch)}
+    source_lse={request:[] for request in range(batch)}
+    result_refs=[];q_prefix=kv_prefix=0
+    for request,(length,keys,count) in enumerate(zip(q,kv,splits,strict=True)):
+        panels=-(-keys//128);per_split=-(-panels//count)
+        for split in range(count):
+            lo=split*per_split*128;hi=min(keys,(split+1)*per_split*128)
+            for head in range(heads):
+                for first in range(0,length,128):
+                    rows=min(128,length-first)
+                    identity=f'{program_id}.main.r{request}.s{split}.h{head}.q{first}'
+                    accesses=[]
+                    for role,field in fields.items():
+                        if role=='semaphore':continue
+                        parent_role=prepared.view_id if role=='prepared_query' else 'dynamic_splits'
+                        if role=='prepared_query':parents[parent_role]=prepared
+                        view=child(identity+'.'+role,parent_role,(1,),(coord(0,offset=request),))
+                        accesses.append(TileAccessTemplate(role,view.view_id,Operation.READ,(),(None,),
+                            (field_ready[role],),(),evidence,unmapped=True))
+                    deps=[TileDependency(role,EventKind.READ_READY,()) for role in ('prepared_query','dynamic_splits')]
+                    for role in ('cu_query','cu_key'):
+                        view=child(identity+'.'+role,role,(2,),(coord(0,(0,1),offset=request),))
+                        accesses.append(TileAccessTemplate(role,view.view_id,Operation.READ,(),(None,),
+                            (ready[role],),tuple(deps),evidence,unmapped=True))
+                    deps.extend(TileDependency(role,EventKind.READ_READY,()) for role in ('cu_query','cu_key'))
+                    if hi>lo:
+                        for role,width,begin,size in (('query',192,q_prefix+first,rows),
+                                ('key',192,kv_prefix+lo,hi-lo),('value',128,kv_prefix+lo,hi-lo)):
+                            view=child(identity+'.'+role,role,(size,width),(
+                                coord(0,(0,1),offset=begin),coord(1,offset=head),coord(2,(1,1))))
+                            accesses.append(TileAccessTemplate(role,view.view_id,Operation.READ,(),(None,None),
+                                (ready[role],),tuple(deps),evidence,unmapped=True))
+                        deps.extend(TileDependency(role,EventKind.READ_READY,()) for role in ('query','key','value'))
+                    if count==1:
+                        output=parents['output'];lse=parents['lse']
+                        o_offset=output.offset_bytes+(q_prefix+first)*output.strides_bytes[0]+head*output.strides_bytes[1]
+                        lse_offset=lse.offset_bytes+head*lse.strides_bytes[0]+(q_prefix+first)*lse.strides_bytes[1]
+                        o_strides=(output.strides_bytes[0],output.strides_bytes[2]);lse_stride=lse.strides_bytes[1]
+                    else:
+                        output=parents['partial_output'];lse=parents['partial_lse']
+                        o_offset=output.offset_bytes+split*output.strides_bytes[0]+head*output.strides_bytes[1]+(q_prefix+first)*output.strides_bytes[2]
+                        lse_offset=lse.offset_bytes+split*lse.strides_bytes[0]+head*lse.strides_bytes[1]+(q_prefix+first)*lse.strides_bytes[2]
+                        o_strides=(output.strides_bytes[2],output.strides_bytes[3]);lse_stride=lse.strides_bytes[2]
+                    lse_view=TensorView(identity+'.lse',lse.allocation_id,lse_offset,(rows,),(lse_stride,),'fp32',4)
+                    selected.append(lse_view)
+                    lse_deps=tuple(dep for dep in deps if dep.access_id!='value')
+                    accesses.append(TileAccessTemplate('lse',lse_view.view_id,Operation.WRITE,(),(None,),(),lse_deps,
+                        evidence,unmapped=True,constant_value=ConstantValue.NEGATIVE_INFINITY if hi<=lo else None))
+                    if hi>lo:
+                        o_view=TensorView(identity+'.output',output.allocation_id,o_offset,(rows,128),o_strides,output.dtype,output.element_bytes)
+                        selected.append(o_view)
+                        accesses.append(TileAccessTemplate('output',o_view.view_id,Operation.WRITE,(),(None,None),(),tuple(deps),evidence,unmapped=True))
+                    family=TileProgram(identity,replace(scope,scope_id=identity,op_ids=(*header,'main',str(request),str(split),str(head),str(first))),
+                        (TileAxis('epilogue',1,1),),tuple(accesses),visibility,evidence)
+                    families.append(family)
+                    lse_ref=publish(lse_view,family,'lse');source_lse[request].append(lse_ref)
+                    if count==1:result_refs.append((lse_view.view_id,lse_ref))
+                    if hi>lo:
+                        o_ref=publish(o_view,family,'output');source_writes[request].append(o_ref)
+                        if count==1:result_refs.append((o_view.view_id,o_ref))
+        q_prefix+=length;kv_prefix+=keys
+    # Aggregate availability is justified by this recipe's complete set of
+    # per-M/head/split writer fields. O accessibility includes reserved empty
+    # slots, explicitly without claiming their initialization or validity.
+    # flash_api launches combine after main on the call's stream. Retain
+    # that source-stage boundary even for the bypass/reset-only path.
+    main_done=ProgramEvent(program_id+'.main.tensor_outputs_complete',EventKind.COMPUTE_DONE,None,None,None,
+        tuple(ref for request in range(batch) for ref in (*source_lse[request],*source_writes[request])))
+    events.append(main_done)
+    after_main={}
+    for role in ('dynamic_splits','semaphore'):
+        view=fields[role]
+        event=ProgramEvent(f'{program_id}.{role}.after_main',EventKind.LOGICAL_AVAILABLE,view.allocation_id,
+            Unmapped(view.shape,view.dtype,view.element_bytes,f'{program_id}.{role}.source_stage_order'),visibility,
+            (field_ready[role],EventRef(main_done.event_id,main_done.kind)),view.view_id)
+        events.append(event);after_main[role]=EventRef(event.event_id,event.kind)
+    combine_ready={'cu_query':ready['cu_query'],'dynamic_splits':after_main['dynamic_splits']}
+    for request,count in enumerate(splits):
+        if count<=1:continue
+        for base,refs in (('partial_lse',tuple(source_lse[request])),
+                ('partial_output',tuple((*source_writes[request],*source_lse[request])))):
+            role=f'{base}.r{request}';view=parents[role]
+            event=ProgramEvent(f'{program_id}.{role}.produced',EventKind.LOGICAL_AVAILABLE,view.allocation_id,
+                Unmapped(view.shape,view.dtype,view.element_bytes,f'{program_id}.{role}.actual_main_epilogues'),
+                visibility,(EventRef(allocation_map[view.allocation_id].allocated_event,EventKind.ALLOCATED),*refs),role)
+            events.append(event);combine_ready[role]=EventRef(event.event_id,event.kind)
+    combine_parents={role:parents[role] for role,*_ in _fa3_split_prefill_combine_layouts(header)}
+    _validate_fa3_split_prefill_combine_parents(header,combine_parents)
+    combine_scope=replace(scope,scope_id=program_id+'.combine',op_ids=header)
+    internal,children,combine_events,combine_families=_fa3_split_prefill_combine_recipe(header,
+        tuple(sorted(combine_parents.items())),tuple(sorted(combine_ready.items())),combine_scope,visibility,
+        bindings.binding_id+'.combine',allocation_map[parents['output'].allocation_id].device_id)
+    combine_families=tuple(replace(family,accesses=tuple(replace(access,input_ready=(after_main['semaphore'],))
+        if access.access_id=='semaphore_reset' else access for access in family.accesses))
+        if family.scope.op_ids[-1]=='reset' else family for family in combine_families)
+    allocations.extend(internal);selected.extend(children);events.extend(combine_events);families.extend(combine_families)
+    child_views=unique_by(children,'view_id')
+    for family in combine_families:
+        for access in family.accesses:
+            if access.access_id in ('output','lse'):
+                view=child_views[access.view_id]
+                result_refs.append((view.view_id,publish(view,family,access.access_id)))
+            elif access.access_id=='semaphore_reset':
+                reset_ref=publish(parents['semaphore'],family,access.access_id)
+    complete=ProgramEvent(program_id+'.tensor_and_reset_complete',EventKind.COMPUTE_DONE,None,None,None,
+        (*tuple(ref for role,ref in result_refs),reset_ref))
+    events.append(complete)
+    # Every final element is covered by the actual writer fields above.
+    # Publish the two full parent results after their union and reset, not
+    # one global-fence event per row. No copy or extra WRITE is introduced.
+    for role in ('output','lse'):
+        view=parents[role]
+        events.append(ProgramEvent(program_id+'.'+role+'.library_result',EventKind.LOGICAL_AVAILABLE,
+            view.allocation_id,Unmapped(view.shape,view.dtype,view.element_bytes,
+                program_id+'.'+role+'.complete_source_writer_union'),visibility,
+            (EventRef(allocation_map[view.allocation_id].allocated_event,EventKind.ALLOCATED),
+                EventRef(complete.event_id,complete.kind)),role))
+    return MemoryAccessProgram('midlayer.memory-access.v1',program_id,main.hardware_id,bindings.binding_id,
+        Coverage(Granularity.TILE,Semantics.LOGICAL,Ordering.PARTIAL,False,(
+            *evidence,'Prepare/main/128-wide combine tensor producer/readiness graph, not an issued-memory trace.',
+            'O full dynamic views are accessible after valid writes, not numerically initialized in empty slots.',
+            'Conditional combine O tails retain real LSE/max-valid READ bounds.',
+            'Native queue worker assignment, synchronization service, physical cache reuse and caller/dispatch integration remain open.')),
+        tuple(allocations),(*bindings.views,*selected),(scope,),tuple(events),(),tuple(families))
+
+
+def fa3_split_prefill_call_source_work(program,*,main,combine,hardware,bindings,scheduler_metadata_precomputed):
+    from src.kernel.memory_access import _tile_template_requested_bytes
+    program.__post_init__()
+    expected=build_fa3_split_prefill_call_source(main,combine,hardware,bindings,Granularity.TILE,
+        program_id=program.program_id,scheduler_metadata_precomputed=scheduler_metadata_precomputed)
+    if program!=expected:
+        raise ValueError('Split-prefill whole call lost actual source writers, aliases, preparation or readiness')
+    views=unique_by(program.views,'view_id')
+    totals={role:0 for role in ('query','key','value','output','lse')}
+    tensor_parents={role:0 for role in ('partial_output','partial_lse','output','lse')}
+    public_parents=unique_by(bindings.views,'view_id')
+    for family in program.tile_programs:
+        if '.main.r' not in family.tile_program_id:continue
+        axes=unique_by(family.axes,'axis_id')
+        for access in family.accesses:
+            if access.access_id in totals:
+                totals[access.access_id]+=_tile_template_requested_bytes(views,axes,family,access)
+            if access.operation is Operation.WRITE:
+                view=views[access.view_id]
+                for role in tensor_parents:
+                    if view.allocation_id==public_parents[role].allocation_id:
+                        tensor_parents[role]+=_tile_template_requested_bytes(views,axes,family,access)
+    return {'main_tensor_totals':totals,'main_tensor_bytes_by_parent':tensor_parents,
+        'scheduler_metadata_precomputed':scheduler_metadata_precomputed,'main_control_service_bound':False,
+        'source_specific_tensor_readiness_bound':True,'dispatch_integrated':False}
+
+
+def fa3_split_prefill_call_result_bindings(program,*,main,combine,hardware,bindings,call_id,binding_id,scheduler_metadata_precomputed):
+    from src.kernel.memory_access_builder import ElementwiseBindings
+    fa3_split_prefill_call_source_work(program,main=main,combine=combine,hardware=hardware,bindings=bindings,
+        scheduler_metadata_precomputed=scheduler_metadata_precomputed)
+    parent_ids={view.allocation_id for view in bindings.views if view.view_id in ('output','lse')}
+    results=tuple(event for event in program.events if event.event_id.endswith('.library_result')
+        and event.allocation_id in parent_ids and event.view_id is not None)
+    return ElementwiseBindings(binding_id,call_id,program.allocations,program.views,program.events,
+        tuple(event.view_id for event in results),(),tuple(EventRef(event.event_id,event.kind) for event in results),
+        bindings.rank,bindings.stream,bindings.visibility_domain)
+
+
+"""Unapplied public-predict bridge; ordinary pricing builds no detailed graph."""
+
+_FA3_SPLIT_PREFILL_PREDICTION = ContextVar('fa3_split_prefill_prediction')
+
+
+def fa3_split_prefill_call_prediction_work(main,combine,hardware,bindings,*,scheduler_metadata_precomputed):
+    """Validate real call operands and source quantities without private DAGs."""
+    from src.kernel.memory_access_builder import ElementwiseBindings
+    from src.kernel.memory_access import validate_storage_bindings,validate_input_readiness
+    from src.kernel.predictors.flash_attn import _fa3_split_prefill_work,_fa3_gqa_observed_work
+    if not isinstance(bindings,ElementwiseBindings):
+        raise TypeError('Split-prefill prediction requires actual typed caller bindings')
+    _fa3_split_prefill_combine_header(main,combine,hardware)
+    expected=standalone_fa3_split_prefill_call_bindings(main,combine,hardware,
+        call_id=bindings.call_id,binding_id=bindings.binding_id,scheduler_metadata_precomputed=scheduler_metadata_precomputed)
+    bindings.__post_init__()
+    if ((bindings.read_views,bindings.write_views)!=(expected.read_views,expected.write_views)
+            or len(bindings.input_ready)!=len(bindings.read_views)):
+        raise ValueError('Split-prefill prediction operand/readiness roles mismatch')
+    actual=unique_by(bindings.views,'view_id');reference=unique_by(expected.views,'view_id')
+    if set(actual)!=set(reference):raise ValueError('Split-prefill prediction parent roles differ')
+    actual_aliases={};expected_aliases={}
+    for role,view in actual.items():
+        other=reference[role]
+        _validate_fa3_split_prefill_parent_geometry(role,view,other)
+        if view.allocation_id not in actual_aliases:actual_aliases[view.allocation_id]=[]
+        if other.allocation_id not in expected_aliases:expected_aliases[other.allocation_id]=[]
+        actual_aliases[view.allocation_id].append(role);expected_aliases[other.allocation_id].append(role)
+    if sorted(actual_aliases.values())!=sorted(expected_aliases.values()):
+        raise ValueError('Split-prefill prediction lost actual native parent aliases')
+    validate_storage_bindings(bindings.allocations,bindings.views,bindings.events,
+        Coverage(Granularity.KERNEL,Semantics.LOGICAL,Ordering.PARTIAL,False,
+            ('Actual split-prefill caller boundary; detailed source recipes remain explicit export.',)))
+    events=unique_by(bindings.events,'event_id')
+    for role,ref in zip(bindings.read_views,bindings.input_ready,strict=True):
+        validate_input_readiness(actual[role],ref,unmapped=True,views=actual,events=events,
+            visibility_domain=bindings.visibility_domain)
+    mw=_fa3_split_prefill_work(main,hardware);cw=_fa3_gqa_observed_work(combine,hardware)
+    output=prod(actual['output'].shape)*2;lse=prod(actual['lse'].shape)*4
+    if mw['splits']!=cw['splits'] or mw['direct_write_bytes']+cw['write_bytes']!=output+lse:
+        raise ValueError('Split-prefill source result bytes or dynamic splits differ')
+    return {'main_write_bytes':mw['write_bytes'],'main_l2_read_bytes':mw['logical_l2_read_bytes'],
+        'main_direct_write_bytes':mw['direct_write_bytes'],'partial_output_write_bytes':mw['partial_output_bytes'],
+        'partial_lse_write_bytes':mw['partial_lse_bytes'],'combine_write_bytes':cw['write_bytes'],
+        'output_bytes':output,'lse_bytes':lse,'splits':mw['splits'],
+        'metadata_precomputed':scheduler_metadata_precomputed,'physical_service_bound':False}
+
+
+@contextmanager
+def fa3_split_prefill_call_prediction_scope(main,combine,hardware,bindings,*,scheduler_metadata_precomputed):
+    """One real library call; no guessed sibling or metadata lifetime facts."""
+    from copy import deepcopy
+    work=fa3_split_prefill_call_prediction_work(main,combine,hardware,bindings,
+        scheduler_metadata_precomputed=scheduler_metadata_precomputed)
+    seal=deepcopy(bindings);kernels=repr((main,combine))
+    token=_FA3_SPLIT_PREFILL_PREDICTION.set((main,combine,hardware,bindings,scheduler_metadata_precomputed,work,seal,kernels))
+    try:
+        yield work
+    finally:
+        _FA3_SPLIT_PREFILL_PREDICTION.reset(token)
+
+
+def current_fa3_split_prefill_prediction_work(kernel,hardware):
+    from src.kernel.memory_access_builder import _prediction_bindings
+    context=copy_context()
+    if _FA3_SPLIT_PREFILL_PREDICTION not in context:return None
+    main,combine,actual_hardware,bindings,precomputed,work,seal,kernels=context[_FA3_SPLIT_PREFILL_PREDICTION]
+    if hardware is not actual_hardware or kernel not in (main,combine) or repr((main,combine))!=kernels:
+        raise ValueError('Split-prefill prediction crossed or changed its actual source call')
+    actual,_=_prediction_bindings(kernel,None)
+    if actual is not bindings or actual!=seal:
+        raise ValueError('Split-prefill prediction requires the unchanged actual caller bindings')
+    observed=fa3_split_prefill_call_prediction_work(main,combine,hardware,actual,scheduler_metadata_precomputed=precomputed)
+    if observed!=work:raise ValueError('Split-prefill prediction source quantities changed')
+    return observed
+
+
+def _validate_fa3_sparse_mla_input_boundary(kernel,hardware,bindings,selected_rows):
+    from src.kernel.memory_access_builder import ElementwiseBindings
+    from src.kernel.memory_access import Span
+    from src.kernel.predictors.flash_attn import _fa3_sparse_mla_work
+    if not isinstance(bindings,ElementwiseBindings):
+        raise TypeError('Sparse FA3 input export requires actual typed caller bindings')
+    work=_fa3_sparse_mla_work(kernel,hardware)
+    if kernel.variant!='mla_decode':
+        raise ValueError('Sparse FA3 input export requires its actual main stage')
+    batch,heads=kernel.shape['batch'],kernel.shape['num_query_heads']
+    used=tuple(kernel.attributes['kv_lens']);capacity=kernel.launch.tiling.tile_shape['kv_capacity']
+    roles=('query_rope','query_latent','key_cache','value_cache','block_table','used_key','cu_query')
+    if (bindings.read_views!=roles or bindings.write_views or len(bindings.input_ready)!=len(roles)):
+        raise ValueError('Sparse FA3 input operand roles/readiness arity mismatch')
+    views=unique_by(bindings.views,'view_id')
+    if set(views)!=set((*roles,'cache_rows')) or any(type(view) is not TensorView for view in views.values()):
+        raise ValueError('Sparse FA3 requires actual resolved tensor views including the cache row parent')
+    for view in views.values():
+        canonical=TensorView(view.view_id,view.allocation_id,view.offset_bytes,view.shape,
+            view.strides_bytes,view.dtype,view.element_bytes)
+        if view.region()!=canonical.region():
+            raise ValueError('Sparse caller tensor derived region differs from its actual fields')
+    if (type(selected_rows) is not tuple or len(selected_rows)!=batch
+            or any(type(row) is not tuple or len(row)!=length
+                for row,length in zip(selected_rows,used,strict=True))):
+        raise ValueError('Sparse FA3 requires the actual live index prefix, separate from capacity')
+    root=views['cache_rows'];pages=root.shape[0]
+    if (root.shape!=(pages,576) or (root.dtype,root.element_bytes)!=('bf16',2)
+            or root.strides_bytes[1]!=2 or root.strides_bytes[0]<1152):
+        raise ValueError('Sparse FA3 requires its actual flat BF16 latent512/RoPE64 cache')
+    if any(type(row) is not int or not 0<=row<pages for rows in selected_rows for row in rows):
+        raise ValueError('Sparse FA3 live physical indices must fit the actual cache row parent')
+    stride=root.strides_bytes[0]
+    for role,width,offset in (('key_cache',64,1024),('value_cache',512,0)):
+        view=views[role]
+        if (view.shape,view.dtype,view.element_bytes,view.allocation_id,view.offset_bytes,view.strides_bytes)!=(
+                (pages,1,1,width),'bf16',2,root.allocation_id,root.offset_bytes+offset,
+                (stride,width*2,width*2,2)):
+            raise ValueError('Sparse FA3 K/V must retain their real latent/RoPE cache aliases')
+    for role,width in (('query_rope',64),('query_latent',512)):
+        view=views[role]
+        if ((view.shape,view.dtype,view.element_bytes)!=((batch,heads,width),'bf16',2)
+                or view.strides_bytes[2]!=2 or view.strides_bytes[1]<width*2
+                or view.strides_bytes[0]<(heads-1)*view.strides_bytes[1]+width*2):
+            raise ValueError('Sparse FA3 query shape or actual head/token stride mismatch')
+    for role,shape in (('block_table',(batch,capacity)),('used_key',(batch,)),('cu_query',(batch+1,))):
+        view=views[role]
+        if (view.shape,view.dtype,view.element_bytes)!=(shape,'int32',4):
+            raise ValueError('Sparse FA3 metadata storage must preserve capacity and real live lengths')
+        if view.strides_bytes[-1]!=4 or (role=='block_table' and view.strides_bytes[0]<capacity*4):
+            raise ValueError('Sparse FA3 metadata must retain its source contiguous scalar layout')
+    metadata={views[role].allocation_id for role in ('block_table','used_key','cu_query')}
+    payload={views[role].allocation_id for role in ('query_rope','query_latent','cache_rows')}
+    if len(metadata)!=3 or metadata&payload or root.allocation_id in {
+            views['query_rope'].allocation_id,views['query_latent'].allocation_id}:
+        raise ValueError('Sparse FA3 fresh metadata/query/cache aliases differ from the source ABI')
+    allocations=unique_by(bindings.allocations,'allocation_id')
+    if set(allocations)!={view.allocation_id for view in views.values()}:
+        raise ValueError('Sparse FA3 input export requires exactly its actual operand allocations')
+    from src.kernel.memory_access import validate_storage_bindings,_union_covers
+    _,_,_,events,_,ancestors=validate_storage_bindings(bindings.allocations,bindings.views,bindings.events,
+        Coverage(Granularity.KERNEL,Semantics.LOGICAL,Ordering.PARTIAL,False,
+            ('Actual sparse caller snapshot boundary;no detailed source graph.',)))
+    visible={}
+    for role,ref in zip(bindings.read_views,bindings.input_ready,strict=True):
+        if ref.allow_skipped_read or ref.node_id not in events or events[ref.node_id].kind is not ref.kind:
+            raise ValueError('Sparse source readiness must refer to actual caller events')
+        reachable=(*ancestors[ref.node_id],ref)
+        visible[role]=tuple(events[item.node_id].region for item in reachable
+            if item.node_id in events and events[item.node_id].kind in (EventKind.INITIALIZED,EventKind.LOGICAL_AVAILABLE)
+            and events[item.node_id].allocation_id==views[role].allocation_id
+            and events[item.node_id].visibility_domain==bindings.visibility_domain)
+    def available(role,region):
+        if not _union_covers(visible[role],region):
+            raise ValueError('Sparse caller selected input lacks initialized/visible readiness')
+    for role in ('used_key','cu_query'):available(role,views[role].region())
+    for request,length in enumerate(used):
+        if not length:continue
+        for role,width in (('query_rope',64),('query_latent',512)):
+            view=views[role]
+            available(role,Strided(view.offset_bytes+request*view.strides_bytes[0],(heads,),
+                (view.strides_bytes[1],),width*2))
+        view=views['block_table']
+        available('block_table',Span(view.offset_bytes+request*view.strides_bytes[0],length*4))
+    for row in sorted({row for request in selected_rows for row in request}):
+        for role,width in (('key_cache',64),('value_cache',512)):
+            view=views[role]
+            available(role,Span(view.offset_bytes+row*stride,width*2))
+    return work,views,allocations
+
+
+def _validate_fa3_sparse_mla_call_boundary(parts,hardware,inputs,storage,selected_rows):
+    from src.kernel.memory_access_builder import ElementwiseBindings
+    from src.kernel.memory_access import Span,TileWriteSource,covers
+    from src.kernel.kernel_spec import KernelSpec
+    from src.kernel.predictors.flash_attn import _fa3_sparse_mla_work
+    if type(parts) is not tuple or len(parts) not in (2,3):
+        raise ValueError('Sparse source requires its original whole library tuple')
+    if (any(not isinstance(part,KernelSpec) for part in parts)
+            or parts[0].kind is not KernelKind.VECTOR or parts[0].variant!='fa3_prepare_varlen'
+            or parts[1].kind is not KernelKind.FLASH_ATTN or parts[1].variant!='mla_decode'):
+        raise ValueError('Sparse source requires its original prepare and main stages')
+    main=parts[1];work=_fa3_sparse_mla_work(main,hardware)
+    expected=hardware.fa3_sparse_mla_forward_specs(main.shape,main.dtype,main.attributes,
+        topk_capacity=main.launch.tiling.tile_shape['kv_capacity'])
+    if parts!=expected:raise ValueError('Sparse source stages differ from their actual whole library call')
+    if not isinstance(inputs,ElementwiseBindings) or not isinstance(storage,ElementwiseBindings):
+        raise TypeError('Sparse source requires actual typed input and fresh storage bindings')
+    if (storage.call_id,storage.rank,storage.stream,storage.visibility_domain)!=(
+            inputs.call_id,inputs.rank,inputs.stream,inputs.visibility_domain):
+        raise ValueError('Sparse source storage must retain its actual caller and lifetime domain')
+    if storage.read_views or storage.input_ready or storage.write_views!=('output','lse','semaphore'):
+        raise ValueError('Sparse fresh storage cannot declare precomputed or initialized scratch inputs')
+    if any(event.kind not in (EventKind.ALLOCATED,EventKind.FREED) for event in storage.events):
+        raise ValueError('Sparse fresh scheduler/partials/results require their actual source writers')
+    input_work,input_views,input_allocations=_validate_fa3_sparse_mla_input_boundary(main,hardware,inputs,selected_rows)
+    parents=unique_by(storage.views,'view_id');layouts=fa3_sparse_mla_call_storage_layouts(main,hardware)
+    if set(parents)!={role for role,*_ in layouts}:raise ValueError('Sparse source storage roles differ from source ABI')
+    b,h=main.shape['batch'],main.shape['num_query_heads'];s=main.launch.tiling.num_kv_splits
+    rounded=ceil(b/4)*4;vectors=1+int(s>1);meta=parents['scheduler_metadata']
+    for role,shape,dtype,width in layouts:
+        view=parents[role]
+        offset=(rounded*4 if role=='dynamic_splits' else vectors*rounded*4 if role=='semaphore' else 0)
+        if (type(view) is not TensorView or (view.shape,view.dtype,view.element_bytes,view.offset_bytes,view.strides_bytes)!=(
+                shape,dtype,width,offset,dense_strides(shape,width))):
+            raise ValueError('Sparse source fresh storage shape/offset/strides differ')
+        canonical=TensorView(view.view_id,view.allocation_id,view.offset_bytes,view.shape,view.strides_bytes,view.dtype,view.element_bytes)
+        if view.region()!=canonical.region():raise ValueError('Sparse fresh storage derived region differs')
+        if role in ('prepared_query','dynamic_splits','semaphore') and view.allocation_id!=meta.allocation_id:
+            raise ValueError('Sparse scheduler fields must alias the actual metadata parent')
+    roots=('scheduler_metadata','output','lse',*(('partial_output','partial_lse') if s>1 else ()))
+    if len({parents[role].allocation_id for role in roots})!=len(roots):
+        raise ValueError('Sparse source fresh tensor parents may not alias')
+    allocations=(*inputs.allocations,*storage.allocations);allocation_map=unique_by(allocations,'allocation_id')
+    if any(allocation.freed_event is not None for allocation in allocations):
+        raise NotImplementedError('Sparse complete tensor export requires live call allocations; retirement binding remains unbound')
+    if {item.allocation_id for item in storage.allocations}!={parents[role].allocation_id for role in roots}:
+        raise ValueError('Sparse source storage requires exactly its actual native parent allocations')
+    from src.kernel.memory_access import validate_storage_bindings
+    validate_storage_bindings(allocations,(*inputs.views,*storage.views),(*inputs.events,*storage.events),
+        Coverage(Granularity.KERNEL,Semantics.LOGICAL,Ordering.PARTIAL,False,
+            ('Actual fresh sparse library storage;source writers remain in explicit export.',)))
+    return {'main':main,'main_work':work,'input_views':input_views,'parents':parents,
+        'allocations':allocations,'allocation_map':allocation_map}
+
+
+def build_fa3_sparse_mla_input_source(kernel,hardware,bindings,granularity,*,program_id,selected_rows):
+    """Explicit sparse input export, not a prediction hot path or complete call DAG.
+
+    selected_rows is a caller-declared snapshot of each live block-table prefix,
+    paired with that binding's actual input-ready event. Unknown values must not
+    be replaced by synthetic rows. It proves selected storage/readiness under
+    those caller facts, not device values, index conversion or emitted traffic.
+    Bindings carry no tensor contents: equality with the device table/counts is
+    a caller responsibility, not a numeric check performed by this exporter.
+    """
+    from src.kernel.memory_access import Span
+    if granularity not in (Granularity.OP,Granularity.KERNEL):
+        raise ValueError('Sparse FA3 resolved input export requires OP or KERNEL granularity')
+    work,views,allocations=_validate_fa3_sparse_mla_input_boundary(kernel,hardware,bindings,selected_rows)
+    batch,heads=kernel.shape['batch'],kernel.shape['num_query_heads']
+    used=tuple(kernel.attributes['kv_lens']);capacity=kernel.launch.tiling.tile_shape['kv_capacity']
+    stride=views['cache_rows'].strides_bytes[0];roles=bindings.read_views
+    scope=AccessScope(program_id,('fa3_sparse_mla_input',str(batch),str(heads),str(capacity),
+        ','.join(map(str,used))),bindings.call_id,(),bindings.rank,bindings.stream,'logical-fa3-sparse-selected-inputs')
+    ready=dict(zip(roles,bindings.input_ready,strict=True));accesses=[]
+    evidence=('Pinned vLLM0.30 flashattn_mla_sparse._run_mqa_kernel: q_rope64/q_nope512, page1 and shared latent512/RoPE64 rows.',
+        'Live physical row values are explicit caller snapshot facts tied to the supplied block-table availability; no invented indices or capacity-as-used.',
+        'Logical task payload matches the existing source demand. Metadata reads are boundary exposure, not native issue multiplicity.')
+    def read(identity,role,region,dependencies=()):
+        view=views[role];allocation=allocations[view.allocation_id]
+        refs=tuple(dict.fromkeys((EventRef(allocation.allocated_event,EventKind.ALLOCATED),ready[role],*dependencies)))
+        access=MemoryAccess(identity,scope.scope_id,view.allocation_id,view.view_id,Operation.READ,region,
+            Semantics.LOGICAL,None,None,None,None,bindings.visibility_domain,refs,EventKind.READ_READY,1,evidence)
+        accesses.append(access)
+        return EventRef(identity,EventKind.READ_READY)
+    for request,(length,count,rows) in enumerate(zip(used,work['splits'],selected_rows,strict=True)):
+        label=f'{program_id}.r{request}'
+        v=views['used_key'];length_ref=read(label+'.used_key','used_key',Span(v.offset_bytes+request*4,4))
+        v=views['cu_query'];query_ref=read(label+'.cu_query','cu_query',Span(v.offset_bytes+request*4,8))
+        panels=ceil(length/64);per_split=ceil(panels/count)
+        for split in range(count):
+            first=split*per_split*64;stop=min(length,(split+1)*per_split*64)
+            if first>=stop:continue
+            for m in range(ceil(heads/64)):
+                task=f'{label}.s{split}.m{m}';live_heads=min(64,heads-m*64)
+                control=(length_ref,query_ref)
+                for role,width in (('query_rope',64),('query_latent',512)):
+                    view=views[role]
+                    region=Strided(view.offset_bytes+request*view.strides_bytes[0]+m*64*view.strides_bytes[1],
+                        (live_heads,),(view.strides_bytes[1],),width*2)
+                    read(task+'.'+role,role,region,control)
+                view=views['block_table']
+                index_ref=read(task+'.indices','block_table',Span(
+                    view.offset_bytes+request*view.strides_bytes[0]+first*4,(stop-first)*4),control)
+                for selected in range(first,stop):
+                    for role,width in (('key_cache',64),('value_cache',512)):
+                        view=views[role]
+                        read(f'{task}.i{selected}.{role}',role,Span(
+                            view.offset_bytes+rows[selected]*stride,width*2),(length_ref,index_ref))
+    return MemoryAccessProgram('midlayer.memory-access.v1',program_id,hardware.hardware_id,bindings.binding_id,
+        Coverage(granularity,Semantics.LOGICAL,Ordering.PARTIAL,False,(
+            'Explicit selected-input source boundary only; prepare/scratch/main-output/combine are not represented by this export.',
+            'Caller snapshots are not GPU observations. Unknown global indices remain unsupported; duplicate selected rows are retained.',
+            'No native page1 service, issued transaction, cache-hit, index-conversion cost or complete-call timing claim.')),
+        bindings.allocations,bindings.views,(scope,),bindings.events,tuple(accesses))
+
+
+def fa3_sparse_mla_input_source_work(program,*,kernel,hardware,bindings,selected_rows):
+    """Consume exactly the exported source, including aliases and real readiness."""
+    expected=build_fa3_sparse_mla_input_source(kernel,hardware,bindings,program.coverage.granularity,
+        program_id=program.program_id,selected_rows=selected_rows)
+    if program!=expected:raise ValueError('Sparse FA3 input source differs from the actual caller snapshot')
+    by_view={role:0 for role in bindings.read_views}
+    for access in program.accesses:by_view[access.view_id]+=requested_bytes(access.region)
+    return {'read_bytes_by_view':by_view,'selected_rows':selected_rows,
+        'physical_service_bound':False,'coverage':'selected_input_boundary_only'}
+
+
+def fa3_sparse_mla_call_storage_layouts(main,hardware):
+    """Source-owned fresh storage geometry; identities/readiness come from caller."""
+    from src.kernel.predictors.flash_attn import _fa3_sparse_mla_work
+    _fa3_sparse_mla_work(main,hardware)
+    if main.variant!='mla_decode':raise ValueError('Sparse call storage requires its main spec')
+    b,h=main.shape['batch'],main.shape['num_query_heads'];s=main.launch.tiling.num_kv_splits
+    rounded=ceil(b/4)*4;vectors=1+int(s>1)
+    layouts=[('scheduler_metadata',(vectors*rounded+1,),'int32',4),
+        ('prepared_query',(b,),'int32',4),('semaphore',(1,),'int32',4),
+        ('output',(b,h,512),'bf16',2),('lse',(h,b),'fp32',4)]
+    if s>1:layouts.extend((('dynamic_splits',(b,),'int32',4),
+        ('partial_output',(s,h,b,512),'fp32',4),('partial_lse',(s,h,b),'fp32',4)))
+    return tuple(layouts)
+
+
+def build_fa3_sparse_mla_call_source(parts,hardware,inputs,storage,granularity,*,program_id,selected_rows):
+    """Explicit complete library tensor source; no physical-service or hot-path claim.
+
+    Caller supplies the original prepare/main[/combine] tuple, actual input and
+    fresh output/scratch bindings and a live physical-index snapshot. Source
+    conversion, GPU content truth, queue atomics and page1 service remain open.
+    """
+    from src.kernel.memory_access import Span,TileWriteSource,covers
+    from src.kernel.predictors.flash_attn import _fa3_sparse_mla_work
+    if granularity not in (Granularity.OP,Granularity.KERNEL,Granularity.TILE):
+        raise ValueError('Unknown sparse source granularity')
+    boundary=_validate_fa3_sparse_mla_call_boundary(parts,hardware,inputs,storage,selected_rows)
+    main,work,parents=boundary['main'],boundary['main_work'],boundary['parents']
+    allocations,allocation_map=boundary['allocations'],boundary['allocation_map']
+    b,h=main.shape['batch'],main.shape['num_query_heads'];s=main.launch.tiling.num_kv_splits
+    input_program=build_fa3_sparse_mla_input_source(main,hardware,inputs,Granularity.KERNEL,
+        program_id=program_id+'.inputs',selected_rows=selected_rows)
+    all_views=[*inputs.views,*storage.views];events=[*inputs.events,*storage.events];families=[]
+    input_views=unique_by(inputs.views,'view_id');input_events=unique_by(inputs.events,'event_id')
+    input_ready=dict(zip(inputs.read_views,inputs.input_ready,strict=True));visibility=inputs.visibility_domain
+    header=('fa3_sparse_mla_call',str(b),str(h),str(s),','.join(map(str,main.attributes['kv_lens'])))
+    scope=AccessScope(program_id,header,inputs.call_id,(),inputs.rank,inputs.stream,'logical-fa3-sparse-library-call')
+    evidence=('Pinned source_506341 sparse BF16/Q1/page1 call. Actual external input snapshots; no production durations.',
+        'Fresh prepare fields and main epilogues are real producers. Empty split partial O remains unwritten.',
+        '512-wide combine source is reused unchanged; LSE-driven max-valid READ and conditional tails remain unknown.',
+        'Queue worker assignment/atomics,issued traffic,physical service and actual runtime source binding remain partial.')
+    def publish(view,family,name):
+        event=ProgramEvent(family.tile_program_id+'.'+name+'.produced',EventKind.LOGICAL_AVAILABLE,
+            view.allocation_id,Unmapped(view.shape,view.dtype,view.element_bytes,view.view_id+'.source_writer'),visibility,
+            (EventRef(allocation_map[view.allocation_id].allocated_event,EventKind.ALLOCATED),),view.view_id,
+            (TileWriteSource(family.tile_program_id,name),))
+        events.append(event);return EventRef(event.event_id,event.kind)
+    def child(identity,view,region):
+        if isinstance(region,Span):
+            shape=(region.length_bytes//view.element_bytes,);strides=(view.element_bytes,);offset=region.offset_bytes
+        else:
+            shape=(*region.counts,region.element_span_bytes//view.element_bytes)
+            strides=(*region.strides_bytes,view.element_bytes);offset=region.base_offset_bytes
+        result=TensorView(identity,view.allocation_id,offset,shape,strides,view.dtype,view.element_bytes)
+        all_views.append(result);return result
+    def actual_ready(role,view):
+        # Select an actual available ancestor of this operand's supplied snapshot;
+        # never manufacture a more convenient initializer for a selected row.
+        reachable=set();pending=[input_ready[role]]
+        while pending:
+            ref=pending.pop()
+            if ref.node_id in reachable:continue
+            reachable.add(ref.node_id);pending.extend(input_events[ref.node_id].dependencies)
+        for identity in sorted(reachable):
+            event=input_events[identity]
+            if (event.kind in (EventKind.INITIALIZED,EventKind.LOGICAL_AVAILABLE)
+                    and event.allocation_id==view.allocation_id and event.visibility_domain==visibility
+                    and event.region is not None and covers(event.region,view.region())):
+                return EventRef(identity,event.kind)
+        raise NotImplementedError('Sparse TILE export requires an actual available region covering each resolved field')
+    prep_id=program_id+'.prepare';prep_access=[]
+    for role in ('cu_query','used_key'):
+        view=input_views[role]
+        prep_access.append(TileAccessTemplate(role,view.view_id,Operation.READ,(),(None,)*len(view.shape),
+            (actual_ready(role,view),),(),evidence))
+    prepared=parents['prepared_query'];semaphore=parents['semaphore']
+    prep_access.extend((
+        TileAccessTemplate('prepared_query',prepared.view_id,Operation.WRITE,(),(None,),(),
+            (TileDependency('cu_query',EventKind.READ_READY,()),),evidence,unmapped=True),
+        TileAccessTemplate('semaphore',semaphore.view_id,Operation.WRITE,(),(None,),(),(),evidence,
+            unmapped=True,constant_value=ConstantValue.ZERO)))
+    if s>1:
+        prep_access.append(TileAccessTemplate('dynamic_splits','dynamic_splits',Operation.WRITE,(),(None,),(),
+            (TileDependency('cu_query',EventKind.READ_READY,()),TileDependency('used_key',EventKind.READ_READY,())),
+            evidence,unmapped=True))
+    prep=TileProgram(prep_id,replace(scope,scope_id=prep_id,op_ids=(*header,'prepare')),
+        (TileAxis('prepare',1,1),),tuple(prep_access),visibility,evidence);families.append(prep)
+    fields=('prepared_query','semaphore',*(('dynamic_splits',) if s>1 else ()))
+    field_ready={role:publish(parents[role],prep,role) for role in fields}
+    prep_done=ProgramEvent(program_id+'.prepare.tensor_outputs_complete',EventKind.COMPUTE_DONE,None,None,None,
+        tuple(field_ready.values()));events.append(prep_done)
+    # The real prepare->main grid/stream boundary includes semaphore zero;
+    # retain it without inventing queue atomic counts or a timed global fence.
+    event=ProgramEvent(program_id+'.prepared_query.after_prepare',EventKind.LOGICAL_AVAILABLE,
+        prepared.allocation_id,Unmapped(prepared.shape,prepared.dtype,prepared.element_bytes,
+            program_id+'.prepared_query.source_stage_order'),visibility,
+        (field_ready['prepared_query'],EventRef(prep_done.event_id,prep_done.kind)),prepared.view_id)
+    events.append(event);field_ready['prepared_query']=EventRef(event.event_id,event.kind)
+    flat={access.access_id:access for access in input_program.accesses};writes={r:[] for r in range(b)}
+    lse_writes={r:[] for r in range(b)};results=[];all_main=[]
+    for request,(length,count) in enumerate(zip(main.attributes['kv_lens'],work['splits'],strict=True)):
+        per_split=ceil(ceil(length/64)/count)
+        for split in range(count):
+            live=min(length,(split+1)*per_split*64)>split*per_split*64
+            for m in range(ceil(h/64)):
+                identity=f'{program_id}.main.r{request}.s{split}.m{m}';accesses=[];rows=min(64,h-m*64)
+                prefix=f'{program_id}.inputs.r{request}';task=f'{prefix}.s{split}.m{m}'
+                selected=[flat[prefix+'.'+role] for role in ('used_key','cu_query')]
+                selected.extend(access for name,access in flat.items() if name.startswith(task+'.'))
+                names={access.access_id:access.access_id[len(task)+1:] if access.access_id.startswith(task+'.')
+                    else access.access_id[len(prefix)+1:] for access in selected}
+                for role in ('prepared_query',*(('dynamic_splits',) if s>1 else ())):
+                    parent=parents[role]
+                    view=LogicalSelectionView(identity+'.'+role,parent.allocation_id,(1,),'int32',4,identity+'.'+role,
+                        role,(LogicalCoordinateBinding(0,(),request),))
+                    all_views.append(view)
+                    accesses.append(TileAccessTemplate(role,view.view_id,Operation.READ,(),(None,),
+                        (field_ready[role],),(),evidence,unmapped=True))
+                control=tuple(TileDependency(role,EventKind.READ_READY,()) for role in
+                    ('prepared_query',*(('dynamic_splits',) if s>1 else ())))
+                for access in selected:
+                    role=access.view_id;view=child(identity+'.'+names[access.access_id],input_views[role],access.region)
+                    dependencies=tuple(TileDependency(names[ref.node_id],EventKind.READ_READY,())
+                        for ref in access.dependencies if ref.node_id in names)
+                    accesses.append(TileAccessTemplate(names[access.access_id],view.view_id,Operation.READ,(),
+                        (None,)*len(view.shape),(actual_ready(role,view),),(*control,*dependencies),evidence))
+                deps=tuple(TileDependency(access.access_id,EventKind.READ_READY,()) for access in accesses)
+                output=parents['output' if count==1 else 'partial_output'];lse=parents['lse' if count==1 else 'partial_lse']
+                if count==1:
+                    o_offset=request*h*1024+m*64*1024;o_stride=1024
+                    l_offset=(m*64*b+request)*4;l_stride=b*4
+                else:
+                    o_offset=(split*h*b+m*64*b+request)*512*4;o_stride=b*512*4
+                    l_offset=(split*h*b+m*64*b+request)*4;l_stride=b*4
+                l_view=TensorView(identity+'.lse',lse.allocation_id,l_offset,(rows,),(l_stride,),'fp32',4);all_views.append(l_view)
+                accesses.append(TileAccessTemplate('lse',l_view.view_id,Operation.WRITE,(),(None,),(),deps,evidence,
+                    unmapped=True,constant_value=ConstantValue.NEGATIVE_INFINITY if not live else None))
+                if live or count==1:
+                    o_view=TensorView(identity+'.output',output.allocation_id,o_offset,(rows,512),
+                        (o_stride,output.element_bytes),output.dtype,output.element_bytes);all_views.append(o_view)
+                    accesses.append(TileAccessTemplate('output',o_view.view_id,Operation.WRITE,(),(None,None),(),deps,
+                        evidence,unmapped=True,constant_value=ConstantValue.ZERO if not live else None))
+                family=TileProgram(identity,replace(scope,scope_id=identity,op_ids=(*header,'main',str(request),str(split),str(m))),
+                    (TileAxis('epilogue',1,1),),tuple(accesses),visibility,evidence);families.append(family)
+                ref=publish(l_view,family,'lse');lse_writes[request].append(ref);all_main.append(ref)
+                if count==1:results.append(ref)
+                if live or count==1:
+                    ref=publish(o_view,family,'output');writes[request].append(ref);all_main.append(ref)
+                    if count==1:results.append(ref)
+    main_done=ProgramEvent(program_id+'.main.complete',EventKind.COMPUTE_DONE,None,None,None,tuple(all_main));events.append(main_done)
+    if s>1:
+        combine=parts[2];_fa3_sparse_mla_work(combine,hardware)
+        combine_header=('fa3_split_combine',','.join('1' for _ in range(b)),','.join(map(str,main.attributes['kv_lens'])),
+            str(h),str(s),str(int(hardware.num_compute_units)),'causal',str(b),'bf16')
+        if _fa3_combine_geometry(combine_header)[-1]!=work['splits']:
+            raise ValueError('Sparse complete-call combine must keep the actual source dynamic splits')
+        combine_parents={role:parents[role] for role in ('scheduler_metadata','dynamic_splits','semaphore',
+            'partial_output','partial_lse','output','lse')};combine_parents['cu_query']=input_views['cu_query']
+        after={}
+        for role in ('dynamic_splits','semaphore'):
+            view=parents[role];event=ProgramEvent(program_id+'.'+role+'.after_main',EventKind.LOGICAL_AVAILABLE,
+                view.allocation_id,Unmapped(view.shape,view.dtype,view.element_bytes,program_id+'.'+role+'.stage_order'),visibility,
+                (field_ready[role],EventRef(main_done.event_id,main_done.kind)),view.view_id)
+            events.append(event);after[role]=EventRef(event.event_id,event.kind)
+        combine_ready={'cu_query':input_ready['cu_query'],'dynamic_splits':after['dynamic_splits']}
+        for request,count in enumerate(work['splits']):
+            if count<=1:continue
+            for role in ('partial_output','partial_lse'):
+                root=parents[role];shape=(count,h,1,512) if role=='partial_output' else (count,h,1)
+                view=TensorView(f'{role}.r{request}',root.allocation_id,request*root.strides_bytes[2],shape,
+                    root.strides_bytes,'fp32',4);all_views.append(view);combine_parents[view.view_id]=view
+                refs=tuple(lse_writes[request]) if role=='partial_lse' else tuple((*writes[request],*lse_writes[request]))
+                event=ProgramEvent(program_id+'.'+view.view_id+'.accessible_after_main',EventKind.LOGICAL_AVAILABLE,
+                    view.allocation_id,Unmapped(view.shape,view.dtype,view.element_bytes,
+                        program_id+'.'+view.view_id+'.source_accessibility_not_empty_O_initialization'),visibility,
+                    (EventRef(allocation_map[view.allocation_id].allocated_event,EventKind.ALLOCATED),*refs),view.view_id)
+                events.append(event);combine_ready[view.view_id]=EventRef(event.event_id,event.kind)
+        internal,children,combine_events,combine_families=_fa3_combine_recipe(combine_header,combine_parents,combine_ready,
+            replace(scope,scope_id=program_id+'.combine',op_ids=combine_header),visibility,
+            storage.binding_id+'.combine',allocation_map[parents['output'].allocation_id].device_id)
+        allocation_map.update(unique_by(internal,'allocation_id'));children=list(children)
+        # Rebind the existing source's final logical stores to their exact typed
+        # parent regions; no copy, new writer or guessed availability is added.
+        child_map=unique_by(children,'view_id');combine_families=list(combine_families)
+        for index,family in enumerate(combine_families):
+            for access in family.accesses:
+                if access.access_id not in ('output','lse'):continue
+                old=child_map[access.view_id];parent=combine_parents[old.parent_view_id]
+                starts=tuple(binding.offset for binding in old.coordinate_map)
+                offset=parent.offset_bytes+sum(start*stride for start,stride in zip(starts,parent.strides_bytes,strict=True))
+                view=TensorView(old.view_id,parent.allocation_id,offset,old.shape,(parent.element_bytes,),parent.dtype,parent.element_bytes)
+                children[children.index(old)]=view;child_map[view.view_id]=view
+                results.append(publish(view,family,access.access_id))
+            if family.scope.op_ids[-1]=='reset':
+                family=replace(family,accesses=tuple(replace(access,input_ready=(after['semaphore'],))
+                    if access.access_id=='semaphore_reset' else access for access in family.accesses))
+                combine_families[index]=family;results.append(publish(parents['semaphore'],family,'semaphore_reset'))
+        allocations=(*allocations,*internal);all_views.extend(children);events.extend(combine_events);families.extend(combine_families)
+    complete=ProgramEvent(program_id+'.results_and_optional_reset.complete',EventKind.COMPUTE_DONE,None,None,None,tuple(results));events.append(complete)
+    for role in ('output','lse'):
+        view=parents[role]
+        events.append(ProgramEvent(program_id+'.'+role+'.library_result',EventKind.LOGICAL_AVAILABLE,view.allocation_id,
+            Unmapped(view.shape,view.dtype,view.element_bytes,program_id+'.'+role+'.actual_writer_union'),visibility,
+            (EventRef(allocation_map[view.allocation_id].allocated_event,EventKind.ALLOCATED),EventRef(complete.event_id,complete.kind)),role))
+    return MemoryAccessProgram('midlayer.memory-access.v1',program_id,hardware.hardware_id,storage.binding_id,
+        Coverage(Granularity.TILE,Semantics.LOGICAL,Ordering.PARTIAL,False,evidence),tuple(allocations),tuple(all_views),
+        (scope,),tuple(events),(),tuple(families))
+
+
+def fa3_sparse_mla_call_source_work(program,*,parts,hardware,inputs,storage,selected_rows):
+    from src.kernel.memory_access import _tile_template_requested_bytes
+    expected=build_fa3_sparse_mla_call_source(parts,hardware,inputs,storage,Granularity.TILE,
+        program_id=program.program_id,selected_rows=selected_rows)
+    if program!=expected:raise ValueError('Sparse call lost actual source writers,aliases,readiness or caller snapshot')
+    views=unique_by(program.views,'view_id');parents=unique_by(storage.views,'view_id')
+    totals={stage:{role:0 for role in ('output','lse','partial_output','partial_lse','semaphore')}
+        for stage in ('prepare','main','combine')}
+    for family in program.tile_programs:
+        stage='prepare' if family.tile_program_id.endswith('.prepare') else 'main' if '.main.r' in family.tile_program_id else 'combine'
+        axes=unique_by(family.axes,'axis_id')
+        for access in family.accesses:
+            if access.operation is not Operation.WRITE:continue
+            view=views[access.view_id]
+            for role in totals[stage]:
+                if role in parents and view.allocation_id==parents[role].allocation_id:
+                    # Scheduler slices share a parent; only the actual reset/zero is charged here.
+                    if role=='semaphore' and access.access_id not in ('semaphore','semaphore_reset'):continue
+                    totals[stage][role]+=_tile_template_requested_bytes(views,axes,family,access)
+    return {'write_bytes_by_stage_and_parent':totals,'physical_service_bound':False,
+        'runtime_integrated':False,'coverage':'complete_library_tensor_source_only'}
+
+
+def fa3_sparse_mla_call_result_bindings(program,*,parts,hardware,inputs,storage,selected_rows,call_id,binding_id):
+    """Expose actual final O/LSE parents after their source writers/optional reset."""
+    from src.kernel.memory_access_builder import ElementwiseBindings
+    fa3_sparse_mla_call_source_work(program,parts=parts,hardware=hardware,inputs=inputs,storage=storage,selected_rows=selected_rows)
+    refs=tuple(EventRef(program.program_id+'.'+role+'.library_result',EventKind.LOGICAL_AVAILABLE)
+        for role in ('output','lse'))
+    return ElementwiseBindings(binding_id,call_id,program.allocations,program.views,program.events,
+        ('output','lse'),(),refs,inputs.rank,inputs.stream,inputs.visibility_domain)
+
+
+_FA3_SPARSE_MLA_PREDICTION = ContextVar('fa3_sparse_mla_prediction')
+
+
+def fa3_sparse_mla_call_prediction_work(parts,hardware,inputs,storage,*,selected_rows):
+    """Validate real whole-call facts without constructing any detailed source graph."""
+    from src.kernel.predictors.flash_attn import _fa3_sparse_mla_work
+    boundary=_validate_fa3_sparse_mla_call_boundary(parts,hardware,inputs,storage,selected_rows)
+    main,mw,parents=boundary['main'],boundary['main_work'],boundary['parents']
+    cw=_fa3_sparse_mla_work(parts[2],hardware) if len(parts)==3 else None
+    output=prod(parents['output'].shape)*2;lse=prod(parents['lse'].shape)*4
+    combine_write=0 if cw is None else cw['write_bytes']
+    reset=0 if cw is None else cw['semaphore_reset_bytes']
+    if mw['direct_write_bytes']+combine_write-reset!=output+lse:
+        raise ValueError('Sparse library source result bytes differ from actual output parents')
+    if cw is not None and cw['splits']!=mw['splits']:
+        raise ValueError('Sparse paired source dynamic splits differ')
+    return {'main_write_bytes':mw['write_bytes'],'main_l2_read_bytes':mw['logical_l2_read_bytes'],
+        'main_direct_write_bytes':mw['direct_write_bytes'],'partial_output_write_bytes':mw['partial_output_bytes'],
+        'partial_lse_write_bytes':mw['partial_lse_bytes'],'combine_write_bytes':combine_write,
+        'output_bytes':output,'lse_bytes':lse,'splits':mw['splits'],'semaphore_reset_bytes':reset,
+        'physical_service_bound':False,'device_snapshot_truth_verified':False}
+
+
+@contextmanager
+def fa3_sparse_mla_call_prediction_scope(parts,hardware,inputs,storage,*,selected_rows):
+    """Keep the actual sparse call and declared index snapshot through pricing."""
+    from copy import deepcopy
+    work=fa3_sparse_mla_call_prediction_work(parts,hardware,inputs,storage,selected_rows=selected_rows)
+    seal=(deepcopy(inputs),deepcopy(storage));kernels=repr(parts)
+    token=_FA3_SPARSE_MLA_PREDICTION.set((parts,hardware,inputs,storage,selected_rows,work,seal,kernels))
+    try:
+        yield work
+    finally:
+        _FA3_SPARSE_MLA_PREDICTION.reset(token)
+
+
+def current_fa3_sparse_mla_prediction_work(kernel,hardware):
+    from src.kernel.memory_access_builder import _prediction_bindings
+    context=copy_context()
+    if _FA3_SPARSE_MLA_PREDICTION not in context:return None
+    parts,actual_hardware,inputs,storage,rows,work,seal,kernels=context[_FA3_SPARSE_MLA_PREDICTION]
+    if hardware is not actual_hardware or not any(kernel is part for part in parts[1:]) or repr(parts)!=kernels:
+        raise ValueError('Sparse prediction crossed or changed its actual source call')
+    actual,_=_prediction_bindings(kernel,None)
+    expected=inputs if kernel is parts[1] else storage
+    if actual is not expected or (inputs,storage)!=seal:
+        raise ValueError('Sparse prediction requires unchanged actual caller bindings')
+    observed=fa3_sparse_mla_call_prediction_work(parts,hardware,inputs,storage,selected_rows=rows)
+    if observed!=work:raise ValueError('Sparse prediction source quantities changed')
+    return observed

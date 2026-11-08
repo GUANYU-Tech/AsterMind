@@ -17,9 +17,10 @@ ROOT = Path(__file__).resolve().parents[4]
 SOURCE = Path(__file__).with_name("fused_moe_b_panel_fanout.cu")
 RUNNER = Path(__file__)
 OUTPUT_ROOT = ROOT / "profiler_output" / "microbench" / "nvidia_a800"
-VLLM_SOURCE = Path(
-    "/share_data/yangxinhao/chip_modeling/vllm_src_3ver/a800/vllm/"
-    "model_executor/layers/fused_moe/fused_moe.py")
+VLLM_SOURCE = (
+    Path(os.environ["MIDLAYER_A800_VLLM_SOURCE"])
+    / "model_executor/layers/fused_moe/fused_moe.py"
+)
 VLLM_SOURCE_SHA256 = (
     "8be8477a653894194ef5c5095afc287b0409a51d980590a36dd43c8471f6740e")
 DEVICE_NAME = "NVIDIA A800-SXM4-80GB"

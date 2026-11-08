@@ -908,6 +908,7 @@ def collective_source_work(program):
     if not program.tile_programs:
         raise ValueError('collective projection requires its current tile source')
     agent=program.tile_programs[0].scope.agent
+    if agent=='variable-collective-segments':return variable_collective_source_work(program)
     if agent=='all-reduce-elements':return numeric_all_reduce_tile_source_work(program)
     if agent=='all-reduce-unbound-words':return untyped_all_reduce_tile_source_work(program)
     return collective_copy_tile_source_work(program)
@@ -2644,3 +2645,81 @@ def logical_combine_source_traffic(program,*,expected_kernel,hardware,known_outp
     width=expected_kernel.launch.parameters['split_scratch_dram_bytes_per_element']
     if width<0:raise ValueError('Negative declared scratch DRAM width')
     return float(read+write),float(read/4*width+write)
+
+
+def variable_collective_source_work(program):
+    """Validate every participant segment and contributor before pricing wire work."""
+    from src.kernel.memory_access import Operation, EventKind, TileDependency, TensorView, unique_by
+    from src.kernel.kernel_spec import DTYPE_BYTES
+    program.__post_init__()
+    if program.scopes or program.accesses or not program.tile_programs:
+        raise ValueError("variable collective requires its compressed segment sources")
+    first = program.tile_programs[0].scope.op_ids
+    if len(first) < 9 or first[:1] != ("communication",) or first[2] != "partitioned":
+        raise ValueError("variable collective source requires ordered participants and segment sizes")
+    operation, count = first[1], int(first[3])
+    if count < 2 or len(first) != 5 + 2 * count or operation not in ("all_gatherv", "reduce_scatterv"):
+        raise ValueError("unknown variable collective coordinate contract")
+    ranks = tuple(int(value) for value in first[4:4 + count])
+    sizes = tuple(int(value) for value in first[4 + count:4 + 2 * count])
+    if len(set(ranks)) != count or min(ranks) < 0 or min(sizes) < 0 or sum(sizes) <= 0:
+        raise ValueError("variable collective ranks and payload extents must be valid")
+    expected = {index for index, size in enumerate(sizes) if size}
+    if len(program.tile_programs) != len(expected):
+        raise ValueError("variable collective must cover every positive segment once")
+    views = unique_by(program.views, "view_id")
+    gather, seen = operation == "all_gatherv", set()
+    for family in program.tile_programs:
+        header = family.scope.op_ids
+        if (family.scope.agent != "variable-collective-segments" or header[:-1] != first[:-1]
+                or len(family.axes) != 1 or family.causal_prefixes):
+            raise ValueError("variable collective segments disagree on their physical group")
+        index = int(header[-1])
+        if index not in expected or index in seen:
+            raise ValueError("variable collective contains a missing or repeated segment")
+        seen.add(index)
+        reads = tuple(access for access in family.accesses if access.operation is Operation.READ)
+        writes = tuple(access for access in family.accesses if access.operation is Operation.WRITE)
+        sources, destinations = ((ranks[index],), ranks) if gather else (ranks, (ranks[index],))
+        if (len(reads) != len(sources) or len(writes) != len(destinations)
+                or any(access.scope is None for access in family.accesses)
+                or {access.scope.rank for access in reads} != set(sources)
+                or {access.scope.rank for access in writes} != set(destinations)):
+            raise ValueError("variable segment must retain every required participant")
+        dtype = views[reads[0].view_id].dtype
+        if dtype not in ("uint8", "bf16", "fp16", "fp32", "int8", "int32", "int64"):
+            raise ValueError("variable collective lacks an explicit scalar storage ABI")
+        width = DTYPE_BYTES[dtype]
+        axis = "byte" if dtype == "uint8" else "element"
+        if (sizes[index] % width or any(size % width for size in sizes)
+                or (family.axes[0].axis_id, family.axes[0].extent, family.axes[0].block) != (axis, sizes[index] // width, 1)):
+            raise ValueError("variable collective coordinates must cover complete segment elements")
+        unknown_sum = not gather and dtype == "uint8"
+        if (len(family.partitions) != int(unknown_sum)
+                or unknown_sum and family.partitions[0].axis_id != axis):
+            raise ValueError("byte-only scatter sum must retain its unknown scalar partition")
+        required = tuple(TileDependency(access.access_id, EventKind.READ_READY,
+            (axis,) if unknown_sum else (), partition_axis=axis if unknown_sum else None) for access in reads)
+        for access in family.accesses:
+            read = access.operation is Operation.READ
+            role = "input" if read else "output"
+            view = views[access.view_id]
+            if (not isinstance(view, TensorView) or view.shape != (sizes[index] // width,)
+                    or (view.dtype, view.element_bytes, view.strides_bytes) != (dtype, width, (width,))
+                    or access.iteration_axes != (axis,) or access.view_axes != (axis,)
+                    or access.view_axis_divisors or access.view_axis_padding or access.unmapped
+                    or access.indirect_target is not None or access.scope.op_ids != ("communication", operation, role)):
+                raise ValueError("variable collective must retain exact contiguous participant segments")
+            full_size = (sizes[index] if (gather and read or not gather and not read) else sum(sizes))
+            parent_offsets = {parent.offset_bytes for parent in program.views if isinstance(parent, TensorView)
+                and parent.allocation_id == view.allocation_id and parent.shape == (full_size // width,)
+                and (parent.dtype, parent.element_bytes, parent.strides_bytes) == (dtype, width, (width,))}
+            offset = 0 if (gather and read or not gather and not read) else sum(sizes[:index])
+            if len(parent_offsets) != 1 or view.offset_bytes != next(iter(parent_offsets)) + offset:
+                raise ValueError("variable collective segment must preserve its original participant offset")
+            if read:
+                if access.dependencies or len(access.input_ready) != 1:
+                    raise ValueError("variable collective input requires its actual readiness event")
+            elif len(access.dependencies) != len(required) or set(access.dependencies) != set(required):
+                raise ValueError("variable collective output must depend on all contributing inputs")
+    return sum(sizes), count, operation

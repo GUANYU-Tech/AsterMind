@@ -21,6 +21,7 @@ from evaluation.reporting.standard_evaluation_report import (
     timestamp_now,
     write_kernel_evaluation_report,
     write_serving_evaluation_report,
+    _write_serving_evaluation_report_payload,
 )
 
 from evaluation.json_shape import write_json_atomic as _write_json_atomic
@@ -29,9 +30,7 @@ from evaluation.json_shape import write_json_atomic as _write_json_atomic
 DEFAULT_OUTPUT = ROOT / "experiment_logs/evaluation/standard_report"
 KERNEL_RUNS_ROOT = ROOT / "experiment_logs/evaluation/kernel_runs"
 SERVING_RUNS_ROOT = ROOT / "experiment_logs/evaluation/serving_runs"
-DEFAULT_SERVING_PYTHON = Path(
-    "/home/yangxinhao/miniconda3/envs/r2r_qwen3_next/bin/python"
-)
+DEFAULT_SERVING_PYTHON = Path(sys.executable)
 _KERNEL_TIMING_LINE = re.compile(
     r"^\[kernel\]\s+(?P<hardware>[a-z0-9_]+):\s+"
     r"(?P<status>PASS|FAIL|SKIPPED)\s+\((?P<seconds>[0-9]+(?:\.[0-9]+)?)s\)$"
@@ -45,16 +44,17 @@ def _arguments(argv=None):
     mode.add_argument("--serving-only", action="store_true")
     mode.add_argument("--all", action="store_true")
     mode.add_argument("--refresh-serving-report", action="store_true")
+    mode.add_argument("--refresh-kernel-report", action="store_true")
     mode.add_argument("--llmservingsim-report-only", action="store_true")
     parser.add_argument("--llmservingsim-results", type=Path)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument(
-        "--jobs", type=int, choices=range(1, 65), default=45,
-        metavar="1..64", help="parallel full Serving case workers (default: 45)",
+        "--jobs", type=int, default=0,
+        metavar="N", help="parallel Serving case workers; 0 uses one worker per selected case (default)",
     )
     parser.add_argument(
-        "--kernel-jobs", type=int, choices=range(1, 65), default=16,
-        metavar="1..64",
+        "--kernel-jobs", type=int, default=16,
+        metavar="N",
     )
     parser.add_argument(
         "--case", action="append", default=[],
@@ -86,10 +86,21 @@ def _arguments(argv=None):
     )
     parser.add_argument("--serving-timing-mode", choices=("device_only", "device_plus_launch",
         "device_plus_launch_plus_scheduler"), default="device_plus_launch_plus_scheduler")
+    parser.add_argument("--serving-execution-mode", choices=("accelerated", "fast"),
+        default="accelerated", help="detailed analytical execution or optional fast execution")
+    parser.add_argument("--serving-execution-workers", type=int, default=0,
+        help="per-case streaming tail workers; 0 keeps the automatic one-worker-per-case default")
+    parser.add_argument("--serving-state-audit", action="store_true",
+        help="write per-rank work and source-memory lifecycle sidecars")
+    parser.add_argument("--h200-serving-scenario", choices=("analytical_bf16_v1",),
+        help="explicit H200 analytical BF16/Host scenario; other hardware retains its normal settings")
     parser.add_argument("--vllm-sdk-python", type=Path)
     parser.add_argument("--vllm-source-root", type=Path)
     parser.add_argument("--reuse-virtual-run", type=Path,
         help="existing virtual run directory; validate exact commands and regenerate metrics/report without simulation")
+    parser.add_argument(
+        "--with-html", action="store_true",
+        help="Also write the offline interactive HTML report and its projections (default: Markdown-only)")
     args = parser.parse_args(argv)
     try:
         _validate_serving_source_options(args)
@@ -126,12 +137,12 @@ def _run_checked(command: list[str], log_path: Path) -> float:
     return elapsed
 
 
-def _run_kernel(stamp: str, jobs: int) -> dict[str, object]:
+def _run_kernel(stamp: str, jobs: int, *, with_html: bool = False) -> dict[str, object]:
     component_dir = KERNEL_RUNS_ROOT / stamp
     component_dir.mkdir(parents=True, exist_ok=False)
     result_path = component_dir / "kernel_matrix.json"
     evaluation_log = component_dir / "evaluation.log"
-    evaluation_wall = _run_checked([
+    command = [
         sys.executable,
         "scripts/evaluation/run_full_evaluation.py",
         "--part", "kernel",
@@ -144,7 +155,10 @@ def _run_kernel(stamp: str, jobs: int) -> dict[str, object]:
         "--kernel-case-timing-dir", str(component_dir / "case_timing"),
         "--kernel-semantic-output-dir", str(component_dir / "semantic"),
         "--dump-json", str(result_path),
-    ], evaluation_log)
+    ]
+    if with_html:
+        command.append("--with-html")
+    evaluation_wall = _run_checked(command, evaluation_log)
     hardware_wall_times = {}
     for line in evaluation_log.read_text().splitlines():
         match = _KERNEL_TIMING_LINE.fullmatch(line)
@@ -212,7 +226,8 @@ def _load_state(path: Path) -> dict[str, object]:
 
 
 def _validate_serving_source_options(args):
-    if args.refresh_serving_report or args.llmservingsim_report_only:
+    if (args.refresh_serving_report or args.refresh_kernel_report
+            or args.llmservingsim_report_only):
         return
     if (args.reuse_serving_results or args.nvidia_h200_dataset_root is not None
             or args.nvidia_h200_vllm_version == "0.11.0"):
@@ -224,7 +239,7 @@ def _validate_serving_source_options(args):
             "historical state remains readable with --kernel-only")
 
 
-def _run_serving(args, stamp):
+def _run_serving(args, stamp, *, payloads=None):
     _validate_serving_source_options(args)
     if args.vllm_sdk_python is None or args.vllm_source_root is None:
         raise ValueError("virtual Tensor evaluation needs --vllm-sdk-python and --vllm-source-root")
@@ -247,7 +262,17 @@ def _run_serving(args, stamp):
         "--vllm-sdk-python", str(args.vllm_sdk_python.absolute()),
         "--vllm-source-root", str(args.vllm_source_root.resolve(strict=True)),
         "--h200-capture-version", args.nvidia_h200_vllm_version,
-        "--serving-timing-mode", args.serving_timing_mode]
+        "--serving-timing-mode", args.serving_timing_mode,
+        "--serving-execution-mode", args.serving_execution_mode,
+        "--serving-execution-workers", str(args.serving_execution_workers)]
+    if args.serving_state_audit:
+        command.append("--serving-state-audit")
+    if args.with_html:
+        # The standard report's single HTML switch also opts the Serving
+        # matrix into its offline interactive pages; Markdown is unaffected.
+        command.append("--interactive-report")
+    if args.h200_serving_scenario is not None:
+        command += ["--h200-serving-scenario", args.h200_serving_scenario]
     for case in args.case:
         command.extend(("--case", case))
     if args.reuse_virtual_run is not None:
@@ -255,12 +280,30 @@ def _run_serving(args, stamp):
     wall = _run_checked(command, SERVING_RUNS_ROOT / f"virtual-report-{stamp}.log")
     result_path = run_dir / "results.json"
     payload = json.loads(result_path.read_text())
+    if payloads is not None:
+        payloads[str(result_path.resolve())] = payload
     if payload["workload_path"] != "virtual_tensor":
         raise ValueError("standard Serving evaluator returned a non-virtual workload identity")
+    recorded_workers = payload["serving_execution_workers"]
+    if (isinstance(recorded_workers, bool) or not isinstance(recorded_workers, int)
+            or recorded_workers < 0):
+        raise ValueError("standard Serving evaluator returned an invalid serving_execution_workers field")
+    recorded_workers_auto = payload["serving_execution_workers_auto"]
+    if type(recorded_workers_auto) is not bool:
+        raise ValueError("standard Serving evaluator returned an invalid serving_execution_workers_auto field")
     return {"generated_at": timestamp_now(), "source_commit": payload["source_commit"], "workload_path": payload["workload_path"],
         "serving_timing_mode": args.serving_timing_mode,
+        "serving_execution_mode": args.serving_execution_mode,
+        "serving_execution_workers": recorded_workers,
+        "serving_execution_workers_auto": recorded_workers_auto,
+        "serving_state_audit": args.serving_state_audit,
         "nvidia_h200_vllm_version": args.nvidia_h200_vllm_version, "nvidia_h200_dataset_root": None,
         "result_path": str(result_path), "case_count": payload["cell_count"],
+        **({"simulation_batch_timing": payload["simulation_batch_timing"]}
+            if "simulation_batch_timing" in payload else {}),
+        **({"serving_promoted_cases": payload["serving_promoted_cases"],
+            "serving_worker_grant_counts": payload["serving_worker_grant_counts"]}
+            if "serving_promoted_cases" in payload else {}),
         "evaluation_wall_time_s": payload["evaluation_wall_time_seconds"],
         "command_wall_time_s": wall, "plot_wall_time_s": 0.0}
 
@@ -273,10 +316,53 @@ def _source_commit() -> str:
     return completed.stdout.strip()
 
 
-def _assemble_serving_report(report, state, args, *, refresh=False):
+def _assemble_serving_report(report, state, args, *, refresh=False, payloads=None):
+    started = time.perf_counter()
+    wall = _assemble_serving_markdown(report, state, args, refresh=refresh, payloads=payloads)
+    if not args.with_html:
+        return wall
+    from evaluation.reporting.serving_interactive import write_status_report
+    # Reuse the completed Markdown's plots and table values. No prediction,
+    # step recording, or report projection is needed in the default mode.
+    markdown = report.read_text()
+    links = [{"label": label, "path": str((report.parent / path).resolve())}
+        for label, path in re.findall(r"!\[([^\]]*)\]\(([^\n]+)\)", markdown)[:2]]
+    links.append({"label": "完整 Markdown 报告", "path": str(report)})
+    key = str(Path(state["serving"]["result_path"]).resolve())
+    payload = (payloads[key] if payloads is not None and key in payloads
+        else json.loads(Path(key).read_text()))
+    rows = []
+    completed = 0
+    for cell in payload["cells"]:
+        status = cell["prediction_status"]
+        if status == "completed":
+            completed += 1
+            values = []
+            for metric, label in (("ttft_ms", "TTFT"), ("tpot_ms", "TPOT")):
+                mean = cell["metrics"]["latency"][metric]["mean"]
+                values.append(f"{label}：实测 {mean['observed']:.3f} / 预测 {mean['predicted']:.3f} ms")
+            text = "；".join(values)
+        elif status in ("failed", "unsupported"):
+            text = status + "：" + str(cell["prediction_reason"])
+        else:
+            raise ValueError("unknown Serving prediction status: " + status)
+        rows.append({"label": cell["cell_id"], "value": text})
+    write_status_report({"main_chain_status": {"status": "complete" if completed == len(rows) else "partial",
+            "reason": "已保存的 Serving 评估汇总；完成运行不代表精度达标。"},
+        "report_facts": [{"label": "已完成 / Case 总数", "value": f"{completed} / {len(rows)}"},
+            {"label": "Serving 结果表", "value": rows}],
+        "report_links": links}, report.with_suffix(".html"))
+    with report.open("a") as stream:
+        stream.write("\n离线交互概要：[HTML](" + report.with_suffix(".html").name + ")\n")
+    return time.perf_counter() - started
+
+
+def _assemble_serving_markdown(report, state, args, *, refresh=False, payloads=None):
     """Render known paired or anonymous evaluations without rerunning prediction."""
     serving = state["serving"]
-    payload = json.loads(Path(serving["result_path"]).read_text())
+    key = str(Path(serving["result_path"]).resolve())
+    payload = (payloads[key] if payloads is not None and key in payloads
+        else json.loads(Path(serving["result_path"]).read_text()))
     if "report_layout" in payload:
         if payload["report_layout"] != "standard_paired":
             raise ValueError("unknown virtual Serving report layout")
@@ -286,10 +372,11 @@ def _assemble_serving_report(report, state, args, *, refresh=False):
         timing_path = result_dir / "report_generation_timing.json"
         if completed and not timing_path.is_file():
             write_sharegpt_evaluation_report(result_dir, completed,
-                run_elapsed_wall_time_seconds=payload["evaluation_wall_time_seconds"])
+                run_elapsed_wall_time_seconds=payload["evaluation_wall_time_seconds"],
+                plot_jobs=len(completed) if args.jobs == 0 else args.jobs)
         serving["plot_wall_time_s"] = (json.loads(timing_path.read_text())["plot_wall_time_seconds"]
             if timing_path.is_file() else 0.0)
-        return write_serving_evaluation_report(report, state,
+        return _write_serving_evaluation_report_payload(report, state, payload, started=time.perf_counter(),
             llmservingsim_results=args.llmservingsim_results, refresh_latency_plots=refresh)
     if "workload_path" in payload:
         if payload["workload_path"] != "virtual_tensor":
@@ -316,7 +403,7 @@ def _assemble_serving_report(report, state, args, *, refresh=False):
             with report.open("a") as stream:
                 stream.write("\n\n" + "\n".join(section) + "\n")
         return time.perf_counter() - started
-    return write_serving_evaluation_report(report, state,
+    return _write_serving_evaluation_report_payload(report, state, payload, started=time.perf_counter(),
         llmservingsim_results=args.llmservingsim_results, refresh_latency_plots=refresh)
 
 
@@ -336,6 +423,18 @@ def run(argv=None) -> tuple[Path, ...]:
             hashes["report_assembly_wall_time_s"]["serving_report.md"] = wall
             _write_json_atomic(hashes_path, hashes)
         return (report,)
+    if args.refresh_kernel_report:
+        state = _load_state(output_dir / "state.json")
+        report = output_dir / "kernel_report.md"
+        wall = write_kernel_evaluation_report(report, state,
+            with_html=args.with_html)
+        hashes_path = output_dir / "hashes.json"
+        if hashes_path.is_file():
+            hashes = json.loads(hashes_path.read_text())
+            hashes["sha256"]["kernel_report.md"] = hashlib.sha256(report.read_bytes()).hexdigest()
+            hashes["report_assembly_wall_time_s"]["kernel_report.md"] = wall
+            _write_json_atomic(hashes_path, hashes)
+        return (report,)
     if args.llmservingsim_report_only:
         if args.llmservingsim_results is None:
             raise ValueError("--llmservingsim-report-only requires --llmservingsim-results")
@@ -348,14 +447,16 @@ def run(argv=None) -> tuple[Path, ...]:
     output_dir.mkdir(parents=True, exist_ok=True)
     state_path = output_dir / "state.json"
     stamp = time.strftime("%Y%m%d_%H%M%S")
+    # Run-owned parsed objects; no global or cross-experiment result cache.
+    serving_payloads = {}
     if args.all:
         # Both component runners inherit the caller's fixed CPU affinity.
         # Running their 45-worker pools together makes the Kernel card timing
         # depend on the concurrent Serving mix, so it is not a valid
         # cross-hardware timing comparison.  Each component still evaluates
         # its independent cases in parallel internally.
-        kernel = _run_kernel(stamp, args.kernel_jobs)
-        serving = _run_serving(args, stamp)
+        kernel = _run_kernel(stamp, args.kernel_jobs, with_html=args.with_html)
+        serving = _run_serving(args, stamp, payloads=serving_payloads)
         update_mode = "all"
     else:
         if state_path.is_file():
@@ -365,12 +466,12 @@ def run(argv=None) -> tuple[Path, ...]:
         else:
             previous = _load_state(state_path)
         if args.kernel_only:
-            kernel = _run_kernel(stamp, args.kernel_jobs)
+            kernel = _run_kernel(stamp, args.kernel_jobs, with_html=args.with_html)
             serving = previous["serving"]
             update_mode = "kernel-only"
         elif args.serving_only:
             kernel = previous["kernel"]
-            serving = _run_serving(args, stamp)
+            serving = _run_serving(args, stamp, payloads=serving_payloads)
             update_mode = "serving-only"
         else:
             raise AssertionError("one standard report mode must be selected")
@@ -390,12 +491,12 @@ def run(argv=None) -> tuple[Path, ...]:
     if update_mode in {"all", "kernel-only"}:
         kernel_report = output_dir / "kernel_report.md"
         assembly_wall_times["kernel_report.md"] = write_kernel_evaluation_report(
-            kernel_report, state
+            kernel_report, state, with_html=args.with_html,
         )
         report_paths.append(kernel_report)
     if update_mode in {"all", "serving-only"}:
         serving_report = output_dir / "serving_report.md"
-        assembly_wall_times["serving_report.md"] = _assemble_serving_report(serving_report, state, args)
+        assembly_wall_times["serving_report.md"] = _assemble_serving_report(serving_report, state, args, payloads=serving_payloads)
         report_paths.append(serving_report)
         _write_json_atomic(state_path, state)
     legacy_report = output_dir / "report.md"

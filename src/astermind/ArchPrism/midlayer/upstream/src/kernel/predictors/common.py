@@ -1,6 +1,9 @@
 """Shared physical model input and arithmetic for pure predictors."""
 
+from src.kernel.prediction_cache import RuntimeCache
+
 import dataclasses
+import itertools
 import math
 import threading
 from fractions import Fraction
@@ -10,6 +13,7 @@ from src.kernel.kernel_spec import (
     KernelPrediction, KernelSpec, graph_replayed_launch, prediction_from_ns,
 )
 from src.kernel.model_contract import (
+    PredictionDiagnostics,
     PredictionInput,
     AIV_COMPLETE_TASK_FLOOR_ONLY,
     AIV_EMPTY_TASK_SHELL_COMPETING_SOURCE_FLOOR,
@@ -35,6 +39,7 @@ from src.kernel.model_contract import (
     FiaSplitFuseWorkPlan,
     GpuGroupedGemmPipelineEnvelopeDemand,
     MemoryAccessClassDemand,
+    MemoryAccessClassSignature,
     MemoryNodeDemand,
     MemoryPathDemand,
     MemorySourceDemand,
@@ -60,13 +65,13 @@ FULL_RESOURCE_OCCUPANCY = 1.0
 
 
 _PIPELINE_STAGE_TEMPLATE_CACHE_SIZE = 4096
-_pipeline_stage_templates = {}
+_pipeline_stage_templates = RuntimeCache()
 _pipeline_stage_templates_lock = threading.Lock()
 _TYPED_COMPUTE_PIPELINE_STAGE_TEMPLATE_CACHE_SIZE = 4096
-_typed_compute_pipeline_stage_templates = {}
+_typed_compute_pipeline_stage_templates = RuntimeCache()
 _typed_compute_pipeline_stage_templates_lock = threading.Lock()
 _MEMORY_ACCESS_TEMPLATE_CACHE_SIZE = 4096
-_memory_access_templates = {}
+_memory_access_templates = RuntimeCache()
 _memory_access_templates_lock = threading.Lock()
 
 
@@ -1294,6 +1299,419 @@ def attach_pipeline_work_plan(
     )
 
 
+def merge_operand_read_paths(paths, *, name="operand_read"):
+    """Merge untyped requests competing for the same ordered ingress path.
+
+    This preserves bytes and transactions at every node. It does not merge
+    independent producers or typed services with different physical meanings.
+    """
+    if not paths or any(path.access_kind != "read" for path in paths):
+        raise ValueError("operand merge requires nonempty read paths")
+    first = paths[0]
+    if any(path.source != first.source or path.queues != first.queues
+           or path.access_class_demands for path in paths):
+        raise ValueError("operand merge requires one untyped request source")
+    roles = tuple(node.resource_role for node in first.nodes)
+    if any(tuple(node.resource_role for node in path.nodes) != roles for path in paths):
+        raise ValueError("operand merge requires matching hierarchy nodes")
+    nodes = []
+    for index, original in enumerate(first.nodes):
+        items = tuple(path.nodes[index] for path in paths)
+        if any((node.transaction_bytes, node.independent_service_streams,
+                node.capacity_ceiling_resource_role) != (
+                original.transaction_bytes, original.independent_service_streams,
+                original.capacity_ceiling_resource_role) for node in items):
+            raise ValueError("operand merge requires matching transaction semantics")
+        nodes.append(dataclasses.replace(original, bytes=math.fsum(node.bytes for node in items),
+            transactions=(None if original.transactions is None
+                          else math.fsum(node.transactions for node in items))))
+    return dataclasses.replace(first, name=name, nodes=tuple(nodes),
+        initial_transactions=(None if first.initial_transactions is None
+                              else math.fsum(path.initial_transactions for path in paths)))
+
+
+def attach_recurrent_matmul_pipeline(inp, hardware, *, task_count, k_tiles,
+                                     buffer_slots, read_path_name, write_path_name,
+                                     resident_ctas_per_unit=1, output_relayout_bytes=0.0,
+                                     task_memory_bytes=None):
+    """Coarse resident-CTA load/MMA/store schedule using existing services.
+
+    The source owner supplies its stage count and populated workgroups. CTA
+    assignment is a uniform analytical worker model, not observed placement.
+    Concurrent CTA lanes share each unit's capacity equally; multiplying the
+    lane count does not multiply any hardware resource capacity.
+
+    Optional source-ordered (read, write) byte pairs retain masked task tails.
+    They partition the existing paths, including their aggregate downstream
+    ratios; they do not infer per-task cache hits or change global traffic.
+    """
+    for name, value in (("task_count", task_count), ("k_tiles", k_tiles),
+                        ("buffer_slots", buffer_slots),
+                        ("resident_ctas_per_unit", resident_ctas_per_unit)):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+    if hardware.gpu_store_completion_scope != "l2":
+        raise ValueError("recurrent matmul store retirement requires coherent L2")
+    if resident_ctas_per_unit > hardware.max_blocks_per_unit:
+        raise ValueError("resident CTA count exceeds hardware block capacity")
+    if (isinstance(output_relayout_bytes, bool)
+            or not isinstance(output_relayout_bytes, (int, float))
+            or not math.isfinite(output_relayout_bytes) or output_relayout_bytes < 0):
+        raise ValueError("output_relayout_bytes must be finite non-negative bytes")
+    max_read_scale = 1.0
+    if task_memory_bytes is not None:
+        if (not isinstance(task_memory_bytes, tuple)
+                or len(task_memory_bytes) != task_count
+                or any(not isinstance(pair, tuple) or len(pair) != 2
+                       for pair in task_memory_bytes)):
+            raise ValueError("task_memory_bytes requires one read/write pair per task")
+        if any(isinstance(value, bool) or not isinstance(value, (int, float))
+               or not math.isfinite(value) or value <= 0
+               for pair in task_memory_bytes for value in pair):
+            raise ValueError("task_memory_bytes must contain positive finite bytes")
+        totals = []
+        for index, name in enumerate((read_path_name, write_path_name)):
+            paths = tuple(path for path in inp.memory_paths if path.name == name)
+            if len(paths) != 1:
+                raise ValueError("task byte partition requires one named memory path")
+            nodes = tuple(node for node in paths[0].nodes
+                          if node.resource_role == "l2_cache")
+            if len(nodes) != 1:
+                raise ValueError("task byte partition requires one L2 node per path")
+            total = math.fsum(pair[index] for pair in task_memory_bytes)
+            if not math.isclose(total, nodes[0].bytes, rel_tol=1e-12, abs_tol=1e-6):
+                raise ValueError("task bytes must conserve the aggregate L2 path")
+            totals.append(total)
+        read_mean, write_mean = (total / task_count for total in totals)
+        max_read_scale = max(pair[0] / read_mean for pair in task_memory_bytes)
+        if len(set(task_memory_bytes)) == 1:
+            task_memory_bytes = None
+    operand_shared_fraction = 0.0
+    output_shared_fraction = 0.0
+    if output_relayout_bytes > 0:
+        shared_bytes = inp.demand_per_resource["smem"]
+        if output_relayout_bytes >= shared_bytes:
+            raise ValueError("output relayout requires positive shared operand work")
+        if {d.resource_role for d in inp.compute_demands} != {"compute_tensor"}:
+            raise ValueError("shared output relayout requires one Tensor resource")
+        if {"smem", "compute_tensor"} & set(inp.resource_time_overrides_ns):
+            raise ValueError("shared operand dominance cannot use time overrides")
+        from src.kernel.formula import PerformanceFormula
+        tensor, = inp.compute_demands
+        tensor_capacity = PerformanceFormula(hardware)._compute_capacity(
+            inp, hardware.resource_by_role("compute_tensor"))
+        shared_capacity = hardware.resource_by_role("smem").effective_capacity(
+            inp.active_units, sm_freq_hz=inp.sm_freq_hz, dram_freq_hz=inp.dram_freq_hz)
+        operand_bytes = shared_bytes - output_relayout_bytes
+        tensor_time = tensor.operations / (tensor_capacity * tensor.shape_efficiency
+            * min(1.0, tensor.schedule_efficiency / inp.wave_efficiency))
+        if operand_bytes * max_read_scale / shared_capacity > tensor_time:
+            raise ValueError("operand shared service must finish within Tensor stage")
+        # The operand SMEM capacity branch runs beside Tensor work. Its
+        # shorter service on every task lets the matrix buffer retain its existing
+        # release. The output fraction alone follows matrix completion.
+        operand_shared_fraction = operand_bytes / shared_bytes
+        output_shared_fraction = output_relayout_bytes / shared_bytes
+    workers = min(task_count, inp.active_units * resident_ctas_per_unit)
+    counts = tuple((task_count - worker + workers - 1) // workers for worker in range(workers))
+    def cta_pattern(worker, read_scale=1.0, write_scale=1.0):
+        def tick(name, *, first, repeat=1):
+            stages = (
+                PipelineStageDemand("operand_load", f"memory:{read_path_name}",
+                    read_scale / (task_count * k_tiles), include_first_request_latency=first,
+                    prior_resources=(f"memory:{write_path_name}",) if first else ()),
+                PipelineStageDemand("matrix", "compute:compute_tensor", 1.0 / (task_count * k_tiles)),
+            )
+            if operand_shared_fraction:
+                stages += (PipelineStageDemand("operand_shared", "resource:smem",
+                    operand_shared_fraction * read_scale / (task_count * k_tiles),
+                    predecessors=("operand_load",)),)
+            return PipelineTaskDemand(name, worker, stages, repeat_count=repeat)
+        tasks = (tick("first_k_tile", first=True),)
+        if k_tiles > 1:
+            tasks += (tick("remaining_k_tiles", first=False, repeat=k_tiles - 1),)
+        store_stages = ()
+        if output_shared_fraction:
+            store_stages += (PipelineStageDemand("output_shared", "resource:smem",
+                output_shared_fraction / task_count, predecessors=(),
+                prior_resources=("compute:compute_tensor",)),)
+        store_stages += (PipelineStageDemand(
+            "output_store", f"memory:{write_path_name}", write_scale / task_count,
+            predecessors=("output_shared",) if output_shared_fraction else (),
+            prior_resources=("compute:compute_tensor",),
+            completion_resource_roles=("l2_cache",)),)
+        tasks += (PipelineTaskDemand("store", worker, store_stages),)
+        return PipelineTaskSequenceDemand("cta", worker, tasks)
+
+    programs = []
+    if task_memory_bytes is None:
+        for count in dict.fromkeys(counts):
+            physical = tuple(worker for worker, value in enumerate(counts) if value == count)
+            worker = physical[0]
+            programs.append(PipelineTaskProgramDemand(f"worker_{worker}_ctas", worker,
+                (cta_pattern(worker),), (0,), repeat_count=count,
+                worker_multiplicity=len(physical), physical_workers=physical))
+    else:
+        by_profile = {}
+        for worker in range(workers):
+            profile = task_memory_bytes[worker::workers]
+            if profile not in by_profile:
+                by_profile[profile] = []
+            by_profile[profile].append(worker)
+        for profile, physical in by_profile.items():
+            worker = physical[0]
+            patterns, order, indices = [], [], {}
+            for pair, same in itertools.groupby(profile):
+                repeats = sum(1 for _ in same)
+                key = (pair, repeats)
+                if key not in indices:
+                    indices[key] = len(patterns)
+                    sequence = cta_pattern(worker, pair[0] / read_mean, pair[1] / write_mean)
+                    patterns.append(dataclasses.replace(sequence,
+                        name=f"cta_{len(patterns)}", repeat_count=repeats))
+                order.append(indices[key])
+            programs.append(PipelineTaskProgramDemand(f"worker_{worker}_ctas", worker,
+                tuple(patterns), tuple(order), worker_multiplicity=len(physical),
+                physical_workers=tuple(physical)))
+    plan = PipelineWorkPlan(workers, tuple(programs), (
+        PipelineBuffer("operand_ring", "operand_load", "matrix", buffer_slots, "worker"),))
+    return attach_pipeline_work_plan(inp, hardware, plan)
+
+
+def attach_single_panel_matmul_pipeline(inp, hardware, *, task_count, dtype,
+                                        tile_m, tile_k, panel_bytes,
+                                        resident_ctas_per_unit, row_stride_bytes,
+                                        read_path_name, write_path_name):
+    """Aggregate a measured single-panel class with reclaimable shared service.
+
+    The byte-only partial-cohort evidence admits work conservation instead of
+    permanently reserving bandwidth for completed CTA lanes. Whole operand,
+    matrix/shared and output phases remain serialized as a coarse envelope.
+    Native placement, fine overlap and per-task cache ratios stay unbound.
+    """
+    if (inp.mem_model != "gpu_mshr" or inp.pipeline_plan is not None
+            or inp.sm_freq_hz != hardware.nominal_sm_freq_hz):
+        return inp
+    name = (f"single_panel_async_copy_threads{inp.block_size}"
+            f"_resident{resident_ctas_per_unit}_b{panel_bytes}")
+    signature = MemoryAccessClassSignature(access_class=name, dtype=dtype,
+        tile_m=tile_m, tile_k=tile_k, logical_row_bytes=row_stride_bytes)
+    services = tuple(s for s in hardware.memory_access_class_services
+        if s.service == name and s.signature == signature
+        and s.access_kind == "read" and s.ingress_resource_role == "l2_cache")
+    if not services:
+        return inp
+    if len(services) != 1:
+        raise ValueError("single-panel progress requires one exact service")
+    service, = services
+    table = service.logical_byte_capacity_per_s_by_grid_ctas
+    if table is None:
+        raise ValueError("single-panel progress requires measured cohorts")
+    if task_count not in tuple(grid for grid, _ in table):
+        return inp
+    paths = tuple(p for p in inp.memory_paths if p.name == read_path_name)
+    if len(paths) != 1 or paths[0].access_kind != "read":
+        raise ValueError("single-panel envelope requires one operand path")
+    path, = paths
+    if path.access_class_demands:
+        return inp
+    plan = PipelineWorkPlan(1, (PipelineTaskDemand("single_panel_aggregate", 0, (
+        PipelineStageDemand("operand_load", f"memory:{read_path_name}", 1.0,
+            include_first_request_latency=True),
+        PipelineStageDemand("matrix", "compute:compute_tensor", 1.0),
+        PipelineStageDemand("operand_shared", "resource:smem", 1.0,
+            predecessors=("operand_load",)),
+        PipelineStageDemand("output_store", f"memory:{write_path_name}", 1.0,
+            predecessors=("matrix", "operand_shared"),
+            completion_resource_roles=("l2_cache",)),
+    )),))
+    result = attach_pipeline_work_plan(inp, hardware, plan)
+    return dataclasses.replace(result, limitations=result.limitations + (
+        "single_panel_work_conserving_aggregate_operand_matrix_output_envelope",
+        "single_panel_partial_cohort_and_native_overlap_remain_analytical",))
+
+
+def attach_async_copy_ring_capacity(inp, hardware, *, read_path_name, dtype,
+                                    tile_m, tile_k, panel_bytes, buffer_slots,
+                                    resident_ctas_per_unit, k_tiles):
+    """Bind an independently measured byte-ring capacity to its physical class.
+
+    This is a frontend/byte-copy lower bound beside generic hierarchy service,
+    not a replacement L2 port rate or a sum of cache-hit and cache-miss times.
+    The published primitive spans 64..1024 rounds with a fully populated chip.
+    Source owners retain their own stage, residency and operand-byte derivation.
+    """
+    if (inp.mem_model != "gpu_mshr" or not 64 <= k_tiles <= 1024
+            or inp.active_units != hardware.num_compute_units
+            or inp.sm_freq_hz != hardware.nominal_sm_freq_hz):
+        return inp
+    name = (f"async_copy_ring_threads{inp.block_size}_depth{buffer_slots}"
+            f"_resident{resident_ctas_per_unit}")
+    signature = MemoryAccessClassSignature(
+        access_class=name, dtype=dtype, tile_m=tile_m, tile_k=tile_k,
+        logical_row_bytes=panel_bytes)
+    services = tuple(service for service in hardware.memory_access_class_services
+                     if service.service == name and service.access_kind == "read"
+                     and service.ingress_resource_role == "l2_cache"
+                     and service.signature == signature)
+    if not services:
+        return inp
+    if len(services) != 1:
+        raise ValueError("async copy ring capacity requires one exact service")
+    paths = tuple(path for path in inp.memory_paths if path.name == read_path_name)
+    if len(paths) != 1 or paths[0].access_kind != "read":
+        raise ValueError("async copy ring capacity requires one operand read")
+    path, = paths
+    if path.access_class_demands:
+        raise ValueError("async copy ring capacity cannot replace existing typed services")
+    if path.nodes[0].resource_role != "l2_cache":
+        raise ValueError("async copy ring requires L2 ingress")
+    demand = MemoryAccessClassDemand(
+        service=name, ingress_resource_role="l2_cache",
+        logical_bytes=path.nodes[0].bytes, signature=signature)
+    typed_path = dataclasses.replace(path, access_class_demands=(demand,))
+    return dataclasses.replace(inp,
+        memory_paths=tuple(typed_path if item is path else item for item in inp.memory_paths),
+        limitations=inp.limitations + (
+            "async_copy_ring_capacity_is_independent_byte_frontend_bound",
+            "async_copy_ring_masked_and_cold_bytes_use_aggregate_capacity_approximation",))
+
+
+def attach_coalesced_async_copy_progress_floor(inp, hardware, *, read_path_name,
+        dtype, tile_m, tile_k, panel_bytes, buffer_slots, row_stride_bytes,
+        requesting_B_bytes, unique_B_bytes, maximum_fanout):
+    """Compete compulsory same-address request progress with original work.
+
+    DRAM request merging reduces unique traffic but does not make pending
+    requesters into completed cache hits. The source supplies first-wave
+    duplicate work, treating every later weight replay as free in this floor.
+    Independent byte-only fanout capacities retain full copy/control work.
+    """
+    if (inp.mem_model != "gpu_mshr"
+            or inp.sm_freq_hz != hardware.nominal_sm_freq_hz
+            or not 1 <= maximum_fanout <= 16):
+        return inp
+    if not (math.isfinite(requesting_B_bytes) and math.isfinite(unique_B_bytes)
+            and 0 < unique_B_bytes <= requesting_B_bytes):
+        raise ValueError("coalesced B work requires positive conserved bytes")
+    fanout = requesting_B_bytes/unique_B_bytes
+    if fanout > maximum_fanout:
+        raise ValueError("average request fanout exceeds maximum")
+    lower = 2**int(math.floor(math.log2(fanout)))
+    upper = lower if fanout == lower else lower*2
+    seconds_per_byte = []
+    for count in (lower,upper):
+        name = (f"coalesced_async_copy_threads{inp.block_size}_slots{buffer_slots}"
+                f"_b{panel_bytes}_fanout{count}")
+        signature = MemoryAccessClassSignature(access_class=name,dtype=dtype,
+            tile_m=tile_m,tile_k=tile_k,logical_row_bytes=row_stride_bytes)
+        services = tuple(s for s in hardware.memory_access_class_services
+            if s.service == name and s.signature == signature
+            and s.access_kind == "read" and s.ingress_resource_role == "l2_cache")
+        if not services:
+            return inp
+        if len(services) != 1:
+            raise ValueError("coalesced progress requires one exact capability")
+        service, = services
+        table = service.logical_byte_capacity_per_s_by_grid_ctas
+        if table is None:
+            raise ValueError("coalesced progress requires measured grid points")
+        points = dict(table)
+        if inp.grid_size not in points:
+            return inp
+        seconds_per_byte.append(1/points[inp.grid_size])
+    paths = tuple(p for p in inp.memory_paths if p.name == read_path_name)
+    if len(paths) != 1 or paths[0].access_kind != "read":
+        raise ValueError("coalesced progress requires one B read path")
+    path, = paths
+    if path.access_class_demands:
+        return inp
+    ingress, = (n for n in path.nodes if n.resource_role == "l2_cache")
+    if requesting_B_bytes > ingress.bytes*(1+1e-12):
+        raise ValueError("compulsory request work exceeds B ingress")
+    # Interpolate only independently measured adjacent fanouts. The physical
+    # launch grid is exact; failed or absent endpoints are never bridged.
+    share = 0 if lower == upper else (fanout-lower)/(upper-lower)
+    service_time = requesting_B_bytes*(seconds_per_byte[0]*(1-share)
+                                      + seconds_per_byte[1]*share)*1e9
+    if inp.execution_time_floor_ns is not None:
+        service_time = max(service_time,inp.execution_time_floor_ns)
+    return dataclasses.replace(inp,execution_time_floor_ns=service_time,
+        limitations=inp.limitations + (
+            "compulsory_coalesced_B_request_progress_is_competing_byte_only_floor",
+            "coalesced_B_uniform_wave_and_mean_fanout_are_analytical",
+            "coalesced_B_later_weight_replays_and_nonrequesting_CTAs_are_free_in_floor",))
+
+
+def attach_finite_async_copy_progress_floor(inp, hardware, *, read_path_name,
+                                           dtype, tile_m, tile_k, panel_bytes,
+                                           buffer_slots, row_stride_bytes):
+    """Compete an independent full byte-ring body with the existing program.
+
+    Rates retain copy-group/control/synchronization progress. They must not
+    replace L2 capacity, inflate global payload, or be added to the matrix
+    pipeline. Only exact eligible measured grids bind; holes stay unbound.
+    The source owner proves the matching padded tile copy allocation. The
+    primitive's broadcast A layout is optimistic for native gather tails;
+    inactive CTAs and B hits contribute no cold bytes to this floor. The
+    original physical launch and complete A/cache work remain priced.
+    """
+    if (inp.mem_model != "gpu_mshr"
+            or inp.sm_freq_hz != hardware.nominal_sm_freq_hz):
+        return inp
+    name = (f"finite_async_copy_threads{inp.block_size}_slots{buffer_slots}"
+            f"_b{panel_bytes}")
+    signature = MemoryAccessClassSignature(
+        access_class=name, dtype=dtype, tile_m=tile_m, tile_k=tile_k,
+        logical_row_bytes=row_stride_bytes)
+    services = tuple(service for service in hardware.memory_access_class_services
+                     if service.service == name and service.access_kind == "read"
+                     and service.ingress_resource_role == "l2_cache"
+                     and service.signature == signature)
+    if not services:
+        return inp
+    if len(services) != 1:
+        raise ValueError("finite async copy requires one exact service")
+    service, = services
+    table = service.logical_byte_capacity_per_s_by_grid_ctas
+    if table is None:
+        raise ValueError("finite async progress requires measured grid points")
+    if inp.grid_size not in tuple(grid for grid, _ in table):
+        return inp
+    paths = tuple(path for path in inp.memory_paths if path.name == read_path_name)
+    if len(paths) != 1 or paths[0].access_kind != "read":
+        raise ValueError("finite async progress requires one B read path")
+    path, = paths
+    nodes = {node.resource_role: node for node in path.nodes}
+    if (path.access_class_demands or set(nodes) != {"l2_cache", "dram"}
+            or nodes["dram"].bytes <= 0):
+        return inp
+    if nodes["dram"].bytes > nodes["l2_cache"].bytes:
+        raise ValueError("finite async cold bytes exceed B ingress")
+    # Resolve the existing typed capability without attaching its finite
+    # progress to each K stage (which would charge startup/control twice).
+    # A mixed stream retains the complete original cache/DRAM pipeline.
+    # This competing cold-substream floor treats B hits as free and scales
+    # even the primitive's control work down with its cold byte fraction.
+    # It is deliberately optimistic; it neither serializes two cache tiers
+    # nor assigns a measured all-cold duration to the complete mixed stream.
+    demand = MemoryAccessClassDemand(service=name, ingress_resource_role="l2_cache",
+                                    logical_bytes=nodes["dram"].bytes,
+                                    signature=signature)
+    from src.kernel.memory_path_solver import solve_memory_access_classes
+    diagnostic, = solve_memory_access_classes(
+        (dataclasses.replace(path, access_class_demands=(demand,)),),
+        services, grid_size=inp.grid_size)
+    floor = diagnostic.service_time_s * 1e9
+    if inp.execution_time_floor_ns is not None:
+        floor = max(floor, inp.execution_time_floor_ns)
+    return dataclasses.replace(inp, execution_time_floor_ns=floor,
+        limitations=inp.limitations + (
+            "finite_async_byte_ring_complete_body_is_competing_progress_floor",
+            "finite_async_byte_ring_cold_substream_treats_B_hits_as_free",
+            "finite_async_byte_ring_broadcast_A_and_native_layout_are_approximations",))
+
+
 def attach_attention_pipeline_envelope(
         inp: PredictionInput, hardware,
         envelope: AttentionPipelineEnvelopeDemand) -> PredictionInput:
@@ -1481,16 +1899,26 @@ def causal_attention_pairs(
 
 
 def launch_wave_geometry(kernel: KernelSpec, hardware, *,
-                         execution_units: Optional[int] = None
+                         execution_units: Optional[int] = None,
+                         active_workgroups: Optional[int] = None,
                          ) -> Tuple[float, float, int]:
     """Return fixed resource occupancy, tail-wave efficiency and active units.
 
     ``smem``, registers, CTA residency and resident warps are deliberately
     absent.  A finite grid still exposes a physical tail because workgroups
-    beyond the active units require a later wave.
+    beyond the active units require a later wave. Source-proven early-return
+    workgroups can be excluded from useful-work capacity without changing
+    the physical launch or its dispatch boundary.
     """
 
     launch = kernel.launch
+    workgroups = launch.grid_size
+    if active_workgroups is not None:
+        if isinstance(active_workgroups, bool) or not isinstance(active_workgroups, int):
+            raise TypeError("active_workgroups must be an integer")
+        if not 0 < active_workgroups <= launch.grid_size:
+            raise ValueError("active_workgroups must be within the physical launch")
+        workgroups = active_workgroups
     if execution_units is None:
         unit_count = hardware.num_compute_units
     else:
@@ -1500,12 +1928,12 @@ def launch_wave_geometry(kernel: KernelSpec, hardware, *,
         if execution_units <= 0:
             raise ValueError("execution_units must be positive")
         unit_count = execution_units
-    wave_size = min(launch.grid_size, unit_count)
+    wave_size = min(workgroups, unit_count)
     if wave_size <= 0:
         raise ValueError("launch produced a non-positive wave size")
-    waves = launch.grid_size / wave_size
+    waves = workgroups / wave_size
     wave_efficiency = waves / math.ceil(waves)
-    active_units = min(launch.grid_size, unit_count)
+    active_units = min(workgroups, unit_count)
     if hardware.kernel_memory_model not in (
             "gpu_mshr", "npu_tile", "pim_bank", "systolic_scratchpad"):
         raise ValueError(
@@ -1515,6 +1943,75 @@ def launch_wave_geometry(kernel: KernelSpec, hardware, *,
         FULL_RESOURCE_OCCUPANCY,
         wave_efficiency,
         active_units,
+    )
+
+
+def sum_serial_kernel_predictions(stages) -> KernelPrediction:
+    parts = tuple(stages)
+    if not parts:
+        raise ValueError("serial prediction requires at least one stage")
+    names = tuple(name for name, _ in parts)
+    if any(not isinstance(name, str) or not name for name in names) or len(set(names)) != len(names):
+        raise ValueError("serial prediction stage names must be non-empty and unique")
+    if any(prediction.diagnostics is None for _, prediction in parts):
+        raise ValueError("serial prediction stages require structured diagnostics")
+    if any(prediction.diagnostics.pipeline is not None for _, prediction in parts):
+        raise ValueError("serial composition of nested pipeline diagnostics is unsupported")
+    resources = {}
+    compute = {}
+    arbitration = {}
+    for _, prediction in parts:
+        for role, seconds in prediction.t_per_resource.items():
+            resources[role] = (resources[role] if role in resources else 0.0) + seconds
+        for role, seconds in prediction.diagnostics.compute_time_s.items():
+            compute[role] = (compute[role] if role in compute else 0.0) + seconds
+        for item in prediction.diagnostics.memory_arbitration:
+            role = item.resource_role
+            if role not in arbitration:
+                arbitration[role] = []
+            arbitration[role].append(item)
+    combined_arbitration = []
+    for role, items in arbitration.items():
+        first = items[0]
+        if any(item.arbitration_mode != first.arbitration_mode
+                or item.read_capacity_per_s != first.read_capacity_per_s
+                or item.write_capacity_per_s != first.write_capacity_per_s
+                for item in items[1:]):
+            raise ValueError(f"serial memory arbitration capacities differ for {role}")
+        combined_arbitration.append(dataclasses.replace(first,
+            read_bytes=math.fsum(item.read_bytes for item in items),
+            write_bytes=math.fsum(item.write_bytes for item in items),
+            read_service_time_s=math.fsum(item.read_service_time_s for item in items),
+            write_service_time_s=math.fsum(item.write_service_time_s for item in items),
+            analytical_time_s=math.fsum(item.analytical_time_s for item in items),
+            effective_time_s=math.fsum(item.effective_time_s for item in items),
+            overridden=any(item.overridden for item in items)))
+    support_levels = {prediction.diagnostics.support_level for _, prediction in parts}
+    support_level = next(iter(support_levels)) if len(support_levels) == 1 else "partial"
+    limitations = tuple(dict.fromkeys(
+        limitation for _, prediction in parts
+        for limitation in prediction.diagnostics.limitations))
+    diagnostics = PredictionDiagnostics(
+        compute_time_s=compute,
+        memory=tuple(dataclasses.replace(item, path_name=f"{name}:{item.path_name}")
+            for name, prediction in parts for item in prediction.diagnostics.memory),
+        memory_access_classes=tuple(dataclasses.replace(item, path_name=f"{name}:{item.path_name}")
+            for name, prediction in parts for item in prediction.diagnostics.memory_access_classes),
+        memory_arbitration=tuple(combined_arbitration),
+        pipeline=None,
+        critical_path=tuple(f"{name}:{component}" for name, prediction in parts
+            for component in prediction.diagnostics.critical_path),
+        support_level=support_level,
+        limitations=limitations + ("serial_stage_support_and_critical_path_combined",),
+    )
+    groups = {name: prediction.t_total_s for name, prediction in parts}
+    return KernelPrediction(
+        t_total_s=sum(groups.values()),
+        t_per_group=groups,
+        t_launch_s=sum(prediction.t_launch_s for _, prediction in parts),
+        bottleneck_group=max(groups, key=groups.__getitem__),
+        t_per_resource=resources,
+        diagnostics=diagnostics,
     )
 
 

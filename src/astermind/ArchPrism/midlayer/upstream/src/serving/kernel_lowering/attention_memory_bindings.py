@@ -3,7 +3,7 @@
 Logical cache selections preserve their real arena without inventing page IDs,
 slot contents, or library workspace. Native ABIs lacking source ports stay partial.
 """
-from dataclasses import replace
+from dataclasses import fields, replace
 from math import prod
 
 from src.kernel.kernel_spec import KernelKind
@@ -14,6 +14,451 @@ from src.kernel.memory_access_builder import (
 from src.kernel.memory_cache_update import paged_kv_source_index_type
 from src.serving.workload.workload_graph import WorkloadKind
 from .memory_bindings import source_memory_events
+
+
+def fa3_gqa_caller_facts(attributes,hardware):
+    """Normalize complete optional graph-caller facts at the source boundary."""
+    fields=("fa3_gqa_graph_configured_mode","fa3_gqa_max_capture_tokens","fa3_gqa_query_tokens")
+    present=tuple(field in attributes for field in fields)
+    if any(present) and not all(present):
+        raise ValueError("FA3 caller graph facts must be complete")
+    graph=({"graph_configured_mode":attributes[fields[0]],"max_capture_tokens":attributes[fields[1]],
+        "query_tokens":attributes[fields[2]]} if all(present) else {})
+    facts = hardware.fa3_gqa_model_call_facts(attributes["source_model_execution_version"],
+        page_size=None if attributes["fa3_gqa_page_origin"]=="vllm030_CacheConfig_default" else attributes["fa3_gqa_page_size"],
+        **graph)
+    if "source_program" in attributes and attributes["source_program"] == "vllm_0_30_fa3_gqa_full_decode":
+        if not all(present) or attributes[fields[0]] not in ("FULL_DECODE_ONLY", "FULL_AND_PIECEWISE"):
+            raise ValueError("FA3 FULL caller requires its exact capture configuration")
+        facts["fa3_gqa_caller_scenario"] = "vllm030_full_decode_zero_request_tail_default_aot"
+    return facts
+
+
+def fa3_plan_call_groups(calls):
+    """Retain explicitly source-bound library groups through deferred pricing."""
+    groups = {}
+    for call in calls:
+        source = call.memory_source
+        if source is not None and "fa3_full_aot_component" in source.attributes:
+            continue
+        if source is None or not ("fa3_source_revision" in source.attributes
+                or "fa3_gqa_caller_scenario" in source.attributes or "fa3_expanded_source_revision" in source.attributes):
+            continue
+        key = (source.pool_name, source.rank, source.node_id)
+        if key not in groups:
+            groups[key] = []
+        groups[key].append(call)
+    by_id = {call.call_id: call for call in calls}
+    source_completions={call.source_node_ids[0]:call.call_id for call in calls if len(call.source_node_ids)==1}
+    for group in groups.values():
+        main = group[0]
+        attrs = main.memory_source.attributes
+        full = ("source_program" in attrs
+            and attrs["source_program"] == "vllm_0_30_fa3_gqa_full_decode")
+        if ("fa3_gqa_caller_scenario" in attrs and main.kernel_spec.kind is KernelKind.FLASH_ATTN
+                and not full):
+            producer_id = attrs["fa3_gqa_metadata_prepare_node"]
+            if producer_id not in by_id:
+                raise ValueError("FA3 GQA lost its actual shared metadata producer")
+            producer = by_id[producer_id]
+            if (producer.kernel_spec.kind is not KernelKind.VECTOR
+                    or producer.kernel_spec.variant != "fa3_prepare_varlen"
+                    or producer.kernel_spec.dtype != "int32"
+                    or producer.kernel_spec.shape["batch"] != main.kernel_spec.shape["batch"]
+                    or producer.rank != main.rank or producer.pool_name != main.pool_name
+                    or producer.kernel_spec.hardware_id != main.kernel_spec.hardware_id
+                    or producer.source_node_ids != (producer_id,)
+                    or producer_id not in main.dependencies
+                    or producer_id not in main.memory_source.predecessors):
+                raise ValueError("FA3 GQA metadata readiness requires its actual same-rank prepare")
+        if "source_program" in attrs and attrs["source_program"] == "vllm_0_30_fa3_gqa_full_decode":
+            if "fa3_full_aot_layout" in attrs:
+                _validate_full_fa3_aot_frame(group,by_id,source_completions)
+            producer_id = attrs["fa3_gqa_metadata_prepare_node"]
+            if producer_id not in by_id:
+                raise ValueError("FA3 FULL lost its actual metadata producer")
+            producer = by_id[producer_id]
+            if (producer.kernel_spec.kind is not KernelKind.VECTOR
+                    or producer.kernel_spec.variant != "fa3_prepare_varlen"
+                    or producer.kernel_spec.shape["batch"] != main.kernel_spec.shape["batch"]
+                    or producer.rank != main.rank or producer.pool_name != main.pool_name
+                    or producer.kernel_spec.hardware_id != main.kernel_spec.hardware_id
+                    or producer_id not in main.dependencies):
+                raise ValueError("FA3 FULL metadata readiness requires its actual same-rank prepare")
+    return {call.call_id: tuple(group) for group in groups.values() for call in group}
+
+
+def _same_fa3_port(actual, role):
+    return (actual.allocation_id, actual.offset_bytes, actual.shape, actual.strides_bytes,
+        actual.dtype, actual.element_bytes, actual.region()) == (
+        role.allocation_id, role.offset_bytes, role.shape, role.strides_bytes,
+        role.dtype, role.element_bytes, role.region())
+
+
+def predict_fa3_plan_call(call, calls, hardware, method, evaluate):
+    """Validate actual parents and enter the library scope before memo lookup.
+
+    Only binding identity is projected back to the original source call. The
+    plan retains every stage, dependency, allocation and readiness reference.
+    """
+    if "fa3_gqa_caller_scenario" in call.memory_source.attributes:
+        return _predict_fa3_gqa_plan_call(call, calls, hardware, method, evaluate)
+    if "fa3_expanded_source_revision" in call.memory_source.attributes:
+        return _predict_fa3_expanded_plan_call(call, calls, hardware, method, evaluate)
+    if ("source_component" in call.memory_source.attributes
+            and call.memory_source.attributes["source_component"] == "fa3_mla_unsplit_prefill_call"):
+        return _predict_fa3_unsplit_plan_call(call, calls, hardware, method, evaluate)
+    from src.kernel.memory_access_builder import prediction_memory_bindings
+    from src.kernel.memory_flash_attention import (
+        current_fa3_split_prefill_prediction_work,
+        fa3_split_prefill_call_prediction_scope,
+    )
+    source = call.memory_source
+    hardware.require_fa3_mla_source_revision(source.attributes["fa3_source_revision"])
+    model_source = ("source_component" in source.attributes
+        and source.attributes["source_component"] == "fa3_mla_split_prefill_call")
+    if model_source:
+        revision = hardware.fa3_mla_source_revision_for_model(source.attributes["source_model_execution_version"])
+        if (source.attributes["fa3_source_revision"] != revision
+                or source.attributes["fa3_backend_source"] != hardware.fa3_mla_model_backend_source(
+                    source.attributes["source_model_execution_version"])
+                or source.attributes["fa3_runtime_binary_bound"] is not False
+                or source.attributes["fa3_length_array_transport_bound"] is not False):
+            raise ValueError("FA3 model call changed its declared source/backend scope")
+    if "scheduler_metadata_precomputed" not in source.attributes:
+        raise ValueError("FA3 source call must preserve its actual metadata lifetime")
+    precomputed = source.attributes["scheduler_metadata_precomputed"]
+    if type(precomputed) is not bool:
+        raise TypeError("FA3 metadata lifetime must be boolean")
+    if len(calls) != (2 if precomputed else 3):
+        raise ValueError("FA3 plan must preserve the complete ordered library call")
+    main, combine = (stage.kernel_spec for stage in calls[-2:])
+    stage_binding = calls[-2].memory_bindings
+    if not isinstance(stage_binding, ElementwiseBindings):
+        raise ValueError("FA3 plan requires actual library source parents")
+    bindings = replace(stage_binding, binding_id=source.node_id + ":library-memory", call_id=source.node_id)
+    roles = {view.view_id: view for view in bindings.views}
+    output_roles = (source.attributes["fa3_source_output_roles"]
+        if "fa3_source_output_roles" in source.attributes else ("output", "lse"))
+    if (len(roles) != len(bindings.views)
+            or any(role not in roles for role in (*bindings.read_views, "output", "lse"))
+            or len(source.inputs) != len(bindings.read_views) or len(source.outputs) != len(output_roles)
+            or any(not _same_fa3_port(port, roles[role]) for port, role in zip(
+                source.inputs, bindings.read_views, strict=True))
+            or any(not _same_fa3_port(port, roles[role]) for port, role in zip(
+                source.outputs, output_roles, strict=True))):
+        raise ValueError("FA3 plan source ports must retain the actual library parents")
+    if {item.allocation_id: item.with_lifetime(item.allocation_id, item.allocated_event, None)
+            for item in source.allocations} != {
+            item.allocation_id: item for item in bindings.allocations}:
+        raise ValueError("FA3 plan source allocation lifetimes changed")
+    for index, stage in enumerate(calls):
+        if (stage.memory_source is not source or stage.source_node_ids != (source.node_id,)
+                or stage.rank != source.rank or stage.pool_name != source.pool_name
+                or stage.kernel_spec.hardware_id != hardware.hardware_id or stage.resource != "compute"):
+            raise ValueError("FA3 plan stages crossed source or hardware ownership")
+        if index and calls[index - 1].call_id not in stage.dependencies:
+            raise ValueError("FA3 plan lost its actual stage dependency")
+        if stage.kernel_spec.kind is KernelKind.FLASH_ATTN:
+            actual = stage.memory_bindings
+            if not isinstance(actual, ElementwiseBindings) or stage.memory_unbound_reason is not None:
+                raise ValueError("FA3 stage requires its own bound source identity")
+            for field in fields(ElementwiseBindings):
+                if field.name not in ("binding_id", "call_id") and getattr(actual, field.name) != getattr(bindings, field.name):
+                    raise ValueError("FA3 stage changed shared library operands")
+        elif (index != 0 or precomputed or stage.kernel_spec.kind is not KernelKind.VECTOR
+                or stage.kernel_spec.variant != "fa3_prepare_varlen" or stage.memory_bindings is not None):
+            raise ValueError("FA3 plan has an invalid prepare stage")
+    attributes = dict(main.attributes)
+    if "return_softmax_lse" in combine.attributes:
+        attributes["return_softmax_lse"] = combine.attributes["return_softmax_lse"]
+    expected = hardware.fa3_mla_forward_specs(main.shape, main.dtype, main.variant, attributes,
+        scheduler_metadata_precomputed=precomputed)
+    if tuple(stage.kernel_spec for stage in calls) != expected:
+        raise ValueError("FA3 plan stages differ from the complete source factory call")
+    with fa3_split_prefill_call_prediction_scope(main, combine, hardware, bindings,
+            scheduler_metadata_precomputed=precomputed) as work:
+        if model_source and source.attributes["fa3_dynamic_splits"] != work["splits"]:
+            raise ValueError("FA3 model metadata differs from its actual source split program")
+        actual = bindings if call.kernel_spec.kind is KernelKind.FLASH_ATTN else None
+        if actual is not None:
+            with prediction_memory_bindings(call.kernel_spec, actual, method):
+                current_fa3_split_prefill_prediction_work(call.kernel_spec, hardware)
+        prediction = evaluate(call.kernel_spec, hardware, method, memory_bindings=actual)
+        if model_source and actual is not None and prediction.diagnostics is not None:
+            prediction = replace(prediction, diagnostics=replace(prediction.diagnostics,
+                limitations=prediction.diagnostics.limitations + (
+                    "fa3_v030_declared_default_source_not_installed_GPU_binary_binding"
+                        if source.attributes["source_model_execution_version"] == "vllm_0_30_0"
+                        else "fa3_v027_declared_default_source_not_installed_GPU_binary_binding",
+                    "fa3_caller_length_array_transport_unbound",)))
+        return prediction
+
+
+def _predict_fa3_expanded_plan_call(call, calls, hardware, method, evaluate):
+    """Validate complete D256 MHA calls without inventing native scratch."""
+    from src.kernel.memory_access import Strided
+    from src.kernel.memory_access_builder import bound_prediction_memory_program
+    source, attrs = call.memory_source, call.memory_source.attributes
+    revision = hardware.fa3_mla_source_revision_for_model(attrs["source_model_execution_version"])
+    if (attrs["fa3_expanded_source_revision"] != revision
+            or attrs["source_component"] != "fa3_expanded_mla_prefill_call"
+            or attrs["scheduler_metadata_precomputed"] is not False
+            or attrs["fa3_runtime_binary_bound"] is not False
+            or attrs["fa3_length_array_transport_bound"] is not False
+            or attrs["fa3_native_workspace_bound"] is not False
+            or attrs["fa3_backend_source"] != "vllm_0_30_default_hopper_flash_attn3"
+            or attrs["causal"] is not True or attrs["return_softmax_lse"] is not False
+            or attrs["q_lens"] != attrs["kv_lens"] or attrs["full_cuda_graphs"] is not False
+            or type(attrs["max_cudagraph_capture_size"]) is not int or attrs["max_cudagraph_capture_size"] != 0
+            or "flash_attn_version" in attrs and (type(attrs["flash_attn_version"]) is not int or attrs["flash_attn_version"] != 3)
+            or any(field in attrs for field in ("attention_backend", "graph_runtime_mode", "graph_logical_tokens",
+                "graph_model_input_tokens", "model_input_shape", "model_input_q_lens", "model_input_kv_lens"))
+            or len(calls) not in (2, 3)
+            or len(source.inputs) != 3 or len(source.outputs) != 1):
+        raise ValueError("expanded FA3 plan changed its source identity or public parents")
+    main = calls[1].kernel_spec
+    if (main.kind is not KernelKind.FLASH_ATTN or main.variant != "prefill"
+            or main.dtype != "bf16" or main.shape["head_dim"] != 256
+            or main.shape["num_query_heads"] != main.shape["num_kv_heads"]):
+        raise ValueError("expanded FA3 requires its D256 expanded MHA program")
+    expected = hardware.fa3_gqa_forward_specs(main.shape, main.dtype,
+        {**{name: attrs[name] for name in ("causal", "kv_dist", "q_lens", "kv_lens")},
+            "kv_layout": "contiguous", "return_softmax_lse": attrs["return_softmax_lse"]},
+        page_size=None, num_splits=0, scheduler_metadata_precomputed=False)
+    if tuple(stage.kernel_spec for stage in calls) != expected:
+        raise ValueError("expanded FA3 plan lost a source stage")
+    for index, stage in enumerate(calls):
+        if (stage.memory_source is not source or stage.rank != source.rank or stage.pool_name != source.pool_name
+                or stage.source_node_ids != (source.node_id,) or stage.resource != "compute"
+                or stage.kernel_spec.hardware_id != hardware.hardware_id
+                or index and calls[index-1].call_id not in stage.dependencies):
+            raise ValueError("expanded FA3 plan lost its source stage dependency")
+    shape = (sum(main.attributes["q_lens"]), main.shape["num_query_heads"], 256)
+    if any(view.shape != shape or view.dtype != "bf16" for view in (*source.inputs, *source.outputs)):
+        raise ValueError("expanded FA3 actual Q/K/V/O extents disagree with its source call")
+    for view in (*source.inputs, *source.outputs):
+        if view.region() != Strided(view.offset_bytes, view.shape, view.strides_bytes, view.element_bytes):
+            raise ValueError("expanded FA3 public parent geometry was corrupted")
+    if call.kernel_spec.kind is KernelKind.FLASH_ATTN:
+        expected_binding, reason = _bind_expanded_attention(call, source)
+        if call.memory_bindings != expected_binding or call.memory_unbound_reason != reason:
+            raise ValueError("expanded FA3 bound operands lost actual parents, readiness or lifetimes")
+    if call.memory_bindings is not None:
+        bound_prediction_memory_program(call.kernel_spec, hardware, call.memory_bindings, method)
+    if call.memory_bindings is None and call.memory_unbound_reason is None:
+        raise ValueError("expanded FA3 native ABI requires an explicit unbound reason")
+    prediction = evaluate(call.kernel_spec, hardware, method, memory_bindings=call.memory_bindings)
+    if call.kernel_spec.kind is KernelKind.FLASH_ATTN and prediction.diagnostics is not None:
+        prediction = replace(prediction, diagnostics=replace(prediction.diagnostics,
+            limitations=prediction.diagnostics.limitations + (
+                "fa3_expanded_mla_complete_source_call_and_public_parents_validated",
+                "fa3_expanded_mla_native_scratch_and_metadata_transport_unbound",
+                "fa3_declared_vllm030_default_source_not_observed_runtime_binary",)))
+    return prediction
+
+
+def _predict_fa3_gqa_plan_call(call, calls, hardware, method, evaluate):
+    """Keep the complete GQA source sequence; unbound native ABI stays partial."""
+    from src.kernel.memory_access import Strided
+    from src.kernel.memory_access_builder import bound_prediction_memory_program
+    source = call.memory_source
+    attrs = source.attributes
+    facts = fa3_gqa_caller_facts(attrs,hardware)
+    if any(type(attrs[name]) is not type(value) or attrs[name] != value for name, value in facts.items()):
+        raise ValueError("GQA plan lost its actual source scenario facts")
+    main = calls[0].kernel_spec
+    if (main.kind is not KernelKind.FLASH_ATTN or main.variant not in ("prefill", "decode")
+            or len(source.inputs) != (7 if "fa3_full_aot_layout" in attrs else 4)
+            or len(source.outputs) != (2 if "fa3_full_aot_layout" in attrs else 1)
+            or attrs["fa3_gqa_metadata_prepare_node"] not in calls[0].dependencies):
+        raise ValueError("GQA plan lost public ports or its shared metadata producer")
+    expected = hardware.fa3_gqa_forward_specs(main.shape, attrs["fa3_gqa_operand_dtype"], main.attributes,
+        page_size=facts["fa3_gqa_page_size"], num_splits=facts["fa3_gqa_num_splits"],
+        scheduler_metadata_precomputed=facts["fa3_gqa_scheduler_metadata_precomputed"])
+    if tuple(stage.kernel_spec for stage in calls) != expected:
+        raise ValueError("GQA plan differs from the complete source library call")
+    for index, stage in enumerate(calls):
+        if (stage.memory_source is not source or stage.rank != source.rank or stage.pool_name != source.pool_name
+                or stage.source_node_ids != (source.node_id,) or stage.resource != "compute"
+                or stage.kernel_spec.hardware_id != hardware.hardware_id
+                or index and calls[index - 1].call_id not in stage.dependencies):
+            raise ValueError("GQA plan crossed source ownership or lost a stage dependency")
+    if any(view.dtype != main.dtype for view in (*source.inputs[:4], source.outputs[0])):
+        raise ValueError("FA3 GQA public Q/K/V/cache/O dtype must match the actual operand dtype")
+    for view in (*source.inputs, *source.outputs):
+        if view.region() != Strided(view.offset_bytes, view.shape, view.strides_bytes, view.element_bytes):
+            raise ValueError("GQA caller public storage geometry was corrupted")
+    rows = sum(main.attributes["q_lens"])
+    full = ("source_program" in main.attributes
+        and main.attributes["source_program"] == "vllm_0_30_fa3_gqa_full_decode")
+    caller_rows = main.attributes["graph_model_input_tokens"] if full else rows
+    if "fa3_gqa_query_tokens" in facts and caller_rows!=facts["fa3_gqa_query_tokens"]:
+        raise ValueError("FA3 caller split policy lost the actual caller token extent")
+    if full:
+        if (attrs["graph_runtime_mode"] != "FULL" or attrs["fa3_gqa_execution_origin"] != "full_captured"
+                or type(attrs["fa3_full_max_num_seqs"]) is not int or attrs["fa3_full_max_num_seqs"] <= 0
+                or main.shape["batch"] != min(caller_rows,attrs["fa3_full_max_num_seqs"])
+                or type(attrs["fa3_full_capture_max_seq_len"]) is not int
+                or main.shape["kv_len"] > attrs["fa3_full_capture_max_seq_len"]
+                or attrs["fa3_gqa_native_workspace_bound"] is not False
+                or any(type(attrs[field]) is not type(main.attributes[field]) or attrs[field] != main.attributes[field]
+                    for field in ("source_program", "graph_runtime_mode", "graph_model_input_tokens",
+                        "model_input_q_lens", "model_input_kv_lens", "q_lens", "kv_lens"))
+                or not isinstance(attrs["fa3_full_capture_id"],str) or not attrs["fa3_full_capture_id"]):
+            raise ValueError("FA3 FULL source lost its actual capture descriptor/bounds")
+        if source.input_producers != attrs["fa3_full_input_producers"]:
+            raise ValueError("FA3 FULL public input readiness changed")
+        allocations = {item.allocation_id:item for item in source.allocations}
+        for port,parent in zip((source.inputs[0],source.outputs[0]), attrs["fa3_full_physical_parents"],strict=True):
+            allocation,offset,shape,strides,allocated,retired = parent
+            if (allocation != port.allocation_id
+                    or (allocations[allocation].allocated_event, allocations[allocation].freed_event) != (allocated,retired) or offset != port.offset_bytes or shape != (caller_rows,*port.shape[1:])
+                    or strides != port.strides_bytes or offset+sum((n-1)*s for n,s in zip(shape,strides,strict=True))
+                        +port.element_bytes > allocations[allocation].size_bytes):
+                raise ValueError("FA3 FULL physical Q/O parent alias or capacity changed")
+    heads, dimension = main.shape["num_query_heads"], main.shape["head_dim"]
+    if prod(source.inputs[0].shape) != rows * heads * dimension or prod(source.outputs[0].shape) != rows * heads * dimension:
+        raise ValueError("GQA public input/output extents disagree with the source call")
+    if not full:
+        if (source.kind is not WorkloadKind.FLASH_ATTN or source.variant != main.variant
+                or attrs["source_component"] != "symbolic_gqa_mathematical"):
+            raise ValueError("GQA source lost its actual ordinary attention operation")
+        for role, port in zip(("key", "value"), source.inputs[1:3], strict=True):
+            _reshape(port, role, (rows, main.shape["num_kv_heads"], dimension))
+        if call.kernel_spec.kind is KernelKind.FLASH_ATTN:
+            # Main and combine retain the same source wrapper but use
+            # different operand ABIs. Revalidate through the binding
+            # dispatcher used by TraceMemoryContext, including its exact
+            # unbound reason, before either direct or cached prediction.
+            binding, reason = bind_attention_memory(call, source)
+            if call.memory_bindings != binding or call.memory_unbound_reason != reason:
+                raise ValueError("GQA public operands changed actual parents, readiness or lifetimes")
+    if call.memory_bindings is not None:
+        bound_prediction_memory_program(call.kernel_spec, hardware, call.memory_bindings, method)
+    elif call.memory_unbound_reason is None:
+        raise ValueError("GQA unbound native operands require an explicit reason")
+    prediction = evaluate(call.kernel_spec, hardware, method, memory_bindings=call.memory_bindings)
+    if call.kernel_spec.kind is KernelKind.FLASH_ATTN and prediction.diagnostics is not None:
+        prediction = replace(prediction, diagnostics=replace(prediction.diagnostics,
+            limitations=prediction.diagnostics.limitations + (
+                "fa3_gqa_complete_source_call_and_shared_metadata_dependency_validated",
+                "fa3_gqa_native_workspace_pages_and_metadata_transport_unbound",
+                "fa3_gqa_declared_default_caller_not_observed_runtime_binary",)))
+    return prediction
+
+
+def _predict_fa3_unsplit_plan_call(call, calls, hardware, method, evaluate):
+    from src.kernel.memory_flash_attention import fa3_prefill_prediction_work
+    source = call.memory_source
+    attributes = source.attributes
+    revision = hardware.fa3_mla_source_revision_for_model(attributes["source_model_execution_version"])
+    if (attributes["fa3_source_revision"] != revision
+            or attributes["scheduler_metadata_precomputed"] is not False
+            or attributes["fa3_backend_source"] != hardware.fa3_mla_model_backend_source(
+                attributes["source_model_execution_version"])
+            or attributes["fa3_runtime_binary_bound"] is not False
+            or attributes["fa3_length_array_transport_bound"] is not False or len(calls) != 2):
+        raise ValueError("FA3 unsplit model call changed its source/backend/lifetime scope")
+    prepare, main_call = calls
+    main = main_call.kernel_spec
+    binding = main_call.memory_bindings
+    if not isinstance(binding, ElementwiseBindings):
+        raise ValueError("FA3 unsplit model call lost actual native ports")
+    expected = hardware.fa3_mla_forward_specs(main.shape, main.dtype, main.variant, main.attributes,
+        scheduler_metadata_precomputed=False)
+    if (tuple(stage.kernel_spec for stage in calls) != expected
+            or prepare.call_id not in main_call.dependencies or prepare.memory_bindings is not None):
+        raise ValueError("FA3 unsplit model call lost its complete source stage sequence")
+    for stage in calls:
+        if (stage.memory_source is not source or stage.source_node_ids != (source.node_id,)
+                or stage.rank != source.rank or stage.pool_name != source.pool_name
+                or stage.kernel_spec.hardware_id != hardware.hardware_id or stage.resource != "compute"):
+            raise ValueError("FA3 unsplit stages crossed actual source ownership")
+    parents = {view.view_id: view for view in binding.views}
+    output_roles = ("output", "lse", "scheduler_metadata")
+    if (attributes["fa3_source_output_roles"] != output_roles
+            or len(source.inputs) != len(binding.read_views) or len(source.outputs) != 3
+            or any(not _same_fa3_port(port, parents[role]) for port, role in zip(
+                source.inputs, binding.read_views, strict=True))
+            or any(not _same_fa3_port(port, parents[role]) for port, role in zip(
+                source.outputs, output_roles, strict=True))):
+        raise ValueError("FA3 unsplit source ports differ from actual caller operands")
+    if {item.allocation_id: item.with_lifetime(item.allocation_id, item.allocated_event, None)
+            for item in source.allocations} != {item.allocation_id: item for item in binding.allocations}:
+        raise ValueError("FA3 unsplit source allocation lifetimes changed")
+    # Validation runs even when the evaluator is about to return a memo hit.
+    fa3_prefill_prediction_work(main, hardware, binding)
+    prediction = evaluate(call.kernel_spec, hardware, method,
+        memory_bindings=binding if call is main_call else None)
+    if call is main_call and prediction.diagnostics is not None:
+        prediction = replace(prediction, diagnostics=replace(prediction.diagnostics,
+            limitations=prediction.diagnostics.limitations + (
+                "fa3_unsplit_model_source_aliases_and_readiness_validated",
+                "fa3_v030_declared_default_source_not_installed_GPU_binary_binding"
+                    if attributes["source_model_execution_version"] == "vllm_0_30_0"
+                    else "fa3_v027_declared_default_source_not_installed_GPU_binary_binding",
+                "fa3_caller_length_array_transport_unbound",)))
+    return prediction
+
+
+def _bind_fa3_unsplit_prefill(call, source):
+    input_roles = ("query", "key", "value", "cu_query", "cu_key")
+    output_roles = ("output", "lse", "scheduler_metadata")
+    if len(source.inputs) != 5 or len(source.outputs) != 3 or source.attributes["fa3_source_output_roles"] != output_roles:
+        raise ValueError("FA3 unsplit model call requires its exact library ports")
+    parents = {role: replace(view, view_id=role) for role, view in zip(
+        (*input_roles, *output_roles), (*source.inputs, *source.outputs), strict=True)}
+    library_call = replace(call, call_id=source.node_id, memory_bindings=None,
+        memory_source=None, memory_unbound_reason=None)
+    allocations, events, ready, visibility = source_memory_events(library_call, source,
+        tuple(zip((parents[role] for role in input_roles), source.input_producers, strict=True)))
+    return ElementwiseBindings(call.call_id + ":source-memory", call.call_id, allocations,
+        tuple(parents.values()), events, input_roles, ("output", "lse"), ready,
+        call.rank, "source-forward", visibility), None
+
+
+def _bind_fa3_split_prefill(call, source):
+    """Project real model/library ports, including source-owned scratch roots."""
+    input_roles = ("query", "key", "value", "cu_query", "cu_key")
+    output_roles = ("output", "lse", "scheduler_metadata", "partial_output", "partial_lse")
+    if (source.attributes["scheduler_metadata_precomputed"] is not False
+            or source.attributes["fa3_source_output_roles"] != output_roles
+            or len(source.inputs) != len(input_roles) or len(source.outputs) != len(output_roles)):
+        raise ValueError("FA3 model call requires its exact eager library ports")
+    parents = {role: replace(view, view_id=role) for role, view in zip(
+        (*input_roles, *output_roles), (*source.inputs, *source.outputs), strict=True)}
+    q_lens = source.attributes["q_lens"]
+    splits = source.attributes["fa3_dynamic_splits"]
+    if len(q_lens) != len(splits):
+        raise ValueError("FA3 model call lost per-request dynamic split facts")
+    batch = len(q_lens)
+    rounded = -(-batch // 4) * 4
+    meta = parents["scheduler_metadata"]
+    views = list(parents.values())
+    for role, offset, shape in (("dynamic_splits", rounded * 4, (batch,)),
+            ("semaphore", 2 * rounded * 4, (1,))):
+        views.append(replace(meta, view_id=role, offset_bytes=meta.offset_bytes + offset,
+            shape=shape, strides_bytes=(4,)))
+    prefix = 0
+    for index, (length, count) in enumerate(zip(q_lens, splits, strict=True)):
+        if count > 1:
+            for role in ("partial_output", "partial_lse"):
+                parent = parents[role]
+                row_axis = 2
+                shape = (count, parent.shape[1], length, *parent.shape[3:])
+                views.append(replace(parent, view_id=f"{role}.r{index}", shape=shape,
+                    offset_bytes=parent.offset_bytes + prefix * parent.strides_bytes[row_axis]))
+        prefix += length
+    # Shared source IDs give every stage equal readiness facts. Stage-specific
+    # call IDs are retained on the binding and never replace storage identity.
+    library_call = replace(call, call_id=source.node_id, memory_bindings=None,
+        memory_source=None, memory_unbound_reason=None)
+    allocations, events, ready, visibility = source_memory_events(library_call, source,
+        tuple(zip((parents[role] for role in input_roles), source.input_producers, strict=True)))
+    return ElementwiseBindings(call.call_id + ":source-memory", call.call_id, allocations,
+        tuple(views), events, input_roles, ("output", "lse", "semaphore"), ready,
+        call.rank, "source-forward", visibility), None
 
 
 def _reshape(view, name, shape):
@@ -112,6 +557,17 @@ def _bind_public_attention(call, source):
         reads.append((selected, cache))
         producers.append(source.input_producers[3])
     return _elementwise(call, source, tuple(reads), (output,), tuple(producers))
+
+
+def _bind_expanded_attention(call, source):
+    if call.kernel_spec.variant == "combine" or call.kernel_spec.launch.tiling.num_kv_splits not in (None, 1):
+        return None, "expanded_fa3_native_split_workspace_ports_unavailable"
+    if len(source.inputs) != 3 or len(source.outputs) != 1:
+        raise ValueError("expanded attention requires actual Q/K/V and O parents")
+    reads = tuple((replace(view, view_id=role), view) for view, role in zip(
+        source.inputs, ("query", "key", "value"), strict=True))
+    output = replace(source.outputs[0], view_id="output")
+    return _elementwise(call, source, reads, (output,), source.input_producers)
 
 
 def _bind_mla_decode(call, source):
@@ -220,6 +676,9 @@ def _bind_mla_cache(call, source):
 
 
 def _bind_v4_insert(call, source):
+    if ("mathematical_program" in call.kernel_spec.attributes and call.kernel_spec.attributes["mathematical_program"]
+            == "vllm_0_30_dspark_partial_context_insert_v1"):
+        return None, "dspark_partial_context_native_slot_values_unbound"
     if len(source.inputs) == 4:
         return None, "v4_insert_source_slot_tensor_unavailable"
     if len(source.inputs) != 5 or len(source.outputs) != 2:
@@ -253,9 +712,39 @@ def _bind_v4_insert(call, source):
     return _elementwise(call, source, reads, writes, producers)
 
 
+def _bind_dsa_index_cache(call, source):
+    if len(source.inputs) != 2 or len(source.outputs) != 1:
+        return None, "dsa_index_cache_source_key_and_slot_ports_unavailable"
+    key, slots = source.inputs
+    cache, = source.outputs
+    spec = call.kernel_spec
+    rows, width, scale = (spec.shape[name] for name in ("seq_len", "key_dim", "scale_bytes_per_token"))
+    if (key.shape != (rows, width) or key.dtype != "bf16" or slots.shape != (rows,) or slots.dtype != "int64"
+            or cache.dtype != "uint8" or cache.shape[-1] != width + scale or scale != 4):
+        raise ValueError("DSA cache insert must preserve real BF16 keys, slots and the shared FP8/scale backing")
+    key, slots = _reshape(key, "key", (rows, 1, width)), replace(slots, view_id="slots")
+    def field(role, shape, dtype, element_bytes):
+        return LogicalSelectionView(role, cache.allocation_id, shape, dtype, element_bytes,
+            f"target_cache_tiles.dsa_fp8_index_cache.{role}.T{rows}.D{width}.S{scale}", None)
+    return _elementwise(call, source, ((key, key), (slots, slots)),
+        (field("cache_payload", (rows, 1, width), "fp8", 1), field("cache_scale", (rows, 1, 1), "fp32", 4)),
+        source.input_producers)
+
+
 def bind_attention_memory(call, source):
     """Return typed actual operands or a bounded reason for missing source ABI."""
     spec = call.kernel_spec
+    if (source.kind is WorkloadKind.FLASH_ATTN and spec.kind is KernelKind.FLASH_ATTN
+            and "fa3_expanded_source_revision" in source.attributes):
+        return _bind_expanded_attention(call, source)
+    if (source.kind is WorkloadKind.FLASH_ATTN and spec.kind is KernelKind.FLASH_ATTN
+            and "source_component" in source.attributes
+            and source.attributes["source_component"] == "fa3_mla_split_prefill_call"):
+        return _bind_fa3_split_prefill(call, source)
+    if (source.kind is WorkloadKind.FLASH_ATTN and spec.kind is KernelKind.FLASH_ATTN
+            and "source_component" in source.attributes
+            and source.attributes["source_component"] == "fa3_mla_unsplit_prefill_call"):
+        return _bind_fa3_unsplit_prefill(call, source)
     if source.kind is WorkloadKind.KV_UPDATE and spec.kind is KernelKind.KV_CACHE:
         if source.variant != spec.variant:
             return None, "cache_source_variant_mapping_unavailable"
@@ -263,6 +752,8 @@ def bind_attention_memory(call, source):
             return _bind_paged_cache(call, source)
         if spec.variant == "mla_kv_cache":
             return _bind_mla_cache(call, source)
+        if spec.variant == "dsa_fp8_index_cache":
+            return _bind_dsa_index_cache(call, source)
         if spec.variant == "dsv4_qnorm_rope_kv_insert":
             return _bind_v4_insert(call, source)
         reasons = {
@@ -291,3 +782,101 @@ def bind_attention_memory(call, source):
     if spec.kind is KernelKind.EAGER_ATTN:
         return None, "eager_attention_source_score_and_probability_backings_unavailable"
     return None, "attention_source_family_operand_mapping_unavailable"
+
+
+def _validate_full_fa3_aot_frame(group,by_id,source_completions):
+    """Consume the real AOT writer/copy/clear and per-call reset parents."""
+    from math import prod
+    main=group[0]
+    source=main.memory_source
+    attrs=source.attributes
+    b,r,n,capacity,dynamic,offsets,holes=attrs["fa3_full_aot_layout"]
+    if (any(type(value) is not int or value<=0 for value in (b,r,n,capacity)) or type(dynamic) is not bool
+            or b!=main.kernel_spec.shape["batch"] or r!=(b+3)//4*4 or n!=(2+int(dynamic))*r+1 or dynamic!=(b<=992)
+            or capacity!=1+4*((max(attrs["fa3_full_max_num_seqs"],attrs["fa3_gqa_max_capture_tokens"])+3)//4*4)):
+        raise ValueError("FA3 AOT native packet layout changed")
+    expected_offsets=(0,r,2*r,3*r) if dynamic else (0,r,2*r)
+    expected_holes=tuple(offset+i for offset in expected_offsets[:-1] for i in range(b,r))
+    if offsets!=expected_offsets or holes!=expected_holes:
+        raise ValueError("FA3 AOT rounded holes cannot be initialized by padding")
+    selected=[]
+    for role in ("prepare","copy","clear"):
+        identity=attrs["fa3_full_aot_"+role+"_node"]
+        if identity not in by_id:
+            raise ValueError("FA3 AOT actual helper is missing")
+        call=by_id[identity]
+        if call.memory_source is None or call.rank!=main.rank or call.pool_name!=main.pool_name:
+            raise ValueError("FA3 AOT helper crossed actual source ownership")
+        helper=call.memory_source
+        if (helper.attributes["fa3_full_aot_component"]!=role or helper.attributes["fa3_full_aot_layout"]!=attrs["fa3_full_aot_layout"]
+                or helper.attributes["fa3_full_aot_hole_validity"]!="uninitialized_copied_not_zero"):
+            raise ValueError("FA3 AOT helper validity/layout changed")
+        if (helper.attributes["fa3_full_aot_head_shape"] != tuple(main.kernel_spec.shape[field]
+                    for field in ("num_query_heads", "num_kv_heads", "head_dim"))
+                or helper.attributes["fa3_gqa_operand_dtype"] != main.kernel_spec.dtype):
+            raise ValueError("FA3 AOT helper must preserve actual rank-local heads and operand dtype")
+        selected.append(call)
+    prepare,copy,clear=selected
+    p,c,z=(call.memory_source for call in selected)
+    if (prepare.kernel_spec.variant!="fa3_prepare_varlen" or prepare.kernel_spec.shape["batch"]!=b
+            or prepare.kernel_spec.attributes!={"source_program":"vllm_0_30_fa3_full_aot_prepare",
+                "use_dynamic_split":dynamic,"head_swizzle":True}
+            or len(p.inputs)!=2 or tuple(view.shape for view in p.inputs)!=((b+1,),(b,))
+            or len(p.outputs)!=len(offsets)):
+        raise ValueError("FA3 AOT prepare lost its native input/field ABI")
+    if any(view.dtype!="int32" or view.strides_bytes!=(4,) or view.offset_bytes!=0 for view in p.inputs):
+        raise ValueError("FA3 AOT caller input dtype or storage layout changed")
+    from itertools import accumulate
+    if (p.attributes["fa3_full_aot_cu_query"]!=(0,*accumulate(main.kernel_spec.attributes["model_input_q_lens"]))
+            or p.attributes["fa3_full_aot_used_key"]!=main.kernel_spec.attributes["model_input_kv_lens"]):
+        raise ValueError("FA3 AOT actual input values changed before preparation")
+    packet=p.outputs[0].allocation_id
+    for i,view in enumerate(p.outputs):
+        if (view.allocation_id!=packet or view.dtype!="int32" or view.strides_bytes!=(4,)
+                or view.offset_bytes!=offsets[i]*4 or view.shape!=((b,) if i<len(offsets)-1 else (1,))):
+            raise ValueError("FA3 AOT prepare cannot write rounded holes")
+    if (copy.kernel_spec.kind is not KernelKind.MEMCPY or copy.kernel_spec.transfer.algorithm!="stream_copy"
+            or copy.kernel_spec.transfer.bytes!=n*4 or copy.kernel_spec.transfer.direction!="d2d"
+            or copy.kernel_spec.transfer.link!="dram" or len(c.inputs)!=1 or len(c.outputs)!=1
+            or c.inputs[0].allocation_id!=packet or c.inputs[0].offset_bytes!=0 or c.inputs[0].shape!=(n,)
+            or c.inputs[0].dtype!="int32" or c.inputs[0].strides_bytes!=(4,)
+            or prepare.call_id not in copy.dependencies):
+        raise ValueError("FA3 AOT actual prefix copy changed")
+    if len(source.inputs)!=7 or len(source.outputs)!=2 or len(source.input_producers)!=7:
+        raise ValueError("FA3 AOT native caller requires seven inputs and two outputs")
+    metadata=source.inputs[6]
+    if (metadata.dtype!="int32"
+            or metadata.shape!=(n,) or metadata.offset_bytes!=0 or metadata.strides_bytes!=(4,)
+            or not _same_fa3_port(metadata,c.outputs[0])
+            or not _same_fa3_port(source.inputs[4],p.inputs[0]) or not _same_fa3_port(source.inputs[5],p.inputs[1])
+            or source.outputs[1].allocation_id!=metadata.allocation_id
+            or source.outputs[1].offset_bytes!=offsets[-1]*4 or source.outputs[1].shape!=(1,)
+            or source.outputs[1].dtype!="int32" or source.outputs[1].strides_bytes!=(4,)):
+        raise ValueError("FA3 AOT native caller lost copied parents or reset alias")
+    allocation=next(item for item in c.allocations if item.allocation_id==metadata.allocation_id)
+    if (capacity<n or allocation.size_bytes!=capacity*4 or len(z.inputs)!=0 or len(z.outputs)!=1
+            or z.outputs[0].allocation_id!=metadata.allocation_id or z.outputs[0].offset_bytes!=n*4
+            or z.outputs[0].shape!=(capacity-n,) or z.outputs[0].dtype!="int32" or z.outputs[0].strides_bytes!=(4,)
+            or copy.call_id not in clear.dependencies
+            or clear.kernel_spec.attributes!={"operation":"fill","reads":0,"writes":1,
+                "mathematical_program":"vllm_0_30_fa3_aot_tail_clear"}):
+        raise ValueError("FA3 AOT tail clear cannot initialize the internal holes or overwrite live metadata")
+    # A same-buffer reset supplies a direct, source-proven readiness edge.
+    producer=source.input_producers[-1]
+    if producer not in source_completions or source_completions[producer] not in main.dependencies:
+        raise ValueError("FA3 AOT metadata was consumed before its real current writer")
+    ready_call=by_id[source_completions[producer]]
+    if producer!=z.node_id:
+        previous=ready_call.memory_source
+        if (previous is None or "fa3_full_aot_layout" not in previous.attributes
+                or previous.rank!=source.rank or previous.pool_name!=source.pool_name
+                or len(previous.outputs)!=2 or not _same_fa3_port(previous.outputs[1],source.outputs[1])):
+            raise ValueError("FA3 AOT readiness requires actual prefix clear or previous same-buffer reset")
+    main_allocations={item.allocation_id:item for item in source.allocations}
+    if main_allocations[metadata.allocation_id]!=allocation or allocation.freed_event is not None:
+        raise ValueError("FA3 AOT metadata parent lifetime changed")
+    prepared_allocations={item.allocation_id:item for item in p.allocations}
+    for port in source.inputs[4:6]:
+        if (main_allocations[port.allocation_id]!=prepared_allocations[port.allocation_id]
+                or main_allocations[port.allocation_id].freed_event is not None):
+            raise ValueError("FA3 AOT caller input lifetime changed")

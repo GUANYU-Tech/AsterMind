@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import partial
 import hashlib
 from importlib import metadata as importlib_metadata
 import json
@@ -11,10 +12,12 @@ import math
 import os
 from pathlib import Path
 import random
+import shutil
 import socket
 import stat
 import subprocess
 import sys
+import tempfile
 from typing import Any
 
 import numpy as np
@@ -25,6 +28,7 @@ from evaluation.serving.experiments.experiment_manifest import (
     ExperimentCell,
     ManifestValidationError,
     ProductionTraceSweepCell,
+    SimulationCell,
     VLLM_CONFORMANCE_SCHEDULER_DEFAULTS,
     validate_sampling_config,
 )
@@ -85,6 +89,184 @@ class WorkloadArtifact:
         }
 
 PROJECT_ROOT = ROOT
+
+
+_SIMULATION_PREVIEW_FIELDS = (
+    "backend", "deployment", "prediction_method", "launch_policy",
+    "serving_timing_mode", "execution_mode", "execution_workers", "step_retention",
+    "graph_mode", "graph_capture_sizes", "prefix_cache_mode", "enable_prefix_caching",
+    "enable_chunked_prefill", "max_model_len", "max_batched_tokens", "max_requests",
+    "kv_block_size_tokens", "prefill_tp_size", "prefill_pp_size", "decode_tp_size",
+    "ffn_tp_size", "num_prefill_instances", "num_decode_instances", "enable_expert_parallel",
+    "vllm_async_scheduling", "mtp_num_speculative_tokens",
+    "vllm_scheduler_version", "attention_kv_layout", "attention_kv_distribution",
+)
+
+
+_SIMULATION_EXPLICIT_FILE_OPTIONS = frozenset({
+    "workload", "production-trace", "canonical-requests", "model",
+    "hardware-config", "decode-hardware-config", "additional-colocated-hardware-config",
+    "runtime-memory-policy", "kv-lifecycle-replay", "mtp-acceptance-replay",
+    "mtp-draft-token-ids-by-step", "expert-routing-replay", "expert-routing-profile-manifest",
+    "host-launch-profile", "scheduler-host-profile", "host-request-path-profile",
+    "host-runtime-prepare-profile", "slo-config", "interactivity-tgs-config",
+    "vllm-sdk-python", "vllm-source-root",
+})
+
+
+def simulation_explicit_input_files(options: dict[str, Any]) -> dict[str, Any]:
+    """Observe explicit files with the existing file provenance owner.
+
+    This deliberately does not assert complete dependency coverage: directory
+    inputs, implicit profiles, and the Python environment need separate identity.
+    """
+    from evaluation.serving.simulation.simulation_artifacts import directory_provenance, file_provenance
+
+    files = {}
+    for name in sorted(_SIMULATION_EXPLICIT_FILE_OPTIONS & options.keys()):
+        raw = options[name]
+        values = raw if isinstance(raw, list) else [raw]
+        entries = []
+        for value in values:
+            if not isinstance(value, str):
+                raise ManifestValidationError(f"{name} must name a file or directory")
+            path = Path(value).resolve()
+            if path.is_file():
+                size = path.stat().st_size
+                if size <= 64 * 1024 * 1024:
+                    entries.append({"status": "file", "provenance": file_provenance(path)})
+                else:
+                    entries.append({"status": "large_file_not_fingerprinted", "path": str(path), "size_bytes": size})
+            elif path.is_dir():
+                if name == "vllm-source-root" and (path / ".git").exists():
+                    # Use the Scheduler owner's package manifest so ignored
+                    # Python sources are observed as well as Git contents.
+                    from src.serving.backend.vllm_scheduler_process import _package_python_manifest
+
+                    package_root = path / "vllm"
+                    if package_root.is_dir():
+                        count, digest = _package_python_manifest(package_root)
+                        python_sources = {"status": "observed", "file_count": count,
+                                          "manifest_sha256": digest}
+                        package_entries = tuple(package_root.rglob("*"))
+                        if any(candidate.is_symlink() for candidate in package_entries):
+                            package_auxiliary = {"status": "symlinks_not_fingerprinted"}
+                        elif any(candidate.is_file() for candidate in package_entries):
+                            auxiliary = directory_provenance(
+                                package_root, allowed_suffixes=("*",))
+                            package_auxiliary = {"status": "observed",
+                                "file_count": auxiliary["file_count"],
+                                "tree_sha256": auxiliary["tree_sha256"],
+                                "scope": "all_regular_package_files"}
+                        else:
+                            package_auxiliary = {"status": "no_package_files"}
+                    else:
+                        python_sources = {"status": "package_directory_missing"}
+                        package_auxiliary = {"status": "package_directory_missing"}
+                    entries.append({"status": "git_directory_partial_identity",
+                                    "identity": git_code_identity(path),
+                                    "scope": "git_contents_and_vllm_package_files",
+                                    "package_python_sources": python_sources,
+                                    "package_auxiliary": package_auxiliary})
+                else:
+                    entries.append({"status": "directory_not_fingerprinted", "path": str(path)})
+            else:
+                entries.append({"status": "unavailable", "path": str(path)})
+            if name == "vllm-sdk-python":
+                # A venv's interpreter is commonly a symlink to its base
+                # Python; resolving that link does not bind the venv config.
+                venv_config = Path(value).absolute().parent.parent / "pyvenv.cfg"
+                if venv_config.is_file():
+                    entries.append({"status": "file", "provenance": file_provenance(venv_config)})
+                else:
+                    entries.append({"status": "venv_config_not_present", "path": str(venv_config)})
+        files[name] = entries
+    return {"scope": "explicit_file_arguments_only_not_complete_dependency_identity", "files": files}
+
+
+def preview_simulation_requests(args: Any) -> dict[str, Any]:
+    """Summarize small inputs using the same loader used by actual execution."""
+    from evaluation.serving.simulation.simulation_artifacts import load_request_source
+    from src.serving.request_gen.request_stream import request_stream_sha256
+
+    if args.workload is not None:
+        kind, source = "workload", args.workload
+    elif args.production_trace is not None:
+        kind, source = "production_trace", args.production_trace
+    elif args.canonical_requests is not None:
+        kind, source = "canonical_requests", args.canonical_requests
+    else:
+        raise ValueError("simulation request source is missing")
+    source_path = Path(source)
+    if source_path.stat().st_size > 64 * 1024 * 1024:
+        return {"status": "not_materialized_large_input", "kind": kind,
+                "path": str(source_path), "reason": "preview avoids loading input larger than 64 MiB"}
+    stream, arrival, workload_hash, _, _ = load_request_source(args)
+    requests = stream.requests
+    preview = {
+        "status": "input_parsed_not_executed", "kind": kind, "path": str(source_path),
+        "workload_hash": workload_hash, "request_stream_sha256": request_stream_sha256(stream),
+        "request_count": len(requests),
+        "arrival_time_range_s": [min(r.arrival_time_s for r in requests),
+                                 max(r.arrival_time_s for r in requests)],
+        "input_tokens_range": [min(r.input_tokens for r in requests), max(r.input_tokens for r in requests)],
+        "output_tokens_range": [min(r.output_tokens for r in requests), max(r.output_tokens for r in requests)],
+        "declared_prefix_hit_tokens": sum(r.prefix_hit_tokens for r in requests),
+        "prefix_hit_source": ("synthetic_length_only_zero_assumption" if kind == "workload"
+                              else "input_field_not_runtime_observation"),
+        "effective_prefix_hits": "unknown_until_execution",
+        "input_generation_seed": "unknown_or_not_applicable",
+        "prompt_token_ids_present_request_count": sum(r.prompt_token_ids is not None for r in requests),
+        "output_token_ids_present_request_count": sum(r.output_token_ids is not None for r in requests),
+        "arrival_process": arrival,
+    }
+    if kind == "workload":
+        artifact = load_workload_artifact(source_path)
+        preview["input_generation_seed"] = artifact.seed
+        preview["workload_generation"] = {"seed": artifact.seed,
+            "requested_num_requests": artifact.requested_num_requests,
+            "token_controls": artifact.token_controls}
+    return preview
+
+
+def materialize_cpu_simulation_plan(cell: SimulationCell, cell_root: Path) -> dict[str, Any]:
+    """Use the simulation CLI as the single owner of option normalization."""
+    from evaluation.serving.simulation.simulation_runner import _parse_args
+    from evaluation.serving.simulation.simulation_execution import use_streaming_step_retention
+
+    options = []
+    for key in sorted(cell.options):
+        value = cell.options[key]
+        options.append(f"--{key}")
+        if value is None:
+            continue
+        if isinstance(value, list):
+            options.extend(str(item) for item in value)
+        else:
+            options.append(str(value))
+    result_path = (cell_root / "result.json").resolve()
+    summary_path = (cell_root / "settings.md").resolve()
+    options.extend(("--output", str(result_path), "--settings-summary", str(summary_path), "--quiet"))
+    try:
+        parsed = _parse_args(options)
+        external_request_source = (parsed.production_trace is not None
+                                   or parsed.canonical_requests is not None)
+        use_streaming_step_retention(parsed, True if external_request_source else None)
+    except SystemExit as error:
+        raise ManifestValidationError(f"{cell.id}: invalid simulation settings") from error
+    return {
+        "cell_id": cell.id,
+        "execution_type": "cpu_simulation",
+        "requested": cell.options,
+        "normalized_preview": {name: vars(parsed)[name] for name in _SIMULATION_PREVIEW_FIELDS},
+        "request_preview": preview_simulation_requests(parsed),
+        "command": [sys.executable, "-m", "scripts.evaluation.serving.simulation_runner_entrypoint", *options],
+        "output": str(result_path),
+        "settings_summary": str(summary_path),
+        "report_enabled": "interactive-report" in cell.options,
+        "interactive_report": str(Path(str(cell.options["interactive-output"])).resolve()
+            if "interactive-output" in cell.options else result_path.with_suffix(".html")),
+    }
 
 _VLLM_CUSTOM_DATASET_SHUFFLE_SEED = 0
 VLLM_BENCH_SERVE_SHA256 = (
@@ -1867,11 +2049,32 @@ def _git_commit(project_root: Path) -> str:
 
 
 def git_code_identity(repository_root: str | Path) -> dict[str, Any]:
-    """Hash HEAD plus staged, unstaged, and non-ignored untracked contents."""
+    """Hash HEAD and worktree contents without writing shared Git metadata."""
     root = Path(repository_root).resolve()
     if not (root / ".git").exists() and (root / "SOURCE_COMMIT").is_file():
         return _snapshot_code_identity(root)
-    commit_bytes = _git_bytes(
+    with tempfile.TemporaryDirectory(prefix="midlayer-git-readonly-") as directory:
+        sandbox = Path(directory)
+        (sandbox / "hooks").mkdir()
+        (sandbox / "lfs").mkdir()
+        return _git_code_identity(root, sandbox)
+
+
+def _git_code_identity(root: Path, sandbox: Path) -> dict[str, Any]:
+    read_git = partial(_git_bytes, sandbox=sandbox)
+    index_bytes = read_git(root, ("rev-parse", "--git-path", "index"), allow_empty=False)
+    index_path = Path(os.fsdecode(index_bytes.rstrip(b"\n")))
+    if not index_path.is_absolute():
+        index_path = root / index_path
+    private_index = sandbox / "worktree-index"
+    try:
+        shutil.copyfile(index_path, private_index)
+    except FileNotFoundError:
+        # Git treats a missing index as empty; point it at the private path so
+        # any later refresh remains in the sandbox.
+        pass
+    git = partial(_git_bytes, sandbox=sandbox, index_file=private_index)
+    commit_bytes = git(
         root, ("rev-parse", "--verify", "HEAD"), allow_empty=False)
     try:
         commit = commit_bytes.decode("ascii").strip()
@@ -1882,7 +2085,37 @@ def git_code_identity(repository_root: str | Path) -> dict[str, Any]:
         raise RuntimeError(
             f"git returned an invalid commit identifier: {commit!r}")
 
-    status_bytes = _git_bytes(
+    tracked_paths = git(root, ("ls-files", "-z"), allow_empty=True)
+    _validate_git_content_attributes(root, tracked_paths, sandbox)
+    common_bytes = git(root, ("rev-parse", "--git-common-dir"), allow_empty=False)
+    common_path = Path(os.fsdecode(common_bytes.rstrip(b"\n")))
+    if not common_path.is_absolute():
+        common_path = root / common_path
+    lfs_objects = _git_lfs_objects(root, common_path.resolve(), sandbox)
+    try:
+        lfs_metadata = lfs_objects.lstat()
+    except FileNotFoundError:
+        lfs_metadata = None
+    if lfs_metadata is not None:
+        if stat.S_ISLNK(lfs_metadata.st_mode):
+            lfs_metadata = lfs_objects.stat()
+        if not stat.S_ISDIR(lfs_metadata.st_mode):
+            raise RuntimeError(f"Git LFS object storage is not a directory: {lfs_objects}")
+    # Git LFS clean writes only to the private, initially empty store configured
+    # by _git_bytes. It needs no objects from the shared store to hash files.
+    index_flags = git(root, ("ls-files", "-v", "-z"), allow_empty=True)
+    for entry in index_flags.split(b"\0"):
+        if not entry:
+            continue
+        if len(entry) < 3 or entry[1:2] != b" ":
+            raise RuntimeError("git returned malformed index flags")
+        tag = entry[0]
+        if tag == ord("S") or ord("a") <= tag <= ord("z"):
+            raise RuntimeError(
+                "git code identity cannot verify files marked assume-unchanged "
+                "or skip-worktree")
+
+    status_bytes = git(
         root,
         ("status", "--porcelain=v1", "--untracked-files=all"),
         allow_empty=True,
@@ -1893,12 +2126,46 @@ def git_code_identity(repository_root: str | Path) -> dict[str, Any]:
         raise RuntimeError("git status contains a non-UTF-8 path") from error
     status_lines = tuple(status_text.splitlines())
 
-    tracked_diff = _git_bytes(
+    tracked_diff = git(
         root,
         ("diff", "HEAD", "--binary", "--no-ext-diff", "--no-textconv"),
         allow_empty=True,
     )
-    raw_untracked = _git_bytes(
+    staged_diff = git(
+        root,
+        ("diff", "--cached", "HEAD", "--binary", "--no-ext-diff", "--no-textconv"),
+        allow_empty=True,
+    )
+    # An index stat cache can hide same-size edits with a restored mtime. A
+    # fresh temporary index forces Git to compare tracked worktree contents.
+    with tempfile.TemporaryDirectory(prefix="midlayer-git-identity-") as directory:
+        fresh_index = Path(directory) / "index"
+        git(root, ("read-tree", "HEAD"), allow_empty=True, index_file=fresh_index)
+        verified_diff = git(
+            root, ("diff", "HEAD", "--binary", "--no-ext-diff", "--no-textconv"),
+            allow_empty=True, index_file=fresh_index)
+        verified_names = git(
+            root, ("diff", "HEAD", "--name-only", "-z", "--no-ext-diff", "--no-textconv"),
+            allow_empty=True, index_file=fresh_index) if verified_diff else b""
+    status_paths: set[bytes] = set()
+    if verified_diff:
+        raw_status = git(
+            root, ("status", "--porcelain=v1", "-z", "--untracked-files=all"),
+            allow_empty=True)
+        entries = iter(raw_status.split(b"\0"))
+        for entry in entries:
+            if not entry:
+                continue
+            if len(entry) < 4 or entry[2:3] != b" ":
+                raise RuntimeError("git returned malformed porcelain status")
+            status_paths.add(entry[3:])
+            if b"R" in entry[:2] or b"C" in entry[:2]:
+                original = next(entries, b"")
+                if not original:
+                    raise RuntimeError("git returned an incomplete rename status")
+                status_paths.add(original)
+    verified_paths = {name for name in verified_names.split(b"\0") if name}
+    raw_untracked = git(
         root,
         ("ls-files", "--others", "--exclude-standard", "-z"),
         allow_empty=True,
@@ -1908,6 +2175,8 @@ def git_code_identity(repository_root: str | Path) -> dict[str, Any]:
     digest = hashlib.sha256()
     digest.update(b"midlayer-git-worktree-content-v1\0")
     _update_framed_digest(digest, b"tracked_diff", tracked_diff)
+    _update_framed_digest(digest, b"staged_diff", staged_diff)
+    _update_framed_digest(digest, b"verified_worktree_diff", verified_diff)
     for raw_path in untracked_paths:
         relative_path = Path(os.fsdecode(raw_path))
         path = root / relative_path
@@ -1945,7 +2214,7 @@ def git_code_identity(repository_root: str | Path) -> dict[str, Any]:
         )
         _update_framed_digest(digest, b"untracked_content", content)
 
-    if status_lines:
+    if status_lines or verified_diff:
         worktree_state = "dirty_not_reproducible_by_commit_alone"
     else:
         worktree_state = "clean_reproducible_by_commit"
@@ -1953,7 +2222,7 @@ def git_code_identity(repository_root: str | Path) -> dict[str, Any]:
         "repository_root": str(root),
         "git_commit": commit,
         "worktree_state": worktree_state,
-        "changed_path_count": len(status_lines),
+        "changed_path_count": len(status_lines) + len(verified_paths - status_paths),
         "git_status_short": status_lines,
         "status_porcelain_sha256": hashlib.sha256(status_bytes).hexdigest(),
         "git_diff_hash": digest.hexdigest(),
@@ -1992,16 +2261,89 @@ def _update_framed_digest(
         digest.update(value)
 
 
+def _validate_git_content_attributes(root: Path, tracked_paths: bytes, sandbox: Path) -> None:
+    """Reject transformations that could hide actual checked-out code bytes."""
+    paths = tuple(path for path in tracked_paths.split(b"\0") if path)
+    names = (b"filter", b"text", b"eol", b"working-tree-encoding", b"ident")
+    if not paths:
+        return
+    raw = _git_bytes(
+        root, ("check-attr", "-z", "--stdin", *(name.decode("ascii") for name in names)),
+        allow_empty=False, stdin=tracked_paths, sandbox=sandbox,
+        index_file=sandbox / "worktree-index")
+    fields = raw.split(b"\0")
+    if fields[-1:] != [b""] or len(fields) != len(paths) * len(names) * 3 + 1:
+        raise RuntimeError("git returned malformed content attributes")
+    offset = 0
+    for path in paths:
+        for name in names:
+            actual_path, actual_name, value = fields[offset:offset + 3]
+            offset += 3
+            if actual_path != path or actual_name != name:
+                raise RuntimeError("git returned mismatched content attributes")
+            if value in (b"unspecified", b"unset"):
+                continue
+            if (name == b"filter" and value == b"lfs"
+                    and path.startswith((b"kernel_dataset/", b"launch_data/", b"serving_dataset/"))):
+                continue
+            raise RuntimeError("git code identity cannot verify unsupported Git content attributes")
+
+
+def _git_lfs_objects(root: Path, common_path: Path, sandbox: Path) -> Path:
+    """Resolve Git LFS's optional storage configuration without writing it."""
+    environment = dict(os.environ)
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
+    for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"):
+        if name in environment:
+            del environment[name]
+    completed = subprocess.run(
+        ("git", "-C", str(root), "--work-tree", str(root),
+         "-c", f"core.hooksPath={sandbox / 'hooks'}",
+         "config", "--path", "--get", "lfs.storage"),
+        capture_output=True, env=environment,
+    )
+    if completed.returncode == 1:
+        return common_path / "lfs" / "objects"
+    if completed.returncode != 0:
+        raise RuntimeError("cannot determine Git LFS storage configuration")
+    value = os.fsdecode(completed.stdout.rstrip(b"\n"))
+    if not value:
+        raise RuntimeError("Git LFS storage configuration is empty")
+    storage = Path(value)
+    if not storage.is_absolute():
+        storage = common_path / storage
+    return storage.resolve() / "objects"
+
+
 def _git_bytes(
     repository_root: Path,
     arguments: tuple[str, ...],
     *,
     allow_empty: bool,
+    sandbox: Path,
+    index_file: Path | None = None,
+    stdin: bytes | None = None,
 ) -> bytes:
+    environment = dict(os.environ)
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
+    for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"):
+        if name in environment:
+            del environment[name]
+    if index_file is not None:
+        environment["GIT_INDEX_FILE"] = str(index_file)
     try:
         completed = subprocess.run(
-            ("git", "-C", str(repository_root), *arguments),
+            ("git", "-C", str(repository_root), "--work-tree", str(repository_root),
+             "-c", f"core.hooksPath={sandbox / 'hooks'}",
+             "-c", f"lfs.storage={sandbox / 'lfs'}",
+             "-c", "core.trustctime=true", "-c", "core.checkStat=default",
+             "-c", "core.fsmonitor=false", "-c", "core.autocrlf=false",
+             "-c", "filter.lfs.clean=git-lfs clean -- %f",
+             "-c", "filter.lfs.process=git-lfs filter-process",
+             "-c", "filter.lfs.required=true", *arguments),
+            input=stdin,
             capture_output=True,
+            env=environment,
         )
     except FileNotFoundError as error:
         raise RuntimeError("git is required to record code identity") from error

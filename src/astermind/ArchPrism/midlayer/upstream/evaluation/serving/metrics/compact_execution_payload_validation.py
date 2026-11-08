@@ -81,6 +81,7 @@ STREAMING_EXECUTION_ARTIFACT_HASH_METHODS = {
     12: "ordered_exact_execution_contract_sha256_chain_v4",
     13: "ordered_exact_execution_contract_sha256_chain_v5",
     14: "ordered_exact_execution_contract_sha256_chain_v6",
+    16: "ordered_exact_execution_contract_sha256_chain_v6",
 }
 _MAIN_CHAIN = (
     "RequestStream -> SchedulerBackend/BackendStep/ScheduleStep "
@@ -739,7 +740,8 @@ def _validate_execution_artifact(
         if (type(modeled_kv_offload["schema_version"]) is not int
                 or modeled_kv_offload["schema_version"] != 4
                 or schema_version not in (7, 8, 15)
-                or not modeled_transfers
+                or (not modeled_transfers
+                    and modeled_kv_offload["mode"] != "fixed_prefix_tier_replay")
                 or physical_transfer_count < len(modeled_transfers)):
             raise ValueError("available modeled KV artifact schema mismatch")
     else:
@@ -826,7 +828,7 @@ def _validate_streaming_execution_artifact(
     schema_version = artifact["schema_version"]
     if schema_version not in STREAMING_EXECUTION_ARTIFACT_HASH_METHODS:
         raise ValueError(
-            "streaming execution artifact schema_version must be 9, 10, 11, 12, 13, or 14")
+            "streaming execution artifact schema_version must be 9, 10, 11, 12, 13, 14, or 16")
     if (artifact["hash_method"]
             != STREAMING_EXECUTION_ARTIFACT_HASH_METHODS[schema_version]):
         raise ValueError("streaming execution artifact hash_method mismatch")
@@ -850,7 +852,8 @@ def _validate_streaming_execution_artifact(
         raise ValueError(
             "streaming execution artifact counts must be non-negative")
     if (counts["schedule_steps"] != counts["simulation_steps"]
-            or counts["modeled_kv_offload_transfers"] != 0):
+            or (schema_version != 16
+                and counts["modeled_kv_offload_transfers"] != 0)):
         raise ValueError(
             "streaming execution artifact counts violate the retention scope")
 
@@ -869,8 +872,10 @@ def _validate_streaming_execution_artifact(
         chain_field,
         "request_level_artifact",
     }
-    if schema_version in (13, 14):
+    if schema_version in (13, 14, 16):
         streaming_fields.add("transfer_summary")
+    if schema_version == 16:
+        streaming_fields.add("modeled_kv_offload")
     _exact_fields(streaming, streaming_fields,
                   "streaming execution artifact aggregate")
     if streaming["retention"] != "step_ir_consumed_then_released":
@@ -886,7 +891,7 @@ def _validate_streaming_execution_artifact(
     if streaming["request_level_artifact"] != "not_retained":
         raise ValueError(
             "streaming execution artifact request-level retention mismatch")
-    if schema_version in (13, 14):
+    if schema_version in (13, 14, 16):
         transfer_summary = _mapping(
             streaming["transfer_summary"],
             "streaming execution artifact transfer summary",
@@ -931,6 +936,42 @@ def _validate_streaming_execution_artifact(
         raise ValueError(
             "legacy streaming execution artifact cannot retain transfers")
 
+    if schema_version == 16:
+        offload = _mapping(streaming["modeled_kv_offload"],
+            "streaming modeled KV offload")
+        _exact_fields(offload, {
+            "mode", "validation_status", "transfer_count",
+            "h2d_bytes_per_rank", "d2h_bytes_per_rank",
+            "completion_records_sha256", "final_tier_state",
+        }, "streaming modeled KV offload")
+        if (offload["mode"] not in ("fixed_prefix_tier_replay", "modeled_host_kv_serial")
+                or offload["validation_status"] not in (
+                    "modeled_request_private_full_blocks",
+                    "modeled_shared_prefix_full_blocks")
+                or type(offload["transfer_count"]) is not int
+                or offload["transfer_count"] != counts["modeled_kv_offload_transfers"]
+                or any(type(offload[field]) is not int or offload[field] < 0
+                    for field in ("h2d_bytes_per_rank", "d2h_bytes_per_rank"))):
+            raise ValueError("streaming modeled KV offload counts disagree")
+        _sha256(offload["completion_records_sha256"],
+            "streaming KV completion records SHA256")
+        final_tier_state = _mapping(offload["final_tier_state"],
+            "streaming KV final tier state")
+        if ("validation_status" not in final_tier_state
+                or final_tier_state["validation_status"] != offload["validation_status"]):
+            raise ValueError("streaming KV final tier validation status disagrees")
+        if tuple(_sequence(final_tier_state["inflight_ready_events"],
+                "streaming KV final tier inflight events")):
+            raise ValueError("streaming KV final tier state retains transfers")
+        tiers = _mapping(final_tier_state["tiers"],
+            "streaming KV final tier capacities")
+        if set(tiers) != {"hbm", "host"}:
+            raise ValueError("streaming KV final tier state has invalid tiers")
+        for tier in ("hbm", "host"):
+            state = _mapping(tiers[tier], f"streaming KV {tier} tier")
+            if type(state["reserved_bytes"]) is not int or state["reserved_bytes"] != 0:
+                raise ValueError("streaming KV final tier state retains reserved capacity")
+
     top_level_counts = {
         "num_steps": _integer(payload["num_steps"], "simulation num_steps"),
         "num_transfers": _integer(
@@ -940,9 +981,9 @@ def _validate_streaming_execution_artifact(
     }
     if (top_level_counts["num_steps"] != counts["schedule_steps"]
             or top_level_counts["num_steps"] != counts["simulation_steps"]
-            or (schema_version not in (13, 14)
+            or (schema_version not in (13, 14, 16)
                 and top_level_counts["num_transfers"] != 0)
-            or (schema_version in (13, 14)
+            or (schema_version in (13, 14, 16)
                 and top_level_counts["num_transfers"]
                 != counts["trace_transfers"])
             or top_level_counts["num_kernel_calls"] != counts["kernel_calls"]):
@@ -968,7 +1009,7 @@ def _validate_streaming_execution_artifact(
         "main chain status",
     )
     if (main_chain["status"] != "executed"
-            or main_chain["chain"] != (_SYMBOLIC_MAIN_CHAIN if schema_version == 14 else _MAIN_CHAIN)
+            or main_chain["chain"] != (_SYMBOLIC_MAIN_CHAIN if schema_version in (14, 16) else _MAIN_CHAIN)
             or main_chain["execution_artifact_sha256"] != artifact_sha):
         raise ValueError("main chain did not execute the streaming artifact")
     return {

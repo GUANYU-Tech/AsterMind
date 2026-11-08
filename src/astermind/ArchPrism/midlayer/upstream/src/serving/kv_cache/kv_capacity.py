@@ -10,15 +10,15 @@ from types import MappingProxyType
 from typing import Callable, Iterable, Mapping, Optional
 
 from src.kernel.hardware_spec import HWSpec
-from src.serving.kv_cache.model_residency import dsv4_model_buffer_bytes, model_rank_residencies
+from src.serving.kv_cache.model_residency import dsv4_model_buffer_bytes, dsv4_parallel_model_buffer_bytes, model_rank_residencies
 from src.serving.kv_cache.vllm_allocation import (
     VLLMKVAllocation,
     allocate_vllm_kv_cache,
 )
-from src.serving.parallelism.pp import pipeline_layer_ranges_for_model
+from src.serving.parallelism.pp import pipeline_layer_ranges_for_model, pipeline_layer_ranges
 from src.serving.parallelism.parallel_config import ParallelConfig
 from src.serving.workload.model_config import (
-    ModelConfig, is_validated_qwen3_moe_ep2_model_scope, is_validated_qwen3_pipeline_model_scope,
+    KIMI_K3_CONFIG_SHA256, ModelConfig, is_deepseek_v4_parallel_model_scope, is_deepseek_v4_data_parallel_model_scope, is_dense_parallel_model_scope, is_kimi_k3_parallel_model_scope, is_kimi_k3_data_parallel_model_scope, is_qwen3_moe_source_model_scope, is_validated_qwen3_moe_ep2_model_scope, is_qwen3_moe_pipeline_model_scope,
 )
 
 
@@ -141,6 +141,9 @@ class RuntimeMemoryPolicyBinding:
     max_batched_tokens: int
     max_requests: int
     kv_block_size_tokens: int
+    data_parallel_size: int = 1
+    context_parallel_size: int = 1
+    pipeline_layer_partition: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         for name in ("hardware_id", "deployment", "worker_role"):
@@ -161,8 +164,12 @@ class RuntimeMemoryPolicyBinding:
                 "tensor_parallel_size", "pipeline_parallel_size",
                 "expert_parallel_size", "max_model_len",
                 "max_batched_tokens", "max_requests",
-                "kv_block_size_tokens"):
+                "kv_block_size_tokens", "data_parallel_size", "context_parallel_size"):
             _require_integer(name, getattr(self, name), positive=True)
+        if self.pipeline_layer_partition is not None and (not isinstance(self.pipeline_layer_partition, tuple)
+                or len(self.pipeline_layer_partition) != self.pipeline_parallel_size
+                or any(type(count) is not int or count < 1 for count in self.pipeline_layer_partition)):
+            raise ValueError("runtime memory policy pipeline partition requires one positive integer per PP stage")
 
 
 @dataclass(frozen=True)
@@ -340,6 +347,8 @@ class KVCapacityRankBudget:
     model_weight_resident_bytes: int
     non_kv_reserve_bytes: int
     available_kv_bytes: int
+    data_parallel_rank: int = 0
+    context_parallel_rank: int = 0
 
     def __post_init__(self) -> None:
         for name in (
@@ -347,7 +356,7 @@ class KVCapacityRankBudget:
                 "expert_parallel_rank", "layer_start", "layer_end",
                 "physical_hbm_bytes", "utilized_hbm_bytes",
                 "model_weight_resident_bytes", "non_kv_reserve_bytes",
-                "available_kv_bytes"):
+                "available_kv_bytes", "data_parallel_rank", "context_parallel_rank"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int):
                 raise TypeError(f"rank budget {name} must be an integer")
@@ -370,9 +379,11 @@ class KVCapacityRankBudget:
 class KVCapacityPlan:
     """Resolved capacity consumed by one native framework scheduler.
 
-    kv_block_bytes is a physical allocation row. In a native0.30 shared pool
-    it need not equal the representative token block size times the logical
-    average kv_bytes_per_token; complete native arena facts prove that row.
+    kv_block_bytes is the maximum physical allocation row across workers.
+    Native0.30 hybrid PP workers may have different rows and still share a
+    Scheduler block count. Exact per-worker arenas remain in native receipts;
+    this conservative scalar need not equal the representative token block
+    size times logical kv_bytes_per_token.
     """
 
     pool_name: str
@@ -390,8 +401,24 @@ class KVCapacityPlan:
     rank_budgets: tuple[KVCapacityRankBudget, ...]
     native_allocation: Optional[VLLMKVAllocation]
     v4_weight_storage_profile: str | None = None
+    data_parallel_size: int = 1
+    native_allocations: tuple[VLLMKVAllocation, ...] = ()
+    context_parallel_size: int = 1
+    pipeline_layer_partition: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
+        _require_integer("data_parallel_size", self.data_parallel_size, positive=True)
+        _require_integer("context_parallel_size", self.context_parallel_size, positive=True)
+        if self.pipeline_layer_partition is not None and (not isinstance(self.pipeline_layer_partition, tuple)
+                or self.source_mode != "analytical" or self.pipeline_parallel_size is None
+                or len(self.pipeline_layer_partition) != self.pipeline_parallel_size
+                or any(type(count) is not int or count < 1 for count in self.pipeline_layer_partition)):
+            raise ValueError("capacity pipeline partition requires one positive integer per PP stage")
+        if self.native_allocations == () and self.native_allocation is not None:
+            object.__setattr__(self, "native_allocations", (self.native_allocation,))
+        if (not isinstance(self.native_allocations, tuple)
+                or any(not isinstance(allocation, VLLMKVAllocation) for allocation in self.native_allocations)):
+            raise TypeError("capacity native allocations must contain actual allocator receipts")
         if not isinstance(self.pool_name, str) or not self.pool_name:
             raise ValueError("KV capacity plan pool_name must be non-empty")
         if self.source_mode not in (
@@ -407,21 +434,31 @@ class KVCapacityPlan:
                 "kv_block_size_tokens", "kv_bytes_per_token",
                 "kv_block_bytes", "num_kv_blocks"):
             _require_integer(name, getattr(self, name), positive=True)
-        if self.kv_block_bytes != (
-                self.kv_block_size_tokens * self.kv_bytes_per_token):
+        source_mixed_pool = (self.source_mode == "analytical"
+            and (self.model_config_sha256 == KIMI_K3_CONFIG_SHA256 or self.v4_weight_storage_profile is not None))
+        if self.kv_block_bytes != self.kv_block_size_tokens * self.kv_bytes_per_token or source_mixed_pool:
             allocation = self.native_allocation
-            if (self.source_mode != "analytical" or allocation is None
-                    or allocation.version != "0.30.0" or allocation.kv_spec_type != "UniformTypeKVCacheSpecs"
-                    or allocation.num_kv_blocks != self.num_kv_blocks
-                    or not allocation.worker_allocated_tensor_bytes
-                    or any(size != self.num_kv_blocks * self.kv_block_bytes
-                           for size in allocation.worker_allocated_tensor_bytes)):
+            if (allocation is None or allocation.version != "0.30.0"
+                    or allocation.kv_spec_type not in ("UniformTypeKVCacheSpecs", "MambaSpec")):
+                raise ValueError("KV capacity block bytes disagree with token geometry or native shared-pool arena")
+            if source_mixed_pool:
+                rows = tuple(divmod(size, receipt.num_kv_blocks) for receipt in self.native_allocations
+                    for size in receipt.worker_allocated_tensor_bytes)
+                if (not rows or any(row <= 0 or remainder for row, remainder in rows)
+                        or any(receipt.version != "0.30.0" or receipt.kv_spec_type not in (
+                            "UniformTypeKVCacheSpecs", "MambaSpec") for receipt in self.native_allocations)
+                        or max(row for row, _ in rows) != self.kv_block_bytes):
+                    raise ValueError("KV capacity block bytes disagree with token geometry or native shared-pool arena")
+            elif (allocation.num_kv_blocks != self.num_kv_blocks or not allocation.worker_allocated_tensor_bytes
+                    or any(size != self.num_kv_blocks * self.kv_block_bytes for size in allocation.worker_allocated_tensor_bytes)):
                 raise ValueError("KV capacity block bytes disagree with token geometry or native shared-pool arena")
         if self.source_mode == "analytical":
             if (not self.rank_budgets
                     or self.native_allocation is None
-                    or self.native_allocation.num_kv_blocks
-                    != self.num_kv_blocks):
+                    or not self.native_allocations
+                    or min(allocation.num_kv_blocks for allocation in self.native_allocations) != self.num_kv_blocks
+                    or len(self.native_allocations) != self.data_parallel_size
+                    or self.native_allocations[0] != self.native_allocation):
                 raise ValueError(
                     "analytical KV capacity requires rank budgets and the "
                     "matching native allocation")
@@ -447,10 +484,10 @@ class KVCapacityPlan:
                     "expert_parallel_size"):
                 _require_integer(name, getattr(self, name), positive=True)
             expected_rank_count = (
-                self.tensor_parallel_size * self.pipeline_parallel_size)
+                self.tensor_parallel_size * self.pipeline_parallel_size * self.context_parallel_size * self.data_parallel_size)
             if len(self.rank_budgets) != expected_rank_count:
                 raise ValueError(
-                    "analytical KV capacity rank count disagrees with TP x PP")
+                    "analytical KV capacity rank count disagrees with DP x PP x PCP x TP")
             if tuple(budget.rank for budget in self.rank_budgets) != tuple(
                     range(expected_rank_count)):
                 raise ValueError(
@@ -458,27 +495,43 @@ class KVCapacityPlan:
                     "ordered")
             for budget in self.rank_budgets:
                 expected_tp_rank = budget.rank % self.tensor_parallel_size
-                expected_pp_rank = budget.rank // self.tensor_parallel_size
-                expected_ep_rank = (
-                    expected_tp_rank if self.expert_parallel_size > 1 else 0)
+                expected_cp_rank = budget.rank // self.tensor_parallel_size % self.context_parallel_size
+                expected_pp_rank = budget.rank // (self.tensor_parallel_size * self.context_parallel_size) % self.pipeline_parallel_size
+                expected_dp_rank = budget.rank // (self.tensor_parallel_size * self.context_parallel_size * self.pipeline_parallel_size)
+                expected_ep_rank = ((expected_dp_rank * self.context_parallel_size + expected_cp_rank)
+                    * self.tensor_parallel_size + expected_tp_rank if self.expert_parallel_size > 1 else 0)
+                if self.pipeline_layer_partition is not None:
+                    expected_start = sum(self.pipeline_layer_partition[:expected_pp_rank])
+                    if (budget.layer_start, budget.layer_end) != (expected_start,
+                            expected_start + self.pipeline_layer_partition[expected_pp_rank]):
+                        raise ValueError("capacity rank budget disagrees with its explicit pipeline partition")
                 if (budget.tensor_parallel_rank != expected_tp_rank
                         or budget.pipeline_parallel_rank != expected_pp_rank
+                        or budget.data_parallel_rank != expected_dp_rank
+                        or budget.context_parallel_rank != expected_cp_rank
                         or budget.expert_parallel_rank != expected_ep_rank):
                     raise ValueError(
                         "analytical KV capacity rank coordinates disagree "
                         "with TP/PP/EP")
             if (self.expert_parallel_size not in (
-                    1, self.tensor_parallel_size)):
+                    1, self.tensor_parallel_size * self.data_parallel_size * self.context_parallel_size)):
                 raise ValueError(
-                    "analytical KV capacity supports EP disabled or EP=TP")
-            if (len(self.native_allocation.worker_num_kv_blocks)
-                    != expected_rank_count):
+                    "analytical KV capacity supports EP disabled or EP=TP x DP x PCP")
+            if any(len(allocation.worker_num_kv_blocks) != expected_rank_count // (self.data_parallel_size * self.context_parallel_size)
+                    for allocation in self.native_allocations):
                 raise ValueError(
                     "native KV allocation worker count disagrees with TP x PP")
         elif self.source_mode == "debug_explicit_block_count":
-            if self.rank_budgets or self.native_allocation is not None:
+            if (self.rank_budgets or self.data_parallel_size != 1 or self.context_parallel_size != 1
+                    or self.native_allocations != (() if self.native_allocation is None else (self.native_allocation,))):
                 raise ValueError(
-                    "debug explicit capacity cannot claim analytical evidence")
+                    "debug explicit capacity cannot claim analytical rank budgets")
+            if self.native_allocation is not None and (
+                    self.native_allocation.version != "0.30.0"
+                    or self.native_allocation.num_kv_blocks != self.num_kv_blocks
+                    or any(size != self.num_kv_blocks * self.kv_block_bytes
+                        for size in self.native_allocation.worker_allocated_tensor_bytes)):
+                raise ValueError("debug native allocation disagrees with its explicit shared-pool geometry")
             if any(value is not None for value in (
                     self.hardware_id, self.model_config_sha256,
                     self.tensor_parallel_size, self.pipeline_parallel_size,
@@ -552,7 +605,7 @@ def load_runtime_memory_policy(
         binding_raw = entry["binding"]
         if not isinstance(binding_raw, dict):
             raise TypeError(f"{label}.binding must be a mapping")
-        if set(binding_raw) != _BINDING_FIELDS:
+        if not _BINDING_FIELDS <= set(binding_raw) or set(binding_raw) - _BINDING_FIELDS - {"data_parallel_size", "context_parallel_size", "pipeline_layer_partition"}:
             raise ValueError(
                 f"{label}.binding fields must be exactly "
                 f"{sorted(_BINDING_FIELDS)}")
@@ -576,6 +629,11 @@ def load_runtime_memory_policy(
                     f"{reserve_label}.provenance",
                 ),
             ))
+        if "pipeline_layer_partition" in binding_raw:
+            declared = binding_raw["pipeline_layer_partition"]
+            if declared is not None and not isinstance(declared, list):
+                raise TypeError("runtime policy pipeline_layer_partition must be a list or null")
+            binding_raw = {**binding_raw, "pipeline_layer_partition": None if declared is None else tuple(declared)}
         policy = RuntimeMemoryPolicy(
             pool_name=entry["pool_name"],
             binding=RuntimeMemoryPolicyBinding(**binding_raw),
@@ -609,7 +667,10 @@ def runtime_memory_policy_payload(policies: tuple[RuntimeMemoryPolicy, ...]) -> 
     if len({p.pool_name for p in policies}) != len(policies):
         raise ValueError("runtime policy payload cannot repeat a scheduler pool")
     return {"schema_version": 2, "scheduler_pools": [{
-        "pool_name": policy.pool_name, "binding": asdict(policy.binding),
+        "pool_name": policy.pool_name, "binding": {key: list(value) if key == "pipeline_layer_partition" and value is not None else value
+            for key, value in asdict(policy.binding).items()
+            if (key not in ("data_parallel_size", "context_parallel_size") or value != 1)
+                and (key != "pipeline_layer_partition" or value is not None)},
         "gpu_memory_utilization": {"numerator": policy.gpu_memory_utilization_numerator,
             "denominator": policy.gpu_memory_utilization_denominator,
             "provenance": asdict(policy.gpu_memory_utilization_provenance)},
@@ -902,6 +963,7 @@ def resolve_analytical_kv_capacity_plan(
     allocator: Callable[..., VLLMKVAllocation] = allocate_vllm_kv_cache,
     scheduler_version: str = "0.11.0",
     v4_weight_storage_profile: str | None = None,
+    pipeline_layer_partition: tuple[int, ...] | None = None,
 ) -> KVCapacityPlan:
     """Derive rank budgets and require the selected version's native facts.
 
@@ -918,7 +980,8 @@ def resolve_analytical_kv_capacity_plan(
         raise TypeError("analytical KV capacity requires HWSpec")
     if not isinstance(model, ModelConfig):
         raise TypeError("analytical KV capacity requires ModelConfig")
-    if model.config_extraction_path != "$":
+    k3_source = model.config_sha256 == KIMI_K3_CONFIG_SHA256
+    if model.config_extraction_path != "$" and not k3_source:
         raise NotImplementedError(
             "normal KV capacity cannot use an extracted text_config as "
             "complete model residency: outer multimodal stages and the "
@@ -932,29 +995,57 @@ def resolve_analytical_kv_capacity_plan(
         raise TypeError("analytical KV capacity include_mtp must be boolean")
     if scheduler_version not in ("0.11.0", "0.30.0"):
         raise ValueError("unsupported analytical KV Scheduler version")
+    if pipeline_layer_partition is not None and scheduler_version != "0.30.0":
+        raise NotImplementedError("explicit pipeline partition requires the vLLM0.30 native allocator")
+    v4_scope = (model.model_type == "deepseek_v4" and hardware.hardware_id == "nvidia_h200"
+        and deployment == "colocated" and worker_role == "colocated"
+        and parallelism.context_parallel_size == parallelism.sequence_parallel_size == 1
+        and (is_deepseek_v4_data_parallel_model_scope(model, parallelism)
+            if parallelism.data_parallel_size > 1 else is_deepseek_v4_parallel_model_scope(model,
+                parallelism.tensor_parallel_size, parallelism.pipeline_parallel_size,
+                expert_parallel=parallelism.enable_expert_parallel)))
     if scheduler_version == "0.30.0":
         if allocator is allocate_vllm_kv_cache:
             raise NotImplementedError("0.30 analytical KV capacity requires an explicit native 0.30 allocator")
         if include_mtp:
             raise NotImplementedError("0.30 MTP normal capacity requires a complete startup activation ledger and runtime reserves; the conditional constructor-sized GLM target/drafter source program does not establish all-routing workspace bounds, sparse-index-group/speculative metadata, library/compiler state or allocator reservation")
-        source_pp = (deployment == "colocated" and worker_role == "colocated" and hardware.hardware_id == "nvidia_a800"
-            and not parallelism.enable_expert_parallel
-            and is_validated_qwen3_pipeline_model_scope(model, parallelism.tensor_parallel_size, parallelism.pipeline_parallel_size))
-        if (model.model_type not in ("glm_moe_dsa", "deepseek_v4", "qwen3", "qwen3_moe", "llama")
-                or (parallelism.pipeline_parallel_size != 1 and not source_pp)
+        source_pp = (((deployment == "colocated" and worker_role == "colocated"
+                and hardware.hardware_id in ("nvidia_a800", "nvidia_h200"))
+            or (deployment == "pd_disagg" and worker_role in ("prefill", "decode")
+                and hardware.hardware_id in ("nvidia_a800", "nvidia_h200")))
+            and ((parallelism.is_rank_local and not parallelism.enable_expert_parallel
+                and (deployment == "colocated" or model.compute_dtype == "bf16")
+                and is_dense_parallel_model_scope(model, parallelism.tensor_parallel_size, parallelism.pipeline_parallel_size))
+                or is_qwen3_moe_pipeline_model_scope(model, parallelism.tensor_parallel_size, parallelism.pipeline_parallel_size)))
+        k3_scope = (k3_source and hardware.hardware_id == "nvidia_h200"
+            and deployment == "colocated" and worker_role == "colocated"
+            and (is_kimi_k3_data_parallel_model_scope(model, parallelism)
+                if parallelism.data_parallel_size > 1 else parallelism.is_rank_local
+                    and is_kimi_k3_parallel_model_scope(model, parallelism.tensor_parallel_size,
+                        parallelism.pipeline_parallel_size, expert_parallel=parallelism.enable_expert_parallel)))
+        if not (k3_scope or v4_scope) and (model.model_type not in ("glm_moe_dsa", "deepseek_v4", "qwen3", "qwen3_moe", "llama")
+                or (parallelism.pipeline_parallel_size != 1 and not (source_pp
+                    or (model.model_type == "glm_moe_dsa" and model.weight_dtype == "bf16" and parallelism.context_parallel_size == 1)))
                 or (parallelism.enable_expert_parallel and not (
-                    parallelism.tensor_parallel_size == 2 and is_validated_qwen3_moe_ep2_model_scope(model)))):
-            raise NotImplementedError("0.30 analytical KV facts require ordinary GLM/V4/Qwen3/Llama PP1/MTP-off; EP is limited to validated Qwen3MoE TP=EP=2")
+                    (is_qwen3_moe_source_model_scope(model)
+                        and parallelism.expert_parallel_size == parallelism.tensor_parallel_size * parallelism.data_parallel_size)
+                    or (model.model_type == "glm_moe_dsa" and model.weight_dtype == "bf16"
+                        and (parallelism.context_parallel_size == 1 or parallelism.pipeline_parallel_size == 1)
+                        and parallelism.sequence_parallel_size in ((1, parallelism.tensor_parallel_size)
+                            if parallelism.data_parallel_size > 1 and parallelism.tensor_parallel_size > 1 else (1,)))))):
+            raise NotImplementedError("0.30 analytical KV facts require a supported complete model TP/PP source and expert placement; MTP and unbound storage remain separate gates")
     if model.model_type == "deepseek_v4":
-        if (scheduler_version != "0.30.0" or hardware.hardware_id != "nvidia_h200"
-                or v4_weight_storage_profile != "sm90_deepgemm_marlin" or worker_role != "colocated"):
+        if (scheduler_version != "0.30.0" or not v4_scope
+                or v4_weight_storage_profile != "sm90_deepgemm_marlin"):
             raise NotImplementedError("normal V4 source capacity requires explicit H200/0.30 SM90 DeepGEMM/Marlin storage")
         # The existing policy's framework reserve must include these model
         # buffers once. Do not silently subtract them a second time or omit
         # them because Serving uses a shorter sequence limit than the config.
-        buffers = dsv4_model_buffer_bytes(model, parallelism, max_batched_tokens=max_batched_tokens)
+        buffer_bytes_by_rank = tuple(sum(dsv4_parallel_model_buffer_bytes(model, parallelism, rank,
+            max_batched_tokens=max_batched_tokens, pipeline_layer_partition=pipeline_layer_partition).values())
+            for rank in range(parallelism.worker_count))
         framework = next(reserve for reserve in policy.non_kv_reserves if reserve.kind == "framework")
-        if framework.bytes < sum(buffers.values()):
+        if framework.bytes < max(buffer_bytes_by_rank):
             raise ValueError("V4 framework reserve is smaller than source-defined persistent model buffers")
     elif v4_weight_storage_profile is not None:
         raise ValueError("V4 weight storage profile requires a V4 model")
@@ -983,6 +1074,9 @@ def resolve_analytical_kv_capacity_plan(
         tensor_parallel_size=parallelism.tensor_parallel_size,
         pipeline_parallel_size=parallelism.pipeline_parallel_size,
         expert_parallel_size=parallelism.expert_parallel_size,
+        data_parallel_size=parallelism.data_parallel_size,
+        context_parallel_size=parallelism.context_parallel_size,
+        pipeline_layer_partition=pipeline_layer_partition,
         max_model_len=max_model_len,
         max_batched_tokens=max_batched_tokens,
         max_requests=max_requests,
@@ -1000,10 +1094,14 @@ def resolve_analytical_kv_capacity_plan(
         residency_options["model_execution_version"] = "vllm_0_30_0"
     if v4_weight_storage_profile is not None:
         residency_options["v4_weight_storage_profile"] = v4_weight_storage_profile
+    if pipeline_layer_partition is not None:
+        residency_options["pipeline_layer_partition"] = pipeline_layer_partition
     residencies = model_rank_residencies(model, parallelism, **residency_options)
     rank_budgets = tuple(
         KVCapacityRankBudget(
             rank=residency.rank,
+            data_parallel_rank=residency.data_parallel_rank,
+            context_parallel_rank=residency.context_parallel_rank,
             tensor_parallel_rank=residency.tensor_parallel_rank,
             pipeline_parallel_rank=residency.pipeline_parallel_rank,
             expert_parallel_rank=residency.expert_parallel_rank,
@@ -1020,20 +1118,33 @@ def resolve_analytical_kv_capacity_plan(
         )
         for residency in residencies
     )
-    allocation = allocator(
-        model,
-        parallelism,
-        kv_block_size_tokens=kv_block_size_tokens,
-        max_model_len=max_model_len,
-        available_memory_by_rank=tuple(
-            budget.available_kv_bytes for budget in rank_budgets),
-    )
-    if not isinstance(allocation, VLLMKVAllocation):
+    local_rank_count = parallelism.tensor_parallel_size * parallelism.pipeline_parallel_size
+    if parallelism.data_parallel_size > 1 and (scheduler_version != "0.30.0" or not (
+            model.model_type in ("qwen3_moe", "glm_moe_dsa") or v4_scope or k3_source
+                and is_kimi_k3_data_parallel_model_scope(model, parallelism))):
+        raise NotImplementedError("shared DP normal capacity requires a supported0.30 MoE coordinator")
+    local_parallelism = (ParallelConfig(tensor_parallel_size=parallelism.tensor_parallel_size,
+        pipeline_parallel_size=parallelism.pipeline_parallel_size,
+        enable_expert_parallel=parallelism.enable_expert_parallel and parallelism.tensor_parallel_size > 1)
+        if parallelism.data_parallel_size > 1 or parallelism.context_parallel_size > 1 else parallelism)
+    # CPU's Scheduler/allocator uses CP1. Every PCP rank holds a complete
+    # cache; a shared block pool must fit the smallest corresponding budget.
+    # Receipts stay native CP1 facts, with physical replication reported below.
+    cp = parallelism.context_parallel_size
+    tp = parallelism.tensor_parallel_size
+    allocations = tuple(allocator(model, local_parallelism,
+        kv_block_size_tokens=kv_block_size_tokens, max_model_len=max_model_len,
+        **({"pipeline_layer_partition": pipeline_layer_partition} if pipeline_layer_partition is not None else {}),
+        available_memory_by_rank=tuple(min(rank_budgets[
+            replica * local_rank_count * cp + (lane // tp * cp + context_rank) * tp + lane % tp
+        ].available_kv_bytes for context_rank in range(cp)) for lane in range(local_rank_count)))
+        for replica in range(parallelism.data_parallel_size))
+    if any(not isinstance(allocation, VLLMKVAllocation) for allocation in allocations):
         raise TypeError("native KV allocator must return VLLMKVAllocation")
-    if allocation.version != scheduler_version:
-        raise RuntimeError("native KV allocation version disagrees with the selected Scheduler")
+    allocation = allocations[0]
     if scheduler_version == "0.30.0":
-        expected_spec_type = "FullAttentionSpec" if model.attention_layout == "standard_gqa" else "UniformTypeKVCacheSpecs"
+        expected_spec_type = ("UniformTypeKVCacheSpecs" if k3_source else
+            "FullAttentionSpec" if model.attention_layout == "standard_gqa" else "UniformTypeKVCacheSpecs")
     elif model.attention_layout == "standard_gqa":
         expected_spec_type = "FullAttentionSpec"
     elif model.attention_layout == "mla":
@@ -1041,24 +1152,28 @@ def resolve_analytical_kv_capacity_plan(
     elif model.attention_layout == "dsa_mla":
         expected_spec_type = "HeterogeneousMLAAttentionSpec"
     else:
-        raise AssertionError(
-            "model residency accepted an unsupported attention layout")
-    if (allocation.kv_spec_type != expected_spec_type
-            or allocation.kv_block_size_tokens != kv_block_size_tokens
-            or allocation.max_model_len != max_model_len
-            or len(allocation.worker_num_kv_blocks) != len(rank_budgets)
-            or any(blocks != allocation.num_kv_blocks
-                   for blocks in allocation.worker_num_kv_blocks)
-            or len(allocation.worker_allocated_tensor_bytes)
-            != len(rank_budgets)):
-        raise RuntimeError(
-            "native vLLM KV allocation disagrees with the analytical inputs")
-    layer_ranges = pipeline_layer_ranges_for_model(
-        model, parallelism.pipeline_parallel_size)
-    if model.model_type == "deepseek_v4":
-        # PP1 is enforced above. This average is informational; physical
-        # storage comes from the native mixed-group arena below.
-        stage_kv_bytes_per_token = (model.kv_bytes_per_token_per_parallel_rank(parallelism.tensor_parallel_size, 1),)
+        raise AssertionError("model residency accepted an unsupported attention layout")
+    for receipt in allocations:
+        if receipt.version != scheduler_version:
+            raise RuntimeError("native KV allocation version disagrees with the selected Scheduler")
+        if (receipt.kv_spec_type != expected_spec_type
+                or receipt.kv_block_size_tokens != kv_block_size_tokens or receipt.max_model_len != max_model_len
+                or len(receipt.worker_num_kv_blocks) != local_rank_count
+                or any(blocks != receipt.num_kv_blocks for blocks in receipt.worker_num_kv_blocks)
+                or len(receipt.worker_allocated_tensor_bytes) != local_rank_count):
+            raise RuntimeError("native vLLM KV allocation disagrees with the analytical inputs")
+    allocated_bytes_by_rank = tuple(allocations[budget.data_parallel_rank].worker_allocated_tensor_bytes[
+        budget.pipeline_parallel_rank * parallelism.tensor_parallel_size + budget.tensor_parallel_rank]
+        for budget in rank_budgets)
+    layer_ranges = (pipeline_layer_ranges(model.num_hidden_layers, parallelism.pipeline_parallel_size, pipeline_layer_partition)
+        if pipeline_layer_partition is not None else pipeline_layer_ranges_for_model(model, parallelism.pipeline_parallel_size))
+    if k3_source:
+        stage_kv_bytes_per_token = (0,) * parallelism.pipeline_parallel_size
+    elif model.model_type == "deepseek_v4":
+        # Logical rates follow actual PP owners. Physical bytes remain the
+        # native mixed-group arenas, including their padding and aliasing.
+        stage_kv_bytes_per_token = tuple(model.kv_bytes_per_token_for_layer_range(
+            parallelism.tensor_parallel_size, first, end) for first, end in layer_ranges)
     else:
         stage_kv_bytes_per_token = tuple(
             model.kv_bytes_per_token_for_layer_range(
@@ -1074,35 +1189,39 @@ def resolve_analytical_kv_capacity_plan(
     logical_rate = max(rank_kv_bytes_per_token)
     kv_bytes_per_token = -(-logical_rate.numerator // logical_rate.denominator) if model.model_type == "deepseek_v4" else logical_rate
     kv_block_bytes = kv_block_size_tokens * kv_bytes_per_token
-    if model.model_type == "deepseek_v4":
-        row_sizes = tuple(divmod(size, allocation.num_kv_blocks) for size in allocation.worker_allocated_tensor_bytes)
-        if any(remainder or row != row_sizes[0][0] for row, remainder in row_sizes):
-            raise RuntimeError("V4 shared cache arenas must contain identical integral pool rows")
-        kv_block_bytes = row_sizes[0][0]
+    if model.model_type == "deepseek_v4" or k3_source:
+        row_sizes = tuple(divmod(size, receipt.num_kv_blocks) for receipt in allocations
+            for size in receipt.worker_allocated_tensor_bytes)
+        if not row_sizes or any(remainder or row <= 0 for row, remainder in row_sizes):
+            raise RuntimeError("native mixed-cache arenas must contain positive integral pool rows")
+        # PP changes actual hybrid-cache ownership and row widths. The native
+        # allocator reconciles block counts, not physical bytes per worker.
+        kv_block_bytes = max(row for row, _ in row_sizes)
+        if k3_source:
+            kv_bytes_per_token = -(-kv_block_bytes // kv_block_size_tokens)
         if any(size > budget.available_kv_bytes for size, budget in zip(
-                allocation.worker_allocated_tensor_bytes, rank_budgets, strict=True)):
-            raise RuntimeError("V4 native shared cache arena exceeds its rank-local budget")
+                allocated_bytes_by_rank, rank_budgets, strict=True)):
+            raise RuntimeError("native mixed-cache arena exceeds its rank-local budget")
     elif model.attention_layout != "dsa_mla":
         for budget, bytes_per_token in zip(
                 rank_budgets, rank_kv_bytes_per_token, strict=True):
             local_layers = budget.layer_end - budget.layer_start
             native_bytes_per_block = (
-                allocation.kv_page_size_bytes_per_layer * local_layers)
+                allocations[budget.data_parallel_rank].kv_page_size_bytes_per_layer * local_layers)
             if native_bytes_per_block != (
                     kv_block_size_tokens * bytes_per_token):
                 raise RuntimeError(
                     "native vLLM KV spec bytes disagree with ModelConfig: "
                     f"native={native_bytes_per_block}, "
                     f"model={kv_block_size_tokens * bytes_per_token}")
-    for allocated_bytes, bytes_per_token in zip(
-            allocation.worker_allocated_tensor_bytes,
-            rank_kv_bytes_per_token):
-        if model.model_type == "deepseek_v4":
+    for budget, allocated_bytes, bytes_per_token in zip(rank_budgets,
+            allocated_bytes_by_rank, rank_kv_bytes_per_token, strict=True):
+        if model.model_type == "deepseek_v4" or k3_source:
             # Native mixed groups have different logical token block sizes;
             # the full arena/row validation above owns physical capacity.
             continue
         if allocated_bytes < (
-                allocation.num_kv_blocks
+                allocations[budget.data_parallel_rank].num_kv_blocks
                 * kv_block_size_tokens
                 * bytes_per_token):
             raise RuntimeError(
@@ -1114,7 +1233,7 @@ def resolve_analytical_kv_capacity_plan(
         kv_block_size_tokens=kv_block_size_tokens,
         kv_bytes_per_token=kv_bytes_per_token,
         kv_block_bytes=kv_block_bytes,
-        num_kv_blocks=allocation.num_kv_blocks,
+        num_kv_blocks=min(receipt.num_kv_blocks for receipt in allocations),
         hardware_id=hardware.hardware_id,
         model_config_sha256=model.config_sha256,
         tensor_parallel_size=parallelism.tensor_parallel_size,
@@ -1123,6 +1242,10 @@ def resolve_analytical_kv_capacity_plan(
         worker_role=worker_role,
         rank_budgets=rank_budgets,
         native_allocation=allocation,
+        native_allocations=allocations,
+        data_parallel_size=parallelism.data_parallel_size,
+        context_parallel_size=parallelism.context_parallel_size,
+        pipeline_layer_partition=pipeline_layer_partition,
         v4_weight_storage_profile=v4_weight_storage_profile,
     )
 
@@ -1224,6 +1347,40 @@ def resolve_debug_kv_capacity_plan(
     )
 
 
+def resolve_debug_vllm030_byte_budget_capacity_plan(
+    pool_name: str,
+    *,
+    native_allocation: VLLMKVAllocation,
+) -> KVCapacityPlan:
+    """Represent a mathematical byte-budget run without normal-capacity claims."""
+
+    if not isinstance(native_allocation, VLLMKVAllocation) or native_allocation.version != "0.30.0":
+        raise TypeError("debug native byte-budget capacity requires a vLLM0.30 allocation")
+    sizes = native_allocation.worker_allocated_tensor_bytes
+    if not sizes or any(size != sizes[0] for size in sizes):
+        raise ValueError("debug native byte-budget capacity requires a uniform shared arena")
+    if sizes[0] % native_allocation.num_kv_blocks:
+        raise ValueError("debug native arena must contain whole shared-pool blocks")
+    kv_block_bytes = sizes[0] // native_allocation.num_kv_blocks
+    kv_bytes_per_token = -(-kv_block_bytes // native_allocation.kv_block_size_tokens)
+    return KVCapacityPlan(
+        pool_name=pool_name,
+        source_mode="debug_explicit_block_count",
+        kv_block_size_tokens=native_allocation.kv_block_size_tokens,
+        kv_bytes_per_token=kv_bytes_per_token,
+        kv_block_bytes=kv_block_bytes,
+        num_kv_blocks=native_allocation.num_kv_blocks,
+        hardware_id=None,
+        model_config_sha256=None,
+        tensor_parallel_size=None,
+        pipeline_parallel_size=None,
+        expert_parallel_size=None,
+        worker_role=None,
+        rank_budgets=(),
+        native_allocation=native_allocation,
+    )
+
+
 def validate_ffn_source_capacity(source_memory, *, model, deployment, hardware_by_id):
     """Reject impossible known FFN storage; never infer absent runtime reserves."""
     from src.serving.deployment.deployment_config import worker_role_operator_group
@@ -1302,24 +1459,42 @@ def _validated_source_peak_witness(record):
     return peak, step_id
 
 
+def _pipeline_transient_witness_bytes(record) -> int:
+    total = 0
+    for item in record["peak_live_storage"]:
+        name = item["allocation_id"]
+        if (((":receive:" in name and ":pp-" in name)
+                or name.endswith((":block-residual", ":pipeline:prefix-add", ":output-attn-res")))):
+            total += item["size_bytes"]
+    return total
+
+
 def validate_source_activation_capacity(
     source_memory: Mapping[str, object],
     *,
     plans: Iterable[KVCapacityPlan],
     policy_config: RuntimeMemoryPolicyConfig,
     pool_ranks: Mapping[str, tuple[int, ...]],
+    source_workspace_budget: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Require executed source peaks to fit the existing normal rank ledger.
 
-    This does not size startup memory, replace any reserve, or establish
-    compiled/runtime completeness. Native KV backing bytes and all existing
-    non-activation reserves stay charged. Pool-local capacity ranks map to
-    actual trace ranks through the deployment's explicit placement.
+    Native KV backing bytes and all existing non-activation reserves stay
+    charged. A complete source workspace bound is required before a verified
+    policy can establish normal analytical capacity; peaks alone cannot.
     """
     if not isinstance(source_memory, Mapping):
         raise TypeError("normal source capacity requires the actual source memory report")
     if not isinstance(policy_config, RuntimeMemoryPolicyConfig):
         raise TypeError("normal source capacity requires a bound runtime policy")
+    if source_workspace_budget is not None:
+        required = {"activation_workspace_upper_bound_bytes", "pipeline_p2p_working_bytes",
+            "worker_persistent_bytes"}
+        if (not isinstance(source_workspace_budget, Mapping)
+                or not required <= set(source_workspace_budget)
+                or any(type(source_workspace_budget[name]) is not int
+                    or source_workspace_budget[name] < 0 for name in required)):
+            raise ValueError("normal source capacity requires explicit nonnegative workspace bounds")
     normalized = tuple(plans)
     if not normalized or any(not isinstance(plan, KVCapacityPlan) for plan in normalized):
         raise TypeError("normal source capacity requires canonical capacity plans")
@@ -1351,10 +1526,10 @@ def validate_source_activation_capacity(
         policy = policy_config.policy_for_pool(plan.pool_name)
         binding = policy.binding
         if (plan.hardware_id, plan.model_config_sha256, plan.tensor_parallel_size,
-                plan.pipeline_parallel_size, plan.expert_parallel_size, plan.worker_role,
+                plan.pipeline_parallel_size, plan.expert_parallel_size, plan.data_parallel_size, plan.context_parallel_size, plan.pipeline_layer_partition, plan.worker_role,
                 plan.kv_block_size_tokens, plan.native_allocation.max_model_len) != (
                 binding.hardware_id, binding.model_config_sha256, binding.tensor_parallel_size,
-                binding.pipeline_parallel_size, binding.expert_parallel_size, binding.worker_role,
+                binding.pipeline_parallel_size, binding.expert_parallel_size, binding.data_parallel_size, binding.context_parallel_size, binding.pipeline_layer_partition, binding.worker_role,
                 binding.kv_block_size_tokens, binding.max_model_len):
             raise ValueError("normal source capacity plan disagrees with its runtime policy binding")
         placement = pool_ranks[plan.pool_name]
@@ -1364,36 +1539,85 @@ def validate_source_activation_capacity(
             raise ValueError("normal source capacity requires every physical rank of its pool")
         activation = next(item.bytes for item in policy.non_kv_reserves if item.kind == "activation")
         other_reserves = policy.non_kv_reserve_bytes - activation
+        ranked_pipeline = (source_workspace_budget is not None and any(name in source_workspace_budget
+            for name in ("pipeline_intermediate_persistent_bytes_by_rank",
+                "pipeline_transient_upper_bound_bytes_by_rank")))
+        if source_workspace_budget is not None:
+            communication = next(item.bytes for item in policy.non_kv_reserves if item.kind == "communication")
+            framework = next(item.bytes for item in policy.non_kv_reserves if item.kind == "framework")
+            if not ranked_pipeline and source_workspace_budget["pipeline_p2p_working_bytes"] > communication:
+                raise ValueError("source pipeline working storage exceeds the communication reserve")
+            if source_workspace_budget["worker_persistent_bytes"] > framework:
+                raise ValueError("source worker persistent storage exceeds the framework reserve")
+            if ranked_pipeline:
+                ranked_names = ("pipeline_intermediate_persistent_bytes_by_rank",
+                    "pipeline_transient_upper_bound_bytes_by_rank")
+                if any(name not in source_workspace_budget for name in ranked_names):
+                    raise ValueError("ranked PP capacity requires both persistent and transient bounds")
+                values = tuple(source_workspace_budget[name] for name in ranked_names)
+                if any(not isinstance(rows, tuple) or len(rows) != len(plan.rank_budgets)
+                        or any(type(value) is not int or value < 0 for value in rows) for rows in values):
+                    raise ValueError("ranked PP capacity requires one nonnegative bound per local rank")
+                totals = tuple(persistent + transient for persistent, transient in zip(*values, strict=True))
+                if max(totals) != source_workspace_budget["pipeline_p2p_working_bytes"]:
+                    raise ValueError("ranked PP working storage disagrees with its aggregate bound")
+                if any(source_workspace_budget["worker_persistent_bytes"] + persistent > framework
+                        for persistent in values[0]):
+                    raise ValueError("source PP persistent storage exceeds the framework reserve")
         rank_results = {}
         for budget in plan.rank_budgets:
             physical_rank = placement[budget.rank]
             record = records[str(physical_rank)]
             peak, step_id = _validated_source_peak_witness(record)
+            pipeline_witness = (_pipeline_transient_witness_bytes(record) if ranked_pipeline else 0)
+            workspace = (0 if source_workspace_budget is None
+                else source_workspace_budget["activation_workspace_upper_bound_bytes"])
+            if ranked_pipeline:
+                workspace += source_workspace_budget["pipeline_transient_upper_bound_bytes_by_rank"][budget.rank]
+            required_activation = peak - pipeline_witness + workspace
             if (budget.non_kv_reserve_bytes != policy.non_kv_reserve_bytes
                     or budget.utilized_hbm_bytes != policy.utilized_hbm_bytes(budget.physical_hbm_bytes)):
                 raise ValueError("normal source capacity rank budget lost its bound runtime reserves")
-            native_bytes = plan.native_allocation.worker_allocated_tensor_bytes[budget.rank]
+            native_bytes = plan.native_allocations[budget.data_parallel_rank].worker_allocated_tensor_bytes[budget.pipeline_parallel_rank * plan.tensor_parallel_size + budget.tensor_parallel_rank]
             headroom = (budget.utilized_hbm_bytes - budget.model_weight_resident_bytes
                 - native_bytes - other_reserves)
-            if peak > activation:
+            if required_activation > activation:
                 raise ValueError(f"source activation exceeds normal activation budget: pool={plan.pool_name} "
-                    f"rank={physical_rank} step={step_id} peak={peak} budget={activation}")
-            if peak > headroom:
+                    f"rank={physical_rank} step={step_id} required={required_activation} budget={activation}")
+            if required_activation > headroom:
                 raise ValueError(f"source activation exceeds normal non-KV headroom: pool={plan.pool_name} "
-                    f"rank={physical_rank} step={step_id} peak={peak} headroom={headroom}")
+                    f"rank={physical_rank} step={step_id} required={required_activation} headroom={headroom}")
             if native_bytes > budget.available_kv_bytes:
                 raise ValueError("native KV backing exceeds its normal rank budget")
-            rank_results[str(physical_rank)] = {
+            row = {
                 "capacity_local_rank": budget.rank, "known_activation_peak_bytes": peak,
                 "witness_step_id": step_id, "activation_budget_bytes": activation,
                 "model_weight_resident_bytes": budget.model_weight_resident_bytes,
                 "native_kv_backing_bytes": native_bytes, "other_reserve_bytes": other_reserves,
                 "utilized_hbm_bytes": budget.utilized_hbm_bytes,
                 "source_non_kv_headroom_bytes": headroom,
-                "activation_budget_margin_bytes": activation - peak,
-                "headroom_margin_bytes": headroom - peak}
+                "required_activation_bytes": required_activation,
+                "activation_budget_margin_bytes": activation - required_activation,
+                "headroom_margin_bytes": headroom - required_activation}
+            if ranked_pipeline:
+                row.update(pipeline_transient_witness_bytes=pipeline_witness,
+                    pipeline_intermediate_persistent_bytes=source_workspace_budget[
+                        "pipeline_intermediate_persistent_bytes_by_rank"][budget.rank],
+                    pipeline_transient_upper_bound_bytes=source_workspace_budget[
+                        "pipeline_transient_upper_bound_bytes_by_rank"][budget.rank])
+            rank_results[str(physical_rank)] = row
         reconciled[plan.pool_name] = {"ranks": rank_results,
             "policy_evidence_status": policy.evidence_status}
+    complete_policy = (source_workspace_budget is not None
+        and all(policy_config.policy_for_pool(name).evidence_status == "verified_runtime_evidence"
+            for name in names))
+    if complete_policy:
+        return {"reported_steps": reported, "total_simulation_steps": total,
+            "pools": reconciled, "normal_capacity_accepted": True,
+            "source_workspace_budget": dict(source_workspace_budget),
+            "scope": "complete_bound_source_reserve_ledger_and_all_executed_forward_peaks_fit",
+            "limitations": ("analytical_source_budget_not_measured_h200_runtime_acceptance",
+                "executed_peaks_are_validation_witnesses_not_fitted_reserve_parameters")}
     return {"reported_steps": reported, "total_simulation_steps": total,
         "pools": reconciled, "normal_capacity_accepted": False,
         "scope": "executed_forward_known_source_peaks_fit_existing_normal_budget_only",
@@ -1402,11 +1626,32 @@ def validate_source_activation_capacity(
             "existing_policy_reserves_and_evidence_status_are_unchanged")}
 
 
+def _capacity_source_sequence_axes(plan: KVCapacityPlan, model: ModelConfig) -> tuple[int, bool, bool]:
+    """Describe the actual family program; CP alone never enables SP."""
+    if not (plan.data_parallel_size > 1 and plan.expert_parallel_size > 1 and plan.tensor_parallel_size > 1):
+        return 1, False, False
+    if model.model_type == "qwen3_moe":
+        model_sp, moe_sp = False, True
+    elif model.model_type in ("glm_moe_dsa", "deepseek_v3", "kimi_k2"):
+        model_sp, moe_sp = plan.pipeline_parallel_size == 1, True
+    elif model.model_type in ("kimi_linear", "deepseek_v4"):
+        model_sp = moe_sp = plan.pipeline_parallel_size == 1
+    else:
+        raise NotImplementedError("capacity manifest has no source sequence-parallel semantics for this model family")
+    return plan.tensor_parallel_size if moe_sp else 1, model_sp, moe_sp
+
+
 def kv_capacity_manifest(
     plans: Iterable[KVCapacityPlan],
     policy_config: Optional[RuntimeMemoryPolicyConfig],
+    *,
+    models_by_pool: Mapping[str, ModelConfig] | None = None,
 ) -> dict[str, object]:
-    """Serialize request-safe analytical inputs, accounting, and allocation."""
+    """Serialize capacity and source axes bound to each actual model config.
+
+    Analytical plans require complete model bindings. Debug plans carry no
+    source model identity and must leave models_by_pool unset.
+    """
 
     normalized = tuple(plans)
     if not normalized or any(
@@ -1432,8 +1677,29 @@ def kv_capacity_manifest(
     else:
         raise TypeError(
             "policy_config must be RuntimeMemoryPolicyConfig or null")
+    if modes == {"analytical"}:
+        if not isinstance(models_by_pool, Mapping) or set(models_by_pool) != set(pool_names):
+            raise ValueError("analytical capacity manifest requires exact models_by_pool bindings")
+        for plan in normalized:
+            model = models_by_pool[plan.pool_name]
+            if not isinstance(model, ModelConfig):
+                raise TypeError("capacity manifest model binding must be ModelConfig")
+            if (model.config_sha256 != plan.model_config_sha256
+                    or model.config_sha256 != policy_config.policy_for_pool(plan.pool_name).binding.model_config_sha256):
+                raise ValueError("capacity manifest model binding disagrees with the plan or policy identity")
+    elif modes == {"debug_explicit_block_count"}:
+        if models_by_pool is not None:
+            raise ValueError("debug capacity manifest cannot claim source model bindings")
+    else:
+        raise AssertionError("validated capacity manifest source modes disappeared")
     entries = []
     for plan in sorted(normalized, key=lambda item: item.pool_name):
+        if plan.source_mode == "analytical":
+            source_sp, model_sp, moe_sp = _capacity_source_sequence_axes(plan, models_by_pool[plan.pool_name])
+        elif plan.source_mode == "debug_explicit_block_count":
+            source_sp, model_sp, moe_sp = 1, False, False
+        else:
+            raise AssertionError("validated capacity plan mode disappeared")
         policy = (
             None
             if policy_config is None
@@ -1448,10 +1714,18 @@ def kv_capacity_manifest(
             "tensor_parallel_size": plan.tensor_parallel_size,
             "pipeline_parallel_size": plan.pipeline_parallel_size,
             "expert_parallel_size": plan.expert_parallel_size,
+            "data_parallel_size": plan.data_parallel_size,
+            "context_parallel_size": plan.context_parallel_size,
+            "pipeline_layer_partition": plan.pipeline_layer_partition,
+            "source_sequence_parallel_size": source_sp,
+            "source_model_sequence_parallel": model_sp,
+            "source_moe_sequence_parallel": moe_sp,
+            "native_allocation_scope": "native_cp1_projection_with_complete_physical_cache_replicas" if plan.context_parallel_size > 1 else "native_rank_allocation",
             "kv_block_size_tokens": plan.kv_block_size_tokens,
             "kv_bytes_per_token": plan.kv_bytes_per_token,
             "kv_block_bytes": plan.kv_block_bytes,
             "num_kv_blocks": plan.num_kv_blocks,
+            "num_kv_blocks_semantics": "minimum_per_replica; actual capacities retained in native receipts",
             "runtime_memory_policy": (
                 None if policy is None else {
                     "binding": asdict(policy.binding),
@@ -1474,6 +1748,7 @@ def kv_capacity_manifest(
                 }
             ),
             "rank_budgets": [asdict(budget) for budget in plan.rank_budgets],
+            "native_vllm_allocations_by_data_parallel_rank": [asdict(allocation) for allocation in plan.native_allocations],
             "native_vllm_allocation": (
                 None
                 if plan.native_allocation is None

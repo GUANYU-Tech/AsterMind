@@ -320,7 +320,10 @@ def compare_v4_target_work(reference, plan, hardware):
                     differences.append("selected_indices")
                 if row["kind"] == "lm_head":
                     owner, compulsory = create_predictor(spec.kind).resource_input(spec, hardware_for_call(call, hardware))
-                    tensor_flops = owner.demand_per_resource["compute_tensor"]
+                    # Source matmul arithmetic is independent of whether its
+                    # launch maps GEMM to Tensor Cores or GEMV to SIMT FMA.
+                    tensor_flops = sum(owner.demand_per_resource[resource]
+                        for resource in ("compute_tensor", "compute_fma"))
                     write = sum(node.bytes for path in owner.memory_paths if path.access_kind == "write"
                         for node in path.nodes if node.resource_role == "dram")
                     # Roofline's compulsory operand bytes differ from the
