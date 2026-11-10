@@ -123,6 +123,7 @@ void Topology::add_directed_link(const std::string &source,
                     latency_ns});
   adjacency_[source].push_back(index);
   reverse_adjacency_[target].push_back(index);
+  shortest_routes_.clear();
   auto &outgoing = adjacency_[source];
   std::sort(outgoing.begin(), outgoing.end(),
             [&](const auto left, const auto right) {
@@ -144,6 +145,7 @@ bool Topology::has_node(const std::string &node_id) const {
 void Topology::set_link_enabled(const std::string &source, const std::string &target, bool enabled) {
   for (auto &link : links_) {
     if (link.source == source && link.target == target) {
+      if (link.enabled != enabled) shortest_routes_.clear();
       link.enabled = enabled;
       return;
     }
@@ -153,6 +155,10 @@ void Topology::set_link_enabled(const std::string &source, const std::string &ta
 
 Route Topology::shortest_latency_route(const std::string &source,
                                        const std::string &target) const {
+  const auto key = std::make_pair(source, target);
+  if (const auto found = shortest_routes_.find(key); found != shortest_routes_.end()) {
+    return found->second;
+  }
   if (!has_node(source)) {
     throw std::invalid_argument("flow source does not exist: " + source);
   }
@@ -232,7 +238,10 @@ Route Topology::shortest_latency_route(const std::string &source,
     current = links_[found->second].source;
   }
   std::reverse(reversed_links.begin(), reversed_links.end());
-  return {best_paths[target], reversed_links, distances[target]};
+  if (shortest_routes_.size() >= 65536) shortest_routes_.clear();
+  Route route{best_paths[target], reversed_links, distances[target]};
+  shortest_routes_.emplace(key, route);
+  return route;
 }
 
 Route Topology::ecmp_latency_route(const std::string &source,

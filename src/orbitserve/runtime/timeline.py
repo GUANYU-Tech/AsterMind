@@ -1,4 +1,4 @@
-"""One simulation clock shared by OrbitServe, AsterMind and communication.
+"""One simulation clock for system events and Compute Cell batch boundaries.
 
 The timeline is deliberately small at its public interface: every subsystem
 registers an absolute-time event and the timeline executes events in
@@ -9,6 +9,7 @@ they do not own another clock or event queue.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_CEILING
 import heapq
 import itertools
 import math
@@ -16,6 +17,10 @@ from typing import Any, Callable, Iterable, Protocol
 
 
 EventCallback = Callable[[], None]
+
+
+def nanoseconds(seconds):
+    return int((Decimal(str(seconds)) * 1_000_000_000).to_integral_value(rounding=ROUND_CEILING))
 
 
 @dataclass(frozen=True)

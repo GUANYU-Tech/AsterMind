@@ -1,5 +1,7 @@
 # 输入、输出与时钟约定（v0.2）
 
+本文描述批外系统传输使用的 `CommunicationRuntime`。AsterMind 批内算子用独立的 [同步估时接口](compute-handoff.md#astermind-的算子级估时)。
+
 ## 公共接口
 
 | 接口 | 输入／结果 |

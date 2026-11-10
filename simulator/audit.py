@@ -5,6 +5,12 @@ import json
 from pathlib import Path
 
 
+def audit_estimate(estimate):
+    assert all(type(value) is int and value >= 0 for value in estimate.values())
+    assert estimate["cross_satellite_flows"] <= estimate["flow_count"]
+    assert estimate["rounds"] <= estimate["flow_count"] or estimate["duration_ns"] == 0
+
+
 def audit(result):
     transfers = {event["id"]: event for event in result["transfers"]}
     if len(transfers) != len(result["transfers"]):
@@ -46,6 +52,13 @@ def audit(result):
                 assert end - start == expected, call
                 counts["kernels"] += 1
                 continue
+            if "communication_estimate" in call:
+                estimate = call["communication_estimate"]
+                audit_estimate(estimate)
+                assert end - start == estimate["duration_ns"]
+                counts["communications"] += 1
+                continue
+            # Original event-driven traces remain auditable.
             phase_ready = start
             for phase in call["phases"]:
                 for flow in phase:
@@ -80,6 +93,11 @@ def audit(result):
     for distribution in result.get("input_distributions", []):
         batch = batches[distribution["cell_id"], distribution["step_id"]]
         assert distribution["completed_ns"] <= batch["start_time_ns"]
+        if "communication_estimate" in distribution:
+            estimate = distribution["communication_estimate"]
+            audit_estimate(estimate)
+            assert distribution["completed_ns"] - distribution["ready_ns"] == estimate["duration_ns"]
+            continue
         for phase in distribution["phases"]:
             for flow in phase:
                 assert transfers[flow["id"]]["completion_time_ns"] <= distribution["completed_ns"]

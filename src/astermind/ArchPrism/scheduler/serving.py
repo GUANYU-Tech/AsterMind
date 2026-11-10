@@ -111,7 +111,8 @@ class ServingScheduler:
         if self._inflight is not None or self._dispatch_pending or self._migration_pause is not None:
             return
         self._dispatch_pending = True
-        self.loop.schedule(self.loop.now_s, DISPATCH, f"{self.cell_id}:plan", self._dispatch)
+        self.loop.schedule(self.loop.now_s, DISPATCH, "batch:dispatch", self._dispatch,
+                           owner_id=self.cell_id, metadata={"pool_name": self.backend.config.pool_name})
 
     def _dispatch(self):
         self._dispatch_pending = False
@@ -161,7 +162,8 @@ class ServingScheduler:
         self._record_load()
         self.batch_executor.start_batch(self.cell_id, step.schedule.step_id, plan,
                                        self.execution, self._complete_step,
-                                       token_count=step.schedule.token_count, pool_name=step.schedule.pool_name)
+                                       token_count=step.schedule.token_count, pool_name=step.schedule.pool_name,
+                                       on_next_batch=self._continue_batch)
 
     def _apply_kv(self, step, *, releasing):
         if self.storage_enabled:
@@ -233,18 +235,16 @@ class ServingScheduler:
                 progress["prefill_active_s"], progress["decode_active_s"],
             ))
 
-        def publish_batch():
-            if self._on_output is not None:
-                for output in outputs:
-                    self._on_output(output)
-            for completion in completions:
-                self._on_complete(completion)
-
         self._record_load()
-        self.loop.schedule(end, NOTIFY, f"{self.cell_id}:step_done", publish_batch,
-                           owner_id=self.cell_id,
-                           metadata={"pool_name": step.schedule.pool_name, "step_id": step.schedule.step_id})
-        self._request_dispatch()
+        if self._on_output is not None:
+            for output in outputs:
+                self._on_output(output)
+        for completion in completions:
+            self._on_complete(completion)
+
+    def _continue_batch(self):
+        if not self._dispatch_pending and len(self._requests) > len(self._completed) + len(self._failed):
+            self._dispatch()
 
     def snapshot(self):
         pool = self.execution.deployment.worker_pools[self.backend.config.pool_name]
@@ -276,13 +276,14 @@ class ServingScheduler:
                 "kv_allocated_bytes_scope": "representative_rank",
             },
             "host_timing": "native_launch_profile" if self.execution.host_launch_profiles else "device_only",
-            "device_communication_timing": "external_network_completion",
+            "device_communication_timing": "isolated_operator_estimate",
         }
 
     def report(self):
+        runtime = self.backend.runtime_info
         return dict(steps=self.steps, load_history=self.load_history, final_load=self.snapshot(),
                     execution_performance=self.execution.performance_stats(),
-                    scheduler_runtime=asdict(self.backend.runtime_info))
+                    scheduler_runtime=runtime if isinstance(runtime, dict) else asdict(runtime))
 
     def _record_load(self):
         self.load_history.append(self.snapshot())

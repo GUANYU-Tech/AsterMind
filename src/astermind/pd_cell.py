@@ -3,7 +3,7 @@
 from dataclasses import replace
 
 from orbitserve.runtime.engine.cell_events import CellCompletion
-from orbitserve.runtime.engine.network_events import nanoseconds
+from orbitserve.runtime.timeline import nanoseconds
 from src.serving.workload.kv_transfer_workload import build_pd_kv_transfer_workload
 
 from .cell import MidlayerCell
@@ -11,10 +11,12 @@ from .ArchPrism.midlayer.runtime import create_midlayer_runtime
 
 
 class PrefillDecodeCell:
-    def __init__(self, cell_id, loop, config, executor, on_complete, on_output, on_failure):
+    def __init__(self, cell_id, loop, config, executor, on_complete, on_output, on_failure, *,
+                 submit_handoff):
         backends, self.execution, _ = create_midlayer_runtime(config)
         self.cell_id, self.loop, self.executor = cell_id, loop, executor
         self.on_complete, self.on_output, self.on_failure = on_complete, on_output, on_failure
+        self.submit_handoff = submit_handoff
         self.requests, self.prefill_completions, self.handoffs = {}, {}, {}
         self.transferring = set()
         try:
@@ -85,7 +87,7 @@ class PrefillDecodeCell:
 
         for part in partitions:
             part_id = part["id"]
-            self.executor.transport.submit_transport(part_id, part["source"], part["target"], part["bytes"],
+            self.submit_handoff(part_id, part["source"], part["target"], part["bytes"],
                 "pd_kv", request_id, lambda part_id=part_id: terminal(part_id),
                 lambda event, part_id=part_id: terminal(part_id, event))
 

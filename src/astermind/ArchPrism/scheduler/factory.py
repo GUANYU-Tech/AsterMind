@@ -1,6 +1,8 @@
 """Bind a Cell to its supported upstream CPU Scheduler."""
 
 from dataclasses import replace
+import os
+from pathlib import Path
 
 from src.serving.backend.vllm import VLLMBackend, VLLMSchedulerConfig
 
@@ -19,6 +21,8 @@ def create_scheduler(config, backend_config, model, hardware, *, export_embeddin
     )
     if config.scheduler_adapter == "upstream_exact":
         return VLLMBackend.from_model(backend_config, requested)
+    if config.scheduler_adapter == "vllm_0_30":
+        return _glm_vllm030(config, backend_config, requested, model, hardware)
 
     from ...cell_storage import capacity_inputs
     from .latest_vllm_backend import LatestSchedulerProcess
@@ -33,3 +37,39 @@ def create_scheduler(config, backend_config, model, hardware, *, export_embeddin
     except BaseException:
         process.close()
         raise
+
+
+def _glm_vllm030(config, backend_config, requested, model, hardware):
+    from src.serving.kv_cache.model_residency import model_rank_residencies
+    from src.serving.parallelism.parallel_config import ParallelConfig
+    from src.serving.parallelism.pp import pipeline_layer_ranges_for_model
+
+    if (model.model_type, model.weight_dtype, config.hardware_id, config.deployment,
+            config.pipeline_parallel_size) != ("glm_moe_dsa", "bf16", "nvidia_a800", "colocated", 4):
+        raise NotImplementedError("this 0.30 adapter supports colocated BF16 GLM on A800 PP4")
+    python = os.environ.get("ORBITServe_VLLM030_PYTHON")
+    source = os.environ.get("ORBITServe_VLLM030_SOURCE")
+    if not python or not source:
+        raise ValueError("set ORBITServe_VLLM030_PYTHON and ORBITServe_VLLM030_SOURCE")
+    parallelism = ParallelConfig(tensor_parallel_size=config.tensor_parallel_size,
+                                 pipeline_parallel_size=config.pipeline_parallel_size,
+                                 enable_expert_parallel=config.enable_expert_parallel)
+    ranges = pipeline_layer_ranges_for_model(model, parallelism.pipeline_parallel_size)
+    layers = tuple(end - start for start, end in ranges)
+    residencies = model_rank_residencies(
+        model, parallelism, worker_role="colocated", model_execution_version="vllm_0_30_0",
+        pipeline_layer_partition=layers,
+    )
+    # Use the projected A800 policy's 90% utilization and 2 GiB non-KV reserve.
+    hbm_budget = hardware.resource_by_role("dram").size_bytes * 9 // 10 - 2 * 1024**3
+    budgets = tuple(hbm_budget - rank.weight_resident_bytes for rank in residencies)
+    if min(budgets) <= 0:
+        raise ValueError("GLM weights and non-KV reserve exceed the projected A800 HBM budget")
+    settings = replace(requested, scheduler_version="0.30.0", pipeline_layer_partition=layers,
+                       enable_chunked_prefill=False, gpu_memory_utilization=0.9)
+    return VLLMBackend.from_vllm030_byte_budget(
+        settings, python_executable=Path(python), source_root=Path(source),
+        pool_name=backend_config.pool_name, max_batched_tokens=config.max_batched_tokens,
+        max_requests=config.max_requests, kv_block_size_tokens=config.kv_block_size_tokens,
+        available_memory_by_rank=budgets, supported_layouts_by_rank=(("LBHNC",),) * len(budgets),
+    )

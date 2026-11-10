@@ -2,7 +2,8 @@ import sys
 from types import SimpleNamespace
 import unittest
 
-from network_sim import CommunicationRuntime, TransferRequest
+from network_sim import CommunicationOperator, CommunicationRuntime, OperatorCommunication
+from network_sim import PhysicalTopology, Scenario, TransferRequest
 from network_sim.comm.ns3_runtime import DEFAULT_LIBRARY, NS3Runtime
 from simulator.config import SimulationConfig
 from simulator.examples.make_examples import example
@@ -12,7 +13,7 @@ class SharedNetworkTests(unittest.TestCase):
     def topology(self):
         return SimulationConfig.model_validate(example()).topology()
 
-    def test_cell_executors_are_distinct_and_share_the_network_driver(self):
+    def test_cell_executors_share_an_operator_comm_separate_from_transport(self):
         from simulator.engine import Simulation
 
         def make_cell(config, loop, on_complete, on_output, executor):
@@ -23,13 +24,35 @@ class SharedNetworkTests(unittest.TestCase):
             first = simulation.cells["cellA"].executor
             second = simulation.cells["cellB"].executor
             self.assertIsNot(first, second)
-            self.assertIs(first.transport, second.transport)
-            self.assertIs(first.transport, simulation.transport)
-            self.assertIs(first.transport.network, simulation.network)
+            self.assertIs(first.comm, second.comm)
+            self.assertIs(first.comm, simulation.operator_comm)
+            self.assertIsNot(first.comm, simulation.network)
             self.assertIs(first.loop, simulation.loop)
             self.assertIs(second.loop, simulation.loop)
             self.assertEqual({key[0] for key in first.placements}, {"cellA"})
             self.assertEqual({key[0] for key in second.placements}, {"cellB"})
+
+    def test_operator_estimates_route_and_rounds_without_bandwidth_competition(self):
+        raw = dict(cells=[dict(id="c", satellites=["s"])],
+                   satellites=[dict(id="s")],
+                   devices=[dict(id=f"g{i}", satellite="s", kind="gpu") for i in range(3)],
+                   links=[])
+        raw["devices"].append(dict(id="sw", satellite="s", kind="switch", capacity_gbps=4))
+        for i in range(3):
+            raw["links"].append(dict(id=f"l{i}", source=f"g{i}", target="sw",
+                                     bandwidth_gbps=8, latency_ns=10))
+        comm = OperatorCommunication(PhysicalTopology(Scenario.model_validate(raw)))
+        gpu = ("g0", "g1", "g2")
+        reduce = CommunicationOperator("all_reduce", "ring", gpu, 3000, "per_rank_input",
+                                       ring_order=gpu, reduction="sum")
+        result = comm.estimate(reduce)
+        # Each round independently prices 1000 bytes on a 4 Gbps path with 20 ns latency.
+        self.assertEqual((result.duration_ns, result.rounds, result.flow_count), (8080, 4, 12))
+        self.assertEqual(comm.estimate(reduce), result)
+        exchange = CommunicationOperator("all_to_all", "pairwise", gpu, 3500, "aggregate_input",
+                                        traffic_matrix_bytes=((0, 1000, 0), (2000, 0, 0), (0, 500, 0)))
+        result = comm.estimate(exchange)
+        self.assertEqual((result.duration_ns, result.rounds, result.flow_count), (6040, 2, 3))
 
     def test_three_origins_contend_on_one_resource(self):
         with CommunicationRuntime(self.topology()) as runtime:

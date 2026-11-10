@@ -59,6 +59,7 @@ private:
   std::map<std::string, std::vector<std::size_t>> reverse_adjacency_;
   std::map<std::string, std::uint32_t> ecmp_switch_seeds_;
   std::set<std::pair<std::string, std::string>> directed_pairs_;
+  mutable std::map<std::pair<std::string, std::string>, Route> shortest_routes_;
 };
 
 struct FlowRequest {

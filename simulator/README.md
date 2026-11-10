@@ -24,15 +24,14 @@ python -m simulator --midlayer-root /path/to/midlayer_hw_model-main --scenario s
 |---|---|---|
 | 卫星、地面和设备资源 | [物理网络](../src/network_sim/physical/) | 配置卫星、GPU、交换机、终端和候选连接。`resources.py` 校验逻辑 rank 和请求端点是否符合物理资源 |
 | 轨道与链路条件 | [environment.py](../src/network_sim/physical/environment.py) | 复用 O-S 的 SGP4/ITRS。由可见性和链路参数得到可用窗口，由建链策略管理终端捕获与释放 |
-| 请求与多个 Cell | `engine.py` | 创建共享时钟、Comm 和网络事件驱动，为各 Cell 建立独立执行器，安排请求输入和 token 输出 |
+| 请求与多个 Cell | `engine.py` | 创建全局时间线，为 Cell 注入算子级 Comm，独立安排用户输入和 token 交付 |
 | Cell、Scheduler、KV | `src/astermind/cell.py`、`src/astermind/ArchPrism/scheduler/` | 原生 vLLM 决定 batch、阶段、KV block，Cell 保存进度，OrbitServe 协调迁移 |
 | 计算图与 kernel | M-L 的构图、lowering、预测和本地访存模块 | 提供各 rank 的任务、张量形状、通信和依赖，预测本地 kernel 耗时 |
-| 执行映射与协调 | `src/astermind/ArchPrism/execution/` | 每个 Cell 的 rank 映射、批次依赖与算子推进，通过共享驱动提交跨 GPU 传输 |
-| 传输与迁移 | [Comm](../src/network_sim/comm/)、`migration.py` | 按物理链路状态选路、计算竞争和回报终态。迁移按终态提交或回滚 KV |
+| 执行映射与协调 | `src/astermind/ArchPrism/execution/` | 计算每个 Cell 的 rank 映射和批内依赖时序，只登记批次边界 |
+| 批内通信 | [OperatorCommunication](../src/network_sim/comm/operator.py) | 按完整算子展开链路流量，使用固定拓扑做同步的孤立时长估算 |
+| 批外传输与迁移 | [CommunicationRuntime](../src/network_sim/comm/runtime.py)、`migration.py` | 按物理链路状态选路、计算竞争和回报终态。迁移按终态提交或回滚 KV |
 
-计算侧提供计算和通信的依赖、点对点端点或集合通信参与组、数据量及其含义。执行映射层按选定算法把集合通信展开为逐阶段传输，将逻辑 rank 映射到 GPU 和终端，再提交给通信后端。点对点或已经展开的传输直接复用。当前接通 Ring AllReduce/AllGather、PP 点对点和部分显式变长通信，并非所有集合算法均已接通。
-
-通信后端根据实际连接、链路状态和资源竞争返回完成/失败事件及时间。外部协调层收到事件后释放后续计算和通信；整轮结束再反馈 Scheduler。M-L 原先的跨 GPU 通信预测不重复计费，GPU 本地 kernel、HBM、L2 等仍由 M-L 计时。
+执行器将逻辑 rank 映射到物理 GPU，把完整通信算子交给 Comm。Comm 拆分轮次和流，在配置拓扑上同步返回相对时长。Execution 用各算子的时长和依赖计算整批完成时刻。GPU 本地 kernel、HBM、L2 等仍由 M-L 计时。详见 [AsterMind 对外接口](../src/astermind/README.md#对外接口)。
 
 Cell 选择目前为初始策略：优先已分配但未计算结束的请求较少者，再按孤立输入传输估计、Cell ID 排序；同 session 默认留在原 Cell。原 O-S 全部研究策略尚未逐项接入。完整 batch 结束后再调度下一轮，每轮保留每条请求的阶段、query 长度和已有 KV 长度。
 
@@ -109,6 +108,26 @@ python -m simulator.checks
 ```
 
 `--validate` 只检查资源、配置和拓扑，不证明模型或硬件 kernel 能执行。`audit.py` 核查实际执行的依赖与计时；当前验收见 `runs/acceptance.json`，测试见 `runs/unit_tests.json`，源文件身份由 `provenance.py` 记录。所有示例均采用合成通信参数，不代表真实卫星部署测量。早期核查文件描述的是当时版本，不替代此处现状。
+
+### GLM-5.2 四星 PP4 带宽对照
+
+四颗卫星各承载一个 PP 阶段，按 18／20／20／20 层划分。每星有 8、16 或 32 张 A800，阶段内 TP 和 EP 都等于每星卡数。三个相邻阶段间的链路均设为 1 km 的单程传播时延（3,336 ns），带宽分别跑 400 和 1,000 Gbps 两档。两档都用同样的星内链路与 32 条同时发出的 1,000 输入／100 输出 token 请求。
+
+从仓库根目录运行。仿真器使用现有计算环境，原生调度进程另用与源码匹配的 vLLM 0.30 CPU 环境。该场景采用投影的 A800 显存预算，由 0.30 分配各 rank 的 KV 块。模型采用设备侧仿真计时。
+
+```bash
+export ORBITServe_VLLM030_PYTHON=/path/to/vllm030/venv/bin/python
+export ORBITServe_VLLM030_SOURCE=/path/to/vllm030/source
+python -m network_sim.build_native --output-dir simulator/runs/glm52_pp4/native
+python -m simulator.examples.make_glm52_pp4_bandwidth_sweep simulator/runs/glm52_pp4
+for scenario in simulator/runs/glm52_pp4/*gbps.json; do
+  PYTHONHASHSEED=0 python -m simulator.examples.run_glm52_pp4_bandwidth_case \
+    "$scenario" "${scenario%.json}.summary.json" \
+    --flow-library simulator/runs/glm52_pp4/native/libnetwork_native.so
+done
+```
+
+长用例逐批审计算子依赖和 Comm 估时，统计估算的跨星 PP 流量，再释放已完成的明细。摘要保留各请求的首 token 时延和 Decode TPOT、各批时刻、跨星流量和总输出吞吐。Cell 的首 token 时延从输入就绪算起，端到端吞吐用全部送达的输出 token 除以从首个请求发出到最后一个 token 送达的仿真时长。旧版 FlowSim 实验使用了竞争计时，当前入口的批内耗时口径不同。
 
 2026-10-17 本轮 14 项测试通过，三个新增端到端样例通过依赖与计时审计：四个 Cell 在 2.010/5.010/8.010/11.090 ms 开始计算，12 个请求全部完成，峰值 4 个 Cell 同时运行，出现 8 个 P/D 混合 step，共享 1 Gbps 地面终端最多有 4 条流竞争；TP2→TP2 迁移按两个 rank 各传 2,359,296 字节，全部到齐后提交，目标实际命中 32 token 前缀；A800 与 C500 两个独立 Cell 共存运行。以上为合成配置的功能验证，不是硬件精度实测。汇总见 `runs/20261017_summary.json`；`runs/midlayer_boundary.json` 再次核对 M-L 的 147 个源码、111 个配置文件均未改动。
 

@@ -13,13 +13,14 @@ import sys
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--compiler", help="C++ compiler executable (g++, clang++, or zig)")
+    parser.add_argument("--output-dir", type=Path, help="build into a separate directory")
     parser.add_argument("--upstream-tests", action="store_true")
     args = parser.parse_args()
     root = Path(__file__).resolve().parent
-    output = root / "build"
+    output = args.output_dir or root / "build"
     checkout = root.parents[1] if root.parent.name == "src" else root.parent
     bridge = root / "comm/native/bridge.cc"
-    output.mkdir(exist_ok=True)
+    output.mkdir(parents=True, exist_ok=True)
     compiler = args.compiler or shutil.which("g++") or shutil.which("clang++")
     if not compiler:
         candidate = checkout / "integration/deps/ziglang/zig.exe"

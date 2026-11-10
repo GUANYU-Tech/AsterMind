@@ -10,7 +10,7 @@ import zipfile
 PUBLIC_FILES = (
     "__init__.py", "__main__.py", "api.py", "model.py", "topology.py", "runtime.py", "link_policy.py",
     "physical/__init__.py", "physical/model.py", "physical/topology.py", "physical/link_policy.py",
-    "comm/__init__.py", "comm/model.py", "comm/runtime.py",
+    "comm/__init__.py", "comm/model.py", "comm/operator.py", "comm/runtime.py",
     "build_native.py", "package_release.py", "requirements.txt", "README.md", ".gitignore",
     "physical/_vendor/__init__.py", "physical/_vendor/astermind_interfaces.py",
     "physical/_vendor/orbitserve_link_selection.py",

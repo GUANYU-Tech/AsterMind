@@ -77,7 +77,7 @@ class MidlayerCellConfig:
     max_requests: int = 4
     num_kv_blocks: int = 64
     kv_block_size_tokens: int = 16
-    scheduler_adapter: Literal["auto", "upstream_exact", "vllm_0_31"] = "auto"
+    scheduler_adapter: Literal["auto", "upstream_exact", "vllm_0_30", "vllm_0_31"] = "auto"
     enable_prefix_caching: bool = False
     watermark: float = 0.0
     memory_policy_file: str | None = None
@@ -149,14 +149,14 @@ def create_midlayer_runtime(config: MidlayerCellConfig, *, with_scheduler: bool 
         from src.serving.workload.model_config import DEEPSEEK_V3_L32_CONFIG_SHA256
         if model.config_sha256 == DEEPSEEK_V3_L32_CONFIG_SHA256:
             raise NotImplementedError("DeepSeek-V3 L32 has no bound symbolic Serving source in this snapshot")
-    elif (config.deployment != "colocated" or config.scheduler_adapter == "vllm_0_31"
+    elif (config.deployment != "colocated" or config.scheduler_adapter in ("vllm_0_30", "vllm_0_31")
           or config.host_launch_profile_file is not None):
         raise NotImplementedError("the logical main uses colocated CPU scheduling and device timing")
     if config.scheduler_adapter == "auto":
         adapter = ("vllm_0_31" if _SOURCE_INPUTS and model.attention_layout == "standard_gqa"
                    else "upstream_exact")
         config = replace(config, scheduler_adapter=adapter)
-    if config.scheduler_adapter not in ("vllm_0_31", "upstream_exact"):
+    if config.scheduler_adapter not in ("vllm_0_31", "vllm_0_30", "upstream_exact"):
         raise ValueError("unknown Scheduler adapter")
     if isinstance(config.watermark, bool) or not math.isfinite(config.watermark) or not 0 <= config.watermark < 1:
         raise ValueError("watermark must be in [0, 1)")
@@ -200,9 +200,6 @@ def create_midlayer_runtime(config: MidlayerCellConfig, *, with_scheduler: bool 
             for index, (pool, role) in enumerate(zip(pools, roles, strict=True))), routes=routes),
         num_layers=model.num_hidden_layers, num_experts=model.num_experts, **plan_options,
     )
-    validate_workload_emission_parallelism(deployment, model, allow_single_pool_tp2=True,
-        allow_single_pool_ep2=True, allow_single_pool_tp1_pp=True, allow_single_pool_tp2_pp2=True)
-
     host_profiles = None
     if config.host_launch_profile_file is not None:
         from src.serving.host_timing import load_host_launch_profile
@@ -217,6 +214,11 @@ def create_midlayer_runtime(config: MidlayerCellConfig, *, with_scheduler: bool 
         # Older explicit snapshots provide eager Host intervals with the device timeline.
         materialize_timeline_details=host_profiles is not None,
     )
+    source_options = ({"runtime_inputs": execution.runtime_inputs}
+                      if config.scheduler_adapter == "vllm_0_30" else {})
+    validate_workload_emission_parallelism(deployment, model, allow_single_pool_tp2=True,
+        allow_single_pool_ep2=True, allow_single_pool_tp1_pp=True, allow_single_pool_tp2_pp2=True,
+        **source_options)
     if not with_scheduler:
         return {}, execution, storage_enabled
 

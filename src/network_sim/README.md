@@ -1,6 +1,6 @@
 # 设备拓扑与通信模块（v0.2）
 
-静态基础与动态建链已经实现：自由配置 Cell／卫星／GPU／Switch／多终端，查询实际设备路径，以及按链路和设备总容量进行公平带宽共享。它独立运行，未修改多 GPU 操作层、OrbitServe 或 Mid-Layer 的计算代码。
+通信模块共用一套 Cell／卫星／GPU／Switch／终端拓扑。AsterMind 用 `OperatorCommunication` 同步估算批内通信算子。OrbitServe 的批外系统传输用 `CommunicationRuntime` 处理动态建链和公平带宽共享。 [AsterMind 算子对接](docs/compute-handoff.md)
 
 先看 [分层架构图与代码对应](docs/architecture.md)；浏览器版在 [architecture.html](docs/architecture.html)，包含框架、两星设备图和共享瓶颈三张图。
 
@@ -16,7 +16,8 @@
 | 静态 Cell 间连接 | 显式跨 Cell 终端连接；两端必须声明 `external_access`；未连接轨道和可见性 |
 | 路径 | 确定性最小传播延迟路径；不按拥塞改路；GPU 不自动充当中继 |
 | 流量共享 | 直接使用 AsterMind FlowSim 的 max-min 分配，任务加入／结束时重新分配 |
-| 外部时钟 | `next_event_time_ns` + `advance_to`，可供未来 O-S 全局事件时钟驱动 |
+| 批内算子估时 | `estimate(CommunicationOperator)` 返回相对纳秒时长，按轮次展开传输并查物理路径 |
+| 批外传输时钟 | `next_event_time_ns` + `advance_to` 由 OrbitServe 的事件驱动器调用 |
 | 终态反馈 | 完成／断链失败各携带任务来源、关联编号、实际路径和时刻；每任务只通知一次 |
 | 动态建链 | simple_keep 保持旧链；os_reference 复用 O-S 通用／Walker 选择；三项时间可配 |
 | 可用窗口 | 外部输入可见区间，失效时中断在途任务，未开始任务等待建链；尚未接轨道 |

@@ -6,7 +6,8 @@ from .bootstrap import activate
 
 
 class Simulation:
-    def __init__(self, config, *, midlayer_root=None, cell_factory=None, network_factory=None):
+    def __init__(self, config, *, midlayer_root=None, cell_factory=None, network_factory=None,
+                 operator_comm_factory=None):
         startup = time.perf_counter()
         self.config = config
         self.root = activate(midlayer_root)
@@ -40,12 +41,14 @@ class Simulation:
             {c.id: {p.rank: p.device for p in c.placements} for c in config.cells})
         self._session_cells = {}
         try:
+            from network_sim.comm.operator import OperatorCommunication
             from astermind.ArchPrism.execution.network_batch_executor import NetworkBatchExecutor
             from astermind.ArchPrism.execution.placement import RankPlacement
+            self.operator_comm = (operator_comm_factory or OperatorCommunication)(self.topology)
             for c in config.cells:
                 placements = tuple(RankPlacement(c.id, p.pool, p.rank,
                     self.topology.devices[p.device].satellite, p.device) for p in c.placements)
-                executor = NetworkBatchExecutor(c.id, self.transport, placements,
+                executor = NetworkBatchExecutor(c.id, self.loop, self.operator_comm, placements,
                     on_batch_boundary=self.migrations.on_batch_boundary)
                 self.executors[c.id] = executor
                 if cell_factory is None:
@@ -74,7 +77,8 @@ class Simulation:
         if cell.deployment == "pd_disagg":
             from astermind.pd_cell import PrefillDecodeCell
             return PrefillDecodeCell(cell.id, self.loop, config, executor,
-                                     self._completed, self._output, self._cell_failure)
+                                     self._completed, self._output, self._cell_failure,
+                                     submit_handoff=self.transport.submit_transport)
         return ServingScheduler.create(cell.id, self.loop, config, self._completed,
             on_output=self._output, on_failure=self._cell_failure,
             batch_executor=executor, history_store=self.history)
@@ -219,6 +223,7 @@ class Simulation:
                              event_loop_wall_s=time.perf_counter() - started,
                              simulated_time_ns=round(self.loop.now_s * 1e9)),
             provenance=dict(midlayer_root=str(self.root), communication=self.config.backend,
+                batch_communication="isolated_operator_estimate",
                 graph_backends={c.id: c.graph_backend for c in self.config.cells},
                 accuracy="integration tests; no new hardware accuracy claim"))
 

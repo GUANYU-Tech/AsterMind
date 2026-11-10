@@ -1,14 +1,9 @@
 """Drive a shared communication backend from the global timeline."""
 
-from decimal import Decimal, ROUND_CEILING
-
 from network_sim.comm.model import TransferRequest
 
+from ..timeline import nanoseconds
 from .cell_events import DISPATCH
-
-
-def nanoseconds(seconds):
-    return int((Decimal(str(seconds)) * 1_000_000_000).to_integral_value(rounding=ROUND_CEILING))
 
 
 class CommunicationFailed(RuntimeError):

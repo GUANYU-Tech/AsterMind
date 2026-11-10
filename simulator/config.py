@@ -50,7 +50,7 @@ class ServingCell(Contract):
     max_requests: Positive = 4
     num_kv_blocks: Positive = 64
     kv_block_size_tokens: Positive = 16
-    scheduler_adapter: Literal["auto", "upstream_exact", "vllm_0_31"] = "auto"
+    scheduler_adapter: Literal["auto", "upstream_exact", "vllm_0_30", "vllm_0_31"] = "auto"
     prefix_caching: bool = False
     native_expert_parallel: bool = False
     expert_routing_seed: Annotated[int, Field(strict=True, ge=0)] | None = None
