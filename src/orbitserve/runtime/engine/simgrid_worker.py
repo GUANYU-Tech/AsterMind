@@ -9,6 +9,7 @@ serialization. Capacities are converted from bits/s to SimGrid bytes/s here.
 from __future__ import annotations
 
 import json
+import math
 import sys
 from importlib.metadata import version
 
@@ -25,7 +26,7 @@ def main():
             "--cfg=network/model:CM02",
             "--cfg=network/crosstraffic:0",
             "--cfg=network/weight-S:0",
-            "--cfg=precision/timing:1e-12",
+            "--cfg=precision/timing:1e-15",
             "--cfg=precision/work-amount:1e-9",
             "--log=root.thres:critical",
         ]
@@ -51,6 +52,9 @@ def main():
         )
     zone.seal()
     active = {}
+    link_metadata = {row['key']:row for row in initial['links']}
+    from .simgrid_events import NativeGlobalEvents
+    scheduler = NativeGlobalEvents(sg, next(iter(hosts.values())), active) if initial.get('global_scheduler') else None
 
     def emit(payload):
         print(
@@ -67,6 +71,8 @@ def main():
             try:
                 op = command["op"]
                 if op == "close":
+                    if scheduler is not None:
+                        scheduler.close()
                     for row in active.values():
                         row["comm"].cancel()
                     active.clear()
@@ -82,6 +88,22 @@ def main():
                     )
                     active[command["id"]] = {"comm": comm, "key": command["key"]}
                     emit({"started": command["id"]})
+                elif op == 'schedule_event':
+                    scheduler.schedule(command['id'], command['at_s'], command['priority'],restore=command.get('restore',False))
+                    emit({'scheduled':command['id']})
+                elif op == 'scheduler_state':
+                    emit({'scheduler':scheduler.report()})
+                elif op == 'restore_scheduler':
+                    stats=command['stats']
+                    if scheduler.stats['dispatched'] or stats['pending']!=len(scheduler.pending):
+                        raise ValueError('scheduler restoration must match all pending deadlines')
+                    scheduler.stats={key:stats[key] for key in scheduler.stats}
+                    emit({'scheduler':scheduler.report()})
+                elif op == 'cancel_events':
+                    scheduler.cancel(command['ids'])
+                    emit({'cancelled_events':command['ids']})
+                elif op == 'pop_event':
+                    emit({'event':scheduler.pop(), 'scheduler':scheduler.report()})
                 elif op == "configure":
                     for key, bits_per_s in command["capacities"].items():
                         rows = [r for r in active.values() if r["key"] == key]
@@ -103,7 +125,7 @@ def main():
                             remaining[identity] = row["comm"].remaining / BYTE_SCALE
                             row["comm"].cancel()
                     emit({"cancelled": remaining})
-                elif op == "advance":
+                elif op in {"advance", "advance_next"}:
                     target = float(command["until_s"])
                     before_time = sg.Engine.clock
                     before = {
@@ -112,7 +134,9 @@ def main():
                     }
                     if target < before_time - 1e-12:
                         raise ValueError("SimGrid cannot move backwards")
-                    if target > before_time:
+                    if op == 'advance_next':
+                        scheduler.advance(target)
+                    elif target > before_time:
                         if active:
                             activities = sg.ActivitySet(
                                 [r["comm"] for r in active.values()]
@@ -133,6 +157,20 @@ def main():
                         / BYTE_SCALE
                         for identity, amount in before.items()
                     }
+                    service_errors = {identity:(math.ulp(amount)+math.ulp(active[identity]['comm'].remaining))*2/BYTE_SCALE
+                                      + links[active[identity]['key']].bandwidth/BYTE_SCALE*1e-15
+                                      for identity,amount in before.items()}
+                    elapsed = sg.Engine.clock - before_time
+                    rates = {identity:amount*8/elapsed for identity,amount in progress.items()} if elapsed>0 else {}
+                    resources = {}
+                    for identity,rate in rates.items():
+                        key = active[identity]['key']
+                        metadata = link_metadata[key]
+                        for resource,capacity in [(key,links[key].bandwidth*8/BYTE_SCALE),
+                            *[(pool,pools[pool].bandwidth*8/BYTE_SCALE) for pool in metadata.get('pools',())]]:
+                            entry = resources.setdefault(resource,dict(resource_id=resource,capacity_bps=capacity,allocated_bandwidth_bps=0,allocation_error_bps=0))
+                            entry['allocated_bandwidth_bps'] += rate
+                            entry['allocation_error_bps'] += service_errors[identity]*8/elapsed
                     for identity in done:
                         active.pop(identity)
                     emit(
@@ -140,6 +178,14 @@ def main():
                             "completed": done,
                             "bytes_sent": progress,
                             "interval_start_s": before_time,
+                            "horizon_reached": sg.Engine.clock >= target,
+                            "scheduler": scheduler.report() if scheduler else None,
+                            "allocated_rates_bps": rates,
+                            "resources": list(resources.values()),
+                            "service_clock": "simgrid_float64_seconds",
+                            "service_errors_bytes": service_errors,
+                            "native_interval_start_s": before_time,
+                            "native_interval_end_s": sg.Engine.clock,
                         }
                     )
                 else:

@@ -1,6 +1,7 @@
 """Native block transaction, adapted from Merge_ML_Version's migration seam."""
 
 import math
+from ..clock import stamp
 
 
 class NetworkKVMigration:
@@ -44,6 +45,7 @@ class NetworkKVMigration:
             "state": "waiting_for_batch_boundary",
             "requested_time_s": self.loop.now_s,
         }
+        stamp(record)
         self.records[spec.id] = record
         source.pause_for_migration(spec.id)
         try:
@@ -90,6 +92,7 @@ class NetworkKVMigration:
                 record.update(
                     state="failed", reason=reason, completed_time_s=self.loop.now_s
                 )
+                stamp(record)
                 release()
 
         def memory_delay(cell, size, operation):
@@ -141,6 +144,7 @@ class NetworkKVMigration:
                     partitions=partitions,
                     start_time_s=self.loop.now_s,
                 )
+                stamp(record)
                 failures = []
 
                 def delivered(rank, failure=None):
@@ -152,6 +156,7 @@ class NetworkKVMigration:
                         state="failed" if failure else "completed",
                         terminal_time_s=self.loop.now_s,
                     )
+                    stamp(part)
                     if failure:
                         failures.append(failure)
                     if pending:
@@ -162,6 +167,7 @@ class NetworkKVMigration:
                         return
                     record["network_complete_time_s"] = self.loop.now_s
                     record["state"] = "writing"
+                    stamp(record)
 
                     def commit():
                         if record["state"] != "writing":
@@ -187,6 +193,7 @@ class NetworkKVMigration:
                             )
                             raise
                         finally:
+                            stamp(record)
                             release()
                         if on_complete is not None:
                             on_complete(record)

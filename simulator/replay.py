@@ -16,6 +16,10 @@ WEB = Path(__file__).with_name("web")
 
 
 def native_ns(seconds):
+    from orbitserve.runtime.clock import Time
+    from orbitserve.runtime.timeline import nanoseconds
+    if isinstance(seconds, Time):
+        return nanoseconds(seconds)
     return int(
         (Decimal(str(seconds)) * 1_000_000_000).to_integral_value(
             rounding=ROUND_CEILING
@@ -86,11 +90,30 @@ def audit_checks(result):
                     f"依赖尚未完成：{identity}",
                 )
             if not call["communication"]:
+                if result.get('configuration',{}).get('timeline_mode') == 'simgrid':
+                    from orbitserve.runtime.clock_audit import computation_duration_valid
+                    duration_valid=computation_duration_valid(call,result['network']['clock'])
+                else:
+                    duration_valid=end-start==native_ns(call['native_prediction_s'])
                 check(
                     "kernel_duration",
-                    end - start == native_ns(call["native_prediction_s"]),
+                    duration_valid,
                     at,
-                    "算子耗时应等于原生预测向上取整至 ns",
+                    "算子耗时必须符合原生预测及所选引擎的时钟契约",
+                )
+                continue
+            if call.get("communication_backend") == "protobridge":
+                row = call.get("surrogate", {})
+                attempts = row.get("attempts", [])
+                check(
+                    "communication_barrier",
+                    bool(attempts)
+                    and not call["phases"]
+                    and row.get("end_s") is not None
+                    and native_ns(row["end_s"]) == end
+                    and row["end_s"] >= row["start_s"] >= row["ready_s"],
+                    at,
+                    "ProtoBridge 完成事件必须满足通信屏障，不能同时重复提交逐流通信",
                 )
                 continue
             ready = start
@@ -122,11 +145,11 @@ def audit_checks(result):
                 "COMM 结束时刻必须等于末阶段的最后一次实际交付",
             )
 
-    batches = {(b["cell_id"], b["step_id"]): b for b in result["batches"]}
+    batches = {(b["cell_id"], b["step_id"]): b["start_time_ns"] for b in result["batches"]}
     for i, distribution in enumerate(result.get("input_distributions", [])):
         batch = batches.get((distribution["cell_id"], distribution["step_id"]))
         valid = (
-            batch is not None and distribution["completed_ns"] <= batch["start_time_ns"]
+            batch is not None and distribution["completed_ns"] <= batch
         )
         for phase in distribution["phases"]:
             for flow in phase:
@@ -173,15 +196,16 @@ def audit_checks(result):
 
     for index, row in enumerate(result["network"]["event_log"]):
         if row["kind"] == "bandwidth_update":
+            from orbitserve.runtime.service_precision import bandwidth_check
+            outcome=bandwidth_check(row,native_ns_clock=result.get('configuration',{}).get('backend')=='flowsim')
             check(
                 "service_capacity",
-                0
-                <= row["allocated_bandwidth_bps"]
-                <= row["link_capacity_bps"] * (1 + 1e-5) + 1e-3
-                and row["bytes_sent"] >= 0,
+                outcome['state']!='fail',
                 f"network.event_log[{index}]",
-                "实际分配带宽不能超过该区间物理容量；服务字节非负",
+                outcome.get('detail',''),
             )
+            if outcome['state']=='precision':
+                groups['service_capacity'].setdefault('warnings',[]).append(dict(evidence=f'network.event_log[{index}]',**outcome))
 
     for event in transfers.values():
         physical = physical_terminals.get(event["id"])
@@ -240,14 +264,10 @@ def audit_checks(result):
                 at,
                 "目标写入完成不得早于网络屏障",
             )
+            from orbitserve.runtime.clock_audit import migration_barrier_valid
             check(
                 "migration_transaction",
-                all(
-                    e is not None
-                    and e.get("completion_time_ns", math.inf)
-                    <= physical_ns(migration["network_complete_time_s"]) + 1e-3
-                    for e in terminals
-                ),
+                migration_barrier_valid(migration, terminals),
                 at,
                 "网络屏障等待最慢分片",
             )
@@ -273,18 +293,29 @@ def audit_checks(result):
             )
 
     for row in groups.values():
-        row["state"] = "pass" if not row["violations"] else "fail"
+        row["state"] = "fail" if row['violations'] else 'warn' if row.get('warnings') else 'pass'
+    from orbitserve.runtime.clock_audit import clock_checks
+    for row in clock_checks(result):
+        if row['id'] in groups:
+            existing = groups[row['id']]
+            row['checked'] = max(row['checked'], existing['checked'])
+            row['violations'].extend(existing['violations'])
+            row['state'] = 'fail' if row['violations'] else 'pass'
+        groups[row['id']] = row
     return list(groups.values())
 
 
 def replay_data(result, *, source_name="report.json", source_sha256=None):
     from simulator.config import SimulationConfig
+    from simulator.record_store import CompressedRecords
 
     config = SimulationConfig.model_validate(result["configuration"])
     graph = config.topology()
     nodes = graph.node_device
     placements = {(c.id, p.rank): p.device for c in config.cells for p in c.placements}
-    calls, steps, ready_times = [], [], {}
+    owners = {d.id: d.satellite for d in graph.devices.values()}
+    calls, steps, ready_times = CompressedRecords(), [], {}
+    ready_ticks = {}
     for cell_id, cell in result["cells"].items():
         for index, row in enumerate(cell["steps"]):
             schedule = row["step"]["schedule"]
@@ -311,6 +342,8 @@ def replay_data(result, *, source_name="report.json", source_sha256=None):
             for phase in call["phases"]:
                 for flow in phase:
                     ready_times[flow["id"]] = flow["ready_time_ns"]
+                    if flow.get('ready_time_ticks') is not None:
+                        ready_ticks[flow['id']] = flow['ready_time_ticks']
             calls.append(
                 {
                     "id": call["call_id"],
@@ -319,15 +352,24 @@ def replay_data(result, *, source_name="report.json", source_sha256=None):
                     "batch": batch["step_id"],
                     "rank": call["rank"],
                     "device": placements.get((batch["cell_id"], call["rank"])),
+                    "owner": owners.get(placements.get((batch["cell_id"], call["rank"]))),
                     "kind": call["kind"],
                     "comm": call["communication"],
                     "start": call["start_time_ns"],
                     "end": call["end_time_ns"],
+                    "start_ticks": call.get('start_time_ticks'),
+                    "end_ticks": call.get('end_time_ticks'),
                     "deps": [lookup.get(tuple(d), -1) for d in call["dependencies"]],
                     "gap": call["launch_gap_ns"],
                     "host_ready": call["host_ready_time_ns"],
                     "native_ns": native_ns(call["native_prediction_s"]),
                     "phases": phases,
+                    "communication_backend": call.get(
+                        "communication_backend", config.backend
+                    )
+                    if call["communication"]
+                    else None,
+                    "surrogate": call.get("surrogate"),
                     "evidence": f"batches[{batch_index}].calls[{i}]",
                 }
             )
@@ -335,7 +377,7 @@ def replay_data(result, *, source_name="report.json", source_sha256=None):
         for phase in distribution["phases"]:
             for flow in phase:
                 ready_times[flow["id"]] = flow["ready_time_ns"]
-    resource_map, hops, events, terminal_clock = {}, [], [], {}
+    resource_map, hops, events, terminal_clock = {}, CompressedRecords(), [], {}
     observed_capacity = {}
     physical_events = result["network"].get("flows", [])
     for event in physical_events:
@@ -391,6 +433,8 @@ def replay_data(result, *, source_name="report.json", source_sha256=None):
                     "target": nodes.get(row["target_node_id"], row["target_node_id"]),
                     "start": physical_ns(row["interval_start_s"]),
                     "end": physical_ns(row["interval_end_s"]),
+                    "start_ticks": row.get('interval_start_ticks'),
+                    "end_ticks": row.get('interval_end_ticks'),
                     "rate": row["allocated_bandwidth_bps"],
                     "capacity": row["link_capacity_bps"],
                     "bytes": row["bytes_sent"],
@@ -421,11 +465,12 @@ def replay_data(result, *, source_name="report.json", source_sha256=None):
                 **event,
                 "start": ready_times.get(event["id"]),
                 "end": end,
+                "start_ticks": ready_ticks.get(event['id']),
+                "end_ticks": event.get('time_ticks'),
                 "physical_end": terminal_clock.get(event["id"]),
                 "evidence": f"transfers[{index}]",
             }
         )
-    owners = {d.id: d.satellite for d in graph.devices.values()}
     migrations = {}
     for identity, migration in result.get("migrations", {}).items():
         ready = [
@@ -439,17 +484,15 @@ def replay_data(result, *, source_name="report.json", source_sha256=None):
             "source_read_complete_ns": min(ready) if ready else None,
             "mode": definition.mode if definition is not None else None,
         }
-    for call in calls:
-        call["owner"] = owners.get(call["device"])
     end = max(
-        [t["end"] for t in transfers]
-        + [c["end"] for c in calls]
-        + [
+        max((t["end"] for t in transfers), default=1),
+        max((c["end"] for c in calls), default=1),
+        max((
             physical_ns(m["completed_time_s"])
             for m in result.get("migrations", {}).values()
             if "completed_time_s" in m
-        ]
-        + [1]
+        ), default=1),
+        1,
     )
     cells = {
         c.id: {
@@ -486,7 +529,7 @@ def replay_data(result, *, source_name="report.json", source_sha256=None):
         "horizon": config.horizon_ns,
         "end": end,
         "devices": [d.model_dump(mode="json") for d in graph.devices.values()],
-        "links": [l.model_dump(mode="json") for l in graph.links],
+        "links": [link.model_dump(mode="json") for link in graph.links],
         "resources": list(resource_map.values()),
         "ground": list(config.ground_owners),
         "cells": cells,
@@ -504,22 +547,30 @@ def replay_data(result, *, source_name="report.json", source_sha256=None):
         "provenance": result["provenance"],
         "physical_identity": result["network"].get("physical_dataset_identity"),
         "transport": result["network"].get("transport"),
-        "clock_note": "物理服务保持连续时间；算子通知向上取整至下一 ns",
+        "clock": result['network'].get('clock'),
+        "clock_note": "SimGrid 全局事件时钟" if config.timeline_mode=='simgrid' else "统一时钟 · 1 as" if result['network'].get('clock') else "旧时钟记录 · 重新运行后使用统一时钟",
     }
 
 
-def export_reports(reports, destination):
+def export_reports(reports, destination, *, loaded_results=None):
     destination = Path(destination)
     destination.mkdir(parents=True, exist_ok=True)
     catalog = []
     used = set()
     for report in reports:
         report = Path(report)
-        raw = report.read_bytes()
+        digest = hashlib.sha256()
+        with report.open('rb') as stream:
+            for block in iter(lambda: stream.read(1024*1024), b''):
+                digest.update(block)
+        result = (loaded_results or {}).get(str(report))
+        if result is None:
+            with report.open(encoding='utf-8') as stream:
+                result = json.load(stream)
         data = replay_data(
-            json.loads(raw),
+            result,
             source_name=report.name,
-            source_sha256=hashlib.sha256(raw).hexdigest(),
+            source_sha256=digest.hexdigest(),
         )
         identity = re.sub(r"[^a-zA-Z0-9_-]", "-", report.stem)
         if identity in used:
@@ -528,9 +579,8 @@ def export_reports(reports, destination):
         name = identity + ".json"
         path = destination / name
         temporary = path.with_suffix(".json.tmp")
-        temporary.write_text(
-            json.dumps(data, ensure_ascii=False, separators=(",", ":")), encoding="utf8"
-        )
+        with temporary.open('w',encoding='utf8',buffering=1024*1024) as stream:
+            json.dump(data, stream, ensure_ascii=False, separators=(",", ":"))
         temporary.replace(path)
         catalog.append(
             {

@@ -183,24 +183,16 @@
       <section id="auditPanel" class="panel">
         <div class="panel-title">
           <div>
-            <h2>实现是否符合记录中的约束？</h2>
-            <p class="muted">
-              重新检查每个算子依赖、通信阶段、输入分发与迁移事务；证据可定位到源
-              JSON。
-            </p>
+            <h2>记录校验</h2>
           </div>
           <span id="auditBadge" class="badge"></span>
         </div>
         <div id="checks" class="checks"></div>
         <details class="source">
-          <summary>记录身份与验证边界</summary>
+          <summary>记录来源</summary>
           <div id="sourceDetails"></div>
         </details>
       </section>
-      <footer>
-        OrbitServe · 原生模型预测与真实仿真事件回放 · 计算通知按 ns
-        向上取整，物理服务保留连续时间 · GPU 实测精度及原生算子能耗未在此验证
-      </footer>
     </main>
     <script type="module" src="replay.js"></script>
   </body>

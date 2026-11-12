@@ -158,6 +158,11 @@ class LinkParameters(Contract):
     fso: dict = Field(default_factory=dict)
 
 
+class CellLinkAddition(Contract):
+    source: Identifier
+    target: Identifier
+
+
 class SimulationConfig(Contract):
     schema_version: Literal[1, "orbitserve.native_cells.v1"] = 1
     # Ground resources are explicit in the outer model. The current network
@@ -170,7 +175,12 @@ class SimulationConfig(Contract):
     cells: tuple[ServingCell, ...]
     requests: tuple[Request, ...]
     migrations: tuple[Migration, ...] = ()
-    backend: Literal["flowsim", "ns3"] = "flowsim"
+    backend: Literal["flowsim", "ns3", "simgrid"] = "flowsim"
+    timeline_mode: Literal["orbitserve", "simgrid"] = "orbitserve"
+    communication_mode: Literal[
+        "flowsim", "protobridge_satellite", "protobridge_cell"
+    ] = "flowsim"
+    protobridge_startup_us: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 0.0
     horizon_ns: Positive = 1_000_000_000
     packet_bytes: Literal[1400] = 1400
     record_packets: bool = False
@@ -179,7 +189,22 @@ class SimulationConfig(Contract):
     physical_dataset: str | None = None
     physical_network: dict | str | None = None
     physical_link_bindings: dict[str, str] = Field(default_factory=dict)
+    additional_cell_links: tuple[CellLinkAddition, ...] = ()
+    disabled_physical_links: tuple[Identifier, ...] = ()
     runtime_network: dict = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def scene_default_communication(cls, value):
+        # Numeric-v1 files retain their historical transport behavior. New
+        # scene-editor documents default to the fewest FlowSim events.
+        if (
+            isinstance(value, dict)
+            and value.get("schema_version") == "orbitserve.native_cells.v1"
+            and "communication_mode" not in value
+        ):
+            return {**value, "communication_mode": "protobridge_cell"}
+        return value
 
     @classmethod
     def load(cls, path):
@@ -202,6 +227,14 @@ class SimulationConfig(Contract):
 
     @model_validator(mode="after")
     def validate_ids(self):
+        if self.timeline_mode == 'simgrid' and self.backend != 'simgrid':
+            raise ValueError('SimGrid timeline requires the SimGrid communication backend')
+        if self.backend == 'simgrid' and self.timeline_mode != 'simgrid':
+            raise ValueError('native SimGrid communication requires timeline_mode=simgrid')
+        if self.communication_mode != "flowsim" and self.backend not in {"flowsim", "simgrid"}:
+            raise ValueError(
+                "ProtoBridge modes require FlowSim or SimGrid for external communication"
+            )
         from orbitserve.runtime import RUNTIME_NETWORK_FIELDS
 
         if set(self.runtime_network) - set(RUNTIME_NETWORK_FIELDS):

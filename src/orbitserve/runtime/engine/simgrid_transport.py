@@ -13,6 +13,7 @@ import tempfile
 import threading
 from pathlib import Path
 from ..setup.radio_capacity import capacity_pools, hop_pools, directional_profile
+from .simgrid_events import SIMGRID_CLOCK, native_time, simgrid_time
 
 BYTE_SCALE = 1_000_000
 
@@ -37,7 +38,7 @@ class SimGridTransport:
     error_type = SimGridUnavailable
     check_available = staticmethod(require_simgrid)
 
-    def __init__(self, nodes, edges, profiles, *, start_s=0.0, shared_pools=None, link_pools=None):
+    def __init__(self, nodes, edges, profiles, *, start_s=0.0, shared_pools=None, link_pools=None, global_scheduler=False):
         self.check_available()
         if isinstance(start_s, bool) or not isinstance(start_s, (int, float)) or not math.isfinite(start_s) or start_s < 0:
             raise ValueError('native transport start_s must be finite and nonnegative')
@@ -54,6 +55,9 @@ class SimGridTransport:
         self.pool_overrides, self.link_pool_overrides = shared_pools, link_pools
         self.configured_capacities = {}
         self.active = {}
+        self.global_scheduler = global_scheduler
+        self.scheduled_events = {}
+        self.scheduler_stats = {}
         self.resources = {}
         self.closed = False
         # Resolve/validate all input-derived values before owning a subprocess.
@@ -108,7 +112,7 @@ class SimGridTransport:
         self.reader = threading.Thread(target=read_responses, daemon=True)
         try:
             self.reader.start()
-            ready = self._request({"nodes": sorted(nodes), "links": links, 'pools': pools, 'start_s': start_s})
+            ready = self._request({"nodes": sorted(nodes), "links": links, 'pools': pools, 'start_s': start_s, 'global_scheduler':global_scheduler})
             if not ready.get("ready"):
                 raise self.error_type(f"{self.worker_name} worker did not initialize")
             self.validate_ready(ready)
@@ -124,6 +128,8 @@ class SimGridTransport:
                 "capacity_units": "public_bits_per_second_native_bytes_per_second",
                 'aggregate_sharing': 'native_shared_satellite_rf_resources',
             }
+            if global_scheduler:
+                self.provenance.update(clock=SIMGRID_CLOCK, timeline_authority='simgrid_engine', event_scheduler='native_simgrid_multiplexed_waits')
         except BaseException:
             self.close(force=True)
             raise
@@ -156,7 +162,7 @@ class SimGridTransport:
             time_s = result['time_s']
             if isinstance(time_s, bool) or not isinstance(time_s, (int, float)) or not math.isfinite(time_s) or time_s < self.now:
                 raise ValueError('worker time must be finite and monotonic')
-            self.now = float(time_s)
+            self.now = simgrid_time(time_s) if getattr(self, 'global_scheduler', False) else float(time_s)
             return result
         except (OSError, queue.Empty, ValueError, TypeError, KeyError) as error:
             # A timeout/malformed reply loses request-response alignment. Reusing
@@ -184,10 +190,16 @@ class SimGridTransport:
     def register_edge(self, edge):
         """SimGrid seals platforms: rebuild at this causal boundary, retaining work."""
         remaining = self._request({'op': 'remaining'})['remaining']
+        scheduler = self._request({'op':'scheduler_state'})['scheduler'] if self.global_scheduler else None
         replacement = type(self)(self.nodes, (*self.edges, edge), self.profiles, start_s=self.now,
-                                 shared_pools=self.pool_overrides, link_pools=self.link_pool_overrides)
+                                 shared_pools=self.pool_overrides, link_pools=self.link_pool_overrides,
+                                 global_scheduler=self.global_scheduler)
         try:
             replacement.configure(self.configured_capacities)
+            for identity, (at, priority) in self.scheduled_events.items():
+                replacement.schedule_event(identity, at, priority,restore=True)
+            if scheduler is not None:
+                replacement.scheduler_stats=replacement._request({'op':'restore_scheduler','stats':scheduler})['scheduler']
             for identity, row in self.active.items():
                 replacement.start(identity, row['leg'], remaining[identity])
             # Zero capacity is represented by suspended activities, so apply it
@@ -227,6 +239,35 @@ class SimGridTransport:
             raise ValueError('native transport time must be finite and monotonic')
         response = self._request({"op": "advance", "until_s": time_s})
         for identity in response["completed"]:
+            self.active.pop(identity, None)
+        return response
+
+    def schedule_event(self, identity, at, priority, *, restore=False):
+        value = native_time(at)
+        self._request({'op':'schedule_event','id':identity,'at_s':value,'priority':priority,'restore':restore})
+        self.scheduled_events[identity] = (simgrid_time(value), priority)
+        return simgrid_time(value)
+
+    def cancel_events(self, identities):
+        if identities:
+            self._request({'op':'cancel_events','ids':list(identities)})
+            for identity in identities:
+                self.scheduled_events.pop(identity, None)
+
+    def pop_event(self):
+        response = self._request({'op':'pop_event'})
+        self.scheduler_stats = response['scheduler']
+        identity = response['event']
+        if identity is not None:
+            self.scheduled_events.pop(identity)
+        return identity
+
+    def advance_next(self, horizon):
+        response = self._request({'op':'advance_next','until_s':native_time(horizon)})
+        self.scheduler_stats = response['scheduler']
+        response['time_s'] = self.now
+        response['interval_start_s'] = simgrid_time(response['interval_start_s'])
+        for identity in response['completed']:
             self.active.pop(identity, None)
         return response
 

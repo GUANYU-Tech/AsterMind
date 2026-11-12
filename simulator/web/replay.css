@@ -831,6 +831,9 @@ input[type="range"] {
 .check.fail strong {
   color: var(--red);
 }
+.check.warn{border-color:#816c3e;background:#29251a}
+.check.warn strong,.badge.warn{color:#e7c77a}
+.badge.warn{border-color:#816c3e;background:#29251a}
 .check.unverified {
   border-color: #34475a;
   background: #14202e;

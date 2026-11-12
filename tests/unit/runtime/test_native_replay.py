@@ -1,10 +1,11 @@
 import copy
 import json
+import tempfile
 import unittest
 from pathlib import Path
 
 from simulator.config import SimulationConfig
-from simulator.replay import audit_checks, native_ns, replay_data
+from simulator.replay import audit_checks, export_reports, native_ns, replay_data
 
 
 def report():
@@ -121,6 +122,20 @@ def report():
 
 
 class NativeReplayTests(unittest.TestCase):
+    def test_loaded_result_export_matches_file_export(self):
+        value = report()
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / 'report.json'
+            source.write_text(json.dumps(value))
+            a = export_reports([source], root / 'from-file')
+            b = export_reports([source], root / 'from-memory', loaded_results={str(source): value})
+            self.assertEqual(a, b)
+            self.assertEqual(
+                json.loads((root / 'from-file/report.json').read_text()),
+                json.loads((root / 'from-memory/report.json').read_text()),
+            )
+
     def test_recorded_contract_passes_and_preserves_exact_operator_times(self):
         value = report()
         self.assertTrue(all(c["state"] == "pass" for c in audit_checks(value)))

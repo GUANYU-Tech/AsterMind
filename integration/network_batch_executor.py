@@ -7,7 +7,6 @@ does not emulate NCCL protocol or a separate GPU reduction kernel.
 """
 
 from collections import defaultdict
-from decimal import ROUND_CEILING, Decimal
 
 from src.kernel.kernel_spec import KernelKind
 from src.serving.kernel_lowering.execution_timeline import (
@@ -20,14 +19,8 @@ from src.serving.kernel_lowering.execution_timeline import (
 
 from network_sim import TransferRequest
 from orbitserve.runtime.engine.cell_events import DISPATCH, STEP_COMPLETE
-
-
-def nanoseconds(seconds):
-    return int(
-        (Decimal(str(seconds)) * 1_000_000_000).to_integral_value(
-            rounding=ROUND_CEILING
-        )
-    )
+from orbitserve.runtime.timeline import nanoseconds
+from orbitserve.runtime.clock import Time, ticks
 
 
 class CommunicationFailed(RuntimeError):
@@ -140,12 +133,15 @@ class NetworkBatchExecutor:
     def _device(self, cell_id, pool, rank):
         return self.placements[(cell_id, pool, rank)].gpu_device_id
 
+    def _make_request(self, **fields):
+        return TransferRequest(**fields)
+
     def _arm_network(self):
         self._generation += 1
         generation = self._generation
         next_ns = self.network.next_event_time_ns()
         if next_ns is not None:
-            at_s = next_ns / 1e9
+            at_s = Time.from_ns(next_ns)
             if at_s < self.loop.now_s:
                 raise RuntimeError("network clock missed an event")
             self.loop.schedule(
@@ -186,7 +182,7 @@ class NetworkBatchExecutor:
             self._transfer_counter += 1
             identifier = f"compute-transfer-{self._transfer_counter}"
             pending.add(identifier)
-            request = TransferRequest(
+            request = self._make_request(
                 id=identifier,
                 source=self._device(cell_id, pool, source_rank),
                 target=self._device(cell_id, pool, target_rank),
@@ -211,6 +207,23 @@ class NetworkBatchExecutor:
         participants = transfer.participants
         correlation = f"{cell_id}/{call.call_id}/{occurrence}"
         size = transfer.bytes
+        try_collective = getattr(self.network, "try_collective", None)
+        scoped_participants = (
+            (transfer.source_rank, transfer.destination_rank)
+            if transfer.operation == "send_recv"
+            else participants
+        )
+        if try_collective and try_collective(
+            cell_id,
+            transfer,
+            tuple(
+                self._device(cell_id, call.pool_name, rank)
+                for rank in scoped_participants
+            ),
+            record,
+            on_complete,
+        ):
+            return
         if transfer.operation == "send_recv":
             if transfer.bytes_semantics != "payload" or len(participants) != 2:
                 raise NotImplementedError("PP requires a two-rank payload transfer")
@@ -300,7 +313,7 @@ class NetworkBatchExecutor:
                 "invalid KV transfer identity, endpoints, bytes or callback"
             )
         self.network.submit(
-            TransferRequest(
+            self._make_request(
                 id=transfer_id,
                 source=self._device(*source),
                 target=self._device(*target),
@@ -462,15 +475,17 @@ class NetworkBatchExecutor:
             else None
         )
         start_ns = nanoseconds(self.loop.now_s)
+        start_ticks = ticks(self.loop.now_s)
         batch = {
             "cell_id": cell_id,
             "step_id": step_id,
             "start_time_ns": start_ns,
+            "start_time_ticks": str(start_ticks),
             "end_time_ns": None,
             "calls": [],
             "native_batch_duration_s": components.execution_timeline.duration_s,
             "native_communication_duration_charged_s": 0.0,
-            "model": "native M-L compute and eager Host; FlowSim ring and PP payload",
+            "model": "native M-L compute and eager Host; hosted collective and PP communication",
         }
         self.records.append(batch)
         tasks, successors, resource_last = {}, defaultdict(list), {}
@@ -518,12 +533,14 @@ class NetworkBatchExecutor:
                 "phases": [],
                 "native_prediction_s": components.predictions[call.call_id].t_total_s,
                 "host_ready_time_ns": start_ns + (host_end.get(key, 0)),
+                "host_ready_time_ticks": str(start_ticks + host_end.get(key, 0) * 10**9),
                 "launch_gap_ns": gap_ns,
             }
             batch["calls"].append(record)
             tasks[key] = {
                 "remaining": len(deps),
                 "dependency_end_ns": start_ns,
+                "dependency_end_ticks": start_ticks,
                 "call": call,
                 "record": record,
                 "done": False,
@@ -543,6 +560,7 @@ class NetworkBatchExecutor:
             task["done"] = True
             end_ns = nanoseconds(self.loop.now_s)
             task["record"]["end_time_ns"] = end_ns
+            task['record']['end_time_ticks'] = str(ticks(self.loop.now_s))
             unfinished -= 1
             if key in terminal_engines:
                 engine = terminal_engines[key]
@@ -556,6 +574,7 @@ class NetworkBatchExecutor:
                 successor["dependency_end_ns"] = max(
                     successor["dependency_end_ns"], end_ns
                 )
+                successor['dependency_end_ticks'] = max(successor['dependency_end_ticks'], ticks(self.loop.now_s))
                 if successor["remaining"] == 0:
                     ready(next_key)
             if unfinished == 0:
@@ -566,6 +585,7 @@ class NetworkBatchExecutor:
                         "joint DP graph drained without every engine completion"
                     )
                 batch["end_time_ns"] = end_ns
+                batch['end_time_ticks'] = str(ticks(self.loop.now_s))
                 self._active.remove(identity)
                 on_complete(self.loop.now_s)
 
@@ -573,24 +593,23 @@ class NetworkBatchExecutor:
             task = tasks[key]
             call, record = task["call"], task["record"]
             record["start_time_ns"] = nanoseconds(self.loop.now_s)
+            record['start_time_ticks'] = str(ticks(self.loop.now_s))
             if record["communication"]:
                 self._communication(cell_id, call, key[1], record, lambda: finish(key))
             else:
-                end_ns = record["start_time_ns"] + nanoseconds(
-                    record["native_prediction_s"]
-                )
+                end_time = Time(self.loop.now_s) + Time.from_ns(nanoseconds(record['native_prediction_s']))
                 self.loop.schedule(
-                    end_ns / 1e9, STEP_COMPLETE, "kernel:complete", lambda: finish(key)
+                    end_time, STEP_COMPLETE, "kernel:complete", lambda: finish(key)
                 )
 
         def ready(key):
             task, record = tasks[key], tasks[key]["record"]
-            at_ns = max(
-                task["dependency_end_ns"] + record["launch_gap_ns"],
-                record["host_ready_time_ns"],
+            at_ticks = max(
+                task['dependency_end_ticks'] + record['launch_gap_ns'] * 10**9,
+                int(record['host_ready_time_ticks']),
             )
             self.loop.schedule(
-                at_ns / 1e9, DISPATCH, "kernel:launch", lambda: launch(key)
+                Time.from_ticks(at_ticks), DISPATCH, "kernel:launch", lambda: launch(key)
             )
 
         for key in sorted(tasks, key=lambda key: tasks[key]["record"]["position"]):

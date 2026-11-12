@@ -9,6 +9,21 @@ const esc = (value) =>
   );
 const ms = (ns) => `${(ns / 1e6).toFixed(ns < 1e6 ? 4 : 3)} ms`;
 const duration = (ns) => (ns < 1e6 ? `${(ns / 1e3).toFixed(3)} μs` : ms(ns));
+const exactTime = (ticks, ns) => {
+  if (ticks == null) return ms(ns);
+  const value=BigInt(ticks),part=(value%1000000000000000000n).toString().padStart(18,'0').replace(/0+$/,'');
+  return `${value/1000000000000000000n}${part?'.'+part:''} s`;
+};
+const exactDuration = (row) => {
+  if(row.start_ticks==null||row.end_ticks==null)return duration(row.end-row.start);
+  const ns=Number(BigInt(row.end_ticks)-BigInt(row.start_ticks))/1e9;
+  return ns<1000?`${Number(ns.toPrecision(9))} ns`:duration(ns);
+};
+const transportLabel = (data) => data.backend === "simgrid" ? "SimGrid" : data.backend === "ns3" ? "ns-3" : "FlowSim";
+const communicationLabel = (data) => ({
+  protobridge_cell: "Cell 内 ProtoBridge · Cell 外 FlowSim",
+  protobridge_satellite: "卫星内 ProtoBridge · 星间 FlowSim",
+}[data.provenance?.communication_mode] || (data.backend === "ns3" ? "ns-3 包级" : "全部通信使用 FlowSim")).replaceAll('FlowSim',data.backend==='simgrid'?'SimGrid':'FlowSim');
 const bytes = (n) =>
   n >= 2 ** 20
     ? `${(n / 2 ** 20).toFixed(3)} MiB`
@@ -213,15 +228,13 @@ function renderMetrics() {
     ],
     [
       kernels.toLocaleString(),
-      "原生计算算子",
-      `${d.calls.length - kernels} 次 COMM`,
+      "计算 / 存储算子调用",
+      `${d.calls.length - kernels} 个通信操作 · ${d.page_scope ? '当前批次的 GPU 汇总' : '跨批次和 GPU 汇总'}`,
     ],
     [
       d.transfers.length.toLocaleString(),
-      "物理传输终态",
-      `${
-        d.backend === "ns3" ? "ns-3 包级" : "FlowSim 流级"
-      } · ${d.hops.length.toLocaleString()} 服务区间`,
+      "端到端消息记录",
+      `${d.transfers.filter(t => t.backend !== "protobridge").length} ${transportLabel(d)} / ${d.transfers.filter(t => t.backend === "protobridge").length} ProtoBridge · ${d.hops.length.toLocaleString()} 逐段服务记录`,
     ],
     [
       `${passed}/${d.audit.length}`,
@@ -470,9 +483,7 @@ function renderTopology() {
     }" text-anchor="middle">${esc(role)}</text></g>`;
   }
   $("topology").innerHTML = svg;
-  $("networkBadge").textContent = `${
-    d.backend === "ns3" ? "ns-3" : "FlowSim"
-  } · 单一物理事件时钟`;
+  $("networkBadge").textContent = `${communicationLabel(d)} · 同一时间轴`;
 }
 function renderNow() {
   const d = state.data;
@@ -746,7 +757,7 @@ function renderCall() {
     return;
   }
   $("selectedType").textContent = c.comm
-    ? "物理 COMM 屏障"
+    ? (c.communication_backend === "protobridge" ? "ProtoBridge 通信屏障" : `${transportLabel(state.data)} 通信屏障`)
     : names[c.kind] || c.kind;
   const depEnd = Math.max(
     c.host_ready,
@@ -759,7 +770,7 @@ function renderCall() {
   }</span></div><div class="facts">${[
     [
       c.comm ? "参与 GPU" : "映射",
-      c.comm
+      c.surrogate ? c.surrogate.devices.join(" ↔ ") : c.comm
         ? [
             ...new Set(
               c.phases.flat().flatMap((id) => {
@@ -770,9 +781,10 @@ function renderCall() {
           ].join(" ↔ ")
         : `${c.device} · ${c.owner} · r${c.rank}`,
     ],
-    ["实际耗时", duration(c.end - c.start)],
+    ["仿真记录耗时", exactDuration(c)],
+    ["求解方法", c.comm ? (c.communication_backend === "protobridge" ? "ProtoBridge · 当前物理链路参数" : `${transportLabel(state.data)} · 逐流执行`) : "AsterMind GPU 计算模型"],
     ["原生参考", duration(c.native_ns) + (c.comm ? " · 未额外计费" : "")],
-    ["开始 → 结束", `${ms(c.start)} → ${ms(c.end)}`],
+    ["开始 → 结束", `${exactTime(c.start_ticks,c.start)} → ${exactTime(c.end_ticks,c.end)}`],
     ["直接依赖", `${c.deps.length} 个 · launch gap ${duration(c.gap)}`],
     ["依赖就绪后的间隔", duration(Math.max(0, c.start - depEnd))],
   ]
@@ -817,7 +829,9 @@ function renderFlows() {
   let content = "";
   if (!ids.length)
     content = empty(
-      "该算子为本地计算或存储操作；选择 COMM 条带可查看实际传输阶段。"
+      c?.comm && c.communication_backend === "protobridge"
+        ? "此通信使用 ProtoBridge，未生成逐流传输记录。"
+        : c?.comm ? "该通信没有记录可展示的逐跳传输。" : "该算子为本地计算或存储操作；选择 COMM 条带可查看实际传输阶段。"
     );
   else {
     for (const [phaseIndex, phase] of (c?.comm
@@ -850,8 +864,8 @@ function renderFlows() {
   if (t) {
     const hops = flowHops.get(t.id) || [];
     content += `<div class="evidence">${esc(t.evidence)} · ${
-      t.start == null ? "就绪时刻未记录" : `就绪 ${ms(t.start)}`
-    } → 通知 ${ms(t.end)}<br>物理终态 ${
+      t.start == null ? "就绪时刻未记录" : `就绪 ${exactTime(t.start_ticks,t.start)}`
+    } → 通知 ${exactTime(t.end_ticks,t.end)}<br>物理终态 ${
       t.physical_end != null ? ms(t.physical_end) : "未记录"
     } · ${esc(t.reason || "依赖在实际交付后释放")}</div>`;
     content += `<div class="scroll-table"><table class="hop-table"><thead><tr><th>服务资源 / 方向</th><th>区间 / ms</th><th>实际服务 / 容量</th><th>逻辑字节</th></tr></thead><tbody>${hops
@@ -861,9 +875,9 @@ function renderFlows() {
             h.source === h.target
               ? `${h.source} 容量门`
               : `${h.source} → ${h.target}`
-          )}</td><td title="原始 ns：${h.start} → ${h.end}">${(
+          )}</td><td title="${exactTime(h.start_ticks,h.start)} → ${exactTime(h.end_ticks,h.end)}">${(
             h.start / 1e6
-          ).toFixed(4)} → ${(h.end / 1e6).toFixed(4)}</td><td>${rate(
+          ).toFixed(4)} → ${(h.end / 1e6).toFixed(4)}<br>${exactDuration(h)}</td><td>${rate(
             h.rate
           )} / ${rate(h.capacity)}</td><td title="逻辑字节原值：${
             h.bytes
@@ -1099,19 +1113,22 @@ function renderMemory() {
     .join("");
 }
 const checksText = {
+  unified_clock: ['统一时钟与事件顺序'],
+  shared_capacity: ['共享链路与容量池'],
+  byte_conservation: ['逐跳字节守恒'],
   delivery_clock: [
-    "物理完成后通知算子",
-    "物理完成至算子通知的延迟在 0–1 ns 内",
+    "通信完成后通知算子",
+    "通信完成与依赖释放的时刻一致",
   ],
   service_capacity: [
-    "服务不超过物理容量",
-    "每个区间的分配速率与容量、字节量对照",
+    "逐段传输的带宽检查",
+    "逐个带宽服务区间核对分配速率与容量、字节量；区间数不是请求数",
   ],
   transfer_identity: ["传输终态唯一", "每个 transfer ID 只有一个终态"],
   dependency_order: ["算子因果与依赖", "前驱完成与 launch gap 均已满足"],
-  kernel_duration: ["原生算子耗时", "与原生预测的 ns 取整值逐项对照"],
+  kernel_duration: ["计算 / 存储调用耗时", "每次执行与 AsterMind 模型预测的 ns 取整值对照；不是硬件实测"],
   communication_accounting: ["通信不重复计费", "原生 COMM 参考值实际计费为零"],
-  communication_barrier: ["通信阶段屏障与字节量", "下一阶段等上一阶段最慢交付"],
+  communication_barrier: ["通信依赖与字节量", "逐流通信等待最慢交付；ProtoBridge 通信等待估算完成事件"],
   input_distribution: ["输入先于批次就绪", "token ID 分发完成后启动算子图"],
   request_delivery: ["请求与 token 交付", "计算、输出交付与 token 数量一致"],
   ground_forwarding: ["地面用户不转发 GPU 流量", "实际路径中没有地面用户中继"],
@@ -1119,22 +1136,21 @@ const checksText = {
 };
 function renderAudit() {
   const d = state.data,
-    failures = d.audit.filter((c) => c.state === "fail");
-  $("auditBadge").className = `badge ${failures.length ? "fail" : "pass"}`;
+    failures = d.audit.filter((c) => c.state === "fail"),
+    warnings = d.audit.reduce((sum,c)=>sum+(c.warnings?.length||0),0);
+  $("auditBadge").className = `badge ${failures.length ? "fail" : warnings ? "warn" : "pass"}`;
   $("auditBadge").textContent = failures.length
     ? `${failures.length} 类约束有违规`
-    : "记录中的一致性检查通过";
+    : warnings ? `${warnings.toLocaleString()} 条精度提示` : "记录一致性检查通过";
   $("checks").innerHTML =
     d.audit
       .map((c) => {
-        const [title, description] = checksText[c.id] || [c.id, "记录一致性"];
+        const [title] = checksText[c.id] || [c.id];
         return `<div class="check ${
-          c.state === "fail" ? "fail" : ""
-        }"><strong>${c.state === "pass" ? "✓" : "✕"} ${esc(
+          c.state === "fail" ? "fail" : c.state === 'warn' ? 'warn' : ""
+        }"><strong>${c.state === "pass" ? "✓" : c.state === 'warn' ? '△' : "✕"} ${esc(
           title
-        )}</strong><span>${c.checked.toLocaleString()} 项检查 · ${esc(
-          description
-        )}</span>${
+        )}</strong><span>${c.checked.toLocaleString()} 项核对</span>${
           c.violations.length
             ? `<details open><summary>${
                 c.violations.length
@@ -1143,10 +1159,9 @@ function renderAudit() {
                 .map((v) => `<p>${esc(v.evidence)}<br>${esc(v.detail)}</p>`)
                 .join("")}</details>`
             : ""
-        }</div>`;
+        }${c.warnings?.length?`<details><summary>${c.warnings.length.toLocaleString()} 条时钟精度提示</summary>${c.warnings.slice(0,8).map(v=>`<p>${esc(v.evidence)}<br>${esc(v.detail)}</p>`).join('')}</details>`:''}</div>`;
       })
-      .join("") +
-    `<div class="check unverified"><strong>— GPU 实测预测精度</strong><span>这里检查仿真执行的因果与记账；没有硬件实测对照。</span></div><div class="check unverified"><strong>— 原生算子能耗</strong><span>未建模，不将算子耗时转换成虚构能耗。</span></div>`;
+      .join("");
   $("sourceDetails").innerHTML = `<p>源报告：<code>${esc(
     d.source.name
   )}</code><br>SHA-256：<code>${esc(
@@ -1238,9 +1253,8 @@ async function loadCase(id) {
       })
     );
     $("caseSelect").value = item.id;
-    $("caseSubtitle").textContent = `${d.title} · ${
-      d.backend === "ns3" ? "ns-3 包级" : "FlowSim 流级"
-    } · ${d.source.name}`;
+    if($("batchSelect"))$("batchSelect").value=item.id;
+    $("caseSubtitle").textContent = `${d.title} · ${communicationLabel(d)}`;
     $("cellFilter").innerHTML =
       '<option value="">全部 Cell</option>' +
       Object.keys(d.cells)
@@ -1277,11 +1291,14 @@ async function loadCase(id) {
       ? fault.time + Math.min(1e8, (d.end - fault.time) / 3)
       : Math.min(d.end * 0.4, state.data.calls[state.selected]?.start || 0);
     setTime(t);
-    history.replaceState(
-      null,
-      "",
-      `${location.pathname}?case=${encodeURIComponent(item.id)}`
-    );
+    if(d.page_scope?.kind==='batch'){
+      setView(d.page_scope.start, d.page_scope.end);
+      setTime(d.page_scope.start);
+      $("caseSubtitle").textContent += ' · 当前批次算子与通信；校验与显存快照属于完整实验';
+    }
+    const caseUrl = new URL(location.href);
+    caseUrl.searchParams.set("case", item.id);
+    history.replaceState(null, "", caseUrl);
   } catch (error) {
     fail(error);
   }
@@ -1474,16 +1491,36 @@ function tick(now) {
   requestAnimationFrame(tick);
 }
 requestAnimationFrame(tick);
+const replayLoading=document.createElement('p');
+replayLoading.setAttribute('role','status');replayLoading.textContent='正在读取计算批次…';
+$("metrics").before(replayLoading);
 try {
-  catalog = await get("catalog.json");
+  let catalogReady=false;
+  for(let attempt=0;attempt<120;attempt++){
+    const response=await fetch('catalog.json'),value=await response.json();
+    if(response.ok){catalog=value;catalogReady=true;break}
+    if(!String(value.error||'').includes('正在整理'))throw Error(value.error||'回放索引读取失败');
+    $("caseSubtitle").textContent='正在整理计算批次索引…';
+    replayLoading.textContent='首次打开正在整理计算批次索引，完成后自动显示。';
+    await new Promise(resolve=>setTimeout(resolve,3000));
+  }
+  if(!catalogReady)throw Error('回放索引仍在整理，请稍后重新加载');
   if (!catalog.length) throw Error("没有已导出的原生执行记录");
   $("caseSelect").innerHTML = catalog
     .map((c) => `<option value="${esc(c.id)}">${esc(c.title)}</option>`)
     .join("");
+  if(catalog.some(c=>c.paged)){
+    const label=document.createElement('label'),select=document.createElement('select');
+    label.className='paged-batches';label.textContent='计算批次 ';select.id='batchSelect';
+    select.setAttribute('aria-label','计算批次');select.innerHTML=$("caseSelect").innerHTML;
+    select.onchange=()=>loadCase(select.value);label.append(select);$("metrics").before(label);
+  }
   const initial =
     new URLSearchParams(location.search).get("case") ||
     new URLSearchParams(location.hash.slice(1)).get("case");
   await loadCase(initial || catalog[0].id);
 } catch (error) {
   fail(error);
+} finally {
+  replayLoading.remove();
 }

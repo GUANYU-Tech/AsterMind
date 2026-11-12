@@ -109,14 +109,16 @@ def construct_scheduler(config, requested, storage_options=None):
     if (
         config.role != "colocated"
         or config.scheduler_pipeline_depth != 1
-        or (not extended and (tp, pp) not in ((1, 1), (2, 1), (2, 2)))
+        or (not extended and (tp, pp) not in ((1, 1), (2, 1), (2, 2))
+            and not (tp == 1 and pp >= 2 and model.model_type == "qwen3"
+                     and not model.tie_word_embeddings))
         or requested.async_scheduling
         or requested.mtp_num_speculative_tokens
         or model.attention_layout != "standard_gqa"
         or model.compute_dtype != "bf16"
     ):
         raise NotImplementedError(
-            "latest adapter supports dense BF16 colocated sync TP1/PP1, TP2/PP1 and TP2/PP2 only"
+            "latest adapter requires supported BF16 colocated synchronous TP/PP emission"
         )
     if tp > 1 and (
         model.model_type not in ("qwen3", "qwen3_moe") or model.weight_dtype != "bf16"
@@ -623,14 +625,17 @@ class LatestSchedulerProcess:
         self.process.start()
         child.close()
         try:
-            self.runtime_info = self.receive()
+            # Cold imports and the official source-manifest verification can
+            # exceed a normal RPC deadline on mounted development filesystems.
+            # Keep execution RPCs bounded by the existing shorter deadline.
+            self.runtime_info = self.receive(timeout=180)
         except BaseException:
             self.close()
             raise
 
-    def receive(self):
-        if not self.pipe.poll(60):
-            raise TimeoutError("latest Scheduler worker exceeded 60 seconds")
+    def receive(self, timeout=60):
+        if not self.pipe.poll(timeout):
+            raise TimeoutError(f"latest Scheduler worker exceeded {timeout} seconds")
         status, value = self.pipe.recv()
         if status != "ok":
             raise RuntimeError(value)

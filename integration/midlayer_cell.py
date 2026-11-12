@@ -1,6 +1,7 @@
 """Persistent M-L cell adapter; native scheduling and kernel models stay upstream.
 
 Scope: dense colocated TP1/PP1, Qwen3 TP2/PP1 and TP2/PP2,
+native untied Qwen3 TP1 with uniform pipeline stages,
 Qwen3MoE TP2/EP2, synchronous depth-one, optional native Host launch,
 exclusive GPUs,
 declared linear-session prefix reuse and static migration via native blocks.
@@ -128,8 +129,10 @@ class MidlayerCellConfig:
         if not self.qwen_parallel_extension and (
             self.tensor_parallel_size,
             self.pipeline_parallel_size,
-        ) not in ((1, 1), (2, 1), (2, 2)):
-            raise NotImplementedError("Cell supports TP1/PP1, TP2/PP1 and TP2/PP2 only")
+        ) not in ((1, 1), (2, 1), (2, 2)) and not (
+            self.tensor_parallel_size == 1 and self.pipeline_parallel_size >= 2
+        ):
+            raise NotImplementedError("Cell supports TP1, TP2/PP1, TP2/PP2 and native TP1 pipeline stages")
         if (self.tensor_parallel_size, self.pipeline_parallel_size) != (
             1,
             1,
@@ -194,6 +197,8 @@ def create_midlayer_runtime(config: MidlayerCellConfig, *, with_scheduler: bool 
     elif config.enable_expert_parallel or config.expert_routing_seed is not None:
         raise ValueError("dense Cells cannot carry expert parallelism/routing inputs")
     hardware = HWSpec(config.root / config.hardware_file)
+    if hardware.hardware_id != config.hardware_id:
+        raise ValueError("硬件档案的型号与 hardware_id 不一致")
     parallelism = ParallelConfig(
         tensor_parallel_size=config.tensor_parallel_size,
         pipeline_parallel_size=config.pipeline_parallel_size,
@@ -269,7 +274,7 @@ def create_midlayer_runtime(config: MidlayerCellConfig, *, with_scheduler: bool 
             model,
             allow_single_pool_tp2=True,
             allow_single_pool_ep2=config.enable_expert_parallel,
-            allow_single_pool_tp1_pp=False,
+            allow_single_pool_tp1_pp=True,
             allow_single_pool_tp2_pp2=True,
         )
     layer_start, layer_end = pipeline_layer_ranges_for_model(

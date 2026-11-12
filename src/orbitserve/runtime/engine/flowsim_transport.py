@@ -6,6 +6,7 @@ import importlib
 import math
 
 from ..setup.radio_capacity import capacity_pools, hop_pools
+from ..clock import CLOCK, Time
 
 # Preserve fractional logical bytes while the FlowSim API uses integer bytes.
 BYTE_SCALE = 1_000_000
@@ -19,9 +20,9 @@ def require_flowsim():
             "FlowSim mode requires the compatible AsterMind _flowsim extension"
         ) from error
     if not all(hasattr(module.EventSimulator, name) for name in (
-        "advance_until", "start_hop", "set_bandwidth", "remaining", "cancel"
+        "advance_until_ticks", "start_hop", "set_bandwidth", "remaining", "cancel"
     )) or not hasattr(module.Topology, "attach_pool"):
-        raise RuntimeError("FlowSim extension lacks the shared-runtime API")
+        raise RuntimeError("FlowSim extension lacks the integer attosecond clock API; rebuild with integration/flowsim_clock.patch before running")
     return module
 
 
@@ -32,7 +33,7 @@ class FlowSimTransport:
         self.nodes = nodes
         self.edges = tuple(edges)
         self.active = {}
-        self.now = 0.0
+        self.now = Time()
         self.completed = []
         self._configured_capacities = {}
         pools = capacity_pools(nodes) if shared_pools is None else dict(shared_pools)
@@ -49,6 +50,7 @@ class FlowSimTransport:
                 for pool in link_pools.get((edge['link_id'], source, target), hop_pools(nodes, source, target)):
                     topology.attach_pool(source, target, pool)
         self.simulator = module.EventSimulator(topology)
+        self.simulator.advance_until_ticks('0')
         self.provenance = {
             "backend": "flowsim",
             "sharing_scope": "each_directed_physical_hop",
@@ -57,6 +59,8 @@ class FlowSimTransport:
             "packetization": False,
             "aggregate_sharing": "max_min_directed_link_and_satellite_rf_pools",
             "payload_quantization_bytes": 1 / BYTE_SCALE,
+            "clock": CLOCK,
+            "bandwidth_evidence": "native_allocations_and_shared_resources",
         }
 
     def resource(self, leg):
@@ -91,17 +95,13 @@ class FlowSimTransport:
     def advance_until(self, time_s):
         if isinstance(time_s, bool) or not math.isfinite(time_s) or time_s < self.now:
             raise ValueError("FlowSim time must be finite and monotonic")
-        before = self.simulator.remaining()
         start = self.now
-        target_ns = time_s * 1e9
-        self.simulator.advance_until(target_ns)
-        native_now = self.simulator.now_ns
-        # A round trip through nanoseconds can round one ULP below the
-        # original seconds value. Snap only after the native target was reached.
-        self.now = time_s if native_now >= target_ns else native_now / 1e9
-        after = self.simulator.remaining()
-        sent = {identity: max(0.0, amount - after.get(identity, 0.0)) / BYTE_SCALE
-                for identity, amount in before.items()}
+        native = self.simulator.advance_until_ticks(str(Time(time_s).ticks))
+        self.now = Time.from_ticks(int(native['end_ticks']))
+        sent = {row['id']: row['bytes_sent'] / BYTE_SCALE for row in native['services']}
+        rates = {row['id']: row['rate_bytes_per_ns'] * 8e9 / BYTE_SCALE for row in native['services']}
+        resources = [dict(resource_id=row['id'], allocated_bandwidth_bps=row['allocated_bytes_per_ns'] * 8e9 / BYTE_SCALE,
+                          capacity_bps=row['capacity_bytes_per_ns'] * 8e9 / BYTE_SCALE) for row in native['resources']]
         done, self.completed = sorted(self.completed), []
         if time_s > start and self.now <= start and not done:
             raise RuntimeError(
@@ -110,7 +110,9 @@ class FlowSimTransport:
         for identity in done:
             self.active.pop(identity)
         return {"time_s": self.now, "interval_start_s": start,
-                "bytes_sent": sent, "completed": done}
+                "bytes_sent": sent, "completed": done,
+                'allocated_rates_bps': rates, 'resources': resources,
+                'interval_start_ticks': native['start_ticks'], 'interval_end_ticks': native['end_ticks']}
 
     def cancel(self, identities):
         for identity in identities:

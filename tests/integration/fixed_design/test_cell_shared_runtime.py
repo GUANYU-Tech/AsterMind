@@ -319,6 +319,15 @@ class CellSharedRuntimeTests(unittest.TestCase):
         self.assertTrue(all(row.completed_at_s > 3 for row in completed))
         self.assertEqual({row.backend for row in completed}, {"fluid:flow"})
 
+    def test_terminal_callback_error_is_not_swallowed_by_completed_transfer(self):
+        def setup(runtime,engine):
+            def invalid(event):
+                raise ValueError('invalid successor callback')
+            runtime.network.subscribe(invalid)
+            runtime.network.submit(CellTransfer('callback-check','sat-a','sat-b',10,0))
+        with self.assertRaisesRegex(ValueError,'invalid successor callback'):
+            run_simulation(scenario(),compute_runtime=ProbeRuntime(setup))
+
     def test_native_executor_submits_input_distribution_before_collective(self):
         completed, started = [], []
 

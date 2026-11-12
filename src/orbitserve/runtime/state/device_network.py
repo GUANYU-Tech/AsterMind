@@ -8,6 +8,7 @@ no physical capacity or acquisition clock is duplicated by this projection.
 from __future__ import annotations
 
 from types import SimpleNamespace
+from ..clock import Time
 
 from ..setup.network_spec import LinkProfile, NetworkNodeSpec
 from .network import C_KM_PER_S, NetworkState
@@ -27,8 +28,10 @@ class DeviceNetworkState(NetworkState):
         ground_owners=(),
     ):
         self.topology, self.physical = topology, physical
+        self.disabled_device_links = set()
+        self.failed_device_links = set()
         self.start_s = physical.start_s if physical is not None else 0.0
-        self.end_s = float(horizon_s)
+        self.end_s = Time(horizon_s)
         if self.start_s != 0 or (physical is not None and horizon_s > physical.end_s):
             raise ValueError(
                 "device serving horizon must lie inside physical data starting at zero"
@@ -104,7 +107,7 @@ class DeviceNetworkState(NetworkState):
             a, b = topology.devices[link.source], topology.devices[link.target]
             metadata = {
                 "bandwidth_bps": link.bandwidth_gbps * 1e9,
-                "latency_s": link.latency_ns / 1e9,
+                "latency_s": Time.from_ns(link.latency_ns),
                 "resource_id": f"link:{link.id}",
                 "device_link_id": link.id,
                 "owners": (a.satellite, b.satellite),
@@ -241,7 +244,7 @@ class DeviceNetworkState(NetworkState):
             )
         for data in self._directions.values():
             boundaries.update(
-                at / 1e9 for at, _ in data.get("schedule", ()) if at / 1e9 < self.end_s
+                Time.from_ns(at) for at, _ in data.get("schedule", ()) if Time.from_ns(at) < self.end_s
             )
         self.environment_times = tuple(sorted(boundaries))
         self.frames = [
@@ -333,7 +336,7 @@ class DeviceNetworkState(NetworkState):
             return {"bandwidth_bps": 0.0, "direction_blocked": True}
         rate = data["bandwidth_bps"]
         for at, multiplier in data.get("schedule", ()):
-            if at / 1e9 <= time_s:
+            if Time.from_ns(at) <= time_s:
                 rate = data["bandwidth_bps"] * multiplier
         if data.get("physical_link_id"):
             original = self.physical.edge_by_id[data["physical_link_id"]]
@@ -362,6 +365,8 @@ class DeviceNetworkState(NetworkState):
         }
         if self.faulted(edge):
             state.update(state="DOWN", reason="injected_fault")
+        if data.get('device_link_id') in self.disabled_device_links:
+            state.update(state='DOWN', reason='manual_device_link_disconnected')
         return state
 
     def _edge_transfer(
@@ -374,6 +379,8 @@ class DeviceNetworkState(NetworkState):
         )
 
     def faulted(self, edge, time_s=None):
+        if self.metadata(edge).get('device_link_id') in self.failed_device_links:
+            return True
         if self.physical is None:
             return False
         data = self.metadata(edge)

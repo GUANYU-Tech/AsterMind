@@ -9,6 +9,24 @@ from orbitserve.runtime.setup.network_spec import NetworkNodeSpec
 
 @unittest.skipUnless(importlib.util.find_spec("_flowsim"), "requires shared-runtime FlowSim")
 class FlowSimTransportTests(unittest.TestCase):
+    def test_tiny_service_records_its_native_clock_interval(self):
+        from orbitserve.runtime.service_precision import bandwidth_check
+        nodes={name:NetworkNodeSpec(name,'compute') for name in ('a','b')}
+        engine=FlowSimTransport(nodes,({'link_id':'ab','endpoint_a':'a','endpoint_b':'b'},),{})
+        self.addCleanup(engine.close)
+        leg=dict(link_id='ab',source_node_id='a',target_node_id='b')
+        engine.advance_until(8.659443882295493)
+        engine.configure({engine.resource(leg):200e9})
+        engine.start('tiny',leg,4.)
+        result=engine.advance_until(9.)
+        duration=(int(result['interval_end_ticks'])-int(result['interval_start_ticks']))/1e18
+        self.assertGreater(duration,0)
+        event=dict(interval_start_s=result['interval_start_s'],interval_end_s=result['time_s'],allocated_bandwidth_bps=result['allocated_rates_bps']['tiny'],link_capacity_bps=200e9,bytes_sent=result['bytes_sent']['tiny'],payload_bytes=4.,interval_start_ticks=result['interval_start_ticks'],interval_end_ticks=result['interval_end_ticks'])
+        self.assertEqual(bandwidth_check(event,native_ns_clock=True)['state'],'pass')
+        self.assertEqual(duration, .16e-9)
+        self.assertEqual(result['completed'],['tiny'])
+        self.assertEqual(result['bytes_sent']['tiny'],4.)
+
     def test_sub_ulp_native_completion_drains_fractional_tail(self):
         nodes = {name: NetworkNodeSpec(name, "compute") for name in ("a", "b")}
         engine = FlowSimTransport(nodes, ({"link_id": "ab", "endpoint_a": "a", "endpoint_b": "b"},), {})

@@ -19,7 +19,8 @@ from ..communication import (
     RouteHop,
 )
 from ..state.network import NetworkUnavailable
-from ..timeline import GlobalTimeline
+from ..timeline import GlobalTimeline, nanoseconds
+from ..clock import Time
 from .astermind_bridge import AsterMindRuntime
 from .cell_events import CellRequest
 
@@ -34,12 +35,13 @@ class CellTransfer:
     origin: str = "midlayer"
     operation: str = "transfer"
     correlation_id: str | None = None
+    ready_time_ticks: str | None = None
 
     def model_dump(self):
         return dict(id=self.id, source=self.source, target=self.target,
                     size_bytes=self.size_bytes, ready_time_ns=self.ready_time_ns,
                     origin=self.origin, operation=self.operation,
-                    correlation_id=self.correlation_id)
+                    correlation_id=self.correlation_id, ready_time_ticks=self.ready_time_ticks)
 
 
 @dataclass(frozen=True)
@@ -56,6 +58,7 @@ class CellTransferEvent:
     completion_time_ns: float | None = None
     failure_time_ns: float | None = None
     reason: str | None = None
+    time_ticks: str | None = None
 
     def model_dump(self):
         # Contract fields are immutable scalar values and a tuple of node IDs.
@@ -64,7 +67,7 @@ class CellTransferEvent:
                       size_bytes=self.size_bytes, origin=self.origin,
                       operation=self.operation, correlation_id=self.correlation_id,
                       path=self.path, completion_time_ns=self.completion_time_ns,
-                      failure_time_ns=self.failure_time_ns, reason=self.reason)
+                      failure_time_ns=self.failure_time_ns, reason=self.reason, time_ticks=self.time_ticks)
         if self.kind == "completed":
             result.pop("failure_time_ns")
             result.pop("reason")
@@ -155,6 +158,21 @@ class RuntimeCellNetwork:
                     queue.append((neighbor, (*path, neighbor)))
         raise ValueError(f"no candidate path: {source}->{target}")
 
+    def ready_time(self, request):
+        exact=getattr(request,'ready_time_ticks',None)
+        ready=Time.from_ticks(int(exact)) if exact is not None else Time.from_ns(request.ready_time_ns)
+        now=self.host.now if isinstance(self.host.now,Time) else Time(self.host.now)
+        if ready < now and exact is None and isinstance(request.ready_time_ns,float):
+            # Legacy callbacks can only return the rounded public ns value.
+            # Align that one representation of "now"; real past events and
+            # every explicit integer-tick deadline remain strictly rejected.
+            budget=math.ceil(math.ulp(request.ready_time_ns)*1e9)
+            if request.ready_time_ns==self.now_ns and now.ticks-ready.ticks<=budget:
+                ready=now
+        if ready < now:
+            raise ValueError("Cell transfer cannot be submitted in the past")
+        return ready
+
     def submit(self, request):
         if self.closed:
             raise RuntimeError("Cell network is closed")
@@ -170,11 +188,7 @@ class RuntimeCellNetwork:
             or request.size_bytes < 0
         ):
             raise ValueError("Cell transfer size must be finite and nonnegative")
-        if (
-            not math.isfinite(request.ready_time_ns)
-            or request.ready_time_ns < self.now_ns - 1e-6
-        ):
-            raise ValueError("Cell transfer cannot be submitted in the past")
+        ready = self.ready_time(request)
         source, target = self.resolve_pair(request.source, request.target)
         identity = f"__cell_transfer__/{request.id}"
         if identity in self.host.jobs or identity in self.host.service_jobs:
@@ -208,11 +222,12 @@ class RuntimeCellNetwork:
                 request.operation,
                 request.correlation_id,
                 tuple(self.map_path(path)),
-                completion_time_ns=None if reason else self.now_ns,
-                failure_time_ns=self.now_ns if reason else None,
+                completion_time_ns=None if reason else nanoseconds(self.host.now),
+                failure_time_ns=nanoseconds(self.host.now) if reason else None,
                 reason=reason,
+                time_ticks=str(self.host.now.ticks),
             )
-            self.events.append(event.model_dump())
+            self.events.append({**event.model_dump(), 'backend':self.host.net.spec.transport_model})
             self.host.log.append(
                 {
                     **event.model_dump(),
@@ -238,7 +253,9 @@ class RuntimeCellNetwork:
                     None,
                     request.operation,
                     "external_flow_done",
-                    context={"callback": terminal, "cell_transfer_id": request.id},
+                    context={"callback": terminal, "cell_transfer_id": request.id,
+                             "business_request_id": request.correlation_id,
+                             "flow_source_node_id": source, "flow_target_node_id": target},
                 )
             except NetworkUnavailable as error:
                 if (
@@ -266,6 +283,9 @@ class RuntimeCellNetwork:
                     "context": {
                         "callback": terminal,
                         "cell_transfer_id": request.id,
+                        "business_request_id": request.correlation_id,
+                        "flow_source_node_id": source,
+                        "flow_target_node_id": target,
                         "attempt": 1,
                     },
                 }
@@ -282,7 +302,7 @@ class RuntimeCellNetwork:
                 self.host.fail(job, str(error))
 
         self.host.push(
-            max(self.host.now, request.ready_time_ns / 1e9),
+            max(self.host.now, ready),
             33,
             "external_callback",
             payload=start,
@@ -352,6 +372,7 @@ class CellTransferExecutor:
                     self.network.now_ns,
                     operation=operation,
                     correlation_id=correlation_id,
+                    ready_time_ticks=str(self.loop.now_s.ticks),
                 )
             )
         except BaseException:
@@ -372,6 +393,10 @@ def bind_batch_executor(executor_class, loop, network, placements):
     """
 
     class HostedExecutor(executor_class):
+        def _make_request(self, **fields):
+            fields['ready_time_ns'] = nanoseconds(loop.now_s)
+            return CellTransfer(**fields, ready_time_ticks=str(loop.now_s.ticks))
+
         def __init__(self):
             super().__init__(loop, network, placements)
             self.boundary_listeners = network.boundary_listeners
@@ -420,6 +445,7 @@ def bind_batch_executor(executor_class, loop, network, placements):
                     network.now_ns,
                     operation=operation,
                     correlation_id=correlation_id,
+                    ready_time_ticks=str(loop.now_s.ticks),
                 )
             )
             self._callbacks[identifier] = on_complete
@@ -453,14 +479,14 @@ def bind_batch_executor(executor_class, loop, network, placements):
                     "cell_id": cell_id,
                     "step_id": step_id,
                     "ready_s": loop.now_s,
-                    "ready_ns": math.ceil(loop.now_ns),
+                    "ready_ns": nanoseconds(loop.now_s),
                     "phases": [],
                 }
                 self.input_distributions.append(record)
 
                 def distributed():
                     record["completed_s"] = loop.now_s
-                    record["completed_ns"] = math.ceil(loop.now_ns)
+                    record["completed_ns"] = nanoseconds(loop.now_s)
                     start()
 
                 self._phase(

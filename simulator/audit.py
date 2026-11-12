@@ -46,8 +46,28 @@ def audit(result):
                         Decimal(str(call["native_prediction_s"])) * 1_000_000_000
                     ).to_integral_value(rounding=ROUND_CEILING)
                 )
-                assert end - start == expected, call
+                if result.get('configuration',{}).get('timeline_mode') == 'simgrid':
+                    from orbitserve.runtime.clock_audit import computation_duration_valid
+                    assert computation_duration_valid(call,result['network']['clock']), call
+                else:
+                    assert end - start == expected, call
                 counts["kernels"] += 1
+                continue
+            if call.get("communication_backend") == "protobridge":
+                row = call["surrogate"]
+                assert not call["phases"], (
+                    "surrogate must not also submit collective flows"
+                )
+                assert row["end_s"] >= row["start_s"] >= row["ready_s"]
+                assert end == int(
+                    (Decimal(str(row["end_s"])) * 1_000_000_000).to_integral_value(
+                        rounding=ROUND_CEILING
+                    )
+                )
+                assert row["attempts"] and row["source_sha256"]
+                last = row["attempts"][-1]
+                assert abs(row["end_s"] - last["start_s"] - last["duration_s"]) < 1e-12
+                counts["communications"] += 1
                 continue
             phase_ready = start
             for phase in call["phases"]:
@@ -68,24 +88,44 @@ def audit(result):
         )
         events = [transfers[p["transfer_id"]] for p in partitions]
         assert all(event["kind"] == "completed" for event in events)
-        assert max(event["completion_time_ns"] for event in events) <= round(
-            migration["completed_time_s"] * 1e9
-        )
+        from orbitserve.runtime.clock_audit import migration_barrier_valid
+        assert migration_barrier_valid(migration, events), migration
         if "bytes_per_rank" in migration:
             assert sum(event["size_bytes"] for event in events) == migration["bytes"]
             assert all(
                 event["size_bytes"] == migration["bytes_per_rank"] for event in events
             )
-    batches = {(b["cell_id"], b["step_id"]): b for b in result["batches"]}
+    batch_starts = {
+        (b["cell_id"], b["step_id"]): b["start_time_ns"] for b in result["batches"]
+    }
     for distribution in result.get("input_distributions", []):
-        batch = batches[distribution["cell_id"], distribution["step_id"]]
-        assert distribution["completed_ns"] <= batch["start_time_ns"]
+        start = batch_starts[distribution["cell_id"], distribution["step_id"]]
+        assert distribution["completed_ns"] <= start, (
+            f"input distribution {distribution['cell_id']}/{distribution['step_id']} "
+            f"completed at {distribution['completed_ns']} ns after batch start {start} ns"
+        )
         for phase in distribution["phases"]:
             for flow in phase:
                 assert (
                     transfers[flow["id"]]["completion_time_ns"]
                     <= distribution["completed_ns"]
                 )
+    from orbitserve.runtime.service_precision import bandwidth_check
+    services = warnings = 0
+    for index, row in enumerate(result.get('network', {}).get('event_log', [])):
+        if row['kind'] != 'bandwidth_update':
+            continue
+        outcome = bandwidth_check(row, native_ns_clock=result.get('configuration', {}).get('backend') == 'flowsim')
+        assert outcome['state'] != 'fail', dict(evidence=f'network.event_log[{index}]', **outcome)
+        services += 1
+        warnings += outcome['state'] == 'precision'
+    counts.update(bandwidth_services=services, bandwidth_precision_warnings=warnings)
+    from orbitserve.runtime.clock_audit import clock_checks
+    exact = clock_checks(result)
+    assert all(row['state'] == 'pass' for row in exact), [row for row in exact if row['state'] == 'fail']
+    if exact:
+        counts['clock_checks'] = {row['id']: row['checked'] for row in exact}
+        counts['clock'] = result['network']['clock']
     return dict(passed=True, **counts, measurement=result.get("measurement", {}))
 
 

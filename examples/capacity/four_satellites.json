@@ -1,0 +1,23 @@
+{
+  "schema_version": "orbitserve.capacity_study.v1",
+  "models": ["all"],
+  "hardware": ["nvidia_a800", "nvidia_h200", "metax_c500", "ascend_910b"],
+  "cards_per_satellite": [1, 2, 4, 6, 8],
+  "link_bandwidth_gbps": [400, 1000],
+  "bandwidth_accounting": "bidirectional_aggregate",
+  "layouts": ["local_replicas", "cross_pairs", "cross_replicas", "cross_pipeline", "cross_tp", "target"],
+  "workloads": [
+    {"name": "short", "input_tokens": 512, "output_tokens": 128},
+    {"name": "medium", "input_tokens": 2048, "output_tokens": 256},
+    {"name": "long-input", "input_tokens": 8192, "output_tokens": 256}
+  ],
+  "request_rates": [0.5, 2, 8, 32, 128],
+  "seeds": [17, 29, 43],
+  "arrival_distribution": "poisson",
+  "warmup_s": 5,
+  "measurement_s": 30,
+  "drain_s": 30,
+  "min_measured_requests": 20,
+  "link_distance_km": 100,
+  "timeout_s": 600
+}

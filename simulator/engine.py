@@ -20,6 +20,8 @@ class Simulation:
         cell_factory=None,
         network_factory=None,
         physical_output_dir=None,
+        startup_progress=None,
+        cell_init_workers=None,
     ):
         self.cells = {}
         self.network = self.host = self._physics_lifetime = None
@@ -30,6 +32,8 @@ class Simulation:
                 cell_factory=cell_factory,
                 network_factory=network_factory,
                 physical_output_dir=physical_output_dir,
+                startup_progress=startup_progress,
+                cell_init_workers=cell_init_workers,
             )
         except BaseException:
             self.close()
@@ -43,16 +47,36 @@ class Simulation:
         cell_factory=None,
         network_factory=None,
         physical_output_dir=None,
+        startup_progress=None,
+        cell_init_workers=None,
     ):
+        from .startup_resources import startup_policy
+
+        self.cell_startup_policy = startup_policy(len(config.cells), cell_init_workers)
         startup = time.perf_counter()
+        self.startup_stages = []
+        stage_started, previous = startup, None
+
+        def report(phase, **details):
+            nonlocal stage_started, previous
+            now = time.perf_counter()
+            if previous is not None:
+                self.startup_stages.append({**previous, "wall_s": now - stage_started})
+            stage_started, previous = now, dict(phase=phase, **details)
+            if startup_progress is not None:
+                startup_progress({**previous, "elapsed_s": now - startup})
+
+        report("bootstrap")
         self.config = config
         self.root = activate(midlayer_root)
         self.cells = {}
         self.network = self.host = self._physics_lifetime = None
         self.topology = config.topology()
+        report("physics")
         self.physical, self._physics_lifetime = load_physics(
             config, physical_output_dir
         )
+        report("network")
         self.host = DeviceRuntimeHost(self.topology, config, self.physical)
         self.loop = self.host.timeline
         self.network = (network_factory or DeviceCommunicationRuntime)(
@@ -76,6 +100,21 @@ class Simulation:
         self.executor = bind_batch_executor(
             NetworkBatchExecutor, self.loop, self.network, placements
         )
+        # Record compression changes storage only, never event order or timing.
+        # Completed native graphs and callback logs otherwise grow as Python
+        # dictionaries for the entire run, exhausting memory on large workloads.
+        from .record_store import CompressedRecords
+
+        self.host.log = CompressedRecords()
+        self.loop.events = CompressedRecords()
+        self.executor.records = CompressedRecords(
+            chunk_size=4, sealed=lambda row: row["end_time_ns"] is not None
+        )
+        policy = getattr(self.network, "communication_policy", None)
+        if policy is not None:
+            policy.records = CompressedRecords(
+                sealed=lambda row: row["end_s"] is not None or "cancelled_s" in row
+            )
         self.cells, self.requests = {}, {r.id: r for r in config.requests}
         self.state = {
             r.id: {
@@ -100,18 +139,28 @@ class Simulation:
             {c.id: {p.rank: p.device for p in c.placements} for c in config.cells},
         )
         self._session_cells = {}
-        try:
-            for c in config.cells:
-                if cell_factory is None:
-                    cell = self._native_cell(c)
-                else:
-                    cell = cell_factory(
-                        c, self.loop, self._completed, self._output, self.executor
-                    )
-                self.cells[c.id] = cell
-        except BaseException:
-            self.close()
-            raise
+        self.cell_init_workers = self.cell_startup_policy["workers"]
+        if cell_factory is None:
+            # Resolve the native module graph on the owning thread first.
+            from .native_cell import NetworkMidlayerCell  # noqa: F401
+            from .startup import initialize_cells
+
+            self.cells = initialize_cells(
+                config.cells,
+                self._native_cell,
+                workers=self.cell_init_workers,
+                progress=lambda **details: report("cells", **details),
+            )
+        else:
+            # Injected factories may mutate shared state during construction.
+            self.cell_init_workers = 1
+            self.cell_startup_policy.update(workers=1, source="custom_factory")
+            for index, c in enumerate(config.cells, 1):
+                report("cell", cell=c.id, index=index, total=len(config.cells))
+                self.cells[c.id] = cell_factory(
+                    c, self.loop, self._completed, self._output, self.executor
+                )
+        report("ready")
         self.startup_wall_s = time.perf_counter() - startup
 
     def _native_cell(self, cell):
@@ -149,9 +198,21 @@ class Simulation:
             batch_executor=self.executor,
             history_store=self.history,
         )
-        from .native_execution import NativeStepExecution
+        try:
+            from .native_execution import NativeStepExecution
 
-        created.execution = NativeStepExecution(created.execution)
+            created.execution = NativeStepExecution(created.execution)
+            from .record_store import CompressedRecords
+
+            # A load snapshot contains the native allocator's complete record
+            # prefix. Retaining every snapshot as decoded dictionaries grows
+            # quadratically as requests and decode steps accumulate.
+            created.load_history = CompressedRecords(chunk_size=4)
+            created.communication_batches = CompressedRecords(chunk_size=4)
+            created.steps = CompressedRecords(chunk_size=128)
+        except BaseException:
+            created.close()
+            raise
         return created
 
     def _submit(self, source, target, size, operation, request_id, callback):
@@ -216,6 +277,7 @@ class Simulation:
         cell_config = self._select(request)
         state = self.state[request.id]
         state.update(status="input", cell=cell_config.id)
+        self._record_request("request_arrival", request.id)
         if request.session_id is not None:
             self._session_cells[request.session_id] = cell_config.id
         self.decisions.append(
@@ -228,7 +290,9 @@ class Simulation:
         )
 
         def ready():
-            state.update(status="computing", cell_ready_ns=round(self.loop.now_s * 1e9))
+            from orbitserve.runtime.timeline import nanoseconds
+            state.update(status="computing", cell_ready_ns=nanoseconds(self.loop.now_s), cell_ready_ticks=str(self.loop.now_s.ticks))
+            self._record_request("cell_input_ready", request.id)
             cell_request = CellRequest(
                 request.id,
                 self.loop.now_s,
@@ -257,14 +321,20 @@ class Simulation:
 
         def received():
             state = self.state[request.id]
-            now = round(self.loop.now_s * 1e9)
+            from orbitserve.runtime.timeline import nanoseconds
+            now = nanoseconds(self.loop.now_s)
             if output.token_start in self._received_chunks[request.id]:
                 raise RuntimeError("duplicate user delivery")
             self._received_chunks[request.id].add(output.token_start)
             state["received_tokens"] += output.token_count
             if output.token_start == 0:
                 state["first_token_received_ns"] = now
+                state['first_token_received_ticks'] = str(self.loop.now_s.ticks)
+                self._record_request("first_delivered", request.id)
             state["last_token_received_ns"] = now
+            state['last_token_received_ticks'] = str(self.loop.now_s.ticks)
+            if state["received_tokens"] == request.output_tokens:
+                self._record_request("output_delivered", request.id)
             self._finish(request.id)
 
         self._submit(
@@ -278,9 +348,10 @@ class Simulation:
 
     def _completed(self, completion):
         self.completions.append(asdict(completion))
-        self.state[completion.request_id]["compute_complete_ns"] = round(
-            completion.completion_time_s * 1e9
-        )
+        from orbitserve.runtime.timeline import nanoseconds
+        self.state[completion.request_id]['compute_complete_ns'] = nanoseconds(completion.completion_time_s)
+        self.state[completion.request_id]['compute_complete_ticks'] = str(completion.completion_time_s.ticks)
+        self._record_request("compute_complete", completion.request_id)
         self._finish(completion.request_id)
         for migration in self.config.migrations:
             if migration.after_request == completion.request_id:
@@ -296,9 +367,19 @@ class Simulation:
                     ),
                 )
 
+    def _record_request(self, kind, request_id):
+        self.host.log.append(
+            dict(
+                kind=kind,
+                request_id=request_id,
+                time_s=self.loop.now_s,
+                cell_id=self.state[request_id].get("cell"),
+            )
+        )
+
     def _finish(self, request_id):
         state = self.state[request_id]
-        if state["status"] == "failed":
+        if state["status"] in {"failed", "completed"}:
             return
         if (
             "compute_complete_ns" in state
@@ -308,6 +389,15 @@ class Simulation:
             state["completed_ns"] = max(
                 state["compute_complete_ns"], state["last_token_received_ns"] or 0
             )
+            state['completed_ticks'] = str(self.loop.now_s.ticks)
+            self.host.log.append(
+                dict(
+                    kind="request_complete",
+                    request_id=request_id,
+                    time_s=self.loop.now_s,
+                    cell_id=state["cell"],
+                )
+            )
 
     def run(self):
         from orbitserve.runtime.engine.cell_events import ARRIVAL
@@ -315,7 +405,7 @@ class Simulation:
         started = time.perf_counter()
         for request in self.config.requests:
             self.loop.schedule(
-                request.arrival_ns / 1e9,
+                self.host.now.from_ns(request.arrival_ns),
                 ARRIVAL,
                 f"arrival:{request.id}",
                 lambda request=request: self._arrive(request),
@@ -324,7 +414,7 @@ class Simulation:
         for at, positions in self.topology.orbit_grid or ():
             if at <= self.config.horizon_ns:
                 self.loop.schedule(
-                    at / 1e9,
+                    self.host.now.from_ns(at),
                     ARRIVAL,
                     f"orbit:{at}",
                     lambda positions=positions: self.positions.update(positions),
@@ -365,12 +455,18 @@ class Simulation:
             "final_positions_itrs_km": self.positions,
             "measurement": {
                 "runtime_startup_wall_s": self.startup_wall_s,
+                "startup_stages": self.startup_stages,
+                "cell_init_workers": self.cell_init_workers,
+                "cell_startup_policy": self.cell_startup_policy,
                 "event_loop_wall_s": time.perf_counter() - started,
                 "simulated_time_ns": round(self.loop.now_s * 1e9),
             },
             "provenance": {
                 "midlayer_root": str(self.root),
                 "communication": self.config.backend,
+                "communication_mode": self.config.communication_mode,
+                "timeline_mode": self.config.timeline_mode,
+                "timeline_authority": "simgrid_engine" if self.config.timeline_mode == 'simgrid' else "orbitserve_runtime",
                 "graph_backends": {c.id: c.graph_backend for c in self.config.cells},
                 "network_model": "orbitserve_dynamic_device_graph",
                 "accuracy": "integration tests; no new hardware accuracy claim",

@@ -13,9 +13,22 @@ import itertools
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
+from decimal import ROUND_CEILING, Decimal
 from typing import Any, Protocol
+from .clock import CLOCK, Time, ClockLog
 
 EventCallback = Callable[[], None]
+
+
+def nanoseconds(seconds):
+    """Map host seconds to the next native tick without float multiplication."""
+    if isinstance(seconds, Time):
+        return (seconds.ticks + 10**9 - 1) // 10**9
+    return int(
+        (Decimal(str(seconds)) * 1_000_000_000).to_integral_value(
+            rounding=ROUND_CEILING
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -34,12 +47,12 @@ class GlobalTimeline:
     def __init__(self, *, start_s: float = 0.0, host=None):
         if not math.isfinite(start_s) or start_s < 0:
             raise ValueError("timeline start must be finite and nonnegative")
-        self._now_s = float(start_s)
+        self._now_s = Time(start_s)
         self._host = host
         self._pending = 0
         self._sequence = itertools.count()
         self._queue: list[tuple[float, int, int, TimelineEvent, EventCallback]] = []
-        self.events: list[dict[str, Any]] = []
+        self.events: list[dict[str, Any]] = ClockLog()
         self._stopped = False
 
     @property
@@ -64,7 +77,8 @@ class GlobalTimeline:
         owner_id: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> TimelineEvent:
-        if not math.isfinite(at_s) or at_s < self.now_s:
+        at_s = at_s if isinstance(at_s, Time) else Time(at_s)
+        if at_s < self.now_s:
             raise ValueError("cannot schedule a past or nonfinite event")
         if type(priority) is not int:
             raise TypeError("event priority must be an integer")
@@ -73,7 +87,7 @@ class GlobalTimeline:
         if not callable(callback):
             raise TypeError("event callback must be callable")
         sequence = next(self._sequence)
-        event = TimelineEvent(float(at_s), priority, sequence, kind, owner_id, metadata)
+        event = TimelineEvent(at_s, priority, sequence, kind, owner_id, metadata)
         if self._host is not None:
             self._pending += 1
 
@@ -81,7 +95,7 @@ class GlobalTimeline:
                 self._pending -= 1
                 self.events.append(
                     {
-                        "time_s": event.time_s,
+                        "time_s": self._host.now,
                         "priority": event.priority,
                         "sequence": event.sequence,
                         "event": event.kind,
@@ -157,14 +171,16 @@ class GlobalTimeline:
             callback()
             handled += 1
         if until_s is not None and not self._stopped:
-            self._now_s = until_s
+            self._now_s = Time(until_s)
         return self.report()
 
     def report(self) -> dict[str, Any]:
         return {
+            'clock': self._host.transport_provenance.get('clock', CLOCK) if self._host is not None else CLOCK,
+            'time_ticks': str(self.now_s.ticks),
             "time_s": self.now_s,
             "handled_events": len(self.events),
-            "pending_events": len(self._queue),
+            "pending_events": self.pending_count,
             "stopped": self._stopped,
         }
 
@@ -236,7 +252,7 @@ class GlobalScheduling:
 
     def dispatch(self, request: Any, *, at_s: float | None = None) -> str:
         selected = self.policy.select_cell(request, self.cells.snapshots())
-        ready_at = self.cells.timeline.now_s if at_s is None else float(at_s)
+        ready_at = self.cells.timeline.now_s if at_s is None else Time(at_s)
         self.cells.submit(selected, request, at_s=ready_at)
         return selected
 

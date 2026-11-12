@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import heapq
 import math
+from ..clock import Time, ClockLog
 from dataclasses import replace
 from collections import defaultdict, deque
 from types import SimpleNamespace
@@ -240,18 +241,18 @@ class _EventEngine:
             eligible,
         )
         self.net, self.serving = environment.network, spec.serving_profile
-        self.end = min(
-            float(environment.time["end_s"]),
-            float(spec.time_horizon_s) if spec.time_horizon_s is not None else math.inf,
-        )
-        self.jobs, self.heap, self.log = {}, [], []
+        self.end = Time(environment.time['end_s'])
+        if spec.time_horizon_s is not None:
+            self.end = min(self.end, Time(spec.time_horizon_s))
+        self.jobs, self.heap, self.log = {}, [], ClockLog()
         self.service_jobs = {}
         self.followers = defaultdict(list)
         self.active_compute = {}
         self.waiting = defaultdict(deque)
         self.sequence = 0
-        self.now = 0.0
+        self.now = Time()
         self.transport = None
+        self.global_scheduler = self.net.spec.transport_model == 'simgrid'
         self.shared_messages = {}
         self.shared_capacities = {}
         self.messages = {}
@@ -265,7 +266,8 @@ class _EventEngine:
             from .simgrid_transport import SimGridTransport
 
             self.transport = SimGridTransport(
-                self.net.nodes, self.net.edges, self.net.spec.link_profiles, **transport_options
+                self.net.nodes, self.net.edges, self.net.spec.link_profiles,
+                global_scheduler=self.global_scheduler, **transport_options
             )
             self.transport_provenance = self.transport.provenance
         elif self.net.spec.transport_model in {'fluid', 'ns3', 'flowsim'}:
@@ -278,13 +280,24 @@ class _EventEngine:
             options = {'record_packets': getattr(self.compute_runtime, 'record_packets', getattr(self, 'record_packets', False))} if self.net.spec.transport_model == 'ns3' else {}
             self.transport = Transport(self.net.nodes, self.net.edges, self.net.spec.link_profiles, **options, **transport_options)
             self.transport_provenance = self.transport.provenance
+        if self.global_scheduler:
+            if self.net.spec.transport_model != 'simgrid':
+                raise ValueError('SimGrid global scheduling requires native SimGrid transport')
+            from .simgrid_events import SimGridEventQueue, native_time, simgrid_time
+            self.heap = SimGridEventQueue(self.transport)
+            self.end = simgrid_time(native_time(self.end))
 
     def push(self, time, priority, kind, request_id=None, payload=None):
-        if time < self.now - 1e-9:
+        # Preserve native SimGrid doubles carried by Time; record projections
+        # must never round a same-time callback into a different native instant.
+        time = time if isinstance(time, Time) else Time(time)
+        if time < self.now:
             raise RuntimeError("event scheduled in the past")
         self.sequence += 1
+        if self.global_scheduler:
+            return self.heap.append((time, priority, self.sequence, kind, request_id, payload))
         heapq.heappush(
-            self.heap, (float(time), priority, self.sequence, kind, request_id, payload)
+            self.heap, (time, priority, self.sequence, kind, request_id, payload)
         )
 
     def message_owner(self, request_id):
@@ -432,17 +445,24 @@ class _EventEngine:
                 self.transport.close()
 
     def _run(self):
-        while self.heap:
+        while self.heap or (self.global_scheduler and self.transport.active):
             if self.controller and hasattr(self.controller, 'poll'):
                 self.controller.poll(self)
-            if self.transport:
+            if self.global_scheduler:
+                event = self.heap.pop_due()
+                if event is None:
+                    if self.now >= self.end:
+                        break
+                    self.advance_shared(None)
+                    continue
+                time, priority, sequence, kind, request_id, payload = event
+            elif self.transport:
                 target = min(self.heap[0][0], self.end)
                 if target > self.transport.now:
                     self.advance_shared(target)
                     continue
-            time, priority, sequence, kind, request_id, payload = heapq.heappop(
-                self.heap
-            )
+            if not self.global_scheduler:
+                time, priority, sequence, kind, request_id, payload = heapq.heappop(self.heap)
             if time > self.end:
                 break
             self.now = time
@@ -494,10 +514,15 @@ class _EventEngine:
             try:
                 getattr(self, "on_" + kind)(job, payload)
             except (NetworkUnavailable, EnergyWindowError, ValueError) as error:
-                if job is None:
+                if job is None or job['done']:
                     raise
                 self.fail(job, str(error))
-        self.now = self.end
+        if self.global_scheduler:
+            while self.transport.now < self.end:
+                self.advance_shared(None)
+            self.now = self.transport.now
+        else:
+            self.now = self.end
         for job in tuple(self.service_jobs.values()):
             if not job['done'] and job.get('external_failure_callback') is not None:
                 self.fail(job, 'simulation_horizon_exceeded')
@@ -825,9 +850,13 @@ class _EventEngine:
     def schedule_reallocation(self):
         # Replaced graph versions must not accumulate future events or wake
         # route waiters after they have become obsolete.
-        self.heap[:] = [e for e in self.heap if e[3] not in {'link_state', 'network_update'}
-                        or (e[5] or {}).get('revision', 0) == self.net.revision]
-        heapq.heapify(self.heap)
+        def keep(e):
+            return e[3] not in {'link_state', 'network_update'} or (e[5] or {}).get('revision', 0) == self.net.revision
+        if self.global_scheduler:
+            self.heap.retain(keep)
+        else:
+            self.heap[:] = [e for e in self.heap if keep(e)]
+            heapq.heapify(self.heap)
         for event in self.net.events:
             if event['time_s'] >= self.now:
                 self.push(event['time_s'], 0, 'link_state', None,
@@ -837,10 +866,14 @@ class _EventEngine:
                 self.push(frame['time_s'], 0, 'network_update', None, {'revision': self.net.revision})
 
     def advance_shared(self, target):
-        response = self.transport.advance_until(target)
+        response = self.transport.advance_next(self.end) if self.global_scheduler else self.transport.advance_until(target)
         self.now = response["time_s"]
         start = response["interval_start_s"]
         duration = self.now - start
+        native_clock = {name: response[name] for name in ('interval_start_ticks', 'interval_end_ticks') if name in response}
+        if duration > 0 and 'resources' in response:
+            self.log.append(dict(time_s=self.now, kind='resource_service', interval_start_s=start,
+                                 interval_end_s=self.now, **native_clock, resources=response['resources']))
         contenders = defaultdict(int)
         for identity in response["bytes_sent"]:
             contenders[
@@ -854,7 +887,7 @@ class _EventEngine:
                     "start_s": start,
                     "finish_s": self.now,
                     "bytes": sent,
-                    "bandwidth_bps": sent * 8 / duration,
+                    "bandwidth_bps": response.get('allocated_rates_bps', {}).get(identity, sent * 8 / duration),
                     "link_capacity_bps": self.shared_capacities[
                         self.transport.resource(leg)
                     ],
@@ -876,6 +909,11 @@ class _EventEngine:
                             "allocated_bandwidth_bps": segment["bandwidth_bps"],
                             "bytes_sent": sent,
                             "link_capacity_bps": segment["link_capacity_bps"],
+                            **native_clock,
+                            **({'service_clock':response['service_clock'],
+                                'native_interval_start_s':response['native_interval_start_s'],'native_interval_end_s':response['native_interval_end_s'],
+                                'native_service_error_bytes':response['service_errors_bytes'][identity]}
+                               if 'service_clock' in response else {}),
                         },
                     },
                 )
@@ -934,6 +972,8 @@ class _EventEngine:
 
     def on_transmit_start(self, job, message):
         leg = message["leg"]
+        if self.global_scheduler:
+            leg['start_s'] = self.now
         current = self.net.link_at(leg['link_id'], self.now)
         if current['state'] != 'UP' or current.get('setup_start_s') != leg.get('setup_start_s'):
             self.interrupt_transfer(job, message, 'link_unavailable_at_transmission_start')

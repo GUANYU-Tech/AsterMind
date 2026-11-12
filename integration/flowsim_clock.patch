@@ -1,0 +1,203 @@
+--- a/include/flowsim/flowsim.hh
++++ b/include/flowsim/flowsim.hh
+@@ -118,6 +118,22 @@
+   Topology topology_;
+ };
+ 
++struct TickService {
++  std::string id;
++  long double bytes_sent;
++  long double rate_bytes_per_ns;
++};
++struct TickResource {
++  std::string id;
++  long double allocated_bytes_per_ns;
++  long double capacity_bytes_per_ns;
++};
++struct TickAdvance {
++  std::string start_ticks, end_ticks;
++  std::vector<TickService> services;
++  std::vector<TickResource> resources;
++};
++
+ class EventSimulator {
+ public:
+   using Callback = std::function<void()>;
+@@ -140,6 +156,8 @@
+   void run();
+   void stop();
+   void advance_until(long double target_ns);
++  // Absolute integer attoseconds; the hosted API has no floating clock bridge.
++  TickAdvance advance_until_ticks(const std::string &target_ticks);
+   void set_bandwidth(const std::string &source, const std::string &target,
+                      double bandwidth_gbps);
+   void set_pool_capacity(const std::string &pool, double bandwidth_gbps);
+--- a/src/event_simulator.cc
++++ b/src/event_simulator.cc
+@@ -16,6 +16,25 @@
+ 
+ constexpr long double kEventEpsilon = 1e-9L;
+ constexpr long double kByteEpsilon = 1e-6L;
++
++using Tick = unsigned __int128;
++constexpr long double kTicksPerNs = 1000000000.0L;
++Tick parse_ticks(const std::string &value) {
++  if (value.empty()) throw std::invalid_argument("empty clock tick");
++  Tick result = 0;
++  for (char c : value) {
++    if (c < '0' || c > '9' || result > (~Tick(0) - (c - '0')) / 10)
++      throw std::invalid_argument("invalid or overflowing clock tick");
++    result = result * 10 + (c - '0');
++  }
++  return result;
++}
++std::string tick_string(Tick value) {
++  std::string result;
++  do { result.push_back('0' + value % 10); value /= 10; } while (value);
++  std::reverse(result.begin(), result.end());
++  return result;
++}
+ 
+ struct PhaseTimer {
+   bool enabled;
+@@ -162,6 +181,7 @@
+   }
+ 
+   void advance_until(const long double target_ns) {
++    if (tick_mode_) throw std::logic_error("integer clock cannot use float advance");
+     ++advance_calls_;
+     if (running_ || !std::isfinite(target_ns) || target_ns < current_time_) {
+       throw std::invalid_argument("advance target must be finite and monotonic");
+@@ -190,6 +210,80 @@
+     advance_to(next_time);
+     finish_transmissions();
+     process_ready_events();
++  }
++
++  TickAdvance advance_until_ticks(const std::string &target_string) {
++    const Tick target = parse_ticks(target_string);
++    if (running_ || target < current_ticks_ || (!tick_mode_ && current_time_ != 0))
++      throw std::invalid_argument("integer clock target must be monotonic");
++    if (!events_.empty())
++      throw std::logic_error("hosted integer clock accepts zero-latency direct hops only");
++    tick_mode_ = true;
++    ++advance_calls_;
++    recompute_rates_if_needed();
++    Tick next = target;
++    std::map<std::size_t, Tick> completions;
++    for (const auto index : active_) {
++      const auto &flow = flows_[index];
++      if (flow.route.propagation_latency_ns != 0 || flow.route.link_indices.size() != 1)
++        throw std::logic_error("host owns propagation and multi-hop scheduling");
++      if (flow.rate_bytes_per_ns > 0) {
++        const auto delay = std::ceil(flow.remaining_bytes / flow.rate_bytes_per_ns * kTicksPerNs);
++        if (!std::isfinite(delay) || delay >= static_cast<long double>(~Tick(0) - current_ticks_))
++          throw std::overflow_error("integer completion overflow");
++        const Tick completion = current_ticks_ + std::max(Tick(1), static_cast<Tick>(delay));
++        completions.emplace(index, completion);
++        next = std::min(next, completion);
++      }
++    }
++    TickAdvance result{tick_string(current_ticks_), tick_string(next), {}, {}};
++    const auto elapsed = static_cast<long double>(next - current_ticks_) / kTicksPerNs;
++    std::map<std::size_t, long double> link_rates;
++    std::map<std::string, long double> pool_rates;
++    std::vector<std::size_t> finished;
++    for (const auto index : active_) {
++      auto &flow = flows_[index];
++      const auto service = std::min(flow.remaining_bytes, flow.rate_bytes_per_ns * elapsed);
++      // A completion is never published before ceil(remaining/rate). No byte epsilon.
++      const bool done = completions.count(index) && completions.at(index) == next;
++      const auto sent = done ? flow.remaining_bytes : service;
++      flow.remaining_bytes = done ? 0 : flow.remaining_bytes - sent;
++      result.services.push_back({flow.request.id, sent, flow.rate_bytes_per_ns});
++      std::set<std::string> pools;
++      for (const auto link : flow.route.link_indices) {
++        link_rates[link] += flow.rate_bytes_per_ns;
++        const auto &attached = topology_.link_pools(link);
++        pools.insert(attached.begin(), attached.end());
++      }
++      for (const auto &pool : pools) pool_rates[pool] += flow.rate_bytes_per_ns;
++      if (done) finished.push_back(index);
++    }
++    for (const auto &[index, allocated] : link_rates) {
++      const auto &link = topology_.links()[index];
++      result.resources.push_back({"link:" + link.source + ">" + link.target, allocated, link.capacity_bytes_per_ns});
++    }
++    for (const auto &[pool, allocated] : pool_rates)
++      result.resources.push_back({"pool:" + pool, allocated, topology_.pool_capacities().at(pool)});
++    for (const auto &resource : result.resources) {
++      if (resource.allocated_bytes_per_ns > resource.capacity_bytes_per_ns * (1 + 1e-15L))
++        throw std::logic_error("shared resource allocation exceeds capacity");
++    }
++    current_ticks_ = next;
++    // Compatibility reports only; never used for elapsed service or scheduling.
++    current_time_ = static_cast<long double>(current_ticks_) / kTicksPerNs;
++    for (const auto index : finished) {
++      auto &flow = flows_[index];
++      flow.transmitting = false;
++      flow.transmission_end_time = current_time_;
++      for (const auto link : flow.route.link_indices)
++        event_checked_add(link_bytes_[link], flow.request.size_bytes);
++    }
++    if (!finished.empty()) {
++      active_.erase(std::remove_if(active_.begin(), active_.end(), [&](auto i) { return !flows_[i].transmitting; }), active_.end());
++      rates_dirty_ = true;
++      for (const auto index : finished) complete_delivery(index);
++    }
++    return result;
+   }
+ 
+   void run() {
+@@ -605,6 +699,8 @@
+   double rate_allocation_s_ = 0, advance_bytes_s_ = 0;
+   double completion_search_s_ = 0, completion_processing_s_ = 0;
+   long double current_time_ = 0.0L;
++  Tick current_ticks_ = 0;
++  bool tick_mode_ = false;
+   std::uint64_t next_event_sequence_ = 0;
+   std::uint64_t progress_revision_ = 0;
+   bool rates_dirty_ = true;
+@@ -643,6 +739,9 @@
+ void EventSimulator::advance_until(long double target_ns) {
+   impl_->advance_until(target_ns);
+ }
++TickAdvance EventSimulator::advance_until_ticks(const std::string &target_ticks) {
++  return impl_->advance_until_ticks(target_ticks);
++}
+ void EventSimulator::set_bandwidth(const std::string &source, const std::string &target,
+                                    double bandwidth_gbps) {
+   impl_->set_bandwidth(source, target, bandwidth_gbps);
+--- a/python/bindings.cc
++++ b/python/bindings.cc
+@@ -54,6 +54,30 @@
+            py::arg("id"), py::arg("source"), py::arg("target"),
+            py::arg("size_bytes"), py::arg("on_complete"))
+       .def("advance_until", &flowsim::EventSimulator::advance_until)
++      .def("advance_until_ticks", [](flowsim::EventSimulator &sim, const std::string &target) {
++        auto result = sim.advance_until_ticks(target);
++        py::dict value;
++        value["start_ticks"] = result.start_ticks;
++        value["end_ticks"] = result.end_ticks;
++        py::list services, resources;
++        for (const auto &row : result.services) {
++          py::dict item;
++          item["id"] = row.id;
++          item["bytes_sent"] = row.bytes_sent;
++          item["rate_bytes_per_ns"] = row.rate_bytes_per_ns;
++          services.append(item);
++        }
++        for (const auto &row : result.resources) {
++          py::dict item;
++          item["id"] = row.id;
++          item["allocated_bytes_per_ns"] = row.allocated_bytes_per_ns;
++          item["capacity_bytes_per_ns"] = row.capacity_bytes_per_ns;
++          resources.append(item);
++        }
++        value["services"] = services;
++        value["resources"] = resources;
++        return value;
++      })
+       .def("set_bandwidth", &flowsim::EventSimulator::set_bandwidth)
+       .def("set_pool_capacity", &flowsim::EventSimulator::set_pool_capacity)
+       .def("cancel", &flowsim::EventSimulator::cancel)
