@@ -6,24 +6,21 @@ from astermind.engine.cell_bridge import RuntimeCellNetwork, CellTransferExecuto
 from astermind.engine.events import _EventEngine
 from astermind.engine.state.device_network import DeviceNetworkState
 from astermind.engine.timeline import GlobalTimeline
-from astermind.engine.clock import Time
+from astermind.engine.clock import Time, CLOCK
+from astermind.engine.timeline import nanoseconds
+from astermind.engine.cell_bridge import CellTransferEvent
 
 
 class DeviceRuntimeHost(_EventEngine):
     def __init__(self, topology, config, physical=None):
-        timeline_mode=getattr(config,'timeline_mode','simgrid' if config.backend=='simgrid' else 'orbitserve')
-        if timeline_mode not in {'orbitserve','simgrid'} or (timeline_mode=='simgrid') != (config.backend=='simgrid'):
-            raise ValueError('timeline mode and communication backend are inconsistent')
-        self.record_packets = getattr(config, "record_packets", False)
+        timeline_mode="orbitserve"
         network = DeviceNetworkState(
             topology,
             Time.from_ns(config.horizon_ns),
-            config.backend,
+            "runtime_comm",
             physical=physical,
             bindings=config.physical_link_bindings,
             ground_owners=getattr(config, "ground_owners", ()),
-            failure_policy=config.runtime_network.get("failure_policy", "fail"),
-            max_transfer_retries=config.runtime_network.get("max_transfer_retries", 0),
         )
         network.timeline_mode = timeline_mode
         spec = SimpleNamespace(
@@ -48,8 +45,8 @@ class DeviceRuntimeHost(_EventEngine):
             for time_s, observations in batches.items():
                 self.push(time_s, -2, "fault_batch", payload=observations)
         self.timeline = GlobalTimeline(host=self)
-        self.communication_mode = getattr(config, "communication_mode", "flowsim")
-        self.protobridge_startup_us = getattr(config, "protobridge_startup_us", 0.0)
+        self.comm_policy = config.communication
+        self.communication_policy = None
 
     def debit(self, job, node_id, *, prompt=0, output=0, size=0, stage):
         # Native kernel energy is not inferred from byte traffic or fake SOC.
@@ -66,40 +63,69 @@ class DeviceCommunicationRuntime(RuntimeCellNetwork):
     def __init__(self, host, topology):
         super().__init__(host)
         self.topology = topology
-        self.communication_policy = None
-        if host.communication_mode != "flowsim":
-            from astermind.engine.device_communication import ScopedProtoBridge
-
-            self.communication_policy = ScopedProtoBridge(self, host.communication_mode)
+        from astermind.engine.comm.target_network import TargetNetworkFrames
+        from astermind.engine.comm.event_runtime import RuntimeCommunication
+        self.communication_policy = RuntimeCommunication(TargetNetworkFrames(self), host.timeline, host.comm_policy)
         host.communication_policy = self.communication_policy
+        self.pending = {}
 
     def submit(self, request):
-        if self.communication_policy is None:
-            return super().submit(request)
-        return self.communication_policy.submit(request, super().submit)
+        if self.closed:
+            raise RuntimeError("Cell network is closed")
+        if request.id in self.pending or request.id in self.communication_policy.used_ids:
+            raise ValueError("duplicate Cell transfer")
+        if type(request.size_bytes) is not int or request.size_bytes < 0:
+            raise ValueError("Cell transfer requires nonnegative integer bytes")
+        ready = self.ready_time(request)
+        self.resolve_pair(request.source, request.target)
+        self.pending[request.id] = request
 
-    def try_collective(self, cell_id, transfer, devices, record, on_complete):
-        if self.communication_policy is None:
-            return False
-        return self.communication_policy.collective(
-            cell_id, transfer, devices, record, on_complete
-        )
+        def finish(failure=None):
+            if self.pending.pop(request.id, None) is None:
+                return
+            now = self.host.now
+            event = CellTransferEvent(
+                "completed" if failure is None else "failed", request.id,
+                request.source, request.target, request.size_bytes,
+                request.origin, request.operation, request.correlation_id,
+                tuple(self.communication_policy.delivery_paths.get(request.id, (request.source, request.target))),
+                completion_time_ns=nanoseconds(now) if failure is None else None,
+                failure_time_ns=nanoseconds(now) if failure is not None else None,
+                reason=None if failure is None else failure.reason, time_ticks=str(now.ticks))
+            self.events.append(event.model_dump())
+            for listener in tuple(self._listeners):
+                listener(event)
+
+        def begin():
+            if request.id not in self.pending:
+                return
+            self.communication_policy.submit_transfer(request.id, request.source, request.target,
+                request.size_bytes, finish, finish)
+        self.host.timeline.schedule(ready, 1, "comm:submit_transfer", begin)
+        return request.id
 
     def cancel(self, identifiers, reason="cell_transfer_cancelled"):
-        identifiers = tuple(identifiers)
-        if self.communication_policy is not None:
-            self.communication_policy.cancel(identifiers, reason)
-        return super().cancel(identifiers, reason)
+        for identifier in tuple(identifiers):
+            if identifier in self.communication_policy.tasks:
+                self.communication_policy.cancel(identifier, reason)
+            elif identifier in self.pending:
+                request = self.pending.pop(identifier)
+                event = CellTransferEvent("failed", identifier, request.source, request.target,
+                    request.size_bytes, request.origin, request.operation, request.correlation_id, (),
+                    failure_time_ns=nanoseconds(self.host.now), reason=reason,
+                    time_ticks=str(self.host.now.ticks))
+                self.events.append(event.model_dump())
+                for listener in tuple(self._listeners):
+                    listener(event)
 
     def close(self):
+        if self.closed:
+            return
+        self.cancel(tuple(self.pending), "cell_network_closed")
+        for identifier in tuple(self.communication_policy.tasks):
+            self.communication_policy.cancel(identifier, "cell_network_closed")
+        self.communication_policy.close()
         self.closed = True
-        if self.communication_policy is not None:
-            self.communication_policy.cancel(
-                tuple(self.communication_policy.requests), "cell_network_closed"
-            )
-            self.communication_policy.pending.clear()
-            self.communication_policy.active.clear()
-        return super().close()
 
     def subscribe(self, callback):
         def delivered(event):
@@ -124,6 +150,7 @@ class DeviceCommunicationRuntime(RuntimeCellNetwork):
         return self.topology.physical_path(path)
 
     def route(self, source, target, size_bytes=0):
+        self.communication_policy._refresh()._publish_forecast()
         a, b = self.resolve_pair(source, target)
         arrival, path = self.host.net.transfer(a, b, self.host.now, size_bytes)
         nodes = (a, *(leg["target_node_id"] for leg in path))
@@ -134,27 +161,16 @@ class DeviceCommunicationRuntime(RuntimeCellNetwork):
 
     def snapshot(self):
         return {
-            "backend": self.host.net.spec.transport_model,
-            "communication_mode": self.host.communication_mode,
-            "timeline_mode": getattr(self.host.net, 'timeline_mode', 'orbitserve'),
-            "timeline_authority": 'simgrid_engine' if self.host.global_scheduler else 'orbitserve_runtime',
-            "scheduler": getattr(self.host.transport, 'scheduler_stats', {}),
-            "surrogate_operations": self.communication_policy.records
-            if self.communication_policy
-            else [],
-            "clock_s": self.host.now,
-            "clock": self.host.transport_provenance.get('clock'),
-            "clock_ticks": str(self.host.now.ticks),
-            "transport": self.host.transport_provenance,
+            "backend": "runtime_comm",
+            "timeline_authority": "integer_ticks",
+            "clock_s": self.host.now, "clock_ticks": str(self.host.now.ticks), "clock": CLOCK,
+            "transport": {"allocator": self.communication_policy.allocator.provenance,
+                          "semantics": "whole_path_external_resources",
+                          "intra_competition": False},
             "flows": list(self.events),
             "device_topology": self.topology.view("devices"),
-            "physical_dataset_identity": getattr(
-                self.host.net.physical, "dataset_identity", None
-            ),
-            "physical_dataset_root": getattr(
-                self.host.net.physical, "dataset_root", None
-            ),
+            "physical_dataset_identity": getattr(self.host.net.physical, "dataset_identity", None),
+            "physical_dataset_root": getattr(self.host.net.physical, "dataset_root", None),
             "physical_link_bindings": self.host.net._bindings,
-            "energy_model": "not_evaluated",
-            "event_log": self.host.log,
+            "energy_model": "not_evaluated", "event_log": self.host.log,
         }

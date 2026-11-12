@@ -1,62 +1,70 @@
-# Regression tests
+# Validation
 
-The fixed-design entry is SimulationConfig -> Simulation. DSE, Analytical
-performance tables, energy/SOC/DVFS execution and their exclusive tests are removed.
-Independent physical geometry and workload tests remain.
-
-```bash
-python -m unittest discover -s tests -t . -v
-ORBITSERVE_MIDLAYER_ROOT=/path/to/midlayer python -m unittest discover -s tests/external/native_cells -v
-```
-
-Install the actual native dependencies before claiming backend validation. A skip
-is not a successful native test. FlowSim needs the compatible shared-runtime
-extension, not an upstream extension with a different API. Real ISLSim tests are
-explicitly run from `tests/external/islsim` with its external source configured.
-
-| Behavior | Coverage |
-| --- | --- |
-| Native CLI, schema defaults, rejected removed fields | `smoke/test_native_entry.py` |
-| Shared host clock, byte conservation, directional RF, fault/retry/acquisition | `integration/fixed_design/test_network_acceptance.py`, `test_network_recovery.py`, `test_boundary_control.py`, `test_time_varying_transport.py`, `test_radio_sharing.py` |
-| Native Cell callbacks, input before collective, migration rollback/horizon | `integration/fixed_design/test_cell_shared_runtime.py`, `unit/runtime/test_cell_migration.py` |
-| Actual Mid-Layer/vLLM TP/PP, KV move/prefix reuse, communication scopes | `external/native_cells/` |
-| Physical dataset hashes, reuse, fault causality, serial/parallel exports | `integration/fixed_design/test_physical_dataset.py`, `test_physical_precompute.py`, `test_parallel_physical_exports.py` |
-| Independent workload behavior | `unit/workload/`, `smoke/test_main_composite_chat_bundle.py` |
-| Installed package and packaged resources | `scripts/check_distribution.py` |
-
-`tests/network_case.py` is a transfer-only fixture for the shared event engine.
-It executes physical request/reply bytes, without synthesizing LLM computation,
-energy or KV state. Real LLM scheduling and KV are validated by the Native suite.
-Legacy test documents are not accepted as SimulationConfig inputs.
-
-The V1 cleanup, follow-up removal and explicit test exclusions are recorded in [V1 validation](V1_VALIDATION.md).
-
-## Repeating the layout regression
-
-With the pinned native dependencies available:
+All commands run from the repository root with native dependencies installed.
+The retained suite rejects skipped tests; explicit native scripts fail on missing
+Schedulers/models. External directories are explicit suites, not implicit unittest
+recursive discovery. Old execution-mode tests are replaced by the cases below.
 
 ```bash
+python -m astermind.common.build_native
 python tests/scripts/run_retained_tests.py
-ORBITSERVE_NATIVE_REPORT_DIR=/absolute/path/to/reports python tests/scripts/run_migration_native.py
-python tests/scripts/compare_migration.py /absolute/path/to/baseline /absolute/path/to/reports
-python tests/scripts/check_distribution.py --work-dir /absolute/path/to/new-package-check
-python -m viz.export /absolute/path/to/reports/*.json --out /absolute/path/to/replay
+python tests/scripts/run_compute_comm.py --cases DS01 DS02 DS03 DS04 DS05 DS06-copy DS06-move --output results/matrix
+python tests/scripts/run_compute_comm.py --cases DS07-pp1 DS07-pp2 DS07-idle --output results/matrix
+# Run in the separate official vLLM 0.11 Scheduler environment:
+python tests/scripts/run_compute_comm.py --cases DS08-one-token DS08 DS08-kv-failure --output results/matrix
+python tests/scripts/run_compute_comm_e2e.py --output results/e2e
+python tests/scripts/check_distribution.py --work-dir /absolute/path/to/new-check
 ```
 
-The Native matrix saves the exact physical and memory-policy inputs before test
-cleanup. `ASTER_TEST_ROOT` can point to a frozen baseline checkout; select its
-installed package with `PYTHONPATH` when testing the old layout. Use the same
-dependencies and report filenames on both sides.
+The matrix defaults to both global compute modes. Add `--intra surrogate
+IntraSatelliteRoofline` for both intra models where supported. DS03/05/07 need the
+pinned vLLM 0.30 source and worker Python environment variables documented in
+`astermind/README.md`. No test supplies fake successful compute as native evidence.
 
-Serve an exported replay over HTTP and run the browser check with Playwright
-available in the Node module search path:
+| Case | Acceptance |
+| --- | --- |
+| DS01 | Two stars, TP2 per star, real prefill/decode, both intra models |
+| DS02 | Two independent cross-star TP2 schedulers compete for one shared Comm; solo vs concurrent |
+| DS03 | Cross-star TP2/PP2, actual pipeline sends and dependencies |
+| DS04 | Cross-star MoE EP2, seeded routing and exchanges |
+| DS05 | Two scale-up groups per star, source hierarchical collective |
+| DS06-copy/move | Real native KV partitions, import/commit, prefix reuse, source release |
+| DS07-pp1/pp2 | Original WideEP DP4/TP8/EP32 with four active replicas |
+| DS07-idle | Source unbound token ownership rejection with idle DP replicas; no fabricated output |
+| DS08-one-token/full | Original Kimi TP8/EP8 PD, bypass, all-shard decode handoff, and failed KV prevents decode |
+| E2E | 8 moving satellites, 2 grounds, 4 TP2 Cells, 6 requests, gated migration, capacity changes, fault, timeout, repeat determinism |
 
-```bash
-node tests/browser/native_replay.cjs http://127.0.0.1:8767/replay/ /absolute/path/to/browser-evidence
-```
+DS02 is deliberately a lower-level integration: the unchanged physical Builder
+assigns a satellite to one Cell, so two Cells sharing both satellites cannot be
+claimed as an accepted SimulationConfig deployment.
 
-The optional final argument `baseline` expects the documented old scene-switch
-bug; omit it for the migrated frontend. A multi-case export tests scene switching.
-The installation check also produces a real ns3 report and a `replay/` folder
-for the same browser test. It requires the Native dependencies; successful imports
-alone do not count as installed execution validation.
+Unit/module tests cover original route/cache behavior, physical data, controls,
+clock precision, prerequisites/KV rollback, collector decompositions, phase barriers,
+protocol/FEC capacity bases, directional/shared RF resources, whole-path wait/fail,
+capacity updates, cancellation, failure isolation, and no double compute/Comm charge.
+`test_cell_time_records` corrupts evidence by one tick or removes gate evidence to
+ensure the audit detects it. `test_comm_semantics` tests source intra limitations.
+
+Source differential scripts:
+
+- `probe_compute_source.py`: identical native RuntimeInputs/operator plans and
+  predictions in frozen source vs port (not the obsolete compute baseline).
+- `probe_comm_source.py`: identical unique-path resource oracle, protocol, traffic
+  and model inputs in frozen source vs port; integer ns projection can differ ≤1 ns.
+- `probe_retained_physics.py`: old target baseline vs new target, same ordered route
+  queries/cache history/faults/physical snapshots; require exact JSON equality.
+
+Build validation creates an sdist, builds a wheel from that sdist with isolated
+build dependencies, installs outside source, verifies resources/imports, builds
+native helpers, runs a real native CLI case and audits it. It also exports a
+historical report using unchanged viz. New modes have complete raw schema-2 reports;
+new-mode frontend rendering is deliberately outside scope. Historical browser checks
+use `tests/browser/native_replay.cjs` with a suitable recorded fixture.
+
+Real ISLSim remains explicit: `ORBITSERVE_ISLSIM_ROOT=/path/to/ISLSim python -m
+unittest discover -s tests/external/islsim -v`. Historical validation records in
+`V1_VALIDATION.md` describe earlier commits and must not be read as current features.
+
+WideEP fixtures disable per-allocation service dumps (`trace_service=false`) to
+avoid quadratic trace volume; operator/dependency/failure records and aggregate
+Comm statistics remain. Resource-conservation tests retain full allocation evidence.

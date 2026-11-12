@@ -35,44 +35,32 @@ class PhysicalDatasetTests(unittest.TestCase):
         cls.temporary.cleanup()
 
     def config(self, **changes):
-        raw = json.loads((ROOT / "examples/native/two_cells_ns3.json").read_text())
+        raw = json.loads((ROOT / "examples/native/two_cells.json").read_text())
         raw.update(physical_dataset=str(self.dataset), **changes)
         return SimulationConfig.model_validate(raw)
 
     def test_runtime_reuses_dataset_with_physical_engines_disabled(self):
-        from types import SimpleNamespace
-        from tests.network_case import NetworkHost
-        from astermind.engine.cell_bridge import RuntimeCellNetwork, CellTransfer
-        from astermind.engine.timeline import GlobalTimeline
+        from astermind.engine.cell_bridge import CellTransfer
 
         def execute(physical):
-            host = NetworkHost(SimpleNamespace(time_horizon_s=physical.end_s, routing_policy="earliest_arrival"), SimpleNamespace(network=physical, time=physical.trace.time))
-            host.timeline = GlobalTimeline(host=host)
-            network = RuntimeCellNetwork(host)
+            from tests.network_case import device_runtime
+            host,network=device_runtime(physical)
             try:
-                for row in physical.frames:
-                    host.push(row["time_s"], 0, "network_update")
-                for event in physical.events:
-                    host.push(event["time_s"], 0, "link_state", payload=event)
-                for at in physical.environment_times:
-                    host.push(at, 0, "topology_sample")
-                for at, index, restored, fault in physical.fault_observations():
-                    host.push(at, -2, "fault_batch", payload=((index, fault, restored),))
-                source = next(n.node_id for n in physical.nodes.values() if n.role == "ground")
-                target = next(n.node_id for n in physical.nodes.values() if n.role == "compute")
-                network.submit(CellTransfer("saved-physics", source, target, 128, 0))
+                source=next(n.node_id for n in physical.nodes.values() if n.role=='ground')
+                target=next(n.node_id for n in physical.nodes.values() if n.role=='compute')
+                network.submit(CellTransfer('saved-physics',source+':hub',target+':hub',128,0))
                 host.run()
-                self.assertEqual(len(network.events), 1)
-                self.assertEqual(network.events[0]["kind"], "completed")
-                self.assertGreater(sum(e.get("bytes_sent", 0) for e in host.log if e["kind"] == "bandwidth_update"), 0)
+                self.assertEqual(len(network.events),1)
+                self.assertEqual(network.events[0]['kind'],'completed')
+                self.assertGreater(sum(row['application_bytes'] for row in network.communication_policy.trace
+                                       if row['kind']=='service'),0)
             finally:
-                network.close()
-                host.close()
+                network.close();host.close()
 
         failure = AssertionError("runtime attempted physical recomputation")
         with patch('astermind.builder.physical.network.run_network_experiment', side_effect=failure), patch('astermind.builder.physical.network.generate_orbit_trace', side_effect=failure), patch.object(LinkProfile, "attributes", side_effect=failure), patch.object(NetworkState, "_compile", side_effect=failure), patch.object(NetworkState, "sun_separation", side_effect=failure):
             first, lifetime = load_physics(self.config())
-            second, _ = load_physics(self.config(backend="simgrid", timeline_mode="simgrid"))
+            second, _ = load_physics(self.config(compute_mode="roofline"))
             self.assertIsNone(lifetime)
             self.assertEqual(first.dataset_identity, second.dataset_identity)
             self.assertEqual(first.dataset_root, str(self.dataset))

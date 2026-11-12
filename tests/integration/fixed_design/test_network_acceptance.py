@@ -5,7 +5,6 @@ reused across every backend. Small RF capacities isolate networking invariants;
 this is a correctness case, not a vendor-throughput or orbit-accuracy benchmark.
 """
 
-import importlib.util
 import tempfile
 import unittest
 from dataclasses import replace
@@ -221,25 +220,3 @@ class NetworkAcceptanceTests(unittest.TestCase):
         edge = state.edges[0]
         self.assertNotEqual(state.distance(edge, 8.0), state.distance(edge, 9.0))
         return result
-
-    def test_queue_three_routes(self):
-        for policy in POLICIES:
-            with self.subTest(policy=policy):
-                self.verify_matrix_row("queue", policy)
-
-    def test_fluid_three_routes(self):
-        for policy in POLICIES:
-            with self.subTest(policy=policy):
-                self.verify_matrix_row("fluid", policy)
-
-    @unittest.skipUnless(importlib.util.find_spec("simgrid"), "requires native SimGrid")
-    def test_simgrid_three_routes(self):
-        for policy in POLICIES:
-            with self.subTest(policy=policy):
-                self.verify_matrix_row("simgrid", policy)
-
-    @unittest.skipUnless(importlib.util.find_spec("ns"), "requires native ns-3")
-    def test_ns3_three_routes(self):
-        for policy in POLICIES:
-            with self.subTest(policy=policy):
-                self.verify_matrix_row("ns3", policy)

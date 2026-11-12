@@ -266,8 +266,6 @@
   "schema_version": "orbitserve.native_cells.v1",
   "physical_network": "dynamic_physics.json",
   "runtime_network": {
-    "failure_policy": "retry_next_sample",
-    "max_transfer_retries": 8,
     "fault_timing": "continuous",
     "faults": [
       {
@@ -277,5 +275,10 @@
         "end_s": 0.5
       }
     ]
+  },
+  "compute_mode": "midlayer",
+  "communication": {
+    "intra_mode": "IntraSatelliteRoofline",
+    "retry_limit": 8
   }
 }

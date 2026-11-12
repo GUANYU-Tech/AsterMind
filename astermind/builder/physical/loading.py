@@ -52,7 +52,7 @@ def load_physics(config, output_dir=None):
             {
                 **concrete["network"],
                 **config.runtime_network,
-                "transport_model": config.backend,
+                "transport_model": "runtime_comm",
             }
         )
         trace = load_orbit_trace(root / "orbit_trace/trace_manifest.json")

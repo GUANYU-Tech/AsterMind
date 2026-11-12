@@ -1,62 +1,15 @@
-from types import SimpleNamespace
+"""Manual fabric controls reach the sole communication runtime."""
 import unittest
-from tests.unit.runtime.test_scoped_protobridge import graph
-from astermind.common.bootstrap import activate
-from astermind.engine.network_host import DeviceRuntimeHost, DeviceCommunicationRuntime
+from tests.unit.runtime import test_comm_port as fixtures
 from astermind.engine.device_controls import apply_device_command
-from astermind.engine.cell_bridge import CellTransfer
-
 
 class DeviceControlsTests(unittest.TestCase):
-    def test_gpu_link_fault_recovery_reaches_both_communication_solvers(self):
-        activate()
-        for mode in ("flowsim", "protobridge_cell"):
-            with self.subTest(mode=mode):
-                config = SimpleNamespace(
-                    horizon_ns=1_000_000_000,
-                    backend="flowsim",
-                    communication_mode=mode,
-                    physical_link_bindings={},
-                    runtime_network={
-                        "failure_policy": "retry_next_sample",
-                        "max_transfer_retries": 20,
-                    },
-                )
-                host = DeviceRuntimeHost(graph(), config)
-                network = DeviceCommunicationRuntime(host, host.net.topology)
-                done = []
-                network.subscribe(done.append)
-                network.submit(
-                    CellTransfer(
-                        "inflight",
-                        "a0",
-                        "a1",
-                        1000,
-                        0,
-                        origin="multi_gpu",
-                        operation="tp",
-                    )
-                )
-
-                def control(action):
-                    return apply_device_command(
-                        host, dict(action=action, target_id="a0")
-                    )
-
-                host.timeline.schedule(
-                    0.0001, -3, "test-fault", lambda: control("device_link_fail")
-                )
-                host.timeline.schedule(
-                    0.0002, -3, "test-restore", lambda: control("device_link_restore")
-                )
-                try:
-                    host.run()
-                    self.assertEqual(len(done), 1)
-                    self.assertEqual(done[0].kind, "completed")
-                    self.assertEqual(
-                        len([e for e in host.log if e["kind"] == "topology_command"]), 2
-                    )
-                    self.assertFalse(host.net.failed_device_links)
-                finally:
-                    network.close()
-                    host.close()
+    def test_invalid_command_keeps_graph_unchanged(self):
+        fixture=fixtures.CommPortTests();self.addCleanup(fixture.doCleanups)
+        host,network,comm=fixture.runtime()
+        before=host.net.revision
+        for command in ({'action':'device_link_fail','target_id':'isl'},
+                        {'action':'unsupported','target_id':'alocal'}):
+            with self.assertRaises(ValueError):apply_device_command(host,command)
+        self.assertEqual(host.net.revision,before)
+        self.assertFalse(host.net.failed_device_links)

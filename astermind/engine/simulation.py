@@ -3,7 +3,7 @@
 import time
 from dataclasses import asdict
 
-from astermind.engine.cell_bridge import bind_batch_executor
+from astermind.engine.cell_bridge import CellTransferExecutor
 from astermind.engine.cell_migration import NetworkKVMigration
 from astermind.engine.timeline import nanoseconds
 
@@ -70,6 +70,8 @@ class Simulation:
         report("bootstrap")
         self.config = config
         self.root = activate(midlayer_root)
+        from astermind.engine.compute.provenance import inputs
+        self.native_inputs = inputs(self.root,config.cells)
         self.cells = {}
         self.network = self.host = self._physics_lifetime = None
         self.topology = config.topology()
@@ -83,7 +85,7 @@ class Simulation:
         self.network = (network_factory or DeviceCommunicationRuntime)(
             self.host, self.topology
         )
-        from astermind.engine.adapters.cell_communication import RankPlacement
+        from astermind.engine.compute.placement import RankPlacement
 
         placements = tuple(
             RankPlacement(
@@ -96,26 +98,17 @@ class Simulation:
             for c in config.cells
             for p in c.placements
         )
-        from astermind.engine.adapters.network_batch_executor import NetworkBatchExecutor
-
-        self.executor = bind_batch_executor(
-            NetworkBatchExecutor, self.loop, self.network, placements
-        )
-        # Record compression changes storage only, never event order or timing.
-        # Completed native graphs and callback logs otherwise grow as Python
-        # dictionaries for the entire run, exhausting memory on large workloads.
+        from astermind.engine.compute.batch_executor import RuntimeBatchExecutor
+        self.executor = CellTransferExecutor(self.loop, self.network)
+        self.executors = {
+            cell.id: RuntimeBatchExecutor(cell.id, self.loop, self.network.communication_policy,
+                tuple(p for p in placements if p.cell_id == cell.id),
+                on_batch_boundary=self.executor.notify_batch_boundary)
+            for cell in config.cells
+        }
         from astermind.engine.record_store import CompressedRecords
-
         self.host.log = CompressedRecords()
         self.loop.events = CompressedRecords()
-        self.executor.records = CompressedRecords(
-            chunk_size=4, sealed=lambda row: row["end_time_ns"] is not None
-        )
-        policy = getattr(self.network, "communication_policy", None)
-        if policy is not None:
-            policy.records = CompressedRecords(
-                sealed=lambda row: row["end_s"] is not None or "cancelled_s" in row
-            )
         self.cells, self.requests = {}, {r.id: r for r in config.requests}
         self.state = {
             r.id: {
@@ -136,7 +129,7 @@ class Simulation:
         self._transport_serial = 0
         self._received_chunks = {r.id: set() for r in config.requests}
         self._cell_configs = {c.id: c for c in config.cells}
-        from astermind.engine.adapters.cell_storage import SessionHistoryStore
+        from astermind.engine.compute.cell_storage import SessionHistoryStore
 
         self.history = SessionHistoryStore()
         self.migrations = NetworkKVMigration(
@@ -148,7 +141,7 @@ class Simulation:
         self.cell_init_workers = self.cell_startup_policy["workers"]
         if cell_factory is None:
             # Resolve the native module graph on the owning thread first.
-            from astermind.engine.native_cell import NetworkMidlayerCell  # noqa: F401
+            from astermind.engine.compute.serving import ServingScheduler  # noqa: F401
             from astermind.engine.startup import initialize_cells
 
             self.cells = initialize_cells(
@@ -170,53 +163,36 @@ class Simulation:
         self.startup_wall_s = time.perf_counter() - startup
 
     def _native_cell(self, cell):
-        from astermind.engine.adapters.midlayer_cell import MidlayerCellConfig
-
-        from astermind.engine.native_cell import NetworkMidlayerCell
+        from astermind.engine.compute.runtime import MidlayerCellConfig
+        from astermind.engine.compute.serving import ServingScheduler
+        from astermind.engine.compute.pd_cell import PrefillDecodeCell
+        from astermind.engine.compute.deployment import validate_cell_deployment
 
         p = cell.parallel
         config = MidlayerCellConfig(
-            self.root,
-            model_file=cell.model,
-            hardware_file=cell.hardware,
-            hardware_id=cell.hardware_id,
-            max_model_len=cell.max_model_len,
-            max_batched_tokens=cell.max_batched_tokens,
-            max_requests=cell.max_requests,
-            num_kv_blocks=cell.num_kv_blocks,
-            kv_block_size_tokens=cell.kv_block_size_tokens,
-            scheduler_adapter="vllm_0_31",
-            enable_prefix_caching=cell.prefix_caching,
-            enable_expert_parallel=cell.native_expert_parallel,
-            expert_routing_seed=cell.expert_routing_seed,
-            host_launch_profile_file=cell.host_launch_profile,
-            memory_policy_file=cell.memory_policy_file,
-            watermark=cell.watermark,
-            tensor_parallel_size=p.tp,
-            pipeline_parallel_size=p.pp,
-        )
-        created = NetworkMidlayerCell.create(
-            cell.id,
-            self.loop,
-            config,
-            self._completed,
-            on_output=self._output,
-            batch_executor=self.executor,
-            history_store=self.history,
-        )
+            self.root, model_file=cell.model, hardware_file=cell.hardware,
+            hardware_id=cell.hardware_id, max_model_len=cell.max_model_len,
+            max_batched_tokens=cell.max_batched_tokens, max_requests=cell.max_requests,
+            num_kv_blocks=cell.num_kv_blocks, kv_block_size_tokens=cell.kv_block_size_tokens,
+            scheduler_adapter=cell.scheduler_adapter, enable_prefix_caching=cell.prefix_caching,
+            enable_expert_parallel=cell.expert_parallel_enabled,
+            expert_routing_seed=cell.expert_routing_seed, host_launch_profile_file=cell.host_launch_profile,
+            memory_policy_file=cell.memory_policy_file, watermark=cell.watermark,
+            tensor_parallel_size=p.tp, pipeline_parallel_size=p.pp,
+            data_parallel_size=p.dp, sequence_parallel_size=p.sp,
+            deployment=cell.deployment, execution_mode=cell.execution_mode,
+            compute_mode=self.config.compute_mode)
+        executor = self.executors[cell.id]
+        if cell.deployment == "pd_disagg":
+            created = PrefillDecodeCell(cell.id, self.loop, config, executor,
+                self._completed, self._output, self._cell_failure,
+                submit_handoff=self.executor.submit_transport)
+        else:
+            created = ServingScheduler.create(cell.id, self.loop, config, self._completed,
+                on_output=self._output, on_failure=self._cell_failure,
+                batch_executor=executor, history_store=self.history)
         try:
-            from astermind.engine.native_execution import NativeStepExecution
-
-            created.set_failure_callback(self._cell_failure)
-            created.execution = NativeStepExecution(created.execution)
-            from astermind.engine.record_store import CompressedRecords
-
-            # A load snapshot contains the native allocator's complete record
-            # prefix. Retaining every snapshot as decoded dictionaries grows
-            # quadratically as requests and decode steps accumulate.
-            created.load_history = CompressedRecords(chunk_size=4)
-            created.communication_batches = CompressedRecords(chunk_size=4)
-            created.steps = CompressedRecords(chunk_size=128)
+            validate_cell_deployment(cell, created.execution, executor.placements.values())
         except BaseException:
             created.close()
             raise
@@ -572,7 +548,7 @@ class Simulation:
                 e2e_ns=None if state["status"] != "completed" else state["completed_ns"] - state["arrival_ns"],
             )
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "status": "completed"
             if all(s["status"] == "completed" for s in self.state.values())
             and all(m["state"] == "completed" for m in self.migrations.records.values())
@@ -583,19 +559,12 @@ class Simulation:
             "request_state_events": self.request_state_events,
             "compute_completions": self.completions,
             "produced_outputs": self.outputs,
-            "cells": {
-                key: {
-                    "steps": c.steps,
-                    "load_history": c.load_history,
-                    "final_load": c.snapshot(),
-                    "execution_performance": c.execution.performance_stats(),
-                    "scheduler_runtime": asdict(c.backend.runtime_info),
-                }
-                for key, c in self.cells.items()
-            },
+            "cells": {key: cell.report() for key, cell in self.cells.items()},
             "transfers": self.executor.transfer_events,
-            "batches": self.executor.records,
-            "input_distributions": self.executor.input_distributions,
+            "batches": [row for executor in self.executors.values() for row in executor.records],
+            "input_distributions": [row for executor in self.executors.values() for row in executor.input_distributions],
+            "communication_events": self.network.communication_policy.trace,
+            "communication_runtime_stats": self.network.communication_policy.stats,
             "migrations": self.migrations.records,
             "network": self.network.snapshot(),
             "event_log": self.loop.events,
@@ -611,10 +580,13 @@ class Simulation:
             },
             "provenance": {
                 "midlayer_root": str(self.root),
-                "communication": self.config.backend,
-                "communication_mode": self.config.communication_mode,
-                "timeline_mode": self.config.timeline_mode,
-                "timeline_authority": "simgrid_engine" if self.config.timeline_mode == 'simgrid' else "orbitserve_runtime",
+                "communication": "runtime_comm",
+                "compute_mode": self.config.compute_mode,
+                "compute_modes": {c.id: self.config.compute_mode for c in self.config.cells},
+                "native_inputs": self.native_inputs,
+                "source_commit": "9c08c9cad81df5a4fee5e606114753df8dab6c2d",
+                "timeline_mode": "orbitserve",
+                "timeline_authority": "integer_ticks",
                 "graph_backends": {c.id: c.graph_backend for c in self.config.cells},
                 "network_model": "orbitserve_dynamic_device_graph",
                 "accuracy": "integration tests; no new hardware accuracy claim",

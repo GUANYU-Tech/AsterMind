@@ -67,7 +67,8 @@ def main():
                         "configuration": config.model_dump(),
                         "requests": simulation.state,
                         "transfers": simulation.executor.transfer_events,
-                        "batches": simulation.executor.records,
+                        "batches": [row for executor in simulation.executors.values() for row in executor.records],
+                        "communication_events": simulation.network.communication_policy.trace,
                         "migrations": simulation.migrations.records,
                         "network": simulation.network.snapshot(),
                     }

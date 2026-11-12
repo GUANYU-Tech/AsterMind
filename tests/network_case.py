@@ -93,7 +93,7 @@ def _network():
         communication_topology="explicit",
         ground_roles=(),
         fault_timing="continuous",
-        transport_model="queue",
+        transport_model="runtime_comm",
         explicit_pairs=(
             ("sat-a", "sat-b"),
             ("gateway-0", "sat-a"),
@@ -210,3 +210,31 @@ def run_traffic(spec):
     host.transfer_jobs = list(host.service_jobs.values())
     host.completed = sum(job.get("completed", False) for job in host.transfer_jobs)
     return host
+
+
+def device_runtime(physical):
+    """Use actual retained physics with a synthetic public device deployment."""
+    from astermind.builder.models import Scenario
+    from astermind.builder.topology import PhysicalTopology
+    from astermind.engine.network_host import DeviceRuntimeHost,DeviceCommunicationRuntime
+    from astermind.engine.comm.frame_surrogate import CommPolicy
+    from astermind.engine.timeline import nanoseconds
+    owners=list(physical.nodes)
+    devices=[dict(id=f'{owner}:hub',satellite=owner,kind='switch') for owner in owners]
+    links=[];bindings={}
+    for index,edge in enumerate(physical.edges):
+        terminals=[]
+        for side,owner in enumerate((edge['endpoint_a'],edge['endpoint_b'])):
+            terminal=f'edge{index}-{side}'
+            terminals.append(terminal)
+            devices.append(dict(id=terminal,satellite=owner,kind='terminal',external_access=True))
+            links.append(dict(id=terminal+'-access',source=owner+':hub',target=terminal,bandwidth_gbps=100000))
+        identity=f'physical-{index}'
+        links.append(dict(id=identity,source=terminals[0],target=terminals[1],bandwidth_gbps=100))
+        bindings[identity]=edge['link_id']
+    graph=PhysicalTopology(Scenario.model_validate(dict(cells=[dict(id='resources',satellites=owners)],
+        satellites=[dict(id=owner) for owner in owners],devices=devices,links=links,dynamic_external=True)))
+    config=SimpleNamespace(horizon_ns=nanoseconds(physical.end_s),physical_link_bindings=bindings,
+        runtime_network={},communication=CommPolicy(runtime_protocol='payload_only',inter_parameters=dict(startup_us=0)))
+    host=DeviceRuntimeHost(graph,config,physical)
+    return host,DeviceCommunicationRuntime(host,graph)

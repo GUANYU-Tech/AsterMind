@@ -1,6 +1,5 @@
 """Boundary interventions execute on the real engine across transport backends."""
 
-import importlib.util
 import unittest
 from unittest.mock import patch
 from dataclasses import replace
@@ -13,7 +12,7 @@ from astermind.engine.state.interventions import apply_topology_command
 from tests.unit.runtime.test_dynamic_network import network
 
 
-def scenario(mode='queue', faults=(), edges=None, setup=0, terminals=4):
+def scenario(mode='runtime_comm', faults=(), edges=None, setup=0, terminals=4):
     base = network(edges=edges or (('a','b',0.,240.),('b','c',0.,240.),('a','d',0.,240.),('d','c',0.,240.)),
                    bandwidth=8000., setup=setup, terminals=terminals)
     trace = base.trace
@@ -39,24 +38,6 @@ def job(engine, identity):
 
 
 class BoundaryControlTests(unittest.TestCase):
-    @unittest.skipUnless(importlib.util.find_spec('simgrid'), 'requires native SimGrid')
-    def test_native_extension_keeps_zero_capacity_work_suspended(self):
-        engine=scenario('simgrid')
-        transport=engine.transport
-        leg=dict(link_id='communication_isl:a:b',source_node_id='a',target_node_id='b')
-        key=transport.resource(leg)
-        try:
-            transport.configure({key:8000.})
-            transport.start('suspended',leg,8000.)
-            self.assertAlmostEqual(transport.advance_until(1.)['bytes_sent']['suspended'],1000.,places=5)
-            transport.configure({key:0.})
-            self.assertEqual(transport.advance_until(2.)['bytes_sent']['suspended'],0.)
-            transport.register_edge(dict(link_id='communication_isl:a:c',endpoint_a='a',endpoint_b='c',kind='communication_isl'))
-            self.assertEqual(transport.advance_until(3.)['bytes_sent']['suspended'],0.)
-            transport.configure({key:8000.})
-            self.assertAlmostEqual(transport.advance_until(4.)['bytes_sent']['suspended'],1000.,places=5)
-        finally:
-            transport.close()
 
     def test_malformed_commands_do_not_mutate_runtime(self):
         engine=scenario()
@@ -67,22 +48,6 @@ class BoundaryControlTests(unittest.TestCase):
         self.assertEqual(engine.net.revision,0)
         self.assertFalse(engine.net.active_faults)
 
-    def test_boundary_fault_retries_at_same_boundary_for_all_available_backends(self):
-        for mode, module in [('queue',None),('fluid',None),('simgrid','simgrid'),('ns3','ns')]:
-            if module and not importlib.util.find_spec(module):
-                continue
-            with self.subTest(mode=mode):
-                fault = dict(target_type='link', target_id='communication_isl:a:b', start_s=60., end_s=180.)
-                engine = scenario(mode, (fault,))
-                request = job(engine, 'r')
-                engine.send(request,'a','c',80000.,None,'input','delivered')
-                engine.push(60.,-2,'fault_start',None,(0,fault))
-                engine.push(180.,-2,'fault_end',None,(0,fault))
-                engine.run()
-                recovery = next(e for e in engine.log if e['kind']=='route_recovery')
-                self.assertEqual(recovery['time_s'],60.)
-                self.assertNotIn('failure',request)
-                self.assertTrue(any(p['target_node_id']=='d' for p in request['path']))
 
     def test_nonboundary_fault_is_rejected(self):
         with self.assertRaisesRegex(ValueError, '时间片边界'):
@@ -121,27 +86,6 @@ class BoundaryControlTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'不可见'):
             apply_topology_command(engine,dict(action='connect',endpoint_a='a',endpoint_b='c'))
 
-    def test_new_native_link_preserves_active_transfer_progress(self):
-        for mode,module in [('queue',None),('fluid',None),('simgrid','simgrid'),('ns3','ns')]:
-            if module and not importlib.util.find_spec(module):
-                continue
-            with self.subTest(mode=mode):
-                engine=scenario(mode)
-                first=job(engine,'existing')
-                engine.send(first,'a','b',100000.,None,'input','delivered')
-                result=[]
-                def connect(unused,payload):
-                    result.append(apply_topology_command(engine,dict(action='connect',endpoint_a='a',endpoint_b='c')))
-                    second=job(engine,'new')
-                    engine.send(second,'a','c',1000.,None,'input','delivered')
-                engine.on_test_connect=connect
-                engine.push(60.,5,'test_connect')
-                engine.run()
-                self.assertEqual(result[0]['message'],'连接成功')
-                self.assertNotIn('failure',first)
-                self.assertNotIn('failure',engine.jobs['new'])
-                sent=sum(s['bytes'] for p in first['path'] for s in p['segments'])
-                self.assertAlmostEqual(sent,100000.,places=3)
 
     def test_runtime_random_models_reproducible_and_boundary_aligned(self):
         engine=scenario()

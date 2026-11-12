@@ -3,77 +3,14 @@
 import unittest
 from astermind.engine.clock import CLOCK, Time
 from astermind.engine.timeline import GlobalTimeline
-from astermind.engine.flowsim_transport import FlowSimTransport
-from astermind.engine.setup.network_spec import NetworkNodeSpec
 from astermind.engine.service_precision import bandwidth_check
 from astermind.engine.clock_audit import clock_checks
 
 
 class UnifiedClockTests(unittest.TestCase):
-    def test_thousand_simultaneous_flows_share_capacity_and_complete_together(self):
-        engine, leg = self.transport()
-        for index in range(1000):
-            engine.start(str(index), leg, 4)
-        response = engine.advance_until(1)
-        self.assertEqual(len(response['completed']), 1000)
-        self.assertEqual(set(response['bytes_sent'].values()), {4.})
-        self.assertEqual(engine.now.ticks, 160000000000)
-        for resource in response['resources']:
-            self.assertLessEqual(resource['allocated_bandwidth_bps'], resource['capacity_bps'])
 
-    def transport(self):
-        nodes = {name: NetworkNodeSpec(name, "compute") for name in ("a", "b")}
-        engine = FlowSimTransport(
-            nodes, [dict(link_id="ab", endpoint_a="a", endpoint_b="b")], {}
-        )
-        self.addCleanup(engine.close)
-        leg = dict(link_id="ab", source_node_id="a", target_node_id="b")
-        engine.configure({engine.resource(leg): 200e9})
-        return engine, leg
 
-    def test_large_origin_has_exact_same_service_and_does_not_merge_events(self):
-        durations = []
-        for origin in (0, 8.659443882295493, 1000000000):
-            engine, leg = self.transport()
-            engine.advance_until(origin)
-            first = engine.now
-            engine.start("four-bytes", leg, 4)
-            response = engine.advance_until(first + 1)
-            durations.append(engine.now.ticks - first.ticks)
-            self.assertEqual(response["bytes_sent"]["four-bytes"], 4)
-            self.assertEqual(response["allocated_rates_bps"]["four-bytes"], 200e9)
-            loop = GlobalTimeline(start_s=first)
-            observed = []
-            loop.schedule(
-                engine.now, 0, "first", lambda: observed.append(loop.now_s.ticks)
-            )
-            loop.schedule(
-                engine.now + 1e-18,
-                0,
-                "second",
-                lambda: observed.append(loop.now_s.ticks),
-            )
-            loop.run()
-            self.assertEqual(observed[1] - observed[0], 1)
-        self.assertEqual(durations, [160000000] * 3)
 
-    def test_shared_capacity_and_conservation_under_staggered_arrivals(self):
-        engine, leg = self.transport()
-        total = {}
-        engine.start("a", leg, 4)
-        response = engine.advance_until(Time(".00000000008"))
-        total["a"] = response["bytes_sent"]["a"]
-        engine.start("b", leg, 4)
-        while engine.active:
-            response = engine.advance_until(1)
-            for row in response["resources"]:
-                self.assertLessEqual(
-                    row["allocated_bandwidth_bps"], row["capacity_bps"]
-                )
-            for key, value in response["bytes_sent"].items():
-                total[key] = total.get(key, 0) + value
-        self.assertEqual(total, {"a": 4, "b": 4})
-        self.assertEqual(engine.now.ticks, 320000000)
 
     def test_same_time_priority_and_sequence_and_past_rejection(self):
         loop = GlobalTimeline(start_s=8)

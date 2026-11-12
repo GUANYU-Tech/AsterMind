@@ -17,17 +17,17 @@ class NativeEntryTests(unittest.TestCase):
     def scene(self):
         return json.loads((ROOT / "examples/native/two_cells.json").read_text())
 
-    def test_schema_defaults_remain_distinct(self):
+    def test_both_schema_spellings_select_the_same_comm_runtime(self):
         for version, expected in (
-            (1, "flowsim"),
-            ("orbitserve.native_cells.v1", "protobridge_cell"),
+            (1, "runtime"),
+            ("orbitserve.native_cells.v1", "runtime"),
         ):
             with self.subTest(version=version):
                 value = self.scene()
                 value["schema_version"] = version
                 value.pop("communication_mode", None)
                 self.assertEqual(
-                    SimulationConfig.model_validate(value).communication_mode, expected
+                    SimulationConfig.model_validate(value).communication.execution, expected
                 )
 
     def test_removed_fields_are_rejected_even_when_empty(self):

@@ -23,8 +23,6 @@ class DeviceNetworkState(NetworkState):
         *,
         physical=None,
         bindings=None,
-        failure_policy="fail",
-        max_transfer_retries=0,
         ground_owners=(),
     ):
         self.topology, self.physical = topology, physical
@@ -167,8 +165,6 @@ class DeviceNetworkState(NetworkState):
                 "nodes": tuple(self.nodes.values()),
                 "transport_model": backend,
                 "link_profiles": profiles,
-                "failure_policy": failure_policy,
-                "max_transfer_retries": max_transfer_retries,
                 "fault_timing": getattr(base, "fault_timing", "continuous"),
             }
         )

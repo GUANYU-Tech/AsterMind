@@ -789,11 +789,8 @@ class NetworkState:
                     bandwidth /= 1 + self.shared_load.get((link_id, source, target), 0)
                     bandwidth = min([bandwidth] + [self.pool_capacities[k] /
                                     (1 + self.shared_pool_load.get(k, 0)) for k in pools])
-                    if self.spec.transport_model == 'ns3' and payload_bytes > 0 and edge['kind'] != 'device_gate':
-                        # Native P2P uses 1400-byte payload packets plus 2-byte PPP.
-                        bandwidth *= payload_bytes / (math.ceil(payload_bytes / 1400) * 2 + math.ceil(payload_bytes))
                 duration = (remaining / bandwidth) if bandwidth > 0 else math.inf
-                finish = min(cursor + duration, stop)
+                finish = stop if not math.isfinite(duration) else min(cursor + duration, stop)
                 complete = bandwidth > 0 and duration <= stop - cursor
                 sent = (
                     remaining

@@ -1,11 +1,12 @@
 """Select one immutable M-L snapshot before any native imports."""
 
 import os
+import json
 import sys
 from pathlib import Path
 
 WORKSPACE = Path(__file__).resolve().parents[2]
-DEFAULT_ML = WORKSPACE / "third_party/midlayer-6fe5734-canonical"
+DEFAULT_ML = WORKSPACE / "astermind/engine/compute/upstream"
 
 
 def activate(root=None):
@@ -16,6 +17,10 @@ def activate(root=None):
     ).resolve()
     if not (root / "src/serving/execution.py").is_file():
         raise ValueError(f"Missing M-L snapshot: {root}")
+    marker=root/'.orbitserve_snapshot.json'
+    expected='2e66b9c300efce1d80de158bd519e00e6e95ec797c9262a14b94cf3a25ae251e'
+    if not marker.is_file() or json.loads(marker.read_text()).get('source_config_tree_sha256')!=expected:
+        raise ValueError('Use the pinned Communication_backend native snapshot; old compute snapshots are retired')
     if "src.kernel.hardware_spec" in sys.modules:
         loaded = (
             Path(sys.modules["src.kernel.hardware_spec"].__file__).resolve().parents[2]

@@ -351,5 +351,9 @@
       "output_bytes_per_token": 10000
     }
   ],
-  "horizon_ns": 1000000000
+  "horizon_ns": 1000000000,
+  "compute_mode": "midlayer",
+  "communication": {
+    "intra_mode": "IntraSatelliteRoofline"
+  }
 }

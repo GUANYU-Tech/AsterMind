@@ -311,3 +311,96 @@ Run the baseline comparison from the repository root with:
 ```bash
 python -m tests.scripts.compare_prerequisites BEFORE_DIR AFTER_DIR
 ```
+
+## Compute / Comm replacement (2026-11-13)
+
+This section supersedes earlier transport/compute descriptions. Target baseline:
+`1c15450cb3f89ad6eec7bfbf23f2a49a9910f939`; imported source:
+`Communication_backend` `9c08c9cad81df5a4fee5e606114753df8dab6c2d`.
+The current branch remains `version/AsterMind-V1.0`.
+
+Scope: replace old compute and all old communication execution modes with source
+Midlayer/Roofline (global choice), source-supported DP/WideEP/PD and RuntimeCommunication.
+Retain target Builder/Engine, request assignment/prerequisites, route/cache policy,
+physical/orbit/dynamic links and integer attosecond clock. `viz/` has no changes;
+new modes output complete raw schema-2 reports only.
+
+Source preservation: 3,624 mapped files, 3,605 byte-identical and 19 boundary-adapted
+files, verified against the frozen source. The native algorithms, profiles and
+calibrations are untouched. The sole native snapshot edit retains parent PYTHONPATH
+in the 0.30 subprocess launcher, fixing host Time unpickling after installation
+outside a source checkout. Original vendor license/provenance files remain present.
+Source and target hashes plus adaptations are in `engine/compute/SOURCE.json`.
+
+Validation completed:
+
+- 418 module/unit/integration/smoke tests pass, no skips (`retained-418.log`).
+  This includes exact-tick corruption/missing-evidence checks, configured request
+  prerequisites, resource capacity/protocol accounting, temporal-path failure,
+  fault recovery, cancellation and all-shard migration commit barriers.
+- Generated/imported workload requests also pass an explicit real native test:
+  all four request identities survive generation/CSV import and complete.
+- Source-vs-port compute: 12 equal operator-plan hashes and 9,576 exactly equal
+  local predictions, across prefill/decode, TP/PP/EP and both compute modes.
+- Source-vs-port Comm: 24 identical path/resource/protocol oracle cases pass.
+  Completion projection differs by at most 1 ns; operation/phase/flow/byte semantics
+  match. This projection tolerance does not permit changing routing or input data.
+- Retained route/physical regression: 144 ordered queries under all three route
+  policies, including caches, capacity schedules and faults, produce byte-identical
+  JSON before/after. Zero-capacity Time+infinity is guarded without changing route
+  costs, candidate search, cache or policy selection; a new regression checks that
+  such a candidate cannot invalidate a reachable alternative.
+- Native DS01–06 and DS08: 24 distinct cases pass, including both intra predictors,
+  cross-star TP/PP/EP, independent Cell competition, hierarchical SU collectives,
+  real KV copy/move/prefix reuse, PD one-token bypass/full handoff and failed KV
+  preventing Decode. DS02 is lower-level integration because the unchanged physical
+  Builder does not allow two Cells to own the same satellite.
+- Full-platform E2E: both compute modes × normal/repeat/fault/timeout = 8 cases.
+  Each normal case has 8 moving satellites, 2 grounds, 4 TP2 Cells and 6 requests,
+  10,590 compute calls, 814 communications and 20 request/KV transfers. Repeats
+  have exactly equal simulated records. Fault cases verify injection/restoration;
+  timeout cases fail explicitly and release communication resources.
+- WideEP DS07: all 6 cases pass. PP1 uses 32 GPUs and executes 103,680 kernels,
+  1,872 communications and 239,926 dependencies in each compute mode. PP2 uses
+  64 GPUs and executes 103,296 kernels, 2,608 communications and 240,076 dependencies.
+  Both idle-replica cases fail explicitly before prediction output, matching the
+  original source's unbound token-ownership error. Source probes reproduce this
+  error in both modes; their pending-step cleanup diagnostics are not counted as
+  successful end-to-end execution. In total, 30 matrix cases plus 8 E2E cases pass.
+- Distribution: sdist→wheel→outside-source install, 133 imported modules and pinned
+  resources verified, both native helpers built, actual 0.31 and 0.30 CLI runs and
+  audits pass. Build dependencies are isolated from Scheduler environments.
+- Historical frontend: unchanged assets export correctly; browser smoke loads two
+  recorded calls, switches details, opens device details and reloads with no JS or
+  HTTP errors. Desktop/mobile screenshots retained. This is historical-schema
+  compatibility, not a claim that new DP/PD reports render in the old frontend.
+- Independent different-model compute and Comm reviews completed. Required issues
+  were fixed and reviewed again. Undefined-name/shadowing Ruff checks and Git
+  whitespace checks on host/adapted files pass. The staged full-tree check reports
+  inherited whitespace in 17 byte-identical upstream files; each staged blob was
+  verified against its pinned source hash and retained without formatting changes.
+  Untouched source unused-import warnings are also retained.
+
+Environment: Python 3.12; official vLLM 0.31 package identity is verified by the
+shipped adapter. vLLM 0.30 source is pinned to
+`ced6857afa0ea7b2e3f0846a62e1394e90f15607` and uses the configured CPU worker Python.
+PD uses a separate official vLLM 0.11 installation with Transformers 4.57.6,
+Tokenizers 0.22.2 and Hugging Face Hub 0.36.2, sharing the tested CPU Torch/runtime
+libraries. The original complete 0.11 CPU lock installation could not fetch from
+its PyTorch endpoint because of a certificate hostname mismatch; TLS verification
+was not disabled. The verified environment is a CPU Scheduler simulation setup,
+not a fully resolved GPU/HTTP serving stack.
+
+Preserved upstream boundaries: WideEP idle-replica token ownership may be rejected;
+PD/layout/model restrictions remain explicit; star-local whole-operation predictions
+have neither global contention nor mid-flight repricing. Cross-star execution is
+whole-path, with no store-and-forward. Trace-heavy WideEP fixtures disable detailed
+allocation dumps while retaining operator/dependency records and aggregate Comm
+statistics; dedicated conservation cases keep full trace evidence. Hardware-model
+accuracy is separate from these integration and differential correctness checks.
+
+Evidence on SeeSpace1 is under
+`/data1/guolidong/.astermind-compute-comm-20261113/`, including `results/`, frozen
+archives, `distribution-complete/` and `browser-evidence/`. Commands and scenario
+coverage are maintained in `tests/README.md`. No generated native binary or raw
+result artifact is committed; this iteration is committed locally without a push.

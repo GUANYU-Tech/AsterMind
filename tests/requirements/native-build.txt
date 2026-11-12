@@ -1,5 +1,2 @@
-# SimGrid 4.1's Python bindings are incompatible with newer property call_guard checks.
-# Keep this in the isolated build environment; do not disable pip build isolation.
-pybind11==2.13.6
-# Includes the Windows legacy-wheel path validation fix (GHSA-xmj3-9gf7-h52w).
+# Build-only requirement; isolated from native Scheduler environments.
 setuptools>=84.1.0

@@ -57,6 +57,7 @@ def expand_presets(physical):
 
 def compile_topology(config):
     physical = expand_presets(config.physical)
+    hierarchies = physical.pop("intra_hierarchies", {})
     physical["dynamic_external"] = bool(
         config.physical_dataset or config.physical_network
     )
@@ -67,6 +68,22 @@ def compile_topology(config):
         else "declared_static_resources"
     }
     topology.orbit_grid = None
+    from astermind.engine.comm.intra_hierarchy import IntraHierarchy
+    topology.intra_hierarchies = {}
+    for owner, raw in hierarchies.items():
+        if owner not in topology.satellites:
+            raise ValueError("unknown intra hierarchy owner")
+        hierarchy = IntraHierarchy.model_validate(raw)
+        for group in hierarchy.su_groups:
+            for identifier in group:
+                device = topology.devices.get(identifier)
+                if device is None or device.kind != "gpu" or device.satellite != owner:
+                    raise ValueError("intra hierarchy GPU belongs to another owner or is missing")
+        for identifier in hierarchy.su_switches:
+            device = topology.devices.get(identifier)
+            if device is None or device.kind != "switch" or device.satellite != owner:
+                raise ValueError("intra hierarchy switch belongs to another owner or is missing")
+        topology.intra_hierarchies[owner] = hierarchy.model_dump()
     ground = set(config.ground_owners)
     if not ground <= set(topology.satellites):
         raise ValueError("unknown ground owner")
@@ -90,8 +107,6 @@ def compile_topology(config):
                 f"satellite {satellite}: role does not match external access"
             )
     for cell in config.cells:
-        if any(p.pool != "main" for p in cell.placements):
-            raise ValueError("first serving entry point requires the main pool")
         for placement in cell.placements:
             if placement.device in gpu_devices:
                 raise ValueError("two Cells cannot occupy the same physical GPU")
@@ -118,6 +133,8 @@ def compile_topology(config):
                 "first serving entry point delivers input to first-stage rank zero"
             )
         output_rank = cell.parallel.tp * (cell.parallel.pp - 1)
+        if cell.deployment == "pd_disagg":
+            output_rank += cell.parallel.workers
         if cell.output_device != placement_by_rank[output_rank]:
             raise ValueError(
                 "Cell output must originate at the final pipeline stage leader"

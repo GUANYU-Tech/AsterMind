@@ -1,6 +1,5 @@
-"""Real ISLSim budgets feed every transport backend, without formula patches."""
+"""Real ISLSim budgets feed the shared Comm, without formula patches."""
 from dataclasses import replace
-import importlib.util
 import json
 from pathlib import Path
 import tempfile
@@ -37,14 +36,7 @@ class ISLSimRuntimeTests(unittest.TestCase):
                 if 'cancelled_at_s' not in leg:
                     self.assertAlmostEqual(leg['propagation_delay_s'], leg['distance_km'] / 299792.458)
 
-    def test_queue_uses_real_islsim(self): self.verify_backend('queue')
-    def test_fluid_uses_real_islsim(self): self.verify_backend('fluid')
-
-    @unittest.skipUnless(importlib.util.find_spec('simgrid'), 'requires native SimGrid')
-    def test_simgrid_uses_real_islsim(self): self.verify_backend('simgrid')
-
-    @unittest.skipUnless(importlib.util.find_spec('ns'), 'requires native ns-3')
-    def test_ns3_uses_real_islsim(self): self.verify_backend('ns3')
+    def test_runtime_comm_uses_real_islsim(self): self.verify_backend('runtime_comm')
 
     def test_default_experiment_freezes_native_input_and_rejects_other_model_dataset(self):
         original = manifest()

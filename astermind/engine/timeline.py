@@ -185,7 +185,7 @@ class GlobalTimeline:
 
     def report(self) -> dict[str, Any]:
         return {
-            'clock': self._host.transport_provenance.get('clock', CLOCK) if self._host is not None else CLOCK,
+            'clock': CLOCK,
             'time_ticks': str(self.now_s.ticks),
             "time_s": self.now_s,
             "handled_events": len(self.events),

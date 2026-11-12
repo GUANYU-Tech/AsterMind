@@ -1,0 +1,57 @@
+# User-authorized analytical scenario; original hardware configuration remains separately versioned.
+hardware_id: nvidia_rtx_pro_5500
+clock_domains: {}
+components:
+- name: tensor_bf16
+  count: 1
+  type: compute
+  role: compute_tensor
+  scope: shared
+  capacity_per_second: 187390000000000.0
+- name: tensor_fp16
+  count: 1
+  type: compute
+  role: compute_tensor_fp16
+  scope: shared
+  capacity_per_second: 187390000000000.0
+- name: tensor_fp8
+  count: 1
+  type: compute
+  role: compute_tensor_fp8
+  scope: shared
+  capacity_per_second: 374850000000000.0
+- name: tensor_int8
+  count: 1
+  type: compute
+  role: compute_tensor_int8
+  scope: shared
+  capacity_per_second: 374850000000000.0
+- name: dram
+  count: 1
+  type: memory
+  role: dram
+  scope: shared
+  capacity_per_second: 978599999999.9999
+  size_bytes: 84000000000
+- name: tensor_fp4
+  type: compute
+  role: compute_tensor_fp4
+  scope: shared
+  count: 1
+  capacity_per_second: 749700000000000.0
+resource_groups: []
+memory_subsystem: {}
+scheduling: {}
+interconnect:
+  roce_unidir_bw_GB_s: 50
+  roce_devices_per_nic: 2
+  roce_switch_topology: fully_connected
+  roce_signal_latency_ns: null
+  roce_collective_startup_ns: 50000
+  parameter_source: user_20261104_direct_switch_collective_startup_50us
+  pcie_bw_bytes_s: 63015384615.38461
+features:
+  kernel_memory_model: roofline
+  kernel_dtype: bf16
+  parameter_source: user_20261104_all_matrix_FP4_RTX_denseFP4_1071T_compute70_bandwidth70_PCIe5x16
+  gpu_vector_memory_only: true

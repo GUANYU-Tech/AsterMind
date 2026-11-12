@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=84.1.0", "pybind11>=2.13,<4"]
+requires = ["setuptools>=84.1.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -16,10 +16,6 @@ dependencies = [
   "pydantic>=2.7,<3",
 ]
 
-[project.optional-dependencies]
-simgrid = ["simgrid==4.1"]
-ns3 = ["ns3==3.44.post0"]
-
 [tool.setuptools]
 include-package-data = false
 
@@ -32,7 +28,8 @@ namespaces = false
 "viz" = ["*.html", "*.css", "*.js"]
 "examples.native" = ["*.json"]
 "workloads.main_composite_chat" = ["countries.csv", "gateways.json", "profiles/*.csv", "profiles/*.json"]
-"astermind.engine.adapters" = ["runtime/*.json", "requirements-scheduler-latest.lock", "patches/*.patch", "*.patch"]
+"astermind.engine.compute" = ["SOURCE.json", "scheduler_runtime/*", "upstream/**/*", "upstream/.orbitserve_snapshot.json"]
+"astermind.engine.comm" = ["native_allocator.cc", "_vendor/**/*"]
 "astermind.builder.orbit" = [
   "data/iers/0.2026.5.11.1.8.52/*",
   "data/stk_validation/*.json",

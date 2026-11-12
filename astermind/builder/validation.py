@@ -8,11 +8,6 @@ def validate_scene_config(value):
     from astermind.engine.network_host import DeviceRuntimeHost
 
     config = SimulationConfig.model_validate(value)
-    if config.backend not in {"flowsim", "simgrid"}:
-        raise ValueError("此场景入口要求 Cell 外部通信使用 FlowSim 或 SimGrid")
-    if config.backend == 'simgrid':
-        from astermind.engine.simgrid_transport import require_simgrid
-        require_simgrid()
     if not config.requests:
         raise ValueError("请添加至少一个业务请求")
     if any(r.arrival_ns >= config.horizon_ns for r in config.requests):

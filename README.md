@@ -1,6 +1,6 @@
 # OrbitServe
 
-OrbitServe is a simulation platform for LEO compute constellations serving global terrestrial AI inference demand. Each run evaluates one fixed SimulationConfig with Mid-Layer computation and physical communication. DSE and the former Analytical request engine are removed.
+OrbitServe is a simulation platform for LEO compute constellations serving global terrestrial AI inference demand. Each run evaluates one fixed SimulationConfig with globally selected Midlayer or Roofline computation and physical communication. DSE and the former Analytical request engine are removed.
 
 ## Repository Layout
 
@@ -11,7 +11,8 @@ astermind/
     topology/   Device/Cell graph validation and native topology compilation
     physical/   Physical datasets, precomputation, loading and exports
   engine/       Simulation, clocks, transport, routing, faults, Cell/KV execution
-    adapters/   Mid-Layer Cells and official vLLM Scheduler adapters
+    compute/    Pinned upstream compute snapshot and official vLLM Scheduler adapters
+    comm/       Pinned upstream communication models and shared flow allocator
     setup/      Network specifications and runtime resource setup
     state/      Live network state, physical data access and caches
   workload/     Canonical workload contracts, loading and materialization
@@ -44,7 +45,7 @@ astermind.experiments.cli
   -> Simulation
   -> physical_network preparation OR verified physical_dataset reuse
   -> explicit device topology and Cell placements
-  -> Mid-Layer/vLLM computation + shared Runtime transport events
+  -> Midlayer/Roofline + vLLM scheduling + shared Comm events
   -> Native requests, metrics, provenance and audit
 ```
 
@@ -82,16 +83,16 @@ Dataset-specific adapters live under `workloads/<dataset>/`. Native simulations 
 ## Running Examples
 
 ```bash
-python -m astermind.experiments.cli examples/native/two_cells_ns3.json \
-  --midlayer-root /path/to/midlayer --out results/cells/ns3.json
-python -m astermind.experiments.cli examples/native/dynamic_tp2_pp2.json \
-  --midlayer-root /path/to/midlayer --out results/cells/cross.json --full
+python -m astermind.common.build_native
+python -m astermind.experiments.cli examples/native/two_cells.json --out results/cells/basic.json --full
 ```
 
 The CLI accepts numeric schema `1` and `orbitserve.native_cells.v1` through
-SimulationConfig. Their existing communication defaults remain `flowsim` and
-`protobridge_cell`, respectively. Summary mode writes `*.artifacts/native_result.json`;
-`--full` writes the complete result. `--artifact-dir` and `--midlayer-root` are retained.
+SimulationConfig. Both use the same Comm execution path. Set global
+`compute_mode` to `midlayer` (default) or `roofline`; individual Cells cannot
+choose a different compute model. Summary mode writes
+`*.artifacts/native_result.json`; `--full` writes the complete raw report.
+See [native setup and contracts](astermind/README.md) before running.
 
 ## Physical Network Model
 
@@ -256,121 +257,44 @@ datasets before running with ISLSim; selecting another link model also requires
 matching physical data. This adapter verifies consistency with upstream results,
 not independent calibration of ISLSim's physical assumptions or formulas.
 
-Native transport is selected by `SimulationConfig.backend` (`flowsim`, `simgrid` or `ns3`). The independent physical/network tools also expose `queue` and `fluid`:
+### Compute and communication execution
 
-| Value | Execution and contention |
-| --- | --- |
-| `queue` | Whole-message store-and-forward; one transmission occupies a link direction and later messages queue. |
-| `fluid` | OrbitServe equal-share fluid service; arrivals, completions and capacity changes update the shares of active flows. |
-| `flowsim` (default) | AsterMind FlowSim provides max-min sharing of directed hops and aggregate RF pools; OrbitServe drives network state and the event clock. |
-| `simgrid` | Real SimGrid 4.1 CM02 activities share each directed physical hop; native activity completion drives the Runtime event queue. |
-| `ns3` | Real ns-3 point-to-point serialization with 1400-byte payload packets, 2-byte PPP overhead and packet round-robin admission. |
+The source compute snapshot and communication implementation are transplanted
+from `Communication_backend` commit `9c08c9cad81df5a4fee5e606114753df8dab6c2d`.
+[Source mappings and hashes](astermind/engine/compute/SOURCE.json) identify each
+imported file. The native Midlayer snapshot, hardware profiles and calibration
+data are bundled; build its original LRU helper and the extracted native
+progressive-filling allocator with `python -m astermind.common.build_native`.
+Scheduler environments remain explicit native dependencies.
 
-The default FlowSim backend requires the shared-runtime `_flowsim` extension
-from a separately prepared AsterMind checkout. Install that checkout into the
-same Python environment (`python -m pip install -e /path/to/astermind`) for
-the compatible extension. On the configured
-workstation, `third_party/astermind` holds the modified local checkout; it and
-the root workstation-only build adapter are ignored by Git and are not supplied
-by an OrbitServe checkout. Prepare that dependency before selecting FlowSim.
-An older `_flowsim` fails explicitly.
-The native shared `advance_until()` must also guard positive residual-byte
-completion times that round back to the current native clock, using the next
-representable native time as its standalone `run()` loop already does. The
-FlowSim fractional-tail regression checks this requirement. The workstation
-source fix remains in the ignored AsterMind checkout and must be carried with
-that external dependency when preparing another environment.
-OrbitServe supplies candidate links and updates capacity at runtime; FlowSim
-retains in-flight bytes during capacity changes and shares each directed hop
-and applicable RF pools across all flows. OrbitServe handles per-hop routing,
-propagation, network visibility, and link recovery. New candidate edges added
-after the simulation begins are not yet supported by this backend. A lost
-contact follows OrbitServe's existing interrupted-hop policy: partial bytes on
-that hop are discarded on retry, while completed hops are retained.
+Comm owns active transfers, shared external link/RF resources, protocol budgets,
+retries and completion callbacks on the existing integer attosecond timeline.
+The retained network owns route selection/cache, SGP4 positions, physical link
+supply and topology updates. No source routing policy is imported.
 
-### Native Cells from Merge_ML_Version
+The selected path must be available end to end at one time. There is no
+intermediate store-and-forward. Infeasible temporal paths wait, then fail at a
+configured timeout or the simulation horizon. Contact loss restarts the entire
+attempt, discarding partial application bytes; capacity changes preserve progress.
+Route forecasts retain the original algorithm and can conservatively reject a
+path near the horizon even when a whole-path flow could theoretically finish.
 
-The first-party Builder, Engine and native adapters now run
-real Mid-Layer Cells and the official vLLM 0.31 Scheduler on the dynamic Runtime.
-Explicit GPU/switch/terminal graphs support multiple GPUs per satellite, cross-
-satellite TP/PP and per-rank KV migration. The existing `_EventEngine` owns all
-physical hops, resource contention, acquisition and fault recovery. Native COMM
-predictions are not charged again alongside physical communication.
+Star-local supported collectives use the upstream whole-operation surrogate or
+`IntraSatelliteRoofline`; other plans decompose into phases/P2P as upstream
+supports. Star-local predictions neither compete globally nor reprice in flight.
+Cross-star phases use the shared native allocator. Native compute COMM estimates
+are never added again to actual communication time. Protocol capacity basis and
+resource profiles prevent charging the same FEC/framing overhead twice.
 
-```bash
-python -m astermind.experiments.cli examples/native/dynamic_tp2_pp2.json \
-  --midlayer-root /path/to/midlayer --out results/cells/cross.json
-python -m astermind.experiments.cli examples/native/dynamic_migration_tp2.json \
-  --midlayer-root /path/to/midlayer --out results/cells/migration.json
-```
+The old FlowSim extension, ns-3, SimGrid and ProtoBridge execution selectors are
+removed. The new Comm vendors its own upstream ProtoBridge models and allocator
+extraction; those source dependencies are distinct from the retired execution modes.
 
-See [native setup, examples, resource semantics and validation](astermind/README.md)
-and [the Runtime adapter contract](astermind/engine/CELL_INTEGRATION.md).
-Mid-Layer source/calibration and native binaries remain external local dependencies.
-Explicit test KV block counts are not hardware-derived HBM limits; bound memory
-policies are checked separately. Native kernel energy is not evaluated.
-
-`python -m viz.export REPORT.json --out local/results/native-cells-viewer`
-exports an offline replay of real Scheduler batches, per-GPU operators, dependency
-edges, physical communication and KV transactions. The local console links it at
-`/native-cells/`. Its checks expose concrete trace violations and keep hardware
-accuracy and native energy explicitly outside the verified scope.
-
-Install ns-3 separately with `python3 -m pip install ".[ns3]"` on a supported
-platform, with a C++20 compiler available (`sudo apt-get install build-essential`
-on Ubuntu, or set `CXX`). Each worker compiles a small temporary adapter against
-the installed ns-3 headers and libraries, avoiding cppyy JIT initialization traps.
-It uses a 1 ps native clock and lazy directed
-point-to-point resources. Capacity changes apply at the next packet boundary.
-Logical payloads retain microbyte precision; the native wire packet pads its last
-payload to an integer byte and adds the 2-byte PPP header. Padding is not counted
-as delivered application data.
-OrbitServe still performs hop selection, propagation and fault recovery; this
-adapter does not simulate TCP or IP routing. Selecting a missing native backend
-fails explicitly. The queue and fluid backends require neither library.
-
-SimGrid 4.1 may build from source. On Ubuntu or Ubuntu under WSL, install its
-system build dependencies before installing the optional backend:
-
-```bash
-sudo apt-get update
-sudo apt-get install --yes --no-install-recommends \
-  build-essential cmake libboost-dev pybind11-dev python3-dev
-python3 -m pip install --upgrade 'pip==26.2.2'
-python3 -m pip install --build-constraint tests/requirements/native-build.txt ".[simgrid]"
-```
-
-Run these commands from the repository root. The build constraint selects
-pybind11 2.13.6 for SimGrid 4.1's isolated build; newer pybind11 property checks
-are incompatible with this SimGrid release. It does not disable build isolation.
-
-SimGrid's supported operating systems are determined by SimGrid, not a Conda
-environment name. Queue mode does not import or require SimGrid. Explicitly
-selecting an unavailable SimGrid backend raises an error; there is no fallback.
-
-All backends retain per-hop store-and-forward and independent full-duplex
-directions. In SimGrid mode, OrbitServe converts bits/s to native bytes/s, uses
-CM02 with zero native link latency and disabled reverse cross-traffic, and adds
-Orbit-derived propagation after native serialization. Thus propagation is charged
-once. Payload work is scaled to microbytes to preserve fractional payload
-sizes; the quantization is declared in result provenance. Shared transmission
-completion times are not booked in advance. New contenders, completions and
-capacity updates change active transfers. Zero capacity suspends and later
-resumes their remaining bytes; contact loss cancels the hop and fails its request.
-No packet loss or retransmission is fabricated.
-
-Native engines run in isolated subprocesses, one per Runtime evaluation, so
-repeated simulations do not reuse SimGrid's process-global clock. The two
-event engines stop at each native completion or next Runtime/environment event.
-`bandwidth_update` audit events report observed byte progress over a stated
-interval, including allocated bandwidth, link capacity and contender count.
-Route forecasting in fluid, SimGrid and ns-3 uses currently observed link
-and RF-pool contenders; ns-3 forecasts additionally charge packet padding/PPP.
-These forecasts assume the observed contenders persist, without predicting their
-future completion or exact packet order. Actual completion comes from the selected
-transport. There is no end-to-end multi-hop fluid flow or implicit ground NIC pool.
-Mid-Layer owns operator timing and collective lowering. The shared network executes
-physical transfers; the Native communication estimate is not charged twice.
+Raw schema-2 reports include exact event ticks, requests, pool/replica Scheduler
+reports, operators, communication traces/allocations, KV transactions and source
+provenance. The `viz/` frontend is unchanged and accepts its historical report
+schema. New modes are raw-report only; no synthetic replay/storage data is created.
+See [the boundary contract](astermind/engine/CELL_INTEGRATION.md).
 
 Link profiles support fixed capacities, RF free-space/Shannon budgets and an
 optical Gaussian-beam/photon-budget model. Optical inputs include wavelength,
@@ -511,12 +435,9 @@ the directional details and aggregate resource definitions.
 Asymmetric exports set the legacy symmetric `bandwidth_gbps_per_direction` to
 null; consumers must read `bandwidth_gbps_by_direction` and its pool IDs.
 
-Fluid uses max-min allocation across links and RF pools. SimGrid routes contain
-native shared RF resources. ns-3 arbitrates whole native packets across GSLs
-using exclusive RF pools, rotating between links; this is conservative when
-slow links hold a pool. Queue mode reserves the link direction and all matching
-RF pools for the whole message. These are deliberately different service models,
-not a promise of identical latency or packet fairness.
+Comm uses the upstream max-min allocator across directed external links and
+shared RF/terminal capacity pools. Reverse directions retain physical pool
+membership; a terminal gate is charged once per path.
 
 `network/astermind_network.jsonl.gz` exports per-sample cell membership, physical
 rank mappings, internal links, external satellite links and enabled direct ground
@@ -620,48 +541,20 @@ See [the regression coverage map](tests/README.md) for preserved behavior and
 intentional changes from the legacy Runtime/DSE interfaces.
 
 ```bash
-python3 -m unittest discover -s tests/unit -t .
-python3 -m unittest discover -s tests/integration -t .
-python3 -m unittest discover -s tests/smoke -t .
-python3 -m unittest discover -s tests/slow -t .
-python3 -m unittest discover -s tests -t .
-python3 -m ruff check src tests
-# With the optional dependency installed, explicitly verify the native backend:
-python3 -m unittest tests.unit.runtime.test_simgrid_transport \
-  tests.integration.fixed_design.test_simgrid_runtime
-python3 -m unittest tests.unit.runtime.test_radio_capacity \
-  tests.integration.fixed_design.test_radio_sharing \
-  tests.integration.fixed_design.test_network_acceptance
+python tests/scripts/run_retained_tests.py
+python tests/scripts/run_compute_comm.py --output results/compute-comm
+python tests/scripts/run_compute_comm_e2e.py --output results/e2e
+python tests/scripts/check_distribution.py --work-dir /absolute/path/to/new-package-check
 ```
 
-Former Analytical concurrency and DSE matrix tests are removed. Native integration requires the external dependencies documented in `astermind/README.md`.
-
-Real ISLSim invocation is an additional local integration suite, separate from
-the four CI suites. With a local checkout and the native backends installed, run:
+Missing dependencies and skipped tests do not count as successful native
+validation. The [test guide](tests/README.md) lists scheduler environments,
+DP/WideEP/PD cases, source differential oracles, physical regression and failures.
+Real ISLSim validation remains a separate explicit suite:
 
 ```bash
-ORBITSERVE_ISLSIM_ROOT=/path/to/ISLSim python3 -m unittest discover -s tests/external/islsim -v
+ORBITSERVE_ISLSIM_ROOT=/path/to/ISLSim python -m unittest discover -s tests/external/islsim -v
 ```
-
-The local suite verifies that generated inputs are accepted by the actual model
-and checks its results, source identity and Runtime integration. A missing model
-fails this explicit local command; there is no substitute calculation.
-
-The network acceptance case loads one canonical workload bundle and reuses one
-real SGP4 trace from a small synthetic constellation across three routing policies and four
-backends. It asserts chronological events, delivered/discarded byte conservation,
-single-terminal failover, acquisition waiting, mid-transfer capacity changes and
-competition. Native rows require the respective optional dependencies; skipped
-rows are not native-backend validation. Dedicated RF tests check aggregate sharing
-across distinct GSLs and independent uplink/downlink pools.
-`test_network_time_consistency` independently reconstructs distance, propagation,
-Friis/Shannon RF and optical photon budgets at every sample and selected interior
-times. It also integrates a long transfer across geometry and exact capacity
-boundaries. `test_time_varying_transport` observes real backend configuration calls
-to verify updates during execution, rather than only checking precomputed frames.
-Path records timestamp their distance at serialization completion; individual
-service intervals retain their own sample time and distance. Positions are held
-within samples, while configured capacity schedules retain exact event times.
 
 ## Directory Rules
 
@@ -694,7 +587,6 @@ python tests/scripts/check_distribution.py
 
 The project license is pending maintainer selection. Before public release,
 review dependency and bundled-data redistribution terms and the Git history
-that will become visible. The optional ns-3 backend is
-[GPL-2.0-only](https://pypi.org/project/ns3/3.44.post0/); the bundled IERS data
-retains its own license and provenance. Passing software tests does not replace
+that will become visible. Bundled vendor license/provenance files and IERS
+license/provenance are retained alongside their sources. Passing software tests does not replace
 validation of model assumptions and scientific reference results.

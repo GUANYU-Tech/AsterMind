@@ -12,4 +12,4 @@ ORBITSERVE_ISLSIM_ROOT=/path/to/ISLSim python -m unittest discover -s tests/exte
 ```
 
 The real-model tests have no analytical substitute. Missing ISLSim fails the
-explicit local command. SimGrid/ns3 rows require their native optional packages.
+explicit local command. Comm requires the built native allocator.

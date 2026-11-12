@@ -96,8 +96,6 @@ def apply_topology_command(engine, command):
         net._compile(from_s=now)
         net.frame_times = [f['time_s'] for f in net.frames]
         engine.schedule_reallocation()
-        engine.interrupt_unavailable('manual_link_disconnected')
-        engine.wake_retries()
         message = '链路已断开，后续时间片持续生效'
     elif action == 'connect':
         if not all(isinstance(command.get(k), str) for k in ('endpoint_a', 'endpoint_b')):
@@ -126,13 +124,9 @@ def apply_topology_command(engine, command):
             raise ValueError('两端终端资源不足，或连接不满足当前分配条件')
         if row['state'] == 'SETTING_UP' and (row['ready_s'] >= net.end_s or trial.link_at(target, row['ready_s'])['state'] != 'UP'):
             raise ValueError('剩余物理可用窗口不足以完成建链')
-        if added and engine.transport and hasattr(engine.transport, 'register_edge'):
-            engine.transport.register_edge(edge)
         # Publish only after the complete physical/resource check succeeds.
         net.__dict__.update(trial.__dict__)
         engine.schedule_reallocation()
-        engine.interrupt_unavailable('topology_reallocated')
-        engine.wake_retries()
         message = '连接成功' if row['state'] == 'UP' else '建链中，等待捕获完成'
     else:
         raise ValueError('不支持的拓扑操作')

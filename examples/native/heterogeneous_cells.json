@@ -218,5 +218,9 @@
     "satA": "mixed",
     "satB": "mixed"
   },
-  "horizon_ns": 1000000000
+  "horizon_ns": 1000000000,
+  "compute_mode": "midlayer",
+  "communication": {
+    "intra_mode": "IntraSatelliteRoofline"
+  }
 }

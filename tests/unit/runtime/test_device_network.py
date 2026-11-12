@@ -1,6 +1,5 @@
 """Device-level resources must remain real shared hops, not satellite aliases."""
 
-import importlib.util
 import json
 import unittest
 from pathlib import Path
@@ -9,6 +8,7 @@ from types import SimpleNamespace
 from astermind.builder.topology import PhysicalTopology
 from astermind.builder.models import Scenario
 from astermind.engine.cell_bridge import CellTransferExecutor
+from astermind.engine.comm.frame_surrogate import CommPolicy
 from astermind.engine.network_host import DeviceCommunicationRuntime, DeviceRuntimeHost
 
 
@@ -48,6 +48,7 @@ def run_transfers(backend):
         horizon_ns=4_000_000_000,
         backend=backend,
         runtime_network={},
+        communication=CommPolicy(runtime_protocol="payload_only",inter_parameters=dict(startup_us=0)),
         physical_link_bindings={},
     )
     host = DeviceRuntimeHost(graph, config)
@@ -69,7 +70,7 @@ def run_transfers(backend):
                 lambda identifier=identifier: completed.append((identifier, host.now)),
             )
         host.run()
-        return completed, host.log, dict(host.transport_provenance), network.events
+        return completed, network.communication_policy.trace, {}, network.events
     finally:
         network.close()
         host.close()
@@ -163,6 +164,7 @@ class DeviceNetworkTests(unittest.TestCase):
             horizon_ns=4_000_000_000,
             backend="fluid",
             runtime_network={},
+        communication=CommPolicy(runtime_protocol="payload_only",inter_parameters=dict(startup_us=0)),
             ground_owners=("u", "v"),
             physical_link_bindings={},
         )
@@ -244,31 +246,16 @@ class DeviceNetworkTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "canonical physical_network allocator"):
             SimulationConfig.model_validate(value)
 
-    def test_two_gpus_on_one_satellite_use_distinct_ports_and_switch_capacity(self):
-        completed, events, _, _ = run_transfers("fluid")
+    def test_intra_p2p_keeps_distinct_ports_and_explicit_noncompetition(self):
+        completed, events, _, _ = run_transfers('runtime_comm')
         self.assertEqual(len(completed), 2)
-        self.assertTrue(all(2.0 <= time < 2.00001 for _, time in completed))
-        segments = [e for e in events if e["kind"] == "bandwidth_update"]
-        gates = [e for e in segments if e.get("link_capacity_bps") == 8000.0]
-        self.assertTrue(any(e["allocated_bandwidth_bps"] == 4000.0 for e in gates))
-        self.assertAlmostEqual(sum(e["bytes_sent"] for e in gates), 2000.0)
-
-    @unittest.skipUnless(
-        importlib.util.find_spec("_flowsim"), "requires shared-runtime FlowSim"
-    )
-    def test_real_flowsim_shares_same_satellite_switch(self):
-        completed, _, _, _ = run_transfers("flowsim")
-        self.assertTrue(all(2.0 <= time < 2.00001 for _, time in completed))
-
-    @unittest.skipUnless(importlib.util.find_spec("ns"), "requires native ns-3")
-    def test_real_ns3_resource_gates_do_not_add_ppp_packets(self):
-        completed, _, provenance, _ = run_transfers("ns3")
-        self.assertEqual(len(completed), 2)
-        self.assertTrue(2.0 <= max(time for _, time in completed) < 2.00001)
-        # Two actual GPU-to-switch and two switch-to-GPU links; the virtual
-        # switch budget gate schedules service but is not another wire packet.
-        self.assertEqual(provenance["native_counters"]["packets_started"], 4)
-        self.assertEqual(provenance["native_counters"]["wire_bytes_started"], 4008)
+        self.assertEqual(completed[0][1],completed[1][1])
+        services=[event for event in events if event['kind']=='intra_service']
+        self.assertEqual(len(services),2)
+        self.assertTrue(all(not event['intra_competition'] for event in services))
+        self.assertTrue(all(event['bandwidth_gbps']==0.000008 for event in services))
+        self.assertEqual({tuple(event['path']) for event in services},
+                         {('gpu0','switch','gpu1'),('gpu2','switch','gpu3')})
 
     def test_gpu_cannot_forward_between_two_switches(self):
         graph = topology()
@@ -300,6 +287,7 @@ class DeviceNetworkTests(unittest.TestCase):
             horizon_ns=1_000_000_000,
             backend="fluid",
             runtime_network={},
+        communication=CommPolicy(runtime_protocol="payload_only",inter_parameters=dict(startup_us=0)),
             physical_link_bindings={},
         )
         host = DeviceRuntimeHost(split, config)

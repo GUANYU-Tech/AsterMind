@@ -110,20 +110,20 @@ class RadioCapacityTests(unittest.TestCase):
 
     def test_shared_forecast_can_choose_a_less_congested_route(self):
         base = network(edges=(('a', 'd', 0., 20.), ('a', 'b', 0., 20.), ('b', 'd', 0., 20.)), bandwidth=8000)
-        for mode in ('fluid', 'simgrid', 'ns3'):
+        for mode in ('runtime_comm',):
             state = NetworkState(base.trace, replace(base.spec, transport_model=mode))
             state.shared_load['communication_isl:a:d', 'a', 'd'] = 3
             _, path = state.transfer('a', 'd', 0., 1000)
             self.assertEqual([leg['target_node_id'] for leg in path], ['b', 'd'])
 
     def test_forecasts_include_contenders_for_every_shared_backend(self):
-        for mode in ('queue', 'fluid', 'simgrid', 'ns3'):
+        for mode in ('runtime_comm',):
             base = network(bandwidth=8000)
             state = NetworkState(base.trace, replace(base.spec, transport_model=mode))
             edge = state.edges[0]
             state.shared_load[edge['link_id'], 'a', 'b'] = 1
             _, path = state.transfer('a', 'b', 0., 1000)
-            expected = 1 if mode == 'queue' else 2.004 if mode == 'ns3' else 2
+            expected = 2
             self.assertAlmostEqual(path[0]['transmission_s'], expected)
 
     def test_versioned_profiles_do_not_confuse_geometry_link_and_satellite_capacity(self):

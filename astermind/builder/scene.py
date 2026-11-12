@@ -11,7 +11,7 @@ from astermind.builder.config import Positive, SimulationConfig
 
 
 class SceneDeployment(Contract):
-    timeline_mode: Literal['orbitserve', 'simgrid'] = 'orbitserve'
+    compute_mode: Literal["midlayer", "roofline"] = "midlayer"
     model: str = "configs/model/qwen3-8b.json"
     hardware: str = "configs/hardware/nvidia_a800.yaml"
     hardware_id: str = "nvidia_a800"
@@ -26,10 +26,7 @@ class SceneDeployment(Contract):
     num_kv_blocks: Positive = 64
     gpu_link_bandwidth_gbps: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 1600
     gpu_link_latency_ns: Annotated[int, Field(strict=True, ge=0)] = 200
-    communication_mode: Literal[
-        "flowsim", "protobridge_satellite", "protobridge_cell"
-    ] = "protobridge_cell"
-    protobridge_startup_us: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 0
+    communication: dict = Field(default_factory=dict)
 
 
 def build_scene(
@@ -181,10 +178,8 @@ def build_scene(
         cells=cells,
         requests=list(requests),
         migrations=list(migrations),
-        backend="simgrid" if deployment.timeline_mode == 'simgrid' else "flowsim",
-        timeline_mode=deployment.timeline_mode,
-        communication_mode=deployment.communication_mode,
-        protobridge_startup_us=deployment.protobridge_startup_us,
+        compute_mode=deployment.compute_mode,
+        communication=deployment.communication,
         horizon_ns=round(concrete["time"]["duration_s"] * 1e9),
         runtime_network=runtime_network or {},
     )

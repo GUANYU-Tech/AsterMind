@@ -45,13 +45,13 @@ output = Path.cwd() / 'islsim.json'
 assert main(['--out', str(output)]) == 0
 assert set(json.loads(output.read_text())) == {'tx', 'rx', 'channel'}
 for name in ('astermind.builder.models', 'astermind.builder.topology', 'astermind.builder.config',
-             'astermind.engine.network_host', 'astermind.engine.simulation', 'astermind.engine.adapters'):
+             'astermind.engine.network_host', 'astermind.engine.simulation', 'astermind.engine.compute'):
     loaded = import_module(name)
     assert Path(loaded.__file__).is_relative_to(target), loaded.__file__
 from astermind.builder.config import SimulationConfig
-identity = json.loads(files('astermind.engine.adapters').joinpath('runtime/vllm_0_31_identity.json').read_text())
+identity = json.loads(files('astermind.engine.compute').joinpath('scheduler_runtime/vllm_0_31_identity.json').read_text())
 assert identity, 'native Scheduler identity must be packaged'
-assert files('astermind.engine.adapters').joinpath('requirements-scheduler-latest.lock').is_file()
+assert files('astermind.engine.compute').joinpath('scheduler_runtime/requirements-vllm-0.31.lock').is_file()
 scene = files('examples.native').joinpath('dynamic_tp2_pp2.json')
 config = SimulationConfig.load(scene)
 assert config.cells[0].parallel.workers == 4
@@ -103,6 +103,8 @@ def main():
     environment = {**os.environ, 'PYTHONDONTWRITEBYTECODE': '1',
                    'ORBITSERVE_ISLSIM_ROOT': '/nonexistent/orbitserve-islsim-package-check'}
     environment.pop('PYTHONPATH', None)
+    environment.pop('ORBITServe_MIDLAYER_ROOT', None)
+    environment.pop('ORBITSERVE_MIDLAYER_ROOT', None)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--work-dir", type=Path, help="retain build/install/replay evidence in a new directory")
     args = parser.parse_args()
@@ -127,15 +129,38 @@ def main():
         installed = workspace / 'installed'
         subprocess.run([sys.executable, '-m', 'pip', 'install', '--no-deps', '--target',
                         str(installed), str(wheels[0])], check=True, env=environment)
+        native_env = {**environment, 'PYTHONPATH': str(installed)}
+        subprocess.run([sys.executable, '-B', '-m', 'astermind.common.build_native'],
+                       cwd=workspace,check=True,env=native_env)
         subprocess.run([sys.executable, '-I', '-B', '-c', SMOKE, str(installed)],
                        cwd=workspace, check=True, env=environment)
         # Child native workers must import the installed package too.
         native_env = {**environment, 'PYTHONPATH': str(installed)}
         report = workspace / 'native_result.json'
         subprocess.run([sys.executable, '-B', '-m', 'astermind',
-                        '--scenario', str(installed / 'examples/native/two_cells_ns3.json'),
+                        '--scenario', str(installed / 'examples/native/two_cells.json'),
                         '--output', str(report)], cwd=workspace, check=True, env=native_env)
-        subprocess.run([sys.executable, '-B', '-m', 'viz.export', str(report),
+        subprocess.run([sys.executable, '-B', '-m', 'astermind.engine.audit', str(report),
+                        '--output', str(workspace / 'audit.json')],
+                       cwd=workspace,check=True,env=native_env)
+        if environment.get('ORBITServe_VLLM030_SOURCE'):
+            # Exact tick objects cross the native subprocess boundary outside source.
+            sys.path.insert(0,str(installed))
+            from examples.native.compute_comm_matrix import scene as native_scene
+            import json
+            scene030=workspace/'native030.input.json'
+            scene030.write_text(json.dumps(native_scene('DS03')))
+            report030=workspace/'native030.report.json'
+            subprocess.run([sys.executable,'-B','-m','astermind','--scenario',str(scene030),
+                            '--output',str(report030)],cwd=workspace,check=True,env=native_env)
+            subprocess.run([sys.executable,'-B','-m','astermind.engine.audit',str(report030),
+                            '--output',str(workspace/'native030.audit.json')],cwd=workspace,check=True,env=native_env)
+        # New modes use raw schema2; unchanged viz is checked on its historical schema.
+        sys.path.insert(0,str(root))
+        from tests.unit.runtime.test_native_replay import report as historical_report
+        historical=workspace/'historical.json'
+        historical.write_text(__import__('json').dumps(historical_report()))
+        subprocess.run([sys.executable, '-B', '-m', 'viz.export', str(historical),
                         '--out', str(workspace / 'replay')],
                        cwd=workspace, check=True, env=native_env)
 

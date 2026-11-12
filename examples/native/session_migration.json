@@ -225,5 +225,9 @@
       "session_id": "session",
       "context_id": "c0"
     }
-  ]
+  ],
+  "compute_mode": "midlayer",
+  "communication": {
+    "intra_mode": "IntraSatelliteRoofline"
+  }
 }

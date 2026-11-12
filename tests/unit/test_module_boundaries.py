@@ -24,7 +24,7 @@ class CoreModuleBoundaryTests(unittest.TestCase):
         for module, names in {
             orbit: ('OrbitTraceManifest', 'OrbitTraceBundle', 'generate_orbit_trace', 'load_orbit_trace'),
             workload: ('WorkloadBundleRef', 'WorkloadGenerationResult', 'materialize_workload_bundle'),
-            engine: ('NetworkSpec', 'NetworkState', 'GlobalTimeline', 'CommunicationExecutor'),
+            engine: ('NetworkSpec', 'NetworkState', 'GlobalTimeline'),
         }.items():
             for name in names:
                 with self.subTest(module=module.__name__, name=name):

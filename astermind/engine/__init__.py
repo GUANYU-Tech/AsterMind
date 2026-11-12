@@ -1,7 +1,5 @@
 """Public API for deterministic OrbitServe Runtime simulation."""
 
-from astermind.engine.api import check_network_backend
-from astermind.engine.communication import CommunicationExecutor, InterSatelliteFlowBackend, IntraSatelliteSurrogateBackend, Ns3PacketBackend, PhysicalTransfer
 from astermind.engine.network import NetworkStateFrame
 from astermind.engine.timeline import CellManager, GlobalScheduling, GlobalTimeline
 from astermind.engine.network_exchange import export_cell_network
@@ -17,9 +15,8 @@ from astermind.engine.setup.network_geometry import sun_positions_from_trace
 from astermind.engine.state.network import NetworkState, NetworkUnavailable
 
 __all__ = [
-    "CellManager", "CommunicationExecutor", "GlobalScheduling", "GlobalTimeline",
-    "InterSatelliteFlowBackend", "IntraSatelliteSurrogateBackend", "NetworkStateFrame",
-    "Ns3PacketBackend", "PhysicalTransfer",
+    "CellManager", "GlobalScheduling", "GlobalTimeline",
+    "NetworkStateFrame",
     "freeze_network_profiles",
     "prepare_islsim_config",
     "resolve_islsim_config",
@@ -35,6 +32,5 @@ __all__ = [
     "NetworkState",
     "NetworkUnavailable",
     "candidate_links",
-    "check_network_backend",
     "export_cell_network",
 ]

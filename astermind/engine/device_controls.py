@@ -35,8 +35,6 @@ def apply_device_command(engine, command):
     else:
         net.revision += 1
     engine.schedule_reallocation()
-    engine.interrupt_unavailable("manual_gpu_link_changed")
-    engine.wake_retries()
     event = dict(
         kind="topology_command",
         time_s=engine.now,

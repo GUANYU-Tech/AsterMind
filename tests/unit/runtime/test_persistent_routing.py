@@ -41,7 +41,7 @@ class PersistentRoutingTests(unittest.TestCase):
         link_id = first[0]["link_id"]
         state.shared_load[(link_id, "a", "b")] = 3
         # Use shared-bandwidth forecasting, as the serving backends do.
-        state.spec = replace(state.spec, transport_model="fluid")
+        state.spec = replace(state.spec, transport_model="runtime_comm")
         arrival, reused = state.transfer("a", "d", 1.0, 100.0)
         self.assertEqual(nodes(reused), ["b", "d"])
         self.assertAlmostEqual(arrival, 1.5)
