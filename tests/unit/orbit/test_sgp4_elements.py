@@ -5,13 +5,7 @@ import unittest
 from copy import deepcopy
 from pathlib import Path
 
-from orbitserve.orbit import (
-    SGP4_ELEMENT_BUNDLE_SCHEMA,
-    Sgp4ElementBundle,
-    Sgp4ElementProvenance,
-    Sgp4SatelliteElements,
-    load_sgp4_element_bundle,
-)
+from astermind.builder.orbit import SGP4_ELEMENT_BUNDLE_SCHEMA, Sgp4ElementBundle, Sgp4ElementProvenance, Sgp4SatelliteElements, load_sgp4_element_bundle
 
 
 def _satellite(satellite_id="sat-00001", satnum=10001):

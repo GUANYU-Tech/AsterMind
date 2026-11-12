@@ -7,15 +7,15 @@ import unittest
 from unittest.mock import patch
 
 from pydantic import ValidationError
-from simulator.config import SimulationConfig
-from orbitserve.experiments.cli import main
+from astermind.builder.config import SimulationConfig
+from astermind.experiments.cli import main
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
 class NativeEntryTests(unittest.TestCase):
     def scene(self):
-        return json.loads((ROOT / "simulator/examples/two_cells.json").read_text())
+        return json.loads((ROOT / "examples/native/two_cells.json").read_text())
 
     def test_schema_defaults_remain_distinct(self):
         for version, expected in (
@@ -42,7 +42,7 @@ class NativeEntryTests(unittest.TestCase):
 
     def test_cli_delegates_all_schemas_and_preserves_options(self):
         with patch(
-            "orbitserve.experiments.cli.run_native_cell_manifest", return_value=7
+            'astermind.experiments.cli.run_native_cell_manifest', return_value=7
         ) as execute:
             status = main(
                 [

@@ -4,7 +4,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from orbitserve.common import atomic_output, write_json
+from astermind.common import atomic_output, write_json
 
 
 class ArtifactPublicationTests(unittest.TestCase):

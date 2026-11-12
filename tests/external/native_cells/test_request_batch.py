@@ -11,9 +11,9 @@ class NativeRequestBatchTests(unittest.TestCase):
     run_scene = fixtures.NativeCellIntegrationTests.run_scene
 
     def test_batch_workload_preserves_requests_through_native_execution(self):
-        from simulator.config import SimulationConfig
-        from simulator.request_batch import prepare_batch
-        from simulator.replay import audit_checks
+        from astermind.builder.config import SimulationConfig
+        from astermind.builder.request_batch import prepare_batch
+        from viz.export import audit_checks
 
         value = self.config("dynamic_tp2_pp2.json").model_dump(mode="json")
         value["communication_mode"] = "protobridge_cell"

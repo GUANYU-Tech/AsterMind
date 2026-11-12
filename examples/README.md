@@ -1,7 +1,7 @@
 # Examples
 
-Native fixed-design scenarios live in `simulator/examples/` and are loaded as
-SimulationConfig. See [Native setup and execution](../simulator/README.md).
+Native fixed-design scenarios live in `examples/native/` and are loaded as
+SimulationConfig. See [Native setup and execution](../astermind/README.md).
 
 - `workloads/` retains independent workload descriptions, bundles and source traces.
 - `astermind_joint/` retains standalone configuration/replay helpers; its scripts

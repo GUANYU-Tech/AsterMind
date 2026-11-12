@@ -1,7 +1,7 @@
 """Independent physical/cost fixture inputs; no experiment execution wrapper."""
 import json
 from pathlib import Path
-from orbitserve.experiments.network_inputs import snapshot_network_input
+from astermind.builder.physical.network_inputs import snapshot_network_input
 ROOT = Path(__file__).resolve().parents[1]
 def physical_case():
     path = ROOT / "tests/fixtures/manifests/coupled_physical.json"

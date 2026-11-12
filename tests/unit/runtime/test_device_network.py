@@ -6,9 +6,10 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from network_sim import PhysicalTopology, Scenario
-from orbitserve.runtime.engine.cell_bridge import CellTransferExecutor
-from simulator.network import DeviceCommunicationRuntime, DeviceRuntimeHost
+from astermind.builder.topology import PhysicalTopology
+from astermind.builder.models import Scenario
+from astermind.engine.cell_bridge import CellTransferExecutor
+from astermind.engine.network_host import DeviceCommunicationRuntime, DeviceRuntimeHost
 
 
 def topology():
@@ -76,12 +77,7 @@ def run_transfers(backend):
 
 class DeviceNetworkTests(unittest.TestCase):
     def test_device_projection_preserves_directional_rf_pool_across_ground_links(self):
-        from orbitserve.runtime import (
-            LinkProfile,
-            NetworkNodeSpec,
-            NetworkSpec,
-            NetworkState,
-        )
+        from astermind.engine import LinkProfile, NetworkNodeSpec, NetworkSpec, NetworkState
 
         physical_nodes = (
             NetworkNodeSpec(
@@ -206,11 +202,11 @@ class DeviceNetworkTests(unittest.TestCase):
             host.close()
 
     def test_ground_user_cannot_relay_between_satellites(self):
-        from simulator.config import SimulationConfig
+        from astermind.builder.config import SimulationConfig
 
         path = (
             Path(__file__).resolve().parents[3]
-            / "simulator/examples/session_migration_tp2.json"
+            / "examples/native/session_migration_tp2.json"
         )
         value = json.loads(path.read_text())
         value["physical"]["links"] = [
@@ -232,11 +228,11 @@ class DeviceNetworkTests(unittest.TestCase):
             host.close()
 
     def test_legacy_allocator_is_rejected_instead_of_ignoring_acquisition(self):
-        from simulator.config import SimulationConfig
+        from astermind.builder.config import SimulationConfig
 
         path = (
             Path(__file__).resolve().parents[3]
-            / "simulator/examples/session_migration_tp2.json"
+            / "examples/native/session_migration_tp2.json"
         )
         value = json.loads(path.read_text())
         value["physical"]["link_policy"] = {

@@ -3,14 +3,7 @@ import unittest
 from dataclasses import replace
 from types import SimpleNamespace
 
-from orbitserve.runtime import (
-    LinkProfile,
-    NetworkNodeSpec,
-    NetworkSpec,
-    NetworkState,
-    NetworkUnavailable,
-    candidate_links,
-)
+from astermind.engine import LinkProfile, NetworkNodeSpec, NetworkSpec, NetworkState, NetworkUnavailable, candidate_links
 
 
 def layout(topology="grid", planes=4, slots=6, **kwargs):

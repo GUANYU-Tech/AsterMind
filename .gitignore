@@ -3,9 +3,9 @@
 /log/
 *.log
 # Downloaded third-party workload traces and locally materialized BurstGPT bundles.
-/src/workloads/BurstGPT/data/
-/src/workloads/BurstGPT/bundles/
-/src/workloads/BurstGPT/analysis/
+/workloads/BurstGPT/data/
+/workloads/BurstGPT/bundles/
+/workloads/BurstGPT/analysis/
 __pycache__/
 # Local experiment inputs and machine-specific configuration.
 /inputs/
@@ -48,11 +48,9 @@ __pycache__/
 /htmlcov/
 
 # Merge_ML_Version source adapters: retain their generated artifacts locally.
-/simulator/build/
-/simulator/runs/
-/network_sim/build/
-/network_sim/runs/
-/integration/upstream/
+/astermind/build/
+/astermind/runs/
+/astermind/engine/adapters/upstream/
 *.so
 *.dll
 *.pdb

@@ -3,9 +3,9 @@ import math
 import unittest
 from types import SimpleNamespace
 
-from orbitserve.runtime.engine.cell_bridge import bind_batch_executor
-from orbitserve.runtime.timeline import GlobalTimeline, nanoseconds
-from simulator.audit import audit
+from astermind.engine.cell_bridge import bind_batch_executor
+from astermind.engine.timeline import GlobalTimeline, nanoseconds
+from astermind.engine.audit import audit
 
 
 class CellTimeRecordTests(unittest.TestCase):

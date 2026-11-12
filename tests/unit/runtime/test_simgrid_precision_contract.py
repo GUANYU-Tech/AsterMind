@@ -3,8 +3,8 @@
 import copy
 import unittest
 
-from orbitserve.runtime.engine.simgrid_events import native_time, simgrid_time
-from orbitserve.runtime.service_precision import bandwidth_check
+from astermind.engine.simgrid_events import native_time, simgrid_time
+from astermind.engine.service_precision import bandwidth_check
 
 
 class SimGridPrecisionContractTests(unittest.TestCase):
@@ -29,7 +29,7 @@ class SimGridPrecisionContractTests(unittest.TestCase):
             self.assertEqual(float(simgrid_time(value)), value)
 
     def test_migration_barrier_uses_exact_stamps_and_legacy_ns_projection(self):
-        from orbitserve.runtime.clock_audit import migration_barrier_valid
+        from astermind.engine.clock_audit import migration_barrier_valid
 
         migration = dict(
             network_complete_time_s=1.458470516301513,
@@ -75,11 +75,8 @@ class SimGridPrecisionContractTests(unittest.TestCase):
 
     def test_legacy_ns_callback_only_aligns_the_rounded_current_instant(self):
         from types import SimpleNamespace
-        from orbitserve.runtime.clock import Time
-        from orbitserve.runtime.engine.cell_bridge import (
-            RuntimeCellNetwork,
-            CellTransfer,
-        )
+        from astermind.engine.clock import Time
+        from astermind.engine.cell_bridge import RuntimeCellNetwork, CellTransfer
 
         now = Time.from_ticks(1500166782047599077)
         network = RuntimeCellNetwork(

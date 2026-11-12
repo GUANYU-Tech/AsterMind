@@ -7,15 +7,15 @@ from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
-from simulator.config import SimulationConfig
-from simulator.physics import load_physics
+from astermind.builder.config import SimulationConfig
+from astermind.builder.physical.loading import load_physics
 from tests.system_case import physical_case
-from orbitserve.experiments.network import run_network_experiment
-from orbitserve.experiments.network_inputs import materialize_network_input
-from orbitserve.experiments.physical_dataset import load_dataset, reuse_dataset
+from astermind.builder.physical.network import run_network_experiment
+from astermind.builder.physical.network_inputs import materialize_network_input
+from astermind.builder.physical.physical_dataset import load_dataset, reuse_dataset
 
-from orbitserve.orbit import load_orbit_trace
-from orbitserve.runtime import LinkProfile, NetworkSpec, NetworkState
+from astermind.builder.orbit import load_orbit_trace
+from astermind.engine import LinkProfile, NetworkSpec, NetworkState
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -35,15 +35,15 @@ class PhysicalDatasetTests(unittest.TestCase):
         cls.temporary.cleanup()
 
     def config(self, **changes):
-        raw = json.loads((ROOT / "simulator/examples/two_cells_ns3.json").read_text())
+        raw = json.loads((ROOT / "examples/native/two_cells_ns3.json").read_text())
         raw.update(physical_dataset=str(self.dataset), **changes)
         return SimulationConfig.model_validate(raw)
 
     def test_runtime_reuses_dataset_with_physical_engines_disabled(self):
         from types import SimpleNamespace
         from tests.network_case import NetworkHost
-        from orbitserve.runtime.engine.cell_bridge import RuntimeCellNetwork, CellTransfer
-        from orbitserve.runtime.timeline import GlobalTimeline
+        from astermind.engine.cell_bridge import RuntimeCellNetwork, CellTransfer
+        from astermind.engine.timeline import GlobalTimeline
 
         def execute(physical):
             host = NetworkHost(SimpleNamespace(time_horizon_s=physical.end_s, routing_policy="earliest_arrival"), SimpleNamespace(network=physical, time=physical.trace.time))
@@ -70,7 +70,7 @@ class PhysicalDatasetTests(unittest.TestCase):
                 host.close()
 
         failure = AssertionError("runtime attempted physical recomputation")
-        with patch("orbitserve.experiments.network.run_network_experiment", side_effect=failure), patch("orbitserve.experiments.network.generate_orbit_trace", side_effect=failure), patch.object(LinkProfile, "attributes", side_effect=failure), patch.object(NetworkState, "_compile", side_effect=failure), patch.object(NetworkState, "sun_separation", side_effect=failure):
+        with patch('astermind.builder.physical.network.run_network_experiment', side_effect=failure), patch('astermind.builder.physical.network.generate_orbit_trace', side_effect=failure), patch.object(LinkProfile, "attributes", side_effect=failure), patch.object(NetworkState, "_compile", side_effect=failure), patch.object(NetworkState, "sun_separation", side_effect=failure):
             first, lifetime = load_physics(self.config())
             second, _ = load_physics(self.config(backend="simgrid", timeline_mode="simgrid"))
             self.assertIsNone(lifetime)
@@ -85,7 +85,7 @@ class PhysicalDatasetTests(unittest.TestCase):
         payload = self.config().model_dump(mode="json")
         payload["physical_dataset"] = "physical/physical_dataset.json"
         path.write_text(json.dumps(payload))
-        with patch("orbitserve.experiments.network_inputs.materialize_network_input", side_effect=AssertionError("constellation initialized again")):
+        with patch('astermind.builder.physical.network_inputs.materialize_network_input', side_effect=AssertionError("constellation initialized again")):
             config = SimulationConfig.load(path)
             physical, _ = load_physics(config)
         self.assertEqual(physical.dataset_root, str(self.dataset))
@@ -154,7 +154,7 @@ class PhysicalDatasetTests(unittest.TestCase):
                 self.assertEqual(json.loads(json.dumps(saved.snapshot(t))), expected)
 
     def test_combined_run_output_can_be_reused_by_the_original_source_config(self):
-        from orbitserve.experiments.physical_dataset import validate_dataset_input
+        from astermind.builder.physical.physical_dataset import validate_dataset_input
 
         first = run_network_experiment(self.physical_input, self.root / "combined", _workers=1)
         _, _, index = validate_dataset_input(str(self.root / "combined"), self.physical_input)
@@ -193,7 +193,7 @@ class PhysicalDatasetTests(unittest.TestCase):
             links=dict(common,model='per_step',failure_probability=1.,
                        duration=dict(distribution='exponential',mean_steps=3))))
         with patch.object(LinkProfile,'attributes',side_effect=AssertionError('physics recomputed')), \
-             patch('orbitserve.runtime.setup.faults.random.Random.expovariate',return_value=last+2.25):
+             patch('astermind.engine.setup.faults.random.Random.expovariate',return_value=last+2.25):
             state, events = self.run_faults({k: physical["network"][k] for k in ("fault_timing", "random_faults")})
         self.assertEqual(state.dataset_root, str(self.dataset))
         onsets=[e for e in events if e['kind']=='fault_injected' and e['source']=='random']

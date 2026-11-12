@@ -2,8 +2,8 @@ import unittest
 from dataclasses import replace
 from types import SimpleNamespace
 
-from orbitserve.runtime import NetworkNodeSpec, NetworkSpec, LinkProfile, NetworkState, candidate_links
-from orbitserve.runtime.engine.association import select_ground_links
+from astermind.engine import NetworkNodeSpec, NetworkSpec, LinkProfile, NetworkState, candidate_links
+from astermind.engine.association import select_ground_links
 
 
 class SparseTopologyTests(unittest.TestCase):

@@ -9,10 +9,10 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from orbitserve.experiments.network_inputs import snapshot_network_input
-from orbitserve.experiments.physical_dataset import input_fingerprint
-from orbitserve.runtime import LinkProfile, NetworkSpec, prepare_islsim_config
-from orbitserve.runtime.setup import islsim
+from astermind.builder.physical.network_inputs import snapshot_network_input
+from astermind.builder.physical.physical_dataset import input_fingerprint
+from astermind.engine import LinkProfile, NetworkSpec, prepare_islsim_config
+from astermind.engine.setup import islsim
 from tests.integration.fixed_design.test_dynamic_network_experiment import manifest
 
 
@@ -58,7 +58,7 @@ class ISLSimConfigTests(unittest.TestCase):
             source, output = (Path(directory) / name for name in ('profile.json', 'islsim.json'))
             source.write_text(json.dumps({'islsim_config': {'rx': {'terminal_cap_gbps': 200}}}))
             environment = {**os.environ, 'ORBITSERVE_ISLSIM_ROOT': '/nonexistent/islsim-config-test'}
-            process = subprocess.run([sys.executable, '-m', 'orbitserve.experiments.islsim_cli',
+            process = subprocess.run([sys.executable, '-m', 'astermind.experiments.islsim_cli',
                                       '--input', str(source), '--out', str(output)],
                                      capture_output=True, text=True, env=environment)
             self.assertEqual(process.returncode, 0, process.stderr)

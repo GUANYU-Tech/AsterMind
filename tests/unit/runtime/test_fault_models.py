@@ -5,7 +5,7 @@ import unittest
 from dataclasses import replace
 from unittest.mock import patch
 
-from orbitserve.runtime.setup.faults import realize_runtime_faults, fault_step_details, validate_random_faults
+from astermind.engine.setup.faults import realize_runtime_faults, fault_step_details, validate_random_faults
 from tests.unit.runtime.test_dynamic_network import network
 
 
@@ -69,7 +69,7 @@ class FaultModelTests(unittest.TestCase):
     def test_out_of_horizon_duration_is_preserved_and_marked_censored(self):
         settings=dict(self.common, target_type='node', model='per_step', end_step=1, failure_probability=1,
                       duration=dict(distribution='exponential', mean_steps=3))
-        with patch('orbitserve.runtime.setup.faults.random.Random.expovariate', return_value=8.25):
+        with patch('astermind.engine.setup.faults.random.Random.expovariate', return_value=8.25):
             faults=self.realize(settings, (0.,1.,2.,3.,4.,5.))
         self.assertTrue(faults)
         for fault in faults:

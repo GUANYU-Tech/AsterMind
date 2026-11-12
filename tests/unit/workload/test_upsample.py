@@ -3,12 +3,8 @@ import math
 import types
 import unittest
 
-from orbitserve.workload import (
-    SESSION_REQUEST_KEYS,
-    WorkloadGenerationResult,
-    RegionSpec,
-)
-from orbitserve.workload.upsample import stream_upsampled_sessions
+from astermind.workload import SESSION_REQUEST_KEYS, WorkloadGenerationResult, RegionSpec
+from astermind.workload.upsample import stream_upsampled_sessions
 
 
 BIN_S = 300.0

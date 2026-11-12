@@ -5,13 +5,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from simulator.catalog import (
-    cell_member_counts,
-    parallel_choices,
-    scene_catalog,
-    validate_deployment_choice,
-)
-from simulator.scene import SceneDeployment
+from astermind.builder.catalog import cell_member_counts, parallel_choices, scene_catalog, validate_deployment_choice
+from astermind.builder.scene import SceneDeployment
 
 
 class SceneCatalogTests(unittest.TestCase):

@@ -3,14 +3,8 @@ import json
 import unittest
 from pathlib import Path
 
-import sys
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
-
-from orbitserve.workload import load_workload_bundle
-from orbitserve.workload.contract import (
-    SESSION_REQUEST_KEYS, REGION_KEYS, GATEWAY_KEYS, TIMEBIN_FIELDS,
-    MANIFEST_FILE,
-)
+from astermind.workload import load_workload_bundle
+from astermind.workload.contract import SESSION_REQUEST_KEYS, REGION_KEYS, GATEWAY_KEYS, TIMEBIN_FIELDS, MANIFEST_FILE
 
 BUNDLES_DIR = Path(__file__).resolve().parents[1] / "fixtures/workloads"
 PATTERNS = ["coupled_physical"]

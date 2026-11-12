@@ -3,8 +3,8 @@ import unittest
 from copy import deepcopy
 from pathlib import Path
 
-from orbitserve.experiments.network_inputs import materialize_network_input
-from orbitserve.runtime import NetworkSpec, candidate_links
+from astermind.builder.physical.network_inputs import materialize_network_input
+from astermind.engine import NetworkSpec, candidate_links
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -93,7 +93,7 @@ class NetworkInputTests(unittest.TestCase):
             materialize_network_input(bad)
 
     def test_user_worker_configuration_is_rejected(self):
-        from orbitserve.experiments.network import run_network_experiment
+        from astermind.builder.physical.network import run_network_experiment
 
         value = json.loads(
             (ROOT / "tests/fixtures/network/multi_shell.json").read_text()

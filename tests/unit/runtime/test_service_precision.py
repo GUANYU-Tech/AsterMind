@@ -1,6 +1,6 @@
 import unittest
 
-from orbitserve.runtime.service_precision import bandwidth_check
+from astermind.engine.service_precision import bandwidth_check
 
 
 class ServicePrecisionTests(unittest.TestCase):

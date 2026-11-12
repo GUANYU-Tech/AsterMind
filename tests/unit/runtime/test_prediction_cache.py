@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 import unittest
 
-from orbitserve.runtime.prediction_cache import PredictionCache
+from astermind.engine.prediction_cache import PredictionCache
 
 
 @dataclass(frozen=True)

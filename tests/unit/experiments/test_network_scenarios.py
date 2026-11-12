@@ -2,10 +2,10 @@ import json
 from pathlib import Path
 import unittest
 
-from orbitserve.experiments.network_inputs import materialize_network_input
-from orbitserve.orbit import walker_delta_elements
-from orbitserve.orbit.sgp4.propagation import _initialize_satellite, _load_sgp4_api
-from orbitserve.runtime import NetworkSpec, candidate_links
+from astermind.builder.physical.network_inputs import materialize_network_input
+from astermind.builder.orbit import walker_delta_elements
+from astermind.builder.orbit.sgp4.propagation import _initialize_satellite, _load_sgp4_api
+from astermind.engine import NetworkSpec, candidate_links
 
 ROOT = Path(__file__).resolve().parents[3]
 

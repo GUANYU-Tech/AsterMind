@@ -5,19 +5,30 @@ OrbitServe is a simulation platform for LEO compute constellations serving globa
 ## Repository Layout
 
 ```text
-simulator/                  SimulationConfig, Native orchestration, audit and replay
-integration/                Mid-Layer Cells and official vLLM Scheduler adapters
-network_sim/                Explicit device topology and physical resource graph
-src/orbitserve/              Shared simulation modules
-  orbit/                     Constellation geometry, orbital motion, visibility, sunlight, and traces
-  workload/                  Canonical workload contracts, validation, loading, and materialization
-  runtime/                   Shared clocks, transport, routing, faults and Native Cell/KV adapters
-  common/                    Policy-free metric DTOs and serialization
-src/experiments/             Native CLI, physical preparation and dataset reuse
-src/workloads/main_composite_chat/  Synthetic workload adapter and source profiles
-examples/                    Versioned, user-facing input examples
-tests/                       Unit, integration, smoke, and slow regression suites
+astermind/
+  builder/      SimulationConfig, scene editing/validation and physical preparation
+    orbit/      SGP4 propagation, frame conversion, visibility, sunlight and traces
+    topology/   Device/Cell graph validation and native topology compilation
+    physical/   Physical datasets, precomputation, loading and exports
+  engine/       Simulation, clocks, transport, routing, faults, Cell/KV execution
+    adapters/   Mid-Layer Cells and official vLLM Scheduler adapters
+    setup/      Network specifications and runtime resource setup
+    state/      Live network state, physical data access and caches
+  workload/     Canonical workload contracts, loading and materialization
+  experiments/  Native and physical CLI entry points
+  common/       Shared contracts, serialization and external-dependency bootstrap
+workloads/      Dataset adapters and source profiles
+examples/       User-facing inputs; Native scenarios are in examples/native/
+tests/          Unit, integration, smoke, Native, browser and distribution tests
+viz/            Static replay frontend and export.py
 ```
+
+Builder owns configuration and physical preparation. Engine owns simulation
+execution and mutable runtime state. Existing topology construction, physical
+sampling, fault handling and dynamic link updates keep their original timing.
+The physical loader and scene capability validator may instantiate Engine
+objects; neither is a replacement for the Native simulation entry point.
+
 
 See `CHANGELOG.md` for release history.
 
@@ -28,7 +39,7 @@ merging requires the repository's CI and maintainer review.
 ## Execution Path
 
 ```text
-orbitserve.experiments.cli
+astermind.experiments.cli
   -> SimulationConfig.load
   -> Simulation
   -> physical_network preparation OR verified physical_dataset reuse
@@ -66,14 +77,14 @@ timebin_demand.csv
 workload_summary.json
 ```
 
-Dataset-specific adapters live under `src/workloads/<dataset>/`. Native simulations take explicit `SimulationConfig.requests`; the old manifest `workload.bundle_dir` is not a Native input.
+Dataset-specific adapters live under `workloads/<dataset>/`. Native simulations take explicit `SimulationConfig.requests`; the old manifest `workload.bundle_dir` is not a Native input.
 
 ## Running Examples
 
 ```bash
-python -m orbitserve.experiments.cli simulator/examples/two_cells_ns3.json \
+python -m astermind.experiments.cli examples/native/two_cells_ns3.json \
   --midlayer-root /path/to/midlayer --out results/cells/ns3.json
-python -m orbitserve.experiments.cli simulator/examples/dynamic_tp2_pp2.json \
+python -m astermind.experiments.cli examples/native/dynamic_tp2_pp2.json \
   --midlayer-root /path/to/midlayer --out results/cells/cross.json --full
 ```
 
@@ -115,7 +126,7 @@ batches without changing these simulated-time semantics.
 ### Reusable physical datasets
 
 Physical preparation and Runtime can run as separate stages. First call
-`orbitserve.experiments.network.run_network_experiment(physical_input, dataset_dir)`.
+`astermind.builder.physical.network.run_network_experiment(physical_input, dataset_dir)`.
 Its completion marker, `physical_dataset.json`, identifies a complete dataset:
 the self-contained materialized input, Orbit/environment trace, every sampled
 node position and candidate link, directional budgets, link events and the
@@ -169,8 +180,8 @@ personal checkout or `local/` settings. Export a complete native JSON input with
 OrbitServe's explicit scenario defaults and optional partial parameters:
 
 ```bash
-python3 -m orbitserve.experiments.islsim_cli --out results/islsim.json
-python3 -m orbitserve.experiments.islsim_cli --input profile.json --out results/islsim.json
+python3 -m astermind.experiments.islsim_cli --out results/islsim.json
+python3 -m astermind.experiments.islsim_cli --input profile.json --out results/islsim.json
 ```
 
 `profile.json` may contain native `tx`/`rx`/`channel` sections or a link profile's
@@ -279,7 +290,7 @@ that hop are discarded on retry, while completed hops are retained.
 
 ### Native Cells from Merge_ML_Version
 
-The first-party `integration/`, `simulator/` and `network_sim/` adapters now run
+The first-party Builder, Engine and native adapters now run
 real Mid-Layer Cells and the official vLLM 0.31 Scheduler on the dynamic Runtime.
 Explicit GPU/switch/terminal graphs support multiple GPUs per satellite, cross-
 satellite TP/PP and per-rank KV migration. The existing `_EventEngine` owns all
@@ -287,19 +298,19 @@ physical hops, resource contention, acquisition and fault recovery. Native COMM
 predictions are not charged again alongside physical communication.
 
 ```bash
-python -m orbitserve.experiments.cli simulator/examples/dynamic_tp2_pp2.json \
+python -m astermind.experiments.cli examples/native/dynamic_tp2_pp2.json \
   --midlayer-root /path/to/midlayer --out results/cells/cross.json
-python -m orbitserve.experiments.cli simulator/examples/dynamic_migration_tp2.json \
+python -m astermind.experiments.cli examples/native/dynamic_migration_tp2.json \
   --midlayer-root /path/to/midlayer --out results/cells/migration.json
 ```
 
-See [native setup, examples, resource semantics and validation](simulator/README.md)
-and [the Runtime adapter contract](src/orbitserve/runtime/CELL_INTEGRATION.md).
+See [native setup, examples, resource semantics and validation](astermind/README.md)
+and [the Runtime adapter contract](astermind/engine/CELL_INTEGRATION.md).
 Mid-Layer source/calibration and native binaries remain external local dependencies.
 Explicit test KV block counts are not hardware-derived HBM limits; bound memory
 policies are checked separately. Native kernel energy is not evaluated.
 
-`python -m simulator.replay REPORT.json --out local/results/native-cells-viewer`
+`python -m viz.export REPORT.json --out local/results/native-cells-viewer`
 exports an offline replay of real Scheduler batches, per-GPU operators, dependency
 edges, physical communication and KV transactions. The local console links it at
 `/native-cells/`. Its checks expose concrete trace violations and keep hardware
@@ -510,7 +521,7 @@ not a promise of identical latency or packet fairness.
 `network/astermind_network.jsonl.gz` exports per-sample cell membership, physical
 rank mappings, internal links, external satellite links and enabled direct ground
 links, including inactive links and budget diagnostics. `export_cell_network`
-is also available from `orbitserve.runtime`. Exact heterogeneous snapshots are
+is also available from `astermind.engine`. Exact heterogeneous snapshots are
 preserved. A usable static snapshot additionally supplies conservative uniform
 `serving_formation_fragment` and `astermind_static_fragment` inputs (minimum
 bandwidth and maximum propagation delay); these approximations are labeled and
@@ -600,7 +611,7 @@ Physical preparation can publish a compact, reusable core independently of full
 JSON snapshots and exchange exports. Combined experiments use the core directly;
 standalone callers retain the full-export default. Parallel exports support
 bounded time chunks and selectable compression levels. See
-[physical data and optional exports](src/experiments/PHYSICAL_DATA.md) for commands, layout,
+[physical data and optional exports](astermind/experiments/PHYSICAL_DATA.md) for commands, layout,
 integrity checks and compatibility with existing data.
 
 ## Tests
@@ -623,7 +634,7 @@ python3 -m unittest tests.unit.runtime.test_radio_capacity \
   tests.integration.fixed_design.test_network_acceptance
 ```
 
-Former Analytical concurrency and DSE matrix tests are removed. Native integration requires the external dependencies documented in `simulator/README.md`.
+Former Analytical concurrency and DSE matrix tests are removed. Native integration requires the external dependencies documented in `astermind/README.md`.
 
 Real ISLSim invocation is an additional local integration suite, separate from
 the four CI suites. With a local checkout and the native backends installed, run:

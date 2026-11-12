@@ -2,8 +2,8 @@ import unittest
 from dataclasses import replace
 from types import SimpleNamespace
 
-from orbitserve.runtime import NetworkNodeSpec, NetworkSpec, LinkProfile, NetworkState, NetworkUnavailable
-from orbitserve.runtime.setup.radio_capacity import radio_parameters, hop_pools, max_min_rates
+from astermind.engine import NetworkNodeSpec, NetworkSpec, LinkProfile, NetworkState, NetworkUnavailable
+from astermind.engine.setup.radio_capacity import radio_parameters, hop_pools, max_min_rates
 from tests.unit.runtime.test_dynamic_network import network
 
 

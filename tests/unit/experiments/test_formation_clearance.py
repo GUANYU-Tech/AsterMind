@@ -8,9 +8,9 @@ from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
-from orbitserve.experiments.formation_validation import validate_formation_input
-from orbitserve.experiments.network import run_network_experiment
-from orbitserve.experiments.network_inputs import materialize_network_input
+from astermind.builder.physical.formation_validation import validate_formation_input
+from astermind.builder.physical.network import run_network_experiment
+from astermind.builder.physical.network_inputs import materialize_network_input
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -78,7 +78,7 @@ class FormationClearanceTests(unittest.TestCase):
 
     def test_unsafe_formation_rejected_before_orbit_export_or_link_budgets(self):
         with tempfile.TemporaryDirectory() as folder, \
-             patch('orbitserve.experiments.network.generate_orbit_trace') as generate:
+             patch('astermind.builder.physical.network.generate_orbit_trace') as generate:
             with self.assertRaisesRegex(ValueError, 'formation keepout preflight failed'):
                 run_network_experiment(legacy_crossing_input(), folder, _workers=1)
             generate.assert_not_called()

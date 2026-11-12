@@ -2,7 +2,7 @@ import io
 import json
 import unittest
 
-from simulator.record_store import CompressedRecords, RecordView
+from astermind.engine.record_store import CompressedRecords, RecordView
 
 
 class RecordStoreTests(unittest.TestCase):

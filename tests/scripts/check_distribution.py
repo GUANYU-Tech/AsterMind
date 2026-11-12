@@ -1,5 +1,7 @@
 """Build an sdist and its wheel; smoke-test the installed artifact outside source."""
 import os
+import argparse
+from contextlib import nullcontext
 from pathlib import Path, PurePosixPath
 import subprocess
 import shutil
@@ -20,43 +22,52 @@ import sys
 
 target = Path(sys.argv[1]).resolve()
 sys.path.insert(0, str(target))
-import orbitserve
-assert Path(orbitserve.__file__).is_relative_to(target), orbitserve.__file__
-modules = list(pkgutil.walk_packages(orbitserve.__path__, orbitserve.__name__ + '.'))
+from astermind.common.bootstrap import activate
+activate()
+import astermind
+assert Path(astermind.__file__).is_relative_to(target), astermind.__file__
+modules = list(pkgutil.walk_packages(astermind.__path__, astermind.__name__ + '.'))
 for module in modules:
     loaded = import_module(module.name)
     assert Path(loaded.__file__).is_relative_to(target), loaded.__file__
-from orbitserve.orbit.sgp4 import frames
+from astermind.builder.orbit.sgp4 import frames
 for name, expected in (
     ('finals2000A.all', frames.PINNED_IERS_A_SHA256),
     ('ReadMe.finals2000A', frames.PINNED_IERS_README_SHA256),
     ('Leap_Second.dat', frames.PINNED_LEAP_SECONDS_SHA256),
 ):
-    resource = files('orbitserve.orbit').joinpath('data/iers/0.2026.5.11.1.8.52', name)
+    resource = files('astermind.builder.orbit').joinpath('data/iers/0.2026.5.11.1.8.52', name)
     assert hashlib.sha256(resource.read_bytes()).hexdigest() == expected, name
 for name in ('state_corpus.json', 'geometry_corpus.json'):
-    json.loads(files('orbitserve.orbit').joinpath('data/stk_validation', name).read_text())
-from orbitserve.experiments.islsim_cli import main
+    json.loads(files('astermind.builder.orbit').joinpath('data/stk_validation', name).read_text())
+from astermind.experiments.islsim_cli import main
 output = Path.cwd() / 'islsim.json'
 assert main(['--out', str(output)]) == 0
 assert set(json.loads(output.read_text())) == {'tx', 'rx', 'channel'}
-for name in ('network_sim', 'network_sim.topology', 'simulator.config',
-             'simulator.network', 'simulator.engine', 'integration'):
+for name in ('astermind.builder.models', 'astermind.builder.topology', 'astermind.builder.config',
+             'astermind.engine.network_host', 'astermind.engine.simulation', 'astermind.engine.adapters'):
     loaded = import_module(name)
     assert Path(loaded.__file__).is_relative_to(target), loaded.__file__
-from simulator.config import SimulationConfig
-identity = json.loads(files('integration').joinpath('runtime/vllm_0_31_identity.json').read_text())
+from astermind.builder.config import SimulationConfig
+identity = json.loads(files('astermind.engine.adapters').joinpath('runtime/vllm_0_31_identity.json').read_text())
 assert identity, 'native Scheduler identity must be packaged'
-assert files('integration').joinpath('requirements-scheduler-latest.lock').is_file()
-scene = files('simulator').joinpath('examples/dynamic_tp2_pp2.json')
+assert files('astermind.engine.adapters').joinpath('requirements-scheduler-latest.lock').is_file()
+scene = files('examples.native').joinpath('dynamic_tp2_pp2.json')
 config = SimulationConfig.load(scene)
 assert config.cells[0].parallel.workers == 4
 assert len(config.topology().devices) == 11
 assert Path(config.physical_network).is_file()
 for name in ('index.html', 'replay.js', 'replay.css'):
-    assert files('simulator').joinpath('web', name).is_file(), name
-from simulator.replay import audit_checks
+    assert files('viz').joinpath(name).is_file(), name
+from viz.export import audit_checks
 assert callable(audit_checks)
+from workloads.main_composite_chat import adapter
+assert Path(adapter.__file__).is_relative_to(target)
+assert adapter.load_countries(adapter.DEFAULT_COUNTRIES)
+assert adapter.gateways()
+for profile, day_type in adapter.PROFILE_PATTERNS.values():
+    assert adapter.load_regional_hour_weights(profile, day_type)
+
 print(f'Installed wheel: {len(modules)} modules imported; reference hashes and portable CLI verified.')
 '''
 
@@ -92,7 +103,13 @@ def main():
     environment = {**os.environ, 'PYTHONDONTWRITEBYTECODE': '1',
                    'ORBITSERVE_ISLSIM_ROOT': '/nonexistent/orbitserve-islsim-package-check'}
     environment.pop('PYTHONPATH', None)
-    with TemporaryDirectory(prefix='orbitserve-distribution-') as folder:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--work-dir", type=Path, help="retain build/install/replay evidence in a new directory")
+    args = parser.parse_args()
+    if args.work_dir:
+        args.work_dir.mkdir(parents=True, exist_ok=False)
+    context = nullcontext(str(args.work_dir.resolve())) if args.work_dir else TemporaryDirectory(prefix='astermind-distribution-')
+    with context as folder:
         workspace = Path(folder)
         source_root = workspace / 'source'
         copy_source(root, source_root)
@@ -112,6 +129,15 @@ def main():
                         str(installed), str(wheels[0])], check=True, env=environment)
         subprocess.run([sys.executable, '-I', '-B', '-c', SMOKE, str(installed)],
                        cwd=workspace, check=True, env=environment)
+        # Child native workers must import the installed package too.
+        native_env = {**environment, 'PYTHONPATH': str(installed)}
+        report = workspace / 'native_result.json'
+        subprocess.run([sys.executable, '-B', '-m', 'astermind',
+                        '--scenario', str(installed / 'examples/native/two_cells_ns3.json'),
+                        '--output', str(report)], cwd=workspace, check=True, env=native_env)
+        subprocess.run([sys.executable, '-B', '-m', 'viz.export', str(report),
+                        '--out', str(workspace / 'replay')],
+                       cwd=workspace, check=True, env=native_env)
 
 
 if __name__ == '__main__':

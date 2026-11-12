@@ -7,8 +7,8 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
-from orbitserve.runtime import LinkProfile, NetworkState
-from orbitserve.runtime.setup.sun_geometry import receiver_sun_separation, sun_visible
+from astermind.engine import LinkProfile, NetworkState
+from astermind.engine.setup.sun_geometry import receiver_sun_separation, sun_visible
 from tests.unit.runtime.test_dynamic_network import network
 
 

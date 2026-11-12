@@ -7,12 +7,12 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from orbitserve.runtime import NetworkState
+from astermind.engine import NetworkState
 from tests.network_case import run_traffic
-from orbitserve.runtime.setup import islsim
-from orbitserve.experiments.network import run_network_experiment
-from orbitserve.experiments.network_inputs import snapshot_network_input
-from orbitserve.experiments.physical_dataset import input_fingerprint, load_dataset
+from astermind.engine.setup import islsim
+from astermind.builder.physical.network import run_network_experiment
+from astermind.builder.physical.network_inputs import snapshot_network_input
+from astermind.builder.physical.physical_dataset import input_fingerprint, load_dataset
 from tests.integration.fixed_design.test_network_acceptance import acceptance_spec
 from tests.integration.fixed_design.test_dynamic_network_experiment import manifest
 

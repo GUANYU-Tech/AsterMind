@@ -3,10 +3,10 @@
 import unittest
 from types import SimpleNamespace
 
-from simulator.engine import Simulation
-from orbitserve.runtime.engine.cell_events import CellCompletion
-from orbitserve.runtime.engine.cell_migration import NetworkKVMigration
-from orbitserve.runtime.timeline import GlobalTimeline
+from astermind.engine.simulation import Simulation
+from astermind.engine.cell_events import CellCompletion
+from astermind.engine.cell_migration import NetworkKVMigration
+from astermind.engine.timeline import GlobalTimeline
 
 
 class Cell:
@@ -117,7 +117,7 @@ class CellMigrationTests(unittest.TestCase):
         runtime.config = SimpleNamespace(migrations=(SimpleNamespace(id="kv", mode="move", source_cell="A", target_cell="B", session_id="session", context_id="ctx", after_request="request"),))
         runtime._record_request = lambda *args: None
         runtime._finish = lambda *args: None
-        from orbitserve.runtime.clock import Time
+        from astermind.engine.clock import Time
         runtime._completed(CellCompletion("A", "request", Time(), Time(), Time(), None, None, 1, 0., 0.))
         loop.run(until_s=1)
         for send in sends:

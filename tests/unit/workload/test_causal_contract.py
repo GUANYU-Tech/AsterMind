@@ -2,11 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from orbitserve.workload.contract import (
-    CAUSAL_SESSION_REQUEST_KEYS,
-    validate_exact_keys,
-    validate_session_consistency,
-)
+from astermind.workload.contract import CAUSAL_SESSION_REQUEST_KEYS, validate_exact_keys, validate_session_consistency
 
 
 def _row(**updates):

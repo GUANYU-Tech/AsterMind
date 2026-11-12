@@ -5,9 +5,9 @@ from dataclasses import replace
 from unittest.mock import patch
 
 from tests.network_case import run_traffic
-from orbitserve.runtime.engine.fluid_transport import FluidTransport
-from orbitserve.runtime.engine.simgrid_transport import SimGridTransport
-from orbitserve.runtime.engine.ns3_transport import Ns3Transport
+from astermind.engine.fluid_transport import FluidTransport
+from astermind.engine.simgrid_transport import SimGridTransport
+from astermind.engine.ns3_transport import Ns3Transport
 from tests.integration.fixed_design.test_network_acceptance import acceptance_spec
 from tests.unit.runtime.test_network_time_consistency import temporal_state, expected_rate
 

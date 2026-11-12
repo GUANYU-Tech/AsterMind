@@ -5,8 +5,8 @@ from pathlib import Path
 import unittest
 
 from pydantic import ValidationError
-from simulator.config import SimulationConfig
-from simulator.scene import SceneDeployment
+from astermind.builder.config import SimulationConfig
+from astermind.builder.scene import SceneDeployment
 
 
 class TimelineModeConfigTests(unittest.TestCase):
@@ -14,7 +14,7 @@ class TimelineModeConfigTests(unittest.TestCase):
         value = json.loads(
             (
                 Path(__file__).resolve().parents[3]
-                / "simulator/examples/two_cells.json"
+                / "examples/native/two_cells.json"
             ).read_text()
         )
         value.update(updates)

@@ -4,9 +4,9 @@ import importlib.util
 from types import SimpleNamespace
 import unittest
 
-from simulator.bootstrap import activate
-from simulator.network import DeviceCommunicationRuntime, DeviceRuntimeHost
-from orbitserve.runtime.engine.cell_bridge import CellTransfer
+from astermind.common.bootstrap import activate
+from astermind.engine.network_host import DeviceCommunicationRuntime, DeviceRuntimeHost
+from astermind.engine.cell_bridge import CellTransfer
 from tests.unit.runtime.test_scoped_protobridge import graph
 
 
@@ -109,7 +109,7 @@ class SimGridDeviceTimelineTests(unittest.TestCase):
                 )
 
     def test_hosted_same_time_callbacks_preserve_native_double_and_pending_count(self):
-        from orbitserve.runtime.engine.simgrid_events import simgrid_time
+        from astermind.engine.simgrid_events import simgrid_time
 
         config = SimpleNamespace(
             horizon_ns=1_000_000_000,
@@ -140,7 +140,7 @@ class SimGridDeviceTimelineTests(unittest.TestCase):
         self.assertEqual(host.timeline.report()["pending_events"], 0)
 
     def test_manual_device_fault_and_restore_on_all_three_scopes(self):
-        from simulator.device_controls import apply_device_command
+        from astermind.engine.device_controls import apply_device_command
 
         for mode in ("flowsim", "protobridge_satellite", "protobridge_cell"):
             with self.subTest(mode=mode):

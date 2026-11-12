@@ -3,8 +3,8 @@ import unittest
 from dataclasses import replace
 from types import SimpleNamespace
 
-from orbitserve.runtime.engine.events import _EventEngine
-from orbitserve.runtime.state.network import NetworkState
+from astermind.engine.events import _EventEngine
+from astermind.engine.state.network import NetworkState
 from tests.unit.runtime.test_dynamic_network import network
 
 
@@ -150,7 +150,7 @@ class RecoveryTests(unittest.TestCase):
         self.verify_middle_hop_retains_delivered_prefix("simgrid")
 
     def verify_long_access_recovery(self, mode):
-        from orbitserve.runtime import LinkProfile
+        from astermind.engine import LinkProfile
         from tests.network_case import NetworkCase, traffic, run_traffic
 
         request = {**traffic(arrival=7.25), "input_bytes": 7750}

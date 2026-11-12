@@ -1,8 +1,8 @@
 import math
 import unittest
 
-from orbitserve.orbit import walker_delta_elements, tle_elements, propagate_sgp4_teme, dawn_dusk_elements
-from orbitserve.orbit.sgp4.propagation import _initialize_satellite, _load_sgp4_api
+from astermind.builder.orbit import walker_delta_elements, tle_elements, propagate_sgp4_teme, dawn_dusk_elements
+from astermind.builder.orbit.sgp4.propagation import _initialize_satellite, _load_sgp4_api
 
 
 class Sgp4InitializationTests(unittest.TestCase):

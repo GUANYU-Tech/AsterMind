@@ -3,7 +3,7 @@
 import unittest
 from dataclasses import replace
 
-from orbitserve.runtime.setup.faults import realize_runtime_faults, validate_random_faults
+from astermind.engine.setup.faults import realize_runtime_faults, validate_random_faults
 from tests.unit.runtime.test_dynamic_network import network
 
 

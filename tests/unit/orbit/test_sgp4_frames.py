@@ -7,23 +7,11 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from unittest.mock import patch
 
-from orbitserve.orbit import (
-    ASTROPY_ENGINE_VERSION,
-    PINNED_IERS_A_SHA256,
-    PINNED_IERS_DATA_RELEASE,
-    PINNED_IERS_README_SHA256,
-    PINNED_LEAP_SECONDS_SHA256,
-    SGP4_EARTH_FIXED_REFERENCE_FRAME,
-    Sgp4FrameTransformError,
-    Sgp4PropagationResult,
-    Sgp4TemeSample,
-    propagate_sgp4_teme,
-    transform_sgp4_teme_to_itrs,
-)
-from orbitserve.orbit.sgp4 import frames as frame_module
+from astermind.builder.orbit import ASTROPY_ENGINE_VERSION, PINNED_IERS_A_SHA256, PINNED_IERS_DATA_RELEASE, PINNED_IERS_README_SHA256, PINNED_LEAP_SECONDS_SHA256, SGP4_EARTH_FIXED_REFERENCE_FRAME, Sgp4FrameTransformError, Sgp4PropagationResult, Sgp4TemeSample, propagate_sgp4_teme, transform_sgp4_teme_to_itrs
+from astermind.builder.orbit.sgp4 import frames as frame_module
 
-from .test_sgp4_propagation import _has_tested_sgp4, _iss_bundle
-from .test_sgp4_elements import _bundle
+from tests.unit.orbit.test_sgp4_propagation import _has_tested_sgp4, _iss_bundle
+from tests.unit.orbit.test_sgp4_elements import _bundle
 
 
 def _has_tested_astropy():

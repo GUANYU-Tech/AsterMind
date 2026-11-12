@@ -3,7 +3,7 @@
 import unittest
 from dataclasses import replace
 
-from orbitserve.runtime import NetworkState, NetworkUnavailable
+from astermind.engine import NetworkState, NetworkUnavailable
 from tests.unit.runtime.test_dynamic_network import network
 
 

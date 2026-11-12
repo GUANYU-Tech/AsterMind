@@ -6,27 +6,10 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
-from orbitserve.orbit import (
-    ASTROPY_ENGINE_VERSION,
-    ORBIT_TRACE_SCOPE,
-    SGP4_ENGINE_VERSION,
-    SGP4_ORBIT_TRACE_MODEL,
-    WGS84_SEMI_MAJOR_AXIS_KM,
-    Sgp4EarthFixedResult,
-    Sgp4ElementBundle,
-    Sgp4ItrsSample,
-    Sgp4PropagationResult,
-    Sgp4SunPositionResult,
-    Sgp4SunPositionSample,
-    Sgp4TemeSample,
-    evaluate_sgp4_geometry,
-    generate_orbit_trace,
-    load_orbit_trace,
-    write_sgp4_orbit_trace,
-)
+from astermind.builder.orbit import ASTROPY_ENGINE_VERSION, ORBIT_TRACE_SCOPE, SGP4_ENGINE_VERSION, SGP4_ORBIT_TRACE_MODEL, WGS84_SEMI_MAJOR_AXIS_KM, Sgp4EarthFixedResult, Sgp4ElementBundle, Sgp4ItrsSample, Sgp4PropagationResult, Sgp4SunPositionResult, Sgp4SunPositionSample, Sgp4TemeSample, evaluate_sgp4_geometry, generate_orbit_trace, load_orbit_trace, write_sgp4_orbit_trace
 
-from .test_sgp4_elements import _bundle
-from .test_sgp4_geometry import _has_version
+from tests.unit.orbit.test_sgp4_elements import _bundle
+from tests.unit.orbit.test_sgp4_geometry import _has_version
 
 
 def _pipeline_inputs(times=(0.0, 60.0)):
@@ -312,7 +295,7 @@ class SampleHoldWindowsTests(unittest.TestCase):
     def test_sampled_window_transition_uses_observed_boundary_without_interpolation(
         self,
     ):
-        from orbitserve.orbit.sgp4.geometry import _state_windows
+        from astermind.builder.orbit.sgp4.geometry import _state_windows
 
         samples = (
             (0.0, False, -1.0),
@@ -331,7 +314,7 @@ class BatchedTraceTests(unittest.TestCase):
         times = tuple(float(t) for t in range(122))
         with tempfile.TemporaryDirectory() as folder:
             handoff, timings = [], {}
-            with patch('orbitserve.orbit.trace.load_orbit_trace', side_effect=AssertionError('intermediate trace read')):
+            with patch('astermind.builder.orbit.trace.load_orbit_trace', side_effect=AssertionError('intermediate trace read')):
                 generate_orbit_trace(Path(folder)/'parallel', elements=_bundle(),
                     simulation_epoch_utc='2026-07-20T00:00:00.000000Z',
                     sample_times_s=times, ground_ingresses=(),
@@ -354,8 +337,8 @@ class BatchedTraceTests(unittest.TestCase):
     def test_time_batches_preserve_states_and_merge_windows_without_boundary_duplicates(
         self,
     ):
-        from orbitserve.orbit.sgp4.elements import load_sgp4_element_bundle
-        from orbitserve.orbit.sgp4.trace import _state_partition
+        from astermind.builder.orbit.sgp4.elements import load_sgp4_element_bundle
+        from astermind.builder.orbit.sgp4.trace import _state_partition
 
         bundle = load_sgp4_element_bundle(_bundle())
         times = tuple(float(t) for t in range(122))
@@ -376,7 +359,7 @@ class BatchedTraceTests(unittest.TestCase):
                 workers=1,
             )
             propagation, fixed = _state_partition((bundle, epoch, times))
-            from orbitserve.orbit import evaluate_sgp4_geometry
+            from astermind.builder.orbit import evaluate_sgp4_geometry
 
             geometry = evaluate_sgp4_geometry(
                 fixed,

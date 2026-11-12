@@ -22,7 +22,7 @@ class NativeCommunicationModesTests(unittest.TestCase):
                 self.assertTrue(all(c["steps"] for c in result["cells"].values()))
                 self.assertEqual(result["provenance"]["communication_mode"], mode)
                 results[mode] = result
-                from simulator.replay import audit_checks
+                from viz.export import audit_checks
 
                 self.assertTrue(
                     all(not group["violations"] for group in audit_checks(result)), mode
@@ -54,7 +54,8 @@ class NativeCommunicationModesTests(unittest.TestCase):
         )
 
     def test_scene_builder_preserves_gpu_and_physical_resources(self):
-        from simulator.scene import build_scene, validate_scene_config
+        from astermind.builder.scene import build_scene
+        from astermind.builder.validation import validate_scene_config
         from pydantic import ValidationError
 
         config = build_scene(self.dataset, dict(tp=2, pp=1, gpus_per_satellite=2))

@@ -3,14 +3,14 @@
 import importlib.util
 import unittest
 
-from orbitserve.runtime.engine.flowsim_transport import FlowSimTransport
-from orbitserve.runtime.setup.network_spec import NetworkNodeSpec
+from astermind.engine.flowsim_transport import FlowSimTransport
+from astermind.engine.setup.network_spec import NetworkNodeSpec
 
 
 @unittest.skipUnless(importlib.util.find_spec("_flowsim"), "requires shared-runtime FlowSim")
 class FlowSimTransportTests(unittest.TestCase):
     def test_tiny_service_records_its_native_clock_interval(self):
-        from orbitserve.runtime.service_precision import bandwidth_check
+        from astermind.engine.service_precision import bandwidth_check
         nodes={name:NetworkNodeSpec(name,'compute') for name in ('a','b')}
         engine=FlowSimTransport(nodes,({'link_id':'ab','endpoint_a':'a','endpoint_b':'b'},),{})
         self.addCleanup(engine.close)
@@ -48,7 +48,7 @@ class FlowSimTransportTests(unittest.TestCase):
         self.assertAlmostEqual(result['time_s'], 7.25 + 8_000_000 / 2.3e9, places=12)
 
     def test_flowsim_is_default_transport(self):
-        from orbitserve.runtime import LinkProfile, NetworkSpec
+        from astermind.engine import LinkProfile, NetworkSpec
 
         nodes = (NetworkNodeSpec("a", "compute"), NetworkNodeSpec("b", "compute"))
         network = NetworkSpec(nodes, {"communication_isl": LinkProfile(1000, 0)})

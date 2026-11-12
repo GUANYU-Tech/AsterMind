@@ -5,23 +5,9 @@ import unittest
 from dataclasses import replace
 from importlib.metadata import PackageNotFoundError, version
 
-from orbitserve.orbit import (
-    ASTROPY_ENGINE_VERSION,
-    SGP4_ENGINE_VERSION,
-    SGP4_GEOMETRY_SCHEMA,
-    WGS84_SEMI_MAJOR_AXIS_KM,
-    Sgp4EarthFixedResult,
-    Sgp4GroundIngress,
-    Sgp4ItrsSample,
-    Sgp4SunPositionResult,
-    Sgp4SunPositionSample,
-    compute_sgp4_sun_positions_itrs,
-    evaluate_sgp4_geometry,
-    propagate_sgp4_teme,
-    transform_sgp4_teme_to_itrs,
-)
+from astermind.builder.orbit import ASTROPY_ENGINE_VERSION, SGP4_ENGINE_VERSION, SGP4_GEOMETRY_SCHEMA, WGS84_SEMI_MAJOR_AXIS_KM, Sgp4EarthFixedResult, Sgp4GroundIngress, Sgp4ItrsSample, Sgp4SunPositionResult, Sgp4SunPositionSample, compute_sgp4_sun_positions_itrs, evaluate_sgp4_geometry, propagate_sgp4_teme, transform_sgp4_teme_to_itrs
 
-from .test_sgp4_elements import _bundle
+from tests.unit.orbit.test_sgp4_elements import _bundle
 
 
 def _has_version(package, expected):

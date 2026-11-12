@@ -2,8 +2,8 @@
 import importlib.util
 import unittest
 
-from orbitserve.runtime import NetworkNodeSpec, LinkProfile
-from orbitserve.runtime.engine.fluid_transport import FluidTransport
+from astermind.engine import NetworkNodeSpec, LinkProfile
+from astermind.engine.fluid_transport import FluidTransport
 
 
 def radio_fixture():
@@ -52,11 +52,11 @@ class RadioSharingTests(unittest.TestCase):
 
     @unittest.skipUnless(importlib.util.find_spec('simgrid'), 'requires native SimGrid')
     def test_simgrid_native_shared_rf_resources(self):
-        from orbitserve.runtime.engine.simgrid_transport import SimGridTransport
+        from astermind.engine.simgrid_transport import SimGridTransport
         self.verify(SimGridTransport)
 
     @unittest.skipUnless(importlib.util.find_spec('ns'), 'requires native ns-3')
     def test_ns3_packet_rf_arbitration(self):
-        from orbitserve.runtime.engine.ns3_transport import Ns3Transport
+        from astermind.engine.ns3_transport import Ns3Transport
         self.verify(Ns3Transport, packet=True)
 

@@ -5,11 +5,8 @@ import unittest
 from dataclasses import replace
 from unittest.mock import patch
 
-from orbitserve.runtime import LinkProfile, NetworkSpec, check_network_backend
-from orbitserve.runtime.engine.simgrid_transport import (
-    SimGridTransport,
-    SimGridUnavailable,
-)
+from astermind.engine import LinkProfile, NetworkSpec, check_network_backend
+from astermind.engine.simgrid_transport import SimGridTransport, SimGridUnavailable
 from tests.network_case import NetworkCase, run_traffic, traffic
 
 
@@ -44,7 +41,7 @@ class TransportConfigurationTests(unittest.TestCase):
             scenario, network=replace(scenario.network, transport_model="simgrid")
         )
         with patch(
-            "orbitserve.runtime.engine.simgrid_transport.importlib.util.find_spec",
+            'astermind.engine.simgrid_transport.importlib.util.find_spec',
             return_value=None,
         ):
             with self.assertRaisesRegex(SimGridUnavailable, "optional dependency"):

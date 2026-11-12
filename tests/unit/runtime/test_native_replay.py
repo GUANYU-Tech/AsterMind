@@ -4,13 +4,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from simulator.config import SimulationConfig
-from simulator.replay import audit_checks, export_reports, native_ns, replay_data
+from astermind.builder.config import SimulationConfig
+from viz.export import audit_checks, export_reports, native_ns, replay_data
 
 
 def report():
     """Small recorded-contract fixture; actual native runs are checked separately."""
-    path = Path(__file__).resolve().parents[3] / "simulator/examples/two_cells.json"
+    path = Path(__file__).resolve().parents[3] / "examples/native/two_cells.json"
     config = json.loads(path.read_text())
     config["requests"] = [config["requests"][0]]
     config["requests"][0]["output_tokens"] = 1

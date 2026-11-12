@@ -3,7 +3,7 @@ requires = ["setuptools>=84.1.0", "pybind11>=2.13,<4"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "OrbitServe"
+name = "AsterMind"
 version = "0.0.1"
 description = "Native fixed-design LEO AI serving simulation."
 readme = "README.md"
@@ -22,31 +22,18 @@ ns3 = ["ns3==3.44.post0"]
 
 [tool.setuptools]
 include-package-data = false
-packages = [
-  "simulator",
-  "network_sim",
-  "integration",
-  "orbitserve",
-  "orbitserve.common",
-  "orbitserve.experiments",
-  "orbitserve.runtime",
-  "orbitserve.runtime.engine",
-  "orbitserve.runtime.setup",
-  "orbitserve.runtime.state",
-  "orbitserve.orbit",
-  "orbitserve.orbit.sgp4",
-  "orbitserve.orbit.validation",
-  "orbitserve.workload",
-]
 
-[tool.setuptools.package-dir]
-orbitserve = "src/orbitserve"
-"orbitserve.experiments" = "src/experiments"
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["astermind*", "viz", "workloads*", "examples", "examples.native"]
+namespaces = false
 
 [tool.setuptools.package-data]
-"simulator" = ["examples/*.json", "web/*.html", "web/*.css", "web/*.js"]
-"integration" = ["runtime/*.json", "requirements-scheduler-latest.lock"]
-"orbitserve.orbit" = [
+"viz" = ["*.html", "*.css", "*.js"]
+"examples.native" = ["*.json"]
+"workloads.main_composite_chat" = ["countries.csv", "gateways.json", "profiles/*.csv", "profiles/*.json"]
+"astermind.engine.adapters" = ["runtime/*.json", "requirements-scheduler-latest.lock", "patches/*.patch", "*.patch"]
+"astermind.builder.orbit" = [
   "data/iers/0.2026.5.11.1.8.52/*",
   "data/stk_validation/*.json",
 ]

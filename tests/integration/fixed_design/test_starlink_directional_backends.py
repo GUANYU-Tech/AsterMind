@@ -3,7 +3,7 @@ from dataclasses import replace
 import importlib.util
 import unittest
 
-from orbitserve.runtime import LinkProfile
+from astermind.engine import LinkProfile
 from tests.network_case import run_traffic
 from tests.integration.fixed_design.test_network_acceptance import acceptance_spec
 from tests.unit.runtime.test_starlink_presets import generated_profiles

@@ -3,10 +3,11 @@
 from types import SimpleNamespace
 import unittest
 
-from network_sim import PhysicalTopology, Scenario
-from orbitserve.runtime.engine.cell_bridge import CellTransfer, CellTransferExecutor
-from simulator.bootstrap import activate
-from simulator.network import DeviceCommunicationRuntime, DeviceRuntimeHost
+from astermind.builder.topology import PhysicalTopology
+from astermind.builder.models import Scenario
+from astermind.engine.cell_bridge import CellTransfer, CellTransferExecutor
+from astermind.common.bootstrap import activate
+from astermind.engine.network_host import DeviceCommunicationRuntime, DeviceRuntimeHost
 
 
 def graph(schedule=()):
@@ -77,7 +78,7 @@ class ScopedProtoBridgeTests(unittest.TestCase):
         activate()
 
     def test_native_host_registers_control_boundaries_on_shared_clock(self):
-        from orbitserve.runtime import runtime_control
+        from astermind.engine import runtime_control
 
         controller = SimpleNamespace()
         config = SimpleNamespace(

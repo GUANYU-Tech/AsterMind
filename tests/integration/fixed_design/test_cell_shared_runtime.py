@@ -5,21 +5,12 @@ import unittest
 from dataclasses import replace
 from types import SimpleNamespace
 
-from orbitserve.runtime import (
-    CommunicationExecutor,
-    LinkProfile,
-    PhysicalTransfer,
-)
-from orbitserve.runtime.engine.cell_bridge import (
-    CellTransfer,
-    CellTransferExecutor,
-    RuntimeCellNetwork,
-    bind_batch_executor,
-)
-from orbitserve.runtime.engine.cell_events import CellCompletion, CellTokenOutput, CellRequest
-from orbitserve.runtime.engine.cell_migration import NetworkKVMigration
-from orbitserve.runtime.network import RuntimeNetworkFrames
-from orbitserve.runtime.timeline import GlobalTimeline
+from astermind.engine import CommunicationExecutor, LinkProfile, PhysicalTransfer
+from astermind.engine.cell_bridge import CellTransfer, CellTransferExecutor, RuntimeCellNetwork, bind_batch_executor
+from astermind.engine.cell_events import CellCompletion, CellTokenOutput, CellRequest
+from astermind.engine.cell_migration import NetworkKVMigration
+from astermind.engine.network import RuntimeNetworkFrames
+from astermind.engine.timeline import GlobalTimeline
 from tests.network_case import _trace, _network, run_network, NetworkCase
 
 
@@ -237,7 +228,7 @@ class CellSharedRuntimeTests(unittest.TestCase):
         runtime = ProbeRuntime(setup)
         spec = scenario(faults=(fault,), failure_policy="fail")
         # Use the generated identifier rather than assume a link-name convention.
-        from orbitserve.runtime.engine.topology import candidate_links
+        from astermind.engine.topology import candidate_links
 
         link = next(
             e for e in candidate_links(spec.network) if e["kind"] == "communication_isl"

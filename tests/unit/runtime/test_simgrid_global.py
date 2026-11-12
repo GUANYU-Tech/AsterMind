@@ -4,9 +4,9 @@ import importlib.util
 import unittest
 from types import SimpleNamespace
 
-from orbitserve.runtime.clock import Time
-from orbitserve.runtime.engine.simgrid_events import SimGridEventQueue, native_time
-from orbitserve.runtime.engine.simgrid_transport import SimGridTransport
+from astermind.engine.clock import Time
+from astermind.engine.simgrid_events import SimGridEventQueue, native_time
+from astermind.engine.simgrid_transport import SimGridTransport
 
 
 @unittest.skipUnless(importlib.util.find_spec("simgrid"), "requires native SimGrid")

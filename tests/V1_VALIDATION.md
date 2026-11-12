@@ -128,3 +128,97 @@ Logs and generated artifacts stay outside the repository under
 `v2-batch2-tests.log`, `v2-full-retained.log`, `v2-native.log`,
 `v2-distribution.log`, `v2-replay-and-comparison.log`, `v2-native-reports/`
 and `v2-replay/`. The spawn-safe launcher is `v2-retained-suite.py`.
+
+## Builder / Engine layout migration (2026-11-13)
+
+Branch: `version/AsterMind-V1.0`. Frozen baseline:
+`58f5cf6818bef90d10a406e3c4766c99a410cfad`.
+
+### Scope
+
+- Move the Python package to root `astermind/`; configuration, orbit, topology,
+  scene validation and physical preparation live in `builder/`.
+- Merge the current Runtime and Native execution under `engine/`, retaining
+  `setup/`, `state/`, and the native dependency adapters under `adapters/`.
+- Keep `load_physics` and `validate_scene_config` intact. Their existing Engine
+  dependencies and call timing remain unchanged. The Native CLI still loads
+  `SimulationConfig` directly; validation is not inserted into the ns3 path.
+- Split static model types, execution event contracts and shared scalar contracts
+  without changing their class bodies. Remove only the unused canonical topology
+  adapter; retain `device_numbers` and native graph compilation.
+- Put source dataset adapters in root `workloads/`, Native examples in
+  `examples/native/`, and replay export plus static assets in `viz/`.
+- Preserve serialized schemas, provenance identities, environment variables and
+  computation/communication semantics. Update imports, worker module names,
+  dependency/resource anchors, CLI instructions and distribution resources.
+- A real browser reproduced an existing scene-switch bug: a selected call index
+  from the larger scene was used against the smaller scene before resetting it.
+  Reset that selection before rebuilding the options. No UI redesign is included.
+
+### Differential contract
+
+Two original nine-scenario runs established baseline repeatability. A further
+baseline run retained temporary physical datasets and memory-policy inputs so
+path equivalence could be checked by content, not assumed from filenames.
+
+`tests/scripts/compare_migration.py` compares complete reports and all preserved
+inputs. Exceptions are limited to:
+
+1. Explicit host wall timings and memory-availability probes, including the four
+   known kernel preparation/prediction wall-time fields. Other measurement,
+   cache, network, Cell and audit fields remain exact.
+2. Validated host Cell initialization progress. `FIRST_COMPLETED` can observe
+   either worker first or several workers together. Capacity, total workers,
+   initial/final completion and valid active membership are checked; intermediate
+   host poll granularity is not treated as a simulated event.
+3. Paths whose saved physical dataset or memory-policy contents have been
+   verified equivalent. Physical file hashes are checked before comparison;
+   only explicit physical-preparation wall timings and their corresponding
+   `core_result.json` manifest hash are canonicalized. Orbit manifests,
+   propagation values, numeric shards and physical-state databases remain exact.
+4. Independent transfer observations at the same clock tick. No sorting crosses
+   time or a global control record, and each individual transfer's order stays
+   intact. Request/compute/dependency/decision sequences are not sorted.
+
+The comparison tests deliberately change timing, byte counters, migration state,
+provenance, input identities and observation order to verify that real differences
+are rejected. They also reject invalid/coalesced startup records that violate
+capacity or completion constraints.
+
+### Verification
+
+- Batch 1: 16 configuration, physical contract and scene catalog smoke tests pass.
+- Batch 2: 23 module import, orbit identity, frozen corpus and SimGrid timeline
+  smoke tests pass after correcting serialized identities and test imports.
+- Retained regression: all 459 tests pass in 188.906 s, with no skips (453
+  original tests plus 6 comparison checks); final run is recorded in `retained-459.log`. The same 20 FlowSim-dependent tests are explicitly
+  excluded at the user's request. External ISLSim tests are outside this run.
+- Nine real Native scenarios: ns3 TP2 KV move/prefix reuse; SimGrid direct,
+  satellite and Cell communication; KV move/prefix reuse; cross-satellite TP2/PP2
+  recovery; failed migration rollback; heterogeneous HBM; MoE TP2/EP2.
+  These use the pinned Midlayer, official vLLM Scheduler, ns3 and SimGrid.
+  An import guard rejects execution of `_flowsim`; the legacy communication mode
+  value `flowsim` denotes direct communication and does not select that backend.
+- All 12 reports from those nine scenarios and 8 saved input sets compare without
+  simulation differences. All 13 JSON files exported from the normalized reports
+  (12 replays and catalog) are byte-identical between old and new exporters.
+- Three unchanged real reports additionally produce byte-identical replay JSON.
+  Chromium verifies case/deep-link/reload, play/pause/speed, slider/time entry,
+  event/key-moment jumps, filters/search, call dependencies, topology device/link
+  inspection, batch/KV details, canvas hover/click/wheel and audit/source views.
+  The original cross-case selection failure is reproduced on baseline and passes
+  after the fix. No page errors or failed HTTP responses occur.
+- Six fixed-state screenshots, at 1440x1000 and 768x1000, are byte-identical.
+- sdist -> wheel -> installation outside source imports 126 package modules,
+  verifies orbital/native/frontend/workload resources, executes real ns3 Native
+  simulation and exports its result. The installed report and calculated audit
+  match the original CLI baseline under the same comparison contract; the
+  installed replay passes the browser interaction checks.
+- Static review compares 629 top-level production function/class ASTs: after
+  import relocation, differences are limited to five reviewed bootstrap/build/
+  diagnostic-path adjustments. Split model bodies and retained topology methods
+  match the original ASTs. Ruff F rules and `git diff --check` pass.
+
+Logs, complete reports, preserved inputs, built distributions and browser evidence
+are outside the repository at `/data1/guolidong/.orbitserve-v3/`. Nothing is pushed
+as part of this iteration.

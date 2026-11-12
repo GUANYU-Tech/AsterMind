@@ -8,19 +8,12 @@ from io import StringIO
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from orbitserve.runtime import GlobalTimeline
-from orbitserve.runtime.communication import FrameRouter
-from orbitserve.runtime.engine import ns3_worker
-from orbitserve.runtime.engine.cell_bridge import RuntimeCellNetwork
-from orbitserve.runtime.engine.ns3_transport import Ns3Transport, Ns3Unavailable
-from orbitserve.runtime.network import (
-    CandidateTopologyGraph,
-    CandidateTopologyLink,
-    EstablishedLink,
-    LinkState,
-    NetworkNodeState,
-    NetworkStateFrame,
-)
+from astermind.engine import GlobalTimeline
+from astermind.engine.communication import FrameRouter
+from astermind.engine import ns3_worker
+from astermind.engine.cell_bridge import RuntimeCellNetwork
+from astermind.engine.ns3_transport import Ns3Transport, Ns3Unavailable
+from astermind.engine.network import CandidateTopologyGraph, CandidateTopologyLink, EstablishedLink, LinkState, NetworkNodeState, NetworkStateFrame
 
 
 class CellContractTests(unittest.TestCase):

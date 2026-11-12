@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import unittest
 
-from simulator.request_batch import parse_rows, prepare_batch, seconds_ns
+from astermind.builder.request_batch import parse_rows, prepare_batch, seconds_ns
 
 
 class RequestBatchTests(unittest.TestCase):
@@ -13,7 +13,7 @@ class RequestBatchTests(unittest.TestCase):
         self.experiment = json.loads(
             (
                 Path(__file__).resolve().parents[3]
-                / "simulator/examples/two_cells.json"
+                / "examples/native/two_cells.json"
             ).read_text()
         )
 

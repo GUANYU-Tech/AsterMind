@@ -12,14 +12,9 @@ from dataclasses import replace
 from functools import lru_cache
 from pathlib import Path
 
-from orbitserve.orbit import generate_orbit_trace, load_orbit_trace
-from orbitserve.runtime import (
-    LinkProfile,
-    NetworkNodeSpec,
-    NetworkSpec,
-    NetworkState,
-)
-from orbitserve.workload import load_workload_bundle
+from astermind.builder.orbit import generate_orbit_trace, load_orbit_trace
+from astermind.engine import LinkProfile, NetworkNodeSpec, NetworkSpec, NetworkState
+from astermind.workload import load_workload_bundle
 from tests.unit.orbit.test_sgp4_elements import _bundle, _satellite
 from tests.network_case import NetworkCase, run_traffic
 

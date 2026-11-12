@@ -1,8 +1,8 @@
 import tempfile
 import unittest
 from pathlib import Path
-from orbitserve.experiments.network import run_network_experiment
-from orbitserve.orbit import load_orbit_trace
+from astermind.builder.physical.network import run_network_experiment
+from astermind.builder.orbit import load_orbit_trace
 from tests.integration.fixed_design.test_dynamic_network_experiment import manifest
 
 

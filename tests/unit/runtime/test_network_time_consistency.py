@@ -3,7 +3,7 @@ import math
 import unittest
 from dataclasses import replace
 
-from orbitserve.runtime import LinkProfile, NetworkState
+from astermind.engine import LinkProfile, NetworkState
 from tests.integration.fixed_design.test_network_acceptance import acceptance_spec
 
 C = 299792458.

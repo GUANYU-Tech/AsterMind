@@ -4,7 +4,7 @@ from pathlib import Path
 import unittest
 from copy import deepcopy
 
-from orbitserve.experiments.network import run_network_experiment
+from astermind.builder.physical.network import run_network_experiment
 from tests.system_case import physical_case
 from tests.unit.experiments import test_network_scenarios as scenario_fixtures
 

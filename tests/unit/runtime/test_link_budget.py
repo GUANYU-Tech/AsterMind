@@ -2,7 +2,7 @@ import math
 import unittest
 from dataclasses import replace
 
-from orbitserve.runtime import LinkProfile
+from astermind.engine import LinkProfile
 
 
 def optical(**values):

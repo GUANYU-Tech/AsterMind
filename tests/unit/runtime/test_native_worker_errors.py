@@ -5,8 +5,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock
 
-from orbitserve.runtime.engine.ns3_transport import Ns3Transport, Ns3Unavailable
-from orbitserve.runtime.engine.simgrid_transport import SimGridTransport, SimGridUnavailable
+from astermind.engine.ns3_transport import Ns3Transport, Ns3Unavailable
+from astermind.engine.simgrid_transport import SimGridTransport, SimGridUnavailable
 
 
 class NativeWorkerErrorTests(unittest.TestCase):
@@ -71,7 +71,7 @@ class NativeWorkerErrorTests(unittest.TestCase):
         edge = dict(endpoint_a='a', endpoint_b='b', link_id='ab', kind='isl')
         for kind in (SimGridTransport, Ns3Transport):
             with self.subTest(backend=kind.__name__), patch.object(kind, 'check_available'), \
-                    patch('orbitserve.runtime.engine.simgrid_transport.subprocess.Popen') as start:
+                    patch('astermind.engine.simgrid_transport.subprocess.Popen') as start:
                 with self.assertRaises(KeyError):
                     kind(('a', 'b'), [edge], {})
                 start.assert_not_called()

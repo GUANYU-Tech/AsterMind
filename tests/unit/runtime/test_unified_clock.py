@@ -1,12 +1,12 @@
 """Sub-nanosecond causality, origin independence and strict capacity evidence."""
 
 import unittest
-from orbitserve.runtime.clock import CLOCK, Time
-from orbitserve.runtime.timeline import GlobalTimeline
-from orbitserve.runtime.engine.flowsim_transport import FlowSimTransport
-from orbitserve.runtime.setup.network_spec import NetworkNodeSpec
-from orbitserve.runtime.service_precision import bandwidth_check
-from orbitserve.runtime.clock_audit import clock_checks
+from astermind.engine.clock import CLOCK, Time
+from astermind.engine.timeline import GlobalTimeline
+from astermind.engine.flowsim_transport import FlowSimTransport
+from astermind.engine.setup.network_spec import NetworkNodeSpec
+from astermind.engine.service_precision import bandwidth_check
+from astermind.engine.clock_audit import clock_checks
 
 
 class UnifiedClockTests(unittest.TestCase):

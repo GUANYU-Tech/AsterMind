@@ -3,7 +3,7 @@ import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
-from orbitserve.runtime.engine.ns3_transport import Ns3Transport, Ns3Unavailable
+from astermind.engine.ns3_transport import Ns3Transport, Ns3Unavailable
 
 
 @unittest.skipUnless(importlib.util.find_spec('ns'), 'Install OrbitServe[ns3] for native ns-3 checks')

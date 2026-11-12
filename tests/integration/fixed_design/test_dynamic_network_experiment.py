@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from orbitserve.experiments.network import run_network_experiment
+from astermind.builder.physical.network import run_network_experiment
 from tests.unit.orbit.test_sgp4_elements import _bundle
 
 

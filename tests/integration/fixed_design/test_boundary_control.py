@@ -6,10 +6,10 @@ from unittest.mock import patch
 from dataclasses import replace
 from types import SimpleNamespace
 
-from orbitserve.runtime import NetworkState
-from orbitserve.runtime.engine.events import _EventEngine
-from orbitserve.runtime.setup.faults import realize_runtime_faults, validate_random_faults
-from orbitserve.runtime.state.interventions import apply_topology_command
+from astermind.engine import NetworkState
+from astermind.engine.events import _EventEngine
+from astermind.engine.setup.faults import realize_runtime_faults, validate_random_faults
+from astermind.engine.state.interventions import apply_topology_command
 from tests.unit.runtime.test_dynamic_network import network
 
 

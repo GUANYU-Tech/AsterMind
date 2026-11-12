@@ -9,15 +9,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from orbitserve.experiments.network import run_network_experiment
+from astermind.builder.physical.network import run_network_experiment
 
-from simulator.audit import audit
-from simulator.bootstrap import DEFAULT_ML
-from simulator.config import SimulationConfig
-from simulator.engine import Simulation
+from astermind.engine.audit import audit
+from astermind.common.bootstrap import DEFAULT_ML
+from astermind.builder.config import SimulationConfig
+from astermind.engine.simulation import Simulation
 
 ROOT = Path(__file__).resolve().parents[3]
-EXAMPLES = ROOT / "simulator/examples"
+EXAMPLES = ROOT / "examples/native"
 
 
 class NativeCellIntegrationTests(unittest.TestCase):
@@ -54,7 +54,7 @@ class NativeCellIntegrationTests(unittest.TestCase):
     def run_scene(self, config):
         with Simulation(config, midlayer_root=self.midlayer) as simulation:
             result = simulation.run()
-        from simulator.__main__ import json_default
+        from astermind.__main__ import json_default
 
         result["audit"] = (
             audit(result) if result["status"] == "completed" else {"passed": False}
@@ -150,7 +150,7 @@ class NativeCellIntegrationTests(unittest.TestCase):
     def test_heterogeneous_cells_and_hardware_derived_hbm_capacity(self):
         import hashlib
 
-        from simulator.bootstrap import activate
+        from astermind.common.bootstrap import activate
 
         activate(self.midlayer)
         from src.serving.workload.model_config import load_model_config

@@ -9,14 +9,14 @@ import zlib
 from pathlib import Path
 from unittest.mock import patch
 
-from orbitserve.experiments.network import run_network_experiment
-from orbitserve.experiments.network_exports import export_network_artifacts
-from orbitserve.experiments.physical_dataset import load_dataset, reuse_dataset
-from orbitserve.experiments.snapshot_store import SnapshotSource
+from astermind.builder.physical.network import run_network_experiment
+from astermind.builder.physical.network_exports import export_network_artifacts
+from astermind.builder.physical.physical_dataset import load_dataset, reuse_dataset
+from astermind.builder.physical.snapshot_store import SnapshotSource
 
-from orbitserve.orbit import load_orbit_trace, write_orbit_trace
-from orbitserve.runtime import LinkProfile, NetworkSpec, NetworkState
-from orbitserve.runtime.state.attribute_codec import MAGIC
+from astermind.builder.orbit import load_orbit_trace, write_orbit_trace
+from astermind.engine import LinkProfile, NetworkSpec, NetworkState
+from astermind.engine.state.attribute_codec import MAGIC
 from tests.integration.fixed_design.test_dynamic_network_experiment import manifest
 
 
@@ -88,7 +88,7 @@ class ParallelPhysicalExportTests(unittest.TestCase):
         )
 
     def test_disk_backed_session_reuses_one_connection_and_releases_it(self):
-        import orbitserve.runtime.state.physical_dataset as attributes
+        import astermind.engine.state.physical_dataset as attributes
 
         times = (0.0, 0.5, 2.0, 10.0, 30.5, 40.0, 119.9, 120.0)
         expected = [canonical(SnapshotSource(self.core).snapshot(t)) for t in times]
@@ -111,9 +111,9 @@ class ParallelPhysicalExportTests(unittest.TestCase):
                     connection.execute('SELECT 1')
 
     def test_serial_export_releases_read_session_after_failure(self):
-        import orbitserve.experiments.network_exports as exports
+        import astermind.builder.physical.network_exports as exports
 
-        from orbitserve.runtime.state.physical_dataset import PhysicalAttributes
+        from astermind.engine.state.physical_dataset import PhysicalAttributes
 
         folder = self.copy_core('read-session-failure')
         original_close = PhysicalAttributes.close_read_session
@@ -201,7 +201,7 @@ class ParallelPhysicalExportTests(unittest.TestCase):
         target = self.copy_core("failed")
         with (
             patch(
-                "orbitserve.experiments.network_exports.export_cell_network",
+                'astermind.builder.physical.network_exports.export_cell_network',
                 side_effect=RuntimeError("export failed"),
             ),
             self.assertRaisesRegex(RuntimeError, "export failed"),
@@ -221,7 +221,7 @@ class ParallelPhysicalExportTests(unittest.TestCase):
             load_dataset(target)
 
     def test_attribute_storage_uses_numeric_columns_and_legacy_blocks_still_load(self):
-        from orbitserve.runtime.state.physical_dataset import PhysicalAttributes
+        from astermind.engine.state.physical_dataset import PhysicalAttributes
 
         target = self.copy_core("legacy-block")
         dbpath = target / "physical_state.sqlite"

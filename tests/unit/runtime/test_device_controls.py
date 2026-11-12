@@ -1,10 +1,10 @@
 from types import SimpleNamespace
 import unittest
 from tests.unit.runtime.test_scoped_protobridge import graph
-from simulator.bootstrap import activate
-from simulator.network import DeviceRuntimeHost, DeviceCommunicationRuntime
-from simulator.device_controls import apply_device_command
-from orbitserve.runtime.engine.cell_bridge import CellTransfer
+from astermind.common.bootstrap import activate
+from astermind.engine.network_host import DeviceRuntimeHost, DeviceCommunicationRuntime
+from astermind.engine.device_controls import apply_device_command
+from astermind.engine.cell_bridge import CellTransfer
 
 
 class DeviceControlsTests(unittest.TestCase):

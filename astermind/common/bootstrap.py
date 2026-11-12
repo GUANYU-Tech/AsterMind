@@ -1,0 +1,31 @@
+"""Select one immutable M-L snapshot before any native imports."""
+
+import os
+import sys
+from pathlib import Path
+
+WORKSPACE = Path(__file__).resolve().parents[2]
+DEFAULT_ML = WORKSPACE / "third_party/midlayer-6fe5734-canonical"
+
+
+def activate(root=None):
+    root = Path(
+        root
+        or os.environ.get("ORBITSERVE_MIDLAYER_ROOT")
+        or os.environ.get("ORBITServe_MIDLAYER_ROOT", DEFAULT_ML)
+    ).resolve()
+    if not (root / "src/serving/execution.py").is_file():
+        raise ValueError(f"Missing M-L snapshot: {root}")
+    if "src.kernel.hardware_spec" in sys.modules:
+        loaded = (
+            Path(sys.modules["src.kernel.hardware_spec"].__file__).resolve().parents[2]
+        )
+        if loaded != root:
+            raise RuntimeError(
+                "M-L snapshot is already loaded; start a new process to switch snapshots"
+            )
+    os.environ["ORBITServe_MIDLAYER_ROOT"] = str(root)
+    for path in (root,):
+        if str(path) not in sys.path:
+            sys.path.insert(0, str(path))
+    return root

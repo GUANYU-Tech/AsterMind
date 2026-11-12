@@ -12,8 +12,8 @@ class NativeSceneCapabilitiesTests(unittest.TestCase):
     def run_choice(
         self, hardware, model, tp=1, pp=1, *, experts=False, scope="protobridge_cell"
     ):
-        from simulator.config import SimulationConfig
-        from simulator.replay import audit_checks
+        from astermind.builder.config import SimulationConfig
+        from viz.export import audit_checks
 
         value = self.config("dynamic_tp2_pp2.json").model_dump(mode="json")
         cell = value["cells"][0]

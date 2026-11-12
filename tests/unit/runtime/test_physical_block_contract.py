@@ -10,9 +10,9 @@ import unittest
 from unittest.mock import patch
 import zlib
 
-from orbitserve.runtime.state.attribute_cache import AttributeBlock
-from orbitserve.runtime.state.attribute_codec import MAGIC, decode, encode
-from orbitserve.runtime.state.physical_dataset import PhysicalAttributes, SCHEMA, _decode_block, _encode_block
+from astermind.engine.state.attribute_cache import AttributeBlock
+from astermind.engine.state.attribute_codec import MAGIC, decode, encode
+from astermind.engine.state.physical_dataset import PhysicalAttributes, SCHEMA, _decode_block, _encode_block
 
 
 def rows():
@@ -75,7 +75,7 @@ class PhysicalBlockContractTests(unittest.TestCase):
         for invalid in (valid[:-1], valid + b'junk', b'not zlib'):
             with self.subTest(invalid=invalid[:8]), self.assertRaises(ValueError):
                 _decode_block(invalid)
-        with patch('orbitserve.runtime.state.physical_dataset.MAX_BLOCK_BYTES', 1024):
+        with patch('astermind.engine.state.physical_dataset.MAX_BLOCK_BYTES', 1024):
             with self.assertRaisesRegex(ValueError, 'size limit'):
                 _decode_block(zlib.compress(b' ' * 1025))
             oversized = rows()

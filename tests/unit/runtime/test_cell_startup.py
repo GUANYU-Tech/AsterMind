@@ -6,8 +6,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from simulator.startup import initialize_cells
-from simulator.startup_resources import GIB, startup_policy
+from astermind.engine.startup import initialize_cells
+from astermind.engine.startup_resources import GIB, startup_policy
 
 
 class CellStartupTests(unittest.TestCase):
@@ -97,15 +97,15 @@ class CellStartupTests(unittest.TestCase):
                     workers=workers,
                 )
 
-    @patch("simulator.startup_resources.available_cpu_count", return_value=16)
-    @patch("simulator.startup_resources.available_memory_bytes", return_value=64 * GIB)
+    @patch('astermind.engine.startup_resources.available_cpu_count', return_value=16)
+    @patch('astermind.engine.startup_resources.available_memory_bytes', return_value=64 * GIB)
     def test_automatic_policy_uses_all_available_cpus_when_memory_allows(self, *_):
         self.assertEqual(startup_policy(32)["workers"], 16)
         self.assertEqual(startup_policy(2)["workers"], 2)
         self.assertEqual(startup_policy(8, requested=1)["workers"], 1)
 
-    @patch("simulator.startup_resources.available_cpu_count", return_value=16)
-    @patch("simulator.startup_resources.available_memory_bytes", return_value=8 * GIB)
+    @patch('astermind.engine.startup_resources.available_cpu_count', return_value=16)
+    @patch('astermind.engine.startup_resources.available_memory_bytes', return_value=8 * GIB)
     def test_automatic_policy_reserves_memory_for_the_rest_of_the_server(self, *_):
         policy = startup_policy(32)
         self.assertEqual(policy["workers"], 6)

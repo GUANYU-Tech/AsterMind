@@ -3,9 +3,9 @@ from copy import deepcopy
 import json
 import unittest
 
-from orbitserve.experiments.network_inputs import materialize_network_input
-from orbitserve.runtime import NetworkSpec, STARLINK_RADIO_PROFILES, prepare_islsim_config
-from orbitserve.runtime.setup import islsim
+from astermind.builder.physical.network_inputs import materialize_network_input
+from astermind.engine import NetworkSpec, STARLINK_RADIO_PROFILES, prepare_islsim_config
+from astermind.engine.setup import islsim
 from tests.unit.runtime.test_starlink_presets import generated_profiles, ROOT
 
 

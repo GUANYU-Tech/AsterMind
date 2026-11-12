@@ -4,7 +4,7 @@ import importlib.util
 import unittest
 from dataclasses import replace
 
-from orbitserve.runtime import LinkProfile
+from astermind.engine import LinkProfile
 from tests.network_case import NetworkCase, traffic, run_traffic
 
 

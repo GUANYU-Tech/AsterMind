@@ -8,8 +8,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from orbitserve.runtime import LinkProfile, NetworkSpec, NetworkState
-from orbitserve.runtime.setup import islsim
+from astermind.engine import LinkProfile, NetworkSpec, NetworkState
+from astermind.engine.setup import islsim
 from tests.unit.runtime.test_dynamic_network import network
 
 

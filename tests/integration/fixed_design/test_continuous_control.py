@@ -4,7 +4,7 @@ import importlib.util
 import unittest
 from dataclasses import replace
 
-from orbitserve.runtime.state.interventions import apply_topology_command
+from astermind.engine.state.interventions import apply_topology_command
 from tests.integration.fixed_design.test_boundary_control import scenario, job
 
 

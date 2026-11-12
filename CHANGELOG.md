@@ -11,6 +11,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+- Reorganize the package as root `astermind/builder` and `astermind/engine`;
+  merge Runtime into Engine and place source workload adapters, examples and
+  replay UI in root `workloads/`, `examples/` and `viz/`.
+  Preserve Native simulation behavior and serialized identities. Add strict
+  baseline comparisons, real browser checks and installed Native execution.
+- Fix replay scene switching when the previously selected call index exceeds
+  the new scene's call count.
+
+
 ### Added
 
 - Default new satellite-link JSON profiles and new optical hardware presets to
@@ -209,10 +218,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   class names, with geometry-only records and metadata as their complete public
   output contract.
 - Grouped SGP4 implementation details by responsibility under
-  `orbitserve.orbit.sgp4` while keeping cross-module use on the public
-  `orbitserve.orbit` entry point.
+  `astermind.builder.orbit.sgp4` while keeping cross-module use on the public
+  `astermind.builder.orbit` entry point.
 - Removed `v2` from the canonical Orbit Trace schema and public API names;
-  `orbitserve.orbit_trace`, `write_orbit_trace`, and `load_orbit_trace` now
+  `astermind.builder.orbit_trace`, `write_orbit_trace`, and `load_orbit_trace` now
   define the single current output format.
 - Declared the pinned SGP4, Astropy, Earth-orientation dependencies and vendored
   IERS package data in `pyproject.toml`.
@@ -292,7 +301,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
-- Established the `architecture`, `orbit`, `workload`, `serving`, `runtime`, and `common` module boundaries under `src/orbitserve/`.
+- Established the `architecture`, `orbit`, `workload`, `serving`, `runtime`, and `common` module boundaries under `astermind/`.
 - Added package-level public interfaces for cross-module contracts and services.
 - Added canonical seven-file workload bundle loading, validation, and materialization.
 - Added fixed-design evaluation, DSE, terrestrial baselines, WildChat conversion tools, and public examples.

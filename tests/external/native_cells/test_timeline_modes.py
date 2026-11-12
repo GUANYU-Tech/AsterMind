@@ -11,9 +11,9 @@ class NativeTimelineModesTests(unittest.TestCase):
     config = fixtures.NativeCellIntegrationTests.config
 
     def run_scene(self, config):
-        from simulator.engine import Simulation
-        from simulator.audit import audit
-        from simulator.__main__ import json_default
+        from astermind.engine.simulation import Simulation
+        from astermind.engine.audit import audit
+        from astermind.__main__ import json_default
 
         with Simulation(config, midlayer_root=self.midlayer) as simulation:
             result = simulation.run()
@@ -29,7 +29,7 @@ class NativeTimelineModesTests(unittest.TestCase):
         return result
 
     def run_matrix(self, timelines, scopes):
-        from simulator.__main__ import json_default
+        from astermind.__main__ import json_default
 
         for timeline in timelines:
             for scope in scopes:
@@ -93,7 +93,7 @@ class NativeTimelineModesTests(unittest.TestCase):
             int(migration["completed_time_ticks"]),
             int(migration["network_complete_time_ticks"]),
         )
-        from simulator.replay import audit_checks
+        from viz.export import audit_checks
 
         self.assertTrue(all(row["state"] == "pass" for row in audit_checks(result)))
         self.assertEqual(

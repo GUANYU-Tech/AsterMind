@@ -2,9 +2,9 @@
 
 from types import SimpleNamespace
 from dataclasses import dataclass, field
-from orbitserve.orbit import ORBIT_TRACE_SCHEMA, OrbitTraceBundle, OrbitTraceManifest
-from orbitserve.runtime import NetworkSpec, NetworkNodeSpec, LinkProfile, NetworkState
-from orbitserve.runtime.engine.events import _EventEngine
+from astermind.builder.orbit import ORBIT_TRACE_SCHEMA, OrbitTraceBundle, OrbitTraceManifest
+from astermind.engine import NetworkSpec, NetworkNodeSpec, LinkProfile, NetworkState
+from astermind.engine.events import _EventEngine
 
 
 def _trace():
@@ -119,7 +119,7 @@ def run_network(spec, probe):
         host.push(at, 0, "topology_sample")
     for at, index, restored, fault in network.fault_observations():
         host.push(at, -2, "fault_batch", payload=((index, fault, restored),))
-    from orbitserve.runtime.timeline import GlobalTimeline
+    from astermind.engine.timeline import GlobalTimeline
 
     host.timeline = GlobalTimeline(host=host)
     try:

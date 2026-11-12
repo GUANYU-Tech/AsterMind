@@ -6,14 +6,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from orbitserve.runtime import LinkProfile
-from orbitserve.runtime.state.physical_dataset import _chunks
+from astermind.engine import LinkProfile
+from astermind.engine.state.physical_dataset import _chunks
 from tests.unit.runtime.test_dynamic_network import network
 
 
 class PhysicalPrecomputeTests(unittest.TestCase):
     def test_parallel_prepared_numeric_columns_match_direct_time_varying_geometry(self):
-        from orbitserve.runtime import NetworkState
+        from astermind.engine import NetworkState
 
         original = self.state()
         original.trace.ephemeris_samples.extend(
@@ -37,7 +37,7 @@ class PhysicalPrecomputeTests(unittest.TestCase):
             self.assertFalse(path.exists())
 
     def test_symmetric_budget_is_computed_once_per_visible_link_sample(self):
-        from orbitserve.runtime import NetworkState
+        from astermind.engine import NetworkState
 
         original = self.state()
         state = NetworkState(original.trace, original.spec, _defer_compile=True)
@@ -57,7 +57,7 @@ class PhysicalPrecomputeTests(unittest.TestCase):
         self.assertEqual({t for _, t in calls}, {5.})
 
     def test_cached_allocation_matches_direct_for_both_handover_and_score_modes(self):
-        from orbitserve.runtime import NetworkState
+        from astermind.engine import NetworkState
         from tests.unit.runtime.test_radio_capacity import access_network
 
         for handover in ('retain_valid', 'quality_first'):
@@ -74,7 +74,7 @@ class PhysicalPrecomputeTests(unittest.TestCase):
                                              json.loads(json.dumps(direct.snapshot(time_s))))
 
     def test_deferred_allocation_and_snapshots_never_recalculate_saved_budgets(self):
-        from orbitserve.runtime import NetworkState
+        from astermind.engine import NetworkState
 
         original = self.state()
         expected = [json.loads(json.dumps(original.snapshot(t))) for t in (0., 5., 10., 15., 20.)]
@@ -96,11 +96,8 @@ class PhysicalPrecomputeTests(unittest.TestCase):
             self.assertFalse(deferred._compile_pending)
 
     def test_compact_cache_preserves_values_and_obeys_zero_byte_budget(self):
-        from orbitserve.runtime.state.attribute_cache import AttributeBlock
-        from orbitserve.runtime.state.physical_dataset import (
-            PhysicalAttributes,
-            _edge_blocks,
-        )
+        from astermind.engine.state.attribute_cache import AttributeBlock
+        from astermind.engine.state.physical_dataset import PhysicalAttributes, _edge_blocks
 
         state = self.state()
         rows = [row for _, _, block in _edge_blocks(state, state.edges[0], encoded=False) for row in block]
@@ -110,15 +107,15 @@ class PhysicalPrecomputeTests(unittest.TestCase):
             target = Path(folder)/'cache.sqlite'
             state.save_physical_state(target)
             reader = PhysicalAttributes(target)
-            with patch('orbitserve.runtime.state.physical_dataset.DECODED_READ_CACHE_BYTES', 0):
+            with patch('astermind.engine.state.physical_dataset.DECODED_READ_CACHE_BYTES', 0):
                 for t, value in rows:
                     self.assertEqual(reader.geometry_at(state.edges[0]['link_id'], t), json.loads(json.dumps(value['geometry'])))
                     self.assertEqual(reader.decoded_bytes, 0)
             self.assertGreater(reader.block_loads, 0)
 
     def test_runtime_cache_uses_physical_boundaries_and_reads_small_data_once(self):
-        from orbitserve.runtime import NetworkState
-        from orbitserve.runtime.state.physical_dataset import PhysicalAttributes
+        from astermind.engine import NetworkState
+        from astermind.engine.state.physical_dataset import PhysicalAttributes
         state=network(edges=(('a','b',5.,15.),),schedule=((6.25,.5),))
         state.trace.trace_id='cached-test'
         with tempfile.TemporaryDirectory() as folder:
@@ -134,7 +131,7 @@ class PhysicalPrecomputeTests(unittest.TestCase):
                 self.assertEqual(reader.at.cache_info().misses,1)
                 for t in (0.,4.99,5.,6.249,6.25,6.251,14.99,15.,19.9,20.):
                     self.assertEqual(json.loads(json.dumps(saved.snapshot(t))),json.loads(json.dumps(state.snapshot(t))))
-            with patch('orbitserve.runtime.state.physical_dataset.COMPRESSED_READ_CACHE_BYTES',0):
+            with patch('astermind.engine.state.physical_dataset.COMPRESSED_READ_CACHE_BYTES',0):
                 streamed=PhysicalAttributes(path)
             self.assertIsNone(streamed._packed)
             self.assertEqual(streamed.at(edge['link_id'],6.25),reader.at(edge['link_id'],6.25))
@@ -176,7 +173,7 @@ class PhysicalPrecomputeTests(unittest.TestCase):
     def test_invisible_adaptive_pairs_are_removed_without_dropping_future_contacts(self):
         from types import SimpleNamespace
 
-        from orbitserve.runtime import NetworkNodeSpec, NetworkSpec, NetworkState
+        from astermind.engine import NetworkNodeSpec, NetworkSpec, NetworkState
         spec=NetworkSpec(
             (NetworkNodeSpec('a','communication',4,2),NetworkNodeSpec('b','communication',4,2),NetworkNodeSpec('g','ground',sgl_terminals=1)),
             {'sgl':LinkProfile(100,0),'communication_isl':LinkProfile(100,0)},

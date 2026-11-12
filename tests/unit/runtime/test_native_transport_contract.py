@@ -3,8 +3,8 @@ import importlib.util
 from types import SimpleNamespace
 import unittest
 
-from orbitserve.runtime.engine.ns3_transport import Ns3Transport
-from orbitserve.runtime.engine.simgrid_transport import SimGridTransport
+from astermind.engine.ns3_transport import Ns3Transport
+from astermind.engine.simgrid_transport import SimGridTransport
 
 
 @unittest.skipUnless(importlib.util.find_spec('ns') and importlib.util.find_spec('simgrid'),

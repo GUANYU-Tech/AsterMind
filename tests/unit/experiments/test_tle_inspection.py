@@ -1,8 +1,8 @@
 import unittest
 
-from orbitserve.experiments.tle_inspection import inspect_tle_constellation
-from orbitserve.orbit import walker_delta_elements
-from orbitserve.orbit.sgp4.propagation import _initialize_satellite, _load_sgp4_api
+from astermind.builder.physical.tle_inspection import inspect_tle_constellation
+from astermind.builder.orbit import walker_delta_elements
+from astermind.builder.orbit.sgp4.propagation import _initialize_satellite, _load_sgp4_api
 
 
 def observed_text(planes=4,slots=8,missing=()):

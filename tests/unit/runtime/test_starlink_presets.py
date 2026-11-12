@@ -5,9 +5,9 @@ from pathlib import Path
 from types import SimpleNamespace
 import unittest
 
-from orbitserve.experiments.network_inputs import materialize_network_input
-from orbitserve.runtime import NetworkNodeSpec, NetworkSpec, NetworkState, STARLINK_RADIO_PROFILES
-from orbitserve.runtime.setup.radio_capacity import directional_profile, max_min_rates, hop_pools
+from astermind.builder.physical.network_inputs import materialize_network_input
+from astermind.engine import NetworkNodeSpec, NetworkSpec, NetworkState, STARLINK_RADIO_PROFILES
+from astermind.engine.setup.radio_capacity import directional_profile, max_min_rates, hop_pools
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -56,8 +56,8 @@ class StarlinkPresetTests(unittest.TestCase):
                 self.assertEqual(optical.islsim_config['rx']['terminal_cap_gbps'], optical.bandwidth_bps / 1e9)
 
     def test_generation_native_overrides_change_export_and_input_identity(self):
-        from orbitserve.experiments.network_inputs import snapshot_network_input
-        from orbitserve.experiments.physical_dataset import input_fingerprint
+        from astermind.builder.physical.network_inputs import snapshot_network_input
+        from astermind.builder.physical.physical_dataset import input_fingerprint
         original = json.loads((ROOT/'tests/fixtures/network/multi_shell.json').read_text())
         shell = original['constellations']['communication_shells'][0]
         shell.update(radio_profile='starlink_v2_mini_2024', isl_terminals=3)
