@@ -54,6 +54,7 @@ class GlobalTimeline:
         self._queue: list[tuple[float, int, int, TimelineEvent, EventCallback]] = []
         self.events: list[dict[str, Any]] = ClockLog()
         self._stopped = False
+        self.current_event: TimelineEvent | None = None
 
     @property
     def now_s(self) -> float:
@@ -103,7 +104,11 @@ class GlobalTimeline:
                         "metadata": event.metadata,
                     }
                 )
-                callback()
+                self.current_event = event
+                try:
+                    callback()
+                finally:
+                    self.current_event = None
 
             # Physical updates and hop completions precede native Cell work.
             self._host.push(at_s, 30 + priority, "external_callback", payload=dispatch)
@@ -168,7 +173,11 @@ class GlobalTimeline:
                     "metadata": event.metadata,
                 }
             )
-            callback()
+            self.current_event = event
+            try:
+                callback()
+            finally:
+                self.current_event = None
             handled += 1
         if until_s is not None and not self._stopped:
             self._now_s = Time(until_s)

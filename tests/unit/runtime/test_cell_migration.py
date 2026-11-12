@@ -112,7 +112,11 @@ class CellMigrationTests(unittest.TestCase):
         runtime.cells = {"A": source, "B": target}
         runtime._session_cells = {"session": "A"}
         runtime.completions = []
-        runtime.state = {"request": {}}
+        runtime.state = {"request": {"status": "computing", "received_tokens": 0}}
+        runtime.loop = loop
+        runtime.request_state_events = []
+        runtime._parent_waiters = {}
+        runtime._kv_waiters = {}
         runtime.history = SimpleNamespace(history=lambda *args: {})
         runtime.config = SimpleNamespace(migrations=(SimpleNamespace(id="kv", mode="move", source_cell="A", target_cell="B", session_id="session", context_id="ctx", after_request="request"),))
         runtime._record_request = lambda *args: None
@@ -142,6 +146,56 @@ class CellMigrationTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "native close failed"):
             runtime.close()
         self.assertCountEqual(closed, ["A", "B"])
+
+    def test_terminal_failures_notify_once_after_cleanup(self):
+        for operation in ("export_prefix", "reserve_import", "commit_import", "release_export"):
+            with self.subTest(operation=operation):
+                loop, sends, source, target, _, migration = self.setup_migration()
+                cell = source if operation in ("export_prefix", "release_export") else target
+                original = cell.storage_rpc
+                def fail_selected(name, *args):
+                    if name == operation:
+                        raise ValueError("injected " + operation)
+                    return original(name, *args)
+                cell.storage_rpc = fail_selected
+                failures = []
+                migration.start(SimpleNamespace(id="kv", mode="move"), source, target, {},
+                                on_failure=lambda record: failures.append((record, source.paused, target.paused)))
+                loop.run(until_s=1)
+                for send in sends:
+                    send[-2]()
+                loop.run()
+                self.assertEqual(len(failures), 1, "terminal notification is exactly once")
+                self.assertEqual(failures[0][1:], (False, False), "notify after releasing pauses")
+                self.assertIn(failures[0][0]["state"], ("failed", "source_release_failed"))
+
+    def test_interrupt_is_not_converted_to_request_failure(self):
+        _, _, source, target, _, migration = self.setup_migration()
+        def interrupted(*args):
+            raise KeyboardInterrupt()
+        source.storage_rpc = interrupted
+        failures = []
+        with self.assertRaises(KeyboardInterrupt):
+            migration.start(SimpleNamespace(id="kv", mode="copy"), source, target, {}, on_failure=failures.append)
+        self.assertFalse(source.paused or target.paused)
+        self.assertEqual(len(failures), 1)
+
+    def test_close_and_partition_failure_notify_once(self):
+        loop, sends, source, target, _, migration = self.setup_migration()
+        failures = []
+        migration.start(SimpleNamespace(id="kv", mode="copy"), source, target, {}, on_failure=failures.append)
+        loop.run(until_s=1)
+        sends[0][-1](SimpleNamespace(model_dump=lambda: {"reason": "fault"}))
+        self.assertFalse(failures, "live sibling still owns source data")
+        sends[1][-2]()
+        migration.close()
+        self.assertEqual(len(failures), 1)
+        loop, _, source, target, _, migration = self.setup_migration()
+        source._inflight = object()
+        migration.start(SimpleNamespace(id="kv", mode="copy"), source, target, {}, on_failure=failures.append)
+        migration.close()
+        migration.close()
+        self.assertEqual(len(failures), 2)
 
 
 if __name__ == "__main__":

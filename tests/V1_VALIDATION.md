@@ -222,3 +222,92 @@ capacity or completion constraints.
 Logs, complete reports, preserved inputs, built distributions and browser evidence
 are outside the repository at `/data1/guolidong/.orbitserve-v3/`. Nothing is pushed
 as part of this iteration.
+
+## Communication prerequisite source port
+
+Target baseline: `ddbdf1540cef3c3db3022b2bcfed839370a1d3e2` on
+`version/AsterMind-V1.0`. Source: `Communication_backend` commit
+`9c08c9cad81df5a4fee5e606114753df8dab6c2d`. This is a selective source port,
+not a merge of the complete communication or computation stacks.
+
+### Source and adaptation boundaries
+
+| Source | Destination | Scope |
+| --- | --- | --- |
+| `simulator/config.py`, `simulator/scheduler.py` | `astermind/builder/config.py` | `before_request`, explicit receiver/context checks, predecessor lookup and cycle rejection |
+| `simulator/engine.py` | `astermind/engine/simulation.py` | Input/parent/KV admission barrier, terminal callbacks, cancellation and failure propagation, request state trace and metrics |
+| `simulator/migration.py` terminal callbacks | `astermind/engine/cell_migration.py` | Notify waiting requests after the existing transaction releases its resources |
+| Engine/Cell report observations | `simulation.py`, `timeline.py` | Export existing Cell load history and the currently executing event identity |
+
+The upstream prerequisite control flow is retained. Necessary adaptations are
+limited to the existing interfaces: `SimulationConfig` replaces the external
+scheduler's config access; transfers use the current executor/cancellation API;
+times use the authoritative integer tick clock; migrations retain the current
+physical rank partitions, batch-boundary pauses, read/write delays and allocator
+transaction. `current_event` is an observation only: event keys, times and
+priorities are unchanged. Native interrupts still propagate after cleanup.
+
+The current history store names an omitted context by request ID. Predecessor
+lookup preserves that convention and rejects duplicate effective contexts.
+Parent readiness means computation completion; failed user-output delivery
+after computation does not invalidate a committed parent context. A receiver
+bound by `before_request` must explicitly name the migration target Cell.
+Ordinary requests keep the original automatic Cell selection unchanged.
+Unbound legacy migrations remain supported.
+
+Reports add `request_state_events`, input/parent/KV readiness times (nanoseconds
+and exact ticks), TTFT/TPOT/E2E metrics and existing per-Cell `load_history`.
+Undefined metrics remain null. Existing fields remain present. Communication
+allocator/service events and statistics, compute-mode provenance and DP/PD
+deployment-specific reports remain tied to their deferred model upgrades;
+this port does not emit invented or empty substitutes for them.
+
+No compute adapter, external Midlayer, communication implementation, dynamic
+network policy, automatic Cell selector, frontend asset or frontend logic is
+changed. DP/WideEP/PD, the global Midlayer/roofline switch and communication
+model changes remain deferred. Before the later Midlayer replacement, preserve
+the currently used ProtoBridge communication source with a pinned source hash.
+
+### Tests and comparison
+
+- Batch 1: 13 configuration/physical-contract tests pass.
+- Lifecycle and cleanup smoke: 24 tests pass, including input/KV ordering,
+  parent-only waiting, duplicate notifications, capacity denial, failed parent,
+  export/reservation/commit/source-release failure, close, sibling partitions
+  and `KeyboardInterrupt` cleanup. Independent review reruns all 24 successfully.
+- Retained regression: 476 tests pass in 183.375 s, no skips. The same 20
+  FlowSim-dependent tests are excluded by the user's instruction.
+- Final focused run: 29 tests pass, adding an incompatible-storage rejection
+  test, one hosted/standalone current-event cleanup test and three strict-
+  comparison checks to the 24 lifecycle tests. This gives 481 distinct passing
+  dependency-light/retained tests overall.
+- The nine existing real Native scenarios pass before and after the port,
+  using the unchanged pinned Midlayer/vLLM, ns3 and SimGrid dependencies.
+  All 12 reports and 8 saved input sets compare with zero legacy differences.
+- Four new real Native scenarios pass: bound TP2 move on ns3, bound TP2 copy
+  on SimGrid, same-Cell parent waiting, and failed bound migration on SimGrid.
+  They check admission against exact input/parent/commit ticks, prefix reuse,
+  once-only admission, request failure and allocator rollback. The same-Cell
+  case was rerun after correcting a test assertion: an unused Cell may have
+  empty load history.
+- `tests/scripts/compare_prerequisites.py` reuses the strict comparison rules
+  above and removes only named additive observations and null `before_request`.
+  It rejects bound-receiver scenes as legacy baselines and detects changed
+  compute/transfer/admission times or unknown added fields.
+- Existing replay export accepts raw new success/failure reports. The ns3
+  legacy replay is identical after the same approved report normalization.
+  Browser checks cover playback, case switching, operator search/Cell filters,
+  dependency details, migration jumps, reload, failure rollback and retained
+  Cell ProtoBridge mode. No browser console errors or warnings were observed.
+  Frontend source files are unchanged.
+- Ruff F checks and `git diff --check` pass. FlowSim is not executed.
+
+Evidence is outside the repository at
+`/data1/guolidong/.orbitserve-kv-iteration/`: `baseline/`, `candidate/`,
+`prerequisites/`, `comparison.log`, `retained.log`, `final-focused.log`,
+`parent-rerun.log`, `viz-comparison.json` and exported replay directories.
+Run the baseline comparison from the repository root with:
+
+```bash
+python -m tests.scripts.compare_prerequisites BEFORE_DIR AFTER_DIR
+```

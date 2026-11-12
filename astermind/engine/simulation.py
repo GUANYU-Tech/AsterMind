@@ -5,6 +5,7 @@ from dataclasses import asdict
 
 from astermind.engine.cell_bridge import bind_batch_executor
 from astermind.engine.cell_migration import NetworkKVMigration
+from astermind.engine.timeline import nanoseconds
 
 from astermind.common.bootstrap import activate
 from astermind.engine.network_host import DeviceCommunicationRuntime, DeviceRuntimeHost
@@ -127,6 +128,11 @@ class Simulation:
             for r in config.requests
         }
         self.completions, self.outputs, self.decisions = [], [], []
+        self.request_state_events = CompressedRecords()
+        self._kv_waiters = {}
+        self._parent_waiters = {}
+        self._request_transfers = {}
+        self._failed_cells = set()
         self._transport_serial = 0
         self._received_chunks = {r.id: set() for r in config.requests}
         self._cell_configs = {c.id: c for c in config.cells}
@@ -201,6 +207,7 @@ class Simulation:
         try:
             from astermind.engine.native_execution import NativeStepExecution
 
+            created.set_failure_callback(self._cell_failure)
             created.execution = NativeStepExecution(created.execution)
             from astermind.engine.record_store import CompressedRecords
 
@@ -215,20 +222,75 @@ class Simulation:
             raise
         return created
 
+    # Prerequisite lifecycle ported from Communication 9c08c9c; the existing
+    # selector, native executor, tick clock and migration transaction remain.
+    def _cell_failure(self, failure):
+        if failure.get('failure_scope')=='pool_fail_stop':
+            self._failed_cells.add(failure['cell_id'])
+            # Uploads not yet admitted to the Scheduler are invisible to its
+            # failure list. Invalidate them here before their ready callbacks.
+            for pending_id,pending in tuple(self.state.items()):
+                if pending.get('cell')==failure['cell_id'] and pending['status']=='input':
+                    self._request_failed(pending_id,pending.get('attempt',0),'cell_failed_during_upload',
+                        dict(failure,request_id=pending_id))
+        request_id, attempt = failure['request_id'], 0
+        self._request_failed(request_id,attempt,'cell_failed',failure)
+
+    def _attempt_current(self,request_id,attempt):
+        state=self.state[request_id]
+        return state.get('attempt',0)==attempt and state['status'] not in ('failed','completed')
+
+    def _request_failed(self,request_id,attempt,reason,failure):
+        if not self._attempt_current(request_id,attempt):return
+        self._update_request(request_id,reason,status='failed',failure=failure)
+        self._cancel_request_transfers(request_id,attempt)
+        for callback in self._parent_waiters.pop(request_id, ()):
+            callback(failure)
+        # A failed output delivery does not invalidate an already computed
+        # parent context. Only failed computation prevents its KV prerequisite.
+        if "compute_complete_ns" not in self.state[request_id]:
+            for migration in self.config.migrations:
+                if migration.after_request == request_id and migration.before_request is not None:
+                    self._request_failed(migration.before_request, 0, 'kv_source_failed', failure)
+
+    def _cancel_request_transfers(self,request_id,attempt):
+        pending=getattr(self,'_request_transfers',{}).pop((request_id,attempt),set())
+        if pending:
+            self.network.cancel(tuple(pending), 'request_failed')
+
     def _submit(self, source, target, size, operation, request_id, callback):
         self._transport_serial += 1
-        self.executor.submit_transport(
-            f"serving-{self._transport_serial}",
-            source,
-            target,
-            size,
-            operation,
-            request_id,
-            callback,
-            lambda event: self.state[request_id].update(
-                status="failed", failure=event.model_dump()
-            ),
-        )
+        attempt=self.state[request_id].get('attempt',0)
+        identity=f'serving-{self._transport_serial}'
+        pending=self._request_transfers.setdefault((request_id,attempt),set())
+        pending.add(identity)
+        def complete():
+            pending.discard(identity)
+            if self._attempt_current(request_id,attempt):callback()
+        def failed(event):
+            pending.discard(identity)
+            self._request_failed(request_id,attempt,'transfer_failed',event.model_dump())
+        try:
+            self.executor.submit_transport(identity, source, target, size,
+                operation, request_id, complete, failed)
+        except (ValueError, RuntimeError) as error:
+            pending.discard(identity)
+            self._request_failed(request_id, attempt, 'transfer_submission_failed',
+                                 dict(message=str(error), operation=operation))
+
+    def _update_request(self, request_id, reason, **changes):
+        # Communication 9c08c9c state trace, retaining the authoritative tick.
+        state = self.state[request_id]
+        previous = state["status"]
+        state.update(changes)
+        event = self.loop.current_event
+        self.request_state_events.append(dict(
+            request_id=request_id, reason=reason,
+            time_ns=nanoseconds(self.loop.now_s), time_ticks=str(self.loop.now_s.ticks),
+            event_sequence=event.sequence if event else None,
+            previous=previous, status=state["status"], cell_id=state.get("cell"),
+            received_tokens=state["received_tokens"], attempt=state.get("attempt", 0),
+        ))
 
     def _select(self, request):
         candidates = []
@@ -274,9 +336,15 @@ class Simulation:
     def _arrive(self, request):
         from astermind.engine.cell_events import CellRequest
 
-        cell_config = self._select(request)
-        state = self.state[request.id]
-        state.update(status="input", cell=cell_config.id)
+        if self.state[request.id]["status"] == "failed":
+            return
+        try:
+            cell_config = self._select(request)
+        except (ValueError, RuntimeError) as error:
+            self._request_failed(request.id, 0, "selection_failed",
+                                 dict(stage="cell_selection", message=str(error)))
+            return
+        self._update_request(request.id, "cell_selected", status="input", cell=cell_config.id)
         self._record_request("request_arrival", request.id)
         if request.session_id is not None:
             self._session_cells[request.session_id] = cell_config.id
@@ -289,32 +357,84 @@ class Simulation:
             }
         )
 
+        attempt = 0
+        internal_id = request.id
+        required = tuple(m for m in self.config.migrations if m.before_request == request.id)
+        parent = self.config.predecessor(request)
+        readiness = {"input": False, "kv": not required, "admitted": False,
+                     "parent": parent is None or 'compute_complete_ns' in self.state[parent]}
+        pending_kv = {m.id for m in required}
+        def kv_ready(migration_id, error=None):
+            if not self._attempt_current(request.id, attempt):return
+            if error is not None:
+                self._request_failed(request.id,attempt,'kv_failed',error)
+                return
+            pending_kv.discard(migration_id)
+            readiness['kv'] = not pending_kv
+            if readiness['kv']:
+                self._update_request(request.id, 'kv_ready',
+                    kv_ready_ns=nanoseconds(self.loop.now_s), kv_ready_ticks=str(self.loop.now_s.ticks))
+            ready()
         def ready():
-            from astermind.engine.timeline import nanoseconds
-            state.update(status="computing", cell_ready_ns=nanoseconds(self.loop.now_s), cell_ready_ticks=str(self.loop.now_s.ticks))
-            self._record_request("cell_input_ready", request.id)
-            cell_request = CellRequest(
-                request.id,
-                self.loop.now_s,
-                request.input_tokens,
-                request.output_tokens,
-                prefix_hit_tokens=request.prefix_hit_tokens,
-                session_id=request.session_id,
-                context_id=request.context_id,
-                parent_context_id=request.parent_context_id,
-            )
-            self.cells[cell_config.id].submit_ready_request(cell_request)
-
-        self._submit(
-            request.user_device,
-            cell_config.ingress_device,
-            request.input_bytes,
-            "request_input",
-            request.id,
-            ready,
-        )
+            if not readiness['input'] or not readiness['kv'] or not readiness['parent'] or readiness['admitted']:
+                return
+            readiness['admitted'] = True
+            if not self._attempt_current(request.id,attempt):
+                return
+            if cell_config.id in self._failed_cells or getattr(self.cells[cell_config.id],'_closed',False):
+                self._request_failed(request.id,attempt,'cell_unavailable_at_admission',
+                    dict(cell_id=cell_config.id,reason='target Cell stopped before input arrived'))
+                return
+            self._update_request(request.id, "input_delivered", status="computing",
+                                 cell_ready_ns=nanoseconds(self.loop.now_s),
+                                 cell_ready_ticks=str(self.loop.now_s.ticks))
+            self._record_request('cell_input_ready', request.id)
+            cell_request = CellRequest(internal_id, self.loop.now_s, request.input_tokens, request.output_tokens,
+                prefix_hit_tokens=request.prefix_hit_tokens, session_id=request.session_id,
+                context_id=request.context_id, parent_context_id=request.parent_context_id)
+            try:
+                self.cells[cell_config.id].submit_ready_request(cell_request)
+            except (ValueError,RuntimeError) as error:
+                self._request_failed(request.id,attempt,'cell_admission_failed',
+                    dict(cell_id=cell_config.id,error_type=type(error).__name__,reason=str(error)))
+        def parent_ready(error=None):
+            if not self._attempt_current(request.id, attempt):return
+            if error is not None:
+                self._request_failed(request.id,attempt,'parent_failed',error)
+                return
+            readiness['parent'] = True
+            self._update_request(request.id, 'parent_ready',
+                parent_ready_ns=self.state[parent]['compute_complete_ns'],
+                parent_ready_ticks=self.state[parent]['compute_complete_ticks'])
+            ready()
+        if parent is not None and readiness['parent']:
+            parent_ready()
+        if parent is not None and not readiness['parent']:
+            if self.state[parent]['status'] == 'failed':
+                parent_ready(self.state[parent]['failure'])
+            else:
+                self._parent_waiters.setdefault(parent, []).append(parent_ready)
+        for migration in required:
+            record = self.migrations.records.get(migration.id)
+            if record and record['state'] == 'completed':
+                kv_ready(migration.id)
+            elif record and record['state'] in ('failed', 'capacity_blocked', 'source_release_failed'):
+                kv_ready(migration.id, record)
+            else:
+                self._kv_waiters.setdefault(migration.id, []).append(kv_ready)
+        def input_ready():
+            readiness['input'] = True
+            self._update_request(request.id, 'input_ready',
+                input_ready_ns=nanoseconds(self.loop.now_s), input_ready_ticks=str(self.loop.now_s.ticks))
+            ready()
+        if not self._attempt_current(request.id, attempt):
+            return
+        self._submit(request.user_device, cell_config.ingress_device, request.input_bytes,
+                     "request_input", request.id, input_ready)
 
     def _output(self, output):
+        if not self._attempt_current(output.request_id, 0):
+            return
         self.outputs.append(asdict(output))
         request = self.requests[output.request_id]
         c = self._cell_configs[output.cell_id]
@@ -333,6 +453,7 @@ class Simulation:
                 self._record_request("first_delivered", request.id)
             state["last_token_received_ns"] = now
             state['last_token_received_ticks'] = str(self.loop.now_s.ticks)
+            self._update_request(request.id, 'token_delivered')
             if state["received_tokens"] == request.output_tokens:
                 self._record_request("output_delivered", request.id)
             self._finish(request.id)
@@ -347,25 +468,40 @@ class Simulation:
         )
 
     def _completed(self, completion):
+        if not self._attempt_current(completion.request_id, 0):
+            return
         self.completions.append(asdict(completion))
         from astermind.engine.timeline import nanoseconds
-        self.state[completion.request_id]['compute_complete_ns'] = nanoseconds(completion.completion_time_s)
-        self.state[completion.request_id]['compute_complete_ticks'] = str(completion.completion_time_s.ticks)
+        self._update_request(completion.request_id, 'cell_completed',
+            compute_complete_ns=nanoseconds(completion.completion_time_s),
+            compute_complete_ticks=str(completion.completion_time_s.ticks))
         self._record_request("compute_complete", completion.request_id)
         self._finish(completion.request_id)
+        for callback in self._parent_waiters.pop(completion.request_id, ()):
+            callback()
         for migration in self.config.migrations:
             if migration.after_request == completion.request_id:
-                self.migrations.start(
-                    migration,
-                    self.cells[migration.source_cell],
-                    self.cells[migration.target_cell],
-                    self.history.history(migration.session_id, migration.context_id),
-                    on_complete=lambda record, migration=migration: (
-                        self._session_cells.update(
-                            {migration.session_id: migration.target_cell}
-                        )
-                    ),
-                )
+                try:
+                    self.migrations.start(
+                        migration,
+                        self.cells[migration.source_cell],
+                        self.cells[migration.target_cell],
+                        self.history.history(migration.session_id, migration.context_id),
+                        on_complete=lambda record, migration=migration: (
+                            self._session_cells.update({migration.session_id: migration.target_cell}),
+                            self._kv_terminal(migration.id),
+                        ),
+                        on_failure=lambda error, mid=migration.id: self._kv_terminal(mid, error),
+                    )
+                except (ValueError, RuntimeError) as error:
+                    # Keep diagnostics and rollback state from the existing transaction.
+                    record = self.migrations.records.setdefault(migration.id, {})
+                    record.update(state="failed", message=str(error))
+                    self._kv_terminal(migration.id, record)
+
+    def _kv_terminal(self, migration_id, error=None):
+        for callback in self._kv_waiters.pop(migration_id, ()):
+            callback(migration_id,error)
 
     def _record_request(self, kind, request_id):
         self.host.log.append(
@@ -385,11 +521,11 @@ class Simulation:
             "compute_complete_ns" in state
             and state["received_tokens"] == self.requests[request_id].output_tokens
         ):
-            state["status"] = "completed"
             state["completed_ns"] = max(
                 state["compute_complete_ns"], state["last_token_received_ns"] or 0
             )
             state['completed_ticks'] = str(self.loop.now_s.ticks)
+            self._update_request(request_id, 'user_completed', status='completed')
             self.host.log.append(
                 dict(
                     kind="request_complete",
@@ -425,6 +561,16 @@ class Simulation:
             raise RuntimeError(
                 "Simulation horizon exceeded before all native requests completed"
             )
+        # Communication 9c08c9c user-observed metrics; preserve undefined values.
+        for request_id, state in self.state.items():
+            first, last = state["first_token_received_ns"], state["last_token_received_ns"]
+            count = self.requests[request_id].output_tokens
+            state["metrics"] = dict(
+                ttft_ns=None if first is None else first - state["arrival_ns"],
+                tpot_ns=None if first is None or last is None or count <= 1 or state["status"] != "completed"
+                else (last - first) / (count - 1),
+                e2e_ns=None if state["status"] != "completed" else state["completed_ns"] - state["arrival_ns"],
+            )
         return {
             "schema_version": 1,
             "status": "completed"
@@ -434,11 +580,13 @@ class Simulation:
             "configuration": self.config.model_dump(),
             "requests": self.state,
             "decisions": self.decisions,
+            "request_state_events": self.request_state_events,
             "compute_completions": self.completions,
             "produced_outputs": self.outputs,
             "cells": {
                 key: {
                     "steps": c.steps,
+                    "load_history": c.load_history,
                     "final_load": c.snapshot(),
                     "execution_performance": c.execution.performance_stats(),
                     "scheduler_runtime": asdict(c.backend.runtime_info),

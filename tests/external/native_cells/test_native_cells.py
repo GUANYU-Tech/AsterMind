@@ -210,6 +210,85 @@ class NativeCellIntegrationTests(unittest.TestCase):
         self.assertTrue(result["audit"]["passed"])
         self.assertGreater(result["audit"]["communications"], 0)
 
+    def prerequisite_config(self, *, backend="simgrid", mode="move"):
+        value = self.config(
+            "dynamic_migration_tp2.json", backend=backend,
+            timeline_mode="simgrid" if backend == "simgrid" else "orbitserve",
+            communication_mode="flowsim",
+        ).model_dump(mode="json")
+        value["requests"][1]["arrival_ns"] = 0
+        value["migrations"][0].update(before_request="context1", mode=mode)
+        return value
+
+    def assert_prerequisite_report(self, result):
+        parent, child = (result["requests"][key] for key in ("context0", "context1"))
+        self.assertEqual(result["status"], "completed")
+        self.assertTrue(result["audit"]["passed"])
+        self.assertEqual(child["parent_ready_ticks"], parent["compute_complete_ticks"])
+        self.assertGreaterEqual(int(child["cell_ready_ticks"]), int(child["input_ready_ticks"]))
+        self.assertGreaterEqual(int(child["cell_ready_ticks"]), int(parent["compute_complete_ticks"]))
+        events = list(result["request_state_events"])
+        admitted = [e for e in events if e["request_id"] == "context1" and e["status"] == "computing" and e["previous"] == "input"]
+        self.assertEqual(len(admitted), 1)
+        sequences = {e["sequence"] for e in result["event_log"]}
+        for event in events:
+            self.assertTrue(event["event_sequence"] is None or event["event_sequence"] in sequences)
+            self.assertEqual(event["time_ns"], (int(event["time_ticks"]) + 10**9 - 1) // 10**9)
+        for request in result["requests"].values():
+            self.assertEqual(request["metrics"]["ttft_ns"], request["first_token_received_ns"] - request["arrival_ns"])
+            self.assertEqual(request["metrics"]["tpot_ns"], request["last_token_received_ns"] - request["first_token_received_ns"])
+            self.assertEqual(request["metrics"]["e2e_ns"], request["completed_ns"] - request["arrival_ns"])
+        for cell in result["cells"].values():
+            if cell["steps"]:
+                self.assertTrue(list(cell["load_history"]))
+
+    def check_bound_migration(self, backend, mode):
+        result = self.run_scene(SimulationConfig.model_validate(self.prerequisite_config(backend=backend, mode=mode)))
+        self.assert_prerequisite_report(result)
+        child = result["requests"]["context1"]
+        record = result["migrations"]["copy0"]
+        self.assertEqual(record["state"], "completed")
+        self.assertGreaterEqual(int(child["cell_ready_ticks"]), int(record["completed_time_ticks"]))
+        self.assertEqual(child["kv_ready_ticks"], record["completed_time_ticks"])
+        target = result["cells"]["cellB"]["final_load"]["storage"]
+        self.assertEqual(target["migration_reserved_blocks"], 0)
+        self.assertTrue(any(r.get("effective_prefix_hit_tokens") == 32 for r in target["records"]))
+        if mode == "move":
+            self.assertEqual(record["source_release"]["removed_blocks"], 2)
+        else:
+            self.assertEqual(result["cells"]["cellA"]["final_load"]["storage"]["ready_cached_blocks"], 2)
+
+    def test_bound_move_prerequisites_ns3(self):
+        self.check_bound_migration("ns3", "move")
+
+    def test_bound_copy_prerequisites_simgrid(self):
+        self.check_bound_migration("simgrid", "copy")
+
+    def test_same_cell_parent_prerequisite_simgrid(self):
+        value = self.prerequisite_config()
+        value["migrations"] = []
+        value["requests"][1]["cell"] = "cellA"
+        result = self.run_scene(SimulationConfig.model_validate(value))
+        self.assert_prerequisite_report(result)
+        self.assertNotIn("kv_ready_ns", result["requests"]["context1"])
+
+    def test_bound_migration_failure_fails_receiver_simgrid(self):
+        value = self.prerequisite_config()
+        value["runtime_network"]["failure_policy"] = "fail"
+        result = self.run_scene(SimulationConfig.model_validate(value))
+        self.assertEqual(result["status"], "completed_with_failures")
+        self.assertEqual(result["migrations"]["copy0"]["state"], "failed")
+        child = result["requests"]["context1"]
+        self.assertEqual(child["status"], "failed")
+        self.assertNotIn("cell_ready_ns", child)
+        self.assertEqual(child["metrics"], dict(ttft_ns=None, tpot_ns=None, e2e_ns=None))
+        self.assertFalse(any(c["request_id"] == "context1" for c in result["compute_completions"]))
+        source = result["cells"]["cellA"]["final_load"]["storage"]
+        target = result["cells"]["cellB"]["final_load"]["storage"]
+        self.assertEqual(source["ready_cached_blocks"], 2)
+        self.assertEqual(target["migration_reserved_blocks"], 0)
+        self.assertEqual(target["ready_cached_blocks"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

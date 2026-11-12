@@ -106,6 +106,7 @@ class Request(Contract):
 class Migration(Contract):
     id: Identifier
     after_request: Identifier
+    before_request: Identifier | None = None
     source_cell: Identifier
     target_cell: Identifier
     session_id: str
@@ -174,6 +175,19 @@ class SimulationConfig(Contract):
 
         return compile_topology(self)
 
+    def predecessor(self, request):
+        # Ported from Communication 9c08c9c ConfiguredScheduler.predecessor;
+        # Cell selection remains owned by the existing Engine policy.
+        if request.parent_context_id is None:
+            return None
+        for parent in self.requests:
+            # Retain the current native history key when context_id is omitted.
+            if (parent.session_id, parent.context_id or parent.id) == (
+                request.session_id, request.parent_context_id
+            ):
+                return parent.id
+        raise ValueError("prerequisite requires an explicit parent request in the workload")
+
     @model_validator(mode="after")
     def validate_ids(self):
         if self.timeline_mode == 'simgrid' and self.backend != 'simgrid':
@@ -203,6 +217,44 @@ class SimulationConfig(Contract):
         if not self.cells:
             raise ValueError("at least one serving Cell required")
         known = {c.id for c in self.cells}
+        # Communication 9c08c9c SimulationConfig.validate_ids, adapted to the
+        # retained flat config and explicit receiving Cell (no default_cell).
+        dependencies = {r.id: [] for r in self.requests}
+        contexts = [(r.session_id, r.context_id or r.id) for r in self.requests if r.session_id]
+        if len(contexts) != len(set(contexts)):
+            raise ValueError("duplicate session context")
+        for request in self.requests:
+            parent = self.predecessor(request)
+            if parent is not None:
+                dependencies[request.id].append(parent)
+        for migration in self.migrations:
+            if migration.before_request in dependencies:
+                dependencies[migration.before_request].append(migration.after_request)
+
+        def visit(node, active, done):
+            if node in active:
+                raise ValueError("cyclic KV prerequisites")
+            if node in done:
+                return
+            for parent in dependencies.get(node, ()):
+                visit(parent, active | {node}, done)
+            done.add(node)
+
+        done = set()
+        for node in dependencies:
+            visit(node, set(), done)
+        requests = {r.id: r for r in self.requests}
+        for migration in self.migrations:
+            if migration.before_request is not None:
+                if (migration.before_request not in requests
+                        or migration.before_request == migration.after_request):
+                    raise ValueError("KV prerequisite requires a distinct known receiving request")
+                request = requests[migration.before_request]
+                if request.cell != migration.target_cell:
+                    raise ValueError("KV destination must match explicit receiving request Cell")
+                if (request.session_id != migration.session_id
+                        or request.parent_context_id != migration.context_id):
+                    raise ValueError("KV history must match receiving request parent context")
         if any(r.cell is not None and r.cell not in known for r in self.requests):
             raise ValueError("request selects an unknown Cell")
         if any(r.arrival_ns > self.horizon_ns for r in self.requests):

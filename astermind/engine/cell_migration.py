@@ -14,7 +14,7 @@ class NetworkKVMigration:
         for cleanup in tuple(self._cleanup.values()):
             cleanup("migration_runtime_closed")
 
-    def start(self, spec, source, target, history, *, on_complete=None):
+    def start(self, spec, source, target, history, *, on_complete=None, on_failure=None):
         from astermind.engine.cell_events import STEP_COMPLETE
 
         if spec.mode not in {"copy", "move"} or source is target:
@@ -94,6 +94,8 @@ class NetworkKVMigration:
                 )
                 stamp(record)
                 release()
+                if on_failure is not None:
+                    on_failure(dict(record))
 
         def memory_delay(cell, size, operation):
             value = cell.migration_memory_time(size, operation)
@@ -118,6 +120,8 @@ class NetworkKVMigration:
                     source.storage_rpc("release_export", spec.id, False)
                     record.update(state="capacity_blocked", reason=imported["reason"])
                     release()
+                    if on_failure is not None:
+                        on_failure(dict(record))
                     return
                 reserved = True
                 size = imported["bytes"]
@@ -174,9 +178,11 @@ class NetworkKVMigration:
                             return
                         try:
                             target.storage_rpc("commit_import", spec.id)
-                        except BaseException:
+                        except BaseException as error:
                             abort("target_commit_failed")
-                            raise
+                            if on_failure is None or not isinstance(error, Exception):
+                                raise
+                            return
                         try:
                             result = source.storage_rpc(
                                 "release_export", spec.id, spec.mode == "move"
@@ -186,15 +192,19 @@ class NetworkKVMigration:
                                 source_release=result,
                                 completed_time_s=self.loop.now_s,
                             )
-                        except BaseException:
+                        except BaseException as error:
                             record.update(
                                 state="source_release_failed",
                                 completed_time_s=self.loop.now_s,
                             )
-                            raise
+                            if on_failure is None or not isinstance(error, Exception):
+                                raise
                         finally:
                             stamp(record)
                             release()
+                        if record["state"] == "source_release_failed":
+                            on_failure(dict(record))
+                            return
                         if on_complete is not None:
                             on_complete(record)
 
@@ -239,9 +249,10 @@ class NetworkKVMigration:
                     f"migration:{spec.id}:send",
                     send,
                 )
-            except BaseException:
+            except BaseException as error:
                 abort("migration_setup_failed")
-                raise
+                if on_failure is None or not isinstance(error, Exception):
+                    raise
 
         self._cleanup[spec.id] = abort
         self.executor.boundary_listeners.append(begin_if_idle)
