@@ -18,12 +18,10 @@ from orbitserve.runtime import (
     NetworkNodeSpec,
     NetworkSpec,
     NetworkState,
-    run_simulation,
 )
 from orbitserve.workload import load_workload_bundle
 from tests.unit.orbit.test_sgp4_elements import _bundle, _satellite
-from tests.unit.runtime.test_runtime_engine import _scenario
-from tests.unit.runtime.test_runtime_event_order import strategy
+from tests.network_case import NetworkCase, run_traffic
 
 POLICIES = ("earliest_arrival", "min_hops", "min_propagation")
 
@@ -63,7 +61,7 @@ def acceptance_spec():
     workload = load_workload_bundle(
         Path(__file__).resolve().parents[2] / "fixtures/workloads/coupled_physical"
     ).to_dict()
-    base = _scenario(strategy(), requests=workload["session_requests"])
+    base = NetworkCase(traffic=tuple(workload["session_requests"]), target="sat-c")
     gateway = {
         **workload["gateways"][0],
         "ingress_id": workload["gateways"][0]["gateway_id"],
@@ -120,18 +118,17 @@ def acceptance_spec():
         network=network,
         environment_state=trace,
         gateways=tuple(workload["gateways"]),
-        workload_bundle=workload,
         time_horizon_s=120.0,
     )
 
 
 def run_acceptance(mode, policy):
     base = acceptance_spec()
-    return run_simulation(
+    return run_traffic(
         replace(
             base,
             network=replace(base.network, transport_model=mode),
-            strategy=replace(base.strategy, routing_policy=policy),
+            routing_policy=policy,
         )
     )
 
@@ -154,9 +151,9 @@ class NetworkAcceptanceTests(unittest.TestCase):
     def verify_matrix_row(self, mode, policy):
         result = run_acceptance(mode, policy)
         self.assertEqual(
-            result.request_summary["completed_request_count"], 3, result.request_records
+            result.completed, 3, result.transfer_jobs
         )
-        events = result.state_summary["event_log"]
+        events = result.log
         self.assertEqual(
             [e["time_s"] for e in events], sorted(e["time_s"] for e in events)
         )
@@ -170,7 +167,7 @@ class NetworkAcceptanceTests(unittest.TestCase):
             any(e["kind"] == "route_recovery" and e["time_s"] == 10.0 for e in events)
         )
         paths = [
-            leg for r in result.request_records for leg in r["routing"]["selected_path"]
+            leg for r in result.transfer_jobs for leg in r["path"]
         ]
         backup = [
             leg

@@ -65,7 +65,7 @@ def _summary_payload(payload: dict[str, Any], writer: "_ArtifactWriter") -> dict
     summary["output_mode"] = "summary"
     summary["output_contract"] = {
         "summary_json": "lightweight metrics/provenance for batch runs and plotting",
-        "audit_artifacts": "request-level runtime and DSE audit data externalized from bulky fields",
+        "audit_artifacts": "request-level runtime audit data externalized from bulky fields",
         "full_json_mode": "rerun CLI with --output-mode full to reproduce the historical monolithic JSON",
     }
 
@@ -89,71 +89,10 @@ def _summary_payload(payload: dict[str, Any], writer: "_ArtifactWriter") -> dict
             json_path="performance.details.runtime",
         )
 
-    dse = summary.get("dse")
-    if isinstance(dse, dict):
-        _externalize_dse(dse, writer=writer)
 
     return summary
 
 
-def _externalize_dse(dse: dict[str, Any], *, writer: "_ArtifactWriter") -> None:
-    rows = dse.get("rows")
-    rows_ref = None
-    if isinstance(rows, list) and rows:
-        rows_ref = writer.write_jsonl(
-            name="dse_rows_full",
-            rel_path=("dse", "rows_full.jsonl"),
-            rows=rows,
-            json_path="dse.rows",
-        )
-        dse["rows"] = [
-            _slim_dse_row(row, artifact_ref=rows_ref) if isinstance(row, dict) else row
-            for row in rows
-        ]
-        dse["rows_artifact"] = rows_ref
-
-    runtime_matrix = dse.get("runtime_matrix")
-    if isinstance(runtime_matrix, dict):
-        matrix_rows = runtime_matrix.get("matrix_rows")
-        matrix_ref = None
-        if isinstance(matrix_rows, list) and matrix_rows:
-            matrix_ref = writer.write_jsonl(
-                name="dse_runtime_matrix_rows_full",
-                rel_path=("dse", "runtime_matrix_rows_full.jsonl"),
-                rows=matrix_rows,
-                json_path="dse.runtime_matrix.matrix_rows",
-            )
-            runtime_matrix["matrix_rows"] = [
-                _slim_matrix_row(row, artifact_ref=matrix_ref) if isinstance(row, dict) else row
-                for row in matrix_rows
-            ]
-            runtime_matrix["matrix_rows_artifact"] = matrix_ref
-
-        selected_rows = runtime_matrix.get("selected_rows")
-        if isinstance(selected_rows, list):
-            runtime_matrix["selected_rows"] = [
-                _slim_matrix_row(row, artifact_ref=matrix_ref) if isinstance(row, dict) else row
-                for row in selected_rows
-            ]
-
-        selected_by_design = runtime_matrix.get("selected_by_design")
-        if isinstance(selected_by_design, dict):
-            runtime_matrix["selected_by_design"] = {
-                key: _slim_matrix_row(value, artifact_ref=matrix_ref)
-                if isinstance(value, dict)
-                else value
-                for key, value in selected_by_design.items()
-            }
-
-    frontier = dse.get("frontier")
-    if isinstance(frontier, dict):
-        frontier_ref = writer.write_json(
-            name="dse_frontier_full",
-            rel_path=("dse", "frontier_full.json"),
-            value=frontier,
-            json_path="dse.frontier",
-        )
-        _slim_frontier(frontier, artifact_ref=frontier_ref)
 
 
 def _externalized_runtime_summary(
@@ -193,34 +132,10 @@ def _externalized_runtime_summary(
     )
 
 
-def _slim_score_row(row: dict[str, Any]) -> dict[str, Any]:
-    slim = deepcopy(row)
-    evaluator_result = slim.get("evaluator_result")
-    if isinstance(evaluator_result, dict):
-        slim["evaluator_result"] = _slim_runtime_result(evaluator_result)
-    return slim
 
 
-def _slim_dse_row(row: dict[str, Any], *, artifact_ref: dict[str, Any] | None) -> dict[str, Any]:
-    slim = deepcopy(row)
-    details = _dict_at(slim, ("performance", "details"))
-    for key in ("runtime",):
-        value = details.get(key)
-        if isinstance(value, dict):
-            details[key] = _slim_runtime_result(value)
-    if artifact_ref is not None:
-        slim["artifact_ref"] = artifact_ref
-    return slim
 
 
-def _slim_matrix_row(row: dict[str, Any], *, artifact_ref: dict[str, Any] | None) -> dict[str, Any]:
-    slim = deepcopy(row)
-    runtime_result = slim.get("runtime_result")
-    if isinstance(runtime_result, dict):
-        slim["runtime_result"] = _slim_runtime_result(runtime_result)
-    if artifact_ref is not None:
-        slim["artifact_ref"] = artifact_ref
-    return slim
 
 
 def _slim_runtime_result(
@@ -286,50 +201,8 @@ def _slim_runtime_result(
     return slim
 
 
-def _slim_frontier(frontier: dict[str, Any], *, artifact_ref: dict[str, Any] | None) -> None:
-    for key in ("frontier_rows", "eligible_candidates", "excluded_candidates"):
-        value = frontier.get(key)
-        if isinstance(value, list):
-            frontier[key] = [
-                _frontier_candidate_summary(candidate) if isinstance(candidate, dict) else candidate
-                for candidate in value
-            ]
-    if artifact_ref is not None:
-        frontier["artifact_ref"] = artifact_ref
 
 
-def _frontier_candidate_summary(candidate: dict[str, Any]) -> dict[str, Any]:
-    keep_fields = (
-        "candidate_id",
-        "design_strategy_id",
-        "row_index",
-        "design_id",
-        "strategy_id",
-        "policy",
-        "source",
-        "runtime_evaluated",
-        "eligible",
-        "excluded_reason",
-        "missing_fields",
-        "pareto_member",
-        "valid_for_paper_main_results",
-        "runtime_metric_scope",
-        "calibration",
-        "cost_metric",
-        "cost_usd",
-        "annualized_cost_usd_per_year",
-        "cost_total_usd",
-        "e2e_p95_s",
-        "ttft_p95_s",
-        "e2e_p99_s",
-        "ttft_p99_s",
-        "objective_score",
-        "objective_score_scope",
-        "trace_model",
-        "scope",
-        "warnings",
-    )
-    return {key: candidate.get(key) for key in keep_fields if key in candidate}
 
 
 def _slim_strategy(strategy: dict[str, Any]) -> dict[str, Any]:

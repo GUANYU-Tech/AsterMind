@@ -43,10 +43,10 @@ def execute(mode, target_type):
     spec = SimpleNamespace(
         serving_profile=SimpleNamespace(internal_comm_accounting="embedded"),
         time_horizon_s=20,
-        strategy=SimpleNamespace(routing_policy="earliest_arrival"),
+        routing_policy="earliest_arrival",
     )
     engine = _EventEngine(
-        spec, SimpleNamespace(network=net, time=trace.time), None, None, ()
+        spec, SimpleNamespace(network=net, time=trace.time)
     )
     engine.debit = lambda *args, **kwargs: None
     engine.on_delivered = lambda job, unused: job.update(done=True)
@@ -96,10 +96,10 @@ class RecoveryTests(unittest.TestCase):
         spec = SimpleNamespace(
             serving_profile=SimpleNamespace(internal_comm_accounting="embedded"),
             time_horizon_s=20,
-            strategy=SimpleNamespace(routing_policy="earliest_arrival"),
+            routing_policy="earliest_arrival",
         )
         engine = _EventEngine(
-            spec, SimpleNamespace(network=net, time=trace.time), None, None, ()
+            spec, SimpleNamespace(network=net, time=trace.time)
         )
         engine.debit = lambda *args, **kwargs: None
         engine.on_delivered = lambda job, unused: job.update(done=True)
@@ -150,12 +150,11 @@ class RecoveryTests(unittest.TestCase):
         self.verify_middle_hop_retains_delivered_prefix("simgrid")
 
     def verify_long_access_recovery(self, mode):
-        from orbitserve.runtime import LinkProfile, run_simulation
-        from tests.unit.runtime.test_runtime_engine import _scenario, _request
-        from tests.unit.runtime.test_runtime_event_order import strategy
+        from orbitserve.runtime import LinkProfile
+        from tests.network_case import NetworkCase, traffic, run_traffic
 
-        request = {**_request(arrival_time_s=7.25), "input_bytes": 7750}
-        spec = _scenario(strategy(), requests=(request,))
+        request = {**traffic(arrival=7.25), "input_bytes": 7750}
+        spec = NetworkCase(traffic=(request,))
         trace = spec.environment_state
         samples = tuple(
             dict(row, time_s=float(t))
@@ -187,13 +186,13 @@ class RecoveryTests(unittest.TestCase):
             explicit_pairs=(*spec.network.explicit_pairs, ("gateway-0", "sat-b")),
             link_profiles={**spec.network.link_profiles, "sgl": LinkProfile(8000, 0)},
         )
-        ref = run_simulation(replace(spec, network=net, environment_state=trace))
-        initial = ref.request_records[0]["routing"]["selected_path"][0]
+        ref = run_traffic(replace(spec, network=net, environment_state=trace))
+        initial = ref.transfer_jobs[0]["path"][0]
         self.assertAlmostEqual(initial["finish_s"], 15.0, places=6)
         fault = dict(
             target_type="link", target_id=initial["link_id"], start_s=10.0, end_s=25.0
         )
-        result = run_simulation(
+        result = run_traffic(
             replace(
                 spec,
                 network=replace(
@@ -202,14 +201,14 @@ class RecoveryTests(unittest.TestCase):
                 environment_state=trace,
             )
         )
-        self.assertEqual(result.request_summary["completed_request_count"], 1)
-        events = result.state_summary["event_log"]
+        self.assertEqual(result.completed, 1)
+        events = result.log
         loss = next(e for e in events if e["kind"] == "transfer_cancelled")
         self.assertEqual(loss["time_s"], 10.0)
         self.assertAlmostEqual(loss["bytes_discarded"], 2750, places=5)
         retry = next(e for e in events if e["kind"] == "route_recovery")
         self.assertEqual(retry["time_s"], 10.0)
-        path = result.request_records[0]["routing"]["selected_path"]
+        path = result.transfer_jobs[0]["path"]
         self.assertNotEqual(path[1]["link_id"], initial["link_id"])
         self.assertEqual(path[1]["start_s"], 10.0)
         self.assertEqual(path[1]["payload_bytes"], 7750)

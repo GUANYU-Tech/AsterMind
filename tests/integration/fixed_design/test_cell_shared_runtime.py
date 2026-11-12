@@ -9,25 +9,21 @@ from orbitserve.runtime import (
     CommunicationExecutor,
     LinkProfile,
     PhysicalTransfer,
-    RuntimeStrategySpec,
-    run_simulation,
 )
 from orbitserve.runtime.engine.cell_bridge import (
-    CellDeployment,
-    CellRuntime,
     CellTransfer,
     CellTransferExecutor,
     RuntimeCellNetwork,
     bind_batch_executor,
 )
-from orbitserve.runtime.engine.cell_events import CellCompletion, CellTokenOutput
+from orbitserve.runtime.engine.cell_events import CellCompletion, CellTokenOutput, CellRequest
 from orbitserve.runtime.engine.cell_migration import NetworkKVMigration
 from orbitserve.runtime.network import RuntimeNetworkFrames
 from orbitserve.runtime.timeline import GlobalTimeline
-from tests.unit.runtime.test_runtime_engine import _request, _scenario, _trace
+from tests.network_case import _trace, _network, run_network, NetworkCase
 
 
-def scenario(*, requests=(), transport_model="fluid", **network_options):
+def scenario(*, transport_model="fluid", **network_options):
     trace = _trace()
     trace = replace(
         trace,
@@ -43,25 +39,16 @@ def scenario(*, requests=(), transport_model="fluid", **network_options):
             for row in trace.ephemeris_samples
         ),
     )
-    spec = _scenario(
-        RuntimeStrategySpec(
-            latency_weight=1.0,
-            kv_reuse_weight=0.0,
-            energy_weight=0.0,
-            compute_load_weight=0.0,
-        ),
-        trace=trace,
-    )
     network = replace(
-        spec.network,
+        _network(),
         transport_model=transport_model,
         link_profiles={
-            **spec.network.link_profiles,
+            **_network().link_profiles,
             "communication_isl": LinkProfile(8e6, 0.0, capacity_schedule=((0.5, 0.5),)),
         },
         **network_options,
     )
-    return replace(spec, network=network, requests=tuple(requests))
+    return NetworkCase(network=network, environment_state=trace)
 
 
 class ProbeRuntime:
@@ -118,14 +105,6 @@ class CellSharedRuntimeTests(unittest.TestCase):
         self._assert_shared_clock("ns3")
 
     def _assert_shared_clock(self, backend):
-        requests = tuple(
-            {
-                **_request(f"r{i}", i * 0.1, session_id=f"s{i}"),
-                "input_bytes": 1.0,
-                "prompt_tokens": 4,
-            }
-            for i in range(2)
-        )
         outputs = []
 
         def factory(cell_id, loop, network, on_output, on_complete):
@@ -184,14 +163,16 @@ class CellSharedRuntimeTests(unittest.TestCase):
 
             return Cell()
 
-        runtime = CellRuntime({"sat-a": CellDeployment(factory, {0: "sat-a"})})
-        result = run_simulation(
-            scenario(requests=requests, transport_model=backend),
-            compute_runtime=runtime,
-        )
-        self.assertEqual(result.request_summary["completed_request_count"], 2)
+        def setup(runtime, host):
+            cell = factory("A", runtime.loop, runtime.network, lambda output: None, lambda result: None)
+            for i in range(2):
+                runtime.loop.schedule(i * 0.1, 30, "cell-request", lambda i=i: cell.submit_ready_request(
+                    CellRequest(request_id=f"r{i}", input_tokens=4, output_tokens=2, cell_ready_time_s=runtime.loop.now_s)
+                ))
+        result = run_network(scenario(transport_model=backend), ProbeRuntime(setup))
+        self.assertEqual(len(outputs), 2)
         self.assertTrue(all(t > 3 for t in outputs))
-        events = result.state_summary["event_log"]
+        events = result.log
         self.assertEqual(
             [e["time_s"] for e in events], sorted(e["time_s"] for e in events)
         )
@@ -224,7 +205,7 @@ class CellSharedRuntimeTests(unittest.TestCase):
             )
 
         runtime = ProbeRuntime(setup)
-        run_simulation(scenario(), compute_runtime=runtime)
+        run_network(scenario(), runtime)
         self.assertEqual(runtime.record["state"], "completed")
         self.assertEqual(runtime.record["bytes"], 2_000_000)
         self.assertEqual(len(runtime.record["partitions"]), 2)
@@ -261,13 +242,8 @@ class CellSharedRuntimeTests(unittest.TestCase):
         link = next(
             e for e in candidate_links(spec.network) if e["kind"] == "communication_isl"
         )
-        spec = replace(
-            spec,
-            network=replace(
-                spec.network, faults=({**fault, "target_id": link["link_id"]},)
-            ),
-        )
-        run_simulation(spec, compute_runtime=runtime)
+        spec.network = replace(spec.network, faults=({**fault, "target_id": link["link_id"]},))
+        run_network(spec, runtime)
         self.assertEqual(runtime.record["state"], "failed")
         self.assertIn("rollback_import", target.calls)
         self.assertNotIn("commit_import", target.calls)
@@ -285,9 +261,9 @@ class CellSharedRuntimeTests(unittest.TestCase):
             )
 
         runtime = ProbeRuntime(setup)
-        run_simulation(
-            replace(scenario(), time_horizon_s=0.25), compute_runtime=runtime
-        )
+        spec = scenario()
+        spec.time_horizon_s = 0.25
+        run_network(spec, runtime)
         self.assertEqual(runtime.record["state"], "failed")
         self.assertNotIn("commit_import", target.calls)
         self.assertFalse(source.paused or target.paused)
@@ -299,7 +275,7 @@ class CellSharedRuntimeTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "current time"):
                 frames.frame_at(1)
 
-        run_simulation(scenario(), compute_runtime=ProbeRuntime(setup))
+        run_network(scenario(), ProbeRuntime(setup))
 
     def test_public_communication_executor_binds_to_runtime_resources(self):
         completed = []
@@ -314,7 +290,7 @@ class CellSharedRuntimeTests(unittest.TestCase):
                     completed.append,
                 )
 
-        run_simulation(scenario(), compute_runtime=ProbeRuntime(setup))
+        run_network(scenario(), ProbeRuntime(setup))
         self.assertEqual(len(completed), 2)
         self.assertTrue(all(row.completed_at_s > 3 for row in completed))
         self.assertEqual({row.backend for row in completed}, {"fluid:flow"})
@@ -326,7 +302,7 @@ class CellSharedRuntimeTests(unittest.TestCase):
             runtime.network.subscribe(invalid)
             runtime.network.submit(CellTransfer('callback-check','sat-a','sat-b',10,0))
         with self.assertRaisesRegex(ValueError,'invalid successor callback'):
-            run_simulation(scenario(),compute_runtime=ProbeRuntime(setup))
+            run_network(scenario(), ProbeRuntime(setup))
 
     def test_native_executor_submits_input_distribution_before_collective(self):
         completed, started = [], []
@@ -385,7 +361,7 @@ class CellSharedRuntimeTests(unittest.TestCase):
             )
             executor.start_batch("A", 0, None, execution, lambda at_s: None)
 
-        run_simulation(scenario(), compute_runtime=ProbeRuntime(setup))
+        run_network(scenario(), ProbeRuntime(setup))
         self.assertEqual(len(started), 1)
         self.assertGreater(started[0], 1)
         self.assertGreater(completed[0], started[0] + 1)

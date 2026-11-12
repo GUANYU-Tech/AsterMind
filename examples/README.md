@@ -1,17 +1,15 @@
 # Examples
 
-This directory contains readable, reusable, version-controlled input examples. It does not contain test-generated artifacts or pre-generated experiment results.
+Native fixed-design scenarios live in `simulator/examples/` and are loaded as
+SimulationConfig. See [Native setup and execution](../simulator/README.md).
 
-## Layout
+- `capacity/` retains Native capacity-study inputs.
+- `experiments/` retains documents for the independent terrestrial baseline API.
+- `single_satellite/` retains static hardware, energy sizing and cost inputs.
+- `workloads/` retains independent workload descriptions, bundles and source traces.
+- `astermind_joint/` retains standalone configuration/replay helpers; its scripts
+  using the retired request adapters have been removed.
 
-- `experiments/` contains complete manifests for fixed-design, DSE, and terrestrial-baseline runs.
-- `single_satellite/` contains static per-satellite hardware, energy-sizing, and cost inputs.
-- `workloads/descriptions/` contains descriptions used to build canonical workload bundles.
-- `workloads/trace_examples/` contains canonical seven-file bundles that experiments can load directly.
-- `workloads/source_traces/` contains small raw inputs for trace-replay demonstrations.
-
-`fixed_design_geometry.json` demonstrates a complete Orbit-geometry-to-Runtime path. `orbit_geometry_dse.json` enumerates orbital geometry candidates through the same evaluation path. Both use the same workload and per-satellite hardware input.
-
-See the repository root `README.md` for commands. Write outputs to `results/`, never back into `examples/`.
-
-中文命令行操作、配置迁移和实验结果说明见 [OrbitServe 使用说明](使用说明.md)。
+The Native CLI does not dispatch terrestrial baseline documents.
+Write generated outputs under `results/` or `local/`, not `examples/`.
+中文说明见 [使用说明](使用说明.md)。

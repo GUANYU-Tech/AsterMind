@@ -7,7 +7,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from orbitserve.runtime import NetworkState, run_simulation
+from orbitserve.runtime import NetworkState
+from tests.network_case import run_traffic
 from orbitserve.runtime.setup import islsim
 from orbitserve.experiments.network import run_network_experiment
 from orbitserve.experiments.network_inputs import snapshot_network_input
@@ -24,14 +25,14 @@ class ISLSimRuntimeTests(unittest.TestCase):
         spec = replace(base, network=replace(base.network, link_profiles=profiles, transport_model=mode))
         _, _, (_, model, _) = islsim._api()
         with patch.object(model, 'compute_link', wraps=model.compute_link) as native:
-            result = run_simulation(spec)
+            result = run_traffic(spec)
         self.assertGreater(native.call_count, 0)
         self.assertEqual(result.request_summary['completed_request_count'], 3)
         state = NetworkState(spec.environment_state, spec.network, spec.gateways)
         links = [link for link in state.snapshot(1.)['links'] if link['kind'] != 'sgl']
         self.assertTrue(links)
         self.assertTrue(all(link['capacity_model'] == 'islsim' for link in links))
-        for request in result.request_records:
+        for request in result.transfer_jobs:
             for leg in request['routing']['selected_path']:
                 if 'cancelled_at_s' not in leg:
                     self.assertAlmostEqual(leg['propagation_delay_s'], leg['distance_km'] / 299792.458)

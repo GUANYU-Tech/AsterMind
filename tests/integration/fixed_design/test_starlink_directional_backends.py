@@ -3,7 +3,8 @@ from dataclasses import replace
 import importlib.util
 import unittest
 
-from orbitserve.runtime import LinkProfile, run_simulation
+from orbitserve.runtime import LinkProfile
+from tests.network_case import run_traffic
 from tests.integration.fixed_design.test_network_acceptance import acceptance_spec
 from tests.unit.runtime.test_starlink_presets import generated_profiles
 
@@ -20,10 +21,10 @@ class StarlinkDirectionalBackendTests(unittest.TestCase):
         profiles={**generated.link_profiles,'sgl':LinkProfile(1e12,.5),
                   'communication_isl':LinkProfile(1e12,.5),'cross_layer':LinkProfile(1e12,.5)}
         scenario=replace(base,network=replace(base.network,nodes=nodes,link_profiles=profiles,faults=(),transport_model=mode),
-                         requests=({**base.requests[0],'input_bytes':1000000,'output_bytes':1000000,'output_tokens':1},))
-        result=run_simulation(scenario)
-        self.assertEqual(result.request_summary['completed_request_count'],1)
-        legs=result.request_records[0]['routing']['selected_path']
+                         traffic=({**base.traffic[0],'input_bytes':1000000,'output_bytes':1000000,'output_tokens':1},))
+        result=run_traffic(scenario)
+        self.assertEqual(result.completed,1)
+        legs=result.transfer_jobs[0]['path']
         uplink=next(p for p in legs if p['source_node_id']=='ground-00')
         downlink=next(p for p in legs if p['target_node_id']=='ground-00')
         self.assertEqual(uplink['payload_bytes'],downlink['payload_bytes'])

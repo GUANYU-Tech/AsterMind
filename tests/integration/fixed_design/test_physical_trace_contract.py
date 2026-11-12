@@ -10,7 +10,7 @@ class PhysicalTraceContractTests(unittest.TestCase):
     def test_sgp4_trace_has_physical_members_separate_shells_and_geometry_only(self):
         with tempfile.TemporaryDirectory() as folder:
             result = run_network_experiment(
-                physical_case().physical_network, folder, _workers=1
+                physical_case()["physical_network"], folder, _workers=1
             )
             trace = load_orbit_trace(Path(folder) / "orbit_trace/trace_manifest.json")
             self.assertEqual(len(trace.satellite_catalog), 32)

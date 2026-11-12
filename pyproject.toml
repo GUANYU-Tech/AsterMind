@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "OrbitServe"
 version = "0.0.1"
-description = "LEO AI serving simulation and cost-SLO co-design."
+description = "Native fixed-design LEO AI serving simulation."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -32,14 +32,11 @@ packages = [
   "orbitserve.baselines",
   "orbitserve.baselines.ground",
   "orbitserve.common",
-  "orbitserve.dse",
   "orbitserve.experiments",
   "orbitserve.runtime",
   "orbitserve.runtime.engine",
-  "orbitserve.runtime.metrics",
   "orbitserve.runtime.setup",
   "orbitserve.runtime.state",
-  "orbitserve.serving",
   "orbitserve.orbit",
   "orbitserve.orbit.sgp4",
   "orbitserve.orbit.validation",
@@ -49,7 +46,6 @@ packages = [
 [tool.setuptools.package-dir]
 orbitserve = "src/orbitserve"
 "orbitserve.experiments" = "src/experiments"
-"orbitserve.dse" = "src/dse"
 "orbitserve.baselines" = "src/baselines"
 "orbitserve.baselines.ground" = "src/baselines/ground"
 

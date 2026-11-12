@@ -3,10 +3,8 @@ import tempfile
 from pathlib import Path
 import unittest
 from copy import deepcopy
-from dataclasses import replace
 
 from orbitserve.experiments.network import run_network_experiment
-from orbitserve.experiments import run_experiment
 from tests.system_case import physical_case
 from tests.unit.experiments import test_network_scenarios as scenario_fixtures
 
@@ -35,9 +33,9 @@ class NetworkScenarioIntegrationTests(unittest.TestCase):
         self.assertGreater(len(candidates[1]),len(candidates[0]))
         self.assertTrue(any(e.get('topology_patch') for e in candidates[1]))
 
-    def test_compute_only_runs_full_llm_runtime_with_direct_ground_access(self):
+    def test_compute_only_exports_direct_ground_access(self):
         spec=physical_case()
-        physical=deepcopy(spec.physical_network)
+        physical=deepcopy(spec["physical_network"])
         physical['scenario_type']='compute_only'
         physical['constellations']['communication_shells']=[]
         physical['network']['faults']=[]
@@ -45,14 +43,9 @@ class NetworkScenarioIntegrationTests(unittest.TestCase):
         for formation in physical['constellations']['compute_formations']:
             formation.update(sgl_terminals=2,max_user_links=1,max_gateway_links=1,
                              egress_policy='free')
-        spec=replace(spec,physical_network=physical)
         with tempfile.TemporaryDirectory() as folder:
-            result=run_experiment(spec,output_dir=folder,_workers=1)
-            # This verifies executable workload/deployment/routing integration,
-            # rather than merely accepting a scene label in JSON.
-            runtime=result.to_dict()['runtime']
-            self.assertEqual(runtime['request_summary']['total_request_count'],3)
-            self.assertEqual(runtime['request_summary']['completed_request_count'],3)
-            materialized=json.loads((Path(folder)/'network/materialized_input.json').read_text())
-            self.assertEqual(materialized['network']['ground_roles'],['compute'])
-            self.assertFalse(any(n['role']=='communication' for n in materialized['network']['nodes']))
+            result = run_network_experiment(physical, folder, _workers=1)
+            self.assertTrue(result["checks"]["passed"])
+            materialized = json.loads((Path(folder) / "materialized_input.json").read_text())
+            self.assertEqual(materialized["network"]["ground_roles"], ["compute"])
+            self.assertFalse(any(n["role"] == "communication" for n in materialized["network"]["nodes"]))

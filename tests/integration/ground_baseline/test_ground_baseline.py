@@ -15,7 +15,8 @@ from orbitserve.baselines.ground.runtime import (
     _snapshot_prefix_score,
     run_ground_runtime,
 )
-from orbitserve.experiments import load_experiment_spec, run_experiment
+import json
+from orbitserve.workload import materialize_workload_bundle, WorkloadBundleRef
 from orbitserve.baselines.ground.contracts import GroundScenario as RuntimeScenario, GroundStrategySpec as RuntimeStrategySpec
 from orbitserve.experiments.runtime_dispatch import evaluate_runtime_performance
 from orbitserve.baselines.ground.evaluation import aggregate_ground_records as aggregate_runtime_records
@@ -1198,12 +1199,17 @@ class GroundBaselineRuntimeTests(unittest.TestCase):
 
     def test_reproduction_manifest_promotes_ground_scope_and_tail_metrics(self):
         root=Path(__file__).resolve().parents[3]
-        spec=load_experiment_spec(root/"examples/experiments/skywalker_ground_reproduction.json")
-        result=run_experiment(spec)
-        runtime=result.runtime
+        path = root / "examples/experiments/skywalker_ground_reproduction.json"
+        spec = json.loads(path.read_text())
+        workload = materialize_workload_bundle(WorkloadBundleRef.from_dict(spec["workload"]), base_dir=path.parent).to_dict()
+        runtime = evaluate_runtime_performance(RuntimeScenario(
+            scenario_id=spec["experiment_id"], requests=tuple(workload["session_requests"]),
+            regions=tuple(workload["regions"]), gateways=tuple(workload["gateways"]),
+            runtime_config=RuntimeStrategySpec.from_dict(spec["ground_baseline"]),
+            time_horizon_s=workload["manifest"].get("time_horizon_s"),
+        ))
         self.assertTrue(runtime.evaluated)
         self.assertEqual(runtime.scope,"skywalker_ground_reproduction_surrogate")
-        self.assertEqual(result.module_status["orbit"],"not_required_terrestrial_baseline")
         self.assertEqual(len(runtime.request_records),3)
         self.assertFalse(runtime.valid_for_paper_main_results)
         self.assertGreater(runtime.runtime_metrics["useful_request_throughput_per_s"],0)

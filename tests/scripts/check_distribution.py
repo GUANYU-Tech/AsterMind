@@ -40,8 +40,6 @@ from orbitserve.experiments.islsim_cli import main
 output = Path.cwd() / 'islsim.json'
 assert main(['--out', str(output)]) == 0
 assert set(json.loads(output.read_text())) == {'tx', 'rx', 'channel'}
-from orbitserve.serving import ServingSpec
-assert ServingSpec().parallelism.parallel_node_count == 1
 for name in ('network_sim', 'network_sim.topology', 'simulator.config',
              'simulator.network', 'simulator.engine', 'integration'):
     loaded = import_module(name)

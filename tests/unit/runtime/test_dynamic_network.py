@@ -9,7 +9,6 @@ from orbitserve.runtime import (
     NetworkSpec,
     NetworkState,
     NetworkUnavailable,
-    RuntimeStrategySpec,
     candidate_links,
 )
 
@@ -337,8 +336,6 @@ class DynamicNetworkTests(unittest.TestCase):
                 state.transfer("a", "b", t, 1)
         with self.assertRaises(ValueError):
             state.transfer("a", "b", 0, float("nan"))
-        with self.assertRaises(ValueError):
-            RuntimeStrategySpec(ingress_selection="communication_satellite")
 
     def test_cell_members_and_cross_layer_ingress_are_explicit(self):
         members = tuple(

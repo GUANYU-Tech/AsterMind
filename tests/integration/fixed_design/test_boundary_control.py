@@ -24,8 +24,8 @@ def scenario(mode='queue', faults=(), edges=None, setup=0, terminals=4):
     net = NetworkState(trace, replace(base.spec, nodes=nodes, faults=faults, fault_timing='boundary',
                                      failure_policy='retry_next_sample', transport_model=mode))
     spec = SimpleNamespace(serving_profile=SimpleNamespace(internal_comm_accounting='embedded'),
-                           time_horizon_s=240., strategy=SimpleNamespace(routing_policy='earliest_arrival'))
-    engine = _EventEngine(spec, SimpleNamespace(network=net, time=trace.time), None, None, ())
+                           time_horizon_s=240., routing_policy='earliest_arrival')
+    engine = _EventEngine(spec, SimpleNamespace(network=net, time=trace.time))
     engine.debit = lambda *args, **kwargs: None
     engine.on_delivered = lambda job, unused: job.update(done=True)
     engine.fail = lambda job, reason: job.update(done=True, failure=reason)

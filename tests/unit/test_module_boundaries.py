@@ -5,7 +5,6 @@ from pathlib import Path
 import orbitserve.architecture as architecture
 import orbitserve.orbit as orbit
 import orbitserve.runtime as runtime
-import orbitserve.serving as serving
 import orbitserve.workload as workload
 
 
@@ -20,8 +19,7 @@ class CoreModuleBoundaryTests(unittest.TestCase):
             architecture: ("HardwareSpec", "ResolvedArchitecture", "SatelliteHardwareProfile", "resolve_architecture"),
             orbit: ("OrbitTraceManifest", "OrbitTraceBundle", "generate_orbit_trace", "load_orbit_trace"),
             workload: ("WorkloadBundleRef", "WorkloadGenerationResult", "materialize_workload_bundle"),
-            serving: ("ServingSpec", "ServingThroughputEstimate", "estimate_serving_throughput"),
-            runtime: ("RuntimeSimulationSpec", "RuntimeStrategySpec", "RuntimePerformanceResult", "run_simulation"),
+            runtime: ("NetworkSpec", "NetworkState", "GlobalTimeline", "CommunicationExecutor"),
         }.items():
             with self.subTest(module=module.__name__):
                 for name in names:

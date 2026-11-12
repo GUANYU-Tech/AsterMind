@@ -4,7 +4,7 @@ import unittest
 from dataclasses import replace
 from unittest.mock import patch
 
-from orbitserve.runtime import run_simulation
+from tests.network_case import run_traffic
 from orbitserve.runtime.engine.fluid_transport import FluidTransport
 from orbitserve.runtime.engine.simgrid_transport import SimGridTransport
 from orbitserve.runtime.engine.ns3_transport import Ns3Transport
@@ -17,7 +17,7 @@ class TimeVaryingTransportTests(unittest.TestCase):
         base = acceptance_spec()
         physical = temporal_state()
         scenario = replace(base, network=replace(physical.spec, transport_model=mode),
-                           requests=({**base.requests[0], 'arrival_time_s': 1.25, 'input_bytes': 16384},))
+                           traffic=({**base.traffic[0], 'arrival_time_s': 1.25, 'input_bytes': 16384},))
         calls = []
         original = backend.configure
 
@@ -28,9 +28,9 @@ class TimeVaryingTransportTests(unittest.TestCase):
             return original(engine, capacities)
 
         with patch.object(backend, 'configure', observe):
-            result = run_simulation(scenario)
-        self.assertEqual(result.request_summary['completed_request_count'], 1)
-        leg = result.request_records[0]['routing']['selected_path'][0]
+            result = run_traffic(scenario)
+        self.assertEqual(result.completed, 1)
+        leg = result.transfer_jobs[0]['path'][0]
         self.assertGreater(leg['finish_s'], 5.75)
         direction = (leg['link_id'], 'ground-00', 'sat-a')
         updates = [(t, v) for t, k, v in calls if k == direction]

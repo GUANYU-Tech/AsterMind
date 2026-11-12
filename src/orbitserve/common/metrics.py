@@ -1,4 +1,4 @@
-"""Metric containers used by experiment, simulation, and DSE skeletons."""
+"""Metric containers used by independent simulation and baseline tools."""
 
 from __future__ import annotations
 
@@ -49,17 +49,3 @@ class SLOMetrics:
 
     def to_dict(self) -> dict[str, Any]:
         return to_jsonable(self)
-
-
-@dataclass(frozen=True)
-class DSEMetrics:
-    evaluated: bool = False
-    pareto_frontier_evaluated: bool = False
-    non_separability_regret: float | None = None
-    dominated_design_count: int | None = None
-    rank_disagreement_count: int | None = None
-    warnings: tuple[str, ...] = ("DSE insight metrics are not implemented yet",)
-
-    def to_dict(self) -> dict[str, Any]:
-        return to_jsonable(self)
-

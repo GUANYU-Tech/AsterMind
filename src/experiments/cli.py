@@ -1,23 +1,19 @@
-"""Command-line entrypoint for OrbitServe experiment manifests."""
+"""Command-line entrypoint for Native SimulationConfig scenarios."""
 
 from __future__ import annotations
 
 import argparse
-import json
-import sys
 from pathlib import Path
 
-from .loader import load_experiment_spec
-from .output import default_artifact_dir_for_output, experiment_output_payload
-from .runner import run_experiment
+from .native_cells import run_native_cell_manifest
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Run an OrbitServe experiment manifest."
+        description="Run a Native SimulationConfig scenario."
     )
     parser.add_argument(
-        "manifest", type=Path, help="Path to an experiment JSON manifest."
+        "manifest", type=Path, help="Path to a SimulationConfig JSON scenario."
     )
     parser.add_argument("--out", type=Path, help="Optional output JSON path.")
     parser.add_argument("--indent", type=int, default=2, help="JSON indentation.")
@@ -40,46 +36,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    header = json.loads(args.manifest.read_text(encoding='utf8'))
-    if header.get('schema_version') == 'orbitserve.native_cells.v1':
-        from .native_cells import run_native_cell_manifest
-        return run_native_cell_manifest(args)
-    if args.midlayer_root is not None:
-        parser.error('--midlayer-root requires an orbitserve.native_cells.v1 manifest')
-
-    spec = load_experiment_spec(args.manifest)
-    execution_root = (
-        args.artifact_dir
-        or default_artifact_dir_for_output(args.out)
-        or Path("results/experiments") / spec.experiment_id
-    )
-    result = run_experiment(
-        spec,
-        output_dir=execution_root,
-        progress=lambda stage: print(stage, file=sys.stderr, flush=True),
-    )
-    output_mode = "full" if args.full else args.output_mode
-    artifact_dir = (
-        None
-        if output_mode == "full"
-        else args.artifact_dir
-        if args.artifact_dir is not None
-        else default_artifact_dir_for_output(args.out)
-    )
-    payload = experiment_output_payload(
-        result,
-        output_mode=output_mode,
-        artifact_dir=artifact_dir,
-        output_path=args.out,
-        indent=args.indent,
-    )
-    encoded = json.dumps(payload, ensure_ascii=False, indent=args.indent)
-    if args.out:
-        args.out.parent.mkdir(parents=True, exist_ok=True)
-        args.out.write_text(encoded + "\n", encoding="utf-8")
-    else:
-        print(encoded)
-    return 0
+    return run_native_cell_manifest(args)
 
 
 if __name__ == "__main__":

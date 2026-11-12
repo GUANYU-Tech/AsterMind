@@ -5,13 +5,12 @@ import unittest
 from dataclasses import replace
 from unittest.mock import patch
 
-from orbitserve.runtime import LinkProfile, NetworkSpec, run_simulation
+from orbitserve.runtime import LinkProfile, NetworkSpec, check_network_backend
 from orbitserve.runtime.engine.simgrid_transport import (
     SimGridTransport,
     SimGridUnavailable,
 )
-from tests.unit.runtime.test_runtime_engine import _scenario
-from tests.unit.runtime.test_runtime_event_order import strategy
+from tests.network_case import NetworkCase, run_traffic, traffic
 
 
 def transport():
@@ -31,7 +30,7 @@ def leg(source="a", target="b", link="ab"):
 
 class TransportConfigurationTests(unittest.TestCase):
     def test_default_is_queue_and_unknown_model_is_rejected(self):
-        scenario = _scenario(strategy())
+        scenario = NetworkCase(traffic=(traffic(),))
         self.assertEqual(scenario.network.transport_model, "queue")
         self.assertEqual(
             NetworkSpec.from_value(scenario.network.to_dict()), scenario.network
@@ -40,7 +39,7 @@ class TransportConfigurationTests(unittest.TestCase):
             replace(scenario.network, transport_model="simgrid-like")
 
     def test_explicit_missing_simgrid_fails_without_changing_queue_mode(self):
-        scenario = _scenario(strategy())
+        scenario = NetworkCase(traffic=(traffic(),))
         selected = replace(
             scenario, network=replace(scenario.network, transport_model="simgrid")
         )
@@ -49,9 +48,9 @@ class TransportConfigurationTests(unittest.TestCase):
             return_value=None,
         ):
             with self.assertRaisesRegex(SimGridUnavailable, "optional dependency"):
-                run_simulation(selected)
+                check_network_backend(selected.network.transport_model)
             self.assertEqual(
-                run_simulation(scenario).request_summary["completed_request_count"], 1
+                run_traffic(scenario).completed, 1
             )
 
 

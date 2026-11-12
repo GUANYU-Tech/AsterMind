@@ -2,11 +2,9 @@
 
 from types import SimpleNamespace
 
-from orbitserve.runtime import RuntimeStrategySpec
 from orbitserve.runtime.engine.cell_bridge import RuntimeCellNetwork, CellTransferExecutor as CellTransferExecutor
 from orbitserve.runtime.engine.events import _EventEngine
 from orbitserve.runtime.state.device_network import DeviceNetworkState
-from orbitserve.runtime.state.runtime_state import RuntimeState
 from orbitserve.runtime.timeline import GlobalTimeline
 from orbitserve.runtime.clock import Time
 
@@ -30,14 +28,13 @@ class DeviceRuntimeHost(_EventEngine):
         network.timeline_mode = timeline_mode
         spec = SimpleNamespace(
             network=network.spec,
-            serving_profile=None,
-            strategy=RuntimeStrategySpec(),
+            routing_policy="earliest_arrival",
             time_horizon_s=Time.from_ns(config.horizon_ns),
         )
         environment = SimpleNamespace(
             network=network, time={"start_s": 0.0, "end_s": network.end_s}
         )
-        super().__init__(spec, environment, None, RuntimeState(), ())
+        super().__init__(spec, environment)
         for time_s in network.environment_times:
             self.push(time_s, 0, "topology_sample")
             if self.controller is not None and time_s < self.end:

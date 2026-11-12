@@ -46,7 +46,7 @@ python -m orbitserve.experiments.cli simulator/examples/dynamic_migration_tp2.js
 - 全部传输与计算回调使用 `_EventEngine` 的事件队列。原生 COMM 预测只作参考，物理网络承担实际通信耗时，避免重复计费。ns-3 的内部容量门不产生额外 PPP 数据包。
 - 原生算子 DAG 的时间是整数 ns：实际物理完成后向上取整到下一个 ns 通知算子；`network.flows` 和网络日志保留物理连续时间。不会提前释放依赖。
 
-旧 `orbit`、`link_parameters`、设备 `link_policy` 不会静默使用原来的保守包络；需要迁移为规范 `physical_network`/`physical_dataset`。新例子的 SGP4 平均根数明确标为合成输入，链路容量为显式固定预算加精确时间降速，用于功能正确性检验。
+`orbit`、`link_parameters` 已从 SimulationConfig 删除，输入这些字段会被拒绝；设备 `link_policy` 同样不接受。轨道与链路预算统一使用规范 `physical_network`/`physical_dataset`。新例子的 SGP4 平均根数明确标为合成输入，链路容量为显式固定预算加精确时间降速，用于功能正确性检验。
 
 ## 显存与迁移
 

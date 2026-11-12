@@ -1,19 +1,20 @@
 # OrbitServe
 
-OrbitServe is a simulation platform for LEO compute constellations serving global terrestrial AI inference demand. It studies two-timescale cost-SLO co-design across construction-time design-space exploration and runtime scheduling.
+OrbitServe is a simulation platform for LEO compute constellations serving global terrestrial AI inference demand. Each run evaluates one fixed SimulationConfig with Mid-Layer computation and physical communication. DSE and the former Analytical request engine are removed.
 
 ## Repository Layout
 
 ```text
-src/orbitserve/              Core simulation engine
+simulator/                  SimulationConfig, Native orchestration, audit and replay
+integration/                Mid-Layer Cells and official vLLM Scheduler adapters
+network_sim/                Explicit device topology and physical resource graph
+src/orbitserve/              Shared simulation modules
   architecture/              Per-role physical hardware, static energy sizing, and cost parameters
   orbit/                     Constellation geometry, orbital motion, visibility, sunlight, and traces
   workload/                  Canonical workload contracts, validation, loading, and materialization
-  serving/                   Model deployment, prefill/decode, KV capacity, and throughput estimation
-  runtime/                   Routing, queues, scheduling, KV state, SOC, and request-level execution
+  runtime/                   Shared clocks, transport, routing, faults and Native Cell/KV adapters
   common/                    Policy-free metric DTOs and serialization
-src/experiments/             Manifests, cross-module orchestration, fixed-design evaluation, and output
-src/dse/                     Physical design enumeration, runtime strategies, geometry screening, and frontier analysis
+src/experiments/             Native CLI, capacity tools, physical preparation and dataset reuse
 src/baselines/ground/        Terrestrial serving baselines
 src/workloads/main_composite_chat/  Synthetic workload adapter and source profiles
 examples/                    Versioned, user-facing input examples
@@ -31,19 +32,17 @@ merging requires the repository's CI and maintainer review.
 
 ```text
 orbitserve.experiments.cli
-  -> load ExperimentSpec
-  -> load and materialize a canonical workload bundle
-  -> evaluate_materialized_design
-  -> Architecture + Serving deployment validation
-  -> independent communication/compute constellations and SGP4 traces
-  -> acquisition/terminal allocation/dynamic link attributes
-  -> RuntimeSimulationSpec with Workload requests, Serving tables and per-node energy
-  -> chronological events: requests, physical hops, compute, KV and delivery
-  -> optional DSE runtime-matrix search
-  -> structured output
+  -> SimulationConfig.load
+  -> Simulation
+  -> physical_network preparation OR verified physical_dataset reuse
+  -> explicit device topology and Cell placements
+  -> Mid-Layer/vLLM computation + shared Runtime transport events
+  -> Native requests, metrics, provenance and audit
 ```
 
-Fixed-design evaluation and DSE candidates share `evaluate_materialized_design()`. Architecture does not infer hardware from workload demand. Orbit produces geometrically visible candidates. Runtime selects the active graph under Architecture terminal limits.
+Both CLI entry points execute this same fixed-design path. Compute fields and
+execution settings come from SimulationConfig. There is no legacy manifest
+conversion or performance-table interpolation. Native energy is not evaluated.
 
 ## Installation
 
@@ -59,7 +58,7 @@ WildChat dependencies such as `pyarrow` and `transformers` are optional and are 
 
 ## Workload Contract
 
-The core engine accepts one canonical six-file workload bundle:
+The independent workload tools retain a canonical six-file bundle:
 
 ```text
 workload_manifest.json
@@ -70,35 +69,23 @@ timebin_demand.csv
 workload_summary.json
 ```
 
-Dataset-specific inputs must first be converted under `src/workloads/<dataset>/`. Experiment manifests then reference the generated bundle through `workload.bundle_dir`. The core package does not retain legacy workload readers.
+Dataset-specific adapters live under `src/workloads/<dataset>/`. Native simulations take explicit `SimulationConfig.requests`; the old manifest `workload.bundle_dir` is not a Native input.
 
 ## Running Examples
 
-Fixed design:
-
 ```bash
-python3 -m orbitserve.experiments.cli \
-  examples/experiments/fixed_design_geometry.json \
-  --out results/experiments/fixed_design_geometry.json
+python -m orbitserve.experiments.cli simulator/examples/two_cells_ns3.json \
+  --midlayer-root /path/to/midlayer --out results/cells/ns3.json
+python -m orbitserve.experiments.cli simulator/examples/dynamic_tp2_pp2.json \
+  --midlayer-root /path/to/midlayer --out results/cells/cross.json --full
 ```
 
-DSE:
-
-```bash
-python3 -m orbitserve.experiments.cli \
-  examples/experiments/orbit_geometry_dse.json \
-  --out results/experiments/orbit_geometry_dse.json
-```
-
-Terrestrial baseline:
-
-```bash
-python3 -m orbitserve.experiments.cli \
-  examples/experiments/skywalker_ground_reproduction.json \
-  --out results/experiments/skywalker_ground_reproduction.json
-```
-
-The CLI writes a summary and separate audit artifacts by default. Use `--output-mode full` for a monolithic debugging output. Examples contain inputs only and do not include pre-generated experiment results.
+The CLI accepts numeric schema `1` and `orbitserve.native_cells.v1` through
+SimulationConfig. Their existing communication defaults remain `flowsim` and
+`protobridge_cell`, respectively. Summary mode writes `*.artifacts/native_result.json`;
+`--full` writes the complete result. `--artifact-dir` and `--midlayer-root` are retained.
+The independent terrestrial baseline API remains under `orbitserve.baselines.ground`;
+the Native CLI no longer dispatches ground manifests.
 
 ## Four-satellite compute/bandwidth capacity study
 
@@ -171,13 +158,10 @@ The pilot also reports a clearly named 200-ms TPOT sensitivity target; the main
 
 ## Physical Network Model
 
-The existing experiment CLI runs fixed designs, DSE and terrestrial baselines in
-any supported Python environment. WSL, a particular Conda environment name, a
-web server and browser assets are not required.
-
-Satellite manifests provide `physical_network`, compute `hardware`, optional
-`communication_hardware`, `serving`, `workload` and `runtime_strategy`.
-`physical_network` may be inline or a JSON path relative to the manifest.
+SimulationConfig specifies `physical`, `cells`, `requests` and execution settings.
+Orbital geometry and link budgets enter through `physical_network` or a verified
+`physical_dataset` (mutually exclusive). Relative paths resolve at the scene file.
+Removed fields `orbit` and `link_parameters` are rejected, including empty values.
 Communication shells have independent Walker/TLE inputs and fixed same-shell
 grid/honeycomb neighbors. Communication shells do not connect to one another.
 Compute cells have explicit physical members and fixed internal neighbors.
@@ -225,20 +209,16 @@ with one SQLite writer and per-chunk progress. An incomplete database is kept
 under a temporary name and is never published as a finished dataset.
 Datasets from the previous physics version must be regenerated.
 
-Set the experiment manifest's top-level `physical_dataset` to that directory or
-its `physical_dataset.json`, relative to the experiment manifest. Runtime verifies
-the physics version, input identity and all artifact SHA-256 hashes before use.
-`physical_network` can be omitted to load the baked input directly. If supplied,
-it must match the source or materialized input; only `network.transport_model`
-and independent `route_probes` are excluded from physical identity. Workload,
-Serving and routing choices remain independent experiment inputs.
+Set SimulationConfig's `physical_dataset` to a dataset directory or its
+`physical_dataset.json`, and omit `physical_network`. Runtime verifies the physics
+version and artifact hashes. Cell/request configuration and `runtime_network`
+faults remain independent of the physical dataset identity.
 
 An explicit dataset reference never falls back to physical regeneration. Missing,
 damaged, stale or mismatched datasets fail with an instruction to prepare a new
 dataset. Same-filesystem runs share immutable artifacts with hard links, falling
 back to file copies across filesystems. Each run retains its own traffic state
-and records the source dataset identity. Legacy one-command manifests without a
-dataset reference still prepare physics before Runtime.
+and records the source dataset identity. Scenes with `physical_network` prepare physics before Runtime.
 
 The local console's first step generates this full dataset before entering the
 second step. The second step can also open directly and select a previously
@@ -339,7 +319,7 @@ datasets before running with ISLSim; selecting another link model also requires
 matching physical data. This adapter verifies consistency with upstream results,
 not independent calibration of ISLSim's physical assumptions or formulas.
 
-Network transport is selected by `physical_network.network.transport_model`:
+Native transport is selected by `SimulationConfig.backend` (`flowsim`, `simgrid` or `ns3`). The independent physical/network tools also expose `queue` and `fluid`:
 
 | Value | Execution and contention |
 | --- | --- |
@@ -352,11 +332,11 @@ Network transport is selected by `physical_network.network.transport_model`:
 The default FlowSim backend requires the shared-runtime `_flowsim` extension
 from a separately prepared AsterMind checkout. Install that checkout into the
 same Python environment (`python -m pip install -e /path/to/astermind`) for
-the extension, standalone CLI and joint serving bridge. On the configured
+the compatible extension. On the configured
 workstation, `third_party/astermind` holds the modified local checkout; it and
 the root workstation-only build adapter are ignored by Git and are not supplied
-by an OrbitServe checkout. Joint examples require that local dependency to be
-prepared first. An older `_flowsim` fails explicitly.
+by an OrbitServe checkout. Prepare that dependency before selecting FlowSim.
+An older `_flowsim` fails explicitly.
 The native shared `advance_until()` must also guard positive residual-byte
 completion times that round back to the current native clock, using the next
 representable native time as its standalone `run()` loop already does. The
@@ -370,23 +350,6 @@ propagation, network visibility, and link recovery. New candidate edges added
 after the simulation begins are not yet supported by this backend. A lost
 contact follows OrbitServe's existing interrupted-hop policy: partial bytes on
 that hop are discarded on retry, while completed hops are retained.
-
-An experimental joint run can pass `compute_runtime=AsterMindRuntime(cells)`
-to `run_simulation`, with `AsterMindRuntime` and `AsterMindCell` imported from
-`orbitserve.runtime.engine.astermind_bridge`. The `cells` mapping associates
-each selectable compute node with `AsterMindCell(config, rank_mapping,
-repository)`, where the rank mapping covers exactly the physical cell members.
-OrbitServe owns the clock and network; each cell runs a Midlayer scheduler and
-submits its collective flows into that same network. FlowSim is the default;
-select `transport_model="ns3"` for the packet-level alternative. The current bridge accepts
-independent requests with at least one output token. Cross-request KV reuse,
-request cancellation and recovery of a failed active cell are not yet supported;
-an active serving failure aborts the run. Compute energy uses OrbitServe's
-per-token admission estimate, not Midlayer kernel-level energy. Collective
-communication is recorded against the cell, not attributed to individual
-requests in their path or energy ledgers. OrbitServe's shadow DVFS policy is
-not supported in this mode. The existing queue and legacy backends remain
-available pending full integration.
 
 ### Native Cells from Merge_ML_Version
 
@@ -415,50 +378,6 @@ exports an offline replay of real Scheduler batches, per-GPU operators, dependen
 edges, physical communication and KV transactions. The local console links it at
 `/native-cells/`. Its checks expose concrete trace violations and keep hardware
 accuracy and native energy explicitly outside the verified scope.
-
-`examples/astermind_joint/full_serving.py` runs a 72-plane, 22-satellite-per-plane
-communication shell and two compute replicas on dawn-dusk reference orbits.
-Use `--users single|multi`, `--parallel tp_pp|ep` and `--backend flowsim|ns3`:
-
-```bash
-python examples/astermind_joint/full_serving.py --users multi --parallel tp_pp \
-  --backend flowsim --output local/results/full-serving/multi-tp_pp-flowsim.json
-python examples/astermind_joint/full_serving.py --users multi --parallel tp_pp \
-  --backend ns3 --output local/results/full-serving/multi-tp_pp-ns3.json
-```
-
-The single-user case submits one request; the multi-user case submits eight
-independent requests from four users. Inputs and replies traverse actual eligible
-ground, communication-shell and compute-access hops. Qwen3-4B uses TP2 and PP2
-within each four-satellite replica; Qwen3-30B-A3B uses TP2 and EP2 within each
-two-satellite replica. Replica-level request dispatch is separate from native
-worker-pool DP, which remains one. Midlayer predicts kernel latencies and lowers
-collectives; these runs do not execute model weights or generate text. EP uses
-explicit seeded routing assumptions. Formation offsets are prescribed in LVLH
-around SGP4 reference states, rather than independently propagated formation orbits.
-
-On the configured workstation, the original local console at port 8766 exposes
-`/serving?users=multi&parallel=tp_pp&backend=flowsim` and the corresponding
-`backend=ns3` view. It retains the original 3D Earth and satellite renderer.
-Both views replay executed events; the page can launch a new simulation.
-FlowSim shows continuous flow service with changing allocated bandwidth. The
-ns-3 view shows packet serialization intervals recorded at native `PhyTxEnd`
-events, with exact logical payload, wire size and message offset. Link zoom,
-slow playback and a contention jump expose simultaneous fluid sharing versus
-packet interleaving. The 3D packet marker's position encodes its message byte
-offset, not a packet's propagation trajectory: propagation still follows the
-OrbitServe whole-message per-hop model. Optional packet recording is disabled
-for ordinary runs; this demonstration enables it explicitly.
-
-`examples/astermind_joint/collectives.py` runs four-rank training communication
-graphs (`--mode ring4` for one formation cell, `--mode multi` for four single-satellite
-cells), with FlowSim or ns-3. It uses Midlayer's collective lowering and validates
-all 51 primitive completions and dependency ordering while three background
-requests arrive. SGP4 propagates an initial LTAN-06:00 dawn-dusk design; the formation
-case prescribes a square in the reference satellite's LVLH frame. The workload
-models communication and configured compute barriers, not a full training compute
-or accuracy model. On the configured workstation, the original local 8766 console
-exposes `/collectives` with its existing Earth, satellite, cell and transfer renderer.
 
 Install ns-3 separately with `python3 -m pip install ".[ns3]"` on a supported
 platform, with a C++20 compiler available (`sudo apt-get install build-essential`
@@ -496,7 +415,7 @@ All backends retain per-hop store-and-forward and independent full-duplex
 directions. In SimGrid mode, OrbitServe converts bits/s to native bytes/s, uses
 CM02 with zero native link latency and disabled reverse cross-traffic, and adds
 Orbit-derived propagation after native serialization. Thus propagation is charged
-once. Payload work is scaled to microbytes to preserve analytical first-token
+once. Payload work is scaled to microbytes to preserve fractional payload
 sizes; the quantization is declared in result provenance. Shared transmission
 completion times are not booked in advance. New contenders, completions and
 capacity updates change active transfers. Zero capacity suspends and later
@@ -504,30 +423,17 @@ resumes their remaining bytes; contact loss cancels the hop and fails its reques
 No packet loss or retransmission is fabricated.
 
 Native engines run in isolated subprocesses, one per Runtime evaluation, so
-repeated experiments and DSE do not reuse SimGrid's process-global clock. The two
+repeated simulations do not reuse SimGrid's process-global clock. The two
 event engines stop at each native completion or next Runtime/environment event.
 `bandwidth_update` audit events report observed byte progress over a stated
 interval, including allocated bandwidth, link capacity and contender count.
-Route/compute selection in fluid, SimGrid and ns-3 uses currently observed link
+Route forecasting in fluid, SimGrid and ns-3 uses currently observed link
 and RF-pool contenders; ns-3 forecasts additionally charge packet padding/PPP.
 These forecasts assume the observed contenders persist, without predicting their
 future completion or exact packet order. Actual completion comes from the selected
 transport. There is no end-to-end multi-hop fluid flow or implicit ground NIC pool.
-Serving collective latency remains analytical with physical connectivity checks.
-Cell operator execution and collective scheduling belong to Serving/AsterMind;
-the network layer supplies physical topology and calculated link properties.
-
-Serving retains its analytical model by default. Optional `serving.external_profile`
-accepts `orbitserve.astermind_measurements.v1`: matching `model_name`, resolved
-`hardware`, `formation`, `parallelism`, scope
-`phase_latency_including_cell_communication`, and `samples` covering both phases
-at every configured concurrency. Each sample declares `phase`, token/context
-`length`, `concurrency` and an embedded successful, versioned AsterMind `result`
-with positive `metrics.total_latency_s`; decode samples require `decode_tokens: 1`.
-Prefill rates are length/latency, decode rates are 1/latency. Measured phase times
-already include internal communication, so no analytical communication term is
-added again. A single total-latency result cannot substitute for these tables.
-This is an import contract; OrbitServe does not build or execute AsterMind.
+Mid-Layer owns operator timing and collective lowering. The shared network executes
+physical transfers; the Native communication estimate is not charged twice.
 
 Link profiles support fixed capacities, RF free-space/Shannon budgets and an
 optical Gaussian-beam/photon-budget model. Optical inputs include wavelength,
@@ -682,7 +588,7 @@ is also available from `orbitserve.runtime`. Exact heterogeneous snapshots are
 preserved. A usable static snapshot additionally supplies conservative uniform
 `serving_formation_fragment` and `astermind_static_fragment` inputs (minimum
 bandwidth and maximum propagation delay); these approximations are labeled and
-never automatically replace Serving's existing analytical communication model.
+never replace Native Cell device-level communication.
 Current AsterMind's uniform static network schema cannot express the full dynamic
 graph; consuming exact dynamic snapshots requires an adapter on that side.
 
@@ -759,17 +665,8 @@ different visible peer, which must wait its full setup time. Repairs are learned
 only when observed. Unaffected contacts retain their acquisition clocks;
 recovered contacts reacquire instead of inheriting an obsolete setup timestamp.
 
-Fixed designs and DSE share the same evaluator and canonical Workload. Hardware
-terminal counts/rates, cell member counts, request model names and gateway
-coordinates must match across modules. DSE scans physical configuration paths and
-supported routing strategies. Geometric coverage is a screening upper bound, not
-an inferred Runtime latency or SLO result.
-
-Outputs include the canonical `network/orbit_trace/`, a machine-readable
-`network/network_result.json`, compressed position/link snapshots and timelines,
-`runtime_events.jsonl.gz`, `runtime_requests.jsonl.gz` and
-`experiment_result.json`. These are scientific audit data. The shared runner does
-not create HTML, browser replay indexes or personal viewer data.
+Native results expose requests, batches, transfers, migrations, network observations,
+measurement and provenance. The summary CLI links to the full audit artifact.
 
 ## Single-Satellite Cost Tool
 
@@ -808,7 +705,7 @@ python3 -m unittest tests.unit.runtime.test_radio_capacity \
   tests.integration.fixed_design.test_network_acceptance
 ```
 
-`tests/slow/` contains physical-network Runtime, prefill/decode concurrency and strategy-matrix tests. Full validation must include this suite; routine development may run the first three suites separately.
+Former Analytical concurrency and DSE matrix tests are removed. Native integration requires the external dependencies documented in `simulator/README.md`.
 
 Real ISLSim invocation is an additional local integration suite, separate from
 the four CI suites. With a local checkout and the native backends installed, run:
@@ -846,8 +743,7 @@ within samples, while configured capacity schedules retain exact event times.
 
 ## Input Reliability and Distribution Checks
 
-Canonical request token counts, hardware counts, parallel degrees and Serving
-length grids use integers. Request times and byte counts must be finite and
+Native request token counts, hardware counts and parallel degrees use integers. Request times and byte counts must be finite and
 nonnegative. Fractional counts, booleans and NaN/Infinity are rejected before
 allocating a native backend. Causal requests may arrive in any input order;
 duplicate IDs, missing predecessors and cycles are rejected explicitly.

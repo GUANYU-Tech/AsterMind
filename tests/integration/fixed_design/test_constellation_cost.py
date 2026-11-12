@@ -1,17 +1,17 @@
 import json
 import unittest
-from orbitserve.architecture import resolve_architecture
-from orbitserve.experiments.constellation_cost import estimate_constellation_cost
+from orbitserve.architecture import resolve_architecture, HardwareSpec
+from orbitserve.experiments.constellation_cost import estimate_constellation_cost, CostingSpec
 from tests.system_case import physical_case
 
 
 class ConstellationCostTests(unittest.TestCase):
     def test_cost_scales_architecture_per_member_profile(self):
         spec = physical_case()
-        hardware = resolve_architecture(spec.hardware)
+        hardware = resolve_architecture(HardwareSpec.from_dict(spec["hardware"]))
         result = estimate_constellation_cost(
             {"compute_node_count": 2},
-            spec.costing,
+            CostingSpec.from_dict(spec.get("costing", {})),
             resolved_architecture=hardware,
             formation_member_count=4,
         )
@@ -23,16 +23,16 @@ class ConstellationCostTests(unittest.TestCase):
 
     def test_orbit_metadata_does_not_rewrite_immutable_hardware(self):
         spec = physical_case()
-        hardware = resolve_architecture(spec.hardware)
+        hardware = resolve_architecture(HardwareSpec.from_dict(spec["hardware"]))
         a = estimate_constellation_cost(
             {"compute_node_count": 2, "altitude_km": 500},
-            spec.costing,
+            CostingSpec.from_dict(spec.get("costing", {})),
             resolved_architecture=hardware,
             formation_member_count=4,
         )
         b = estimate_constellation_cost(
             {"compute_node_count": 2, "altitude_km": 900},
-            spec.costing,
+            CostingSpec.from_dict(spec.get("costing", {})),
             resolved_architecture=hardware,
             formation_member_count=4,
         )

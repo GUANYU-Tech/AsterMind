@@ -3,7 +3,8 @@
 import unittest
 from types import SimpleNamespace
 
-from orbitserve.runtime.engine.cell_bridge import CellRuntime
+from simulator.engine import Simulation
+from orbitserve.runtime.engine.cell_events import CellCompletion
 from orbitserve.runtime.engine.cell_migration import NetworkKVMigration
 from orbitserve.runtime.timeline import GlobalTimeline
 
@@ -106,29 +107,35 @@ class CellMigrationTests(unittest.TestCase):
 
     def test_session_placement_changes_only_after_target_commit(self):
         loop, sends, source, target, _, migration = self.setup_migration()
-        runtime = CellRuntime({})
+        runtime = Simulation.__new__(Simulation)
         runtime.migrations = migration
-        runtime.sessions = {"A": source, "B": target}
-        runtime._session_nodes["session"] = "A"
-        runtime.migrate(
-            SimpleNamespace(id="kv", mode="move"), "A", "B", {"session_id": "session"}
-        )
+        runtime.cells = {"A": source, "B": target}
+        runtime._session_cells = {"session": "A"}
+        runtime.completions = []
+        runtime.state = {"request": {}}
+        runtime.history = SimpleNamespace(history=lambda *args: {})
+        runtime.config = SimpleNamespace(migrations=(SimpleNamespace(id="kv", mode="move", source_cell="A", target_cell="B", session_id="session", context_id="ctx", after_request="request"),))
+        runtime._record_request = lambda *args: None
+        runtime._finish = lambda *args: None
+        from orbitserve.runtime.clock import Time
+        runtime._completed(CellCompletion("A", "request", Time(), Time(), Time(), None, None, 1, 0., 0.))
         loop.run(until_s=1)
         for send in sends:
             send[-2]()
-        self.assertEqual(runtime._session_nodes["session"], "A")
+        self.assertEqual(runtime._session_cells["session"], "A")
         loop.run()
-        self.assertEqual(runtime._session_nodes["session"], "B")
+        self.assertEqual(runtime._session_cells["session"], "B")
 
     def test_all_cells_close_even_when_one_native_cleanup_fails(self):
-        runtime = CellRuntime({})
+        runtime = Simulation.__new__(Simulation)
+        runtime._physics_lifetime = runtime.host = runtime.network = None
         closed = []
 
         def failed_close():
             closed.append("B")
             raise RuntimeError("native close failed")
 
-        runtime.sessions = {
+        runtime.cells = {
             "A": SimpleNamespace(close=lambda: closed.append("A")),
             "B": SimpleNamespace(close=failed_close),
         }

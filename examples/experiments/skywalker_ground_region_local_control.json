@@ -86,9 +86,5 @@
       "max_lb_queue_wait_s": 60.0,
       "prefix_tree_max_records": 100000
     }
-  },
-  "dse": {
-    "enabled": false,
-    "sweep": {}
   }
 }

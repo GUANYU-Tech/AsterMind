@@ -18,14 +18,11 @@ class FluidTransportTests(unittest.TestCase):
         self.assertEqual(result['bytes_sent']['tiny'], 1e-8)
     def test_complete_runtime_uses_selected_fluid_backend(self):
         from dataclasses import replace
-        from orbitserve.runtime import run_simulation
-        from tests.unit.runtime.test_runtime_engine import _scenario
-        from tests.unit.runtime.test_runtime_event_order import strategy
-        scenario=_scenario(strategy())
-        scenario=replace(scenario,network=replace(scenario.network,transport_model='fluid'))
-        result=run_simulation(scenario)
-        self.assertEqual(result.request_summary['completed_request_count'],1)
-        self.assertEqual(result.provenance['network_transport']['backend'],'fluid')
+        from tests.network_case import NetworkCase, run_traffic, traffic
+        scenario = NetworkCase(traffic=(traffic(),))
+        result = run_traffic(replace(scenario, network=replace(scenario.network, transport_model="fluid")))
+        self.assertEqual(result.completed, 1)
+        self.assertEqual(result.transport_provenance["backend"], "fluid")
 
     def test_late_join_capacity_change_reverse_direction_and_cancellation(self):
         engine = FluidTransport({}, (), {})

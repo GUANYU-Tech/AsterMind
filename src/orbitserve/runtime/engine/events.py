@@ -1,254 +1,26 @@
-"""Chronological request execution; predictions never publish future mutable state."""
+"""Shared transport events on the Native simulator clock."""
 
 from __future__ import annotations
 
 import heapq
-import math
+from collections import defaultdict
+
 from ..clock import Time, ClockLog
-from dataclasses import replace
-from collections import defaultdict, deque
-from types import SimpleNamespace
-
-from .contracts import RuntimeEngineResult
-from .request_input import prepare_runtime_requests
-from .decision import build_candidate_selector
-from .eligibility import build_compute_eligibility_set
-from ..metrics.records import RuntimeRequestRecord
-from ..setup.kv_capacity import derive_kv_cache_capacity_tokens
-from ..setup.serving_time import prefill_suffix_time_s, decode_time_s
-from ..state.energy import (
-    advance_satellite_energy,
-    apply_request_energy,
-    energy_window_at,
-    EnergyWindowError,
-)
-from ..state.kv_cache import local_kv_reuse_tokens, commit_session_kv, touch_kv_entry
-from ..state.network import NetworkState, NetworkUnavailable
+from ..state.network import NetworkUnavailable
 from ..setup.radio_capacity import hop_pools
-from ..state.runtime_state import RuntimeState
-
-ISL_KINDS = {
-    "communication_isl",
-    "cross_layer",
-    "cell_isl",
-    "inter_cell",
-}
-
-
-def run_event_engine(spec):
-    # Kept local to avoid a module cycle with the prediction helpers.
-    from .simulator import (
-        _build_energy_trace,
-        _all_uncompleted,
-    )
-
-    trace = spec.environment_state
-    if trace is None:
-        return _all_uncompleted(spec, "environment_state_missing")
-    if hasattr(trace, "trace_manifest") and not trace.trace_manifest.evaluated:
-        return _all_uncompleted(spec, "orbit_trace_not_evaluated")
-    serving = spec.serving_profile
-    if serving is None or not serving.has_compute_capacity:
-        return _all_uncompleted(spec, "serving_capacity_unavailable")
-    requests = prepare_runtime_requests(spec.requests)
-    from ..setup.faults import realize_runtime_faults
-    from .topology import candidate_links
-    boundaries = sorted({float(row['time_s']) for row in trace.ephemeris_samples})
-    runtime_network = realize_runtime_faults(spec.network, boundaries, candidate_links(spec.network))
-    network = NetworkState(trace, runtime_network, spec.gateways, physical_state=spec.physical_state_ref)
-    try:
-        energy, initial_soc = _build_energy_trace(trace, spec.energy_profile)
-        capacity = derive_kv_cache_capacity_tokens(spec.constellation, serving)
-    except ValueError as error:
-        return _all_uncompleted(spec, str(error))
-    catalog = tuple(
-        {
-            **row,
-            "compute_capable": row.get("compute_capable") is not False
-            and network.nodes[str(row["satellite_id"])].role == "compute"
-            and network.nodes[str(row["satellite_id"])].compute_target,
-        }
-        for row in trace.satellite_catalog
-    )
-    environment = SimpleNamespace(
-        **{
-            key: getattr(trace, key)
-            for key in (
-                "time",
-                "ephemeris_samples",
-                "sgl_windows",
-                "isl_windows",
-                "sunlight_windows",
-                "trace_id",
-                "trace_model",
-            )
-        },
-        satellite_catalog=catalog,
-        network=network,
-    )
-    eligible = build_compute_eligibility_set(
-        satellite_catalog=catalog
-    ).eligible_compute_satellite_ids
-    if not eligible:
-        return _all_uncompleted(spec, "eligible_compute_set_empty")
-    state = RuntimeState()
-    for node in catalog:
-        state.compute_node_for(
-            str(node["satellite_id"]),
-            initial_soc=spec.energy_profile.get("node_profiles", {})
-            .get(str(node["satellite_id"]), {})
-            .get("initial_soc", initial_soc),
-            max_concurrency=serving.max_concurrency,
-        )
-    for node in eligible:
-        state.kv_cache_for(node, capacity_tokens=capacity)
-    engine = _EventEngine(spec, environment, energy, state, eligible)
-    try:
-        return _execute_requests(engine, requests, trace, capacity)
-    finally:
-        engine.close()
-
-
-def _execute_requests(engine, requests, trace, capacity):
-    network, state = engine.net, engine.state
-    for request in sorted(
-        requests, key=lambda r: (r["arrival_time_s"], r["request_id"])
-    ):
-        if not math.isfinite(request["arrival_time_s"]):
-            raise ValueError("request arrival_time_s must be finite")
-        engine.jobs[request["request_id"]] = {
-            "request": request,
-            "path": [],
-            "ledger": [],
-            "done": False,
-            "first_done_s": None,
-            "output_done_s": None,
-            "copied_tokens": 0,
-            "copied_from": None,
-        }
-        if (
-            request.get("arrival_time_mode", "absolute")
-            == "after_dependency_completion"
-        ):
-            gap = float(request.get("inter_turn_gap_s", 0.0))
-            if not math.isfinite(gap) or gap < 0:
-                raise ValueError("inter_turn_gap_s must be finite and nonnegative")
-            engine.followers[request["depends_on_request_id"]].append(
-                request["request_id"]
-            )
-        else:
-            engine.push(
-                max(0.0, request["arrival_time_s"]),
-                30,
-                "request_arrival",
-                request["request_id"],
-            )
-    if engine.compute_runtime:
-        engine.compute_runtime.initialize(engine, requests)
-    for frame in network.frames:
-        engine.push(frame["time_s"], 0, "network_update", None)
-    for event in network.events:
-        engine.push(event["time_s"], 0, "link_state", None, event)
-    boundaries = sorted({float(row["time_s"]) for row in trace.ephemeris_samples})
-    for time in boundaries:
-        engine.push(time, 0, "topology_sample", None)
-        if engine.controller and time < engine.end:
-            engine.push(time, 5, 'control_boundary', None)
-    fault_batches = defaultdict(list)
-    for index, fault in enumerate(network.spec.faults):
-        if network.spec.fault_timing == 'boundary':
-            fault_batches[fault['start_s']].append((index, fault, False))
-            fault_batches[fault['end_s']].append((index, fault, True))
-        else:
-            engine.push(fault['start_s'], -2, "fault_start", None, (index, fault))
-            engine.push(fault['end_s'], -2, "fault_end", None, (index, fault))
-    for time_s, observations in sorted(fault_batches.items()):
-        engine.push(time_s, -2, 'fault_batch', None, observations)
-    engine.run()
-    ordered = sorted(
-        engine.jobs.values(),
-        key=lambda j: (j["request"]["arrival_time_s"], j["request"]["request_id"]),
-    )
-    return RuntimeEngineResult(
-        records=tuple(j["record"] for j in ordered),
-        decision_traces=tuple(
-            j.get(
-                "decision",
-                {"request_id": j["request"]["request_id"], "candidate_count": 0},
-            )
-            for j in ordered
-        ),
-        state_summary={
-            **state.to_dict(),
-            "event_log": engine.log,
-            "network": {
-                "events": network.events,
-                "transport": engine.transport_provenance,
-                "directed_reservations": [
-                    {
-                        "link_id": key[0],
-                        "source": key[1],
-                        "target": key[2],
-                        "intervals": rows,
-                    }
-                    for key, rows in sorted(network.calendars.items())
-                ],
-            },
-        },
-        provenance={
-            "runtime_engine": "chronological_discrete_event_runtime",
-            "event_order": "time_priority_insertion_sequence",
-            "network_admission_order": "per_hop_ready_event",
-            "communication_queue_model": {
-                'simgrid': 'simgrid_cm02_shared_directed_hops',
-                'fluid': 'orbitserve_equal_share_fluid_directed_hops',
-                'ns3': 'ns3_point_to_point_packet_round_robin',
-                'flowsim': 'flowsim_shared_directed_hops',
-            }.get(engine.net.spec.transport_model)
-            if engine.transport
-            else "directed_full_duplex_reservation_calendar",
-            "network_transport": engine.transport_provenance,
-            "network_rate_update_during_execution": bool(engine.transport),
-            "network_forecast_model": "current_contender_count_snapshot"
-            if engine.transport
-            else "directed_reservation_calendar",
-            "compute_queue_model": "ready_order_fifo_concurrency_slots",
-            "serving_rate_model": getattr(engine.compute_runtime, "serving_rate_model", "astermind_midlayer") if engine.compute_runtime else "admission_snapshot_fixed_rate",
-            "internal_collectives": f"{engine.net.spec.transport_model}_shared_network" if engine.compute_runtime else "serving_embedded_with_physical_connectivity_gate",
-            "fault_semantics": ('boundary_fault_buffered_sender_retry_same_boundary'
-                                if network.spec.fault_timing == 'boundary' else
-                                "continuous_fault_buffered_sender_retry_on_observed_change"),
-            "realized_faults": list(network.spec.faults),
-            "compute_energy_distribution": "equal_work_share_across_physical_cell_members",
-            "rate_update_during_execution": False,
-            "kv_publication": "compute_completion_event",
-            "kv_cache_capacity_tokens": capacity,
-            "kv_capacity_model": "architecture_storage_bytes_per_model_token",
-        },
-    )
 
 
 class _EventEngine:
-    def __init__(self, spec, environment, energy, state, eligible):
-        from .control import current_controller, current_compute_runtime
+    def __init__(self, spec, environment):
+        from .control import current_controller
         self.controller = current_controller()
-        self.compute_runtime = current_compute_runtime()
-        self.spec, self.env, self.energy, self.state, self.eligible = (
-            spec,
-            environment,
-            energy,
-            state,
-            eligible,
-        )
-        self.net, self.serving = environment.network, spec.serving_profile
+        self.spec, self.env = spec, environment
+        self.net = environment.network
         self.end = Time(environment.time['end_s'])
         if spec.time_horizon_s is not None:
             self.end = min(self.end, Time(spec.time_horizon_s))
         self.jobs, self.heap, self.log = {}, [], ClockLog()
         self.service_jobs = {}
-        self.followers = defaultdict(list)
-        self.active_compute = {}
-        self.waiting = defaultdict(deque)
         self.sequence = 0
         self.now = Time()
         self.transport = None
@@ -277,7 +49,7 @@ class _EventEngine:
                 from .ns3_transport import Ns3Transport as Transport
             else:
                 from .flowsim_transport import FlowSimTransport as Transport
-            options = {'record_packets': getattr(self.compute_runtime, 'record_packets', getattr(self, 'record_packets', False))} if self.net.spec.transport_model == 'ns3' else {}
+            options = {'record_packets': getattr(self, 'record_packets', False)} if self.net.spec.transport_model == 'ns3' else {}
             self.transport = Transport(self.net.nodes, self.net.edges, self.net.spec.link_profiles, **options, **transport_options)
             self.transport_provenance = self.transport.provenance
         if self.global_scheduler:
@@ -331,53 +103,8 @@ class _EventEngine:
                         collection.pop(identity, None)
             job['external_failure_callback'](reason)
             return
-        if job.get('external_service'):
-            raise RuntimeError(f"external compute communication failed: {reason}")
-        if self.compute_runtime and job['request']['request_id'] in self.compute_runtime.jobs:
-            raise RuntimeError(f"in-flight AsterMind request failed: {reason}")
-        pending = [(job, reason)]
-        while pending:
-            current, current_reason = pending.pop()
-            if current['done']:
-                continue
-            self._fail_one(current, current_reason)
-            pending.extend((self.jobs[rid], 'dependency_uncompleted')
-                           for rid in reversed(self.followers.get(current['request']['request_id'], ())))
+        raise RuntimeError(f"external communication failed: {reason}")
 
-    def _fail_one(self, job, reason):
-        if job["done"]:
-            return
-        from .simulator import _uncompleted
-
-        if self.transport:
-            self.cancel_shared(job["request"]["request_id"], reason)
-        for identity, message in tuple(self.messages.items()):
-            if message['request_id'] == job['request']['request_id']:
-                message['cancelled'] = True
-                self.messages.pop(identity, None)
-        job["done"] = True
-        self.active_compute.pop(job["request"]["request_id"], None)
-        if "node" in job:
-            queue = self.state.satellite_for(job["node"]).compute_queue
-            queue.reservations[:] = [
-                replace(row, finish_s=self.now)
-                if row.request_id == job["request"]["request_id"]
-                and row.start_s <= self.now < row.finish_s
-                else row
-                for row in queue.reservations
-            ]
-            self.push(self.now, 70, "admit", None, job["node"])
-        job["record"] = _uncompleted(job["request"], reason).with_updates(
-            energy_ledger=tuple(job["ledger"]), selected_path=tuple(job["path"])
-        )
-        self.log.append(
-            {
-                "time_s": self.now,
-                "kind": "request_failed",
-                "request_id": job["request"]["request_id"],
-                "reason": reason,
-            }
-        )
     def _record_event(self, time, kind, request_id, payload, job):
         details = {}
         if kind in {
@@ -437,12 +164,8 @@ class _EventEngine:
             self.controller.finished(self)
 
     def close(self):
-        try:
-            if self.compute_runtime:
-                self.compute_runtime.close()
-        finally:
-            if self.transport:
-                self.transport.close()
+        if self.transport:
+            self.transport.close()
 
     def _run(self):
         while self.heap or (self.global_scheduler and self.transport.active):
@@ -487,33 +210,10 @@ class _EventEngine:
                         if current['state'] != 'UP' or current.get('setup_start_s') != leg.get('setup_start_s'):
                             self.interrupt_transfer(self.message_owner(message['request_id']), message,
                                                     'network_contact_lost_during_transmission')
-                if kind == "network_update":
-                    for active in tuple(self.active_compute.values()):
-                        if self.now < active[
-                            "decode_done_s"
-                        ] and not self.cell_available(active["node"]):
-                            self.fail(
-                                active, "compute_cell_disconnected_during_service"
-                            )
-                if kind == "link_state":
-                    edge = self.net.link_frames[payload["link_id"]][0]
-                    if edge["kind"] == "cell_isl" and payload["state"] == "DOWN":
-                        for active in tuple(self.active_compute.values()):
-                            if (
-                                not active["done"]
-                                and "prefill_start_s" in active
-                                and active["prefill_start_s"]
-                                <= time
-                                < active["decode_done_s"]
-                                and not self.cell_available(active["node"])
-                            ):
-                                self.fail(
-                                    active, "compute_cell_disconnected_during_service"
-                                )
                 continue
             try:
                 getattr(self, "on_" + kind)(job, payload)
-            except (NetworkUnavailable, EnergyWindowError, ValueError) as error:
+            except (NetworkUnavailable, ValueError) as error:
                 if job is None or job['done']:
                     raise
                 self.fail(job, str(error))
@@ -551,75 +251,6 @@ class _EventEngine:
             leg = message['leg']
             if self.net.link_at(leg['link_id'], self.now)['state'] == 'DOWN':
                 self.interrupt_transfer(self.message_owner(message['request_id']), message, reason)
-        for job in tuple(self.active_compute.values()):
-            if not self.cell_available(job['node']):
-                self.fail(job, 'compute_cell_disconnected_during_service')
-
-    def on_request_arrival(self, job, unused):
-        from .simulator import _select_access, _preview_candidate, _decision
-
-        request = job["request"]
-        if not float(self.env.time["start_s"]) <= request["arrival_time_s"] < self.end:
-            raise ValueError("request_time_outside_trace_horizon")
-        access = _select_access(
-            state=self.state,
-            request=request,
-            simulation_spec=self.spec,
-            environment_state=self.env,
-            energy_trace=self.energy,
-            eligible_satellite_ids=self.eligible,
-            sgl_bandwidth_bps=0.0,
-            horizon_s=self.end,
-        )
-        candidates, forecasts = [], {}
-        for node in self.eligible:
-            if (self.compute_runtime and hasattr(self.compute_runtime, 'accepts')
-                    and not self.compute_runtime.accepts(node, request)):
-                continue
-            try:
-                forecast = _preview_candidate(
-                    state=self.state,
-                    request=request,
-                    strategy=self.spec.strategy,
-                    environment_state=self.env,
-                    energy_trace=self.energy,
-                    serving=self.serving,
-                    access=access,
-                    compute_satellite_id=node,
-                    isl_bandwidth_bps=0.0,
-                )
-            except (NetworkUnavailable, EnergyWindowError, ValueError):
-                continue
-            candidate = forecast["candidate"]
-            if self.compute_runtime and hasattr(self.compute_runtime, 'candidate_load'):
-                candidate = replace(candidate, compute_load_score=self.compute_runtime.candidate_load(node))
-            candidates.append(candidate)
-            forecasts[candidate.candidate_id] = forecast
-        selected = build_candidate_selector(self.spec.strategy).select_action(
-            {"candidates": tuple(c.to_dict() for c in candidates)}, request
-        )
-        job["decision"] = _decision(request, selected, candidates)
-        if not selected.evaluated:
-            raise ValueError("no_feasible_compute_candidate")
-        job.update(
-            access=access,
-            node=forecasts[selected.selected_candidate_id][
-                "candidate"
-            ].compute_satellite_id,
-            selection=selected,
-        )
-        if self.compute_runtime and hasattr(self.compute_runtime, 'selected'):
-            self.compute_runtime.selected(job)
-        self.log_route_plan(job, forecasts[selected.selected_candidate_id]['inbound_path'], 'input', 'initial')
-        self.send(
-            job,
-            request["ingress_id"],
-            access.satellite_id,
-            request["input_bytes"],
-            {"sgl"},
-            "input",
-            "access_done",
-        )
 
     def log_route_plan(self, job, path, stage, reason):
         self.log.append(dict(time_s=self.now, kind='route_plan', request_id=job['request']['request_id'],
@@ -635,7 +266,7 @@ class _EventEngine:
             target,
             self.now,
             size,
-            self.spec.strategy.routing_policy,
+            self.spec.routing_policy,
             kinds=kinds,
             avoid_nodes=set(visited),
         )
@@ -788,18 +419,6 @@ class _EventEngine:
                   {**message, 'context': context, 'attempt': attempt, 'resume_node':resume_node})
 
     def on_retry_transfer(self, job, message):
-        if message['completion'] == 'access_done':
-            from .simulator import _select_access
-            try:
-                access = _select_access(state=self.state,
-                    request={**job['request'], 'arrival_time_s': self.now},
-                    simulation_spec=self.spec, environment_state=self.env,
-                    energy_trace=self.energy, eligible_satellite_ids=self.eligible,
-                    sgl_bandwidth_bps=0., horizon_s=self.end)
-                message['target'] = access.satellite_id
-                job['access'] = access
-            except NetworkUnavailable:
-                pass
         self.log.append(dict(time_s=self.now, kind='route_recovery', request_id=message['request_id'],
                              stage=message['stage'], attempt=message['attempt'],
                              source_node_id=message['resume_node'], target_node_id=message['target'],
@@ -838,9 +457,6 @@ class _EventEngine:
             if self.net.faulted(message['leg']):
                 kind = 'node' if failed_nodes.intersection((message['leg']['source_node_id'],message['leg']['target_node_id'])) else 'link'
                 self.interrupt_transfer(self.message_owner(message['request_id']), message, 'injected_' + kind + '_failure')
-        for job in tuple(self.active_compute.values()):
-            if failed_nodes.intersection(self.members(job['node'])):
-                self.fail(job, 'compute_member_failed_no_checkpoint')
         for identity, message in tuple(self.waiting_retries.items()):
             if message['resume_node'] in failed_nodes:
                 self.waiting_retries.pop(identity, None)
@@ -940,26 +556,6 @@ class _EventEngine:
         # Native byte-progress observation over the stated elapsed interval.
         pass
 
-    def debit(self, job, node_id, *, prompt=0, output=0, size=0, stage):
-        node = self.state.satellite_for(node_id)
-        advance_satellite_energy(node, self.energy, self.now)
-        window = energy_window_at(self.energy, node_id, self.now)
-        update = apply_request_energy(
-            node,
-            prompt_tokens=prompt,
-            output_tokens=output,
-            link_bytes=size,
-            energy_window=window,
-            event_time_s=self.now,
-            metadata={
-                "request_id": job["request"]["request_id"],
-                "energy_stage": stage,
-            },
-        )
-        job["ledger"].append(update["ledger_entry"])
-        if update["energy_violation"]:
-            raise ValueError("energy_unavailable")
-        return update
 
     def on_transfer_queued(self, job, message):
         # The next hop is now eligible; its reserved service may start later.
@@ -1040,398 +636,3 @@ class _EventEngine:
             self.waiting_retries[message['leg']['transfer_id']] = {
                 **message, 'resume_node': node, 'attempt': 1,
                 'context': {**message['context'], 'attempt': 1}}
-
-    def on_access_done(self, job, unused):
-        self.send(
-            job,
-            job["access"].satellite_id,
-            job["node"],
-            job["request"]["input_bytes"],
-            ISL_KINDS,
-            "input",
-            "input_done",
-        )
-
-    def on_input_done(self, job, unused):
-        if self.compute_runtime:
-            self.compute_runtime.submit(self, job)
-            return
-        self.on_analytical_input_done(job, unused)
-
-    def on_analytical_input_done(self, job, unused):
-        from .simulator import _preview_kv_copy
-
-        request, node = job["request"], job["node"]
-        required = min(request["prompt_tokens"], request["context_tokens_before_turn"])
-        local = local_kv_reuse_tokens(
-            self.state,
-            satellite_id=node,
-            session_id=request.get("session_id"),
-            required_context_tokens=required,
-        )
-        plan = _preview_kv_copy(
-            state=self.state,
-            session_id=request.get("session_id"),
-            target_satellite_id=node,
-            required_context_tokens=required,
-            prompt_length=request["prompt_tokens"],
-            local_hit_tokens=local,
-            copy_enabled=self.spec.strategy.kv_cache_copy_enabled,
-            kv_bytes_per_token=float(self.serving.kv_cache_bytes_per_token or 0),
-            environment_state=self.env,
-            start_s=self.now,
-            isl_bandwidth_bps=0.0,
-            prefill_rate_table=self.serving.prefill_rate_table,
-            concurrency=self.state.satellite_for(
-                node
-            ).compute_queue.comparison_concurrency_at(self.now),
-            network=self.net.fork(),
-            routing_policy=self.spec.strategy.routing_policy,
-        )
-        job.update(
-            local_hit_tokens=local,
-            effective_reuse_tokens=local,
-            copied_from=plan["source_satellite_id"],
-            copied_tokens=plan["copied_tokens"],
-        )
-        if plan["copied_tokens"]:
-            self.send(
-                job,
-                plan["source_satellite_id"],
-                node,
-                plan["copied_tokens"] * float(self.serving.kv_cache_bytes_per_token),
-                ISL_KINDS,
-                "kv_copy",
-                "copy_done",
-            )
-        else:
-            self.on_copy_done(job, None)
-
-    def on_copy_done(self, job, unused):
-        job["effective_reuse_tokens"] += job["copied_tokens"]
-        job["recompute_tokens"] = max(
-            0, job["request"]["prompt_tokens"] - job["effective_reuse_tokens"]
-        )
-        job["compute_ready_s"] = self.now
-        touch_kv_entry(
-            self.state,
-            satellite_id=job["copied_from"],
-            session_id=job["request"].get("session_id"),
-            now_s=self.now,
-        )
-        self.waiting[job["node"]].append(job["request"]["request_id"])
-        self.push(self.now, 70, "admit", None, job["node"])
-
-    def members(self, node_id):
-        from .simulator import _compute_members
-
-        return _compute_members(self.net, node_id)
-
-    def cell_available(self, node_id):
-        members = set(self.members(node_id))
-        if any(f['target_type'] == 'node' and f['target_id'] in members for f in self.net.active_faults.values()):
-            return False
-        if len(members) < 2:
-            return True
-        adjacency = {node: [] for node in members}
-        for edge in self.net.edges:
-            if edge["kind"] != "cell_isl" or edge["endpoint_a"] not in members:
-                continue
-            row = self.net.link_at(edge["link_id"], self.now)
-            if row["state"] == "UP" and row["bandwidth_bps"] > 0:
-                adjacency[edge["endpoint_a"]].append(edge["endpoint_b"])
-                adjacency[edge["endpoint_b"]].append(edge["endpoint_a"])
-        reached = {node_id}
-        pending = [node_id]
-        while pending:
-            for neighbor in adjacency[pending.pop()]:
-                if neighbor not in reached:
-                    reached.add(neighbor)
-                    pending.append(neighbor)
-        return reached == members
-
-    def on_admit(self, unused, node_id):
-        node = self.state.satellite_for(node_id)
-        if self.waiting[node_id] and not self.cell_available(node_id):
-            members = set(self.members(node_id))
-            changes = [
-                t
-                for edge in self.net.edges
-                if edge["kind"] == "cell_isl" and edge["endpoint_a"] in members
-                for t in self.net.link_times[edge["link_id"]]
-                if t > self.now
-            ]
-            if changes:
-                self.push(min(changes), 70, "admit", None, node_id)
-                self.log.append(
-                    {
-                        "time_s": self.now,
-                        "kind": "compute_wait_for_cell",
-                        "node_id": node_id,
-                    }
-                )
-            else:
-                while self.waiting[node_id]:
-                    self.fail(
-                        self.jobs[self.waiting[node_id].popleft()],
-                        "compute_cell_disconnected",
-                    )
-            return
-        while (
-            self.waiting[node_id]
-            and node.compute_queue.active_count_at(self.now)
-            < self.serving.max_concurrency
-        ):
-            job = self.jobs[self.waiting[node_id].popleft()]
-            if job["done"]:
-                continue
-            try:
-                self.admit_job(job, node)
-            except (ValueError, EnergyWindowError) as error:
-                self.fail(job, str(error))
-
-    def admit_job(self, job, node):
-        node_id = job["node"]
-        request = job["request"]
-        window = energy_window_at(self.energy, node_id, self.now)
-        dvfs = (
-            self.spec.strategy.shadow_dvfs_scale
-            if self.spec.strategy.shadow_dvfs_enabled and not window.get("sunlit", True)
-            else 1.0
-        )
-        concurrency = node.compute_queue.active_count_at(self.now) + 1
-        prefill = (
-            prefill_suffix_time_s(
-                self.serving.prefill_rate_table,
-                prompt_length=request["prompt_tokens"],
-                cached_prefix_tokens=job["effective_reuse_tokens"],
-                concurrency=concurrency,
-            )
-            / dvfs
-        )
-        decode = (
-            decode_time_s(
-                self.serving.decode_rate_table,
-                context_length=request["prompt_tokens"],
-                output_tokens=request["output_tokens"],
-                concurrency=concurrency,
-            )
-            / dvfs
-        )
-        reservation = node.compute_queue.preview(
-            request_id=request["request_id"],
-            ready_s=self.now,
-            duration_for=lambda c, t: prefill + decode,
-        )
-        if reservation.finish_s > self.end:
-            self.fail(job, "simulation_horizon_exceeded")
-            return
-        node.compute_queue.reserve(reservation)
-        job.update(
-            reservation=reservation,
-            prefill_start_s=self.now,
-            prefill_done_s=self.now + prefill,
-            decode_done_s=reservation.finish_s,
-            prefill_service_s=prefill,
-            decode_service_s=decode,
-            concurrency=concurrency,
-            dvfs=dvfs,
-            window=window,
-        )
-        self.push(self.now, 80, "compute_start", request["request_id"])
-
-    def on_compute_start(self, job, unused):
-        self.active_compute[job["request"]["request_id"]] = job
-        request = job["request"]
-        members = self.members(job["node"])
-        job["physical_members"] = members
-        updates = {
-            member: self.debit(
-                job,
-                member,
-                prompt=job["recompute_tokens"] / len(members),
-                output=request["output_tokens"] / len(members),
-                stage="compute",
-            )
-            for member in members
-        }
-        job["soc_before"] = updates[job["node"]]["soc_before"]
-        first_duration = (
-            decode_time_s(
-                self.serving.decode_rate_table,
-                context_length=request["prompt_tokens"],
-                output_tokens=1,
-                concurrency=job["concurrency"],
-            )
-            / job["dvfs"]
-        )
-        self.push(job["prefill_done_s"], 20, "prefill_complete", request["request_id"])
-        self.push(
-            job["prefill_done_s"] + first_duration,
-            20,
-            "first_token_ready",
-            request["request_id"],
-        )
-        self.push(job["decode_done_s"], 20, "compute_complete", request["request_id"])
-
-    def on_prefill_complete(self, job, unused):
-        pass
-
-    def on_first_token_ready(self, job, unused):
-        from .simulator import _first_token_bytes
-
-        self.send(
-            job,
-            job["node"],
-            job["request"]["ingress_id"],
-            _first_token_bytes(job["request"]),
-            None,
-            "first_token",
-            "first_delivered",
-        )
-
-    def on_compute_complete(self, job, unused):
-        self.active_compute.pop(job["request"]["request_id"], None)
-        from .simulator import _first_token_bytes
-
-        request = job["request"]
-        job["kv_event"] = commit_session_kv(
-            self.state,
-            session_id=request.get("session_id"),
-            satellite_id=job["node"],
-            context_tokens=request["prompt_tokens"] + request["output_tokens"],
-            now_s=self.now,
-            copied_from=job["copied_from"],
-        )
-        self.log.append(
-            {
-                "time_s": self.now,
-                "kind": "kv_publish",
-                "request_id": request["request_id"],
-                "node_id": job["node"],
-                "context_tokens": request["prompt_tokens"] + request["output_tokens"],
-            }
-        )
-        self.push(self.now, 70, "admit", None, job["node"])
-        size = max(0, request["output_bytes"] - _first_token_bytes(request))
-        if size:
-            self.send(
-                job,
-                job["node"],
-                request["ingress_id"],
-                size,
-                None,
-                "output",
-                "output_delivered",
-            )
-        else:
-            job["output_done_s"] = self.now
-            self.finish(job)
-
-    def on_first_delivered(self, job, unused):
-        job["first_done_s"] = self.now
-        self.finish(job)
-
-    def on_output_delivered(self, job, unused):
-        job["output_done_s"] = self.now
-        self.finish(job)
-
-    def finish(self, job):
-        if (
-            job["first_done_s"] is None
-            or job["output_done_s"] is None
-            or "kv_event" not in job
-        ):
-            return
-        request, kv, paths = job["request"], job["kv_event"], tuple(job["path"])
-        node = self.state.satellite_for(job["node"])
-        advance_satellite_energy(node, self.energy, self.now)
-        job["record"] = RuntimeRequestRecord(
-            **{
-                k: request.get(k)
-                for k in (
-                    "request_id",
-                    "arrival_time_s",
-                    "prompt_tokens",
-                    "output_tokens",
-                    "session_id",
-                    "region_id",
-                )
-            },
-            completed=True,
-            response_streaming_model="first_token_then_remaining_output",
-            action_type="compute",
-            access_type=job["access"].access_type,
-            access_satellite_id=job["access"].satellite_id,
-            access_compute_node_id=(
-                job["access"].satellite_id
-                if job["access"].access_type == "compute"
-                else None
-            ),
-            serving_compute_node_id=job["node"],
-            serving_satellite_id=job["node"],
-            compute_owner_compute_node_id=job["node"],
-            compute_owner_compute_node_ids=(job["node"],),
-            compute_owner_satellite_id=job["node"],
-            compute_owner_satellite_ids=tuple(
-                job.get("physical_members", [job["node"]])
-            ),
-            dvfs_scale=job["dvfs"],
-            prefill_queue_wait_s=job["prefill_start_s"] - job["compute_ready_s"],
-            decode_queue_wait_s=0.0,
-            prefill_service_s=job["prefill_service_s"],
-            decode_service_s=job["decode_service_s"],
-            ttft_s=job["first_done_s"] - request["arrival_time_s"],
-            e2e_s=max(job["first_done_s"], job["output_done_s"])
-            - request["arrival_time_s"],
-            link_queue_wait_s=sum(leg["queue_wait_s"] for leg in paths),
-            link_transmission_s=sum(leg["transmission_s"] for leg in paths),
-            selected_path=paths,
-            energy_ledger=tuple(job["ledger"]),
-            energy_violation=False,
-            soc_before=job["soc_before"],
-            soc_after=node.soc,
-            compute_sunlit=job["window"].get("sunlit", True),
-            kv_capacity_admission=kv.get("admission"),
-            kv_serve_action=kv.get("action"),
-            kv_hit_tokens=job["effective_reuse_tokens"],
-            kv_copied_tokens=job["copied_tokens"],
-            kv_miss_tokens=job["recompute_tokens"],
-            context_recompute_tokens=job["recompute_tokens"],
-            kv_evicted_tokens=kv.get("evicted_tokens", 0),
-            kv_evicted_bytes=kv.get("evicted_tokens", 0)
-            * float(self.serving.kv_cache_bytes_per_token or 0),
-            kv_evicted_entry_count=len(kv.get("evicted_session_ids", ())),
-            kv_capacity_tokens=kv.get("capacity_tokens"),
-            kv_occupancy_tokens_before=kv.get("occupancy_tokens_before"),
-            kv_occupancy_tokens_after=kv.get("occupancy_tokens_after"),
-            kv_copy_source_satellite_id=job["copied_from"],
-            kv_copy_source_compute_node_id=job["copied_from"],
-            bottleneck_reason="none",
-            provenance={
-                "scope": "physical_network_discrete_event_runtime",
-                "network_transport": self.transport_provenance,
-                "trace_model": self.env.trace_model,
-                "serving_concurrency_at_admission": job["concurrency"],
-                "serving_rate_model": getattr(self.compute_runtime, "serving_rate_model", "astermind_midlayer") if self.compute_runtime else "admission_snapshot_fixed_rate",
-                "trace_id": self.env.trace_id,
-                "score": job["selection"].score,
-                "compute_ready_s": job["compute_ready_s"],
-                "compute_start_s": job["prefill_start_s"],
-                "prefill_complete_s": job["prefill_done_s"],
-                "compute_complete_s": job["decode_done_s"],
-            },
-        )
-        job["done"] = True
-        for rid in self.followers.get(request["request_id"], ()):
-            follower = self.jobs[rid]["request"]
-            follower["source_arrival_time_s"] = follower["arrival_time_s"]
-            follower["arrival_time_s"] = self.now + float(follower["inter_turn_gap_s"])
-            self.push(follower["arrival_time_s"], 30, "request_arrival", rid)
-        self.log.append(
-            {
-                "time_s": self.now,
-                "kind": "request_complete",
-                "request_id": request["request_id"],
-            }
-        )

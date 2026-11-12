@@ -97,7 +97,7 @@ class NativeCellIntegrationTests(unittest.TestCase):
 
     def check_migration(self, backend):
         result = self.run_scene(
-            self.config("dynamic_migration_tp2.json", backend=backend)
+            self.config("dynamic_migration_tp2.json", backend=backend, communication_mode="flowsim")
         )
         self.assertEqual(result["status"], "completed")
         self.assertTrue(result["audit"]["passed"])

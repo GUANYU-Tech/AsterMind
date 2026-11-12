@@ -58,15 +58,13 @@ native kernel energy are outside this entry point. Link faults use Runtime's
 configured fail/retry policy. Energy is reported as `not_evaluated`. Tested
 operator/communication semantics do not establish hardware prediction accuracy.
 
-## Existing member-level adapter
+## Shared adapters
 
-The additive `CellRuntime`, `CellDeployment` and `native_cell_factory()` API still
-supports `run_simulation(spec, compute_runtime=...)`. It maps one native rank to
-each distinct physical member and preserves the original AsterMind entry point.
-Use the device execution path above for multiple GPUs on one satellite.
+The old `CellRuntime`/`CellDeployment`/`AsterMindRuntime` wrappers and their
+`run_simulation` request entry point are removed. SimulationConfig and Simulation
+own Native request execution. RuntimeCellNetwork, CellTransferExecutor,
+NetworkKVMigration, bind_batch_executor and native_cell_factory remain available.
 
-Factories receive `cell_id`, `loop`, `network`, `on_output` and `on_complete`, and
-return a Cell providing `submit_ready_request()`, `snapshot()` and `close()`.
 `RuntimeNetworkFrames`, `FrameRouter` and `CommunicationExecutor.for_runtime()`
 remain additive compatibility APIs and reuse current causal physical state.
 `Ns3PointToPointDriver` is a standalone sequential utility; hosted simulations

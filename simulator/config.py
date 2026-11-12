@@ -113,51 +113,6 @@ class Migration(Contract):
     mode: Literal["copy", "move"] = "copy"
 
 
-class OrbitConfiguration(Contract):
-    # The existing O-S module produces the canonical, hash-verified trace.
-    trace_manifest: str | None = None
-    samples: tuple[dict, ...] = ()
-    elements_file: str | None = None
-    simulation_epoch_utc: str | None = None
-    sample_step_ns: Positive = 1_000_000_000
-    mode: Literal["per_member", "reference_offsets"] = "per_member"
-    reference_satellite: Identifier | None = None
-    offsets_itrs_km: dict[str, tuple[float, float, float]] = Field(default_factory=dict)
-    max_isl_range_km: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 10000
-    min_ground_elevation_deg: Annotated[float, Field(ge=-90, le=90)] = 0
-
-    @model_validator(mode="after")
-    def validate_source(self):
-        if (
-            sum(
-                (
-                    self.trace_manifest is not None,
-                    bool(self.samples),
-                    self.elements_file is not None,
-                )
-            )
-            != 1
-        ):
-            raise ValueError(
-                "supply one orbit source: canonical manifest, samples, or SGP4 elements"
-            )
-        if self.elements_file and not self.simulation_epoch_utc:
-            raise ValueError("SGP4 propagation needs simulation_epoch_utc")
-        if self.mode == "reference_offsets" and not self.reference_satellite:
-            raise ValueError("reference-offset formation needs a reference satellite")
-        if self.mode == "per_member" and (
-            self.reference_satellite or self.offsets_itrs_km
-        ):
-            raise ValueError("independent propagation cannot contain reference offsets")
-        return self
-
-
-class LinkParameters(Contract):
-    kind: Literal["manual", "islsim"] = "manual"
-    distance_km: Annotated[float, Field(gt=0, allow_inf_nan=False)] | None = None
-    fso: dict = Field(default_factory=dict)
-
-
 class CellLinkAddition(Contract):
     source: Identifier
     target: Identifier
@@ -184,8 +139,6 @@ class SimulationConfig(Contract):
     horizon_ns: Positive = 1_000_000_000
     packet_bytes: Literal[1400] = 1400
     record_packets: bool = False
-    orbit: OrbitConfiguration | None = None
-    link_parameters: dict[str, LinkParameters] = Field(default_factory=dict)
     physical_dataset: str | None = None
     physical_network: dict | str | None = None
     physical_link_bindings: dict[str, str] = Field(default_factory=dict)
@@ -214,10 +167,6 @@ class SimulationConfig(Contract):
             value = data.get(key)
             if isinstance(value, str) and not Path(value).is_absolute():
                 data[key] = str((path.parent / value).resolve())
-        for key in ("trace_manifest", "elements_file"):
-            value = data.get("orbit", {}).get(key)
-            if value and not Path(value).is_absolute():
-                data["orbit"][key] = str((path.parent / value).resolve())
         return cls.model_validate(data)
 
     def topology(self):
@@ -240,10 +189,6 @@ class SimulationConfig(Contract):
         if set(self.runtime_network) - set(RUNTIME_NETWORK_FIELDS):
             raise ValueError(
                 "runtime_network may only override runtime faults/recovery fields"
-            )
-        if self.orbit is not None or self.link_parameters:
-            raise ValueError(
-                "use canonical physical_network or physical_dataset for orbit and link budgets"
             )
         if self.physical.get("link_policy") is not None:
             raise ValueError(

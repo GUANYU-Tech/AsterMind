@@ -1,12 +1,8 @@
 import unittest
 from dataclasses import replace
-from types import SimpleNamespace
-from unittest.mock import patch
 
 
 from orbitserve.baselines.ground.costing import estimate_terrestrial_ground_cost
-from orbitserve.dse.search import DSERuntimeMatrixSpec
-from orbitserve.dse.runtime_matrix import DSEDesignContext, evaluate_runtime_matrix
 from orbitserve.baselines.ground.contracts import GroundScenario as RuntimeScenario, GroundStrategySpec as RuntimeStrategySpec
 from orbitserve.experiments.runtime_dispatch import evaluate_runtime_performance
 from orbitserve.baselines.ground.contracts import GroundRequestRecord as RuntimeRequestRecord
@@ -354,61 +350,6 @@ class TerrestrialGroundCostTests(unittest.TestCase):
             scenario.cost_power["annualized_cost_usd_per_year"],
         )
 
-    def test_dse_ground_row_preserves_only_explicit_terrestrial_cost_contract(self):
-        payload = {
-            "evaluated": True,
-            "runtime_metrics": {
-                "served_ratio": 1.0,
-                "useful_request_throughput_per_s": 1.0,
-                "useful_token_throughput_per_s": 100.0,
-                "cost_per_served_request_usd": 2.0,
-                "cost_per_served_mtoken_usd": 20_000.0,
-            },
-            "slo": {"served_ratio": 1.0, "timeout_ratio": 0.0},
-            "performance": {"ttft_p95_s": 1.0, "e2e_p95_s": 2.0},
-            "details": {
-                "terrestrial_costing": {
-                    "evaluated": True,
-                    "total_cost_usd": 2.0,
-                    "annualized_cost_usd_per_year": 17_520.0,
-                }
-            },
-            "warnings": (),
-        }
-        context = DSEDesignContext(
-            design_id="leo-context-that-must-not-leak",
-            design_row={},
-            runtime_scenario=SimpleNamespace(
-                scenario_id="source", serving_profile=None, provenance={}
-            ),
-            current_scheduler={"policy": "local_only"},
-            cost_result={
-                "total_cost_usd": 1_000_000.0,
-                "annualized_cost_usd_per_year": 100_000.0,
-            },
-        )
-        spec = DSERuntimeMatrixSpec(
-            enabled=True,
-            include_current_policy=False,
-            policies=("skywalker_like_ground",),
-            ground_config=_ground_config(include_egress=False),
-            allow_preliminary_runtime_metrics=True,
-            ignore_optional_cost=True,
-        )
-        fake = SimpleNamespace(to_dict=lambda: payload)
-
-        with patch(
-            "orbitserve.dse.runtime_matrix.evaluate_runtime_performance",
-            return_value=fake,
-        ):
-            result = evaluate_runtime_matrix((context,), spec).to_dict()
-
-        row = result["matrix_rows"][0]
-        self.assertEqual(row["design_id"], "terrestrial_reference")
-        self.assertEqual(row["cost_total_usd"], 2.0)
-        self.assertEqual(row["annualized_cost_usd_per_year"], 17_520.0)
-        self.assertEqual(row["cost_per_served_request_usd"], 2.0)
-        self.assertNotEqual(row["annualized_cost_usd_per_year"], 100_000.0)
 
 
 if __name__ == "__main__":  # pragma: no cover
