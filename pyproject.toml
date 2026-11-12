@@ -27,10 +27,6 @@ packages = [
   "network_sim",
   "integration",
   "orbitserve",
-  "orbitserve.architecture",
-  "orbitserve.architecture.single_satellite_cost",
-  "orbitserve.baselines",
-  "orbitserve.baselines.ground",
   "orbitserve.common",
   "orbitserve.experiments",
   "orbitserve.runtime",
@@ -46,8 +42,6 @@ packages = [
 [tool.setuptools.package-dir]
 orbitserve = "src/orbitserve"
 "orbitserve.experiments" = "src/experiments"
-"orbitserve.baselines" = "src/baselines"
-"orbitserve.baselines.ground" = "src/baselines/ground"
 
 [tool.setuptools.package-data]
 "simulator" = ["examples/*.json", "web/*.html", "web/*.css", "web/*.js"]

@@ -9,17 +9,14 @@ simulator/                  SimulationConfig, Native orchestration, audit and re
 integration/                Mid-Layer Cells and official vLLM Scheduler adapters
 network_sim/                Explicit device topology and physical resource graph
 src/orbitserve/              Shared simulation modules
-  architecture/              Per-role physical hardware, static energy sizing, and cost parameters
   orbit/                     Constellation geometry, orbital motion, visibility, sunlight, and traces
   workload/                  Canonical workload contracts, validation, loading, and materialization
   runtime/                   Shared clocks, transport, routing, faults and Native Cell/KV adapters
   common/                    Policy-free metric DTOs and serialization
-src/experiments/             Native CLI, capacity tools, physical preparation and dataset reuse
-src/baselines/ground/        Terrestrial serving baselines
+src/experiments/             Native CLI, physical preparation and dataset reuse
 src/workloads/main_composite_chat/  Synthetic workload adapter and source profiles
 examples/                    Versioned, user-facing input examples
 tests/                       Unit, integration, smoke, and slow regression suites
-docs/research/               Research notes retained from develop
 ```
 
 See `CHANGELOG.md` for release history.
@@ -84,77 +81,6 @@ The CLI accepts numeric schema `1` and `orbitserve.native_cells.v1` through
 SimulationConfig. Their existing communication defaults remain `flowsim` and
 `protobridge_cell`, respectively. Summary mode writes `*.artifacts/native_result.json`;
 `--full` writes the complete result. `--artifact-dir` and `--midlayer-root` are retained.
-The independent terrestrial baseline API remains under `orbitserve.baselines.ground`;
-the Native CLI no longer dispatches ground manifests.
-
-## Four-satellite compute/bandwidth capacity study
-
-`examples/capacity/four_satellites.json` defines a model/hardware/layout sweep
-with four compute satellites and at most eight GPUs per satellite. The model
-catalog is read from a separately prepared local AsterMind checkout; third-party
-code, hardware calibration and generated results remain local.
-
-```bash
-python -m orbitserve.experiments.capacity_study plan examples/capacity/four_satellites.json \
-  --astermind-root /path/to/astermind --out local/capacity-plan.json
-python -m orbitserve.experiments.capacity_study check examples/capacity/four_satellites.json \
-  --astermind-root /path/to/astermind --out local/capacity-capabilities
-python -m orbitserve.experiments.capacity_study run examples/capacity/pilot.json \
-  --astermind-root /path/to/astermind --out local/results/capacity-pilot
-python -m orbitserve.experiments.capacity_study analyze local/results/capacity-pilot \
-  --out local/results/capacity-pilot/analysis
-```
-
-Planning and analysis do not import native dependencies. `check` executes the
-native model/deployment gates and rank-local HBM accounting without starting a
-Scheduler. Running requires AsterMind's prepared FlowSim extension, Midlayer and
-pinned vLLM environment. Configure these through that dependency's installation
-and `PYTHONPATH`; this command does not install packages or patch sources.
-`--model-dir` can include additional model configurations: unsupported models and
-layouts retain explicit reasons. Each executed rate/seed has an isolated process,
-bounded wall time, request/transport/operator evidence and model/hardware hashes.
-`scheduler_startup_timeout_s` separately budgets host-side cold imports within
-the trial wall timeout; it changes no simulated service time or source checks.
-Use `--resume` only with an identical plan and dependency identity. `--limit N`
-limits the current invocation and leaves the study explicitly incomplete.
-
-The default interprets 400G/1T as **bidirectional aggregate**, assigning 200/500
-Gbit/s to each independent direction. Set `bandwidth_accounting: "per_direction"`
-for 400/1000 Gbit/s in each direction. The controlled baseline is a static ring
-with an explicit distance/c propagation delay, local port/switch limits and ground
-links. It does not establish orbital availability or physical optical feasibility.
-
-Analysis reports SLO attainment including unfinished measurement-cohort requests,
-completion goodput within the measurement window, queue growth, per-direction
-link use and GPU kernel active intervals. Drain completions cannot inflate window
-throughput. A rate passes only if every configured seed has a sufficient request
-population and passes the declared SLO/queue test. A highest passing load without
-a higher observed failure is marked as a capacity lower bound. Near-best choices
-are minimum-card **best-tested exploratory configurations**, not procurement or
-flight recommendations. Missing trials, unsupported layouts and hardware coverage
-remain visible. No power/cost ranking is invented.
-
-The queue check is a finite-window diagnostic, not a proof of stationarity. Its
-default permits at most one request per measurement interval of positive backlog
-growth (with `queue_growth_fraction: 0`); trials near the boundary need longer
-windows and repeated seeds. Insufficient populations and worker failures cannot
-provide an upper capacity bound. Token throughput counts completed responses.
-
-HBM pools are bounded by the tightest rank's native model-weight residency, KV
-geometry and an explicitly assumed non-KV reserve. They are not arbitrary debug
-block counts, but the reserve is still unmeasured. Device-only timing omits host
-overhead, and native kernel energy is not evaluated. The short pilot checks the
-research pipeline; its small sample and short prompts are not production sizing.
-The full sweep's service thresholds, traffic, memory reserves, topology and
-hardware prediction accuracy require calibration for a final engineering choice.
-ACK traffic is explicit through `acknowledgements_enabled`,
-`ack_packet_payload_bytes`, `ack_every_packets` and `ack_size_bytes`; defaults
-retain AsterMind's aggregate reverse-ACK model. This is a declared transport
-assumption, not a TCP or optical terminal emulator. Compare ACK and distance
-assumptions separately from bandwidth. Model compute/weight dtypes are recorded
-from the native loader, including nested quantized text-model configurations.
-The pilot also reports a clearly named 200-ms TPOT sensitivity target; the main
-50/100-ms targets remain unchanged.
 
 ## Physical Network Model
 
@@ -667,14 +593,6 @@ recovered contacts reacquire instead of inheriting an obsolete setup timestamp.
 
 Native results expose requests, batches, transfers, migrations, network observations,
 measurement and provenance. The summary CLI links to the full audit artifact.
-
-## Single-Satellite Cost Tool
-
-```bash
-python3 -m orbitserve.architecture.single_satellite_cost.cli \
-  examples/single_satellite/h200_gpu_derived.json \
-  --out results/single_satellite/h200_gpu_derived.json
-```
 
 ## Physical data preparation
 

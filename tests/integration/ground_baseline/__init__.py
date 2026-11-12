@@ -1,1 +1,0 @@
-"""Ground-baseline integration tests."""

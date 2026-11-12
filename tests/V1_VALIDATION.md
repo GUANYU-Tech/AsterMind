@@ -77,3 +77,54 @@ successful reruns above provide the final results.
 
 Static review found no blocking production regression. The obsolete README entry
 and the weakened dataset execution assertion identified during review were fixed.
+
+## Follow-up removal — 2026-11-13
+
+Base: `5042a5600548dddad4c64768abefe695ca9390f3`, on the same
+`version/AsterMind-V1.0` branch and SeeSpace1 environment described above.
+The preceding sections record the first cleanup; this follow-up supersedes their
+statement that independent architecture/cost and ground-baseline tools remain.
+
+### Scope
+
+- Removed the old architecture/static-cost package, constellation-cost utility,
+  ground inference baseline and its dedicated runtime_dispatch entry.
+- Removed capacity_study/capacity_native/capacity_metrics: this separate parameter
+  sweep used external AsterMindConfig rather than the current SimulationConfig.
+- Removed exclusive tests, examples and package declarations for these branches.
+- Deleted root docs/ and output/, their obsolete current-document references,
+  orphan bytecode for removed modules and resulting empty directories.
+- Preserved workload tools and data, ground network resources, native output and
+  replay, all core simulation source and the existing directory/package layout.
+  There are no changes to simulator/, integration/, network_sim/, the shared Runtime,
+  orbit implementation or physical-data preparation. No dependency versions changed.
+
+### Results
+
+| Check | Result |
+| --- | --- |
+| Batch 1 cost/ground removal smoke | 12 tests pass |
+| Batch 2 capacity-sweep removal smoke | 26 tests pass |
+| Retained non-FlowSim regression suite | 453 tests pass in 184.623 s; no import errors or skips |
+| Real Native integrations | 5 tests pass: ns3 TP2 KV move/prefix reuse; SimGrid direct, satellite and Cell communication; SimGrid KV migration/prefix reuse |
+| Real ns3 CLI after each of the 3 batches | Each matches the pre-change baseline: 2 completed requests, 2717 kernels, 6 transfers and passing audit |
+| Replay export from actual ns3 and SimGrid results | Both catalogs/reports load; calls and transfers are present; HTML/JS/CSS match packaged source assets |
+| sdist -> wheel -> installation outside source | Build/install pass; 88 modules import; resource hashes, portable CLI and web resources pass |
+| Static checks and scope review | Ruff F rules, git diff --check and independent read-only review pass; no blocking findings |
+
+The 98 removed test methods exclusively covered retired cost/ground/capacity-study
+features, reducing the retained set from 551 to 453. The same 20 FlowSim-dependent
+tests remain explicitly excluded at the user's request. The external ISLSim suite
+was not run. No skipped or mocked native execution is counted as backend validation.
+
+The three ns3 comparisons check exact request timing/status, decisions, compute
+completions, outputs, transfers, batches, input distributions, migrations, event
+logs, simulated horizon, final positions, provenance and audit counters.
+Host wall-clock measurements and current host resource availability are not expected
+to match. Current request, computation and communication semantics are unchanged.
+
+Logs and generated artifacts stay outside the repository under
+`/data1/guolidong/.orbitserve-tools/`: `v2-batch1-tests.log`,
+`v2-batch2-tests.log`, `v2-full-retained.log`, `v2-native.log`,
+`v2-distribution.log`, `v2-replay-and-comparison.log`, `v2-native-reports/`
+and `v2-replay/`. The spawn-safe launcher is `v2-retained-suite.py`.

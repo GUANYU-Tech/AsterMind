@@ -10,11 +10,9 @@ The bundle is synthetic. It is inspired by the workload structure discussed in S
 
 ## Intended Use
 
-Use this as a small, reviewable user-supplied workload input for parser, scheduler, and experiment smoke tests. The rows follow the OrbitServe `Request schema` from `docs/research/parameters/llm_serving_workload_generation_model.md` and intentionally avoid runtime result fields such as `assigned_satellite`, `selected_path`, `session_action`, `served`, `TTFT`, `E2E`, `energy_violation`, or `cost_per_request`.
+Use this as a small, reviewable user-supplied workload input for parser, scheduler, and experiment smoke tests. These historical request/session rows are separate from the current six-file workload bundle and SimulationConfig.requests. They intentionally avoid runtime result fields such as `assigned_satellite`, `selected_path`, `session_action`, `served`, `TTFT`, `E2E`, `energy_violation`, or `cost_per_request`.
 
-Compiling `workload_description.json` writes the canonical bundle to
-`results/workloads/skywalker_inspired_global_llm/`, leaving this example
-directory as the tracked source trace.
+The files are retained as source examples; no current compiler or Native entry automatically converts this format.
 
 ## Shape
 

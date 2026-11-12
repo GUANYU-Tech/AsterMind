@@ -2,7 +2,6 @@ import ast
 import unittest
 from pathlib import Path
 
-import orbitserve.architecture as architecture
 import orbitserve.orbit as orbit
 import orbitserve.runtime as runtime
 import orbitserve.workload as workload
@@ -16,7 +15,6 @@ CORE = ROOT / "src" / "orbitserve"
 class CoreModuleBoundaryTests(unittest.TestCase):
     def test_public_contracts_are_exported(self):
         for module, names in {
-            architecture: ("HardwareSpec", "ResolvedArchitecture", "SatelliteHardwareProfile", "resolve_architecture"),
             orbit: ("OrbitTraceManifest", "OrbitTraceBundle", "generate_orbit_trace", "load_orbit_trace"),
             workload: ("WorkloadBundleRef", "WorkloadGenerationResult", "materialize_workload_bundle"),
             runtime: ("NetworkSpec", "NetworkState", "GlobalTimeline", "CommunicationExecutor"),
@@ -27,10 +25,8 @@ class CoreModuleBoundaryTests(unittest.TestCase):
 
     def test_core_domain_imports_follow_one_way_allowlist(self):
         allowed = {
-            "architecture": {"common"},
             "orbit": {"common"},
             "workload": {"common"},
-            "serving": {"architecture", "common", "workload"},
             "runtime": {"common", "orbit"},
             "common": set(),
         }
@@ -47,7 +43,7 @@ class CoreModuleBoundaryTests(unittest.TestCase):
             self.assertLessEqual(targets, allowed[source], f"unexpected {source} imports: {targets - allowed[source]}")
 
     def test_cross_domain_imports_use_public_package_interfaces(self):
-        domains = {"architecture", "orbit", "workload", "serving", "runtime", "common"}
+        domains = {"orbit", "workload", "runtime", "common"}
         violations = []
         for path in CORE.rglob("*.py"):
             source = path.relative_to(CORE).parts[0]
@@ -71,7 +67,7 @@ class CoreModuleBoundaryTests(unittest.TestCase):
         self.assertEqual(violations, [], "\n".join(violations))
 
     def test_all_source_consumers_use_core_public_package_interfaces(self):
-        domains = {"architecture", "orbit", "workload", "serving", "runtime", "common"}
+        domains = {"orbit", "workload", "runtime", "common"}
         violations = []
         for path in SRC.rglob("*.py"):
             for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
@@ -105,9 +101,6 @@ class CoreModuleBoundaryTests(unittest.TestCase):
         return None
 
     def test_removed_cross_domain_fields_are_absent(self):
-        hardware_fields = architecture.SatelliteHardwareProfile.__dataclass_fields__
-        for field in ("isl_contention_factor", "max_concurrent_isl_links", "laser_terminal_utilization"):
-            self.assertNotIn(field, hardware_fields)
         for removed in ("ConstellationDesign", "RuntimeTraceBundle", "SimulationConfig", "run_simulation"):
             self.assertFalse(hasattr(orbit, removed))
 

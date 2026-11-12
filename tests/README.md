@@ -2,7 +2,7 @@
 
 The fixed-design entry is SimulationConfig -> Simulation. DSE, Analytical
 performance tables, energy/SOC/DVFS execution and their exclusive tests are removed.
-Independent physical geometry, cost, workload and terrestrial baseline tests remain.
+Independent physical geometry and workload tests remain.
 
 ```bash
 python -m unittest discover -s tests -t . -v
@@ -21,7 +21,7 @@ explicitly run from `tests/external/islsim` with its external source configured.
 | Native Cell callbacks, input before collective, migration rollback/horizon | `integration/fixed_design/test_cell_shared_runtime.py`, `unit/runtime/test_cell_migration.py` |
 | Actual Mid-Layer/vLLM TP/PP, KV move/prefix reuse, communication scopes | `external/native_cells/` |
 | Physical dataset hashes, reuse, fault causality, serial/parallel exports | `integration/fixed_design/test_physical_dataset.py`, `test_physical_precompute.py`, `test_parallel_physical_exports.py` |
-| Independent cost/workload/ground behavior | `unit/architecture/`, `unit/workload/`, `integration/ground_baseline/` |
+| Independent workload behavior | `unit/workload/`, `smoke/test_main_composite_chat_bundle.py` |
 | Installed package and packaged resources | `scripts/check_distribution.py` |
 
 `tests/network_case.py` is a transfer-only fixture for the shared event engine.
@@ -29,4 +29,4 @@ It executes physical request/reply bytes, without synthesizing LLM computation,
 energy or KV state. Real LLM scheduling and KV are validated by the Native suite.
 Legacy test documents are not accepted as SimulationConfig inputs.
 
-The V1 cleanup run and its explicit exclusions are recorded in [V1 validation](V1_VALIDATION.md).
+The V1 cleanup, follow-up removal and explicit test exclusions are recorded in [V1 validation](V1_VALIDATION.md).
