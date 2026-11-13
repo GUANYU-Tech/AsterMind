@@ -2,6 +2,7 @@
 from copy import deepcopy
 from dataclasses import replace
 import json
+import math
 from pathlib import Path
 import sys
 import tempfile
@@ -52,9 +53,27 @@ class ISLSimAdapterTests(unittest.TestCase):
         fixed = replace(automatic, islsim_config={**deepcopy(automatic.islsim_config),
             'tx': {**automatic.islsim_config['tx'], 'modulation_pool': [[4, 'DP-QPSK']]}})
         auto_result, fixed_result = automatic.attributes(1000, 0), fixed.attributes(1000, 0)
-        self.assertEqual(auto_result['modulation_order'], 16)
+        _, _, (config, model, _) = islsim._api()
+        for profile, actual in ((automatic, auto_result), (fixed, fixed_result)):
+            values = profile.islsim_config
+            native_config = config.FSOConfig(
+                tx=config.TXConfig(**values['tx']),
+                rx=config.RXConfig(**values['rx']),
+                channel=config.ChannelConfig(**values['channel']),
+            )
+            expected = model.compute_link(native_config, 1000)
+            self.assertTrue(expected.feasible)
+            self.assertEqual(actual['modulation_order'], expected.modulation_order)
+            self.assertAlmostEqual(actual['bandwidth_bps'], expected.total_bw_gbps * 1e9)
+            self.assertIn(actual['modulation_order'],
+                          [item[0] for item in values['tx']['modulation_pool']])
         self.assertEqual(fixed_result['modulation_order'], 4)
-        self.assertEqual(auto_result['bandwidth_bps'], 2 * fixed_result['bandwidth_bps'])
+        # Both profiles use the same fixed baud rate and have no terminal cap.
+        # Their rate ratio follows bits/symbol, not a hard-coded 16QAM choice.
+        self.assertAlmostEqual(
+            auto_result['bandwidth_bps'] / fixed_result['bandwidth_bps'],
+            math.log2(auto_result['modulation_order']) / math.log2(4),
+        )
         self.assertFalse(fixed.attributes(5000, 0)['link_feasible'])
         self.assertEqual(fixed.attributes(5000, 0)['bandwidth_bps'], 0)
 
