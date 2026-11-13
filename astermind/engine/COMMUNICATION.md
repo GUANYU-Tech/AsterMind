@@ -30,3 +30,75 @@ communication events and allocator statistics. `trace_service=true` additionally
 records each allocation's resource capacities, flow demands and rates, enabling
 conservation audit; this can be large for WideEP. Exact ticks are authoritative.
 The frontend is unchanged and new modes are raw-report only.
+# Global routing configuration
+
+`communication.routing_policy` selects `min_hops`, `min_propagation` (default), or
+`earliest_arrival` for the shared Comm runtime. All Cells and both
+model operators and system transfers use this setting; no per-Cell or per-task
+override is exposed. This chooses physical paths, not request placement.
+The existing priority-queue search and persistent cache are reused, without a
+candidate-path count limit. ISL/GSL budgets remain separate, while their shared
+link, RF pool and terminal resources are allocated in one Comm runtime.
+
+`min_hops` counts only links crossing satellite/ground owners: each ISL or GSL
+counts as one hop, while internal device links and capacity gates count as zero.
+Equal-hop paths retain the existing predicted-arrival tie-breaker.
+`min_propagation` minimizes summed
+propagation delay among routes admitted by the existing temporal feasibility
+checks. The hop metric is adapted from Dynamic-Link's original graph-edge count.
+Both policies still use its heap search
+and per-edge feasibility forecasts, so changing the default alone does not
+guarantee faster simulation. No new allocator-based route trial is introduced.
+
+The global policy also applies to intra-satellite paths. In the DS05 fixture,
+minimum propagation selects a terminal detour rather than the faster SO link;
+this fails the whole H-S topology check and correctly falls back to P2P.
+The H-S model-boundary test gives that optional terminal detour a large delay
+to test the supported SO path independently of the routing default.
+
+## Earliest Arrival: whole-path selection score
+
+For currently usable paths, the score in seconds is:
+
+`sum(propagation_seconds) + payload_bytes * 8 / bottleneck_bps`
+
+Each directed link/device gate uses `capacity_bps / (current_contenders + 1)`.
+RF/shared pools use the same rule with their own contender count. The smallest
+rate along the path is the bottleneck. Taking a minimum does not subtract a
+shared pool twice. Device terminal gates therefore limit the path as well as
+external links. Existing paths that traverse a pool multiple times still have
+their exact resource demand enforced by Comm; this simple route score does not
+solve that coupled allocation problem.
+
+This is a snapshot forecast, not a trial insertion into FlowSim. It cannot
+predict future arrivals or departures, max-min redistribution, or protocol
+overhead. Actual task completion remains owned exclusively by Comm.
+
+The existing sequential-hop feasibility check is retained for contacts,
+capacity schedules, waiting and reservations. If waiting is necessary, its
+explicit waiting time is added to the score. A future-only link uses its first
+service-time capacity when its query-time capacity is zero. This can be
+conservative near contact boundaries and does not guarantee the globally best
+fluid completion time. Comm still requires simultaneous path availability.
+
+The queue retains propagation/wait, bottleneck and feasibility-arrival labels;
+a lower prefix score alone cannot prune a wider-bottleneck alternative.
+For `earliest_arrival`, `transfer(commit=False)` returns the whole-path forecast
+as its first result. Returned leg records retain the sequential feasibility
+times. Legacy `commit=True` calendar reservations retain their sequential
+arrival semantics; production Comm and Scheduler queries use `commit=False`.
+
+## Path cache
+
+- The cache is in-memory and belongs to the running network state. It does not
+  read paths from earlier benchmark files. Forks copy the cache independently.
+- Keys include source, destination, policy, waiting permission, link-kind
+  restrictions and avoided nodes. Capacity is bounded at 16,384 entries.
+- A hit reuses link identities, rechecks transfer feasibility and recalculates
+  timing/score using current loads. It never reuses an old completion timestamp.
+- Traffic changes or a newly available shortcut alone do not trigger rerouting.
+  Cached-path physical changes invalidate the affected entry; failed replay
+  triggers a fresh search. `recompute=True` performs a fresh query without
+  replacing the persistent choice.
+- In-flight FlowSim rate redistribution is independent of route caching.
+  Congestion does not automatically move an active flow to a new path.
