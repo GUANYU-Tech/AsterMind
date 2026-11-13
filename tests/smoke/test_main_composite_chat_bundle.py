@@ -3,23 +3,17 @@ import json
 import unittest
 from pathlib import Path
 
-import sys
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+from astermind.workload import load_workload_bundle
+from astermind.workload.contract import SESSION_REQUEST_KEYS, REGION_KEYS, GATEWAY_KEYS, TIMEBIN_FIELDS, MANIFEST_FILE
 
-from orbitserve.workload import load_workload_bundle
-from orbitserve.workload.contract import (
-    SESSION_REQUEST_KEYS, REGION_KEYS, GATEWAY_KEYS, TIMEBIN_FIELDS,
-    MANIFEST_FILE,
-)
-
-BUNDLES_DIR = Path(__file__).resolve().parents[2] / "src" / "workloads" / "main_composite_chat" / "bundles"
-PATTERNS = ["work_weekday", "work_weekend", "nonwork_weekday", "nonwork_weekend"]
+BUNDLES_DIR = Path(__file__).resolve().parents[1] / "fixtures/workloads"
+PATTERNS = ["coupled_physical"]
 
 
 class BundleFormatTest(unittest.TestCase):
 
     def _bundle_dir(self, pattern: str) -> Path:
-        return BUNDLES_DIR / f"chatgpt_{pattern}"
+        return BUNDLES_DIR / pattern
 
     # ── File count ──────────────────────────────────────────────────
     def test_exactly_six_files(self):
@@ -41,7 +35,7 @@ class BundleFormatTest(unittest.TestCase):
             m = json.loads((d / MANIFEST_FILE).read_text(encoding="utf-8"))
             self.assertEqual(m["schema_version"], "orbitserve.workload")
             self.assertEqual(m["canonicalization"], "orbitserve-json-c14n")
-            self.assertTrue(m["workload_id"].startswith("main_composite_chat_"))
+            self.assertTrue(m["workload_id"].startswith("coupled_physical"))
             self.assertIn("bundle_sha256", m)
             self.assertIn("seed", m)
             self.assertIn("time_horizon_s", m)

@@ -5,15 +5,10 @@ from copy import deepcopy
 from importlib.metadata import PackageNotFoundError, version
 from unittest.mock import patch
 
-from orbitserve.orbit import (
-    SGP4_ENGINE_VERSION,
-    SGP4_REFERENCE_FRAME,
-    Sgp4PropagationError,
-    propagate_sgp4_teme,
-)
-from orbitserve.orbit.sgp4.propagation import _Sgp4Api
+from astermind.builder.orbit import SGP4_ENGINE_VERSION, SGP4_REFERENCE_FRAME, Sgp4PropagationError, propagate_sgp4_teme
+from astermind.builder.orbit.sgp4.propagation import _Sgp4Api
 
-from .test_sgp4_elements import _bundle, _satellite
+from tests.unit.orbit.test_sgp4_elements import _bundle, _satellite
 
 
 def _has_tested_sgp4():
@@ -91,7 +86,7 @@ class Sgp4PropagationTests(unittest.TestCase):
         payload = _bundle()
         payload["satellites"] = [payload["satellites"][0]]
         element = payload["satellites"][0]
-        with patch("orbitserve.orbit.sgp4.propagation._load_sgp4_api", return_value=_fake_api()):
+        with patch('astermind.builder.orbit.sgp4.propagation._load_sgp4_api', return_value=_fake_api()):
             result = propagate_sgp4_teme(
                 payload,
                 simulation_epoch_utc="2026-07-20T00:00:00.000000Z",
@@ -129,7 +124,7 @@ class Sgp4PropagationTests(unittest.TestCase):
         )
         for sample_times, message in invalid:
             with self.subTest(sample_times=sample_times):
-                with patch("orbitserve.orbit.sgp4.propagation._load_sgp4_api") as loader:
+                with patch('astermind.builder.orbit.sgp4.propagation._load_sgp4_api') as loader:
                     with self.assertRaisesRegex((TypeError, ValueError), message):
                         propagate_sgp4_teme(
                             _bundle(),
@@ -141,7 +136,7 @@ class Sgp4PropagationTests(unittest.TestCase):
     def test_any_sample_error_fails_complete_call_with_context(self):
         api = _fake_api()
         _FakeSatrec.sample_error = 6
-        with patch("orbitserve.orbit.sgp4.propagation._load_sgp4_api", return_value=api):
+        with patch('astermind.builder.orbit.sgp4.propagation._load_sgp4_api', return_value=api):
             with self.assertRaises(Sgp4PropagationError) as caught:
                 propagate_sgp4_teme(
                     _bundle(),
@@ -156,7 +151,7 @@ class Sgp4PropagationTests(unittest.TestCase):
     def test_nonfinite_success_payload_fails_with_sample_context(self):
         api = _fake_api()
         _FakeSatrec.return_nonfinite = True
-        with patch("orbitserve.orbit.sgp4.propagation._load_sgp4_api", return_value=api):
+        with patch('astermind.builder.orbit.sgp4.propagation._load_sgp4_api', return_value=api):
             with self.assertRaises(Sgp4PropagationError) as caught:
                 propagate_sgp4_teme(
                     _bundle(),
@@ -173,13 +168,13 @@ class Sgp4PropagationTests(unittest.TestCase):
         first = _bundle()
         second = deepcopy(first)
         second["satellites"].reverse()
-        with patch("orbitserve.orbit.sgp4.propagation._load_sgp4_api", return_value=api):
+        with patch('astermind.builder.orbit.sgp4.propagation._load_sgp4_api', return_value=api):
             left = propagate_sgp4_teme(
                 first,
                 simulation_epoch_utc="2026-07-20T00:00:00.000000Z",
                 sample_times_s=(60.0, 0.0),
             )
-        with patch("orbitserve.orbit.sgp4.propagation._load_sgp4_api", return_value=_fake_api()):
+        with patch('astermind.builder.orbit.sgp4.propagation._load_sgp4_api', return_value=_fake_api()):
             right = propagate_sgp4_teme(
                 second,
                 simulation_epoch_utc="2026-07-20T00:00:00.000000Z",

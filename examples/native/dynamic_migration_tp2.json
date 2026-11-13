@@ -1,0 +1,284 @@
+{
+  "physical": {
+    "cells": [
+      {
+        "id": "cellA",
+        "satellites": [
+          "satA"
+        ]
+      },
+      {
+        "id": "cellB",
+        "satellites": [
+          "satB"
+        ]
+      },
+      {
+        "id": "ground-resources",
+        "satellites": [
+          "ground"
+        ]
+      }
+    ],
+    "satellites": [
+      {
+        "id": "satA"
+      },
+      {
+        "id": "satB"
+      },
+      {
+        "id": "ground"
+      }
+    ],
+    "devices": [
+      {
+        "id": "user",
+        "satellite": "ground",
+        "kind": "terminal",
+        "external_access": true,
+        "max_external_links": 2
+      },
+      {
+        "id": "gpu0",
+        "satellite": "satA",
+        "kind": "gpu"
+      },
+      {
+        "id": "switch0",
+        "satellite": "satA",
+        "kind": "switch",
+        "capacity_gbps": 8
+      },
+      {
+        "id": "isl0",
+        "satellite": "satA",
+        "kind": "terminal",
+        "external_access": true
+      },
+      {
+        "id": "exit0",
+        "satellite": "satA",
+        "kind": "terminal",
+        "external_access": true
+      },
+      {
+        "id": "gpu1",
+        "satellite": "satB",
+        "kind": "gpu"
+      },
+      {
+        "id": "switch1",
+        "satellite": "satB",
+        "kind": "switch",
+        "capacity_gbps": 8
+      },
+      {
+        "id": "isl1",
+        "satellite": "satB",
+        "kind": "terminal",
+        "external_access": true
+      },
+      {
+        "id": "exit1",
+        "satellite": "satB",
+        "kind": "terminal",
+        "external_access": true
+      },
+      {
+        "id": "gpu2",
+        "satellite": "satA",
+        "kind": "gpu"
+      },
+      {
+        "id": "gpu3",
+        "satellite": "satB",
+        "kind": "gpu"
+      }
+    ],
+    "links": [
+      {
+        "id": "local0",
+        "source": "gpu0",
+        "target": "switch0",
+        "bandwidth_gbps": 64
+      },
+      {
+        "id": "to-isl0",
+        "source": "switch0",
+        "target": "isl0",
+        "bandwidth_gbps": 8
+      },
+      {
+        "id": "to-exit0",
+        "source": "switch0",
+        "target": "exit0",
+        "bandwidth_gbps": 8
+      },
+      {
+        "id": "local1",
+        "source": "gpu1",
+        "target": "switch1",
+        "bandwidth_gbps": 64
+      },
+      {
+        "id": "to-isl1",
+        "source": "switch1",
+        "target": "isl1",
+        "bandwidth_gbps": 8
+      },
+      {
+        "id": "to-exit1",
+        "source": "switch1",
+        "target": "exit1",
+        "bandwidth_gbps": 8
+      },
+      {
+        "id": "isl",
+        "source": "isl0",
+        "target": "isl1",
+        "bandwidth_gbps": 8,
+        "latency_ns": 2000
+      },
+      {
+        "id": "ground0",
+        "source": "user",
+        "target": "exit0",
+        "bandwidth_gbps": 1,
+        "latency_ns": 10000
+      },
+      {
+        "id": "ground1",
+        "source": "user",
+        "target": "exit1",
+        "bandwidth_gbps": 1,
+        "latency_ns": 10000
+      },
+      {
+        "id": "local2",
+        "source": "gpu2",
+        "target": "switch0",
+        "bandwidth_gbps": 64
+      },
+      {
+        "id": "local3",
+        "source": "gpu3",
+        "target": "switch1",
+        "bandwidth_gbps": 64
+      }
+    ]
+  },
+  "ground_owners": [
+    "ground"
+  ],
+  "cells": [
+    {
+      "id": "cellA",
+      "placements": [
+        {
+          "rank": 0,
+          "device": "gpu0"
+        },
+        {
+          "rank": 1,
+          "device": "gpu2"
+        }
+      ],
+      "ingress_device": "gpu0",
+      "output_device": "gpu0",
+      "external_terminals": [
+        "exit0",
+        "isl0"
+      ],
+      "max_batched_tokens": 16,
+      "prefix_caching": true,
+      "parallel": {
+        "tp": 2
+      }
+    },
+    {
+      "id": "cellB",
+      "placements": [
+        {
+          "rank": 0,
+          "device": "gpu1"
+        },
+        {
+          "rank": 1,
+          "device": "gpu3"
+        }
+      ],
+      "ingress_device": "gpu1",
+      "output_device": "gpu1",
+      "external_terminals": [
+        "exit1",
+        "isl1"
+      ],
+      "max_batched_tokens": 16,
+      "prefix_caching": true,
+      "parallel": {
+        "tp": 2
+      }
+    }
+  ],
+  "requests": [
+    {
+      "id": "context0",
+      "cell": "cellA",
+      "arrival_ns": 0,
+      "user_device": "user",
+      "input_tokens": 32,
+      "output_tokens": 2,
+      "input_bytes": 128,
+      "session_id": "session",
+      "context_id": "c0"
+    },
+    {
+      "id": "context1",
+      "cell": "cellB",
+      "arrival_ns": 4000000000,
+      "user_device": "user",
+      "input_tokens": 48,
+      "output_tokens": 2,
+      "input_bytes": 64,
+      "session_id": "session",
+      "context_id": "c1",
+      "parent_context_id": "c0",
+      "prefix_hit_tokens": 32
+    }
+  ],
+  "satellite_roles": {
+    "satA": "mixed",
+    "satB": "mixed"
+  },
+  "horizon_ns": 10000000000,
+  "migrations": [
+    {
+      "id": "copy0",
+      "after_request": "context0",
+      "source_cell": "cellA",
+      "target_cell": "cellB",
+      "session_id": "session",
+      "context_id": "c0",
+      "mode": "move"
+    }
+  ],
+  "schema_version": "orbitserve.native_cells.v1",
+  "physical_network": "dynamic_physics.json",
+  "runtime_network": {
+    "fault_timing": "continuous",
+    "faults": [
+      {
+        "target_type": "link",
+        "target_id": "communication_isl:satA:satB",
+        "start_s": 0.25,
+        "end_s": 0.5
+      }
+    ]
+  },
+  "compute_mode": "midlayer",
+  "communication": {
+    "intra_mode": "IntraSatelliteRoofline",
+    "retry_limit": 8
+  }
+}

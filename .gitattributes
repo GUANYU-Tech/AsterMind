@@ -4,3 +4,14 @@
 src/workloads/**/*.json   text eol=lf
 src/workloads/**/*.jsonl  text eol=lf
 src/workloads/**/*.csv    text eol=lf
+
+# Canonical example/test bundle hashes use their exact LF bytes too.
+tests/fixtures/workloads/** text eol=lf
+examples/workloads/trace_examples/** text eol=lf
+
+# Pinned Orbit reference data hashes require canonical LF bytes on every host.
+src/orbitserve/orbit/data/iers/** -text
+src/orbitserve/orbit/data/stk_validation/*.json text eol=lf
+
+# Preserve whitespace markers in the colleague's recorded upstream patch.
+network_sim/docs/vendor_changes.patch -whitespace

@@ -1,19 +1,7 @@
 import unittest
 
-from orbitserve.orbit import (
-    propagate_sgp4_teme,
-    transform_sgp4_teme_to_itrs,
-)
-from orbitserve.orbit.validation import (
-    STK_11_BASELINE_BUILD,
-    STK_11_BASELINE_VERSION,
-    STK_STATE_CORPUS_CASE_IDS,
-    StkDirectStateCapture,
-    StkEnvironmentError,
-    StkStateSample,
-    load_stk_state_corpus,
-    run_stk_state_corpus,
-)
+from astermind.builder.orbit import propagate_sgp4_teme, transform_sgp4_teme_to_itrs
+from astermind.builder.orbit.validation import STK_11_BASELINE_BUILD, STK_11_BASELINE_VERSION, STK_STATE_CORPUS_CASE_IDS, StkDirectStateCapture, StkEnvironmentError, StkStateSample, load_stk_state_corpus, run_stk_state_corpus
 
 
 def _matching_capture(

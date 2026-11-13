@@ -7,13 +7,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import orbitserve.orbit as orbit
-from orbitserve.orbit import (
-    ORBIT_TRACE_SCHEMA,
-    ORBIT_TRACE_SCOPE,
-    load_orbit_trace,
-    write_orbit_trace,
-)
+import astermind.builder.orbit as orbit
+from astermind.builder.orbit import ORBIT_TRACE_SCHEMA, ORBIT_TRACE_SCOPE, load_orbit_trace, write_orbit_trace
 
 
 def _inputs(reverse=False):
@@ -187,7 +182,7 @@ class OrbitTraceTests(unittest.TestCase):
         script = """
 import json, sys
 from pathlib import Path
-from orbitserve.orbit import write_orbit_trace
+from astermind.builder.orbit import write_orbit_trace
 data = json.loads(sys.argv[2])
 write_orbit_trace(Path(sys.argv[1]), **data)
 """

@@ -1,0 +1,78 @@
+{
+  "artifact_type": "gemm_launch_selection",
+  "boolean_encoding": "lowercase_true_false",
+  "capture_baseline_commit": "a2aca5108c489d61642af7360ef307f88152e8d9",
+  "compression": "zstd",
+  "csv_compressed_sha256": "05b8aa96b455b94cec45b55e66432e523a34655faf1af722848cc466f6462cc8",
+  "csv_sha256": "3c62edefb46c14fa32c9c27573698514256dff10a4899d00a027bd9228d780e7",
+  "domain_sha256": "8a935c5226fc5b719fac1ab0e8dd78df130b9deeaa0725c9c936e5eeb9d14bee",
+  "duration_consumed": false,
+  "evidence_sha256": "f72adef9e700ffcbc81372828a64da967efcbbcdc978ffc1cb9c4ebfe5328acd",
+  "evidence_sources": [
+    {
+      "kind": "expanded_evidence",
+      "sha256": "f72adef9e700ffcbc81372828a64da967efcbbcdc978ffc1cb9c4ebfe5328acd"
+    },
+    {
+      "kind": "capture_candidate",
+      "sha256": "63b2283fe3aefd3b830916b36bad66699343125e679e7abf4608ef9b3ec9de46"
+    }
+  ],
+  "generated_by": "scripts/launch_data/metax_c500_launch_generator.py",
+  "hardware_id": "metax_c500",
+  "hardware_revision": {
+    "config_path": "configs/hardware/metax_c500.yaml",
+    "launch_contract": {
+      "cache_capacity_bytes": {
+        "l1_cache": 32768,
+        "l2_cache": 8388608
+      },
+      "hardware_id": "metax_c500",
+      "scheduling": {
+        "max_blocks_per_unit": 32,
+        "max_regs_per_unit": 131072,
+        "max_smem_per_block_bytes": 65536,
+        "max_smem_per_unit_bytes": 65536,
+        "max_threads_per_unit": 2048,
+        "max_warps_per_unit": 32,
+        "num_compute_units": 104,
+        "parallel_unit": "warp",
+        "parallel_width": 64
+      },
+      "schema_version": 1
+    },
+    "launch_contract_sha256": "9ab414aa9be98625ce91ce3320e19d5de46da1f62238c1067e5330b2d5c3ddc3"
+  },
+  "launch_fields": [
+    "tile_m",
+    "tile_n",
+    "tile_k",
+    "pipeline_depth",
+    "split_k",
+    "reduction"
+  ],
+  "null_encoding": "empty_string",
+  "row_count": 140544,
+  "schema_version": 2,
+  "selection_key_fields": [
+    "dtype",
+    "variant",
+    "b",
+    "m",
+    "n",
+    "k",
+    "a_layout",
+    "b_layout",
+    "c_layout",
+    "trans_a",
+    "trans_b",
+    "epilogue",
+    "has_bias"
+  ],
+  "semantic_context_fields": [
+    "position",
+    "tensor_parallel_size",
+    "expert_parallel_size"
+  ],
+  "software_revision": "maca_3.7.2_mcblas_10"
+}

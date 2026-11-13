@@ -1,23 +1,8 @@
 import unittest
 from copy import deepcopy
 
-from orbitserve.orbit import SGP4_ELEMENT_BUNDLE_SCHEMA, Sgp4ElementBundle
-from orbitserve.orbit.validation import (
-    STK_11_BASELINE_BUILD,
-    STK_11_BASELINE_VERSION,
-    StkCommandError,
-    StkConnectClient,
-    StkConnectError,
-    StkConnectResponse,
-    StkEnvironmentError,
-    StkMappingError,
-    StkValidationError,
-    build_stk_set_state_command,
-    capture_stk_direct_states,
-    format_stk_utcg,
-    parse_stk_state_report,
-    probe_stk_11_connect,
-)
+from astermind.builder.orbit import SGP4_ELEMENT_BUNDLE_SCHEMA, Sgp4ElementBundle
+from astermind.builder.orbit.validation import STK_11_BASELINE_BUILD, STK_11_BASELINE_VERSION, StkCommandError, StkConnectClient, StkConnectError, StkConnectResponse, StkEnvironmentError, StkMappingError, StkValidationError, build_stk_set_state_command, capture_stk_direct_states, format_stk_utcg, parse_stk_state_report, probe_stk_11_connect
 
 
 def _satellite(satellite_id="sat-00001", satnum=10001):

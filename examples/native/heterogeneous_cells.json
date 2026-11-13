@@ -1,0 +1,226 @@
+{
+  "physical": {
+    "cells": [
+      {
+        "id": "cellA",
+        "satellites": [
+          "satA"
+        ]
+      },
+      {
+        "id": "cellB",
+        "satellites": [
+          "satB"
+        ]
+      },
+      {
+        "id": "ground-resources",
+        "satellites": [
+          "ground"
+        ]
+      }
+    ],
+    "satellites": [
+      {
+        "id": "satA"
+      },
+      {
+        "id": "satB"
+      },
+      {
+        "id": "ground"
+      }
+    ],
+    "devices": [
+      {
+        "id": "user",
+        "satellite": "ground",
+        "kind": "terminal",
+        "external_access": true,
+        "max_external_links": 2
+      },
+      {
+        "id": "gpu0",
+        "satellite": "satA",
+        "kind": "gpu"
+      },
+      {
+        "id": "switch0",
+        "satellite": "satA",
+        "kind": "switch",
+        "capacity_gbps": 8
+      },
+      {
+        "id": "isl0",
+        "satellite": "satA",
+        "kind": "terminal",
+        "external_access": true
+      },
+      {
+        "id": "exit0",
+        "satellite": "satA",
+        "kind": "terminal",
+        "external_access": true
+      },
+      {
+        "id": "gpu1",
+        "satellite": "satB",
+        "kind": "gpu"
+      },
+      {
+        "id": "switch1",
+        "satellite": "satB",
+        "kind": "switch",
+        "capacity_gbps": 8
+      },
+      {
+        "id": "isl1",
+        "satellite": "satB",
+        "kind": "terminal",
+        "external_access": true
+      },
+      {
+        "id": "exit1",
+        "satellite": "satB",
+        "kind": "terminal",
+        "external_access": true
+      }
+    ],
+    "links": [
+      {
+        "id": "local0",
+        "source": "gpu0",
+        "target": "switch0",
+        "bandwidth_gbps": 64
+      },
+      {
+        "id": "to-isl0",
+        "source": "switch0",
+        "target": "isl0",
+        "bandwidth_gbps": 8
+      },
+      {
+        "id": "to-exit0",
+        "source": "switch0",
+        "target": "exit0",
+        "bandwidth_gbps": 8
+      },
+      {
+        "id": "local1",
+        "source": "gpu1",
+        "target": "switch1",
+        "bandwidth_gbps": 64
+      },
+      {
+        "id": "to-isl1",
+        "source": "switch1",
+        "target": "isl1",
+        "bandwidth_gbps": 8
+      },
+      {
+        "id": "to-exit1",
+        "source": "switch1",
+        "target": "exit1",
+        "bandwidth_gbps": 8
+      },
+      {
+        "id": "isl",
+        "source": "isl0",
+        "target": "isl1",
+        "bandwidth_gbps": 8,
+        "latency_ns": 2000
+      },
+      {
+        "id": "ground0",
+        "source": "user",
+        "target": "exit0",
+        "bandwidth_gbps": 1,
+        "latency_ns": 10000
+      },
+      {
+        "id": "ground1",
+        "source": "user",
+        "target": "exit1",
+        "bandwidth_gbps": 1,
+        "latency_ns": 10000
+      }
+    ]
+  },
+  "ground_owners": [
+    "ground"
+  ],
+  "cells": [
+    {
+      "id": "cellA",
+      "placements": [
+        {
+          "rank": 0,
+          "device": "gpu0"
+        }
+      ],
+      "ingress_device": "gpu0",
+      "output_device": "gpu0",
+      "external_terminals": [
+        "exit0",
+        "isl0"
+      ],
+      "max_batched_tokens": 16
+    },
+    {
+      "id": "cellB",
+      "placements": [
+        {
+          "rank": 0,
+          "device": "gpu1"
+        }
+      ],
+      "ingress_device": "gpu1",
+      "output_device": "gpu1",
+      "external_terminals": [
+        "exit1",
+        "isl1"
+      ],
+      "max_batched_tokens": 16,
+      "hardware": "configs/hardware/metax_c500.yaml",
+      "hardware_id": "metax_c500"
+    }
+  ],
+  "requests": [
+    {
+      "id": "r0",
+      "arrival_ns": 0,
+      "user_device": "user",
+      "input_tokens": 16,
+      "output_tokens": 2,
+      "input_bytes": 200000,
+      "output_bytes_per_token": 10000
+    },
+    {
+      "id": "r1",
+      "arrival_ns": 0,
+      "user_device": "user",
+      "input_tokens": 32,
+      "output_tokens": 2,
+      "input_bytes": 200000,
+      "output_bytes_per_token": 10000
+    },
+    {
+      "id": "r2",
+      "arrival_ns": 2000000,
+      "user_device": "user",
+      "input_tokens": 24,
+      "output_tokens": 2,
+      "input_bytes": 200000,
+      "output_bytes_per_token": 10000
+    }
+  ],
+  "satellite_roles": {
+    "satA": "mixed",
+    "satB": "mixed"
+  },
+  "horizon_ns": 1000000000,
+  "compute_mode": "midlayer",
+  "communication": {
+    "intra_mode": "IntraSatelliteRoofline"
+  }
+}

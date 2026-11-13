@@ -4,28 +4,12 @@ import unittest
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
-from orbitserve.orbit import (
-    ASTROPY_ENGINE_VERSION,
-    ORBIT_TRACE_SCOPE,
-    SGP4_ENGINE_VERSION,
-    SGP4_ORBIT_TRACE_MODEL,
-    WGS84_SEMI_MAJOR_AXIS_KM,
-    Sgp4EarthFixedResult,
-    Sgp4ElementBundle,
-    Sgp4ItrsSample,
-    Sgp4PropagationResult,
-    Sgp4SunPositionResult,
-    Sgp4SunPositionSample,
-    Sgp4TemeSample,
-    evaluate_sgp4_geometry,
-    generate_orbit_trace,
-    load_orbit_trace,
-    write_sgp4_orbit_trace,
-)
+from astermind.builder.orbit import ASTROPY_ENGINE_VERSION, ORBIT_TRACE_SCOPE, SGP4_ENGINE_VERSION, SGP4_ORBIT_TRACE_MODEL, WGS84_SEMI_MAJOR_AXIS_KM, Sgp4EarthFixedResult, Sgp4ElementBundle, Sgp4ItrsSample, Sgp4PropagationResult, Sgp4SunPositionResult, Sgp4SunPositionSample, Sgp4TemeSample, evaluate_sgp4_geometry, generate_orbit_trace, load_orbit_trace, write_sgp4_orbit_trace
 
-from .test_sgp4_elements import _bundle
-from .test_sgp4_geometry import _has_version
+from tests.unit.orbit.test_sgp4_elements import _bundle
+from tests.unit.orbit.test_sgp4_geometry import _has_version
 
 
 def _pipeline_inputs(times=(0.0, 60.0)):
@@ -67,8 +51,7 @@ def _pipeline_inputs(times=(0.0, 60.0)):
         element_set_id=elements.element_set_id,
         simulation_epoch_utc=propagation.simulation_epoch_utc,
         samples=tuple(
-            Sgp4SunPositionSample(time_s, (149_600_000.0, 0.0, 0.0))
-            for time_s in times
+            Sgp4SunPositionSample(time_s, (149_600_000.0, 0.0, 0.0)) for time_s in times
         ),
         iers_a_sha256=earth_fixed.iers_a_sha256,
         iers_readme_sha256=earth_fixed.iers_readme_sha256,
@@ -178,7 +161,7 @@ class Sgp4OrbitTraceTests(unittest.TestCase):
         self.assertEqual(first_files, second_files)
         self.assertEqual(
             hashlib.sha256(first_files["trace_manifest.json"]).hexdigest(),
-            "cc65be31de4a323efe1b857402144b3008c612d4b5ca6878c2b4a55ae6338ced",
+            "8518bc2af62efb317a3fd5656ef45b689e1b09b9b817db4083207338bb47733f",
         )
 
     def test_synthetic_and_predictive_status_are_explicit_warnings(self):
@@ -196,7 +179,7 @@ class Sgp4OrbitTraceTests(unittest.TestCase):
         self.assertTrue(manifest.valid_for_paper_main_results)
         self.assertIn("synthetic", warning_text)
         self.assertIn("predictive", warning_text)
-        self.assertIn("not yet consumed", warning_text)
+        self.assertNotIn("not yet consumed", warning_text)
 
     def test_alignment_and_uniform_grid_fail_before_writing(self):
         elements, propagation, earth_fixed, geometry = _pipeline_inputs()
@@ -285,22 +268,117 @@ class Sgp4OrbitTraceTests(unittest.TestCase):
         self.assertEqual(loaded.trace_model, SGP4_ORBIT_TRACE_MODEL)
 
     def test_generate_orbit_trace_rejects_invalid_gateway_contract(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with self.assertRaisesRegex(ValueError, "missing required fields"):
-                generate_orbit_trace(
-                    Path(tmpdir) / "trace",
-                    elements=_bundle(),
-                    simulation_epoch_utc="2026-07-20T00:00:00.000000Z",
-                    sample_times_s=(0.0, 60.0),
-                    ground_ingresses=(
-                        {
-                            "ingress_id": "equator",
-                            "lat_deg": 0.0,
-                        },
-                    ),
-                    isl_pairs=(),
-                )
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            self.assertRaisesRegex(ValueError, "missing required fields"),
+        ):
+            generate_orbit_trace(
+                Path(tmpdir) / "trace",
+                elements=_bundle(),
+                simulation_epoch_utc="2026-07-20T00:00:00.000000Z",
+                sample_times_s=(0.0, 60.0),
+                ground_ingresses=(
+                    {
+                        "ingress_id": "equator",
+                        "lat_deg": 0.0,
+                    },
+                ),
+                isl_pairs=(),
+            )
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SampleHoldWindowsTests(unittest.TestCase):
+    def test_sampled_window_transition_uses_observed_boundary_without_interpolation(
+        self,
+    ):
+        from astermind.builder.orbit.sgp4.geometry import _state_windows
+
+        samples = (
+            (0.0, False, -1.0),
+            (1.0, True, 3.0),
+            (2.0, True, 1.0),
+            (3.0, False, -1.0),
+        )
+        self.assertEqual(
+            _state_windows(samples, sample_hold=True),
+            ((0.0, 1.0, False), (1.0, 3.0, True)),
+        )
+
+
+class BatchedTraceTests(unittest.TestCase):
+    def test_parallel_memory_handoff_matches_verified_files_without_batch_reads(self):
+        times = tuple(float(t) for t in range(122))
+        with tempfile.TemporaryDirectory() as folder:
+            handoff, timings = [], {}
+            with patch('astermind.builder.orbit.trace.load_orbit_trace', side_effect=AssertionError('intermediate trace read')):
+                generate_orbit_trace(Path(folder)/'parallel', elements=_bundle(),
+                    simulation_epoch_utc='2026-07-20T00:00:00.000000Z',
+                    sample_times_s=times, ground_ingresses=(),
+                    isl_pairs=(('sat-00001', 'sat-00002'),), workers=2,
+                    _bundle_sink=handoff, _timings=timings)
+            loaded = load_orbit_trace(Path(folder)/'parallel/trace_manifest.json')
+            self.assertEqual(handoff, [loaded])
+            self.assertGreater(timings['position_s'], 0.)
+            self.assertGreater(timings['candidate_geometry_s'], 0.)
+            generate_orbit_trace(Path(folder)/'serial', elements=_bundle(),
+                simulation_epoch_utc='2026-07-20T00:00:00.000000Z',
+                sample_times_s=times, ground_ingresses=(),
+                isl_pairs=(('sat-00001', 'sat-00002'),), workers=1)
+            serial = load_orbit_trace(Path(folder)/'serial/trace_manifest.json')
+            self.assertEqual(loaded.trace_id, serial.trace_id)
+            self.assertEqual(loaded.ephemeris_samples, serial.ephemeris_samples)
+            self.assertEqual(loaded.isl_windows, serial.isl_windows)
+            self.assertEqual(loaded.sunlight_windows, serial.sunlight_windows)
+
+    def test_time_batches_preserve_states_and_merge_windows_without_boundary_duplicates(
+        self,
+    ):
+        from astermind.builder.orbit.sgp4.elements import load_sgp4_element_bundle
+        from astermind.builder.orbit.sgp4.trace import _state_partition
+
+        bundle = load_sgp4_element_bundle(_bundle())
+        times = tuple(float(t) for t in range(122))
+        epoch = "2026-07-20T00:00:00.000000Z"
+        with tempfile.TemporaryDirectory() as folder:
+            chunked = generate_orbit_trace(
+                Path(folder) / "chunked",
+                elements=bundle,
+                simulation_epoch_utc=epoch,
+                sample_times_s=times,
+                ground_ingresses=(),
+                isl_pairs=(
+                    (
+                        bundle.satellites[0].satellite_id,
+                        bundle.satellites[1].satellite_id,
+                    ),
+                ),
+                workers=1,
+            )
+            propagation, fixed = _state_partition((bundle, epoch, times))
+            from astermind.builder.orbit import evaluate_sgp4_geometry
+
+            geometry = evaluate_sgp4_geometry(
+                fixed,
+                ground_ingresses=(),
+                isl_pairs=(
+                    (
+                        bundle.satellites[0].satellite_id,
+                        bundle.satellites[1].satellite_id,
+                    ),
+                ),
+                sample_hold=True,
+            )
+            whole = write_sgp4_orbit_trace(
+                Path(folder) / "whole",
+                elements=bundle,
+                propagation=propagation,
+                earth_fixed=fixed,
+                geometry=geometry,
+                sample_hold=True,
+            )
+            self.assertEqual(chunked.trace_id, whole.trace_id)
+            self.assertEqual(chunked.provenance["precompute"]["time_batches"], 2)

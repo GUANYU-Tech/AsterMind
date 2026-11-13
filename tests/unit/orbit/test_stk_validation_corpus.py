@@ -7,13 +7,8 @@ from copy import deepcopy
 from importlib.resources import files
 from pathlib import Path
 
-from orbitserve.orbit import propagate_sgp4_teme
-from orbitserve.orbit.validation import (
-    STK_STATE_CORPUS_CASE_IDS,
-    STK_STATE_CORPUS_REQUIRED_COVERAGE,
-    STK_STATE_CORPUS_SHA256,
-    load_stk_state_corpus,
-)
+from astermind.builder.orbit import propagate_sgp4_teme
+from astermind.builder.orbit.validation import STK_STATE_CORPUS_CASE_IDS, STK_STATE_CORPUS_REQUIRED_COVERAGE, STK_STATE_CORPUS_SHA256, load_stk_state_corpus
 
 
 def _write_json(path, payload):
@@ -42,7 +37,7 @@ class StkStateCorpusTests(unittest.TestCase):
         self.assertEqual(len({case.element_set_id for case in corpus.cases}), 4)
 
     def test_packaged_resource_matches_pinned_hash(self):
-        resource = files("orbitserve.orbit").joinpath(
+        resource = files('astermind.builder.orbit').joinpath(
             "data",
             "stk_validation",
             "state_corpus.json",
@@ -84,7 +79,7 @@ class StkStateCorpusTests(unittest.TestCase):
 
     def test_hash_mismatch_and_unqualified_custom_source_fail_closed(self):
         default_path = Path(
-            files("orbitserve.orbit").joinpath(
+            files('astermind.builder.orbit').joinpath(
                 "data",
                 "stk_validation",
                 "state_corpus.json",
@@ -104,7 +99,7 @@ class StkStateCorpusTests(unittest.TestCase):
 
     def test_invalid_coverage_claim_and_case_order_fail_closed(self):
         default_path = Path(
-            files("orbitserve.orbit").joinpath(
+            files('astermind.builder.orbit').joinpath(
                 "data",
                 "stk_validation",
                 "state_corpus.json",

@@ -1,0 +1,158 @@
+hardware_id: groq_lpu
+# ============================================================
+# Groq LPU Hardware Spec — Tensor Streaming Processor (TSP)
+# ============================================================
+# 来源: "Think Fast: A Tensor Streaming Processor (TSP) for Accelerating
+#        Deep Learning Workloads" (Abts et al., Groq Inc., ISCA 2020).
+# Mark-1 14nm: 4×320×320 MXM (409,600 MAC/cyc INT8 @900MHz),
+# 220MB on-chip SRAM (no DRAM, no cache — deterministic design).
+# latency groundtruth: Timeloop (cycle-accurate) + 20-cycle pipeline fill
+# (20-tile staggered SIMD depth). SRAM capacity check: cases >220MB skipped
+# (single-LPU can't run without host swap, which the LPU design avoids).
+# ============================================================
+clock_domains:
+  tile: 900000000
+  dram: 900000000
+
+components:
+  - name: lpu_core
+    count: 1
+    clock_domain: tile
+    children:
+      - name: mac_mesh
+        role: compute_tensor
+        scope: shared
+        count: 1
+        type: compute
+        primary_variant: int8
+        variants:
+          - name: int8
+            throughput_per_clk: 819200   # 4x320x320 = 409600 INT8 MAC/cyc = 819200 FLOP/cyc
+          - name: fp16
+            throughput_per_clk: 104444   # 1/4 INT8 (ISCA 2020)
+      - name: scalar_pipe
+        role: compute_fma
+        scope: shared
+        count: 1
+        type: compute
+        throughput_per_clk: 5120         # 320 lanes × 16 VXM ALUs
+      - name: sfu_pipe
+        role: compute_sfu
+        scope: shared
+        count: 1
+        type: compute
+        throughput_per_clk: 320
+      - name: alu_pipe
+        role: compute_alu
+        scope: shared
+        count: 1
+        type: compute
+        throughput_per_clk: 5120
+      - name: scratchpad               # 220MB SRAM
+        role: smem
+        scope: shared
+        count: 1
+        type: memory
+        throughput_per_clk: 61111      # 55 TiB/s @ 900MHz ≈ 61111 B/cyc
+        traffic_filter: null
+      - name: l1_cache
+        role: l1_cache
+        scope: shared
+        count: 1
+        type: memory
+        throughput_per_clk: 61111
+        traffic_filter: null
+
+  - name: dram
+    role: dram
+    scope: shared
+    clock_domain: dram
+    count: 1
+    type: memory
+    throughput_per_clk: 61111          # SRAM BW 55 TiB/s (in-SRAM compute, not C2C)
+    traffic_filter: page_conflict
+    size_bytes: 230686720              # 220MB SRAM
+    num_partitions: 176
+
+  - name: l2
+    role: l2_cache
+    scope: shared
+    clock_domain: tile
+    count: 1
+    type: memory
+    throughput_per_clk: 1500
+    traffic_filter: lru
+    size_bytes: 8388608
+    num_partitions: 16
+
+  - name: xbar
+    role: xbar
+    scope: shared
+    clock_domain: tile
+    count: 1
+    type: memory
+    throughput_per_clk: 2000
+    traffic_filter: null
+
+resource_groups:
+  - name: tensor_pipe
+    members: [mac_mesh_int8]
+  - name: fma_sfu_pipe
+    members: [scalar_pipe, sfu_pipe]
+  - name: alu_pipe
+    members: [alu_pipe]
+  - name: smem
+    members: [scratchpad]
+  - name: l1_cache
+    members: [l1_cache]
+  - name: xbar
+    members: [xbar]
+  - name: l2
+    members: [l2]
+  - name: dram
+    members: [dram]
+
+memory_subsystem:
+  dram_latency_ns: 20.0
+  l2_latency_ns: 0
+  cacheline_bytes: 64
+  l2_conflict_efficiency_moe: 0.9
+  dram_protocol_efficiency: 0.95
+  dram_protocol_efficiency_l1cached: 1.0
+  profiler_per_kernel_traffic_reliable: true
+  systolic_dma_bus_bpc: 61111          # SRAM BW 55 TiB/s @ 900MHz (in-SRAM compute, not C2C)
+  dtype_bytes: 1                  # INT8 (ISCA 2020)
+  pipeline_fill: 20                     # 20-tile staggered SIMD depth (ISCA 2020)
+  memcpy_dtod_floor_ns: null
+
+scheduling:
+  parallel_unit: thread
+  parallel_width: 1
+  num_compute_units: 1
+  max_warps_per_unit: 1
+  max_blocks_per_unit: 1
+  max_regs_per_unit: 128
+  max_smem_per_unit_bytes: 230686720    # 220MB
+  max_smem_per_block_bytes: 230686720
+  max_threads_per_unit: 1
+  dispatch_overhead_ns: 0    # LPU deterministic, no launch overhead
+  model_clock_domain: tile
+  dram_clock_domain: dram
+
+interconnect:
+  nvlink_unidir_bw_GB_s: null
+  nvlink_signal_latency_ns: null
+  nccl_alpha_ns: null
+  pcie_bw_GB_s: null
+  pcie_latency_ns: null
+  infiniband_unidir_bw_GB_s: null
+
+features:
+  kernel_memory_model: systolic_scratchpad
+  kernel_dtype: int8
+  l1_cache_enabled: false
+  cluster_supported: false
+  cluster_size: 0
+  multicast_supported: false
+  hw_decompression: false
+  compression_ratio: 1.0

@@ -1,42 +1,61 @@
 # OrbitServe
 
-OrbitServe is a simulation platform for LEO compute constellations serving global terrestrial AI inference demand. It studies two-timescale cost-SLO co-design across construction-time design-space exploration and runtime scheduling.
+OrbitServe is a simulation platform for LEO compute constellations serving global terrestrial AI inference demand. Each run evaluates one fixed SimulationConfig with globally selected Midlayer or Roofline computation and physical communication. DSE and the former Analytical request engine are removed.
 
 ## Repository Layout
 
 ```text
-src/orbitserve/              Core simulation engine
-  architecture/              Identical per-satellite hardware, static energy sizing, and cost parameters
-  orbit/                     Constellation geometry, orbital motion, visibility, sunlight, and traces
-  workload/                  Canonical workload contracts, validation, loading, and materialization
-  serving/                   Model deployment, prefill/decode, KV capacity, and throughput estimation
-  runtime/                   Routing, queues, scheduling, KV state, SOC, and request-level execution
-  common/                    Policy-free metric DTOs and serialization
-src/experiments/             Manifests, cross-module orchestration, fixed-design evaluation, and output
-src/dse/                     Design enumeration, runtime matrix, static SLO proxy, and frontier analysis
-src/baselines/ground/        Terrestrial serving baselines
-src/workloads/wildchat/      WildChat conversion tools with optional dependencies
-examples/                    Versioned, user-facing input examples
-tests/                       Unit, integration, smoke, and slow regression suites
+astermind/
+  builder/      Configuration, scene editing/validation and physical preparation
+    config/     Scenario, resources, deployment, requests, network and communication
+    orbit/      SGP4 propagation, frame conversion, visibility, sunlight and traces
+    topology/   Device/Cell graph validation and native topology compilation
+    physical/   Physical datasets, precomputation, loading and exports
+  engine/       Simulation, clocks, transport, routing, faults, Cell/KV execution
+    compute/    Pinned upstream compute snapshot and official vLLM Scheduler adapters
+    comm/       Pinned upstream communication models and shared flow allocator
+    policies/   Request scheduling/admission, routing, connection and association
+    setup/      Live physical network construction, faults and runtime resource setup
+    state/      Live network state, physical data access and caches
+  workload/     Canonical workload contracts, loading and materialization
+  experiments/  Native and physical CLI entry points
+  common/       Shared contracts, serialization and external-dependency bootstrap
+workloads/      Dataset adapters and source profiles
+examples/       User-facing inputs; Native scenarios are in examples/native/
+tests/          Unit, integration, smoke, Native, browser and distribution tests
+viz/            Static replay frontend and export.py
 ```
 
+Builder owns configuration and physical preparation. Engine owns simulation
+execution and mutable runtime state. Existing topology construction, physical
+sampling, fault handling and dynamic link updates keep their original timing.
+Builder prepares physical inputs; `engine/setup/physical_runtime.py` creates
+live network state. The existing physical loader remains a compatibility entry
+that composes both steps, and scene capability validation may still instantiate
+Engine objects. Neither replaces the Native simulation entry point.
+
+
 See `CHANGELOG.md` for release history.
+
+Development changes are reviewed through a pull request to `develop`. Keep
+validation results, affected interfaces and a rollback procedure in the PR;
+merging requires the repository's CI and maintainer review.
 
 ## Execution Path
 
 ```text
-orbitserve.experiments.cli
-  -> load ExperimentSpec
-  -> load and materialize a canonical workload bundle
-  -> evaluate_materialized_design
-  -> Architecture + Orbit + Serving
-  -> build RuntimeSimulationSpec, including Serving rate tables and energy profile
-  -> run one deterministic RuntimeStrategySpec with concurrency-slot reservations
-  -> optional DSE runtime-matrix search
-  -> structured output
+astermind.experiments.cli
+  -> SimulationConfig.load
+  -> Simulation
+  -> physical_network preparation OR verified physical_dataset reuse
+  -> explicit device topology and Cell placements
+  -> Midlayer/Roofline + vLLM scheduling + shared Comm events
+  -> Native requests, metrics, provenance and audit
 ```
 
-Fixed-design evaluation and DSE candidates share `evaluate_materialized_design()`. Architecture does not infer hardware from workload demand. Orbit produces geometrically visible candidates. Runtime selects the active graph under Architecture terminal limits.
+Both CLI entry points execute this same fixed-design path. Compute fields and
+execution settings come from SimulationConfig. There is no legacy manifest
+conversion or performance-table interpolation. Native energy is not evaluated.
 
 ## Installation
 
@@ -44,74 +63,534 @@ Fixed-design evaluation and DSE candidates share `evaluate_materialized_design()
 python3 -m pip install -e .
 ```
 
+The physical orbit engine pins Astropy 6.1.3 and NumPy 2.2.6 in the package
+dependencies. Keep these versions together; newer NumPy releases remove APIs
+used by this Astropy version. Installing the package applies both pins.
+
 WildChat dependencies such as `pyarrow` and `transformers` are optional and are not required by the core package.
 
 ## Workload Contract
 
-The core engine accepts one canonical seven-file workload bundle:
+The independent workload tools retain a canonical six-file bundle:
 
 ```text
 workload_manifest.json
 regions.json
 gateways.json
-requests.jsonl
-sessions.jsonl
+session_requests.jsonl
 timebin_demand.csv
 workload_summary.json
 ```
 
-Dataset-specific inputs must first be converted under `src/workloads/<dataset>/`. Experiment manifests then reference the generated bundle through `workload.bundle_dir`. The core package does not retain legacy workload readers.
+Dataset-specific adapters live under `workloads/<dataset>/`. Native simulations take explicit `SimulationConfig.requests`; the old manifest `workload.bundle_dir` is not a Native input.
 
 ## Running Examples
 
-Fixed design:
-
 ```bash
-python3 -m orbitserve.experiments.cli \
-  examples/experiments/fixed_design_geometry.json \
-  --out results/experiments/fixed_design_geometry.json
+python -m astermind.common.build_native
+python -m astermind.experiments.cli examples/native/two_cells.json --out results/cells/basic.json --full
 ```
 
-DSE:
+The CLI accepts numeric schema `1` and `orbitserve.native_cells.v1` through
+SimulationConfig. Both use the same Comm execution path. Set global
+`compute_mode` to `midlayer` (default) or `roofline`; individual Cells cannot
+choose a different compute model. Summary mode writes
+`*.artifacts/native_result.json`; `--full` writes the complete raw report.
+See [native setup and contracts](astermind/README.md) before running.
+
+## Physical Network Model
+
+SimulationConfig specifies `physical`, `cells`, `requests` and execution settings.
+Orbital geometry and link budgets enter through `physical_network` or a verified
+`physical_dataset` (mutually exclusive). Relative paths resolve at the scene file.
+Removed fields `orbit` and `link_parameters` are rejected, including empty values.
+Communication shells have independent Walker/TLE inputs and fixed same-shell
+grid/honeycomb neighbors. Communication shells do not connect to one another.
+Compute cells have explicit physical members and fixed internal neighbors.
+Ground access and compute-to-communication access are allocated from currently
+eligible candidates under terminal limits and acquisition delays.
+`network.handover_policy` selects `retain_valid` (default: keep eligible contacts
+and fill free ports) or `quality_first` (rerank dynamic contacts at each boundary).
+A retained winner keeps its original acquisition clock; a new target always pays
+its configured setup delay. Fixed ISL neighbors do not change with this policy.
+Ground matching uses its configured ground/satellite preferences;
+`cross_layer_access_policy` selects `nearest_distance` (default),
+`highest_capacity` (the effective two-direction bottleneck) or `longest_available`.
+These are physical rankings, without Runtime traffic-load prediction. Fixed neighbors do not guarantee physical
+availability: visibility, range and Sun constraints still apply.
+
+The production network trace holds positions and environment-derived link
+attributes at the latest sample. Its visibility windows change at sampled
+boundaries. Acquisition, configured capacity changes, request arrivals and
+transmission/computation events keep their exact event times. Environment sample
+spacing does not round requests or reset partially transmitted bytes. The direct
+geometry/STK benchmark API retains its separate continuous-boundary convention.
+Orbit precomputation can split independent work across processes and bounded time
+batches without changing these simulated-time semantics.
+
+### Reusable physical datasets
+
+Physical preparation and Runtime can run as separate stages. First call
+`astermind.builder.physical.network.run_network_experiment(physical_input, dataset_dir)`.
+Its completion marker, `physical_dataset.json`, identifies a complete dataset:
+the self-contained materialized input, Orbit/environment trace, every sampled
+node position and candidate link, directional budgets, link events and the
+initial causal acquisition timeline. `physical_state.sqlite` stores compressed,
+indexed attribute blocks; Runtime reads them through bounded caches.
+Small datasets (up to 64 MiB of compressed attribute payloads) are read once
+into memory. Fractional route-arrival times reuse the same physical-boundary
+cache entry, while exact capacity-schedule and contact boundaries stay distinct.
+
+After geometric screening, adaptive ground/cross-layer pairs without any contact
+in the full horizon are excluded. Future contacts remain eligible when their
+window opens. Outside geometric availability, audit records carry zero bandwidth
+and `budget_evaluated: false`; they do not fabricate a physical budget. Fixed
+ISLs retain their configured topology. Physical attributes, JSON encoding and
+compression run in bounded process chunks using the same worker budget as Orbit,
+with one SQLite writer and per-chunk progress. An incomplete database is kept
+under a temporary name and is never published as a finished dataset.
+Datasets from the previous physics version must be regenerated.
+
+Set SimulationConfig's `physical_dataset` to a dataset directory or its
+`physical_dataset.json`, and omit `physical_network`. Runtime verifies the physics
+version and artifact hashes. Cell/request configuration and `runtime_network`
+faults remain independent of the physical dataset identity.
+
+An explicit dataset reference never falls back to physical regeneration. Missing,
+damaged, stale or mismatched datasets fail with an instruction to prepare a new
+dataset. Same-filesystem runs share immutable artifacts with hard links, falling
+back to file copies across filesystems. Each run retains its own traffic state
+and records the source dataset identity. Scenes with `physical_network` prepare physics before Runtime.
+
+The local console's first step generates this full dataset before entering the
+second step. The second step can also open directly and select a previously
+completed dataset. Configuration drafts alone cannot start Runtime. Fault inputs,
+random seeds and recovery policy are Runtime choices, excluded from physical
+identity. Changing them reuses the same dataset. Runtime observes faults causally
+and reallocates terminals using saved physical attributes; it never learns future
+faults from exported audit frames. Interactive creation of an unprepared satellite
+pair evaluates that pair from saved positions without modifying the base dataset.
+
+### ISLSim configuration and local link calculation
+
+New JSON network inputs default satellite-to-satellite profiles to
+`capacity_model: "islsim"`. This includes communication ISLs, compute-cell ISLs
+and cross-layer optical links. Ground/RF profiles keep their existing model.
+Explicit `"fixed"`, `"optical_photon_budget"` or `"free_space_shannon"` profiles
+opt out. Low-level callers constructing `LinkProfile` objects select the model
+explicitly; their existing fixed-capacity constructor remains supported.
+
+Configuration generation does not import or invoke ISLSim and does not read a
+personal checkout or `local/` settings. Export a complete native JSON input with
+OrbitServe's explicit scenario defaults and optional partial parameters:
 
 ```bash
-python3 -m orbitserve.experiments.cli \
-  examples/experiments/orbit_geometry_dse.json \
-  --out results/experiments/orbit_geometry_dse.json
+python3 -m astermind.experiments.islsim_cli --out results/islsim.json
+python3 -m astermind.experiments.islsim_cli --input profile.json --out results/islsim.json
 ```
 
-Terrestrial baseline:
+`profile.json` may contain native `tx`/`rx`/`channel` sections or a link profile's
+`islsim_config`. `prepare_islsim_config()` provides the same portable validation
+and export contract. Repository CI tests this contract without an ISLSim checkout
+or cross-repository credentials. The bundled examples explicitly select fixed
+link capacities so they run independently of the external optical model.
 
-```bash
-python3 -m orbitserve.experiments.cli \
-  examples/experiments/skywalker_ground_reproduction.json \
-  --out results/experiments/skywalker_ground_reproduction.json
+Local physical calculations import the external ISLSim `compute_link()` without
+modifying its formulas. Set `ORBITSERVE_ISLSIM_ROOT` to its checkout directory;
+the personal console also reads `local/config/communication-modules.json`.
+`ORBITSERVE_ISLSIM_CONFIG` optionally selects a native JSON configuration.
+The local `resolve_islsim_config()` helper can read the selected native JSON
+(otherwise `configs/google_constellation.json`) and return parameters to place
+in a profile before generating its portable input.
+A missing or mismatched external model raises an error; it never silently falls
+back to another model. Integration uses the locally available checkout; it does
+not clone, pull, push or modify the ISLSim repository.
+
+```json
+{
+  "communication_isl": {
+    "capacity_model": "islsim",
+    "bandwidth_bps": 200000000000,
+    "setup_time_s": 3
+  }
+}
 ```
 
-The CLI writes a summary and separate audit artifacts by default. Use `--output-mode full` for a monolithic debugging output. Examples contain inputs only and do not include pre-generated experiment results.
+The profile's optional `islsim_config` contains ISLSim's native `tx`, `rx` and
+`channel` objects. Partial sections override OrbitServe's portable input defaults;
+the frozen physical input always contains the complete resolved configuration.
+The Python API receives an `FSOConfig` object plus `distance_km`, so creating or
+editing a file in the external ISLSim repository is unnecessary. Native inputs
+are separate from the legacy photon-budget fields.
 
-## Single-Satellite Cost Tool
+| Section | OrbitServe supplies to ISLSim |
+| --- | --- |
+| `tx` | `tx_power_w`, `tx_aperture_m`, `wavelength_m`, `baud_rate_ghz`, `wdm_channels`, `fec_overhead`, `dual_polarization`, `wdm_power_mode`, `modulation_pool` |
+| `rx` | `rx_aperture_m`, `preamp_gain_db`, `preamp_nf_db`, `ber_threshold`, `terminal_cap_gbps` |
+| `channel` | `link_margin_db`, `optical_efficiency` |
+| Per sample | Current endpoint separation in km |
 
-```bash
-python3 -m orbitserve.architecture.single_satellite_cost.cli \
-  examples/single_satellite/h200_gpu_derived.json \
-  --out results/single_satellite/h200_gpu_derived.json
-```
+The Starlink generation presets explicitly pass their per-direction optical
+scenario ceiling to ISLSim's `rx.terminal_cap_gbps` (100 Gbps for V2 Mini and
+200 Gbps for the current V3 presets). Unpublished power, aperture and waveform
+values use explicit base parameters or OrbitServe's portable defaults and remain editable engineering
+assumptions shared across generations, not inferred vendor measurements. Scenario
+overrides layer over generation defaults. Changing only a TX field retains the
+generation's RX settings. Optical port count and aggregate RF capacities stay in
+OrbitServe's topology/resource allocation; they are not single-link ISLSim inputs.
+
+The console offers automatic modulation from the configured candidate pool,
+fixed QPSK/8QAM/16QAM/64QAM, and a custom ordered pool. Fixed mode supplies one
+candidate; it still fails the link when the native BER condition is unmet.
+The current external implementation validates `preamp_gain_db` but does not use
+it in its high-gain SNR approximation. Wavelength affects received power, while
+the current noise approximation uses a fixed 1550 nm photon energy. These upstream
+behaviors are preserved and must not be interpreted as independent calibration.
+
+OrbitServe freezes these parameters and the external source SHA-256 identities
+in the materialized physical input. Actual capacity uses ISLSim's terminal-capped
+`total_bw_gbps`, converted to bit/s and limited by the configured per-direction
+link and endpoint ceilings. ISLSim's BER feasibility result makes an infeasible
+link DOWN; reacquisition still pays OrbitServe's configured setup delay.
+Snapshots retain native SNR, modulation, bandwidth, limiting reason and latency.
+Propagation is charged once. OrbitServe continues to own SGP4 geometry,
+visibility, acquisition, scheduling, routing and fault recovery.
+
+The physical dataset version changes with this integration. Rebuild older
+datasets before running with ISLSim; selecting another link model also requires
+matching physical data. This adapter verifies consistency with upstream results,
+not independent calibration of ISLSim's physical assumptions or formulas.
+
+### Compute and communication execution
+
+The source compute snapshot and communication implementation are transplanted
+from `Communication_backend` commit `9c08c9cad81df5a4fee5e606114753df8dab6c2d`.
+[Source mappings and hashes](astermind/engine/compute/SOURCE.json) identify each
+imported file. The native Midlayer snapshot, hardware profiles and calibration
+data are bundled; build its original LRU helper and the extracted native
+progressive-filling allocator with `python -m astermind.common.build_native`.
+Scheduler environments remain explicit native dependencies.
+
+Comm owns active transfers, shared external link/RF resources, protocol budgets,
+retries and completion callbacks on the existing integer attosecond timeline.
+The retained network owns route selection/cache, SGP4 positions, physical link
+supply and topology updates. No source routing policy is imported.
+
+The selected path must be available end to end at one time. There is no
+intermediate store-and-forward. Infeasible temporal paths wait, then fail at a
+configured timeout or the simulation horizon. Contact loss restarts the entire
+attempt, discarding partial application bytes; capacity changes preserve progress.
+Route forecasts retain the original algorithm and can conservatively reject a
+path near the horizon even when a whole-path flow could theoretically finish.
+
+Star-local supported collectives use the upstream whole-operation surrogate or
+`IntraSatelliteRoofline`; other plans decompose into phases/P2P as upstream
+supports. Star-local predictions neither compete globally nor reprice in flight.
+Cross-star phases use the shared native allocator. Native compute COMM estimates
+are never added again to actual communication time. Protocol capacity basis and
+resource profiles prevent charging the same FEC/framing overhead twice.
+
+The old FlowSim extension, ns-3, SimGrid and ProtoBridge execution selectors are
+removed. The new Comm vendors its own upstream ProtoBridge models and allocator
+extraction; those source dependencies are distinct from the retired execution modes.
+
+Raw schema-2 reports include exact event ticks, requests, pool/replica Scheduler
+reports, operators, communication traces/allocations, KV transactions and source
+provenance. The `viz/` frontend is unchanged and accepts its historical report
+schema. New modes are raw-report only; no synthetic replay/storage data is created.
+See [the boundary contract](astermind/engine/CELL_INTEGRATION.md).
+
+Link profiles support fixed capacities, RF free-space/Shannon budgets and an
+optical Gaussian-beam/photon-budget model. Optical inputs include wavelength,
+transmit power, both apertures and efficiencies, pointing/system losses, receiver
+photons per bit and a terminal rate ceiling. RF inputs include channel width,
+frequency, power, gains or effective apertures, thermal noise and losses. Rates
+are net bit/s **per direction**; propagation is sampled physical distance divided
+by light speed. Serialization, queueing and setup are separate delays. Public
+[Starlink specifications](https://starlink.com/technology) are reference points,
+not disclosure of all terminal parameters. Record undisclosed parameters as
+assumptions; these engineering models are not calibrated vendor emulators.
+
+Communication nodes may select a versioned `radio_profile`, independently of
+Walker/TLE shell geometry. Public source editions are pinned in
+`runtime/setup/radio_capacity.py`:
+
+| Profile | Satellite user downlink | Satellite user uplink | RF feeder aggregate |
+| --- | --- | --- | --- |
+| `starlink_v2_mini_2024` | 96 Gbps | Unpublished in this edition | Unpublished in this edition |
+| `starlink_v3_design_160_20261021` | 1,000 Gbps | 160 Gbps | 1,200 Gbps, conservatively shared across directions |
+| `starlink_v3_progress_2025` | >1,000 Gbps (reported lower bound) | >200 Gbps (reported lower bound) | V3 hardware-page reference, separate source |
+
+V2 Mini's downlink classification is corroborated by the
+[June 2026 SpaceX prospectus](https://content.spacex.com/cms-assets/FINAL_Documents%20and%20Updates/SpaceX%20-%20EU%20Prospectus%20%28Approved%20by%20Bafin%29%20-%20June%205%2C%202026.pdf).
+The V3 profile freezes the [dedicated V3 design page](https://starlink.com/en-ps/updates/starlink-version-3-satellites)
+as retrieved on 2026-10-21. The [Network Update](https://starlink.com/networkupdate)
+instead reports over 200 Gbps uplink; the prospectus lists 1,024 Gbps downlink.
+Those editions are not silently combined. V3 capacities are design figures.
+Constellation materialization supplies auditable `simulation_defaults` for each
+edition. V2's runnable uplink estimate is 160/24 = 6.667 Gbps, inferred from the
+[2024 report, printed p.61](https://starlink.com/public-files/starlinkProgressReport_2024.pdf#page=62),
+not a directly published V2 uplink specification. The 2025-report edition uses
+1,000/200 Gbps as explicit lower-bound scenario assumptions, not exact ceilings.
+Unpublished directional feeder provisioning matches the user-side aggregates;
+this is a traffic-sizing assumption, not measured gateway hardware capacity.
+
+Versioned shells materialize four independent RF profiles: user uplink/downlink
+and feeder uplink/downlink. Nodes reference them through `sgl_profiles`; explicit
+`hardware_link_profiles` override the shell defaults. Representative Ku carriers
+use 14.25 GHz / 62.5 MHz uplink and 12 GHz / 240 MHz downlink; E-band feeder
+carriers use 83.5 GHz / 2 GHz and 73.5 GHz / 500 MHz. Selected carrier widths,
+power, effective apertures, losses and receiver parameters are **engineering
+assumptions**, not vendor-disclosed channel specifications. Per-link rates still
+come from the distance-dependent RF budget and satellite shared-pool limits.
+End-user speed statistics are not used as physical link capacity. Starlink's
+2025 report also describes symmetric 10 Gbps Community Gateways; these are
+not ordinary user terminals or a disclosure of every satellite feeder link.
+Unversioned scenarios and their explicit directional profiles retain their behavior.
+All numeric capacities use decimal SI bit/s. Advertised laser counts/rates do not
+establish duplex accounting, power or aperture; optical budgets remain explicit.
+The hardware references distinguish V2 Mini's three optical terminals from V3's
+six. A selected profile rejects allocations requesting more optical terminals
+than the referenced hardware. `optical_terminal_bandwidth_bps` optionally bounds
+every incident optical link in both directions, including compute-access links;
+its per-direction interpretation requires `terminal_assumptions`. RF feeder
+antenna counts (three/four), user beams and simultaneous GSL peers are distinct
+quantities. `sgl_terminals` remains an explicit scenario concurrency limit, not an
+inferred number of beams. Hardware references and terminal assumptions are exported.
+
+Ground nodes use `ground_kind: "gateway"` by default (RF feeder), or `"user"`
+for user access. The matching satellite aggregate is shared across **all** its
+GSLs: uplink means ground to satellite; downlink means satellite to ground.
+Separate UL/DL pools permit simultaneous full duplex. Feeder capacity never
+borrows user capacity or optical capacity. If a selected edition does not publish
+a required aggregate, supply `radio_capacity_bps` with explicit
+`capacity_assumptions`; an unspecified value produces an input error. Overrides
+are recorded in snapshots. Unversioned existing engineering scenarios retain
+their explicit link inputs.
+
+Physical inputs accept `scenario_type: "compute_only"`, `"communication_only"`,
+or `"mixed"`, checked against the configured satellite roles. Compute-only
+constellations access ground nodes directly; communication-only inputs support
+network diagnostics and route probes. The LLM experiment runner requires compute
+cells. Synthetic sources support `walker_delta` and `dawn_dusk`. The latter
+derives a circular first-order J2 sun-synchronous inclination and epoch mean-Sun
+RAAN from `ltan_hours` (6 or 18); `plane_spread_deg` optionally spreads planes
+around that center. It is an initial design without station keeping or an
+eclipse-free guarantee.
+
+TLE communication sources specify nominal `planes` and `satellites_per_plane`
+for Grid/Honeycomb. Common-epoch angular fitting leaves missing positions empty;
+misaligned satellites remain physical nodes without grid ISLs. Optional
+`source.grid_positions` maps catalog numbers to `[plane, slot]` explicitly.
+This prescribed-grid fit does not reproduce automatic multimodal shell/spacing
+recovery. Compute TLE sources instead require `source.cell_members`, mapping
+each cell name to ordered catalog numbers; every imported satellite must appear
+exactly once. Observed per-member elements are preserved without formation offsets.
+
+Synthetic multi-row compute cells use aligned relative eccentricity/inclination
+vectors, so radial separation accompanies cross-track orbit-plane crossings.
+The requested grid is an initial layout; each member then propagates independently
+with SGP4, without a rigid offset or station-keeping controller. Initialization
+provenance identifies this as `free_sgp4_ei_separated_mean_element_offsets_v2`.
+Before link-budget preparation, a compute-only TEME pass checks pairwise clearance
+on the configured physical time grid, including the final boundary. Unsafe inputs
+fail with the cell, closest member pair, time and required separation. Full ITRS
+validation remains in place. These sampled checks do not guarantee continuous-time
+collision avoidance between boundaries. The separation design follows the
+[relative e/i-vector approach](https://www.dlr.de/en/rb/research-operation/research-projects/flight-dynamics-navigation-and-orbital-sustainability/gnss-technology-and-navigation/tandem-x-autonomous-formation-flying-experiment-taff).
+
+Each communication shell selects `topology_repair: "none"` (baseline) or
+`"ronchetti_intra_orbit"` (method1). Baseline retains Grid/Honeycomb holes.
+Method1 adds candidate links across consecutive same-orbit holes, including
+zero-laser satellites, and subjects them to geometry, 100 km atmospheric clearance,
+range, setup time and endpoint terminal limits. It adds no synthetic satellites
+and does not bridge missing planes. This follows the patched hexGrid rule in
+[Ronchetti et al., LEO-NET 2026](https://github.com/nsg-ethz/irregular-constellations);
+applying that rule to Grid is an extension. Candidate grid assignments stay fixed
+within a run while physical link availability varies over time.
+
+Ground `terminal_count` limits simultaneous satellite peers. Satellite
+`sgl_terminals` limits total ground associations; optional `max_user_links` and
+`max_gateway_links` add independent service quotas (zero disables that service,
+omitted means only the total quota applies). A ground user node represents one
+modeled terminal, not every user in a region. These counts are separate from
+RF capacity and hardware beam/antenna counts. `network.ground_matching` selects
+the default `greedy` admission or ground-proposing `deferred_acceptance` with
+satellite rejection and retries. `ground_access_policy` and
+`satellite_access_policy` independently select `nearest_distance`,
+`longest_available`, `highest_elevation`, or `highest_capacity` (the effective
+two-direction bottleneck rate). Preferences are evaluated per allocation boundary;
+this does not claim globally optimal throughput or traffic-load-aware association.
+
+Compute formations select `egress_policy: "single"` (one specified member),
+`"multi"` (the specified `ingress_members`), or `"free"` (all members).
+The default `multi` preserves existing member lists. Materialized inputs store
+these rules in `network.cell_egress_policies`; explicit links cannot bypass them.
+Free access still consumes each member's actual terminals. Internal cell topology
+and inter-cell connectivity remain independently configured.
+
+An SGL profile may reference `uplink_profile` and `downlink_profile`, each naming
+another nonrecursive link profile for its own RF power, frequency, apertures,
+modem cap and capacity schedule. Geometry/setup stay on the parent profile.
+The effective directional rate is bounded by its physical budget and the relevant
+satellite pools. Snapshot `directions` contains these rates and pool IDs;
+top-level `bandwidth_bps` is the parent budget. Exact AsterMind exports preserve
+the directional details and aggregate resource definitions.
+Asymmetric exports set the legacy symmetric `bandwidth_gbps_per_direction` to
+null; consumers must read `bandwidth_gbps_by_direction` and its pool IDs.
+
+Comm uses the upstream max-min allocator across directed external links and
+shared RF/terminal capacity pools. Reverse directions retain physical pool
+membership; a terminal gate is charged once per path.
+
+`network/astermind_network.jsonl.gz` exports per-sample cell membership, physical
+rank mappings, internal links, external satellite links and enabled direct ground
+links, including inactive links and budget diagnostics. `export_cell_network`
+is also available from `astermind.engine`. Exact heterogeneous snapshots are
+preserved. A usable static snapshot additionally supplies conservative uniform
+`serving_formation_fragment` and `astermind_static_fragment` inputs (minimum
+bandwidth and maximum propagation delay); these approximations are labeled and
+never replace Native Cell device-level communication.
+Current AsterMind's uniform static network schema cannot express the full dynamic
+graph; consuming exact dynamic snapshots requires an adapter on that side.
+
+Optional `network.faults` entries contain `target_type` (`link` or `node`),
+`target_id`, `start_s` and `end_s`, with optional `source` for audit attribution.
+The default `network.fault_timing: "boundary"` requires onset and repair at
+physical sample boundaries. Runtime learns outages at their onset;
+`failure_policy: "retry_next_sample"` discards the incomplete transmission on
+the interrupted hop. Completed upstream hops remain delivered, and the sending
+node retains its buffered message. In boundary mode it immediately reroutes at
+that same boundary, up to `max_transfer_retries`; unavailable routes wait for a
+later boundary. The explicitly selected legacy `fault_timing: "continuous"`
+retains arbitrary fault times and next-sample recovery for old experiments.
+Link and relay failures can
+use alternate paths; computation-node failures terminate affected work because
+there is no model checkpoint recovery. The default policy remains `fail`.
+Cancellation logs report discarded in-flight bytes and the retained buffer owner;
+recovery logs identify the current node and the bytes sent on the replacement
+route. Completed upstream hops are not retransmitted. The model uses whole-message
+store-and-forward at each hop, without TCP packet acknowledgements. If the node
+holding the only forwarding buffer fails, recovery reports that buffer loss.
+
+`network.random_faults.nodes` and `.links` independently configure `enabled`,
+integer `seed`, zero-based `start_step`, `end_step`, and `model`. Each group has
+its own random stream; changing link parameters does not alter sampled node
+failures. Legacy flat settings with `target_type` remain readable.
+
+| Model | Healthy period / onset | Outage duration |
+| --- | --- | --- |
+| `per_step` | Bernoulli `failure_probability` per healthy target per boundary | Configurable `duration` distribution |
+| `exponential` | Exponential with `mean_up_steps` | Exponential with `mean_down_steps` |
+| `weibull` | Weibull `up_scale_steps` and `up_shape`; fresh healthy age after repair | Configurable `duration` distribution |
+| `fixed_ratio` | Sample `ceil(target_count * ratio)` targets once | Prescribed `[start_step, end_step)` interval |
+
+For stochastic onset, `[start_step, end_step)` is the eligible injection window.
+Duration accepts `{"distribution":"fixed","steps":4}`,
+`{"distribution":"uniform","min_steps":2,"max_steps":6}`,
+`{"distribution":"exponential","mean_steps":4}`, or
+`{"distribution":"lognormal","mean_steps":4,"sigma":0.6}`. Lognormal
+`mean_steps` is the arithmetic mean before discretization; `sigma` is the
+standard deviation in log space. Legacy `duration_steps` means fixed duration.
+Continuous samples are rounded up to at least one step, so configured means
+refer to the distributions before rounding. A target cannot fail again on its
+repair boundary. Exponential/Weibull healthy periods start at the window's first
+boundary and restart after each repair; independent components are assumed.
+Weibull shape below/at/above 1 means decreasing/constant/increasing healthy-age
+hazard, rather than an assumption of cumulative unrepaired hardware aging.
+
+Explicit intervals and bounded-duration configurations must fit within the
+horizon. Unbounded repair samples may exceed it: the sampled recovery time is
+preserved and actual onset logs mark `right_censored: true`; no repair is
+invented at simulation end and no sample is shortened or redrawn. For example,
+onset at step 3 with duration 4 repairs at step 7 and lasts `4 * step_s` seconds.
+Probabilities are per step, not per second; use `p = 1 - exp(-rate_per_second *
+step_s)` when converting a constant hazard. These are component UP/DOWN models;
+packet error probabilities and Sun-exclusion geometry are separate mechanisms.
+Random targets are realized by Runtime and remain hidden from route forecasting
+until observation. Actual outcomes are retained in provenance and execution logs;
+actual fault events include start/end step, duration in steps and seconds.
+
+The optional `runtime_control(controller)` context binds an in-process controller
+to one experiment thread. It pauses at boundaries after scheduled faults and
+physical changes, before business events. Commands execute on the engine thread.
+Manual faults and administrative disconnections persist independently; restoring
+a manual fault does not clear a simultaneous random or scheduled outage. The
+local console uses this hook for its event-timeline workspace. It performs
+authoritative physical/terminal checks before publishing connection changes.
+When the failed hop is the initial ground upload, recovery reselects an available
+access satellite while retaining the chosen compute destination. A ready backup
+requires a separate allocated ground/space terminal; acquisition delays still
+apply when the alternative link is not yet established. A fault immediately
+releases its assigned terminals; the next geometry sample may assign them to a
+different visible peer, which must wait its full setup time. Repairs are learned
+only when observed. Unaffected contacts retain their acquisition clocks;
+recovered contacts reacquire instead of inheriting an obsolete setup timestamp.
+
+Native results expose requests, batches, transfers, migrations, network observations,
+measurement and provenance. The summary CLI links to the full audit artifact.
+
+## Physical data preparation
+
+Physical preparation can publish a compact, reusable core independently of full
+JSON snapshots and exchange exports. Combined experiments use the core directly;
+standalone callers retain the full-export default. Parallel exports support
+bounded time chunks and selectable compression levels. See
+[physical data and optional exports](astermind/experiments/PHYSICAL_DATA.md) for commands, layout,
+integrity checks and compatibility with existing data.
 
 ## Tests
 
+See [the regression coverage map](tests/README.md) for preserved behavior and
+intentional changes from the legacy Runtime/DSE interfaces.
+
 ```bash
-python3 -m unittest discover -s tests/unit -t .
-python3 -m unittest discover -s tests/integration -t .
-python3 -m unittest discover -s tests/smoke -t .
-python3 -m unittest discover -s tests/slow -t .
-python3 -m unittest discover -s tests -t .
+python tests/scripts/run_retained_tests.py
+python tests/scripts/run_compute_comm.py --output results/compute-comm
+python tests/scripts/run_compute_comm_e2e.py --output results/e2e
+python tests/scripts/check_distribution.py --work-dir /absolute/path/to/new-package-check
 ```
 
-`tests/slow/` contains long-running trace-backed runtime, prefill/decode, and runtime-matrix tests. Full validation must include this suite; routine development may run the first three suites separately.
+Missing dependencies and skipped tests do not count as successful native
+validation. The [test guide](tests/README.md) lists scheduler environments,
+DP/WideEP/PD cases, source differential oracles, physical regression and failures.
+Real ISLSim validation remains a separate explicit suite:
+
+```bash
+ORBITSERVE_ISLSIM_ROOT=/path/to/ISLSim python -m unittest discover -s tests/external/islsim -v
+```
 
 ## Directory Rules
 
-- `results/` contains final experiment outputs and is not tracked by default.
+- `results/` contains generated experiment outputs and is ignored.
+- `local/` contains personal tools, inputs, results, tests and internal documents; it is ignored. Do not force-add it.
 - `scripts/` is reserved for paper experiment orchestration after the methodology is frozen.
 - `examples/` contains user-facing inputs, not test-generated artifacts.
+
+## Input Reliability and Distribution Checks
+
+Native request token counts, hardware counts and parallel degrees use integers. Request times and byte counts must be finite and
+nonnegative. Fractional counts, booleans and NaN/Infinity are rejected before
+allocating a native backend. Causal requests may arrive in any input order;
+duplicate IDs, missing predecessors and cycles are rejected explicitly.
+
+Physical attribute readers bound decompression to 64 MiB per block, validate
+time and column indices, and return independent metadata values. Atomic artifact
+writes use a separate temporary file per producer; overlapping writers publish
+complete files, with the last successful publication taking effect.
+
+The distribution check builds a source distribution and a wheel from it, installs that wheel
+outside the source tree, imports all modules and verifies the pinned reference
+data and ISLSim configuration CLI. To run this check from a Git checkout with
+the core dependencies installed:
+
+```bash
+python -m pip install 'build==1.6.1'
+python tests/scripts/check_distribution.py
+```
+
+The project license is pending maintainer selection. Before public release,
+review dependency and bundled-data redistribution terms and the Git history
+that will become visible. Bundled vendor license/provenance files and IERS
+license/provenance are retained alongside their sources. Passing software tests does not replace
+validation of model assumptions and scientific reference results.

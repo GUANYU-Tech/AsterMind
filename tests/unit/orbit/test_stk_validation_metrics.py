@@ -2,20 +2,8 @@ import math
 import unittest
 from dataclasses import replace
 
-from orbitserve.orbit import (
-    Sgp4EarthFixedResult,
-    Sgp4ItrsSample,
-    Sgp4PropagationResult,
-    Sgp4TemeSample,
-)
-from orbitserve.orbit.validation import (
-    STK_11_BASELINE_BUILD,
-    STK_11_BASELINE_VERSION,
-    StkDirectStateCapture,
-    StkStateSample,
-    StkValidationError,
-    compare_stk_state_capture,
-)
+from astermind.builder.orbit import Sgp4EarthFixedResult, Sgp4ItrsSample, Sgp4PropagationResult, Sgp4TemeSample
+from astermind.builder.orbit.validation import STK_11_BASELINE_BUILD, STK_11_BASELINE_VERSION, StkDirectStateCapture, StkStateSample, StkValidationError, compare_stk_state_capture
 
 
 _ELEMENT_SET_ID = "sgp4-elements-v1-stk-metric-test"

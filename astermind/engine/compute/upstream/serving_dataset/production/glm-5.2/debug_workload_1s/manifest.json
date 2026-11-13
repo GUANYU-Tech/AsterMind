@@ -1,0 +1,216 @@
+{
+  "alignment": {
+    "launches": {
+      "coverage": null,
+      "path": null,
+      "reason": "hardware-independent Production CSV does not contain this alignment source",
+      "sha256": null,
+      "source_archive_ids": null,
+      "status": "not_applicable"
+    },
+    "metrics": {
+      "coverage": null,
+      "path": null,
+      "reason": "model and runtime settings were not recorded, so source metrics cannot serve as alignment ground truth",
+      "sha256": null,
+      "source_archive_ids": null,
+      "status": "unavailable"
+    },
+    "operators": {
+      "coverage": null,
+      "path": null,
+      "reason": "hardware-independent Production CSV does not contain this alignment source",
+      "sha256": null,
+      "source_archive_ids": null,
+      "status": "not_applicable"
+    },
+    "scheduler": {
+      "coverage": null,
+      "path": null,
+      "reason": "hardware-independent Production CSV does not contain this alignment source",
+      "sha256": null,
+      "source_archive_ids": null,
+      "status": "not_applicable"
+    },
+    "timing": {
+      "coverage": null,
+      "path": null,
+      "reason": "hardware-independent Production CSV does not contain this alignment source",
+      "sha256": null,
+      "source_archive_ids": null,
+      "status": "not_applicable"
+    }
+  },
+  "alignment_steps": {
+    "compressed_sha256": "5e1e433fd95e4ec32faf9cc33735e5804d830623505958e9219e8633233a99bc",
+    "compression": "zstd",
+    "path": "alignment_steps.json.zst",
+    "phases": {
+      "decode": {
+        "rank_ids": [
+          0
+        ],
+        "status": "available"
+      },
+      "mixed": {
+        "rank_ids": [],
+        "status": "not_observed"
+      },
+      "prefill": {
+        "rank_ids": [
+          0
+        ],
+        "status": "available"
+      }
+    },
+    "sha256": "2dd4865441e0e9dfd788c7d0d5ec3eb0f6904068ed186dd789a28fb07063af05",
+    "status": "available"
+  },
+  "converter": {
+    "implementation_id": "midlayer.production_raw_adapter.v1",
+    "source_commit": "f447080c908eebcce24f361ba92db837387e56a0"
+  },
+  "dynamic_inputs": {
+    "coverage": null,
+    "path": null,
+    "reason": "the nine-column Production CSV contains no MoE or MTP dynamic inputs",
+    "sha256": null,
+    "source_archive_ids": null,
+    "status": "unavailable"
+  },
+  "identity": {
+    "case_id": "debug_workload_1s",
+    "hardware_id": null,
+    "model_id": "glm-5.2",
+    "model_revision": null,
+    "source_kind": "production",
+    "tokenizer_revision": null
+  },
+  "provenance": {
+    "completeness": "partial",
+    "gaps": [
+      {
+        "field": "identity.model_revision",
+        "reason": "the Production CSV does not record an immutable model revision"
+      },
+      {
+        "field": "identity.tokenizer_revision",
+        "reason": "the Production CSV does not record an immutable tokenizer revision"
+      },
+      {
+        "field": "runtime.dtype",
+        "reason": "the Production CSV does not record this runtime provenance field"
+      },
+      {
+        "field": "runtime.deployment",
+        "reason": "the Production CSV does not record this runtime provenance field"
+      },
+      {
+        "field": "runtime.tensor_parallel_size",
+        "reason": "the Production CSV does not record this runtime provenance field"
+      },
+      {
+        "field": "runtime.expert_parallel_size",
+        "reason": "the Production CSV does not record this runtime provenance field"
+      },
+      {
+        "field": "runtime.pipeline_parallel_size",
+        "reason": "the Production CSV does not record this runtime provenance field"
+      },
+      {
+        "field": "runtime.target_qps",
+        "reason": "the Production CSV does not record this runtime provenance field"
+      },
+      {
+        "field": "runtime.seed",
+        "reason": "the Production CSV does not record this runtime provenance field"
+      },
+      {
+        "field": "runtime.scheduler_config_sha256",
+        "reason": "the Production CSV does not record this runtime provenance field"
+      },
+      {
+        "field": "runtime.runtime_version",
+        "reason": "the Production CSV does not record this runtime provenance field"
+      },
+      {
+        "field": "runtime.source_commit",
+        "reason": "the Production CSV does not record this runtime provenance field"
+      },
+      {
+        "field": "runtime.capture_enable_prefix_caching",
+        "reason": "the Production CSV does not record this runtime provenance field"
+      },
+      {
+        "field": "raw_sources.production-trace.tool",
+        "reason": "the Production CSV does not identify its producing tool"
+      },
+      {
+        "field": "raw_sources.production-trace.tool_version",
+        "reason": "the Production CSV does not identify a producing tool version"
+      }
+    ]
+  },
+  "raw_sources": [
+    {
+      "archive_id": "production-trace",
+      "bytes": 2957,
+      "relative_path": "debug_workload_1s.csv",
+      "role": "production-trace",
+      "sha256": "033acb30957f16288fd9eb582fdb5cc216fac3ab5ae5bb0b3402c07bc16c721f",
+      "tool": null,
+      "tool_version": null
+    }
+  ],
+  "requests": {
+    "cached_hit_value_evidence": null,
+    "equal_arrival_order": "physical_row_ascending",
+    "field_provenance": {
+      "Cached hit [tokens]": {
+        "kind": "observed_actual",
+        "reason": "source rows are successful requests under upstream attestation: user-confirmed successful-request export from filter_production_trace.py v2.3.0",
+        "source_id": "production-trace"
+      },
+      "In Token [tokens]": {
+        "kind": "observed_actual",
+        "reason": "source rows are successful requests under upstream attestation: user-confirmed successful-request export from filter_production_trace.py v2.3.0",
+        "source_id": "production-trace"
+      },
+      "Out Token [tokens]": {
+        "kind": "observed_actual",
+        "reason": "source rows are successful requests under upstream attestation: user-confirmed successful-request export from filter_production_trace.py v2.3.0",
+        "source_id": "production-trace"
+      },
+      "Query Time Stamp [ms]": {
+        "kind": "observed_actual",
+        "reason": "source rows are successful requests under upstream attestation: user-confirmed successful-request export from filter_production_trace.py v2.3.0",
+        "source_id": "production-trace"
+      }
+    },
+    "id_normalization": "physical_row_request_id_v1",
+    "path": "requests.csv",
+    "requests_sha256": "cd0ae4929ac7d0783c6d190da441dce56156de7f26ffa20038e4c624d1865843",
+    "row_count": 35,
+    "source_id_mapping": {
+      "evidence_source_id": "production-trace",
+      "kind": "physical_row",
+      "reason": "the source CSV has no request ID; request_idx is its zero-based physical data-row index",
+      "source_namespace": null,
+      "target_namespace": "request_idx"
+    }
+  },
+  "runtime": {
+    "capture_enable_prefix_caching": null,
+    "deployment": null,
+    "dtype": null,
+    "expert_parallel_size": null,
+    "pipeline_parallel_size": null,
+    "runtime_version": null,
+    "scheduler_config_sha256": null,
+    "seed": null,
+    "source_commit": null,
+    "target_qps": null,
+    "tensor_parallel_size": null
+  },
+  "schema_version": 1
+}

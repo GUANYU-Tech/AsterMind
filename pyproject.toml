@@ -1,49 +1,36 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=84.1.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "OrbitServe"
+name = "AsterMind"
 version = "0.0.1"
-description = "Private research artifact for OrbitServe LEO AI serving cost-SLO co-design."
+description = "Native fixed-design LEO AI serving simulation."
+readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "numpy==2.2.6",
   "astropy==6.1.3",
   "astropy-iers-data==0.2026.5.11.1.8.52",
   "sgp4==2.27",
+  "pydantic>=2.7,<3",
 ]
 
 [tool.setuptools]
-packages = [
-  "orbitserve",
-  "orbitserve.architecture",
-  "orbitserve.architecture.single_satellite_cost",
-  "orbitserve.baselines",
-  "orbitserve.baselines.ground",
-  "orbitserve.common",
-  "orbitserve.dse",
-  "orbitserve.experiments",
-  "orbitserve.runtime",
-  "orbitserve.runtime.engine",
-  "orbitserve.runtime.metrics",
-  "orbitserve.runtime.setup",
-  "orbitserve.runtime.state",
-  "orbitserve.serving",
-  "orbitserve.orbit",
-  "orbitserve.orbit.sgp4",
-  "orbitserve.orbit.validation",
-  "orbitserve.workload",
-]
+include-package-data = false
 
-[tool.setuptools.package-dir]
-orbitserve = "src/orbitserve"
-"orbitserve.experiments" = "src/experiments"
-"orbitserve.dse" = "src/dse"
-"orbitserve.baselines" = "src/baselines"
-"orbitserve.baselines.ground" = "src/baselines/ground"
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["astermind*", "viz", "workloads*", "examples", "examples.native"]
+namespaces = false
 
 [tool.setuptools.package-data]
-"orbitserve.orbit" = [
+"viz" = ["*.html", "*.css", "*.js"]
+"examples.native" = ["*.json"]
+"workloads.main_composite_chat" = ["countries.csv", "gateways.json", "profiles/*.csv", "profiles/*.json"]
+"astermind.engine.compute" = ["SOURCE.json", "scheduler_runtime/*", "upstream/**/*", "upstream/.orbitserve_snapshot.json"]
+"astermind.engine.comm" = ["native_allocator.cc", "_vendor/**/*"]
+"astermind.builder.orbit" = [
   "data/iers/0.2026.5.11.1.8.52/*",
   "data/stk_validation/*.json",
 ]

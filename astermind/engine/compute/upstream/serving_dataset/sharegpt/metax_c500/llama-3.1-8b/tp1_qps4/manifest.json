@@ -1,0 +1,295 @@
+{
+  "alignment_steps": {
+    "compressed_sha256": "68a7ba90b2eb5a8e88acd679a1f79afaaa9ae3efa931ad064a7b73e2a61d97e7",
+    "compression": "zstd",
+    "path": "alignment_steps.json.zst",
+    "phases": {
+      "decode": {
+        "rank_ids": [
+          0
+        ],
+        "status": "available"
+      },
+      "mixed": {
+        "rank_ids": [
+          0
+        ],
+        "status": "available"
+      },
+      "prefill": {
+        "rank_ids": [
+          0
+        ],
+        "status": "available"
+      }
+    },
+    "sha256": "164f7d7bfe7cdf566dbc451f0524e5c0f6116bcbf388b6e4cf33ea92a7c60844",
+    "status": "available"
+  },
+  "capture": {
+    "metrics_source_archive_id": "accepted-ground-truth-v3",
+    "observer_effect_validation": {
+      "baseline_run_id": "raw/ground_truth.json",
+      "instrumented_run_id": "raw/ground_truth.json",
+      "metric_delta_percent": {
+        "e2e": 2.1268169209236385,
+        "request_throughput": 0.06500244450750714,
+        "tpot": 2.136680396799675,
+        "ttft": 2.5757578304035995
+      },
+      "passed": true,
+      "status": "inherited_from_representative_case",
+      "threshold_percent": 3.0,
+      "validation_case_id": "metax_c500/qwen3-8b/tp1_qps4"
+    },
+    "profiler_attached": false,
+    "requests_source_archive_ids": [
+      "accepted-ground-truth-v3"
+    ],
+    "run_id": "llama-3.1-8b_tp1_qps4/result.json",
+    "scheduler_source_archive_id": "accepted-scheduler-trace-v3",
+    "scheduler_trace_enabled": true
+  },
+  "converter": {
+    "implementation_id": "midlayer.scheduler_capture_candidate.v5",
+    "selection_rule": "middle_complete_work_bearing_step_v1",
+    "source_commit": "eebaca37e9b811f7ebb0c99f9ba3eb14cd74189a"
+  },
+  "identity": {
+    "case_id": "tp1_qps4",
+    "hardware_id": "metax_c500",
+    "model_id": "llama-3.1-8b",
+    "model_revision": null,
+    "raw_model_id": "Llama-3.1-8B",
+    "source_kind": "sharegpt",
+    "tokenizer_revision": null
+  },
+  "metrics": {
+    "path": "metrics.json",
+    "reason": null,
+    "sha256": "6c8a3a50cf0ee6b0bccd39fd02a0580d7c47acee2b53734743090a7251460b7b",
+    "status": "available"
+  },
+  "provenance": {
+    "gaps": [
+      "identity.model_revision: historical raw does not record an immutable model revision",
+      "identity.tokenizer_revision: historical raw does not record an immutable tokenizer revision",
+      "runtime.deployment: historical raw does not record a versioned deployment identity",
+      "runtime.seed: historical raw does not identify one runtime seed contract",
+      "runtime.scheduler_config_sha256: historical raw has no canonical Scheduler config digest",
+      "runtime.runtime_version: historical raw does not record runtime version",
+      "runtime.source_commit: historical raw does not record source commit",
+      "runtime.capture_enable_prefix_caching: historical raw does not record whether prefix caching was enabled",
+      "raw_sources.case-metadata.tool_version: historical raw does not record the producing tool version",
+      "raw_sources.arrival-schedule.tool_version: historical raw does not record the producing tool version",
+      "raw_sources.serving-metrics.tool_version: historical raw does not record the producing tool version",
+      "raw_sources.scheduler.tool_version: historical raw does not record the producing tool version",
+      "raw_sources.trace-provenance.tool_version: historical raw does not record the producing tool version",
+      "raw_sources.operators-rank0.tool_version: historical raw does not record the producing tool version",
+      "raw_sources.device-profiler.tool_version: historical raw does not record the producing tool version",
+      "raw_sources.profiler-step-boundaries.tool_version: historical raw does not record the producing tool version",
+      "alignment.launch_signatures.stream: native mcTracer normalization does not preserve stream identity, so stream is published as null"
+    ],
+    "raw_source_set_sha256": "de7fd391460698ba2f5d3ce7f4fe3446bdc262b0ccfed6c080ee2f87c944ce41"
+  },
+  "raw_sources": [
+    {
+      "archive_id": "case-metadata",
+      "bytes": 461,
+      "relative_path": "meta.json",
+      "role": "case-metadata",
+      "sha256": "2c0c42e6ada0bcaa4b0b2313e2ac7b7bbac463b340753c842c9d28334d364127",
+      "tool": "capture-metadata",
+      "tool_version": null
+    },
+    {
+      "archive_id": "arrival-schedule",
+      "bytes": 3059,
+      "relative_path": "arrival_schedule.json",
+      "role": "arrival-schedule",
+      "sha256": "18e482a76df4598cc5a659fde223b51f73b05c9233d276813a86d7958eee9577",
+      "tool": "workload-generator",
+      "tool_version": null
+    },
+    {
+      "archive_id": "serving-metrics",
+      "bytes": 33223,
+      "relative_path": "serving_metrics.json",
+      "role": "serving-metrics",
+      "sha256": "841e9dd5a1060cdcad29b5e51892ad0ad829da1e63f3d726f69e771f99b0db6c",
+      "tool": "serving-runtime",
+      "tool_version": null
+    },
+    {
+      "archive_id": "scheduler",
+      "bytes": 521675,
+      "relative_path": "plugin_trace.json_scheduler.jsonl",
+      "role": "scheduler",
+      "sha256": "c6e6e326f7a539347847d54d05ef714b0cde63935859e123ce6a81d9d42b4a07",
+      "tool": "vllm-scheduler-trace",
+      "tool_version": null
+    },
+    {
+      "archive_id": "trace-provenance",
+      "bytes": 3285,
+      "relative_path": "plugin_trace.json_provenance.json",
+      "role": "trace-provenance",
+      "sha256": "f8d818bf6afb421ae7899d78c1dea4687c70f67aa827dfc3442ad1ad5c4d14de",
+      "tool": "vllm-operator-trace",
+      "tool_version": null
+    },
+    {
+      "archive_id": "operators-rank0",
+      "bytes": 78089551,
+      "relative_path": "plugin_trace.json_operators.jsonl.rank0",
+      "role": "operators-rank0",
+      "sha256": "a8d9561a8a0cb49c8f9bcc4952461e4c1f5a379590812dee42c1e7bf71061cd9",
+      "tool": "vllm-operator-trace",
+      "tool_version": null
+    },
+    {
+      "archive_id": "device-profiler",
+      "bytes": 3164914286,
+      "relative_path": "mctracer_out/mctracer-443.json",
+      "role": "device-profiler",
+      "sha256": "b73ada50a122888ac308488f4f29a4506429eda71b77071f6bf432f6b9a8b1d2",
+      "tool": "mcTracer",
+      "tool_version": null
+    },
+    {
+      "archive_id": "profiler-step-boundaries",
+      "bytes": 43032,
+      "relative_path": ".mctracer_sync_ends_0.json",
+      "role": "profiler-step-boundaries",
+      "sha256": "6cb40c0ac3004936f943453b2d7633b691b76bd5bb80d524269e36bcb6065b05",
+      "tool": "mcTracer",
+      "tool_version": null
+    },
+    {
+      "archive_id": "production-ground-truth",
+      "bytes": 55841,
+      "relative_path": "ground_truth.json",
+      "role": "production-ground-truth",
+      "sha256": "bdc278f2063659a1b69e0eeeaeaa9d7a7b16dd7cf1e90578b6262c7be0dae560",
+      "tool": "vllm-serving-runtime",
+      "tool_version": "0.8.5"
+    },
+    {
+      "archive_id": "accepted-ground-truth-v3",
+      "bytes": 63078,
+      "relative_path": "llama-3.1-8b_tp1_qps4/result.json",
+      "role": "accepted-ground-truth",
+      "sha256": "f00e0ac4e851bb0c17484f3a211e3e9467b75eafb08fa00ddbbe208342e619f4",
+      "tool": "midlayer-sharegpt-ground-truth",
+      "tool_version": "1"
+    },
+    {
+      "archive_id": "accepted-scheduler-trace-v3",
+      "bytes": 5594556,
+      "relative_path": "llama-3.1-8b_tp1_qps4/scheduler_steps.jsonl",
+      "role": "accepted-scheduler-trace",
+      "sha256": "e2549896a9e175a43bbd0f6ea919af658564ab00743c1e848880663b218824b3",
+      "tool": "midlayer-vllm-scheduler-trace",
+      "tool_version": "2"
+    },
+    {
+      "archive_id": "scheduler-observer-effect-v1",
+      "bytes": 463,
+      "relative_path": "nonpd/observer_effect_representative.json",
+      "role": "scheduler-observer-effect",
+      "sha256": "e00d8bb6a3642d435c1fa9b7f94b2299c7978ed0d172a134c045cd61dc5ab041",
+      "tool": "midlayer-scheduler-trace-ab",
+      "tool_version": "1"
+    }
+  ],
+  "requests": {
+    "cached_hit_value_evidence": {
+      "derivation": "full_scheduler_token_conservation",
+      "kind": "scheduler_equivalent_representative",
+      "logical_prefix_hit_observability": "unavailable",
+      "net_prefix_work_reduction_tokens": 0,
+      "raw_source_set_sha256": "de7fd391460698ba2f5d3ce7f4fe3446bdc262b0ccfed6c080ee2f87c944ce41",
+      "representative_value": 0,
+      "source_archive_ids": [
+        "accepted-ground-truth-v3",
+        "accepted-scheduler-trace-v3"
+      ]
+    },
+    "field_provenance": {
+      "Cached hit [tokens]": {
+        "kind": "scheduler_equivalent_representative",
+        "reason": "logical H unavailable; accepted Scheduler trace proves equivalent zero net prefix-work reduction",
+        "source_archive_id": null
+      },
+      "In Token [tokens]": {
+        "kind": "requested",
+        "reason": null,
+        "source_archive_id": "accepted-ground-truth-v3"
+      },
+      "Out Token [tokens]": {
+        "kind": "requested",
+        "reason": null,
+        "source_archive_id": "accepted-ground-truth-v3"
+      },
+      "Query Time Stamp [ms]": {
+        "kind": "requested",
+        "reason": null,
+        "source_archive_id": "accepted-ground-truth-v3"
+      }
+    },
+    "path": "requests.csv",
+    "row_count": 128,
+    "sha256": "97179945527a1c0b844e0cf5fbf5f5ea013e8d83ec5c5cc5e6de88e6a0894c79"
+  },
+  "runtime": {
+    "capture_enable_prefix_caching": true,
+    "deployment": null,
+    "dtype": "bfloat16",
+    "expert_parallel_size": 1,
+    "pipeline_parallel_size": 1,
+    "runtime_version": "0.24.0",
+    "scheduler_config_sha256": null,
+    "scheduler_pipeline_depth": 2,
+    "scheduler_pipeline_depth_evidence": {
+      "configured_depth": 2,
+      "executor_class": "vllm.v1.executor.uniproc_executor.UniProcExecutor",
+      "pipeline_parallel_size": 1,
+      "runtime_version": "0.24.0",
+      "source_field": "vllm_config.max_concurrent_batches",
+      "source_identity": {
+        "module_file": "/opt/conda/lib/python3.12/site-packages/vllm/config/vllm.py",
+        "module_name": "vllm.v1.executor.uniproc_executor"
+      },
+      "source_kind": "runtime_vllm_config_field"
+    },
+    "seed": 42,
+    "source_commit": null,
+    "target_qps": 4.0,
+    "tensor_parallel_size": 1
+  },
+  "scheduler_steps": {
+    "compressed_sha256": "fc2bdb0f1a66046955d07486131a389db8d130ce2696927cb44152d73aa5292b",
+    "compression": "zstd",
+    "path": "scheduler_steps.jsonl.zst",
+    "provenance": {
+      "buffering": "in_memory_append_then_single_write",
+      "capture_run_id": "llama-3.1-8b_tp1_qps4/result.json",
+      "instrumentation_id": "midlayer-vllm-scheduler-trace",
+      "instrumentation_version": 2,
+      "profiler_attached": false,
+      "source_archive_id": "accepted-scheduler-trace-v3",
+      "source_sha256": "e2549896a9e175a43bbd0f6ea919af658564ab00743c1e848880663b218824b3"
+    },
+    "row_count": 2327,
+    "sha256": "b1e3f725390ad42d9123021364711ec78249c19267d674403cf00a1a75e22512",
+    "timing_boundary": {
+      "clock": "time.perf_counter_ns",
+      "origin": "first_scheduler_step_start",
+      "schedule_end": "immediately_after_scheduler_schedule",
+      "step_end": "immediately_after_scheduler_output_update",
+      "step_start": "immediately_before_scheduler_schedule",
+      "update_start": "immediately_before_scheduler_output_update"
+    }
+  },
+  "schema_version": 5
+}

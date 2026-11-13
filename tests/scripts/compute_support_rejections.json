@@ -1,0 +1,242 @@
+{
+  "005-midlayer": {
+    "message": "analytical HCCS requires its Ascend910B hardware identity",
+    "stage": "prefill-plan",
+    "type": "ValueError"
+  },
+  "005-roofline": {
+    "message": "analytical HCCS requires its Ascend910B hardware identity",
+    "stage": "prefill-plan",
+    "type": "ValueError"
+  },
+  "007-midlayer": {
+    "message": "analytical MetaXLink requires its C500 hardware identity",
+    "stage": "prefill-plan",
+    "type": "ValueError"
+  },
+  "007-roofline": {
+    "message": "analytical MetaXLink requires its C500 hardware identity",
+    "stage": "prefill-plan",
+    "type": "ValueError"
+  },
+  "013-midlayer": {
+    "message": "analytical HCCS requires its Ascend910B hardware identity",
+    "stage": "prefill-plan",
+    "type": "ValueError"
+  },
+  "013-roofline": {
+    "message": "analytical HCCS requires its Ascend910B hardware identity",
+    "stage": "prefill-plan",
+    "type": "ValueError"
+  },
+  "015-midlayer": {
+    "message": "analytical MetaXLink requires its C500 hardware identity",
+    "stage": "prefill-plan",
+    "type": "ValueError"
+  },
+  "015-roofline": {
+    "message": "analytical MetaXLink requires its C500 hardware identity",
+    "stage": "prefill-plan",
+    "type": "ValueError"
+  },
+  "021-midlayer": {
+    "message": "analytical HCCS requires its Ascend910B hardware identity",
+    "stage": "prefill-plan",
+    "type": "ValueError"
+  },
+  "021-roofline": {
+    "message": "analytical HCCS requires its Ascend910B hardware identity",
+    "stage": "prefill-plan",
+    "type": "ValueError"
+  },
+  "023-midlayer": {
+    "message": "analytical MetaXLink requires its C500 hardware identity",
+    "stage": "prefill-plan",
+    "type": "ValueError"
+  },
+  "023-roofline": {
+    "message": "analytical MetaXLink requires its C500 hardware identity",
+    "stage": "prefill-plan",
+    "type": "ValueError"
+  },
+  "030-midlayer": {
+    "message": "analytical HCCS requires its Ascend910B hardware identity",
+    "stage": "prefill-plan",
+    "type": "ValueError"
+  },
+  "030-roofline": {
+    "message": "analytical HCCS requires its Ascend910B hardware identity",
+    "stage": "prefill-plan",
+    "type": "ValueError"
+  },
+  "031-midlayer": {
+    "message": "analytical MetaXLink requires its C500 hardware identity",
+    "stage": "prefill-plan",
+    "type": "ValueError"
+  },
+  "031-roofline": {
+    "message": "analytical MetaXLink requires its C500 hardware identity",
+    "stage": "prefill-plan",
+    "type": "ValueError"
+  },
+  "032-midlayer": {
+    "message": "declared vLLM source API inputs have no supported common forward; legacy fallback is forbidden",
+    "stage": "construct",
+    "type": "NotImplementedError"
+  },
+  "032-roofline": {
+    "message": "declared vLLM source API inputs have no supported common forward; legacy fallback is forbidden",
+    "stage": "construct",
+    "type": "NotImplementedError"
+  },
+  "033-midlayer": {
+    "message": "declared vLLM source API inputs have no supported common forward; legacy fallback is forbidden",
+    "stage": "construct",
+    "type": "NotImplementedError"
+  },
+  "033-roofline": {
+    "message": "declared vLLM source API inputs have no supported common forward; legacy fallback is forbidden",
+    "stage": "construct",
+    "type": "NotImplementedError"
+  },
+  "034-midlayer": {
+    "message": "declared vLLM source API inputs have no supported common forward; legacy fallback is forbidden",
+    "stage": "construct",
+    "type": "NotImplementedError"
+  },
+  "034-roofline": {
+    "message": "declared vLLM source API inputs have no supported common forward; legacy fallback is forbidden",
+    "stage": "construct",
+    "type": "NotImplementedError"
+  },
+  "035-midlayer": {
+    "message": "declared vLLM source API inputs have no supported common forward; legacy fallback is forbidden",
+    "stage": "construct",
+    "type": "NotImplementedError"
+  },
+  "035-roofline": {
+    "message": "declared vLLM source API inputs have no supported common forward; legacy fallback is forbidden",
+    "stage": "construct",
+    "type": "NotImplementedError"
+  },
+  "036-midlayer": {
+    "message": "declared vLLM source API inputs have no supported common forward; legacy fallback is forbidden",
+    "stage": "construct",
+    "type": "NotImplementedError"
+  },
+  "036-roofline": {
+    "message": "declared vLLM source API inputs have no supported common forward; legacy fallback is forbidden",
+    "stage": "construct",
+    "type": "NotImplementedError"
+  },
+  "037-midlayer": {
+    "message": "declared vLLM source API inputs have no supported common forward; legacy fallback is forbidden",
+    "stage": "construct",
+    "type": "NotImplementedError"
+  },
+  "037-roofline": {
+    "message": "declared vLLM source API inputs have no supported common forward; legacy fallback is forbidden",
+    "stage": "construct",
+    "type": "NotImplementedError"
+  },
+  "045-midlayer": {
+    "message": "symbolic GLM requires declared indexer cardinality and workspace entry history",
+    "stage": "construct",
+    "type": "ValueError"
+  },
+  "045-roofline": {
+    "message": "symbolic GLM requires declared indexer cardinality and workspace entry history",
+    "stage": "construct",
+    "type": "ValueError"
+  },
+  "046-midlayer": {
+    "message": "symbolic GLM requires declared indexer cardinality and workspace entry history",
+    "stage": "construct",
+    "type": "ValueError"
+  },
+  "046-roofline": {
+    "message": "symbolic GLM requires declared indexer cardinality and workspace entry history",
+    "stage": "construct",
+    "type": "ValueError"
+  },
+  "047-midlayer": {
+    "message": "symbolic GLM requires declared indexer cardinality and workspace entry history",
+    "stage": "construct",
+    "type": "ValueError"
+  },
+  "047-roofline": {
+    "message": "symbolic GLM requires declared indexer cardinality and workspace entry history",
+    "stage": "construct",
+    "type": "ValueError"
+  },
+  "050-midlayer": {
+    "message": "ordinary K3 execution requires Scheduler token IDs and hybrid cache coordinates",
+    "stage": "prefill-plan",
+    "type": "ValueError"
+  },
+  "050-roofline": {
+    "message": "ordinary K3 execution requires Scheduler token IDs and hybrid cache coordinates",
+    "stage": "prefill-plan",
+    "type": "ValueError"
+  },
+  "054-midlayer": {
+    "message": "DeepSeek-V3 L32 has no bound symbolic Serving source in this snapshot",
+    "stage": "construct",
+    "type": "NotImplementedError"
+  },
+  "054-roofline": {
+    "message": "DeepSeek-V3 L32 has no bound symbolic Serving source in this snapshot",
+    "stage": "construct",
+    "type": "NotImplementedError"
+  },
+  "055-midlayer": {
+    "message": "DSpark draft requires its separate target-hidden/proposer source; ordinary V4 target execution is unavailable",
+    "stage": "prefill-plan",
+    "type": "NotImplementedError"
+  },
+  "055-roofline": {
+    "message": "DSpark draft requires its separate target-hidden/proposer source; ordinary V4 target execution is unavailable",
+    "stage": "prefill-plan",
+    "type": "NotImplementedError"
+  },
+  "056-midlayer": {
+    "message": "DSpark draft requires its separate target-hidden/proposer source; ordinary V4 target execution is unavailable",
+    "stage": "prefill-plan",
+    "type": "NotImplementedError"
+  },
+  "056-roofline": {
+    "message": "DSpark draft requires its separate target-hidden/proposer source; ordinary V4 target execution is unavailable",
+    "stage": "prefill-plan",
+    "type": "NotImplementedError"
+  },
+  "058-midlayer": {
+    "message": "declared vLLM source API inputs have no supported common forward; legacy fallback is forbidden",
+    "stage": "construct",
+    "type": "NotImplementedError"
+  },
+  "058-roofline": {
+    "message": "declared vLLM source API inputs have no supported common forward; legacy fallback is forbidden",
+    "stage": "construct",
+    "type": "NotImplementedError"
+  },
+  "059-midlayer": {
+    "message": "declared vLLM source API inputs have no supported common forward; legacy fallback is forbidden",
+    "stage": "construct",
+    "type": "NotImplementedError"
+  },
+  "059-roofline": {
+    "message": "declared vLLM source API inputs have no supported common forward; legacy fallback is forbidden",
+    "stage": "construct",
+    "type": "NotImplementedError"
+  },
+  "060-midlayer": {
+    "message": "declared vLLM source API inputs have no supported common forward; legacy fallback is forbidden",
+    "stage": "construct",
+    "type": "NotImplementedError"
+  },
+  "060-roofline": {
+    "message": "declared vLLM source API inputs have no supported common forward; legacy fallback is forbidden",
+    "stage": "construct",
+    "type": "NotImplementedError"
+  }
+}
