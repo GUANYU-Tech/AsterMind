@@ -5,9 +5,8 @@ operator switch in Execution. Whole-operation intra predictions remain intact.
 """
 from dataclasses import asdict, dataclass
 from .formation import FormationEstimator
-from .frame_surrogate import FrameRoutes, NoRouteError
+from .frame_surrogate import NoRouteError
 from .task import CommunicationTask
-from .intra_hierarchical import estimate_hierarchical
 from .policy import resolve_task_policy
 
 

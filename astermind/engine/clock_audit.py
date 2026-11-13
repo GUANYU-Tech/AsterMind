@@ -2,6 +2,7 @@
 
 import math
 
+from astermind.engine.audit import migration_barrier_valid
 from astermind.engine.clock import CLOCK
 from astermind.engine.service_precision import bandwidth_check
 from astermind.engine.timeline import nanoseconds
@@ -16,25 +17,6 @@ def computation_duration_valid(call, clock):
     # A native deadline is rounded upward once to a representable double.
     budget = math.ceil((math.ulp(start/1e18)+math.ulp(end/1e18))*1e18)+2
     return expected <= end-start <= expected+budget
-
-
-def migration_barrier_valid(migration, terminals):
-    """Compare one clock representation; legacy ns displays round upward."""
-    try:
-        if not terminals or any(event is None or event['kind'] != 'completed' for event in terminals):
-            return False
-        if 'network_complete_time_ticks' in migration:
-            barrier = int(migration['network_complete_time_ticks'])
-            return (barrier >= 0
-                    and int(migration['completed_time_ticks']) >= barrier
-                    and all(0 <= int(event['time_ticks']) <= barrier for event in terminals))
-        # Old files have no exact migration stamp. Their integer ns completion
-        # fields must be compared to the same ceil-ns projection of the barrier.
-        barrier = nanoseconds(migration['network_complete_time_s'])
-        return (migration['completed_time_s'] >= migration['network_complete_time_s']
-                and all(event['completion_time_ns'] <= barrier for event in terminals))
-    except (KeyError, TypeError, ValueError, OverflowError):
-        return False
 
 
 def clock_checks(result):

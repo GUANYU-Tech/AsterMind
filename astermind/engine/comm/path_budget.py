@@ -64,8 +64,6 @@ def isolated_path_ns(routes, route, size, policy):
         if key not in capacities:
             raise ValueError(f'missing shared capacity pool: {key}')
         limits.append(capacities[key] / coefficient)
-    if budget['local_cap'] is not None:
-        limits.append(budget['local_cap'])
     if not limits or min(limits) <= 0:
         raise ValueError('path has no positive effective capacity')
     return ceil(budget['startup'] + size / min(limits) + budget['tail'])
@@ -74,7 +72,7 @@ def isolated_path_ns(routes, route, size, policy):
 def path_budget(routes,route,size,policy):
     edges=routes.route_resources(route);settings=policy.inter_parameters
     frame=mean_frame_budget(size,settings)
-    demand={};local_caps=[];tail=0.;has_isl=False;records=[]
+    demand={};tail=0.;has_isl=False;records=[]
     for edge in edges:
         same=edge['source_owner']==edge['target_owner']
         ground=not same and bool({edge['source_owner'],edge['target_owner']} & routes.ground_owners)
@@ -105,6 +103,6 @@ def path_budget(routes,route,size,policy):
         records.append(dict(resource=str(key),capacity_basis=basis,applied_costs=sorted(applied),
             application_bytes=size,equivalent_resource_bytes=size*cost,coefficient=cost,
             kind='ground' if ground else 'isl',processing_ns=processing))
-    return dict(demand=demand,local_cap=min(local_caps,default=None),tail=tail,
+    return dict(demand=demand,tail=tail,
         startup=settings.startup_us*1000 if has_isl else 0.,path_keys=tuple(route['resources']),
         path=route['path'],budgets=records)

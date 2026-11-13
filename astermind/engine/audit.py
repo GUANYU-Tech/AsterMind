@@ -3,6 +3,26 @@ import argparse
 import json
 from pathlib import Path
 from astermind.engine.clock import Time
+from astermind.engine.timeline import nanoseconds
+
+
+def migration_barrier_valid(migration, terminals):
+    """Compare one clock representation; legacy ns displays round upward."""
+    try:
+        if not terminals or any(event is None or event['kind'] != 'completed' for event in terminals):
+            return False
+        if 'network_complete_time_ticks' in migration:
+            barrier = int(migration['network_complete_time_ticks'])
+            return (barrier >= 0
+                    and int(migration['completed_time_ticks']) >= barrier
+                    and all(0 <= int(event['time_ticks']) <= barrier for event in terminals))
+        # Old files have no exact migration stamp. Their integer ns completion
+        # fields must be compared to the same ceil-ns projection of the barrier.
+        barrier = nanoseconds(migration['network_complete_time_s'])
+        return (migration['completed_time_s'] >= migration['network_complete_time_s']
+                and all(event['completion_time_ns'] <= barrier for event in terminals))
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
 
 
 def audit_estimate(estimate):
@@ -93,7 +113,6 @@ def audit(result):
         if migration['state']!='completed':continue
         events=[transfers[p['transfer_id']] for p in migration['partitions']]
         assert all(e['kind']=='completed' for e in events),migration
-        from astermind.engine.clock_audit import migration_barrier_valid
         assert migration_barrier_valid(migration,events),migration
         assert sum(e['size_bytes'] for e in events)==migration['bytes'],migration
     batches={(b['cell_id'],b['pool_name'],b['step_id']):b for b in result['batches']}

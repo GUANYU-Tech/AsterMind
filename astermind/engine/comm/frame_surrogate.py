@@ -81,7 +81,6 @@ class FrameRoutes:
             satellite=v.satellite_id) for n,v in frame.node_states.items()})
         self.adj={n:[] for n in frame.node_states}
         self.edges={}
-        self.route_cache={}
         for link in frame.established_topology_graph:
             a,b=link.source_node_id,link.target_node_id
             if any(k in link.attributes for k in ("reverse_bandwidth_bps","reverse_bandwidth_gbps","reverse_latency_ns","reverse_propagation_delay_s")):

@@ -404,3 +404,65 @@ Evidence on SeeSpace1 is under
 archives, `distribution-complete/` and `browser-evidence/`. Commands and scenario
 coverage are maintained in `tests/README.md`. No generated native binary or raw
 result artifact is committed; this iteration is committed locally without a push.
+
+## Unused-code and audit-boundary cleanup (2026-11-13)
+
+Baseline: `0f8975a6260dd9c6f93873823d172f5123482df1`, on
+`version/AsterMind-V1.0`. This section supersedes the earlier layout-migration
+decision to retain `validate_scene_config`; that statement records historical scope.
+
+Scope is limited to deleting unconsumed `engine/contracts.py`, `engine/timing.py`
+and `builder/validation.py`; removing unused Cell/Comm fields, initialization and
+imports, including the always-None local capacity branch; and moving
+`migration_barrier_valid` unchanged into the mainline `engine/audit.py`.
+`clock_audit.py` re-exports that helper for existing callers. Its historical kernel
+and clock checks are unchanged. No validation rules were transferred into
+`config.py` or `request_batch.py`.
+
+Physical Builder organization, independent network/scheduling APIs, prediction
+cache, route/link policy, model algorithms, native allocator and `viz/` are
+unchanged. Imported source remains `9c08c9cad81df5a4fee5e606114753df8dab6c2d`:
+3,624 file mappings, 3,604 byte-identical and 20 adapted. Only five target hashes
+and the cleanup explanation changed; all source hashes and identity are retained.
+
+Validation:
+
+- Each batch passed its relevant smoke tests: 37 communication/Cell/boundary
+  tests, 20 audit/clock/replay tests and 22 request/boundary tests, plus CLI
+  scenario validation.
+- All 423 retained tests pass with no skips: the original 418 remain unchanged,
+  with five new audit compatibility tests. They cover exact ticks, legacy ceil-ns
+  projection, early commit, late/negative delivery, absent/failed partitions and
+  malformed evidence through both import paths.
+- A fresh process forbids importing `clock_audit` while auditing a completed KV
+  migration. Both real normal-E2E reports pass under the new mainline audit;
+  the same guard fails on the baseline's former lazy import, proving sensitivity.
+- Before/after comparison: 22 static communication estimates, 24 dynamic Comm
+  oracle cases, 12 compute plans and 9,576 local predictions are exactly equal.
+- All eight native reports pass audit and have exactly equal simulated records:
+  DS01 in both compute modes and both intra modes (four), DS03 TP2/PP2 in both
+  compute modes (two), and normal full-platform E2E in both modes (two). Each E2E
+  includes 8 moving satellites, 2 grounds, 4 TP2 Cells, 6 requests and KV migration.
+  Only explicit host observations are excluded: phase/startup/event-loop/Comm
+  wall timings, worker PIDs, available host memory and startup memory slots.
+  Source/output path prefixes are rebased; simulated clocks, events, plans,
+  allocations, bytes, failures and semantic measurements are compared exactly.
+- Three real historical KV reports have byte-identical audit output; the
+  supported historical replay fixture, catalog and frontend assets also export
+  byte-identically. Older raw reports containing removed backend/timeline config
+  fields are rejected identically by baseline and candidate. This pre-existing
+  limitation is recorded, not repaired by changing the frontend or configuration.
+- sdist -> wheel -> installation outside source passes: 130 modules imported,
+  pinned resources checked, native helpers built, actual vLLM 0.31 and 0.30 CLI
+  simulations and audits pass. The three deleted modules are absent from both
+  distributions and the installation.
+- Different-model review approves the change with no Critical/Required findings;
+  Brooks review finds no new decay risk in this scope. Source/scope checks verify
+  the unchanged migration helper and historical checks, untouched protected
+  modules, and the five updated imported target hashes. Git diff checks pass.
+
+Evidence is under `/data1/guolidong/.astermind-cleanup-20261113/`. The baseline
+reports are reused from `.astermind-boundary-audit-j1di17c7/results/baseline/`;
+all 3,957 tracked files of that frozen source were rechecked against the baseline
+Git blobs. Candidate tests and reports are fresh executions using the same Python
+3.12 / pinned vLLM 0.31 and 0.30 setup. No dependency versions were changed.

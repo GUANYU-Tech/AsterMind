@@ -4,12 +4,12 @@ Only external resources compete. GPU-to-terminal access is omitted;
 intra-only traffic retains surrogate timing. GlobalTimeline owns all events.
 """
 from dataclasses import asdict,dataclass
-from math import ceil,isfinite
+from math import isfinite
 from astermind.engine.clock import Time
 from astermind.engine.timeline import nanoseconds
 from time import perf_counter
 from .flow_allocator import FlowAllocator
-from .frame_surrogate import FrameRoutes,NoRouteError,CommunicationRouting
+from .frame_surrogate import NoRouteError,CommunicationRouting
 from .planner import plan_communication
 from .operator import OperatorEstimate
 from .path_budget import path_budget, resource_capacities
@@ -125,7 +125,6 @@ class RuntimeCommunication(CommunicationRouting):
         self.stats['max_path_links']=max(self.stats['max_path_links'],len(route['resources']))
         same=routes.topology.devices[f['source']].satellite==routes.topology.devices[f['target']].satellite
         if same and all(e['source_owner']==e['target_owner'] for e in routes.route_resources(route)):
-            effective=self.tasks[f['task']].get('policy',self.policy)
             f['state']='local'
             if all(routes.topology.devices[n].kind=='gpu' for n in (f['source'],f['target'])):
                 from .intra_topology import p2p_ns
@@ -176,7 +175,6 @@ class RuntimeCommunication(CommunicationRouting):
                 if updated['demand']!=f['budget']['demand']:
                     self._fail(f['task'],'protocol/resource membership changed during active attempt')
                 else:
-                    f['budget']['local_cap']=updated['local_cap']
                     # Sending/startup phases use the latest sampled propagation.
                     # Once the tail is scheduled, its arrival time is not rewritten.
                     f['budget']['tail']=updated['tail']

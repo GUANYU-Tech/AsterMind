@@ -87,7 +87,6 @@ class RuntimeCellNetwork:
         )
         self._listeners = []
         self.boundary_listeners = []
-        self._jobs = {}
         self.events = []
         self.closed = False
 

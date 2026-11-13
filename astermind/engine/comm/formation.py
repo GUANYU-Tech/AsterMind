@@ -1,10 +1,6 @@
 """Collective rules with topology-adapted intra and isolated whole-path Inter."""
 from dataclasses import replace
-from itertools import permutations
-from functools import lru_cache
-from math import ceil, isfinite
 
-from ._vendor.intra_theory import whitebox_surrogate_v2 as theory
 from .estimator import CommunicationEstimator, Estimate
 from .task import CommunicationTask
 
@@ -19,21 +15,6 @@ class FormationEstimator(CommunicationEstimator):
         self.settings = self.policy.inter_parameters
         self.ground = set(ground_owners)
         self.intra_hierarchy=intra_hierarchy
-        self.models = {"sendrecv": theory.make_h200_sendrecv_theory(),
-                       "allreduce": theory.make_h200_ring_theory(),
-                       "allgather": theory.make_h200_ring_theory(),
-                       "alltoall": theory.make_h200_alltoall_theory()}
-        self.intra_ns = lru_cache(maxsize=256)(self._intra_ns)
-        self.fabric_models={"tree":theory.make_h200_tree_theory(),
-                            "fullmesh":theory.make_h200_fullmesh_theory()}
-
-    def _intra_ns(self, operation, size, ranks):
-        if not size:
-            return 0
-        us = self.models[operation].predict(size, ranks, "ring", 128, collective=operation)
-        if not isfinite(us) or us < 0:
-            raise ValueError("invalid configured intra mean")
-        return ceil(us * 1000)
 
     def for_hardware(self, hardware, method):
         if hardware.hardware_id != "nvidia_h200":

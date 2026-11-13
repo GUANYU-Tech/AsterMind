@@ -21577,7 +21577,7 @@
       "source": "src/network_sim/comm/planner.py",
       "target": "astermind/engine/comm/planner.py",
       "source_sha256": "31de28217a399c25516211e0acd33537e5805c98fcc2387020c7181e6920e520",
-      "target_sha256": "64ab07bc63816fc5cdc840cee5000934719b78a5a0067e7693d2f261fd47de2a"
+      "target_sha256": "2b72da80f5b3391bb0db6ae2cf9374ec49ac62ed5d13e82d011fff3c5e01375c"
     },
     {
       "source": "src/network_sim/comm/task.py",
@@ -21595,13 +21595,13 @@
       "source": "src/network_sim/comm/path_budget.py",
       "target": "astermind/engine/comm/path_budget.py",
       "source_sha256": "7720f7504aacb908280d69286a82313bcde5a331935c6f2f4d863f1c466c24a2",
-      "target_sha256": "85dad5673a4cbc8626c4f40297031f135a14402e0de6a6a3a70bad9db8b80b57"
+      "target_sha256": "f2a7fc965910b10ee205e32efa7899adf17f65b382866a19dc13642519c193b5"
     },
     {
       "source": "src/network_sim/comm/formation.py",
       "target": "astermind/engine/comm/formation.py",
       "source_sha256": "30b4326f8d9733c3183dfecbd83a4fbf247fe1ecc6e314289e80fd659c22fe80",
-      "target_sha256": "30b4326f8d9733c3183dfecbd83a4fbf247fe1ecc6e314289e80fd659c22fe80"
+      "target_sha256": "32a1ed3c8dd97b2afc33d21574a771ef4d72be16be7cf1c3588df47d59315ea4"
     },
     {
       "source": "src/network_sim/comm/intra_topology.py",
@@ -21631,13 +21631,13 @@
       "source": "src/network_sim/comm/frame_surrogate.py",
       "target": "astermind/engine/comm/frame_surrogate.py",
       "source_sha256": "40ce8d4e79bb0d018b57187014b5fa4cbf24ae51dff9e5c18b48c314c51aeebd",
-      "target_sha256": "d0ef4743b8fffc1fe35a96190b9f36baff790a1392a305bfcf789fc3b3ca53b3"
+      "target_sha256": "e8466b158434937e3480fa410c9886ad2b8661bf9efa8f48d16bcb8dfb46824d"
     },
     {
       "source": "src/network_sim/comm/event_runtime.py",
       "target": "astermind/engine/comm/event_runtime.py",
       "source_sha256": "f7d85c773dfa303b45d1311478cf74eb0a7c7c7489ece0bb0b947d568e11bdbf",
-      "target_sha256": "fe49d94d084838b3b1b875dc59da6d0543ce019ef8e4874e48b8714539d0b16e"
+      "target_sha256": "07285c08b194227bcc3c549d17945ea74396bb2ce27dd41ae5d44be856131408"
     },
     {
       "source": "src/network_sim/comm/native_intra.py",
@@ -21770,6 +21770,7 @@
     "comm/frame_surrogate.py": "Removed source route algorithms and policy selector; FrameRoutes only projects resources; TargetRoutes delegates to existing NetworkState.",
     "comm/path_budget.py": "Explicit target terminal gate coefficient 1 and once-per-path accounting, compatible with heterogeneous adjacent capacity bases. Physical RF costs remain additive.",
     "comm/target_network.py": "New boundary projection of target device/physical state, current load forecasting, full-path availability and original route/cache delegation.",
-    "compute/upstream/": "Native model algorithms/calibration/vendor files unchanged. vllm_scheduler_process.py only retains parent PYTHONPATH after source paths, so exact host Time objects can be unpickled in an installed .30 worker."
+    "compute/upstream/": "Native model algorithms/calibration/vendor files unchanged. vllm_scheduler_process.py only retains parent PYTHONPATH after source paths, so exact host Time objects can be unpickled in an installed .30 worker.",
+    "unused_comm_cleanup": "Remove verified unconsumed Comm initialization, fields and imports; preserve predictor, collective, allocator and effective path-budget behavior."
   }
 }
