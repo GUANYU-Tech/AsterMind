@@ -6,14 +6,16 @@ OrbitServe is a simulation platform for LEO compute constellations serving globa
 
 ```text
 astermind/
-  builder/      SimulationConfig, scene editing/validation and physical preparation
+  builder/      Configuration, scene editing/validation and physical preparation
+    config/     Scenario, resources, deployment, requests, network and communication
     orbit/      SGP4 propagation, frame conversion, visibility, sunlight and traces
     topology/   Device/Cell graph validation and native topology compilation
     physical/   Physical datasets, precomputation, loading and exports
   engine/       Simulation, clocks, transport, routing, faults, Cell/KV execution
     compute/    Pinned upstream compute snapshot and official vLLM Scheduler adapters
     comm/       Pinned upstream communication models and shared flow allocator
-    setup/      Network specifications and runtime resource setup
+    policies/   Request scheduling/admission, routing, connection and association
+    setup/      Live physical network construction, faults and runtime resource setup
     state/      Live network state, physical data access and caches
   workload/     Canonical workload contracts, loading and materialization
   experiments/  Native and physical CLI entry points
@@ -27,8 +29,10 @@ viz/            Static replay frontend and export.py
 Builder owns configuration and physical preparation. Engine owns simulation
 execution and mutable runtime state. Existing topology construction, physical
 sampling, fault handling and dynamic link updates keep their original timing.
-The physical loader and scene capability validator may instantiate Engine
-objects; neither is a replacement for the Native simulation entry point.
+Builder prepares physical inputs; `engine/setup/physical_runtime.py` creates
+live network state. The existing physical loader remains a compatibility entry
+that composes both steps, and scene capability validation may still instantiate
+Engine objects. Neither replaces the Native simulation entry point.
 
 
 See `CHANGELOG.md` for release history.

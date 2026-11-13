@@ -6,6 +6,27 @@ compute and Comm from `Communication_backend` `9c08c9cad81df5a4fee5e606114753df8
 keeping this branch's routing, physical Builder and automatic Cell assignment.
 `engine/compute/SOURCE.json` records per-file origins and adaptation boundaries.
 
+## Configuration and runtime ownership
+
+`builder/config/` groups configuration by domain: `scenario.py` composes the
+SimulationConfig; `resources.py` declares devices and links; `deployment.py`
+declares Cell placement and parallelism; `requests.py` declares requests and KV
+migrations; `network.py` describes physical network policies/resources;
+`communication.py` declares Comm options. Existing import paths remain aliases to
+the same classes, with their existing serialization identities.
+
+`engine/policies/` separates request scheduling (`scheduling.py`), readiness gates
+(`admission.py`), path selection (`routing.py`), candidate/connection priority
+(`connection.py`) and ground association (`association.py`). These rules operate
+on existing Engine owners. They do not introduce another queue, route cache,
+reservation table or network state. Native batch scheduling and communication
+collective selection remain in their original compute and Comm modules.
+
+`builder/physical/loading.py` prepares the dataset, validated network spec and
+orbit trace. `engine/setup/physical_runtime.py` realizes runtime faults, constructs
+the live network and applies explicit Cell link edits. The public `load_physics`
+entry composes these steps and retains temporary-resource ownership and cleanup.
+
 ## Setup
 
 Install the core package, prepare the required official Scheduler environment,

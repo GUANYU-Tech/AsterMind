@@ -21619,7 +21619,7 @@
       "source": "src/network_sim/comm/policy.py",
       "target": "astermind/engine/comm/policy.py",
       "source_sha256": "1de8dae82f0305e482860c20b918133cab3f32bdf05263f64e2d2c6599086473",
-      "target_sha256": "c1b665608b28449019313169f137c540eb902ca22862000cf379782406d6a3e6"
+      "target_sha256": "9e4c431ef18c6f382df950cc0bccb7eaa51d6cf654f744dd8aa554c7c03fea9d"
     },
     {
       "source": "src/network_sim/comm/operator.py",
@@ -21631,7 +21631,7 @@
       "source": "src/network_sim/comm/frame_surrogate.py",
       "target": "astermind/engine/comm/frame_surrogate.py",
       "source_sha256": "40ce8d4e79bb0d018b57187014b5fa4cbf24ae51dff9e5c18b48c314c51aeebd",
-      "target_sha256": "e8466b158434937e3480fa410c9886ad2b8661bf9efa8f48d16bcb8dfb46824d"
+      "target_sha256": "818e3074f4842a36944e2bd1d45f1c6036a75f11f7b8a3da0f139e733e8952e1"
     },
     {
       "source": "src/network_sim/comm/event_runtime.py",
@@ -21746,6 +21746,18 @@
       "target": "astermind/engine/compute/scheduler_runtime/requirements-vllm-0.31.lock",
       "source_sha256": "a9c362b6fdee3ab13dde5d27e4571928d10d3fa59ea50ab6b185af50685d393c",
       "target_sha256": "a9c362b6fdee3ab13dde5d27e4571928d10d3fa59ea50ab6b185af50685d393c"
+    },
+    {
+      "source": "src/network_sim/comm/policy.py",
+      "target": "astermind/builder/config/communication.py",
+      "source_sha256": "1de8dae82f0305e482860c20b918133cab3f32bdf05263f64e2d2c6599086473",
+      "target_sha256": "b6cfc50958f9292a8a135508845c40cf9278728a1c84ad4dc5982db18fbf45b1"
+    },
+    {
+      "source": "src/network_sim/comm/frame_surrogate.py",
+      "target": "astermind/builder/config/communication.py",
+      "source_sha256": "40ce8d4e79bb0d018b57187014b5fa4cbf24ae51dff9e5c18b48c314c51aeebd",
+      "target_sha256": "b6cfc50958f9292a8a135508845c40cf9278728a1c84ad4dc5982db18fbf45b1"
     }
   ],
   "import_transforms": {
@@ -21771,6 +21783,7 @@
     "comm/path_budget.py": "Explicit target terminal gate coefficient 1 and once-per-path accounting, compatible with heterogeneous adjacent capacity bases. Physical RF costs remain additive.",
     "comm/target_network.py": "New boundary projection of target device/physical state, current load forecasting, full-path availability and original route/cache delegation.",
     "compute/upstream/": "Native model algorithms/calibration/vendor files unchanged. vllm_scheduler_process.py only retains parent PYTHONPATH after source paths, so exact host Time objects can be unpickled in an installed .30 worker.",
-    "unused_comm_cleanup": "Remove verified unconsumed Comm initialization, fields and imports; preserve predictor, collective, allocator and effective path-budget behavior."
+    "unused_comm_cleanup": "Remove verified unconsumed Comm initialization, fields and imports; preserve predictor, collective, allocator and effective path-budget behavior.",
+    "builder/config/communication.py": "CommPolicy/CellCommPolicy and their constants relocated unchanged from original Comm modules; runtime resolver remains in Engine. Old class/import identities retained."
   }
 }

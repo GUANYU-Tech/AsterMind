@@ -4,41 +4,7 @@ The resolver changes plans, never resource IDs or runtime ownership. A task's
 ordered participants and data layout remain immutable when selecting an algorithm.
 """
 from dataclasses import replace
-from typing import Literal
-
-from pydantic import BaseModel, ConfigDict, Field, model_validator
-
-Scope = Literal['single_su', 'intra_cross_su', 'inter_satellite']
-ALGORITHMS = {
-    'all_reduce': frozenset(('ring', 'tree', 'fullmesh', 'hierarchical')),
-    'all_gather': frozenset(('ring', 'fullmesh', 'hierarchical')),
-    'all_to_all': frozenset(('pairwise', 'hierarchical')),
-    'all_gatherv': frozenset(('direct', 'pairwise')),
-    'reduce_scatterv': frozenset(('direct', 'pairwise')),
-    'broadcast': frozenset(('direct', 'pairwise')),
-    'send_recv': frozenset(('direct', 'send_recv')),
-}
-DEFAULT_ALGORITHMS = {
-    'all_reduce': 'ring', 'all_gather': 'ring', 'all_to_all': 'pairwise',
-    'all_gatherv': 'pairwise', 'reduce_scatterv': 'pairwise',
-    'broadcast': 'direct', 'send_recv': 'send_recv',
-}
-
-
-class CellCommPolicy(BaseModel):
-    model_config = ConfigDict(extra='forbid', frozen=True)
-    algorithms: dict[Scope, dict[str, str]] = Field(default_factory=dict)
-    intra_mode: Literal['surrogate', 'IntraSatelliteRoofline'] | None = None
-
-    @model_validator(mode='after')
-    def validate_algorithms(self):
-        for scope, operations in self.algorithms.items():
-            for operation, algorithm in operations.items():
-                if operation not in ALGORITHMS or algorithm not in ALGORITHMS[operation]:
-                    raise ValueError(f'unsupported Comm policy operation/algorithm: {operation}/{algorithm}')
-                if algorithm == 'hierarchical' and scope != 'intra_cross_su':
-                    raise ValueError('hierarchical is currently configurable only for intra_cross_su')
-        return self
+from astermind.builder.config.communication import Scope, ALGORITHMS, DEFAULT_ALGORITHMS, CellCommPolicy
 
 
 def resolve_task_policy(policy, task, routes):

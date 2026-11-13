@@ -2,31 +2,10 @@
 
 from collections import defaultdict
 import json
-from typing import Annotated, Literal
-
-from pydantic import Field
-
-from astermind.common.contracts import Contract
-from astermind.builder.config import Positive, SimulationConfig
+from astermind.builder.config import SimulationConfig
 
 
-class SceneDeployment(Contract):
-    compute_mode: Literal["midlayer", "roofline"] = "midlayer"
-    model: str = "configs/model/qwen3-8b.json"
-    hardware: str = "configs/hardware/nvidia_a800.yaml"
-    hardware_id: str = "nvidia_a800"
-    gpus_per_satellite: Annotated[int, Field(strict=True, ge=1, le=64)] = 1
-    tp: Positive = 2
-    pp: Positive = 2
-    expert_parallel: bool = False
-    expert_routing_seed: Annotated[int, Field(strict=True, ge=0)] | None = None
-    max_requests: Annotated[int, Field(strict=True, ge=1, le=1024)] = 4
-    max_model_len: Annotated[int, Field(strict=True, ge=2, le=131072)] = 128
-    max_batched_tokens: Positive = 32
-    num_kv_blocks: Positive = 64
-    gpu_link_bandwidth_gbps: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 1600
-    gpu_link_latency_ns: Annotated[int, Field(strict=True, ge=0)] = 200
-    communication: dict = Field(default_factory=dict)
+from astermind.builder.config.deployment import SceneDeployment
 
 
 def build_scene(

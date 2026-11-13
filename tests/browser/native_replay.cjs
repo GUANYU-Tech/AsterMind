@@ -18,6 +18,7 @@ const path = require('node:path');
   const catalog = await (await page.request.get(new URL('catalog.json', base).href)).json();
   assert(catalog.length >= 1);
   const cases = [];
+  let clockInstalled = false;
   const ready = async () => {
     await page.locator('#callDetails .call-name').waitFor();
     assert.equal(await page.locator('#error').isVisible(), false, await page.locator('#error').textContent());
@@ -40,9 +41,32 @@ const path = require('node:path');
     await page.reload({ waitUntil: 'networkidle' }); await ready();
     await page.locator('#speed').selectOption('0.02');
     await page.locator('#timeInput').fill('0'); await page.locator('#timeInput').dispatchEvent('change');
-    await page.locator('#play').click(); await page.waitForFunction(() => Number(document.querySelector('#time').value) > 0); await page.locator('#play').click();
+    await page.locator('#play').click();
+    await page.waitForFunction(() => Number(document.querySelector('#time').value) > 0);
+    // Short fixtures can finish before the next Playwright click. Pause only
+    // if still playing; clicking an already finished replay would restart it.
+    await page.evaluate(() => {
+      const button = document.querySelector('#play');
+      if (button.textContent.includes('暂停')) button.click();
+    });
     const paused = await time(); assert(paused > 0);
     await page.waitForTimeout(100); assert.equal(await time(), paused);
+    // Exercise an actual pause transition even if the small replay above
+    // auto-completed. The browser clock controls elapsed time, not app state.
+    if (!clockInstalled) {
+      await page.clock.install({ time: new Date('2026-01-01T00:00:00Z') });
+      clockInstalled = true;
+    }
+    await page.clock.pauseAt((await page.evaluate(() => Date.now())) + 1000);
+    await page.locator('#timeInput').fill('0'); await page.locator('#timeInput').dispatchEvent('change');
+    await page.locator('#play').click();
+    assert((await page.locator('#play').textContent()).includes('暂停'));
+    await page.clock.runFor(16);
+    await page.locator('#play').click();
+    assert((await page.locator('#play').textContent()).includes('播放'));
+    const frozen = await time();
+    await page.clock.runFor(1000); assert.equal(await time(), frozen);
+    await page.clock.resume();
     await page.locator('#speed').selectOption('5');
     await page.locator('#timeInput').fill('1'); await page.locator('#timeInput').dispatchEvent('change');
     assert.equal(await time(), 1e6);
@@ -102,15 +126,20 @@ const path = require('node:path');
     assert(await dependency.count()); await dependency.click();
     await page.locator('#search').fill('');
     const step = page.locator('#steps [data-step]').first();
-    assert(await step.count()); await step.click();
-    assert((await page.locator('#stepDetail').textContent()).trim().length > 0);
+    if (data.steps.length) {
+      assert(await step.count()); await step.click();
+      assert((await page.locator('#stepDetail').textContent()).trim().length > 0);
+    } else {
+      assert.equal(await step.count(), 0);
+    }
     const migration = page.locator('#migrations [data-flow]').first();
     if (await migration.count()) await migration.click();
     assert(await page.locator('#checks .check').count());
     await page.locator('details.source summary').click();
     assert((await page.locator('#sourceDetails').textContent()).trim().length > 0);
     await ready();
-    cases.push({ id: item.id, calls: data.calls.length, migrationLinks: await migration.count(), checks: await page.locator('#checks .check').count() });
+    cases.push({ id: item.id, calls: data.calls.length, steps: data.steps.length, pauseExercised: true,
+      migrationLinks: await migration.count(), checks: await page.locator('#checks .check').count() });
   }
   // Regression: retain a large call index, then switch to a shorter scene.
   let switching = 'single-case';
@@ -129,6 +158,7 @@ const path = require('node:path');
     else { assert.equal(visible, false, await page.locator('#error').textContent()); await ready(); switching = 'passed'; }
   }
   assert.deepEqual(errors, []); assert.deepEqual(failedResponses, []);
+  assert(cases.some(item => item.steps > 0), 'Step interaction needs a nonempty Scheduler fixture');
   const result = { cases, switching, errors, failedResponses };
   fs.writeFileSync(path.join(output, 'browser-result.json'), JSON.stringify(result, null, 2));
   console.log(JSON.stringify(result));

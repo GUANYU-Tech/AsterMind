@@ -68,3 +68,11 @@ unittest discover -s tests/external/islsim -v`. Historical validation records in
 WideEP fixtures disable per-allocation service dumps (`trace_service=false`) to
 avoid quadratic trace volume; operator/dependency/failure records and aggregate
 Comm statistics remain. Resource-conservation tests retain full allocation evidence.
+
+## Structural equivalence gate
+
+See [STRUCTURE_VALIDATION.md](STRUCTURE_VALIDATION.md) for the complete regression
+runner, exact baseline comparator, configuration and policy matrices, compute
+support boundaries, native WideEP/PD coverage, browser checks and the explicitly
+accepted ISLSim external-adapter limitation. The full gate invokes the existing
+branch test scripts; partial/discovery runs cannot certify acceptance.

@@ -10,6 +10,7 @@ from copy import copy, deepcopy
 from typing import Any
 
 from astermind.engine.association import select_ground_links
+from astermind.engine.policies.connection import connection_priority
 from astermind.engine.topology import candidate_links
 from astermind.engine.setup.network_spec import NetworkSpec
 from astermind.engine.setup.radio_capacity import capacity_pools, directional_profile, hop_pools, radio_parameters
@@ -424,19 +425,7 @@ class NetworkState:
                 for node in (edge["endpoint_a"], edge["endpoint_b"]):
                     used[node, pool] = used.get((node, pool), 0) + 1
 
-            def priority(edge, t=t):
-                score = edge['distance_km']
-                policy = (self.spec.cross_layer_access_policy if edge['kind']=='cross_layer'
-                          else self.spec.ground_access_policy if edge['kind']=='sgl' else 'nearest_distance')
-                if policy == 'longest_available':
-                    score = -(edge['available_until_s']-t)
-                elif edge['kind']=='cross_layer' and policy=='highest_capacity':
-                    a,b=edge['endpoint_a'],edge['endpoint_b']
-                    score=-min(self.directional_attributes(edge,a,b,t)['bandwidth_bps'],
-                               self.directional_attributes(edge,b,a,t)['bandwidth_bps'])
-                return (1.0 if edge.get('topology_patch') else 0.0,score,edge['distance_km'],edge['link_id'])
-
-            for edge in sorted(eligible.values(), key=priority):
+            for edge in sorted(eligible.values(), key=lambda edge: connection_priority(self, edge, t)):
                 link_id = edge["link_id"]
                 if link_id in states:
                     continue
@@ -869,94 +858,9 @@ class NetworkState:
         ``recompute=True`` bypasses persistence for an explicit fresh search.
         A path that cannot carry this payload also falls back to a fresh search.
         """
-        if policy not in {"min_hops", "min_propagation", "earliest_arrival"}:
-            raise ValueError("unsupported routing policy")
-        if not math.isfinite(payload_bytes) or payload_bytes < 0:
-            raise ValueError("payload_bytes must be finite and nonnegative")
-        if (
-            source not in self.nodes
-            or target not in self.nodes
-            or not self.start_s <= time_s < self.end_s
-        ):
-            raise NetworkUnavailable("route_endpoint_or_time_unavailable")
-        from astermind.engine.state.route_cache import PersistentRouteCache
+        from astermind.engine.policies.routing import route_transfer
 
-        if not hasattr(self, '_route_cache'):
-            self._route_cache = PersistentRouteCache()
-        route_cache = self._route_cache
-        route_key = route_cache.key(source, target, policy, allow_wait, kinds, avoid_nodes)
-        selected = None if recompute else route_cache.get(self, route_key, time_s)
-        if selected is not None:
-            _, hops = selected
-            arrival, replay = time_s, []
-            for link_id, first, second in hops:
-                leg = self._edge_transfer(
-                    link_id, first, second, arrival, payload_bytes, allow_wait
-                )
-                if leg is None:
-                    break
-                replay.append(leg)
-                arrival = leg['arrival_s']
-            else:
-                route_cache.hits += 1
-                if commit:
-                    for leg in replay:
-                        self.reserve(leg)
-                return arrival, tuple(replay)
-            # A long transfer may no longer fit its contact window. Search for
-            # a feasible alternative without caching failed timing predictions.
-            route_cache.replay_failures += 1
-        route_cache.searches += 1
-        adjacency = self._routing_adjacency(kinds)
-        queue = [(0.0, time_s, (source,), 0, ())]
-        labels: dict[str, list[tuple[float, float]]] = {}
-        serial = 0
-        while queue:
-            cost, arrival, nodes, _, path = heapq.heappop(queue)
-            node = nodes[-1]
-            if node == target:
-                if not recompute:
-                    route_cache.remember(self, route_key, path, time_s)
-                if commit:
-                    for leg in path:
-                        self.reserve(leg)
-                return arrival, path
-            prior = labels.setdefault(node, [])
-            if any(c <= cost and t <= arrival for c, t in prior):
-                continue
-            prior[:] = [(c, t) for c, t in prior if not (cost <= c and arrival <= t)]
-            prior.append((cost, arrival))
-            for neighbor, link_id in adjacency.get(node, ()):
-                if (
-                    neighbor in nodes
-                    or neighbor in (avoid_nodes or ())
-                    or not self.route_node_allowed(neighbor, source, target)
-                ):
-                    continue
-                leg = self._edge_transfer(
-                    link_id, node, neighbor, arrival, payload_bytes, allow_wait
-                )
-                if leg is None:
-                    continue
-                extra = (
-                    1.0
-                    if policy == "min_hops"
-                    else leg["propagation_delay_s"]
-                    if policy == "min_propagation"
-                    else leg["arrival_s"] - arrival
-                )
-                serial += 1
-                heapq.heappush(
-                    queue,
-                    (
-                        cost + extra,
-                        leg["arrival_s"],
-                        (*nodes, neighbor),
-                        serial,
-                        (*path, leg),
-                    ),
-                )
-        raise NetworkUnavailable("no_feasible_dynamic_route")
+        return route_transfer(self, source, target, time_s, payload_bytes, policy, commit=commit, allow_wait=allow_wait, kinds=kinds, avoid_nodes=avoid_nodes, recompute=recompute)
 
     def _routing_adjacency(self, kinds):
         """Cache only structural neighbors; every edge cost is evaluated live."""

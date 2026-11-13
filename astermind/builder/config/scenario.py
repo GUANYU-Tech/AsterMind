@@ -1,144 +1,12 @@
-"""Independent physical resources, logical deployment and serving inputs."""
-
+"""Simulation entry configuration and cross-configuration constraints."""
 import json
 from pathlib import Path
 from typing import Annotated, Literal
-
 from pydantic import Field, model_validator
-
 from astermind.common.contracts import Contract, Identifier, Nanoseconds
-from astermind.engine.comm.frame_surrogate import CommPolicy
-
-Positive = Annotated[int, Field(strict=True, gt=0)]
-
-
-class Parallelism(Contract):
-    # Native physical worker count is TP * PP * DP. EP reuses stage-local ranks.
-    dp: Positive = 1
-    tp: Positive = 1
-    sp: Positive = 1
-    pp: Positive = 1
-    ep: Positive = 1
-
-    @property
-    def workers(self):
-        return self.tp * self.pp * self.dp
-
-    @model_validator(mode="after")
-    def validate_native_axes(self):
-        if self.sp != 1:
-            raise ValueError("SP is not supported by the current Cell integration")
-        if self.ep not in (1, self.tp * self.dp):
-            raise ValueError("EP must use the stage-local TP x DP group")
-        return self
-
-
-class Placement(Contract):
-    rank: Annotated[int, Field(strict=True, ge=0)]
-    device: Identifier
-    pool: str = "main"
-
-
-class ServingCell(Contract):
-    id: Identifier
-    model: str = "configs/model/qwen3-4b.json"
-    hardware: str = "configs/hardware/nvidia_a800.yaml"
-    hardware_id: str = "nvidia_a800"
-    parallel: Parallelism = Parallelism()
-    placements: tuple[Placement, ...]
-    ingress_device: Identifier
-    output_device: Identifier
-    max_model_len: Positive = 128
-    max_batched_tokens: Positive = 32
-    max_requests: Positive = 4
-    num_kv_blocks: Positive = 64
-    kv_block_size_tokens: Positive = 16
-    scheduler_adapter: Literal["auto", "vllm_0_11", "vllm_0_30", "vllm_0_31"] = "auto"
-    prefix_caching: bool = False
-    native_expert_parallel: bool = False
-    wide_ep_enabled: bool = False
-    expert_routing_seed: Annotated[int, Field(strict=True, ge=0)] | None = None
-    deployment: Literal["colocated", "pd_disagg"] = "colocated"
-    host_launch_profile: str | None = None
-    memory_policy_file: str | None = None
-    watermark: Annotated[float, Field(ge=0, lt=1, allow_inf_nan=False)] = 0
-    # Egress is a physical role; it never changes the logical rank graph.
-    egress_mode: Literal["single_gateway", "multi_gateway", "distributed"] = "single_gateway"
-    external_terminals: tuple[Identifier, ...]
-    execution_mode: Literal["accelerated", "fast", "reference"] = "accelerated"
-    graph_backend: Literal["midlayer"] = "midlayer"
-
-    @model_validator(mode="before")
-    @classmethod
-    def normalize_scheduler_adapter_name(cls, value):
-        if isinstance(value, dict) and value.get("scheduler_adapter") == "upstream_exact":
-            value = dict(value)
-            value["scheduler_adapter"] = "vllm_0_11"
-        return value
-
-    @property
-    def expert_parallel_enabled(self):
-        return self.native_expert_parallel or self.parallel.ep > 1
-
-    @model_validator(mode="after")
-    def validate_placement(self):
-        if self.parallel.dp > 1 and not self.wide_ep_enabled:
-            raise ValueError("multiple DP replicas in one Cell require wide_ep_enabled=true")
-        if self.wide_ep_enabled and (self.parallel.dp <= 1 or not self.expert_parallel_enabled
-                                    or self.parallel.ep != self.parallel.tp*self.parallel.dp):
-            raise ValueError("WideEP requires DP>1 and the declared stage-local TP x DP expert group")
-        ranks = [p.rank for p in self.placements]
-        workers = self.parallel.workers
-        if self.deployment == "pd_disagg":
-            if self.prefix_caching or self.watermark or self.memory_policy_file:
-                raise ValueError("PD smoke uses explicit KV capacity and no session cache")
-            if any(p.pool != ("prefill" if p.rank < workers else "decode") for p in self.placements):
-                raise ValueError("PD placement requires prefill ranks followed by decode ranks")
-            workers *= 2
-        elif any(p.pool != "main" for p in self.placements):
-            raise ValueError("colocated Cell placements use the main pool")
-        if sorted(ranks) != list(range(workers)):
-            raise ValueError("placements must cover every logical rank exactly once")
-        if len({p.device for p in self.placements}) != len(ranks):
-            raise ValueError("logical ranks require exclusive physical GPUs")
-        if not self.external_terminals or len(set(self.external_terminals)) != len(self.external_terminals):
-            raise ValueError("external terminals must be nonempty and distinct")
-        return self
-
-
-class Request(Contract):
-    id: Identifier
-    arrival_ns: Nanoseconds = 0
-    user_device: Identifier
-    input_tokens: Positive
-    output_tokens: Positive = 1
-    input_bytes: Nanoseconds = 0
-    output_bytes_per_token: Nanoseconds = 4
-    cell: Identifier | None = None
-    session_id: str | None = None
-    context_id: str | None = None
-    parent_context_id: str | None = None
-    prefix_hit_tokens: Nanoseconds = 0
-
-    @model_validator(mode="after")
-    def validate_history(self):
-        if self.prefix_hit_tokens > self.input_tokens:
-            raise ValueError("prefix hit exceeds prompt")
-        if (self.context_id or self.parent_context_id) and not self.session_id:
-            raise ValueError("context identity requires session_id")
-        return self
-
-
-class Migration(Contract):
-    id: Identifier
-    after_request: Identifier
-    before_request: Identifier | None = None
-    source_cell: Identifier
-    target_cell: Identifier
-    session_id: str
-    context_id: str
-    mode: Literal["copy", "move"] = "copy"
-
+from .deployment import Positive, ServingCell
+from .requests import Request, Migration
+from .communication import CommPolicy
 
 class CellLinkAddition(Contract):
     source: Identifier
@@ -282,3 +150,8 @@ class SimulationConfig(Contract):
             ):
                 raise ValueError("migration needs two distinct known Cells")
         return self
+
+
+# Preserve public serialization identities across the file-only move.
+CellLinkAddition.__module__ = 'astermind.builder.config'
+SimulationConfig.__module__ = 'astermind.builder.config'
