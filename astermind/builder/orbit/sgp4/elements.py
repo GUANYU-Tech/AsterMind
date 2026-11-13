@@ -50,7 +50,7 @@ _SATELLITE_REQUIRED_KEYS = {
     "satellite_id",
     "satnum",
 }
-_SATELLITE_OPTIONAL_KEYS = {"object_id"}
+_SATELLITE_OPTIONAL_KEYS = {"object_id", "fixed_lvlh_offset_km"}
 _PROVENANCE_KEYS = {
     "observationally_fitted",
     "source_kind",
@@ -147,8 +147,14 @@ class Sgp4SatelliteElements:
     ephemeris_type: int
     element_set_number: int
     revolution_number_at_epoch: int
+    fixed_lvlh_offset_km: tuple[float, float, float] | None = None
 
     def __post_init__(self) -> None:
+        if self.fixed_lvlh_offset_km is not None:
+            offset = tuple(float(x) for x in self.fixed_lvlh_offset_km)
+            if len(offset) != 3 or not all(math.isfinite(x) for x in offset):
+                raise ValueError('fixed_lvlh_offset_km must contain three finite radial/along/normal values')
+            object.__setattr__(self, 'fixed_lvlh_offset_km', offset)
         object.__setattr__(self, "satellite_id", _require_string(self.satellite_id, "satellite_id"))
         object.__setattr__(
             self, "satnum", _require_integer(self.satnum, "satnum", minimum=1, maximum=339999)
@@ -250,6 +256,7 @@ class Sgp4SatelliteElements:
         )
         return cls(
             satellite_id=satellite_id,
+            fixed_lvlh_offset_km=payload.get('fixed_lvlh_offset_km'),
             satnum=satnum,
             classification=classification,
             object_id=object_id,
@@ -308,6 +315,7 @@ class Sgp4SatelliteElements:
     def to_dict(self) -> dict[str, Any]:
         return {
             "satellite_id": self.satellite_id,
+            **({'fixed_lvlh_offset_km': list(self.fixed_lvlh_offset_km)} if self.fixed_lvlh_offset_km is not None else {}),
             "satnum": self.satnum,
             "classification": self.classification,
             "object_id": self.object_id,

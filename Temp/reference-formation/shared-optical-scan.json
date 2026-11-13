@@ -1,0 +1,84 @@
+{
+  "step_s": 60,
+  "epoch": "2026-07-20T00:00:00.000000Z",
+  "cells": [
+    {
+      "exit": "dawn_dusk-p000-s0000-m000",
+      "allocated_sample_fraction": 1.0,
+      "ready_sample_fraction": 0.8369188063844553,
+      "new_associations": 235,
+      "longest_no_ready_sample_span_s": 0.0
+    },
+    {
+      "exit": "dawn_dusk-p000-s0001-m000",
+      "allocated_sample_fraction": 1.0,
+      "ready_sample_fraction": 0.8320610687022901,
+      "new_associations": 242,
+      "longest_no_ready_sample_span_s": 0.0
+    },
+    {
+      "exit": "dawn_dusk-p000-s0002-m000",
+      "allocated_sample_fraction": 1.0,
+      "ready_sample_fraction": 0.8285912560721721,
+      "new_associations": 247,
+      "longest_no_ready_sample_span_s": 0.0
+    },
+    {
+      "exit": "dawn_dusk-p000-s0003-m000",
+      "allocated_sample_fraction": 1.0,
+      "ready_sample_fraction": 0.8299791811242193,
+      "new_associations": 245,
+      "longest_no_ready_sample_span_s": 0.0
+    },
+    {
+      "exit": "dawn_dusk-p000-s0004-m000",
+      "allocated_sample_fraction": 1.0,
+      "ready_sample_fraction": 0.8306731436502429,
+      "new_associations": 244,
+      "longest_no_ready_sample_span_s": 0.0
+    },
+    {
+      "exit": "walker_delta-p000-s0000-m000",
+      "allocated_sample_fraction": 1.0,
+      "ready_sample_fraction": 0.9979181124219292,
+      "new_associations": 3,
+      "longest_no_ready_sample_span_s": 0.0
+    },
+    {
+      "exit": "walker_delta-p000-s0001-m000",
+      "allocated_sample_fraction": 1.0,
+      "ready_sample_fraction": 0.9986120749479528,
+      "new_associations": 2,
+      "longest_no_ready_sample_span_s": 0.0
+    },
+    {
+      "exit": "walker_delta-p000-s0002-m000",
+      "allocated_sample_fraction": 1.0,
+      "ready_sample_fraction": 0.9986120749479528,
+      "new_associations": 2,
+      "longest_no_ready_sample_span_s": 0.0
+    },
+    {
+      "exit": "walker_delta-p000-s0003-m000",
+      "allocated_sample_fraction": 1.0,
+      "ready_sample_fraction": 0.9986120749479528,
+      "new_associations": 2,
+      "longest_no_ready_sample_span_s": 0.0
+    },
+    {
+      "exit": "walker_delta-p000-s0004-m000",
+      "allocated_sample_fraction": 1.0,
+      "ready_sample_fraction": 0.9979181124219292,
+      "new_associations": 3,
+      "longest_no_ready_sample_span_s": 0.0
+    }
+  ],
+  "wall_s": 148.03721384299934,
+  "allocation_source": "unmodified ae6ee46 allocation block in isolated worktree",
+  "allocation_sha256": "1cd1fdec46bbe87c4ba74a49c9598658deea2bf991986e458bb665ca1af19478",
+  "reference_motion": "local fixed-LVLH addition, NOT original-branch capability",
+  "max_access_links_on_one_comm_satellite": 2,
+  "max_geometry_eligible_backbone_edges_not_allocated": 0,
+  "all_exits_always_allocated_sampled": true,
+  "scope": "Sampled optical admission, 6 shared ports with no category quotas, exit 3 ports, others 2; no ground pool (independent), no online traffic, no continuous visibility proof. Setup readiness sampled at 60s; not continuous-time availability."
+}

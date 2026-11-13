@@ -1,0 +1,519 @@
+{
+  "schema_version": "orbitserve.network_experiment.v1",
+  "time": {
+    "epoch_utc": "2026-07-20T00:00:00.000000Z",
+    "duration_s": 86400,
+    "step_s": 10
+  },
+  "ground_ingresses": [
+    {
+      "ingress_id": "gw_los_angeles",
+      "lat_deg": 34.0522,
+      "lon_deg": -118.2437,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 25.0,
+      "terminal_count": 16,
+      "ground_kind": "gateway"
+    },
+    {
+      "ingress_id": "gw_dallas",
+      "lat_deg": 32.7767,
+      "lon_deg": -96.797,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 25.0,
+      "terminal_count": 16,
+      "ground_kind": "gateway"
+    },
+    {
+      "ingress_id": "gw_new_york",
+      "lat_deg": 40.7128,
+      "lon_deg": -74.006,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 25.0,
+      "terminal_count": 16,
+      "ground_kind": "gateway"
+    },
+    {
+      "ingress_id": "gw_mexico_city",
+      "lat_deg": 19.4326,
+      "lon_deg": -99.1332,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 25.0,
+      "terminal_count": 16,
+      "ground_kind": "gateway"
+    },
+    {
+      "ingress_id": "gw_bogota",
+      "lat_deg": 4.711,
+      "lon_deg": -74.0721,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 25.0,
+      "terminal_count": 16,
+      "ground_kind": "gateway"
+    },
+    {
+      "ingress_id": "gw_lima",
+      "lat_deg": -12.0464,
+      "lon_deg": -77.0428,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 25.0,
+      "terminal_count": 16,
+      "ground_kind": "gateway"
+    },
+    {
+      "ingress_id": "gw_fortaleza",
+      "lat_deg": -3.7319,
+      "lon_deg": -38.5267,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 25.0,
+      "terminal_count": 16,
+      "ground_kind": "gateway"
+    },
+    {
+      "ingress_id": "gw_sao_paulo",
+      "lat_deg": -23.5505,
+      "lon_deg": -46.6333,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 25.0,
+      "terminal_count": 16,
+      "ground_kind": "gateway"
+    },
+    {
+      "ingress_id": "gw_santiago",
+      "lat_deg": -33.4489,
+      "lon_deg": -70.6693,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 25.0,
+      "terminal_count": 16,
+      "ground_kind": "gateway"
+    },
+    {
+      "ingress_id": "gw_london",
+      "lat_deg": 51.5074,
+      "lon_deg": -0.1278,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 25.0,
+      "terminal_count": 16,
+      "ground_kind": "gateway"
+    },
+    {
+      "ingress_id": "gw_madrid",
+      "lat_deg": 40.4168,
+      "lon_deg": -3.7038,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 25.0,
+      "terminal_count": 16,
+      "ground_kind": "gateway"
+    },
+    {
+      "ingress_id": "gw_frankfurt",
+      "lat_deg": 50.1109,
+      "lon_deg": 8.6821,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 25.0,
+      "terminal_count": 16,
+      "ground_kind": "gateway"
+    },
+    {
+      "ingress_id": "gw_istanbul",
+      "lat_deg": 41.0082,
+      "lon_deg": 28.9784,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 25.0,
+      "terminal_count": 16,
+      "ground_kind": "gateway"
+    },
+    {
+      "ingress_id": "gw_moscow",
+      "lat_deg": 55.7558,
+      "lon_deg": 37.6173,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 25.0,
+      "terminal_count": 16,
+      "ground_kind": "gateway"
+    },
+    {
+      "ingress_id": "gw_dakar",
+      "lat_deg": 14.7167,
+      "lon_deg": -17.4677,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 25.0,
+      "terminal_count": 16,
+      "ground_kind": "gateway"
+    },
+    {
+      "ingress_id": "gw_lagos",
+      "lat_deg": 6.5244,
+      "lon_deg": 3.3792,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 25.0,
+      "terminal_count": 16,
+      "ground_kind": "gateway"
+    },
+    {
+      "ingress_id": "gw_nairobi",
+      "lat_deg": -1.2921,
+      "lon_deg": 36.8219,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 25.0,
+      "terminal_count": 16,
+      "ground_kind": "gateway"
+    },
+    {
+      "ingress_id": "gw_johannesburg",
+      "lat_deg": -26.2041,
+      "lon_deg": 28.0473,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 25.0,
+      "terminal_count": 16,
+      "ground_kind": "gateway"
+    },
+    {
+      "ingress_id": "gw_mauritius",
+      "lat_deg": -20.1609,
+      "lon_deg": 57.5012,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 25.0,
+      "terminal_count": 16,
+      "ground_kind": "gateway"
+    },
+    {
+      "ingress_id": "gw_dubai",
+      "lat_deg": 25.2048,
+      "lon_deg": 55.2708,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 25.0,
+      "terminal_count": 16,
+      "ground_kind": "gateway"
+    },
+    {
+      "ingress_id": "gw_almaty",
+      "lat_deg": 43.222,
+      "lon_deg": 76.8512,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 25.0,
+      "terminal_count": 16,
+      "ground_kind": "gateway"
+    },
+    {
+      "ingress_id": "gw_delhi",
+      "lat_deg": 28.6139,
+      "lon_deg": 77.209,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 25.0,
+      "terminal_count": 16,
+      "ground_kind": "gateway"
+    },
+    {
+      "ingress_id": "gw_mumbai",
+      "lat_deg": 19.076,
+      "lon_deg": 72.8777,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 25.0,
+      "terminal_count": 16,
+      "ground_kind": "gateway"
+    },
+    {
+      "ingress_id": "gw_bengaluru",
+      "lat_deg": 12.9716,
+      "lon_deg": 77.5946,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 25.0,
+      "terminal_count": 16,
+      "ground_kind": "gateway"
+    },
+    {
+      "ingress_id": "gw_beijing",
+      "lat_deg": 39.9042,
+      "lon_deg": 116.4074,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 25.0,
+      "terminal_count": 16,
+      "ground_kind": "gateway"
+    },
+    {
+      "ingress_id": "gw_shanghai",
+      "lat_deg": 31.2304,
+      "lon_deg": 121.4737,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 25.0,
+      "terminal_count": 16,
+      "ground_kind": "gateway"
+    },
+    {
+      "ingress_id": "gw_guangzhou",
+      "lat_deg": 23.1291,
+      "lon_deg": 113.2644,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 25.0,
+      "terminal_count": 16,
+      "ground_kind": "gateway"
+    },
+    {
+      "ingress_id": "gw_chengdu",
+      "lat_deg": 30.5728,
+      "lon_deg": 104.0668,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 25.0,
+      "terminal_count": 16,
+      "ground_kind": "gateway"
+    },
+    {
+      "ingress_id": "gw_seoul",
+      "lat_deg": 37.5665,
+      "lon_deg": 126.978,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 25.0,
+      "terminal_count": 16,
+      "ground_kind": "gateway"
+    },
+    {
+      "ingress_id": "gw_tokyo",
+      "lat_deg": 35.6762,
+      "lon_deg": 139.6503,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 25.0,
+      "terminal_count": 16,
+      "ground_kind": "gateway"
+    },
+    {
+      "ingress_id": "gw_bangkok",
+      "lat_deg": 13.7563,
+      "lon_deg": 100.5018,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 25.0,
+      "terminal_count": 16,
+      "ground_kind": "gateway"
+    },
+    {
+      "ingress_id": "gw_jakarta",
+      "lat_deg": -6.2088,
+      "lon_deg": 106.8456,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 25.0,
+      "terminal_count": 16,
+      "ground_kind": "gateway"
+    },
+    {
+      "ingress_id": "gw_sydney",
+      "lat_deg": -33.8688,
+      "lon_deg": 151.2093,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 25.0,
+      "terminal_count": 16,
+      "ground_kind": "gateway"
+    },
+    {
+      "ingress_id": "gw_perth",
+      "lat_deg": -31.9505,
+      "lon_deg": 115.8605,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 25.0,
+      "terminal_count": 16,
+      "ground_kind": "gateway"
+    },
+    {
+      "ingress_id": "gw_auckland",
+      "lat_deg": -36.8509,
+      "lon_deg": 174.7645,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 25.0,
+      "terminal_count": 16,
+      "ground_kind": "gateway"
+    }
+  ],
+  "network": {
+    "link_profiles": {
+      "communication_isl": {
+        "capacity_model": "fixed",
+        "bandwidth_bps": 400000000000.0,
+        "setup_time_s": 3.0,
+        "max_distance_km": 4000.0
+      },
+      "cell_isl": {
+        "capacity_model": "fixed",
+        "bandwidth_bps": 1000000000000.0,
+        "setup_time_s": 1.0,
+        "max_distance_km": 10.0
+      },
+      "cross_layer": {
+        "capacity_model": "fixed",
+        "bandwidth_bps": 400000000000.0,
+        "setup_time_s": 5.0,
+        "max_distance_km": 4000.0
+      },
+      "sgl": {
+        "capacity_model": "fixed",
+        "bandwidth_bps": 1000000000.0,
+        "setup_time_s": 2.0,
+        "max_distance_km": 2500.0,
+        "uplink_profile": "custom_ground_up",
+        "downlink_profile": "custom_ground_down"
+      },
+      "custom_ground_up": {
+        "capacity_model": "fixed",
+        "bandwidth_bps": 400000000.0,
+        "setup_time_s": 2.0
+      },
+      "custom_ground_down": {
+        "capacity_model": "fixed",
+        "bandwidth_bps": 1000000000.0,
+        "setup_time_s": 2.0
+      }
+    },
+    "communication_topology": "explicit",
+    "wrap_planes": true,
+    "wrap_slots": true,
+    "cell_topology": "ring",
+    "inter_cell_links": false,
+    "ground_roles": [
+      "communication"
+    ],
+    "ground_access_policy": "nearest_distance",
+    "handover_policy": "retain_valid",
+    "cross_layer_access_policy": "nearest_distance",
+    "ground_matching": "greedy"
+  },
+  "route_probes": [],
+  "constellations": {
+    "communication_shells": [
+      {
+        "shell_id": "custom-comm",
+        "topology": "grid",
+        "isl_terminals": 6,
+        "sgl_terminals": 1,
+        "optical_terminal_bandwidth_bps": 400000000000.0,
+        "radio_profile": null,
+        "terminal_assumptions": [
+          "Custom design: 400 Gbps per direction, full duplex; six independent optical terminals"
+        ],
+        "capacity_assumptions": [
+          "Custom fixed RF capacity, not measured hardware; one gateway association per satellite"
+        ],
+        "radio_capacity_bps": {
+          "feeder_uplink_bps": 400000000.0,
+          "feeder_downlink_bps": 1000000000.0
+        },
+        "max_gateway_links": 1,
+        "source": {
+          "type": "walker_delta",
+          "altitude_km": 500.0,
+          "inclination_deg": 53.0,
+          "planes": 60,
+          "satellites_per_plane": 100,
+          "walker_phase": 0,
+          "raan0_deg": 0.0,
+          "u0_deg": 0.0
+        }
+      }
+    ],
+    "compute_formations": [
+      {
+        "name": "walker_delta",
+        "source": {
+          "type": "walker_delta",
+          "altitude_km": 550.0,
+          "planes": 1,
+          "clusters_per_plane": 5,
+          "walker_phase": 0,
+          "u0_deg": 0.0,
+          "inclination_deg": 53.0,
+          "raan0_deg": 0.0
+        },
+        "cluster": {
+          "satellites_per_cluster": 4,
+          "grid_shape": "2x2",
+          "formation_pitch_m": 1000.0,
+          "formation_frame": "lvlh",
+          "d_keepout_m": 50.0,
+          "sigma_control_m": 0.0,
+          "sigma_navigation_m": 0.0,
+          "motion_model": "reference_fixed_lvlh",
+          "reference_member": 0,
+          "member_offsets_m": [
+            [
+              0,
+              0,
+              0
+            ],
+            [
+              0,
+              1000,
+              0
+            ],
+            [
+              0,
+              1000,
+              1000
+            ],
+            [
+              0,
+              0,
+              1000
+            ]
+          ]
+        },
+        "topology": "ring",
+        "ingress_members": [
+          0
+        ],
+        "isl_terminals": 3,
+        "sgl_terminals": 0,
+        "egress_policy": "single"
+      },
+      {
+        "name": "dawn_dusk",
+        "source": {
+          "type": "dawn_dusk",
+          "altitude_km": 550.0,
+          "planes": 1,
+          "clusters_per_plane": 5,
+          "walker_phase": 0,
+          "u0_deg": 0.0,
+          "ltan_hours": 6.0,
+          "plane_spread_deg": 0.0
+        },
+        "cluster": {
+          "satellites_per_cluster": 4,
+          "grid_shape": "2x2",
+          "formation_pitch_m": 1000.0,
+          "formation_frame": "lvlh",
+          "d_keepout_m": 50.0,
+          "sigma_control_m": 0.0,
+          "sigma_navigation_m": 0.0,
+          "motion_model": "reference_fixed_lvlh",
+          "reference_member": 0,
+          "member_offsets_m": [
+            [
+              0,
+              0,
+              0
+            ],
+            [
+              0,
+              1000,
+              0
+            ],
+            [
+              0,
+              1000,
+              1000
+            ],
+            [
+              0,
+              0,
+              1000
+            ]
+          ]
+        },
+        "topology": "ring",
+        "ingress_members": [
+          0
+        ],
+        "isl_terminals": 3,
+        "sgl_terminals": 0,
+        "egress_policy": "single"
+      }
+    ]
+  }
+}

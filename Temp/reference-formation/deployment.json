@@ -1,0 +1,16 @@
+{
+  "model": "GLM5.2",
+  "tp": 8,
+  "pp": 4,
+  "dp": 1,
+  "ep": 1,
+  "wide_ep_enabled": false,
+  "exit_member": 0,
+  "stage_to_member": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "scope": "Deployment specification, not an executed compute plan"
+}
