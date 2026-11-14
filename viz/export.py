@@ -16,6 +16,8 @@ WEB = Path(__file__).parent
 
 
 def native_ns(seconds):
+    if seconds is None:
+        return None
     from astermind.engine.clock import Time
     from astermind.engine.timeline import nanoseconds
     if isinstance(seconds, Time):
@@ -40,6 +42,12 @@ def audit_checks(result):
     These are consistency checks over recorded evidence, not hardware validation.
     Never turn a missing trace into a successful check.
     """
+    if result.get('schema_version') == 2:
+        audit = result.get('audit')
+        return [dict(id='v1_causal_audit', checked=1 if audit is not None else 0,
+            state='pass' if audit and audit.get('passed') else 'fail' if audit else 'warn',
+            violations=[] if not audit or audit.get('passed') else [dict(evidence='audit',detail=audit.get('error',str(audit)))],
+            warnings=[] if audit else ['原始报告未包含 V1 审核结果，不能视为通过'])]
     groups = {}
 
     def check(group, condition, evidence, detail):
@@ -338,8 +346,8 @@ def replay_data(result, *, source_name="report.json", source_sha256=None):
             for i, c in enumerate(batch["calls"])
         }
         for i, call in enumerate(batch["calls"]):
-            phases = [[flow["id"] for flow in phase] for phase in call["phases"]]
-            for phase in call["phases"]:
+            phases = [[flow["id"] for flow in phase] for phase in call.get("phases", [])]
+            for phase in call.get("phases", []):
                 for flow in phase:
                     ready_times[flow["id"]] = flow["ready_time_ns"]
                     if flow.get('ready_time_ticks') is not None:
@@ -365,7 +373,7 @@ def replay_data(result, *, source_name="report.json", source_sha256=None):
                     "native_ns": native_ns(call["native_prediction_s"]),
                     "phases": phases,
                     "communication_backend": call.get(
-                        "communication_backend", config.backend
+                        "communication_backend", result.get("network", {}).get("backend", config.backend)
                     )
                     if call["communication"]
                     else None,
@@ -374,7 +382,7 @@ def replay_data(result, *, source_name="report.json", source_sha256=None):
                 }
             )
     for distribution in result.get("input_distributions", []):
-        for phase in distribution["phases"]:
+        for phase in distribution.get("phases", []):
             for flow in phase:
                 ready_times[flow["id"]] = flow["ready_time_ns"]
     resource_map, hops, events, terminal_clock = {}, CompressedRecords(), [], {}
@@ -457,6 +465,13 @@ def replay_data(result, *, source_name="report.json", source_sha256=None):
                 **output,
             }
         )
+    for index, event in enumerate(result.get('communication_events', [])):
+        if event['kind'] == 'admit':
+            ready_times.setdefault(event.get('task',event['id']),event.get('time_ns'))
+            ready_ticks.setdefault(event.get('task',event['id']),event.get('time_ticks'))
+        if event['kind'] != 'allocation':
+            events.append(dict(event,time=int(event.get('time_ticks','0'))/1e9,
+                               evidence=f'communication_events[{index}]'))
     transfers = []
     for index, event in enumerate(result["transfers"]):
         end = event.get("completion_time_ns", event.get("failure_time_ns"))
@@ -525,7 +540,7 @@ def replay_data(result, *, source_name="report.json", source_sha256=None):
         "title": title,
         "source": {"name": source_name, "sha256": source_sha256},
         "status": result["status"],
-        "backend": config.backend,
+        "backend": result.get("network", {}).get("backend", config.backend),
         "horizon": config.horizon_ns,
         "end": end,
         "devices": [d.model_dump(mode="json") for d in graph.devices.values()],
@@ -594,7 +609,7 @@ def export_reports(reports, destination, *, loaded_results=None):
             }
         )
     for name in ("index.html", "replay.js", "replay.css"):
-        shutil.copyfile(WEB / name, destination / name)
+        shutil.copyfile(WEB / ("native_replay.html" if name == "index.html" else name), destination / name)
     temporary = destination / "catalog.json.tmp"
     temporary.write_text(
         json.dumps(catalog, ensure_ascii=False, indent=2), encoding="utf8"

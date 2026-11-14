@@ -1,0 +1,1809 @@
+
+
+===== PDF PAGE 1 =====
+
+Making Protocol Effects Explicit: LLM-to-Packet
+Simulation for Superpod Interconnect Exploration
+HPCA 2027 Submission#356
+Confidential Draft
+Do NOT Distribute!!
+Abstract—Large language models (LLMs) have become the
+foundation of modern AI services. The rapid growth of LLM
+sizes and context lengths has exceeded the memory capacity
+of a single GPU or NPU, requiring model partitioning across
+devices. However, partitioning models across devices introduces
+costly communication overhead, driving the need for superpods
+with large-scale, high-bandwidth, low-latency scale-up fabrics.
+Exploring superpod designs requires accurate interconnect sim-
+ulation, as communication latency is jointly determined by
+link technologies, topologies, and scale-up protocol-stack choices.
+Latency-bandwidth models estimate communication latency us-
+ing a startup term and a transfer term derived from message
+size and effective bandwidth. But they fail to capture contention
+and protocol effects, resulting in errors of up to 40%. Packet-
+level simulators like ns-3 model routing, queueing, and packet
+timing, but require protocol-specific LLM-to-packet implementa-
+tions. The high simulation time also hinders efficient end-to-end
+superpod evaluation and design exploration.
+This paper presentsProtoBridge, an ns-3-based LLM-to-packet
+simulator for superpod interconnect exploration. To make proto-
+col effects explicit,ProtoBridgeintroduces two abstraction layers
+over ns-3 to evaluate different scale-up protocols using a common
+simulation substrate: (1) an operation-to-packet (OTP) layer that
+captures protocol-specific packet exchanges and dependencies,
+and (2) a packet-execution (PEX) layer that applies shared
+packet-level mechanisms to the ns-3 event system.ProtoBridge
+achieves average latency error of 17.8% on H200 NVLink4 and
+10.3% on C500 MetaXLink. To enable faster superpod evaluation
+for further interconnect exploration, we derive a surrogate model
+that combines OTP parameters with analytical models of PEX
+mechanisms. The surrogate reduces the mean absolute percentage
+error (MAPE) from 55.7% of latency-bandwidth models to
+11.8%, and reduces evaluation time from 2.38∼75.70 s to 20.5µs
+per operation. Using the surrogate-to-simulator evaluation work-
+flow, we explore 38,232 superpod designs across topologies, link
+technologies, and protocol configurations in one hour. We use
+ProtoBridgeto analyze two emerging superpod designs, scale-
+up memory pool and co-packaged optics (CPO) interconnects,
+revealing design insights for future LLM superpod architectures.
+I. INTRODUCTION
+Larger models and longer contexts have pushed LLM in-
+ference beyond the memory capacity of a single GPU or
+NPU. Serving systems distribute model weights, key-value
+(KV) cache, and activations through tensor, pipeline, context,
+and expert parallelism [1], [2], [3]. Partitioning relieves GPU
+memory pressure but causes collective, point-to-point, and
+remote-memory communications that affect inference latency
+and throughput [4], [5], [6], [3]. To reduce the communica-
+tion overhead, emerging superpods connect tens to thousands
+1e21e41e61e81e101e1
+1e2
+1e3
+1e4
+Data Size (B)
+Time (𝜇𝑠)HardwareLatency-BW modelProtoBridge
+Lat-BWModelProtoBridgeNVLink-LL128NVLink-LLUB
+(a) (b)010203040
+02004006008001000Groundtruth
+Time (𝜇𝑠)
+1KB64MB
+Fig. 1: AllReduce latencies across (a) message sizes and (b)
+NVLink and Unified Bus (UB) protocol configurations.
+of accelerators through high-bandwidth, low-latency scale-up
+fabrics. For example, NVIDIA GB200 NVL72 connects 72
+GPUs in a scale-up network and provide 130 TB/s of aggregate
+GPU-to-GPU bandwidth [7].
+However, superpod interconnect design has not converged.
+Current products and prototypes differ in link technology,
+topology, and scale-up protocol stacks. These design choices
+jointly determine communication latency and create a large
+design space that requires accurate and efficient interconnect
+evaluation during early-stage architecture exploration.
+Existing approaches are insufficient for evaluating super-
+pod interconnect diversity. Some system-level simulators esti-
+mate communication latency usinglatency-bandwidth models,
+where latency is modeled as a startup cost plus a transfer
+time determined by message size and effective bandwidth [8],
+[9]. However, they ignore packet-level behaviors and suffer
+from low accuracy. For example, on an 8-GPU H200 sys-
+tem in Figure 1(a), the latency-bandwidth model underesti-
+mates 256 MB AllReduce latency by 38.6%. Furthermore, the
+latency-bandwidth model cannot capture the effects of differ-
+ent scale-up protocol configurations, resulting in large errors
+across protocols. As shown in Figure 1(b), different protocols
+may cause different communication latency for the same data
+size, which cannot be captured by latency-bandwidth models.
+Otherpacket-level simulators, e.g., ns-3 [10], resolve the
+packet behavior during simulation, but they are ineffective
+in both end-to-end evaluation and interconnect design explo-
+ration for two reasons. First, existing packet simulators lack
+a common abstraction for scale-up protocols. A new protocol
+requires protocol-specific implementations to generate packets,
+define completion semantics, and execute packet-level mech-
+anisms. Consequently, comparing different protocols requires
+developing separate simulation paths, making fair evaluation
+costly and difficult. Second, packet-level simulation is too
+1
+
+===== PDF PAGE 2 =====
+
+Defining Protocols FreelyThrough Abstraction Layers 
+ns-3Substrate
+Packets
+Comm. Operations
+Physical LayerData rate, Channel, … 
+Data Link LayerPacket, Flow control, Retry, … 
+Transaction LayerMemory semantic, Address, … 
+RAS LayerLink down, Degradation, … 
+class NVL_NetDevice{void Send(NVL_Packet) {//Define NVL Send Rules}void Recv(NVL_Packet) {……}
+class UB_NetDevice{void Send(UB_Packet) {//Define UB Send Rules}void Recv(UB_Packet) {……}For NVLinkFor UB
+Each Protocol Requires a SeparatePacket Implementation
+Communication Ops
+NetDeviceInterface
+Interconnect Fabric
+Network LayersPackets
+SendRecv
+Reimplement
+Latency Surrogate (IV-A)
+White-Box ModelingInterconnect Design Exploration (IV-B)
+TGSInteractivity
+BetterSurrogateProtoBridgeInterconnect DesignProtocol ChoiceModel/KV Partitioning…
+Scale-up Protocol Stackns-3 Packet Simulation ProtoBridge
+Fast & Accurate ExplorationSurrogate SweepingProtoBridgeValidation
+①② ③ ④
+No Fair Protocol ComparisonTens of lines of configurationsSlow: Hours / LLM Minutes for exploring thousands of designs
+DifferentPacket-Simulation PathsOTP (III-B): Operation-To-Packet LayerFactorized Parameters & Dependency Graph
+PEX (III-C): Scale-Up Packet Exec. LayerShared Execution Modules
+LLM Workloads
+NetDeviceInterfaceInterconnectFabricSendRecv
+OTP Config.lData ratelPacket payloadlMem.semanticl……PEX Config.lFlow controllRetrylPacket sprayingl……
+Hardware Config.
+Protocol Config.
+Scale-up Protocol Stack 𝒇(𝒙)Comm. LatencyComm. OperationsHardware Config.Protocol Config.
+Controlns-3
+Fig. 2:ProtoBridgearchitecture and contribution overview. NVL denotes NVLink; RAS denotes reliability, availability, and
+serviceability; TGS denotes tokens per GPU per second.
+slow at LLM serving scale. One communication operation
+takes 2.38∼75.70 s, while one end-to-end LLM serving con-
+figuration invokes 7,869∼24,252 operations. Therefore, packet
+simulation would require hours or days to evaluate one serving
+configuration. In order to evaluate and find the best superpod
+interconnect design across numerous topologies and protocols,
+we need a simulator with a common protocol abstraction
+and a faster estimator that preserves protocol effects without
+simulating every packet.
+To make the protocol effects explicit and efficiently com-
+pare various interconnect designs, we proposeProtoBridge,
+an ns-3-based LLM-to-packet simulator. We introduce two
+abstraction layers, separating protocol-specific behavior from
+the shared ns-3 simulation substrate, as shown in Figure 2. The
+operation-to-packet (OTP) layer first translates each commu-
+nication step into packet transfers and defines each step’s de-
+pendencies and completion rules. The packet-execution (PEX)
+layer then carries the packet execution modules that can
+be shared across protocols, and sends the packets to event-
+based ns-3. This separation models different protocols on
+a common simulation substrate, only requiring the users to
+change the input configurations rather than reimplementing
+protocol-specific packet behaviors.
+Furthermore, to support broad superpod evaluation and
+interconnect exploration, we derive a protocol-defined latency
+surrogate model from the mechanisms of OTP and PEX
+layers. The surrogate extracts the OTP parameters to define the
+startup latency and effective bandwidth of the communication
+operation. It also uses theoretical latency equations from PEX
+mechanisms to model the effect on communication latency.
+Therefore, the surrogate can accurately capture protocol effects
+while reducing the modeling cost to several equations.
+In this paper, we make the following four contributions.
+•We abstract scale-up protocol behavior through the
+operation-to-packet and packet-execution layers, which
+define the protocol’s packet-level behavior and the ex-
+ecution mechanisms, respectively. It explicitly expose
+protocol effects while enabling a unified packet-level
+simulation substrate.
+•We implementProtoBridge, an ns-3-based packet-level
+simulator for LLM superpod interconnects.ProtoBridge
+takes the LLM communication operation and user-defined
+interconnect (protocol and hardware) as inputs, uses OTP-
+PEX abstraction layers to generate packets, and simulates
+the packets using ns-3.ProtoBridgeachieves mean ab-
+solute percentage error (MAPE) of 17.8%, 10.3%, and
+1.76% on H200 NVLink4, C500 MetaXLink, and NVL72
+across various communication operations, respectively.
+•We derive a protocol-defined latency surrogate model
+that combines OTP parameters with analytical models
+of PEX mechanisms to efficiently model communication
+performance. The surrogate reduces MAPE from 55.7%
+of latency-bandwidth models to 11.8%, and reduces eval-
+uation time from 2.38∼75.70 s to 20.5µs per operation.
+•We propose a surrogate-to-simulator superpod intercon-
+nect evaluation workflow, which efficiently analyzes and
+explores superpod interconnect choices across link tech-
+nologies, topologies, and protocols.
+We apply this surrogate-to-simulator workflow to two
+emerging superpod design choices and derive architecture-
+level insights. First, we study scale-up memory pools moti-
+vated by the growing memory demand of long-context LLM
+serving, and analyze the tradeoff between additional memory
+capacity and network contention. Second, we explore co-
+packaged optics (CPO) for large-scale superpods and evaluate
+the impact of link bandwidth, reach, latency, and error han-
+dling on system performance.
+II. BACKGROUND
+A. LLM Inference Communication
+When model weights, KV cache, and activations exceed
+the memory of one GPU or NPU, serving must partition
+them across devices. Tensor parallelism combines partial layer
+results with collectives such as AllReduce, ReduceScatter, and
+AllGather [1]. Context parallelism exchanges attention data
+across token partitions [11]. Expert parallelism uses AllToAll
+for token dispatch and combination [3], while pipeline stages
+exchange activations through point-to-point transfers [2]. KV
+cache migration and prefill/decode disaggregation move KV
+data between serving workers [12], [6], [5]. A scale-up-
+attached memory pool additionally introduces remote-memory
+reads and writes. These communications often gate subsequent
+computation, placing their latency on the serving critical path.
+2
+
+===== PDF PAGE 3 =====
+
+Comm. Op
+ActionWaitDelay
+ActionWaitDelayComplete
+Transfer 0Transfer 11. Start Sending SRCLink BufferSwitchLink BufferDSTFinish Stepns-3 Event Timeline
+PacketizationPropagationSwitchingError handlingPer-step Delay
+Operation-to-Packet Layer
+Packets
+Packet Execution Layer
+ns-3 NetDeviceInterface3. Recv.Callback
+2. SendEvent
+5. Add Delay
+0. Define packets0. Define Mechanisms 
+Transfer01SRC02DST13DataD0D1Depend.-{0}
+LLM
+4. Recv.
+6. Delay Event
+ns-3 Substrate
+Fig. 3:ProtoBridgeexecution over the ns-3 event path. SRC
+and DST denote source and destination.
+Communication operations reach the fabric through differ-
+ent logical exchange patterns. A collective algorithm decom-
+poses a collective into transfers among the participating de-
+vices. For AllReduce, ring, tree, or NVLink SHARP (NVLS)
+determines the communicating peers, step order, and bytes sent
+per step [13], [14], [15]. Point-to-point and remote-memory
+operations instead use direct transfers or request-response
+exchanges. The selected scale-up protocol configuration de-
+termines how each exchange is packetized, controlled, and
+completed. Together with fabric timing, the resulting packet
+traffic and completion condition determine operation latency.
+B. Superpods and Scale-Up Protocols
+A superpod is a large group of GPUs or NPUs connected
+by a high-bandwidth, low-latency scale-up fabric. Published
+systems include NVIDIA GB200 NVL72 with 72 GPUs,
+Huawei CloudMatrix 384 with 384 NPUs, and Google TPU
+v4 Pod with 4,096 Tensor Processing Unit (TPU) chips [7],
+[16], [17]. Their interconnects differ in system scale, topol-
+ogy, and protocol stack. A scale-up protocol configuration
+combines choices at the transaction, link-control, physical,
+and reliability layers. Transaction semantics define requests,
+responses, and operation completion. Link control governs
+packet framing, ordering, credits, and retransmission, while
+physical-layer choices set lane rate, encoding, propagation de-
+lay, and forward error correction (FEC). Reliability, availabil-
+ity, and serviceability functions report residual errors and link
+degradation [18], [19], [20]. These choices jointly determine
+the packet exchanges produced for an operation and the time
+required to execute them.
+III.ProtoBridgeSTRUCTURE
+A. Overview
+ProtoBridgetakes an LLM communication operation, a
+scale-up protocol configuration, and an interconnect config-
+uration as input and returns the operation completion time. To
+simulate different protocols and interconnections on a common
+substrate,ProtoBridgebuilds two abstraction layers on ns-3,
+and Figure 3 summarizes the execution process. The OTP layer
+represents the LLM communication operation as a transfer-
+dependency graph. When a transfer’s dependent nodes are
+ready, OTP packetizes the transfer and passes the resulting
+packets to PEX. The PEX layer applies the configured flow-
+control, forwarding, and error-handling rules to each packet,
+then passes the packet to ns-3 for transmission over a link.
+When a packet reaches its destination, PEX reports its arrival
+classNVL_NetDevice{voidSend(NVL_Packet) {//Define NVL Send Rules}voidRecv(NVL_Packet) {……}
+// NVL Config File// OTP ParametersHeader_size_B= 8Packet_payload_B= 120Completion = Delivery// PEX MechanismsFlow_control= CreditFEC = {528,514,7}LLR_mode= SACK……Config= load(Conf_file);MyProtocolP;P.OTP.SetPacketFormat(Config)P.PEX.SetFlowControl(Config)P.PEX.SetErrorHandling(Config)……
+classUB_NetDevice{voidSend(UB_Packet) {//Define UB Send Rules}voidRecv(UB_Packet) {……}
+// UB Config File// OTP ParametersHeader_size_B= 16Packet_payload_B= 112Completion = Response// PEX MechanismsFlow_control= CreditFEC = {576,514,31}LLR_mode= SACK……
+Thousands of LoC
+Thousands of LoCTens of Lines of ConfigTens of Lines of Config
+~1k LoC provided by ProtoBridgeReimplement Protocols
+User-defined configuration files+ProtoBridge-providedInterface(a) (b)
+Fig. 4: (a) Protocol-specific code and (b) the sharedProto-
+Bridgeinterface. LoC represents Lines of Code.
+to OTP as an event. OTP uses these events to determine
+when the current transfer’s complete dependency is satisfied
+and the next transfer can begin. With the abstraction layers,
+ProtoBridgeallows users to define various protocols in tens of
+lines of configurations and simulate them on a common ns-3
+substrate, rather than re-implementing every protocol in ns-3,
+as illustrated in Figure 4.
+B. Operation-to-Packet Layer
+Protocol configurations can impose different dependencies
+on the same transfer. For example, a datasendcompletes
+when the required bytes reach its destination, while a remote-
+memoryloadfirst sends a request and then completes when the
+required data return. A common representation must express
+various protocols and determine transfer completion from
+packet arrivals.
+We propose the OTP layer to solve this problem by en-
+coding protocol-specific packetization and completion rules
+in atransfer-dependency graph. The graph represents one
+communication operation, with each transfer contributing a
+subgraph. As shown in Algorithm 1, each transfer subgraph
+includes four types of nodes: (1) an ACTION node packetizes
+and issues a transfer, (2) a W AIT node specifies the data,
+response, or acknowledgment required before a data transfer
+completes, (3) Optional DELAY nodes insert protocol-defined
+delays, and (4) a COMPLETE node marks the end of the
+operation. Directed edges define the dependencies between
+nodes. At runtime, a node becomes ready after all dependent
+nodes have completed, and as illustrated in Figure 2, executing
+a transfer subgraph requires the follow steps:
+•The initial ACTION node passes packets to PEX when
+the operation begins.
+•The packets are sent to ns-3 and go through the propa-
+gation path.
+•The packet arrivals from ns-3 go through PEX and update
+the W AIT node.
+•The DELAY nodes insert fixed latency to the simulation.
+•When COMPLETE becomes ready, OTP records the
+current simulation time as the operation completion time.
+Within OTP, the protocol configuration is specified by the
+dependecy graph and its node parameters. Table I introduces
+how the configurations are used in OTP. Packet-transfer and
+packetization fields configure ACTION nodes. Completion
+3
+
+===== PDF PAGE 4 =====
+
+Algorithm 1OTP graph execution.
+Require:protocol config,operation
+Ensure:complete timing
+1:protocol←DEFINEPROTOCOL(protocol config)
+2:rules←protocol.operation rules
+3:graph←GENERATEDEPENDENCYGRAPH(operation, rules)
+4:procedureONNODEREADY(node)▷OTP layer
+5:ifnode.type=ACTIONthen
+6:f ormat←protocol.packetization
+7:packets←PACKETIZE(node.transf er, f ormat)
+8:for allpacket∈packetsdo
+9: EXECUTEPACKET(packet)▷Handoff to PEX
+10:end for
+11:else ifnode.type=WAITthen
+12: WAIT(node, protocol.completion rule)
+13:else ifnode.type=DELAYthen
+14: DELAY(node)
+15:else ifnode.type=COMPLETEthen
+16:complete timing←COMPLETE(operation)
+17:returncomplete timing
+18:end if
+19:end procedure
+TABLE I: Factorized OTP protocol parameters.
+Parameter group Parameters
+Packet transfer Transaction and action type, source and destination,
+packet type, effective and response bytes
+Packetization Header bytes and packet payload
+Dependencies ACTION, W AIT, DELAY , and COMPLETE nodes
+with dependency edges
+Completion Delivery, response, or acknowledgment event
+Local timing Startup and per-transfer-step processing
+and local-timing fields configure W AIT and DELAY nodes.
+Dependency fields connect transfer sub-graphs into a commu-
+nication operation. In this way, various protocol configurations
+can be simulated through a common graph executor, and the
+generated packets are further passed to the PEX layer through
+the same interface.
+C. Packet-Execution Layer
+The scale-up protocol configuration defines packet-
+execution mechanisms, including flow control, switch for-
+warding, forward-error-correction (FEC), and retransmission.
+Because multiple mechanisms are applied to the same packet,
+they jointly affect the packet transfer time. For example, an
+error packet will delay credit return, block later injection, and
+re-enter the switch queues when retransmitted.
+To accurately simulate the packet-execution mechanisms
+and their interactions, we propose the PEX layer that composes
+the protocol-defined packet mechanisms in one event-driven
+execution path. PEX allows each protocol configuration to
+select the packet-execution mechanisms and their parameters,
+while different protocols reuse the shared PEX implementa-
+tion. Figure 5 illustrates a packet’s execution path through the
+source device, links, switches, and destination device:
+1) Packet execution begins when PEX receives the packets
+generated by OTP. The source device will first check
+whether the configured flow-control policy permits each
+packet to enter the interconnect.
+GPU0
+GPU4GPU5GPU6
+GPU7
+①PacketizationLink Buffer②Packet Spraying③Switch ForwardingOutput Queues④Link Error ModelPacket 0Packet 1Packet 2
+Packet n…
+Packet 0Packet k
+Packet 1Packet k+1Packet 1
+Packet k-1 Packet k-1Packet 2k-1
+⑤FEC
+GPU1GPU2GPU3⑦Retry from LLR Buffer
+⑧Retransmit from Source
+k Ports
+Link BufferErr Packet 0Packet 1Packet 2
+Packet n…
+…
+…Packet 1
+Packet k-1
+Err Packet 0
+Link-level Retry (LLR) Buffer
+Parallel across k portsSwitch
+Packet 0
+Hit: Retransmit Packet 0Miss: Source Retransmission Request⑥ Retry Request
+Fig. 5: Shared scale-up PEX path.
+2) The packets go through multiple routes to reach the des-
+tination if packet spraying is enabled in the configuration.
+3) PEX models the switch routing, arbitration, and queuing
+for the packets.
+4) A user-defined link error model is applied to the packets,
+possibly causing packet errors.
+5) At destination, the protocol-defined FEC will try to
+discover and correct error packets.
+6) When a packet is uncorrectable by the current FEC, it
+will trigger a retry request.
+7) If the required packets hit the link-level retry (LLR)
+buffer, they will be retransmitted to the destination device.
+8) If LLR buffer misses, the packets will be retransmitted
+by the source device, causing longer latency.
+In the PEX path, the protocol-defined packet-execution
+mechanisms can mainly be categorized into three groups: (1)
+credit-based flow control that governs packet injection, (2)
+switched forwarding that selects the outgoing link and arbi-
+trates packets waiting for that link, and (3) Link-error handling
+that governs FEC and retransmission after a link transfer. We
+will introduce how PEX implement these mechanisms in the
+following of this part:
+Credit-based flow control.The PEX layer supports credit-
+based flow control, as used by NVLink, UB, and UALink [21],
+[22], [23], [20]. Each virtual channel has a finite number
+of credits. Injecting a packet consumes one credit, but when
+none remain, the source places the packet in its send queue.
+Successful packet delivery sends a credit packet on the reverse
+path. The source increments the available-credit count when
+this packet returns and then admits queued packets. A delayed
+delivery therefore postpones credit return and can block later
+injection.
+Switched forwarding.At each switch, route selection
+chooses the outgoing link. Packets waiting for the same
+link share an output queue, and switch arbitration selects
+the next packet to send. Packets from concurrent operations
+share these output queues and are arbitrated together, so
+concurrent operations can delay each another. The PEX layer
+also implements packet spraying. When equal-cost paths are
+available, packet spraying distributes a transfer across them.
+A destination reorder buffer restores packet order before
+reporting the transfer’s delivery.
+Link-error handling.Our link model combines FEC with
+optional link-level retry (LLR), which are widely used by
+4
+
+===== PDF PAGE 5 =====
+
+high-speed scale-up links [19], [20]. Each link samples errors
+from its configured pre-FEC BER and applies the selected
+FEC code. In the FEC(N, K, T)model, a codeword contains
+Nsymbols, of whichKcarry data, and corrects up to
+T=⌊(N−K)/2⌋symbol errors [24], [19]. Coding expands
+the transmitted bytes and adds encoder and decoder latency
+defined in the configuration file. After FEC decoding, PEX
+delivers a packet when the errors can be corrected.
+When the errors exceed the FEC correction capability, PEX
+marks the packet as uncorrectable and returns a negative
+acknowledgment (NACK) back to the sender. Selective ac-
+knowledgment (SACK) [25] and Go-Back-N (GBN) [26] are
+two typical retransmission mechanisms used in superpods.
+SACK resends the failed packet. GBN also resends the later
+outstanding packets. The sender retains copies of unacknowl-
+edged packets in a finite retransmission buffer. If the required
+copy has been evicted, PEX reloads its payload from the
+source memory (e.g., HBM) before reinjection. The reload
+adds the source-memory access latency according to user’s
+configuration and causes the time to re-transmit the packet.
+IV. SURROGATE-TO-SIMULATOREVALUATIONFLOW
+ProtoBridgeprovides accurate packet-level simulation for
+a given superpod design. But emerging superpods introduce
+a large and diverse design space across topologies, link tech-
+nologies, and protocols, which cannot be efficiently explored
+with packet-level simulation alone. For example, the CPO case
+study in Section VI-B considers 531 interconnect designs and
+72 error-handling configurations, i.e., 38,232 design points.
+Exhaustively evaluating these candidates with packet-level
+simulation is prohibitively expensive. Therefore, we develop
+a surrogate-to-simulator evaluation flow that uses a fast an-
+alytical surrogate to explore the design space and applies
+ProtoBridgefor accurate validation of promising designs.
+A. Protocol-Defined Latency Surrogate
+Packet simulation spends most of its runtime on schedul-
+ing individual packet events. To enable diverse superpods
+evaluation and exploration, we propose a surrogate model
+that simplifies the events while keeping the two quantities
+exposed byProtoBridge: the transfer parameters defined by
+OTP and the latency effects of the mechanisms selected in
+PEX. Analytical equations then compute operation latency
+directly from the protocol configuration without executing
+every packet event. The surrogate divides operation latency
+into protocol startup, fixed delay on the critical path of each
+transfer, serialized transfer time, and recovery overhead. And
+for the transfer time, flow-control stalls, FEC wire overhead,
+and contention change the effective throughput of the transfer.
+This decomposition gives:
+bL=S p +k aTfixed +k aTserialΦcreditΦfecΦshare
++T retx +T reload +T fec,lat.
+(1)
+Here, bLis the estimated operation latency,S p is protocol
+startup latency,k a is the number of collective-algorithm trans-
+fer steps,T fixed is the propagation or switch-pipeline delay
+per transfer, andT serial is the time to transmit the transfer’s
+data. The factorsΦ credit,Φ fec, andΦ share represent credit
+pressure, FEC wire expansion, and shared-resource contention,
+respectively.T retx is the expected retransmission delay,T reload
+is the delay for packets absent from the retry buffer, and
+Tfec,lat is the FEC encoding and decoding latency. EachΦ-
+factor equals one when the corresponding mechanism adds
+no latency and exceeds one when that mechanism reduces
+the effective throughput of the transfer. In the following
+subsection, we will introduce the modeling for each part of
+the surrogate.
+Protocol steps and packet transfer.Computing Equa-
+tion 1 first requires the startup latencyS p, effective bandwidth
+BWeff, number of transfer stepsk a, and bytes sent in each
+transfer stepB step. The collective schedule determinesk a
+andB step from the operation, participant device count, and
+algorithm. E.g., an 8 KB 8-GPU Ring-AllReduce requires 14
+steps withB step equals 1 KB. The time to transmit the data
+in one transfer step is:
+Tserial = Bstep
+BWeff
+.(2)
+BothBW eff andT fixed come from either a calibrated platform
+profile or the hardware specification. However, using the
+hardware specification may be less accurate than a calibrated
+profile.
+Credit pressure.Credit flow control limits the amount
+of data that a sender can keep in flight. WithCcredits
+andB packet bytes per credit, the sender can inject at most
+CBpacket bytes before a credit returns. LetC bdp denote the
+bandwidth-delay product expressed in credits. Keeping a link
+with bandwidthBW link busy during the credit-return time
+TcreditRTT requires:
+Cbdp = BWlinkTcreditRTT
+Bpacket
+(3)
+credits. WhenC < C bdp, the sender exhausts its credits and
+leaves the link idle while waiting for their return. The resulting
+serialization-latency factor is:
+Φcredit = max
+
+1, Cbdp
+C
+
+.(4)
+The ratioC/C bdp is the fraction of link bandwidth that the
+available credit window can sustain, and a factor of one
+indicates that the credit window is large enough to sustain
+the configured link bandwidth.
+FEC and link-level retransmission.FEC changes both
+the transmitted bytes and the probability that a packet re-
+quires retransmission. We model FEC using a Reed-Solomon
+(RS)(Nfec, Kfec, T)code [24].N fec is the number of symbols
+per codeword,K fec is the number of data symbols, andTis
+the number of symbol errors the code can correct. If a fraction
+fl of the transmitted bytes traverses the links protected by the
+selected code, the FEC-expansion factor is:
+Φfec = 1 +f l
+ Nfec
+Kfec
+−1
+
+.(5)
+5
+
+===== PDF PAGE 6 =====
+
+Besides(N fec, Kfec, T),T fec,lat should also be configured to
+add the FEC encoding and decoding pipeline latency.
+ProtoBridgeand the surrogate read the FEC parameters
+(Nfec, Kfec, T)andT fec,lat from the same protocol configu-
+ration. The surrogate uses the FEC parameters with the link
+BER to compute the probability that FEC cannot correct a
+packet. For pre-FEC BERb, a 10-bit symbol is erroneous with
+probabilityp s = 1−(1−b) 10. LetX∼Binomial(N fec, ps)
+be the number of erroneous symbols in one codeword. The
+codeword is uncorrectable with probabilityp cw = Pr[X > T].
+AB packet-byte packet containsQ=⌈8B packet/(10Kfec)⌉
+codewords. Assuming independent codeword errors, the packet
+is uncorrectable with probability:
+pu = 1−(1−p cw)Q.(6)
+A transfer step completes only after all packets arrive, so its
+retransmission delay is determined by the packet that needs the
+most attempts. LetA j be the number of attempts for packet
+jandA max = maxj Aj. BecausePr[A j > r] =p r
+u andA js
+are independent variables,Pr[A max > r] = 1−(1−p r
+u)P .
+The tail-sum identity then gives:
+E[Amax] =
+∞X
+r=0
+h
+1−(1−p r
+u)P
+i
+.(7)
+SACK re-sends only the failed packets and therefore adds the
+following completion-path delay:
+Tretx,SACK =k aTserial (E[Amax]−1).(8)
+GBN retransmits from the failed packet through the end of
+the issued window. The model caps this window atW=
+min(C, Cbdp, P), whereCis the available credit count,C bdp
+is the credit window needed to fill the path, andPis the
+number of packets in the step. Assuming that the failed posi-
+tion is uniformly distributed within the window, the expected
+retransmitted suffix contains(W+ 1)/2packets.
+Retry-buffer capacity determines whether the required
+packet copies remain in the buffer at the sender’s port.
+LetB buf be the buffer capacity and assume the buffer is
+shared byRoutput ports. The buffer totally holdsC buf =
+⌊Bbuf /Bpacket⌋packet copies, and the fraction of absent
+packets from the port’s buffer is:
+m= max
+
+0,1− Cbuf
+R
+
+.(9)
+LetE retry be the expected number of packets that must be
+re-sent. The surrogate computesT reload frommE retry source
+reads. Each read costsL src +B packet/BWsrc, and the source
+memory latencyL src and bandwidthBW src come from the
+selected memory profile.
+Shared-resource contention.Concurrent packets contend
+when their routes use the same link or switch output. Prior
+flow-level simulation models this contention through bottle-
+neck rate allocation [27]. Following this work, our surrogate
+summarizes competing traffic withρ eff, i.e., the fraction of
+bottleneck bandwidth that it occupies. The evaluated transfer
+3.43.63.84
+1416642561.0 5
+1.0 6
+1.0 7
+141664256
+00.511.5
+1416642561.0 0
+1.1 0
+1.2 0
+141664256
+Norm. Latency
+Data Size (MB)
+Data Size (MB)
+Data Size (MB)
+Data Size (MB)
+Norm. Latency
+Norm. Latency
+Norm. Latency(c)
+(a)
+(d)
+(b)
+ProtoBridgeSurrogate Model
+Fig. 6: Isolated validation of (a) credit pressure, (b) FEC
+coding, (c) high-BER retransmission, and (d) 10% output
+contention.
+72.9 36.9 58.5 
+10.6 15.1 9.7 41.1 43.3 27.2 
+74.2 98.2 
+9.1 7.1 14.0 17.9 11.3 0
+50
+100
+0
+40
+80MAPE (%)
+MAPE (%)RingTreeNVLS4KB64KB1MB16MB256MB(a) (b)Collective algorithmsData Size
+Latency-Bandwidth ModelSurrogate Model
+Fig. 7: Modeling error with different: (a) AllReduce algorithms
+and (b) transfer sizes.
+receives the remaining bandwidth,BW eff(1−ρ eff), giving
+Φshare = 1/(1−ρ eff). We haveρ eff = 0andΦ share = 1
+if there is no contention.
+We evaluate the error of each individual PEX mechanism
+of the surrogate in Figure 6. We normalize the operation
+latency of bothProtoBridgeand surrogate model to the latency
+without the corresponding mechanism. Surrogate MAPE is
+0.6% for credit pressure, 0.0% for FEC expansion, 5.2% for
+SACK retransmission at pre-FEC BER10 −3, and 1.1% for
+output contention. The FEC experiment isolates deterministic
+wire expansion, and the formula uses the same RS codeword
+rounding asProtoBridge, so they have exactly the same wire
+efficiencies.
+By expressing protocol mechanisms as analytical latency
+terms, the surrogate reduces the latency-bandwidth baseline’s
+MAPE from 36.9%∼72.9% to 9.7%∼15.1% across collective
+algorithms and from 27.2%∼98.2% to 7.1%∼17.9% across
+transfer sizes (Figure 7). Meanwhile, compared withProto-
+Bridge, the surrogate reduces per-operation evaluation time
+from 2.38∼75.70 s to 20.5µs.
+B. Surrogate-to-Simulator Interconnect Evaluation
+Evaluating an emerging superpod architecture requires con-
+sidering interconnect designs including network topologies,
+switch buffer sizes, and link technologies, under different
+protocol choices that include flow control, switch routing, and
+error handling configurations. The large interconnect design
+space makes packet simulation for every design prohibitively
+time-consuming. We propose a surrogate-to-simulator evalu-
+ation flow that first uses the surrogate to evaluate the full
+interconnect design space and select the best serving points
+for each design. Then for each LLM workload, we useProto-
+Bridgeto evaluate the union of the top 15% of designs ranked
+6
+
+===== PDF PAGE 7 =====
+
+CPUHostDRAMSSD
+GPUGPUGPUGPU
+GPUGPUGPUGPU
+SSDHost DRAMCPUScale-upNetwork
+Scale-upMemory
+Scale-upMemory
+PCIe
+Scale-up   Link
+Scale-up   Link
+PCIe
+Fig. 8: Memory paths in the serving evaluation.
+by surrogate-predicted interactivity and tokens-per-GPU-per-
+second (TGS) to rank the designs more accurately.
+Communication latency alone cannot rank superpod de-
+signs because compute, memory, and stage overlap determine
+whether a communication delay becomes the LLM serving
+critical path. Therefore, we use ASTRA-sim’s system-level
+model to schedule the compute, memory, and communication
+operations [28], with the consideration of their dependencies
+and overlaps. For each evaluation, we first verify memory
+capacity and place model weights and KV data across GPU
+high-bandwidth memory (HBM) and the selected host or
+pooled-memory tier. In this paper, we model GPU compu-
+tation and HBM access using a roofline model [29], while
+other models with higher accuracies such as Accel-sim [30]
+or GPGPU-sim [31] are also supported. If HBMs cannot
+hold all the data, host DRAM or SSDs will be used. Some
+existing work [32] also provides a scale-up memory pool
+to prevent high-latency host memory accesses. The memory
+pool provides extra capacity but adds remote-memory traffic
+to the interconnect, as shown in Figure 8. The surrogate and
+ProtoBridgeboth supply the latency of each communication
+and remote-memory operation.
+The prefill and decode time determines interactivity and
+TGS, which are widely used to evaluate a serving system. For
+a request withPinput andOoutput tokens, time to first token
+(TTFT), denotedT TTFT, ends when the first output token
+is produced, andT decode covers the remainingO−1output
+tokens. Time per output token (TPOT) and interactivity are:
+TPOT = Tdecode
+O−1 ,I= 1
+TPOT = O−1
+Tdecode
+.(10)
+Interactivity is reported in generated tokens per second for
+one user. WithRactive replicas, a synchronous batch ofB
+requests per replica, andGGPUs, we define TGS, measured
+in tokens per GPU per second, as:
+TGS = RB(P+O)
+G(T TTFT +T decode) .(11)
+V. EVALUATION
+A. Evaluation Setup
+Simulation accuracy setup.Table II summarizes setup for
+simulation accuracy evaluation. We compareProtoBridge’s
+results on H200 and C500 with real hardware profiling,
+and on NVL72 with open-source data [33]. H200 connects
+eight GPUs with an NVSwitch, and NVL72 uses an 18-
+plane full-bisection switch topology [7]. C500 connects four
+GPUs through a direct MetaXLink full mesh, and eight C500s
+are connected through Peripheral Component Interconnect
+TABLE II: Simulation accuracy evaluation setup.
+Reference Fabric configuration Workload
+H200 8 GPUs; NVLink4/NVSwitch; 18
+lanes per GPU; 200 Gb/s per GPU-
+plane link
+NCCL collectives;
+1 KB∼1 GB
+C500 4 GPUs: direct full mesh; 8 GPUs:
+two four-GPU domains and an aggre-
+gate PCIe 5.0 host path
+MCCL collectives;
+1 KB∼2 GB
+NVL72 72 GPUs; 18 NVSwitch planes;
+400 Gb/s per GPU-plane link
+NCCL AllReduce;
+512 MB∼8 GB
+ns-3-UB 64 NPUs; 8×8 two-dimensional full
+mesh; 448 Gb/s
+Collective operations
+from 1 KB∼1 GB
+Express (PCIe) 5.0 host path. For UB, the official ns-3-UB
+simulator [34] supplies the UB results, adding a third scale-up
+protocol family and an eight-by-eight two-dimensional full-
+mesh topology.
+Packet-simulation baselines.We compareProtoBridge
+with the analytical, ns-3, and HTSim network backends of
+ASTRA-sim [35], [28]. The released ASTRA-sim with HTSim
+backend parses only fat-tree topologies. Therefore, we add a
+graph loader to HTSim for the C500, UB, and NVL72 physical
+graphs without changing ASTRA-sim’s collective generation.
+Surrogate baselines.We evaluate the surrogate on AllRe-
+duce configurations with 8 and 16 H200 GPUs. The configu-
+rations cover ring, tree, and NVLS algorithms, with message
+sizes from 4 KB to 256 MB. We compare the surrogate with
+a latency-bandwidth model and three machine learning mod-
+els: random forest (RF), XGBoost (XGB), and a multilayer
+perceptron (MLP). The machine learning models receive the
+message size, GPU count, algorithm, credit limit, BER, FEC
+setting, and retransmission setting. Random forest uses 200
+trees, XGB uses 300 depth-6 trees, and the MLP uses hidden
+layers with 64 and 32 neurons.
+B. Simulation Accuracy
+Overall accuracy.We first test whetherProtoBridgecan
+accurately simulate different protocol families and topolo-
+gies. Figure 9 compares 34 configurations and shows the
+MAPE across various data sizes.ProtoBridge’s mean MAPE
+is 17.76% on H200, 10.33% on C500, 1.76% on NVL72, and
+2.77% on UB, while the best ASTRA-sim backend reaches
+52.01%, 28.85%, 15.62%, and 18.49%, respectively.
+Effects of scale-up protocols.Existing simulators cannot
+accurately model the effects of scale-up protocols. As shown
+in Figure 9(c), all three backends of ASTRA-sim can well
+model the ring algorithm for AllReduce, AllGather, and Re-
+duceScatter with little contention. However, UB AllToAll in-
+stead traverses intermediate NPUs in the 2D-full-mesh fabric,
+causing severe contentions. The analytical backend replace the
+multi-hop paths with a fully connected approximation and
+incur 68.59% error. HTSim and ns-3 backends model the
+2D-full-mesh, but use the DCQCN flow control [36], which
+differs from UB credit flow control and retains 56.96% and
+75.35% errors, respectively.ProtoBridgemodels credit-based
+flow control and contention in the shared PEX layer and
+reaches 8.65% MAPE in UB AllToAll.
+7
+
+===== PDF PAGE 8 =====
+
+117.0 
+64.5 
+32.8 
+99.0 
+189.2 
+152.7 
+59.6 
+44.5 
+29.5 
+38.3 
+40.6 
+33.5 
+32.0 
+33.2 
+44.3 
+42.4 
+42.2 
+32.6 
+43.5 
+31.1 
+35.8 
+140.1 
+46.7 
+8.9 
+61.8 
+117.6 
+107.1 
+77.3 
+36.4 
+15.7 
+41.0 
+43.2 
+36.1 
+34.7 
+35.7 
+46.9 
+45.0 
+44.8 
+35.3 
+46.0 
+33.7 
+38.0 
+103.8 
+56.1 
+36.5 
+1.2E+05
+8.3E+04
+3.7E+04
+62.8 
+35.9 
+28.8 
+48.7 
+51.0 
+44.5 
+43.2 
+44.2 
+54.1 
+52.5 
+52.3 
+43.8 
+53.4 
+42.4 
+45.7 
+20.5 
+9.4 
+6.5 
+7.1 
+16.7 
+27.6 
+25.0 
+11.2 
+13.2 
+13.0 
+28.7 
+11.7 
+13.3 
+19.9 
+28.8 
+25.1 
+30.9 
+11.4 
+24.3 
+15.9 
+12.8 
+020406080100
+Ri ng ARLLRi ng ARLL 128Ri ng ARSIMPLETree ARLLTree ARLL 128Tree ARSIMPLERi ng AGLLRi ng AGLL 128Ri ng AGSIMPLERi ng A2ALLRi ng A2ALL 128Ri ng A2ASIMPLETree A2ALLTree A2ALL 128Tree A2ASIMPLECN D A2ALLCN D A2ALL 128CN D A2ASIMPLECN C A2ALLCN C A2ALL 128CN C A2ASIMPLE
+MAPE (%)
+ASTRA-sim analyticalASTRA-sim ns-3ASTRA-sim HTSimProtoBridge
+40.6 
+65.9 
+20.5 
+51.9 
+16.5 
+58.2 
+27.2 
+66.0 
+44.6 
+49.6 
+15.6 
+20.5 
+13.8 
+10.9 
+26.1 
+49.6 
+68.6 
+41.9 
+25.7 
+29.7 
+20.8 
+16.1 
+19.0 
+45.8 
+11.5 
+11.5 
+12.0 
+18.7 
+11.1 
+5.1 
+8.9 
+3.9 020406080
+AR-4GPUAR-8GPUAG-4GPUAG-8GPURS-4 GPURS-8 GPUA2A-4GPUA2A-8GPU
+MAPE (%)
+3.0 
+4.1 
+2.0 
+68.6 
+0.6 
+0.6 
+1.8 
+75.4 
+6.7 
+5.4 
+4.8 
+57.0 
+0.7 
+0.9 
+0.9 
+8.6 
+0
+10
+20
+ARAGRSA2A
+MAPE (%)
+36.4
+27.1
+19.5
+11.1
+11.7
+31.9
+22.5
+14.9
+6.3
+7.0
+32.1
+22.2
+13.7
+4.6
+5.4
+3.4
+0.7
+1.6
+1.8
+1.4010203040
+0.51248
+APE (%)
+Datasize (GiB)
+(a)
+(b) (c) (d)
+Fig. 9: Accuracy against H200, C500, NVL72, and ns-3-UB references. AR, AG, and A2A denote AllReduce, AllGather, and
+AllToAll; CND and CNC denote CollNetDirect and CollNetChain.
+123456123456
+ProtoBridgelatency (us)
+Surrogate latency (us)
+RingTreeNVLSy = x
+MAPE 11.8%P95 31.5%
+13364
+13364
+13364
+13364
+30
+ProtoBridgeRank
+Surrogate Rank16 GPUs8 GPUs
+13364
+1336413364
+13364(a) (b)
+Fig. 10: Surrogate latency prediction and design ranking. P95
+denotes the 95th-percentile error.
+C. Surrogate Fidelity
+Superpod design exploration depends on both latency error
+and candidate ordering. We therefore evaluate the surrogate’s
+absolute error, generalization, ranking accuracy, and the num-
+ber of candidates that require packet simulation to find the
+lowest-latency design.
+Prediction and ranking accuracy.The evaluation contains
+640 AllReduce configurations spanning 8 and 16 GPUs, ring,
+tree, and NVLS algorithms, and message sizes of 4 KB, 64 KB,
+1 MB, 16 MB, and 256 MB. The configurations use credit
+limits of 32 or 128, pre-FEC BERs from 0 to10 −4, and
+enabled or disabled FEC and link-level retransmission. The
+machine learning baselines RF, XGB, and MLP use five-
+fold cross-validation over distinct configurations. Figure 11(a)
+reports both prediction error and ranking accuracy. The sur-
+rogate reaches 11.8% MAPE, compared with 55.7% for the
+latency-bandwidth model, while RF, XGB, and MLP reach
+41.8%, 81.9%, and 47.1%, respectively. Figure 10(a) compares
+every surrogate prediction with itsProtoBridgelatency, and
+Figure 10(b) shows the rank assignments at 1 MB and 256 MB
+with each bar represents one configuration. Across the com-
+plete evaluation, 95% of the surrogate-predicted results have
+an error of less than 31.5%, and the surrogate orders 87.8% of
+17,757 candidate pairs correctly. Explicit protocol and packet-
+mechanism terms in our surrogate model therefore improve
+both latency prediction and design ranking over the latency-
+bandwidth model and the three learned baselines.
+Figure 11(b) evaluates groups excluded when training the
+machine learning baselines. Each test excludes one collec-
+tive algorithm, GPU count, message size, or error regime.
+11 
+15 
+11 
+10 
+46 
+21 
+35 
+33 
+46 
+21 
+34 
+31 
+46 
+26 
+47 
+01020304050
+RingTree8-GPUBE R
+Su rr.RFXGBML P
+020406080100
+020406080100Ranking Accuracy (%)
+MAPE (%)Lat-BWSurr.RFXGBMLP
+MAPERanking Acc.
+(a) (b) 020406080100
+020406080100
+Workloads that find best design (%)
+Simulated Candidates(%)
+33.4%68.5%
+(c)157
+MAPE (%)
+Lat-BWSurr.
+Fig. 11: Surrogate fidelity and design selection.
+Withholding one group of training data significantly effects
+machine learning baselines’ accuracies, while our surrogate
+model keeps the accuracy steady.
+Finding the lowest-latency design.We next measure
+how many packet simulations are required to identify the
+lowest-latency design. We use the same configurations as the
+prediction and ranking evaluation. For each GPU-count and
+message-size pair, the surrogate ranks the candidate protocol
+configurations, andProtoBridgesimulates them in that order.
+At each point, we check whether the simulated candidates
+include the lowest-latency candidate from the complete set.
+Figure 11(c) shows that the surrogate finds the lowest-latency
+candidate after simulating 33.4% of the candidates on average.
+The latency-bandwidth model requires 68.5%. The surrogate
+therefore leaves 66.6% of the candidates un-simulated, com-
+pared with 31.5% for the latency-bandwidth model.
+VI. CASESTUDIES
+We applyProtoBridgeand the surrogate to two designs
+motivated by emerging serving requirements: (1) Long-context
+LLMs can exceed aggregate GPU HBM, motivating memory
+pools attached to the scale-up fabric, but pool accesses contend
+with LLM communication; (2) Larger superpods demand more
+interconnection bandwidth and longer-reach links, motivating
+CPO, but optical links add conversion and error-handling
+overhead.
+A. Case Study I: Scale-Up Memory Pools
+1) Setup:We compare the systems with and without scale-
+up-attached memory pools to determine which designs retain
+their serving benefit under shared-fabric contention.
+Design space.We evaluate DeepSeek-V3, GLM-5.2, and
+Qwen3-235B on 128 H200 GPUs, each with 141 GB of HBM.
+Each request contains one million input tokens and generates
+8
+
+===== PDF PAGE 9 =====
+
+TABLE III: Memory profiles used in Case Study I. Attach-
+ment and fabric bandwidth can further limit the listed read
+bandwidth.
+Tier Capacity Read bandwidth Fixed latency
+H200 HBM [44] 141 GB/GPU 4.8 TB/s Not modeled
+Host DRAM [45], [44], [46] 256 GB/GPU 64 GB/s 2µs
+Host SSD [47] 3.84 TB/GPU 6.8 GB/s 80µs
+LPDDR5X pool [48], [49] 480 GB/node 335 GB/s 1µs
+NVMe pool [50] 30.72 TB/node 14 GB/s 60µs
+HBF pool [51], [52] 1.024 TB/node 3.2 TB/s 20µs
+
+			
+		
+).#,!.%/%.1
+.*&#)--
+
+	
+
+		
+
+&
+)".*#)".*&#)--
+##+##&
+		
+				
+		
+).#,!.%/%.1
+.*&#)--
+
+&
+
+	&
+
+		&
+ 
+		 
+		
+).#,!.%/%.1
+.*&#)--
+		
+
+&
+&
+!0#)
+,#.*$,*).%#,*+**'#(*,1+**'
+TGS
+InteractivityInteractivityInteractivity(a) Deepseek-v3(b) GLM-5.2(c) Qwen3-235B
+G1Pool designsNo-pool designsPool Pareto pointsNo-pool Pareto points1.51x TGS
+Fig. 12: Memory-pool and no-memory-pool serving frontiers
+at a one-million-token context.
+1,024 output tokens. The per-replica batch sizes are from 1 to
+512. We evaluate colocated and prefill/decode-disaggregated
+execution [12], [6]. Disaggregated strategies partition 128
+GPUs between prefill and decode, varying the allocation from
+P/D= 8/120to120/8in eight-GPU increments. Replicated
+variants assign 16, 32, or 64 GPUs to each prefill/decode
+replica pair. Across the three LLMs, the partition optimizer
+considers 2,353 legal combinations of parallelism strategies.
+For each design and batch size, we select the partition with the
+highest TGS at each interactivity requirement. Expert-parallel
+configurations use DeepEP normal mode during prefill and
+low-latency mode during decode [37].
+The interconnect space begins with 23 no-pool configura-
+tions from ten topology families. The direct topology families
+include ring, hypercube, and two-dimensional mesh [38]. The
+switched topology families are multiplane [39], NVL-style [7],
+leaf-spine and three-level Clos [40], fat tree [41], Dragon-
+fly+ [42], and rail-optimized fat tree [43]. Every GPU has 18
+links at 200 Gb/s in each direction, and each topology specifies
+its virtual-channel buffering. The pool choices include low-
+power double-data-rate 5X (LPDDR5X), Non-V olatile Mem-
+ory Express (NVMe) SSD, and high-bandwidth flash (HBF).
+Pool size varies from 1 to 46 memory nodes, pooled data
+includes the KV cache, expert weights, or both, and attachment
+is direct or through leaf switches. These choices define 64
+pool structures on one NVL-style configuration and the rail-
+optimized fat tree. Together with the 23 no-pool configura-
+tions, they yield 151 design points. For the data placement, we
+store as much of the model weights and KV cache as possible
+in HBM. The pool stores the overflow KV and weights, while
+the remaining overflow uses host DRAM and then SSD when
+the pool is still insufficient. Table III shows the capacity,
+bandwidth, and access latency of each memory tier.
+2) Results:As shown in Figure 12, memory pools push
+the TGS-interactivity frontier forward for Deepseek-v3 and
+1100100000.50.70.91.1
+HBF Latency (us)
+TGSInteractivity
+4040040000.30.50.70.91.1
+HBF bandwidth/node (GB/s)
+Normalized metric
+Fig. 13: G1 sensitivity to HBF read bandwidth and fixed
+latency. Values are normalized to 3.2 TB/s per node and 20µs.
+GLM-5.2, while all the memory-pool points on the frontier
+use HBF. Taking Point G1 in Figure 12(b) as an example,
+it uses all 128 GPUs for both prefill and decode (P/D=
+128/128), forming eight replicas with tensor-parallel degree
+16. It attaches a 46-node HBF KV pool to a rail-optimized fat
+tree. The memory pool increases interactivity by 1.93×and
+TGS by 1.51×. Among all no-memory-pool designs that reach
+at least G1’s interactivity, the highest TGS is 29.3% lower than
+G1.
+The results show that the memory pools mainly benefit for
+sparse KV access. GLM-5.2 uses sparse attention in 75 of its
+78 layers. At a one-million-token context, each sparse layer
+reads only the selected 2,048 tokens and its index summaries,
+corresponding to 0.54% of the sparse-layer KV . The memory
+pool therefore expands KV capacity without placing the entire
+context on the fabric for every decode step. HBF also reaches
+the DeepSeek-V3 frontier because multi-head latent attention
+compresses its KV representation. However, Qwen3-235B
+uses dense grouped-query attention and must read all the KV .
+So none of its memory-pool designs remains on the frontier.
+3) Insights:First, memory pools mainly improve TGS.
+Memory pool provides additional capacity to increase batch
+size and allows the model to be deployed on a smaller
+cluster, but can hardly reduce every user’s decode time in
+LLM serving. At G1 in Figure 12, the pool provides enough
+KV capacity for eight replicas with tensor-parallel degree 16
+at batch 64, providing much faster memory accesses than
+host DRAM and SSDs. The additional replicas and higher
+batch sizes raise TGS, while HBF latency and bandwidth
+prevent remote KV reads from materially increasing TPOT.
+Our findings are consistent with Mooncake [53], which inde-
+pendently demonstrates that disaggregated KV-cache storage
+can improve long-context serving throughput when its capacity
+and transfer bandwidth are sufficient.
+Second, it is important to choose a memory type with
+high bandwidth for the memory pool. Figure 13 varies the
+memory pool latency and bandwidth parameters around G1.
+As the bandwidth being lower than 400 GB/s, the TGS and
+interactivity drop simultaneously as the data movement time
+is too long to be hidden by computing. Reducing memory
+bandwidth from 400 GB/s to 200 GB/s lowers TGS by 16.0%
+and interactivity by 26.0%. For the latency, memory pool
+access latency contributes to every decode step that reads
+remote KV . But the serving pipeline overlaps these reads with
+other operations, so fixed latency affects TPOT only when
+9
+
+===== PDF PAGE 10 =====
+
+memory service becomes the longest pipeline stage. Increasing
+latency from 20µs to 1 ms changes both metrics by less
+than 0.01%; at 10 ms, TGS falls by 8.9% and interactivity
+reduces by 15.3%. Therefore, memory pool is more sensitive
+to bandwidth rather than latency, and this is also why HBF
+outperforms LPDDR and NVMe in the design study.
+B. Case Study II: Full-Optical CPO Fabrics
+1) Setup:Electrical link loss rises with signaling rate and
+distance, limiting the reach and energy efficiency of high-
+speed copper links. Optical transmission has lower reach-
+dependent loss, while CPO shortens the electrical path between
+the GPU or switch and the optical engine. Prior studies identify
+CPO as a promising way to achieve higher bandwidth density
+and lower energy per bit [54], [55], [56], [57], [58]. Recent
+implementations report 32 channels at 200 Gb/s with twice
+the bandwidth density and 30% lower power per bit than an
+electrical link [59], [60], [61].
+We use optical-electrical (O/E) hybrid interconnection as
+the baseline, which selects the link medium by distance.
+It uses passive copper for connections up to 2 m, active
+electrical cable for connections from 2 m to 5 m, and optical
+fiber beyond 5 m [62]. We compare this reach-gated baseline
+with full-optical CPO interconnections to determine whether
+their higher channel count and data rate improve serving
+performance after accounting for optical conversion latency
+and link-error handling.
+Design space.We use the same LLMs, output length, and
+DeepEP modes as Section VI-A. Case Study II evaluates 1,024
+GB200 GPUs, each with 186 GB of HBM, 8 TB/s of HBM
+bandwidth, and 2.5 peta floating-point operations per second
+of dense bfloat16 (BF16) compute [7]. Every input contains
+one million tokens, and per-replica batch sizes are from 1 to
+1024.
+The O/E interconnection has 18 channels at 400 Gb/s and
+admits 39 topology configurations. The single-switch NVL-
+style fabric from Section VI-A cannot span 1,024 GPUs, so we
+exclude it. We add a routed 2D-full-mesh Clos [16], as we are
+going to explore CPO with more channels per GPU. CPO uses
+32, 64, or 128 channels at 200, 400, or 800 Gb/s, and optical
+conversion adds 10 ns at each conversion interface [63], [64].
+Combining each channel count with the three rates gives 492
+CPO interconnect designs. Together with the 39 O/E designs,
+the interconnect space contains 531 points. The pre-FEC BER
+ranges from10 −9 to10 −3 [56], [65]. For error handling,
+FEC is disabled or uses RS(528,514,7), RS(544,514,15),
+or RS(576,514,31)[24], [19]. Retransmission uses GBN
+or SACK with a buffer of 0 to 8 MB. We evaluate every
+design point at the six BER values, requiring totally 229,392
+evaluations.
+For each LLM, we form the Pareto frontier of the 18×400-
+Gb/s O/E baseline. We choose the point with the largest
+product of the TGS and interactivity as the reference for the
+following analysis. This choice balances the two metrics rather
+than favoring either endpoint.
+TABLE IV: Serving latency for O/E and 128×800-Gb/s CPO
+at BER10 −9. Each entry shows O/E→CPO.
+Model TTFT (s) TPOT (ms)
+DeepSeek-V3 63.49→63.22 24.75→24.02
+GLM-5.2 3.834→3.543 9.252→8.386
+Qwen3-235B 39.10→38.85 12.79→13.11
+2) Results:Figure 14 uses GLM-5.2’s operators as an
+example, isolating nine communication operations with var-
+ious data sizes from each design, including prefill AllReduce
+(P-AR) and AllGather (P-AG), decode AllReduce (D-AR),
+AllGather (D-AG), and AlltoAll dispatch (D-A2A-d) and com-
+bine (D-A2A-c). We simulate each operation on the O/E inter-
+connection and all nine CPO configurations. The CPO runs use
+pre-FEC BER10 −9, SACK, and a 4 MB retransmission buffer.
+Relative to O/E, 128 CPO channels at 800 Gb/s make the three
+prefill operations 3.55×∼24.8×faster for GLM-5.2, while
+speedups for the decode operations are 0.99×∼1.40×. The
+results show that for prefill communications with large data
+sizes, high bandwidth CPO greatly reduces communication
+latency. For decode communications, increasing bandwidth
+does not bring much benefits as they are latency-dominated;
+instead, the conversion latency and error handling overhead of
+CPO may increase the communication latency. However, for
+decode AlltoAll, increasing channel number provides a 39%
+improvement. This is because increasing channel number gives
+us a larger topology design space. 64- and 128-channel designs
+use 2D-full-mesh topology, compared to leaf-spine topology
+in the 32-channel design, the network contention is greatly
+reduced for AlltoAll communications.
+Table IV shows how CPO changes the TTFT and TPOT
+for three models. Using CPO with 128×800 Gb/s per GPU
+reduces TTFT by 0.42%∼7.58%, reduces TPOT by 2.93% for
+DeepSeek-V3 and 9.36% for GLM-5.2, but increases TPOT by
+2.50% for Qwen3-235B. Although CPO reduces much prefill
+communication overhead, the TTFT only decreases slightly as
+prefill is compute-bound.
+Figure 15 compares CPO at pre-FEC BER10 −9 and
+10−3. Relative to O/E at BER10 −9, the 128×800-Gb/s CPO
+configuration changes TGS by 1.15%, 9.70%, and−0.14%
+for DeepSeek-V3, GLM-5.2, and Qwen3-235B, respectively.
+At BER10 −3, the best 128×800-Gb/s design raises TGS
+by 0.54% for DeepSeek-V3 and 3.98% for GLM-5.2, but
+reduces Qwen3-235B TGS by 12.30%. Even with the strongest
+FEC RS(576,514,31)among our design space and the fastest
+retransmission strategy SACK, a high BER of10 −3 nearly
+destroys all improvements that CPO brings.
+3) Insights:First, operation size determines whether CPO
+bandwidth is useful. Large prefill operations amortize protocol
+startup and optical conversion latency, so their latency falls
+substantially as per-GPU interconnection bandwidth rises.
+However, most decode operations are too small to do so.
+Qwen3-235B illustrates the boundary: its 512-B expert All-to-
+All is slower on CPO, making its TPOT increase. Furthermore,
+10
+
+===== PDF PAGE 11 =====
+
+00.511.52 O/E 18x400GbpsCPO 200Gbps
+P-AR1.5GP-AG768MP-AG72MD-AR768KD-AG12KD-AG4KD-RS 192KD-A2A-d 24KD-A2A-c 24K
+Latencynormalized toO/E CPO 400GbpsCPO 800GbpsCPO 32 channelsCPO 64 channelsCPO 128 channels
+Fig. 14: Operation latency normalized to the corresponding O/E interconnection. Lower is better; O/E baseline equals 1.
+DeepSeek-V3+1.0%+1.1%+1.1%+0.8%+1.0%+1.1%-0.3%+0.3%+0.6%+0.4%+0.5%+0.5%+0.2%+0.4%+0.5%-2.4%-1.7%-1.4%
+GLM-5.2+8.5%+9.3%+9.7%+6.9%+8.5%+9.3%-1.9%+2.4%+4.8%+2.7%+3.5%+4.0%+1.1%+2.7%+3.5%-29.6%-15.7%-13.9%
+Qwen3-235B-0.3%-0.2%-0.1%-0.4%-0.3%-0.2%-0.7%-0.4%-0.3%-12.4%-12.3%-12.3%-12.6%-12.4%-12.3%-12.9%-12.6%-12.4%
+12864321286432200400800SerDes rate (Gb/s)
+CPO TGS change from O/E (%)
+-10
+10
+200400800200400800
+BER=1e-9BER=1e-3
+Fig. 15: Effect of pre-FEC BER on CPO TGS relative to O/E
+at 1,024 GPUs.
+higher BER of CPO introduces more FEC overhead and
+retransmission latency, making the TPOT even worse. In
+short, CPO’s high bandwidth does not benefit LLM decode
+performance unless the high BER problem get solved in the
+future.
+Second, increasing channel count is more significant than
+increasing bandwidth. The 32×400-Gb/s and 64×200-Gb/s
+CPO configurations both provide 12.8 Tb/s, but only the 64-
+channel configuration can form the 2D-full-mesh topology for
+1024 GPUs. Relative to the 32-channel design that uses a
+spine-leaf topology, the 2D-full-mesh reduces their AlltoAll
+communication latency by 39%. With smaller channel area,
+CPO becomes a promising way to increase the channel count
+of one GPU chip, allowing us to construct a superpod with
+thousands of GPUs and a high-connectivity topology. UB-
+mesh [16] provides an independent support of our finding,
+by designing an ND-full-mesh topology with optical intercon-
+nections.
+VII. RELATEDWORK
+System simulators.Chakra standardizes distributed
+machine-learning operations and their dependencies [66].
+ASTRA-sim consumes such workloads and models collectives
+over analytical or detailed network backends [35], [28], [67].
+A recent extension to Chakra also represents collective
+algorithms as point-to-point transfers and reductions [68].
+SimAI increases training-system fidelity by integrating
+framework, kernel, collective, and network models [69],
+while Phantora executes unmodified training frameworks and
+intercepts their compute and communication operations [70].
+LLMServingSim, Vidur, and Frontier instead model serving
+schedules, disaggregation, and runtime state [71], [72], [73],
+[74]. These systems describe when communication operations
+or collective transfers execute.ProtoBridgecontinues from
+those operations to protocol packetization, completion
+dependencies, and the packet mechanisms selected for a
+scale-up design.
+Detailed network simulation.ns-3, BookSim, Garnet, and
+HTSim resolve packet timing, queues, routing, and switch
+behavior [10], [75], [76], [77]. CNSim adds cycle-accurate,
+packet-parallel simulation for large chiplet networks, and
+Arcadia targets cluster-scale network simulation for artificial-
+intelligence workloads [78], [79]. SimBricks composes inde-
+pendent simulators [80]. DICE models physical-layer coding,
+channel errors, retransmission, and flow control along an inter-
+chiplet datapath [81]. These tools execute traffic supplied by a
+workload or protocol implementation. Adding a new scale-up
+protocol still requires code that generates its traffic and maps
+packet outcomes to operation completion.ProtoBridgefactors
+those choices into its two-layer configuration.
+Analytical performance models.FlexFlow and Proteus
+estimate distributed execution while searching parallelization
+strategies [8], [9]. Calculon and LLMCompass use parame-
+terized analytical models to explore LLM system and hard-
+ware designs [82], [83]. Such models make broad exploration
+tractable by representing communication with aggregate la-
+tency and bandwidth parameters. Our surrogate instead retains
+separate terms for the protocol transfer and for delays intro-
+duced by flow control, contention, coding, and retransmission.
+Section V compares the resulting prediction and design-
+ranking accuracy.
+VIII. CONCLUSION
+In this paper, we proposeProtoBridge, an ns-3-based LLM-
+to-packet simulator that enables accurate and efficient evalua-
+tion of emerging superpod interconnect designs. ProtoBridge
+introduces the OTP and PEX abstraction layers to sepa-
+rate protocol-specific packet behaviors from shared packet-
+execution mechanisms, allowing diverse scale-up protocols to
+be modeled on a common simulation substrate.ProtoBridge
+achieves 17.8% and 10.3% average error on H200 NVLink4
+and C500 MetaXLink, respectively. To further enable efficient
+exploration across large interconnect design spaces, we further
+develop a protocol-defined surrogate model that preserves key
+protocol effects, enabling a surrogate-to-simulator workflow
+that explores thousands of superpod configurations efficiently.
+Using this workflow, we analyze emerging superpod designs
+with scale-up memory pools and CPO interconnects, providing
+architectural insights for future LLM superpod designs.
+11
+
+===== PDF PAGE 12 =====
+
+REFERENCES
+[1] M. Shoeybi, M. Patwary, R. Puri, P. LeGresley, J. Casper, and B. Catan-
+zaro, “Megatron-lm: Training multi-billion parameter language models
+using model parallelism,”arXiv preprint arXiv:1909.08053, 2019.
+[2] Y . Huang, Y . Cheng, A. Bapna, O. Firat, M. X. Chen, D. Chen, H. Lee,
+J. Ngiam, Q. V . Le, Y . Wuet al., “Gpipe: efficient training of giant
+neural networks using pipeline parallelism,” inProceedings of the 33rd
+International Conference on Neural Information Processing Systems,
+2019, pp. 103–112.
+[3] S. Rajbhandari, C. Li, Z. Yao, M. Zhang, R. Y . Aminabadi, A. A.
+Awan, J. Rasley, and Y . He, “Deepspeed-moe: Advancing mixture-
+of-experts inference and training to power next-generation ai scale,”
+inInternational conference on machine learning. PMLR, 2022, pp.
+18 332–18 346.
+[4] W. Kwon, Z. Li, S. Zhuang, Y . Sheng, L. Zheng, C. H. Yu, J. Gonzalez,
+H. Zhang, and I. Stoica, “Efficient memory management for large
+language model serving with pagedattention,” inProceedings of the 29th
+symposium on operating systems principles, 2023, pp. 611–626.
+[5] L. Zheng, L. Yin, Z. Xie, C. Sun, J. Huang, C. H. Yu, S. Cao,
+C. Kozyrakis, I. Stoica, J. E. Gonzalezet al., “Sglang: Efficient execution
+of structured language model programs,”Advances in neural information
+processing systems, vol. 37, pp. 62 557–62 583, 2024.
+[6] Y . Zhong, S. Liu, J. Chen, J. Hu, Y . Zhu, X. Liu, X. Jin, and
+H. Zhang, “{DistServe}: Disaggregating prefill and decoding for
+goodput-optimized large language model serving,” in18th USENIX
+Symposium on Operating Systems Design and Implementation (OSDI
+24), 2024, pp. 193–210.
+[7] NVIDIA, “NVIDIA GB200 NVL72,” 2024. [Online]. Available:
+https://www.nvidia.com/en-us/data-center/gb200-nvl72/
+[8] Z. Jia, M. Zaharia, and A. Aiken, “Beyond data and model parallelism
+for deep neural networks.”Proceedings of Machine Learning and
+Systems, vol. 1, pp. 1–13, 2019.
+[9] J. Duan, X. Li, P. Xu, X. Zhang, S. Yan, Y . Liang, and D. Lin,
+“Proteus: Simulating the performance of distributed dnn training,”IEEE
+Transactions on parallel and distributed systems, vol. 35, no. 10, pp.
+1867–1878, 2024.
+[10] G. F. Riley and T. R. Henderson, “The ns-3 network simulator,” in
+Modeling and tools for network simulation. Springer, 2010, pp. 15–34.
+[11] A. Liu, A. Mei, B. Lin, B. Xue, B. Wang, B. Xu, B. Wu, B. Zhang,
+C. Lin, C. Donget al., “Deepseek-v3. 2: Pushing the frontier of open
+large language models,”arXiv preprint arXiv:2512.02556, 2025.
+[12] P. Patel, E. Choukse, C. Zhang, A. Shah, ´I. Goiri, S. Maleki, and
+R. Bianchini, “Splitwise: Efficient generative llm inference using phase
+splitting,” in2024 ACM/IEEE 51st Annual International Symposium on
+Computer Architecture (ISCA). IEEE, 2024, pp. 118–132.
+[13] NVIDIA, “NVIDIA Collective Communication Library (NCCL) User
+Guide,” 2026. [Online]. Available: https://docs.nvidia.com/deeplearning
+/nccl/pdf/NCCL-User-Guide.pdf
+[14] ——, “NVIDIA Scalable Hierarchical Aggregation and Reduction
+Protocol (SHARP), Rev. 3.6.0,” 2024. [Online]. Available: https:
+//docs.nvidia.com/nvidia-scalable-hierarchical-aggregation-and-reducti
+on-protocol-sharp-rev-3-6-0.pdf
+[15] ——, “NVIDIA NVSwitch: The World’s Highest-Bandwidth On-
+Node Switch,” Technical overview, 2018. [Online]. Available: https:
+//images.nvidia.com/content/pdf/nvswitch-technical-overview.pdf
+[16] H. Liao, B. Liu, X. Chen, Z. Guo, C. Cheng, J. Wang, X. Chen, P. Dong,
+R. Meng, W. Liuet al., “Ub-mesh: a hierarchically localized nd-fullmesh
+datacenter network architecture,”IEEE Micro, 2025.
+[17] N. Jouppi, G. Kurian, S. Li, P. Ma, R. Nagarajan, L. Nai, N. Patil,
+S. Subramanian, A. Swing, B. Towleset al., “Tpu v4: An optically
+reconfigurable supercomputer for machine learning with hardware sup-
+port for embeddings,” inProceedings of the 50th annual international
+symposium on computer architecture, 2023, pp. 1–14.
+[18] P. Layer, “Ieee standard for ethernet,” 2018.
+[19] P. Anslow, “Rs (544,514) fec performance including precoding,”IEEE
+P802. 3cd Task Force, 2016.
+[20] UALink Consortium, “UALink 200G 1.0 Specification,” 2025. [Online].
+Available: https://ualinkconsortium.org/specification/ualink-200g-1-0-s
+pecification/
+[21] NVIDIA, “NVIDIA Tesla P100: The Most Advanced Datacenter
+Accelerator Ever Built,” Pascal architecture white paper, 2016.
+[Online]. Available: https://images.nvidia.com/content/pdf/tesla/whitep
+aper/pascal-architecture-whitepaper.pdf
+[22] M. A. Blumrich, N. Jiang, and L. R. Dennison, “Exploiting Idle
+Resources in a High-Radix Switch for Supplemental Storage,” inSC,
+2018, pp. 4:1–4:13. [Online]. Available: https://research.nvidia.com/site
+s/default/files/pubs/2018-11 Exploiting-Idle-Resources/Stashing SC18.
+pdf
+[23] UnifiedBus Community, “UnifiedBus (UB) Base Specification, Revision
+2.0,” 2025. [Online]. Available: https://www.unifiedbus.com/en/docs/U
+B-Base-Specification-2.0-preview-en
+[24] I. S. Reed and G. Solomon, “Polynomial codes over certain finite fields,”
+Journal of the society for industrial and applied mathematics, vol. 8,
+no. 2, pp. 300–304, 1960.
+[25] M. Mathis, J. Mahdavi, S. Floyd, and A. Romanow, “Tcp selective
+acknowledgment options,” Tech. Rep., 1996.
+[26] M. Zorzi and R. R. Rao, “Throughput analysis of go-back-n arq
+in markov channels with unreliable feedback,” inProceedings IEEE
+International Conference on Communications ICC’95, vol. 2. IEEE,
+1995, pp. 1232–1237.
+[27] A. T. Nguyen and F. Eliassen, “An efficient solution for max-min fair
+rate allocation in p2p simulation,” in2009 International Conference on
+Ultra Modern Telecommunications & Workshops. IEEE, 2009, pp. 1–5.
+[28] W. Won, T. Heo, S. Rashidi, S. Sridharan, S. Srinivasan, and T. Kr-
+ishna, “Astra-sim2. 0: Modeling hierarchical networks and disaggregated
+systems for large-model training at scale,” in2023 IEEE International
+Symposium on Performance Analysis of Systems and Software (ISPASS).
+IEEE, 2023, pp. 283–294.
+[29] S. Williams, A. Waterman, and D. Patterson, “Roofline: an insightful
+visual performance model for multicore architectures,”Communications
+of the ACM, vol. 52, no. 4, pp. 65–76, 2009.
+[30] M. Khairy, Z. Shen, T. M. Aamodt, and T. G. Rogers, “Accel-sim:
+An extensible simulation framework for validated gpu modeling,” in
+2020 ACM/IEEE 47th Annual International Symposium on Computer
+Architecture (ISCA). IEEE, 2020, pp. 473–486.
+[31] A. Bakhoda, G. L. Yuan, W. W. Fung, H. Wong, and T. M. Aamodt,
+“Analyzing cuda workloads using a detailed gpu simulator,” in2009
+IEEE international symposium on performance analysis of systems and
+software. IEEE, 2009, pp. 163–174.
+[32] H. Woo, M. Kwon, J. Kim, E. Na, H. Choi, S. Jang, and M. Jung,
+“Scalepool: Hybrid xlink-cxl fabric for composable resource disaggre-
+gation in unified scale-up domains,” inProceedings of the 3rd Workshop
+on Disruptive Memory Systems, 2025, pp. 10–18.
+[33] CoreWeave, “NCCL for Distributed Training,” 2026, commit 5df7d3a.
+[Online]. Available: https://github.com/coreweave/nccl-tests
+[34] OpenUSIM, “ns-3-UB: UnifiedBus Network Simulation Framework,”
+2026, version 1.2.1, commit 7faa8f2. [Online]. Available: https:
+//gitcode.com/open-usim/ns-3-ub
+[35] S. Rashidi, S. Sridharan, S. Srinivasan, and T. Krishna, “Astra-sim: En-
+abling sw/hw co-design exploration for distributed dl training platforms,”
+in2020 IEEE International Symposium on Performance Analysis of
+Systems and Software (ISPASS). IEEE, 2020, pp. 81–92.
+[36] Y . Zhu, H. Eran, D. Firestone, C. Guo, M. Lipshteyn, Y . Liron, J. Padhye,
+S. Raindel, M. H. Yahia, and M. Zhang, “Congestion control for large-
+scale rdma deployments,”ACM SIGCOMM Computer Communication
+Review, vol. 45, no. 4, pp. 523–536, 2015.
+[37] DeepSeek-AI, “DeepEP: A high-performance communication library
+for expert parallelism,” 2025. [Online]. Available: https://github.com/d
+eepseek-ai/DeepEP
+[38] W. J. Dally and B. P. Towles,Principles and practices of interconnection
+networks. Elsevier, 2004.
+[39] A. M. Gherghescu, V .-A. B ˘adoiu, A. Agache, M.-V . Dumitru,
+I. Vasilescu, R. Mantu, and C. Raiciu, “I’ve got 99 problems but flops
+ain’t one,” inProceedings of the 23rd ACM Workshop on Hot Topics in
+Networks, 2024, pp. 195–204.
+[40] M. Al-Fares, A. Loukissas, and A. Vahdat, “A scalable, commodity data
+center network architecture,”ACM SIGCOMM computer communication
+review, vol. 38, no. 4, pp. 63–74, 2008.
+[41] C. E. Leiserson, “Fat-trees: Universal networks for hardware-efficient
+supercomputing,”IEEE transactions on Computers, vol. 100, no. 10,
+pp. 892–901, 1985.
+[42] A. Shpiner, Z. Haramaty, S. Eliad, V . Zdornov, B. Gafni, and E. Zahavi,
+“Dragonfly+: Low cost topology for scaling datacenters,” in2017
+IEEE 3rd International Workshop on High-Performance Interconnection
+Networks in the Exascale and Big-Data Era (HiPINEB). IEEE, 2017,
+pp. 1–8.
+12
+
+===== PDF PAGE 13 =====
+
+[43] W. Wang, M. Ghobadi, K. Shakeri, Y . Zhang, and N. Hasani, “Rail-
+only: A low-cost high-performance network for training llms with trillion
+parameters,” IEEE, pp. 1–10, 2024.
+[44] NVIDIA, “NVIDIA H200 Tensor Core GPU,” Product specification,
+2023. [Online]. Available: https://www.nvidia.com/en-us/data-center/h2
+00/
+[45] ——, “NVIDIA DGX H100/H200 User Guide,” 2026. [Online].
+Available: https://docs.nvidia.com/dgx/dgxh100-user-guide/dgxh100-u
+ser-guide.pdf
+[46] T. Zheng, D. Nellans, A. Zulfiqar, M. Stephenson, and S. W. Keckler,
+“Towards high performance paged memory for gpus,” in2016 IEEE
+International Symposium on High Performance Computer Architecture
+(HPCA). IEEE, 2016, pp. 345–357.
+[47] Micron Technology, “Micron 7450 SSD Series Technical Product
+Specification,” Rev. C, 2026. [Online]. Available: https://assets.micron.
+com/adobe/assets/urn%3Aaaid%3Aaem%3Ad133a40b-b36c-4b17-b76
+8-659acc4d4bca/renditions/original/as/7450-nvme-ssd-tech-prod-spec.
+pdf
+[48] NVIDIA, “Grace Performance Tuning Guide,” 2026. [Online].
+Available: https://docs.nvidia.com/dccpu/grace-perf-tuning-guide/
+[49] F. Werner, M. Weisgut, and T. Rabl, “Towards memory disaggregation
+via nvlink c2c: Benchmarking cpu-requested gpu memory access,” in
+Proceedings of the 4th Workshop on Heterogeneous Composable and
+Disaggregated Systems, 2025, pp. 8–14.
+[50] Micron Technology, “Micron 9550 SSD Series Technical Product
+Specification,” Rev. A, 2025. [Online]. Available: https://www.micron
+.com/content/dam/micron/global/public/products/data-sheet/ssd/9550-n
+vme-ssd-tech-prod-spec.pdf
+[51] Sandisk, “High Bandwidth Flash Fact Sheet,” Jul. 2025. [Online].
+Available: https://documents.sandisk.com/content/dam/asset-library/en
+us/assets/public/sandisk/collateral/company/Sandisk-HBF-Fact-Sheet.p
+df
+[52] M. Ha, E. Kim, and H. Kim, “H 3: Hybrid architecture using high
+bandwidth memory and high bandwidth flash for cost-efficient llm
+inference,”IEEE Computer Architecture Letters, 2026.
+[53] R. Qin, Z. Li, W. He, J. Cui, F. Ren, M. Zhang, Y . Wu, W. Zheng,
+and X. Xu, “Mooncake: Trading more storage for less computation—a
+{KVCache-centric}architecture for serving{LLM}chatbot,” in23rd
+USENIX conference on file and storage technologies (FAST 25), 2025,
+pp. 155–170.
+[54] M. Tan, J. Xu, S. Liu, J. Feng, H. Zhang, C. Yao, S. Chen, H. Guo,
+G. Han, Z. Wenet al., “Co-packaged optics (cpo): status, challenges,
+and solutions,”Frontiers of optoelectronics, vol. 16, no. 1, p. 1, 2023.
+[55] B. G. Lee, N. Nedovic, T. H. Greer, and C. T. Gray, “Beyond cpo: A
+motivation and approach for bringing optics onto the silicon interposer,”
+Journal of Lightwave Technology, vol. 41, no. 4, pp. 1152–1162, 2022.
+[56] C. Sun, D. Jeong, M. Zhang, W. Bae, C. Zhang, P. Bhargava, D. Van Or-
+den, S. Ardalan, C. Ramamurthy, E. Andersonet al., “Teraphy: An o-
+band wdm electro-optic platform for low power, terabit/s optical i/o,” in
+2020 IEEE Symposium on VLSI Technology. IEEE, 2020, pp. 1–2.
+[57] Z. Wu, L. Y . Dai, A. Novick, M. Glick, Z. Zhu, S. Rumley, G. Michel-
+ogiannakis, J. Shalf, and K. Bergman, “Peta-scale embedded photonics
+architecture for distributed deep learning applications,”Journal of Light-
+wave Technology, vol. 41, no. 12, pp. 3737–3749, 2023.
+[58] X. Liet al., “1.6 Tbps FOWLP-Based Silicon Photonic Engine for
+Co-Packaged Optics,”Journal of Lightwave Technology, vol. 43, no. 4,
+pp. 1979–1986, 2025. [Online]. Available: https://opg.optica.org/jlt/abs
+tract.cfm?URI=jlt-43-4-1979
+[59] Marvell Technology, “Marvell Demonstrates Industry’s First 200G 3D
+Silicon Photonics Engine to Scale Accelerated Infrastructure,” Mar.
+2024. [Online]. Available: https://investor.marvell.com/news-events/pr
+ess-releases/detail/146/marvell-demonstrates-industrys-first-200g-3d-s
+ilicon-photonics-engine-to-scale-accelerated-infrastructure
+[60] S. Fathololoumi, “4 tb/s optical compute interconnect chiplet for xpu-
+to-xpu connectivity,” in2024 IEEE Hot Chips 36 Symposium (HCS).
+IEEE Computer Society, 2024, pp. 1–18.
+[61] Broadcom, “TH5 51.2T Bailly CPO (Co-Packaged Optics),” Technical
+presentation, Mar. 2023. [Online]. Available: https://docs.broadcom.co
+m/doc/th5-51.2t-bailly-cpo
+[62] NVIDIA, “NVIDIA LinkX Cables and Transceivers: Guide to Key
+Technologies,” 2026. [Online]. Available: https://docs.nvidia.com/netw
+orking/display/nvidia-linkx-cables-and-transceivers-guide-to-key-techn
+ologies.pdf
+[63] M. A. Mahdian, E. Taheri, and M. Nikdast, “Marvel: A reconfigurable
+chiplet-integrated photonic interposer with optical vertical links and
+robust misalignment tolerance,”IEEE Journal on Emerging and Selected
+Topics in Circuits and Systems, 2025.
+[64] M. Wade, E. Anderson, S. Ardalan, P. Bhargava, S. Buchbinder, M. L.
+Davenport, J. Fini, H. Lu, C. Li, R. Meadeet al., “Teraphy: a chiplet
+technology for low-power, high-bandwidth in-package optical i/o,”IEEE
+Micro, vol. 40, no. 2, pp. 63–71, 2020.
+[65] B. Welch, J. Ingham, E. Bernier, and P. Dawe, “Baseline proposals
+for 200g/l pmd specifications for single wavelength 500 m and 2 km
+standards,”IEEE P802. 3dj Ethernet Task Force, 2023.
+[66] S. Sridharan, T. Heo, L. Feng, Z. Wang, M. Bergeron, W. Fu, S. Zheng,
+B. Coutinho, S. Rashidi, C. Manet al., “Chakra: Advancing performance
+benchmarking and co-design using standardized execution traces,”arXiv
+preprint arXiv:2305.14516, 2023.
+[67] W. Won, J. Yoo, T. Ta, M. Dey, A. Balogh, P. Datta, F. Eris, C. Green,
+W. Liu, C. Manet al., “Astra-sim 3.0: Next-level distributed machine
+learning simulations via high-fidelity gpu and infrastructure modeling,”
+arXiv preprint arXiv:2606.10440, 2026.
+[68] J. Yoo, W. Won, M. Cowan, N. Jiang, B. Klenk, S. Sridharan, and
+T. Krishna, “Towards a standardized representation for deep learning
+collective algorithms,”IEEE Micro, 2025.
+[69] X. Wang, Q. Li, Y . Xu, G. Lu, D. Li, L. Chen, H. Zhou, L. Zheng,
+S. Zhang, Y . Zhuet al., “{SimAI}: unifying architecture design and per-
+formance tuning for{Large-Scale}large language model training with
+scalability and precision,” in22nd USENIX Symposium on Networked
+Systems Design and Implementation (NSDI 25), 2025, pp. 541–558.
+[70] J. Qin, J. Chen, X. Kong, Y . Wu, T. Yuan, L. Luo, Z. Wang, Y . Zhang,
+T. Chen, A. R. Lebecket al., “Phantora: Maximizing code reuse in
+simulation-based machine learning system performance estimation,” in
+23rd USENIX Symposium on Networked Systems Design and Implemen-
+tation (NSDI 26), 2026, pp. 1809–1825.
+[71] J. Cho, M. Kim, H. Choi, G. Heo, and J. Park, “Llmservingsim: A
+hw/sw co-simulation infrastructure for llm inference serving at scale,”
+in2024 IEEE International Symposium on Workload Characterization
+(IISWC). IEEE, 2024, pp. 15–29.
+[72] J. Cho, H. Choi, G. Heo, and J. Park, “Llmservingsim 2.0: A unified
+simulator for heterogeneous and disaggregated llm serving infrastruc-
+ture,” in2026 IEEE International Symposium on Performance Analysis
+of Systems and Software (ISPASS). IEEE, 2026, pp. 1–14.
+[73] A. Agrawal, N. Kedia, J. Mohan, A. Panwar, N. Kwatra, B. S. Gulavani,
+R. Ramjee, and A. Tumanov, “Vidur: A large-scale simulation frame-
+work for llm inference,”Proceedings of Machine Learning and Systems,
+vol. 6, pp. 351–366, 2024.
+[74] Y . Feng, X. Tan, Y . Deng, Y . Jiang, Y . Zhu, and H. Xu, “Frontier:
+Towards comprehensive and accurate llm inference simulation,”arXiv
+preprint arXiv:2605.21312, 2026.
+[75] N. Jiang, D. U. Becker, G. Michelogiannakis, J. Balfour, B. Towles, D. E.
+Shaw, J. Kim, and W. J. Dally, “A detailed and flexible cycle-accurate
+network-on-chip simulator,” in2013 IEEE international symposium on
+performance analysis of systems and software (ISPASS). IEEE, 2013,
+pp. 86–96.
+[76] N. Agarwal, T. Krishna, L.-S. Peh, and N. K. Jha, “Garnet: A detailed
+on-chip network model inside a full-system simulator,” in2009 IEEE
+international symposium on performance analysis of systems and soft-
+ware. IEEE, 2009, pp. 33–42.
+[77] S. Shen, T. Bonato, Z. Hu, P. Jordan, T. Chen, and T. Hoefler,
+“Atlahs: An application-centric network simulator toolchain for ai,
+hpc, and distributed storage,” 2025. [Online]. Available: https:
+//arxiv.org/abs/2505.08936
+[78] Y . Feng, Y . Wei, D. Xiang, and K. Ma, “Evaluating chiplet-based
+{Large-Scale}interconnection networks via{Cycle-Accurate}{Packet-
+Parallel}simulation,” in2024 USENIX Annual Technical Conference
+(USENIX ATC 24), 2024, pp. 731–747.
+[79] Z. Wang, S. S. Ahuja, X. Zhang, M. Noormohammadpour, G. R. Stein-
+brecher, T. Fuller, X. Liu, K. Quirk, M. J. Fernandez, A. Trigunaet al.,
+“Enabling{AI}network{Cross-Layer}design and operations with
+arcadia: A simulation platform at scale,” in23rd USENIX Symposium
+on Networked Systems Design and Implementation (NSDI 26), 2026, pp.
+1791–1807.
+[80] H. Li, J. Li, and A. Kaufmann, “Simbricks: End-to-end network system
+evaluation with modular simulation,” inACM SIGCOMM Conference.
+ACM, 2022, pp. 380–396.
+13
+
+===== PDF PAGE 14 =====
+
+[81] R. Aligholipour, S. Kaxiras, and Y . Yao, “DICE: Detailed Inter-Chiplet
+End-to-End PHY Modeling for Accurate Chiplet Simulation,” inISCA,
+2026.
+[82] M. Isaev, N. Mcdonald, L. Dennison, and R. Vuduc, “Calculon: a
+methodology and tool for high-level co-design of systems and large
+language models,” inProceedings of the International Conference for
+High Performance Computing, Networking, Storage and Analysis, 2023,
+pp. 1–14.
+[83] H. Zhang, A. Ning, R. B. Prabhakar, and D. Wentzlaff, “Llmcompass:
+Enabling efficient hardware design for large language model inference,”
+in2024 ACM/IEEE 51st Annual International Symposium on Computer
+Architecture (ISCA). IEEE, 2024, pp. 1080–1096.
+14

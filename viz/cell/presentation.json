@@ -1,0 +1,2790 @@
+{
+  "schema": {
+    "$defs": {
+      "AcceleratorOverride": {
+        "additionalProperties": false,
+        "properties": {
+          "satellite_id": {
+            "title": "Satellite Id",
+            "type": "string"
+          },
+          "local_index": {
+            "minimum": 0,
+            "title": "Local Index",
+            "type": "integer"
+          },
+          "hardware_id": {
+            "enum": [
+              "nvidia_a800",
+              "metax_c500",
+              "ascend_910b"
+            ],
+            "title": "Hardware Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "satellite_id",
+          "local_index",
+          "hardware_id"
+        ],
+        "title": "AcceleratorOverride",
+        "type": "object"
+      },
+      "CollectiveConfig": {
+        "additionalProperties": false,
+        "description": "Physical backend selected for one intra-pool collective operation.",
+        "properties": {
+          "operation": {
+            "title": "Operation",
+            "type": "string"
+          },
+          "algorithm": {
+            "title": "Algorithm",
+            "type": "string"
+          },
+          "link": {
+            "title": "Link",
+            "type": "string"
+          },
+          "topology": {
+            "title": "Topology",
+            "type": "string"
+          },
+          "resource_id": {
+            "title": "Resource Id",
+            "type": "string"
+          },
+          "backend": {
+            "title": "Backend",
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation",
+          "algorithm",
+          "link",
+          "topology",
+          "resource_id",
+          "backend"
+        ],
+        "title": "CollectiveConfig",
+        "type": "object"
+      },
+      "ConstellationConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "tle_file": {
+            "anyOf": [
+              {
+                "format": "path",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Tle File"
+          },
+          "formation": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/FormationConfig"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "timestamp": {
+            "format": "date-time",
+            "title": "Timestamp",
+            "type": "string"
+          },
+          "earth_orientation_mode": {
+            "default": "stk11_compat",
+            "enum": [
+              "iers",
+              "stk11_compat"
+            ],
+            "title": "Earth Orientation Mode",
+            "type": "string"
+          }
+        },
+        "required": [
+          "timestamp"
+        ],
+        "title": "ConstellationConfig",
+        "type": "object"
+      },
+      "DeploymentConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "mode": {
+            "default": "colocated",
+            "title": "Mode",
+            "type": "string"
+          },
+          "worker_pools": {
+            "items": {
+              "$ref": "#/$defs/WorkerPoolConfig"
+            },
+            "title": "Worker Pools",
+            "type": "array"
+          },
+          "routes": {
+            "default": [],
+            "items": {
+              "$ref": "#/$defs/RouteConfig"
+            },
+            "title": "Routes",
+            "type": "array"
+          },
+          "router": {
+            "$ref": "#/$defs/RouterConfig"
+          },
+          "placements": {
+            "items": {
+              "$ref": "#/$defs/Placement"
+            },
+            "title": "Placements",
+            "type": "array"
+          }
+        },
+        "required": [
+          "worker_pools",
+          "placements"
+        ],
+        "title": "DeploymentConfig",
+        "type": "object"
+      },
+      "ExpertFrequencyProfile": {
+        "additionalProperties": false,
+        "properties": {
+          "canonical_model_id": {
+            "title": "Canonical Model Id",
+            "type": "string"
+          },
+          "model_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Model Ids",
+            "type": "array"
+          },
+          "filename": {
+            "title": "Filename",
+            "type": "string"
+          },
+          "source_path": {
+            "title": "Source Path",
+            "type": "string"
+          },
+          "source_repository_commit": {
+            "title": "Source Repository Commit",
+            "type": "string"
+          },
+          "sha256": {
+            "title": "Sha256",
+            "type": "string"
+          },
+          "shape": {
+            "maxItems": 2,
+            "minItems": 2,
+            "prefixItems": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "integer"
+              }
+            ],
+            "title": "Shape",
+            "type": "array"
+          },
+          "dtype": {
+            "title": "Dtype",
+            "type": "string"
+          },
+          "dimension_semantics": {
+            "maxItems": 2,
+            "minItems": 2,
+            "prefixItems": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "title": "Dimension Semantics",
+            "type": "array"
+          },
+          "value_semantics": {
+            "title": "Value Semantics",
+            "type": "string"
+          },
+          "source_workload": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Source Workload",
+            "type": "object"
+          },
+          "provenance_notes": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Provenance Notes",
+            "type": "array"
+          },
+          "mean_probabilities": {
+            "items": {
+              "type": "number"
+            },
+            "title": "Mean Probabilities",
+            "type": "array"
+          },
+          "manifest_sha256": {
+            "title": "Manifest Sha256",
+            "type": "string"
+          },
+          "layer_probabilities": {
+            "items": {
+              "items": {
+                "type": "number"
+              },
+              "type": "array"
+            },
+            "title": "Layer Probabilities",
+            "type": "array"
+          }
+        },
+        "required": [
+          "canonical_model_id",
+          "model_ids",
+          "filename",
+          "source_path",
+          "source_repository_commit",
+          "sha256",
+          "shape",
+          "dtype",
+          "dimension_semantics",
+          "value_semantics",
+          "source_workload",
+          "provenance_notes",
+          "mean_probabilities",
+          "manifest_sha256",
+          "layer_probabilities"
+        ],
+        "title": "ExpertFrequencyProfile",
+        "type": "object"
+      },
+      "ExpertRoutingInput": {
+        "additionalProperties": false,
+        "properties": {
+          "source_kind": {
+            "title": "Source Kind",
+            "type": "string"
+          },
+          "source_id": {
+            "title": "Source Id",
+            "type": "string"
+          },
+          "algorithm": {
+            "title": "Algorithm",
+            "type": "string"
+          },
+          "root_seed": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Root Seed"
+          },
+          "request_stream_sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Request Stream Sha256"
+          },
+          "replay": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ExpertRoutingReplay"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "vllm_runtime_binding_sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vllm Runtime Binding Sha256"
+          },
+          "distribution": {
+            "title": "Distribution",
+            "type": "string"
+          },
+          "hot_expert_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hot Expert Count"
+          },
+          "hot_expert_weight": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hot Expert Weight"
+          },
+          "profile": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ExpertFrequencyProfile"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        "required": [
+          "source_kind",
+          "source_id",
+          "algorithm",
+          "root_seed",
+          "request_stream_sha256",
+          "replay",
+          "vllm_runtime_binding_sha256",
+          "distribution",
+          "hot_expert_count",
+          "hot_expert_weight"
+        ],
+        "title": "ExpertRoutingInput",
+        "type": "object"
+      },
+      "ExpertRoutingReplay": {
+        "additionalProperties": false,
+        "properties": {
+          "source_path": {
+            "title": "Source Path",
+            "type": "string"
+          },
+          "source_sha256": {
+            "title": "Source Sha256",
+            "type": "string"
+          },
+          "canonical_payload_sha256": {
+            "title": "Canonical Payload Sha256",
+            "type": "string"
+          },
+          "artifact_id": {
+            "title": "Artifact Id",
+            "type": "string"
+          },
+          "provenance": {
+            "$ref": "#/$defs/ExpertRoutingReplayProvenance"
+          },
+          "context": {
+            "$ref": "#/$defs/ExpertRoutingReplayContext"
+          },
+          "records": {
+            "items": {
+              "$ref": "#/$defs/ExpertRoutingReplayRecord"
+            },
+            "title": "Records",
+            "type": "array"
+          }
+        },
+        "required": [
+          "source_path",
+          "source_sha256",
+          "canonical_payload_sha256",
+          "artifact_id",
+          "provenance",
+          "context",
+          "records"
+        ],
+        "title": "ExpertRoutingReplay",
+        "type": "object"
+      },
+      "ExpertRoutingReplayContext": {
+        "additionalProperties": false,
+        "properties": {
+          "model_config_sha256": {
+            "title": "Model Config Sha256",
+            "type": "string"
+          },
+          "request_stream_sha256": {
+            "title": "Request Stream Sha256",
+            "type": "string"
+          },
+          "scheduler_config_sha256": {
+            "title": "Scheduler Config Sha256",
+            "type": "string"
+          },
+          "pool_name": {
+            "title": "Pool Name",
+            "type": "string"
+          },
+          "tensor_parallel_size": {
+            "title": "Tensor Parallel Size",
+            "type": "integer"
+          },
+          "expert_parallel_size": {
+            "title": "Expert Parallel Size",
+            "type": "integer"
+          },
+          "expert_rank_group": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Expert Rank Group",
+            "type": "array"
+          },
+          "expert_placement_strategy": {
+            "title": "Expert Placement Strategy",
+            "type": "string"
+          },
+          "num_experts": {
+            "title": "Num Experts",
+            "type": "integer"
+          },
+          "topk": {
+            "title": "Topk",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "model_config_sha256",
+          "request_stream_sha256",
+          "scheduler_config_sha256",
+          "pool_name",
+          "tensor_parallel_size",
+          "expert_parallel_size",
+          "expert_rank_group",
+          "expert_placement_strategy",
+          "num_experts",
+          "topk"
+        ],
+        "title": "ExpertRoutingReplayContext",
+        "type": "object"
+      },
+      "ExpertRoutingReplayProvenance": {
+        "additionalProperties": false,
+        "properties": {
+          "producer": {
+            "title": "Producer",
+            "type": "string"
+          },
+          "vllm_version": {
+            "title": "Vllm Version",
+            "type": "string"
+          },
+          "vllm_source_commit": {
+            "title": "Vllm Source Commit",
+            "type": "string"
+          },
+          "vllm_package_manifest_sha256": {
+            "title": "Vllm Package Manifest Sha256",
+            "type": "string"
+          },
+          "model_config_sha256": {
+            "title": "Model Config Sha256",
+            "type": "string"
+          }
+        },
+        "required": [
+          "producer",
+          "vllm_version",
+          "vllm_source_commit",
+          "vllm_package_manifest_sha256",
+          "model_config_sha256"
+        ],
+        "title": "ExpertRoutingReplayProvenance",
+        "type": "object"
+      },
+      "ExpertRoutingReplayRecord": {
+        "additionalProperties": false,
+        "properties": {
+          "step_id": {
+            "title": "Step Id",
+            "type": "string"
+          },
+          "layer_index": {
+            "title": "Layer Index",
+            "type": "integer"
+          },
+          "moe_invocation_id": {
+            "title": "Moe Invocation Id",
+            "type": "string"
+          },
+          "schedule_step_sha256": {
+            "title": "Schedule Step Sha256",
+            "type": "string"
+          },
+          "tokens": {
+            "title": "Tokens",
+            "type": "integer"
+          },
+          "tokens_per_expert": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Tokens Per Expert",
+            "type": "array"
+          }
+        },
+        "required": [
+          "step_id",
+          "layer_index",
+          "moe_invocation_id",
+          "schedule_step_sha256",
+          "tokens",
+          "tokens_per_expert"
+        ],
+        "title": "ExpertRoutingReplayRecord",
+        "type": "object"
+      },
+      "ExplicitInterSatelliteLink": {
+        "additionalProperties": false,
+        "properties": {
+          "source": {
+            "minLength": 1,
+            "title": "Source",
+            "type": "string"
+          },
+          "target": {
+            "minLength": 1,
+            "title": "Target",
+            "type": "string"
+          },
+          "mode": {
+            "default": "islsim",
+            "enum": [
+              "fixed",
+              "islsim"
+            ],
+            "title": "Mode",
+            "type": "string"
+          },
+          "bandwidth_gbps": {
+            "anyOf": [
+              {
+                "minimum": 0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Bandwidth Gbps"
+          }
+        },
+        "required": [
+          "source",
+          "target"
+        ],
+        "title": "ExplicitInterSatelliteLink",
+        "type": "object"
+      },
+      "FSOChannelConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "link_margin_db": {
+            "default": 7.0,
+            "minimum": 0,
+            "title": "Link Margin Db",
+            "type": "number"
+          },
+          "optical_efficiency": {
+            "default": 0.7,
+            "exclusiveMinimum": 0,
+            "maximum": 1,
+            "title": "Optical Efficiency",
+            "type": "number"
+          },
+          "wdm_loss_db": {
+            "default": 6.0,
+            "minimum": 0,
+            "title": "Wdm Loss Db",
+            "type": "number"
+          },
+          "pointing_error_rad": {
+            "default": 0.0,
+            "minimum": 0,
+            "title": "Pointing Error Rad",
+            "type": "number"
+          }
+        },
+        "title": "FSOChannelConfig",
+        "type": "object"
+      },
+      "FSOConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "tx": {
+            "$ref": "#/$defs/FSOTxConfig"
+          },
+          "rx": {
+            "$ref": "#/$defs/FSORxConfig"
+          },
+          "channel": {
+            "$ref": "#/$defs/FSOChannelConfig"
+          }
+        },
+        "title": "FSOConfig",
+        "type": "object"
+      },
+      "FSORxConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "rx_aperture_m": {
+            "default": 0.1,
+            "exclusiveMinimum": 0,
+            "title": "Rx Aperture M",
+            "type": "number"
+          },
+          "preamp_nf_db": {
+            "default": 7.5,
+            "minimum": 0,
+            "title": "Preamp Nf Db",
+            "type": "number"
+          },
+          "ber_threshold": {
+            "default": 0.001,
+            "exclusiveMaximum": 0.5,
+            "exclusiveMinimum": 0,
+            "title": "Ber Threshold",
+            "type": "number"
+          },
+          "terminal_cap_gbps": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": 400.0,
+            "title": "Terminal Cap Gbps"
+          }
+        },
+        "title": "FSORxConfig",
+        "type": "object"
+      },
+      "FSOTxConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "tx_power_w": {
+            "default": 5.0,
+            "exclusiveMinimum": 0,
+            "title": "Tx Power W",
+            "type": "number"
+          },
+          "tx_aperture_m": {
+            "default": 0.1,
+            "exclusiveMinimum": 0,
+            "title": "Tx Aperture M",
+            "type": "number"
+          },
+          "wavelength_m": {
+            "default": 1.55e-06,
+            "exclusiveMinimum": 0,
+            "title": "Wavelength M",
+            "type": "number"
+          },
+          "beam_waist_m": {
+            "default": 0.05,
+            "exclusiveMinimum": 0,
+            "title": "Beam Waist M",
+            "type": "number"
+          },
+          "baud_rate_options_ghz": {
+            "items": {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            "minItems": 1,
+            "title": "Baud Rate Options Ghz",
+            "type": "array"
+          },
+          "wdm_channels": {
+            "default": 2,
+            "minimum": 1,
+            "title": "Wdm Channels",
+            "type": "integer"
+          },
+          "fec_overhead": {
+            "default": 0.15,
+            "exclusiveMaximum": 1,
+            "minimum": 0,
+            "title": "Fec Overhead",
+            "type": "number"
+          },
+          "dual_polarization": {
+            "default": true,
+            "title": "Dual Polarization",
+            "type": "boolean"
+          },
+          "wdm_power_mode": {
+            "default": "total_power_fixed",
+            "enum": [
+              "total_power_fixed",
+              "per_channel_power_fixed"
+            ],
+            "title": "Wdm Power Mode",
+            "type": "string"
+          },
+          "modulation_pool": {
+            "items": {
+              "maxItems": 2,
+              "minItems": 2,
+              "prefixItems": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "string"
+                }
+              ],
+              "type": "array"
+            },
+            "minItems": 1,
+            "title": "Modulation Pool",
+            "type": "array"
+          }
+        },
+        "title": "FSOTxConfig",
+        "type": "object"
+      },
+      "FlowSimAcknowledgementConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "default": true,
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "packet_payload_bytes": {
+            "default": 1000,
+            "minimum": 1,
+            "title": "Packet Payload Bytes",
+            "type": "integer"
+          },
+          "ack_interval_packets": {
+            "default": 1,
+            "minimum": 1,
+            "title": "Ack Interval Packets",
+            "type": "integer"
+          },
+          "ack_size_bytes": {
+            "default": 64,
+            "minimum": 1,
+            "title": "Ack Size Bytes",
+            "type": "integer"
+          }
+        },
+        "title": "FlowSimAcknowledgementConfig",
+        "type": "object"
+      },
+      "FlowSimConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "routing_seed": {
+            "default": 0,
+            "maximum": 4294967295,
+            "minimum": 0,
+            "title": "Routing Seed",
+            "type": "integer"
+          },
+          "acknowledgement": {
+            "$ref": "#/$defs/FlowSimAcknowledgementConfig"
+          }
+        },
+        "title": "FlowSimConfig",
+        "type": "object"
+      },
+      "FormationConfig": {
+        "additionalProperties": false,
+        "description": "Static equal-altitude formation; spacing is the adjacent chord length.",
+        "properties": {
+          "layout": {
+            "default": "ring",
+            "enum": [
+              "ring",
+              "chain"
+            ],
+            "title": "Layout",
+            "type": "string"
+          },
+          "spacing_km": {
+            "default": 2.0,
+            "maximum": 10,
+            "minimum": 0.1,
+            "title": "Spacing Km",
+            "type": "number"
+          },
+          "altitude_km": {
+            "default": 535.0,
+            "maximum": 1200,
+            "minimum": 350,
+            "title": "Altitude Km",
+            "type": "number"
+          }
+        },
+        "title": "FormationConfig",
+        "type": "object"
+      },
+      "GraphExecutionConfig": {
+        "additionalProperties": false,
+        "description": "Resolved graph-runtime inputs used to derive physical token rows.",
+        "properties": {
+          "configured_mode": {
+            "title": "Configured Mode",
+            "type": "string"
+          },
+          "capture_sizes": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Capture Sizes",
+            "type": "array"
+          },
+          "piecewise_eager_workload_kinds": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Piecewise Eager Workload Kinds",
+            "type": "array"
+          },
+          "uniform_decode_query_len": {
+            "default": 1,
+            "title": "Uniform Decode Query Len",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "configured_mode",
+          "capture_sizes",
+          "piecewise_eager_workload_kinds"
+        ],
+        "title": "GraphExecutionConfig",
+        "type": "object"
+      },
+      "HardwareConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "satellite_count": {
+            "minimum": 1,
+            "title": "Satellite Count",
+            "type": "integer"
+          },
+          "accelerators_per_satellite": {
+            "minimum": 1,
+            "title": "Accelerators Per Satellite",
+            "type": "integer"
+          },
+          "satellite_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Satellite Ids",
+            "type": "array"
+          },
+          "default_hardware_id": {
+            "enum": [
+              "nvidia_a800",
+              "metax_c500",
+              "ascend_910b"
+            ],
+            "title": "Default Hardware Id",
+            "type": "string"
+          },
+          "accelerator_overrides": {
+            "default": [],
+            "items": {
+              "$ref": "#/$defs/AcceleratorOverride"
+            },
+            "title": "Accelerator Overrides",
+            "type": "array"
+          },
+          "intra_satellite_bandwidth_gbps": {
+            "default": 800.0,
+            "exclusiveMinimum": 0,
+            "title": "Intra Satellite Bandwidth Gbps",
+            "type": "number"
+          },
+          "intra_satellite_latency_ns": {
+            "default": 500,
+            "minimum": 0,
+            "title": "Intra Satellite Latency Ns",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "satellite_count",
+          "accelerators_per_satellite",
+          "satellite_ids",
+          "default_hardware_id"
+        ],
+        "title": "HardwareConfig",
+        "type": "object"
+      },
+      "InterSatelliteTopologyConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "max_range_km": {
+            "default": 5000.0,
+            "exclusiveMinimum": 0,
+            "title": "Max Range Km",
+            "type": "number"
+          },
+          "drop_infeasible_links": {
+            "default": true,
+            "title": "Drop Infeasible Links",
+            "type": "boolean"
+          },
+          "links": {
+            "items": {
+              "$ref": "#/$defs/ExplicitInterSatelliteLink"
+            },
+            "title": "Links",
+            "type": "array"
+          }
+        },
+        "title": "InterSatelliteTopologyConfig",
+        "type": "object"
+      },
+      "IntraSatelliteTopologyConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "type": {
+            "default": "switch",
+            "enum": [
+              "switch",
+              "fully_connected",
+              "ring"
+            ],
+            "title": "Type",
+            "type": "string"
+          },
+          "gateway_local_index": {
+            "default": 0,
+            "minimum": 0,
+            "title": "Gateway Local Index",
+            "type": "integer"
+          }
+        },
+        "title": "IntraSatelliteTopologyConfig",
+        "type": "object"
+      },
+      "KVCacheConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "tiers": {
+            "items": {
+              "$ref": "#/$defs/KVCacheTierConfig"
+            },
+            "title": "Tiers",
+            "type": "array"
+          },
+          "bytes_per_token": {
+            "title": "Bytes Per Token",
+            "type": "integer"
+          },
+          "offload_policy": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Offload Policy"
+          }
+        },
+        "required": [
+          "tiers",
+          "bytes_per_token"
+        ],
+        "title": "KVCacheConfig",
+        "type": "object"
+      },
+      "KVCacheTierConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "capacity_bytes": {
+            "title": "Capacity Bytes",
+            "type": "integer"
+          },
+          "block_size_tokens": {
+            "title": "Block Size Tokens",
+            "type": "integer"
+          },
+          "link": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Link"
+          }
+        },
+        "required": [
+          "name",
+          "capacity_bytes",
+          "block_size_tokens"
+        ],
+        "title": "KVCacheTierConfig",
+        "type": "object"
+      },
+      "KVOffloadConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "default": false,
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "replay_files": {
+            "additionalProperties": {
+              "format": "path",
+              "type": "string"
+            },
+            "title": "Replay Files",
+            "type": "object"
+          },
+          "pcie_latency": {
+            "additionalProperties": {
+              "$ref": "#/$defs/PCIeLatencyConfig"
+            },
+            "propertyNames": {
+              "enum": [
+                "nvidia_a800",
+                "metax_c500",
+                "ascend_910b"
+              ]
+            },
+            "title": "Pcie Latency",
+            "type": "object"
+          }
+        },
+        "title": "KVOffloadConfig",
+        "type": "object"
+      },
+      "MTPAcceptanceAssumption": {
+        "additionalProperties": false,
+        "properties": {
+          "source_id": {
+            "title": "Source Id",
+            "type": "string"
+          },
+          "proposal_depth": {
+            "title": "Proposal Depth",
+            "type": "integer"
+          },
+          "mean_acceptance_rate": {
+            "title": "Mean Acceptance Rate",
+            "type": "string"
+          },
+          "root_seed": {
+            "title": "Root Seed",
+            "type": "integer"
+          },
+          "request_stream_sha256": {
+            "title": "Request Stream Sha256",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_id",
+          "proposal_depth",
+          "mean_acceptance_rate",
+          "root_seed",
+          "request_stream_sha256"
+        ],
+        "title": "MTPAcceptanceAssumption",
+        "type": "object"
+      },
+      "MTPAcceptanceProvenance": {
+        "additionalProperties": false,
+        "properties": {
+          "producer": {
+            "title": "Producer",
+            "type": "string"
+          },
+          "vllm_version": {
+            "title": "Vllm Version",
+            "type": "string"
+          },
+          "vllm_source_commit": {
+            "title": "Vllm Source Commit",
+            "type": "string"
+          },
+          "vllm_package_manifest_sha256": {
+            "title": "Vllm Package Manifest Sha256",
+            "type": "string"
+          },
+          "model_config_sha256": {
+            "title": "Model Config Sha256",
+            "type": "string"
+          }
+        },
+        "required": [
+          "producer",
+          "vllm_version",
+          "vllm_source_commit",
+          "vllm_package_manifest_sha256",
+          "model_config_sha256"
+        ],
+        "title": "MTPAcceptanceProvenance",
+        "type": "object"
+      },
+      "MTPAcceptanceReplay": {
+        "additionalProperties": false,
+        "properties": {
+          "schema_version": {
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "source_path": {
+            "title": "Source Path",
+            "type": "string"
+          },
+          "source_sha256": {
+            "title": "Source Sha256",
+            "type": "string"
+          },
+          "artifact_id": {
+            "title": "Artifact Id",
+            "type": "string"
+          },
+          "provenance": {
+            "$ref": "#/$defs/MTPAcceptanceProvenance"
+          },
+          "scheduler_context": {
+            "$ref": "#/$defs/MTPAcceptanceSchedulerContext"
+          },
+          "steps": {
+            "items": {
+              "$ref": "#/$defs/MTPAcceptanceStepObservation"
+            },
+            "title": "Steps",
+            "type": "array"
+          }
+        },
+        "required": [
+          "schema_version",
+          "source_path",
+          "source_sha256",
+          "artifact_id",
+          "provenance",
+          "scheduler_context",
+          "steps"
+        ],
+        "title": "MTPAcceptanceReplay",
+        "type": "object"
+      },
+      "MTPAcceptanceRequestObservation": {
+        "additionalProperties": false,
+        "properties": {
+          "request_id": {
+            "title": "Request Id",
+            "type": "string"
+          },
+          "phase": {
+            "title": "Phase",
+            "type": "string"
+          },
+          "input_tokens": {
+            "title": "Input Tokens",
+            "type": "integer"
+          },
+          "output_tokens": {
+            "title": "Output Tokens",
+            "type": "integer"
+          },
+          "computed_tokens": {
+            "title": "Computed Tokens",
+            "type": "integer"
+          },
+          "recomputed_tokens": {
+            "title": "Recomputed Tokens",
+            "type": "integer"
+          },
+          "prefix_replay_tokens": {
+            "title": "Prefix Replay Tokens",
+            "type": "integer"
+          },
+          "resumed_from_preemption": {
+            "title": "Resumed From Preemption",
+            "type": "boolean"
+          },
+          "trace_prefix_hit_tokens": {
+            "title": "Trace Prefix Hit Tokens",
+            "type": "integer"
+          },
+          "scheduler_prefix_hit_tokens": {
+            "title": "Scheduler Prefix Hit Tokens",
+            "type": "integer"
+          },
+          "raw_model_output_tokens": {
+            "title": "Raw Model Output Tokens",
+            "type": "integer"
+          },
+          "emitted_tokens": {
+            "title": "Emitted Tokens",
+            "type": "integer"
+          },
+          "mtp_proposed_tokens": {
+            "title": "Mtp Proposed Tokens",
+            "type": "integer"
+          },
+          "mtp_verified_tokens": {
+            "title": "Mtp Verified Tokens",
+            "type": "integer"
+          },
+          "mtp_accepted_tokens": {
+            "title": "Mtp Accepted Tokens",
+            "type": "integer"
+          },
+          "mtp_rejected_tokens": {
+            "title": "Mtp Rejected Tokens",
+            "type": "integer"
+          },
+          "mtp_proposer_tokens": {
+            "title": "Mtp Proposer Tokens",
+            "type": "integer"
+          },
+          "mtp_next_proposed_tokens": {
+            "title": "Mtp Next Proposed Tokens",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "request_id",
+          "phase",
+          "input_tokens",
+          "output_tokens",
+          "computed_tokens",
+          "recomputed_tokens",
+          "prefix_replay_tokens",
+          "resumed_from_preemption",
+          "trace_prefix_hit_tokens",
+          "scheduler_prefix_hit_tokens",
+          "raw_model_output_tokens",
+          "emitted_tokens",
+          "mtp_proposed_tokens",
+          "mtp_verified_tokens",
+          "mtp_accepted_tokens",
+          "mtp_rejected_tokens",
+          "mtp_proposer_tokens",
+          "mtp_next_proposed_tokens"
+        ],
+        "title": "MTPAcceptanceRequestObservation",
+        "type": "object"
+      },
+      "MTPAcceptanceSchedulerContext": {
+        "additionalProperties": false,
+        "properties": {
+          "adapter_contract": {
+            "title": "Adapter Contract",
+            "type": "string"
+          },
+          "request_stream_sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Request Stream Sha256"
+          },
+          "ingress_request_stream_sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ingress Request Stream Sha256"
+          },
+          "decode_admission_contract_sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Decode Admission Contract Sha256"
+          },
+          "pool_name": {
+            "title": "Pool Name",
+            "type": "string"
+          },
+          "backend_role": {
+            "title": "Backend Role",
+            "type": "string"
+          },
+          "scheduler_policy": {
+            "title": "Scheduler Policy",
+            "type": "string"
+          },
+          "max_batched_tokens": {
+            "title": "Max Batched Tokens",
+            "type": "integer"
+          },
+          "max_requests": {
+            "title": "Max Requests",
+            "type": "integer"
+          },
+          "num_kv_blocks": {
+            "title": "Num Kv Blocks",
+            "type": "integer"
+          },
+          "kv_block_size_tokens": {
+            "title": "Kv Block Size Tokens",
+            "type": "integer"
+          },
+          "max_model_len": {
+            "title": "Max Model Len",
+            "type": "integer"
+          },
+          "dtype": {
+            "title": "Dtype",
+            "type": "string"
+          },
+          "num_speculative_tokens": {
+            "title": "Num Speculative Tokens",
+            "type": "integer"
+          },
+          "draft_model_type": {
+            "title": "Draft Model Type",
+            "type": "string"
+          },
+          "num_mtp_layers": {
+            "title": "Num Mtp Layers",
+            "type": "integer"
+          },
+          "draft_max_model_len": {
+            "title": "Draft Max Model Len",
+            "type": "integer"
+          },
+          "padded_drafter_batch": {
+            "title": "Padded Drafter Batch",
+            "type": "boolean"
+          },
+          "prefix_oracle_mode": {
+            "title": "Prefix Oracle Mode",
+            "type": "string"
+          },
+          "attention_kv_layout": {
+            "title": "Attention Kv Layout",
+            "type": "string"
+          },
+          "chunked_prefill": {
+            "title": "Chunked Prefill",
+            "type": "boolean"
+          },
+          "max_num_partial_prefills": {
+            "title": "Max Num Partial Prefills",
+            "type": "integer"
+          },
+          "max_long_partial_prefills": {
+            "title": "Max Long Partial Prefills",
+            "type": "integer"
+          },
+          "long_prefill_token_threshold": {
+            "title": "Long Prefill Token Threshold",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "adapter_contract",
+          "request_stream_sha256",
+          "ingress_request_stream_sha256",
+          "decode_admission_contract_sha256",
+          "pool_name",
+          "backend_role",
+          "scheduler_policy",
+          "max_batched_tokens",
+          "max_requests",
+          "num_kv_blocks",
+          "kv_block_size_tokens",
+          "max_model_len",
+          "dtype",
+          "num_speculative_tokens",
+          "draft_model_type",
+          "num_mtp_layers",
+          "draft_max_model_len",
+          "padded_drafter_batch",
+          "prefix_oracle_mode",
+          "attention_kv_layout",
+          "chunked_prefill",
+          "max_num_partial_prefills",
+          "max_long_partial_prefills",
+          "long_prefill_token_threshold"
+        ],
+        "title": "MTPAcceptanceSchedulerContext",
+        "type": "object"
+      },
+      "MTPAcceptanceStepObservation": {
+        "additionalProperties": false,
+        "properties": {
+          "step_index": {
+            "title": "Step Index",
+            "type": "integer"
+          },
+          "step_id": {
+            "title": "Step Id",
+            "type": "string"
+          },
+          "selected_request_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Selected Request Ids",
+            "type": "array"
+          },
+          "finished_request_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Finished Request Ids",
+            "type": "array"
+          },
+          "preempted_request_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Preempted Request Ids",
+            "type": "array"
+          },
+          "mtp_drafter_executed": {
+            "title": "Mtp Drafter Executed",
+            "type": "boolean"
+          },
+          "requests": {
+            "items": {
+              "$ref": "#/$defs/MTPAcceptanceRequestObservation"
+            },
+            "title": "Requests",
+            "type": "array"
+          }
+        },
+        "required": [
+          "step_index",
+          "step_id",
+          "selected_request_ids",
+          "finished_request_ids",
+          "preempted_request_ids",
+          "mtp_drafter_executed",
+          "requests"
+        ],
+        "title": "MTPAcceptanceStepObservation",
+        "type": "object"
+      },
+      "PCIeLatencyConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "latency_ns": {
+            "minimum": 0,
+            "title": "Latency Ns",
+            "type": "number"
+          },
+          "source": {
+            "description": "Measurement or explicit assumption",
+            "minLength": 1,
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "latency_ns",
+          "source"
+        ],
+        "title": "PCIeLatencyConfig",
+        "type": "object"
+      },
+      "ParallelConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "tensor_parallel_size": {
+            "default": 1,
+            "title": "Tensor Parallel Size",
+            "type": "integer"
+          },
+          "pipeline_parallel_size": {
+            "default": 1,
+            "title": "Pipeline Parallel Size",
+            "type": "integer"
+          },
+          "enable_expert_parallel": {
+            "default": false,
+            "title": "Enable Expert Parallel",
+            "type": "boolean"
+          },
+          "expert_communication_backend": {
+            "default": "allgather_reducescatter",
+            "title": "Expert Communication Backend",
+            "type": "string"
+          },
+          "enable_eplb": {
+            "default": false,
+            "title": "Enable Eplb",
+            "type": "boolean"
+          },
+          "sequence_parallel_size": {
+            "default": 1,
+            "title": "Sequence Parallel Size",
+            "type": "integer"
+          },
+          "context_parallel_size": {
+            "default": 1,
+            "title": "Context Parallel Size",
+            "type": "integer"
+          },
+          "data_parallel_size": {
+            "default": 1,
+            "title": "Data Parallel Size",
+            "type": "integer"
+          }
+        },
+        "title": "ParallelConfig",
+        "type": "object"
+      },
+      "ParallelCoordinate": {
+        "additionalProperties": false,
+        "properties": {
+          "dp": {
+            "default": 0,
+            "minimum": 0,
+            "title": "Dp",
+            "type": "integer"
+          },
+          "pp": {
+            "minimum": 0,
+            "title": "Pp",
+            "type": "integer"
+          },
+          "cp": {
+            "default": 0,
+            "minimum": 0,
+            "title": "Cp",
+            "type": "integer"
+          },
+          "tp": {
+            "minimum": 0,
+            "title": "Tp",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "pp",
+          "tp"
+        ],
+        "title": "ParallelCoordinate",
+        "type": "object"
+      },
+      "PipelineP2PConfig": {
+        "additionalProperties": false,
+        "description": "Physical backend for one ordered intra-pool pipeline boundary.",
+        "properties": {
+          "source_stage": {
+            "title": "Source Stage",
+            "type": "integer"
+          },
+          "destination_stage": {
+            "title": "Destination Stage",
+            "type": "integer"
+          },
+          "algorithm": {
+            "title": "Algorithm",
+            "type": "string"
+          },
+          "link": {
+            "title": "Link",
+            "type": "string"
+          },
+          "topology": {
+            "title": "Topology",
+            "type": "string"
+          },
+          "resource_id": {
+            "title": "Resource Id",
+            "type": "string"
+          },
+          "backend": {
+            "title": "Backend",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_stage",
+          "destination_stage",
+          "algorithm",
+          "link",
+          "topology",
+          "resource_id",
+          "backend"
+        ],
+        "title": "PipelineP2PConfig",
+        "type": "object"
+      },
+      "Placement": {
+        "additionalProperties": false,
+        "properties": {
+          "worker_pool": {
+            "minLength": 1,
+            "title": "Worker Pool",
+            "type": "string"
+          },
+          "parallel_coordinate": {
+            "$ref": "#/$defs/ParallelCoordinate"
+          },
+          "satellite_id": {
+            "minLength": 1,
+            "title": "Satellite Id",
+            "type": "string"
+          },
+          "local_index": {
+            "minimum": 0,
+            "title": "Local Index",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "worker_pool",
+          "parallel_coordinate",
+          "satellite_id",
+          "local_index"
+        ],
+        "title": "Placement",
+        "type": "object"
+      },
+      "ProductionTraceReaderConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "source_format": {
+            "title": "Source Format",
+            "type": "string"
+          },
+          "arrival_time_field": {
+            "title": "Arrival Time Field",
+            "type": "string"
+          },
+          "input_tokens_field": {
+            "title": "Input Tokens Field",
+            "type": "string"
+          },
+          "output_tokens_field": {
+            "title": "Output Tokens Field",
+            "type": "string"
+          },
+          "prefix_hit_tokens_field": {
+            "title": "Prefix Hit Tokens Field",
+            "type": "string"
+          },
+          "request_id_field": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Request Id Field"
+          },
+          "input_time_unit": {
+            "title": "Input Time Unit",
+            "type": "string"
+          },
+          "successful_request_filter": {
+            "$ref": "#/$defs/SuccessfulRequestFilter"
+          }
+        },
+        "required": [
+          "source_format",
+          "arrival_time_field",
+          "input_tokens_field",
+          "output_tokens_field",
+          "prefix_hit_tokens_field",
+          "request_id_field",
+          "input_time_unit",
+          "successful_request_filter"
+        ],
+        "title": "ProductionTraceReaderConfig",
+        "type": "object"
+      },
+      "RequestConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "source": {
+            "enum": [
+              "synthetic",
+              "canonical",
+              "production"
+            ],
+            "title": "Source",
+            "type": "string"
+          },
+          "synthetic": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/SyntheticRequestConfig"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "file": {
+            "anyOf": [
+              {
+                "format": "path",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "File"
+          },
+          "production": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ProductionTraceReaderConfig"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "arrival_rate_scale": {
+            "default": 1.0,
+            "exclusiveMinimum": 0,
+            "title": "Arrival Rate Scale",
+            "type": "number"
+          },
+          "closed_loop_client_count": {
+            "anyOf": [
+              {
+                "minimum": 1,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Closed Loop Client Count"
+          }
+        },
+        "required": [
+          "source"
+        ],
+        "title": "RequestConfig",
+        "type": "object"
+      },
+      "RouteConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "source_pool": {
+            "title": "Source Pool",
+            "type": "string"
+          },
+          "destination_pool": {
+            "title": "Destination Pool",
+            "type": "string"
+          },
+          "payload": {
+            "title": "Payload",
+            "type": "string"
+          },
+          "algorithm": {
+            "title": "Algorithm",
+            "type": "string"
+          },
+          "link": {
+            "title": "Link",
+            "type": "string"
+          },
+          "topology": {
+            "default": "point_to_point",
+            "title": "Topology",
+            "type": "string"
+          },
+          "resource_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Resource Id"
+          },
+          "backend": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Backend"
+          }
+        },
+        "required": [
+          "source_pool",
+          "destination_pool",
+          "payload",
+          "algorithm",
+          "link"
+        ],
+        "title": "RouteConfig",
+        "type": "object"
+      },
+      "RouterConfig": {
+        "additionalProperties": false,
+        "description": "Modeled serial CPU dispatch resource shared by all route stages.",
+        "properties": {
+          "resource_id": {
+            "default": "router_cpu",
+            "title": "Resource Id",
+            "type": "string"
+          },
+          "dispatch_service_time_s": {
+            "default": 0.0,
+            "title": "Dispatch Service Time S",
+            "type": "number"
+          }
+        },
+        "title": "RouterConfig",
+        "type": "object"
+      },
+      "RuntimeConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "timing_mode": {
+            "default": "device_only",
+            "enum": [
+              "device_only",
+              "device_plus_launch",
+              "device_plus_launch_plus_scheduler"
+            ],
+            "title": "Timing Mode",
+            "type": "string"
+          },
+          "timeout_seconds": {
+            "default": 300,
+            "minimum": 1,
+            "title": "Timeout Seconds",
+            "type": "integer"
+          },
+          "output_directory": {
+            "default": "results",
+            "format": "path",
+            "title": "Output Directory",
+            "type": "string"
+          },
+          "host_evidence_directory": {
+            "anyOf": [
+              {
+                "format": "path",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Host Evidence Directory"
+          }
+        },
+        "title": "RuntimeConfig",
+        "type": "object"
+      },
+      "SGLangSchedulerMirrorConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "source_version": {
+            "title": "Source Version",
+            "type": "string"
+          },
+          "max_total_num_tokens": {
+            "title": "Max Total Num Tokens",
+            "type": "integer"
+          },
+          "max_total_num_tokens_source": {
+            "title": "Max Total Num Tokens Source",
+            "type": "string"
+          },
+          "chunked_prefill_size": {
+            "title": "Chunked Prefill Size",
+            "type": "integer"
+          },
+          "max_prefill_tokens": {
+            "title": "Max Prefill Tokens",
+            "type": "integer"
+          },
+          "max_running_requests": {
+            "title": "Max Running Requests",
+            "type": "integer"
+          },
+          "schedule_conservativeness": {
+            "title": "Schedule Conservativeness",
+            "type": "number"
+          },
+          "mtp_num_speculative_tokens": {
+            "title": "Mtp Num Speculative Tokens",
+            "type": "integer"
+          },
+          "mtp_acceptance_assumption": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/MTPAcceptanceAssumption"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "mtp_acceptance_source_id": {
+            "title": "Mtp Acceptance Source Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_version",
+          "max_total_num_tokens",
+          "max_total_num_tokens_source",
+          "chunked_prefill_size",
+          "max_prefill_tokens",
+          "max_running_requests",
+          "schedule_conservativeness",
+          "mtp_num_speculative_tokens",
+          "mtp_acceptance_assumption",
+          "mtp_acceptance_source_id"
+        ],
+        "title": "SGLangSchedulerMirrorConfig",
+        "type": "object"
+      },
+      "SchedulerConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "framework": {
+            "enum": [
+              "vllm",
+              "sglang"
+            ],
+            "title": "Framework",
+            "type": "string"
+          },
+          "max_batched_tokens": {
+            "exclusiveMinimum": 0,
+            "title": "Max Batched Tokens",
+            "type": "integer"
+          },
+          "max_requests": {
+            "exclusiveMinimum": 0,
+            "title": "Max Requests",
+            "type": "integer"
+          },
+          "num_kv_blocks": {
+            "exclusiveMinimum": 0,
+            "title": "Num Kv Blocks",
+            "type": "integer"
+          },
+          "kv_block_size_tokens": {
+            "default": 16,
+            "exclusiveMinimum": 0,
+            "title": "Kv Block Size Tokens",
+            "type": "integer"
+          },
+          "scheduler_pipeline_depth": {
+            "default": 1,
+            "minimum": 1,
+            "title": "Scheduler Pipeline Depth",
+            "type": "integer"
+          },
+          "vllm": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/VLLMOptions"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "sglang": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/SGLangSchedulerMirrorConfig"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        "required": [
+          "framework",
+          "max_batched_tokens",
+          "max_requests",
+          "num_kv_blocks"
+        ],
+        "title": "SchedulerConfig",
+        "type": "object"
+      },
+      "SuccessfulRequestFilter": {
+        "additionalProperties": false,
+        "description": "Proof or exact field rule establishing the successful-only boundary.",
+        "properties": {
+          "mode": {
+            "title": "Mode",
+            "type": "string"
+          },
+          "field_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Field Name"
+          },
+          "accepted_value": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Accepted Value"
+          },
+          "provenance": {
+            "title": "Provenance",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mode",
+          "field_name",
+          "accepted_value",
+          "provenance"
+        ],
+        "title": "SuccessfulRequestFilter",
+        "type": "object"
+      },
+      "SyntheticRequestConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "num_requests": {
+            "title": "Num Requests",
+            "type": "integer"
+          },
+          "request_rate": {
+            "title": "Request Rate",
+            "type": "number"
+          },
+          "input_lengths": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Input Lengths",
+            "type": "array"
+          },
+          "output_lengths": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Output Lengths",
+            "type": "array"
+          },
+          "prefix_hit_fraction": {
+            "default": 0.0,
+            "title": "Prefix Hit Fraction",
+            "type": "number"
+          },
+          "arrival_distribution": {
+            "default": "poisson",
+            "title": "Arrival Distribution",
+            "type": "string"
+          },
+          "seed": {
+            "default": 0,
+            "title": "Seed",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "num_requests",
+          "request_rate",
+          "input_lengths",
+          "output_lengths"
+        ],
+        "title": "SyntheticRequestConfig",
+        "type": "object"
+      },
+      "TopologyConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "source": {
+            "default": "orbit",
+            "enum": [
+              "orbit",
+              "formation",
+              "file"
+            ],
+            "title": "Source",
+            "type": "string"
+          },
+          "file": {
+            "anyOf": [
+              {
+                "format": "path",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "File"
+          },
+          "intra_satellite": {
+            "$ref": "#/$defs/IntraSatelliteTopologyConfig"
+          },
+          "inter_satellite": {
+            "$ref": "#/$defs/InterSatelliteTopologyConfig"
+          }
+        },
+        "title": "TopologyConfig",
+        "type": "object"
+      },
+      "VLLMOptions": {
+        "additionalProperties": false,
+        "properties": {
+          "model": {
+            "title": "Model",
+            "type": "string"
+          },
+          "dtype": {
+            "default": "bfloat16",
+            "title": "Dtype",
+            "type": "string"
+          },
+          "max_model_len": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Max Model Len"
+          },
+          "gpu_memory_utilization": {
+            "default": 0.9,
+            "title": "Gpu Memory Utilization",
+            "type": "number"
+          },
+          "trust_remote_code": {
+            "default": false,
+            "title": "Trust Remote Code",
+            "type": "boolean"
+          },
+          "enable_chunked_prefill": {
+            "default": true,
+            "title": "Enable Chunked Prefill",
+            "type": "boolean"
+          },
+          "enable_prefix_caching": {
+            "default": false,
+            "title": "Enable Prefix Caching",
+            "type": "boolean"
+          },
+          "async_scheduling": {
+            "default": false,
+            "title": "Async Scheduling",
+            "type": "boolean"
+          },
+          "dummy_token_id": {
+            "default": 42,
+            "title": "Dummy Token Id",
+            "type": "integer"
+          },
+          "mtp_num_speculative_tokens": {
+            "default": 0,
+            "title": "Mtp Num Speculative Tokens",
+            "type": "integer"
+          },
+          "mtp_acceptance_policy": {
+            "default": "disabled",
+            "title": "Mtp Acceptance Policy",
+            "type": "string"
+          },
+          "mtp_fixed_accepted_tokens": {
+            "default": 0,
+            "title": "Mtp Fixed Accepted Tokens",
+            "type": "integer"
+          },
+          "mtp_acceptance_source_id": {
+            "default": "disabled",
+            "title": "Mtp Acceptance Source Id",
+            "type": "string"
+          },
+          "mtp_acceptance_replay": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/MTPAcceptanceReplay"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "mtp_acceptance_assumption": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/MTPAcceptanceAssumption"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "request_stream_sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Request Stream Sha256"
+          },
+          "decode_admission_contract_sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Decode Admission Contract Sha256"
+          },
+          "closed_loop_admission_contract_sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Closed Loop Admission Contract Sha256"
+          }
+        },
+        "required": [
+          "model"
+        ],
+        "title": "VLLMOptions",
+        "type": "object"
+      },
+      "WorkerPoolConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "role": {
+            "title": "Role",
+            "type": "string"
+          },
+          "hardware_id": {
+            "anyOf": [
+              {
+                "enum": [
+                  "nvidia_a800",
+                  "metax_c500",
+                  "ascend_910b"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "readOnly": true,
+            "title": "Hardware Id"
+          },
+          "parallelism": {
+            "$ref": "#/$defs/ParallelConfig"
+          },
+          "kv_cache": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/KVCacheConfig"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "collectives": {
+            "default": [],
+            "items": {
+              "$ref": "#/$defs/CollectiveConfig"
+            },
+            "title": "Collectives",
+            "type": "array"
+          },
+          "pipeline_p2p": {
+            "default": [],
+            "items": {
+              "$ref": "#/$defs/PipelineP2PConfig"
+            },
+            "title": "Pipeline P2P",
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "role"
+        ],
+        "title": "WorkerPoolConfig",
+        "type": "object"
+      },
+      "WorkloadInputs": {
+        "additionalProperties": false,
+        "properties": {
+          "expert_routing": {
+            "$ref": "#/$defs/ExpertRoutingInput"
+          },
+          "attention_kv_layout": {
+            "title": "Attention Kv Layout",
+            "type": "string"
+          },
+          "attention_kv_distribution": {
+            "title": "Attention Kv Distribution",
+            "type": "string"
+          },
+          "graph_execution": {
+            "$ref": "#/$defs/GraphExecutionConfig"
+          }
+        },
+        "required": [
+          "expert_routing",
+          "attention_kv_layout",
+          "attention_kv_distribution"
+        ],
+        "title": "WorkloadInputs",
+        "type": "object"
+      }
+    },
+    "additionalProperties": false,
+    "properties": {
+      "hardware": {
+        "$ref": "#/$defs/HardwareConfig"
+      },
+      "topology": {
+        "$ref": "#/$defs/TopologyConfig"
+      },
+      "constellation": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ConstellationConfig"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "fso": {
+        "$ref": "#/$defs/FSOConfig"
+      },
+      "model": {
+        "description": "Built-in model ID or model JSON path",
+        "minLength": 1,
+        "title": "Model",
+        "type": "string"
+      },
+      "requests": {
+        "$ref": "#/$defs/RequestConfig"
+      },
+      "deployment": {
+        "$ref": "#/$defs/DeploymentConfig"
+      },
+      "scheduler": {
+        "additionalProperties": {
+          "$ref": "#/$defs/SchedulerConfig"
+        },
+        "title": "Scheduler",
+        "type": "object"
+      },
+      "runtime_inputs": {
+        "$ref": "#/$defs/WorkloadInputs"
+      },
+      "launch_policy": {
+        "default": "analytical_launch",
+        "enum": [
+          "analytical_launch",
+          "injected_launch"
+        ],
+        "title": "Launch Policy",
+        "type": "string"
+      },
+      "flowsim": {
+        "$ref": "#/$defs/FlowSimConfig"
+      },
+      "runtime": {
+        "$ref": "#/$defs/RuntimeConfig"
+      },
+      "kv_offload": {
+        "$ref": "#/$defs/KVOffloadConfig"
+      }
+    },
+    "required": [
+      "hardware",
+      "topology",
+      "model",
+      "requests",
+      "deployment",
+      "scheduler",
+      "runtime_inputs"
+    ],
+    "title": "AsterMindConfig",
+    "type": "object"
+  },
+  "default_configuration": {
+    "hardware": {
+      "satellite_count": 2,
+      "accelerators_per_satellite": 1,
+      "satellite_ids": [
+        "sat-0",
+        "sat-1"
+      ],
+      "default_hardware_id": "nvidia_a800",
+      "accelerator_overrides": [],
+      "intra_satellite_bandwidth_gbps": 800.0,
+      "intra_satellite_latency_ns": 500
+    },
+    "topology": {
+      "source": "formation",
+      "file": null,
+      "intra_satellite": {
+        "type": "switch",
+        "gateway_local_index": 0
+      },
+      "inter_satellite": {
+        "max_range_km": 5000.0,
+        "drop_infeasible_links": true,
+        "links": [
+          {
+            "source": "sat-0",
+            "target": "sat-1",
+            "mode": "fixed",
+            "bandwidth_gbps": 400.0
+          }
+        ]
+      }
+    },
+    "constellation": {
+      "tle_file": null,
+      "formation": {
+        "layout": "ring",
+        "spacing_km": 2.0,
+        "altitude_km": 535.0
+      },
+      "timestamp": "2026-08-03T12:00:00Z",
+      "earth_orientation_mode": "stk11_compat"
+    },
+    "fso": {
+      "tx": {
+        "tx_power_w": 5.0,
+        "tx_aperture_m": 0.1,
+        "wavelength_m": 1.55e-06,
+        "beam_waist_m": 0.05,
+        "baud_rate_options_ghz": [
+          20.0,
+          30.0,
+          40.0,
+          50.0,
+          60.0
+        ],
+        "wdm_channels": 2,
+        "fec_overhead": 0.15,
+        "dual_polarization": true,
+        "wdm_power_mode": "total_power_fixed",
+        "modulation_pool": [
+          [
+            16,
+            "DP-16QAM"
+          ],
+          [
+            8,
+            "DP-8QAM"
+          ],
+          [
+            4,
+            "DP-QPSK"
+          ]
+        ]
+      },
+      "rx": {
+        "rx_aperture_m": 0.1,
+        "preamp_nf_db": 7.5,
+        "ber_threshold": 0.001,
+        "terminal_cap_gbps": 400.0
+      },
+      "channel": {
+        "link_margin_db": 7.0,
+        "optical_efficiency": 0.7,
+        "wdm_loss_db": 6.0,
+        "pointing_error_rad": 0.0
+      }
+    },
+    "model": "qwen3-4b",
+    "requests": {
+      "source": "synthetic",
+      "synthetic": {
+        "num_requests": 2,
+        "request_rate": 16.0,
+        "input_lengths": [
+          16
+        ],
+        "output_lengths": [
+          2
+        ],
+        "prefix_hit_fraction": 0.0,
+        "arrival_distribution": "constant",
+        "seed": 0
+      },
+      "file": null,
+      "production": null,
+      "arrival_rate_scale": 1.0,
+      "closed_loop_client_count": null
+    },
+    "deployment": {
+      "mode": "colocated",
+      "worker_pools": [
+        {
+          "name": "main",
+          "role": "colocated",
+          "parallelism": {
+            "tensor_parallel_size": 2,
+            "pipeline_parallel_size": 1,
+            "enable_expert_parallel": false,
+            "expert_communication_backend": "allgather_reducescatter",
+            "enable_eplb": false,
+            "sequence_parallel_size": 1,
+            "context_parallel_size": 1,
+            "data_parallel_size": 1
+          },
+          "kv_cache": null,
+          "collectives": [
+            {
+              "operation": "all_reduce",
+              "algorithm": "ring",
+              "link": "rdma",
+              "topology": "ring",
+              "resource_id": "physical-network",
+              "backend": "flowsim"
+            },
+            {
+              "operation": "all_gather",
+              "algorithm": "ring",
+              "link": "rdma",
+              "topology": "ring",
+              "resource_id": "physical-network",
+              "backend": "flowsim"
+            }
+          ],
+          "pipeline_p2p": []
+        }
+      ],
+      "routes": [],
+      "router": {
+        "resource_id": "router_cpu",
+        "dispatch_service_time_s": 0.0
+      },
+      "placements": [
+        {
+          "worker_pool": "main",
+          "parallel_coordinate": {
+            "dp": 0,
+            "pp": 0,
+            "cp": 0,
+            "tp": 0
+          },
+          "satellite_id": "sat-0",
+          "local_index": 0
+        },
+        {
+          "worker_pool": "main",
+          "parallel_coordinate": {
+            "dp": 0,
+            "pp": 0,
+            "cp": 0,
+            "tp": 1
+          },
+          "satellite_id": "sat-1",
+          "local_index": 0
+        }
+      ]
+    },
+    "scheduler": {
+      "main": {
+        "framework": "sglang",
+        "max_batched_tokens": 256,
+        "max_requests": 16,
+        "num_kv_blocks": 1024,
+        "kv_block_size_tokens": 16,
+        "scheduler_pipeline_depth": 1,
+        "vllm": null,
+        "sglang": {
+          "source_version": "v0.5.19",
+          "max_total_num_tokens": 16384,
+          "max_total_num_tokens_source": "explicit configured KV capacity",
+          "chunked_prefill_size": 256,
+          "max_prefill_tokens": 256,
+          "max_running_requests": 16,
+          "schedule_conservativeness": 1.0,
+          "mtp_num_speculative_tokens": 0,
+          "mtp_acceptance_assumption": null,
+          "mtp_acceptance_source_id": "disabled"
+        }
+      }
+    },
+    "runtime_inputs": {
+      "expert_routing": {
+        "source_kind": "not_applicable",
+        "source_id": "not_applicable",
+        "algorithm": "not_applicable",
+        "root_seed": null,
+        "request_stream_sha256": null,
+        "replay": null,
+        "vllm_runtime_binding_sha256": null,
+        "distribution": "not_applicable",
+        "hot_expert_count": null,
+        "hot_expert_weight": null,
+        "profile": null
+      },
+      "attention_kv_layout": "paged",
+      "attention_kv_distribution": "uniform",
+      "graph_execution": {
+        "configured_mode": "NONE",
+        "capture_sizes": [],
+        "piecewise_eager_workload_kinds": [],
+        "uniform_decode_query_len": 1
+      }
+    },
+    "launch_policy": "analytical_launch",
+    "flowsim": {
+      "routing_seed": 0,
+      "acknowledgement": {
+        "enabled": true,
+        "packet_payload_bytes": 1000,
+        "ack_interval_packets": 1,
+        "ack_size_bytes": 64
+      }
+    },
+    "runtime": {
+      "timing_mode": "device_only",
+      "timeout_seconds": 600,
+      "output_directory": "results",
+      "host_evidence_directory": null
+    },
+    "kv_offload": {
+      "enabled": false,
+      "replay_files": {},
+      "pcie_latency": {}
+    }
+  }
+}

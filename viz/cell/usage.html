@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <title>使用记录 · AsterMind</title>
+    <link rel="stylesheet" href="./usage.css?v=20260911-02" />
+    <link rel="stylesheet" href="./fonts.css?v=brand-1" />
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="./">ASTERMIND</a>
+      <span class="workspace-label">仿真工作台 / 使用记录</span>
+      <a class="back-link" href="./">返回仿真 ↗</a>
+    </header>
+    <main>
+      <div class="page-heading">
+        <div><p class="eyebrow">RUN HISTORY</p><h1>使用记录</h1>
+          <p class="muted">每次仿真的来源、配置与执行状态，都在这里。</p></div>
+        <button id="refresh" type="button">↻ 刷新记录</button>
+      </div>
+      <form id="access-form" class="access-panel" hidden>
+        <label for="access-token">管理员口令</label>
+        <div class="access-input"><input id="access-token" type="password" autocomplete="off" placeholder="输入管理员口令" required />
+        <button type="submit">查看记录</button></div>
+        <p class="muted">远程访问需由服务管理员设置 ASTERMIND_USAGE_TOKEN。口令仅在当前页面使用。</p>
+      </form>
+      <section class="history-panel" aria-label="仿真使用记录">
+        <form id="filters" class="filters">
+          <label class="search-label"><span>搜索记录</span>
+            <input id="search" type="search" placeholder="搜索 IP、模型或任务 ID" maxlength="200" /></label>
+          <label><span>运行状态</span><select id="status-filter">
+            <option value="">全部状态</option><option value="success">成功</option>
+            <option value="running">运行中</option><option value="queued">排队中</option>
+            <option value="failed">失败</option><option value="rejected">校验拒绝</option>
+            <option value="cancelled">已取消</option><option value="received">已接收</option>
+          </select></label>
+          <button type="submit">查询</button>
+        </form>
+        <p id="message" role="status" aria-live="polite">正在读取使用记录…</p>
+        <div class="table-scroll"><table>
+          <thead><tr><th>提交时间 / 任务 ID</th><th>来源 IP</th><th>模型</th><th>卫星数</th><th>状态</th><th><span class="sr-only">操作</span></th></tr></thead>
+          <tbody id="records"></tbody>
+        </table></div>
+        <div class="pagination"><span id="count">—</span>
+          <div><button id="previous" type="button" disabled>← 上一页</button>
+          <button id="next" type="button" disabled>下一页 →</button></div></div>
+      </section>
+      <p class="footnote">时间按当前设备时区显示 · 记录覆盖网页仿真提交，包括失败和校验拒绝。</p>
+    </main>
+    <dialog id="detail-dialog" aria-labelledby="detail-title">
+      <header class="detail-heading"><div><p class="eyebrow">RUN DETAILS</p><h2 id="detail-title">运行详情</h2></div>
+        <button id="close-detail" type="button" aria-label="关闭详情">✕</button></header>
+      <div id="detail-content"></div>
+      <footer class="detail-footer"><span id="download-message" role="status"></span>
+        <button id="download" type="button" disabled>下载完整记录 ↓</button></footer>
+    </dialog>
+    <script type="module" src="./usage.js?v=20260911-01"></script>
+  </body>
+</html>

@@ -1,0 +1,224 @@
+{
+  "schema_version": "orbitserve.network_experiment.v1",
+  "time": {
+    "epoch_utc": "2026-07-20T00:00:00.000000Z",
+    "duration_s": 60,
+    "step_s": 1.0
+  },
+  "ground_ingresses": [
+    {
+      "ingress_id": "ground-00",
+      "lat_deg": 0.0,
+      "lon_deg": 0.0,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 10.0
+    },
+    {
+      "ingress_id": "ground-01",
+      "lat_deg": 0.0,
+      "lon_deg": 90.0,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 10.0
+    },
+    {
+      "ingress_id": "ground-02",
+      "lat_deg": 0.0,
+      "lon_deg": 180.0,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 10.0
+    },
+    {
+      "ingress_id": "ground-03",
+      "lat_deg": 0.0,
+      "lon_deg": -90.0,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 10.0
+    },
+    {
+      "ingress_id": "ground-04",
+      "lat_deg": 45.0,
+      "lon_deg": 0.0,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 10.0
+    },
+    {
+      "ingress_id": "ground-05",
+      "lat_deg": -45.0,
+      "lon_deg": 90.0,
+      "altitude_km": 0.0,
+      "min_elevation_deg": 10.0
+    }
+  ],
+  "network": {
+    "link_profiles": {
+      "communication_isl": {
+        "capacity_model": "islsim",
+        "bandwidth_bps": 200000000000.0,
+        "setup_time_s": 3,
+        "wavelength_m": 1.55e-06,
+        "transmit_power_w": 0.2,
+        "transmit_aperture_m": 0.05,
+        "receive_aperture_m": 0.05,
+        "transmit_aperture_efficiency": 0.6,
+        "receive_aperture_efficiency": 0.6,
+        "required_photons_per_bit": 20,
+        "pointing_loss_db": 1.0,
+        "system_loss_db": 2.0,
+        "implementation_efficiency": 0.8,
+        "parameter_sources": [
+          "https://starlink.com/technology",
+          "https://ntrs.nasa.gov/citations/20160011505"
+        ],
+        "assumptions": [
+          "Engineering scenario, not recovered proprietary Starlink terminal parameters.",
+          "200 Gbps PER-DIRECTION modem ceiling is a scenario assumption; vendor statement does not establish duplex accounting.",
+          "1550nm, 0.2W, 5cm apertures, efficiencies, losses and 20 photons/bit receiver requirement are assumptions.",
+          "Symmetric terminal pair; no measured atmospheric or pointing dynamics."
+        ],
+        "max_distance_km": 6000
+      },
+      "cell_isl": {
+        "capacity_model": "islsim",
+        "bandwidth_bps": 200000000000.0,
+        "setup_time_s": 1,
+        "wavelength_m": 1.55e-06,
+        "transmit_power_w": 0.2,
+        "transmit_aperture_m": 0.05,
+        "receive_aperture_m": 0.05,
+        "transmit_aperture_efficiency": 0.6,
+        "receive_aperture_efficiency": 0.6,
+        "required_photons_per_bit": 20,
+        "pointing_loss_db": 1.0,
+        "system_loss_db": 2.0,
+        "implementation_efficiency": 0.8,
+        "parameter_sources": [
+          "https://starlink.com/technology",
+          "https://ntrs.nasa.gov/citations/20160011505"
+        ],
+        "assumptions": [
+          "Engineering scenario, not recovered proprietary Starlink terminal parameters.",
+          "200 Gbps PER-DIRECTION modem ceiling is a scenario assumption; vendor statement does not establish duplex accounting.",
+          "1550nm, 0.2W, 5cm apertures, efficiencies, losses and 20 photons/bit receiver requirement are assumptions.",
+          "Symmetric terminal pair; no measured atmospheric or pointing dynamics."
+        ],
+        "max_distance_km": 10
+      },
+      "cross_layer": {
+        "capacity_model": "islsim",
+        "bandwidth_bps": 200000000000.0,
+        "setup_time_s": 5,
+        "wavelength_m": 1.55e-06,
+        "transmit_power_w": 0.2,
+        "transmit_aperture_m": 0.05,
+        "receive_aperture_m": 0.05,
+        "transmit_aperture_efficiency": 0.6,
+        "receive_aperture_efficiency": 0.6,
+        "required_photons_per_bit": 20,
+        "pointing_loss_db": 1.0,
+        "system_loss_db": 2.0,
+        "implementation_efficiency": 0.8,
+        "parameter_sources": [
+          "https://starlink.com/technology",
+          "https://ntrs.nasa.gov/citations/20160011505"
+        ],
+        "assumptions": [
+          "Engineering scenario, not recovered proprietary Starlink terminal parameters.",
+          "200 Gbps PER-DIRECTION modem ceiling is a scenario assumption; vendor statement does not establish duplex accounting.",
+          "1550nm, 0.2W, 5cm apertures, efficiencies, losses and 20 photons/bit receiver requirement are assumptions.",
+          "Symmetric terminal pair; no measured atmospheric or pointing dynamics."
+        ],
+        "max_distance_km": 4000
+      },
+      "sgl": {
+        "capacity_model": "free_space_shannon",
+        "bandwidth_bps": 10000000000.0,
+        "setup_time_s": 2,
+        "max_distance_km": 2500,
+        "frequency_hz": 12000000000.0,
+        "channel_bandwidth_hz": 240000000.0,
+        "transmit_power_w": 10.0,
+        "transmit_aperture_m": 0.3,
+        "receive_aperture_m": 0.5,
+        "noise_temperature_k": 290.0,
+        "system_loss_db": 2.0,
+        "atmospheric_loss_db": 1.0,
+        "implementation_efficiency": 0.7,
+        "sun_exclusion_angle_deg": 3.0,
+        "parameter_sources": [
+          "https://docs.fcc.gov/public/attachments/FCC-23-36A1.pdf",
+          "https://www.itu.int/rec/R-REC-P.525-5-202411-I/en"
+        ],
+        "assumptions": [
+          "12 GHz representative downlink channel, 240 MHz informed by FCC 23-36 SpaceX analysis.",
+          "10W RF power, effective apertures, temperature and losses are engineering assumptions.",
+          "Symmetric RF abstraction: uplink spectrum/power differ in real Starlink and are not calibrated here.",
+          "No interference/rain time series; Shannon upper bound with fixed implementation factor."
+        ]
+      }
+    },
+    "communication_topology": "explicit",
+    "wrap_planes": true,
+    "wrap_slots": true,
+    "cell_topology": "ring",
+    "inter_cell_links": false,
+    "ground_roles": [
+      "communication"
+    ],
+    "ground_access_policy": "nearest_distance",
+    "transport_model": "simgrid",
+    "failure_policy": "retry_next_sample"
+  },
+  "route_probes": [],
+  "constellations": {
+    "communication_shells": [
+      {
+        "shell_id": "starlink-550",
+        "source": {
+          "type": "walker_delta",
+          "altitude_km": 550.0,
+          "inclination_deg": 53.0,
+          "planes": 72,
+          "satellites_per_plane": 22,
+          "walker_phase": 1,
+          "raan0_deg": 0.0,
+          "u0_deg": 0.0
+        },
+        "topology": "grid",
+        "isl_terminals": 6,
+        "sgl_terminals": 1,
+        "wrap_planes": true,
+        "wrap_slots": true
+      }
+    ],
+    "compute_formations": [
+      {
+        "name": "compute-mid",
+        "source": {
+          "type": "walker_delta",
+          "altitude_km": 800.0,
+          "inclination_deg": 53.0,
+          "planes": 1,
+          "clusters_per_plane": 2,
+          "walker_phase": 0,
+          "raan0_deg": 0.0,
+          "u0_deg": 0.0
+        },
+        "cluster": {
+          "satellites_per_cluster": 10,
+          "grid_shape": "5x2",
+          "formation_pitch_m": 500.0,
+          "formation_frame": "lvlh",
+          "d_keepout_m": 50.0,
+          "sigma_control_m": 0.0,
+          "sigma_navigation_m": 0.0
+        },
+        "topology": "ring",
+        "ingress_members": [
+          0
+        ],
+        "isl_terminals": 4,
+        "sgl_terminals": 0
+      }
+    ]
+  }
+}

@@ -1,0 +1,197 @@
+{
+  "schema_version": "orbitserve.experiment.v1",
+  "experiment_id": "interactive-boundary-demo",
+  "physical_network": {
+    "schema_version": "orbitserve.network_experiment.v1",
+    "time": {
+      "epoch_utc": "2026-07-20T00:00:00.000000Z",
+      "duration_s": 120,
+      "step_s": 5.0
+    },
+    "ground_ingresses": [
+      {
+        "ingress_id": "ground-00",
+        "lat_deg": -0.07881998146938736,
+        "lon_deg": 62.149944043909464,
+        "min_elevation_deg": 5.0,
+        "terminal_count": 1
+      }
+    ],
+    "network": {
+      "link_profiles": {
+        "communication_isl": {
+          "capacity_model": "fixed",
+          "bandwidth_bps": 10000000000.0,
+          "setup_time_s": 3.0,
+          "max_distance_km": 6000.0,
+          "capacity_schedule": [
+            [
+              300.0,
+              0.5
+            ],
+            [
+              400.0,
+              1.0
+            ]
+          ]
+        },
+        "cell_isl": {
+          "capacity_model": "fixed",
+          "bandwidth_bps": 100000000000.0,
+          "setup_time_s": 1.0,
+          "max_distance_km": 10.0
+        },
+        "cross_layer": {
+          "capacity_model": "fixed",
+          "bandwidth_bps": 10000000000.0,
+          "setup_time_s": 5.0,
+          "max_distance_km": 4000.0
+        },
+        "sgl": {
+          "bandwidth_bps": 400.0,
+          "setup_time_s": 2.0,
+          "max_distance_km": 2500.0,
+          "capacity_model": "free_space_shannon",
+          "channel_bandwidth_hz": 500000000.0,
+          "frequency_hz": 20000000000.0,
+          "transmit_power_w": 50.0,
+          "transmit_gain_db": 30.0,
+          "receive_gain_db": 30.0,
+          "noise_temperature_k": 290.0,
+          "system_loss_db": 2.0,
+          "implementation_efficiency": 0.7,
+          "sun_exclusion_angle_deg": 3.0
+        }
+      },
+      "communication_topology": "explicit",
+      "wrap_planes": true,
+      "wrap_slots": true,
+      "cell_topology": "ring",
+      "inter_cell_links": false,
+      "ground_roles": [
+        "communication"
+      ],
+      "ground_access_policy": "nearest_distance",
+      "transport_model": "fluid",
+      "fault_timing": "boundary",
+      "failure_policy": "retry_next_sample",
+      "faults": [],
+      "random_faults": {}
+    },
+    "route_probes": [],
+    "constellations": {
+      "communication_shells": [
+        {
+          "shell_id": "comm-low",
+          "source": {
+            "type": "walker_delta",
+            "altitude_km": 550.0,
+            "inclination_deg": 53.0,
+            "planes": 4,
+            "satellites_per_plane": 6,
+            "walker_phase": 1,
+            "raan0_deg": 0.0,
+            "u0_deg": 0.0
+          },
+          "topology": "grid",
+          "isl_terminals": 6,
+          "sgl_terminals": 1,
+          "wrap_planes": true,
+          "wrap_slots": true
+        }
+      ],
+      "compute_formations": [
+        {
+          "name": "compute-mid",
+          "source": {
+            "type": "walker_delta",
+            "altitude_km": 800.0,
+            "inclination_deg": 53.0,
+            "planes": 1,
+            "clusters_per_plane": 2,
+            "walker_phase": 0,
+            "raan0_deg": 0.0,
+            "u0_deg": 0.0
+          },
+          "cluster": {
+            "satellites_per_cluster": 4,
+            "grid_shape": "4x1",
+            "formation_pitch_m": 500.0,
+            "formation_frame": "lvlh",
+            "d_keepout_m": 50.0,
+            "sigma_control_m": 0.0,
+            "sigma_navigation_m": 0.0
+          },
+          "topology": "ring",
+          "ingress_members": [
+            0
+          ],
+          "isl_terminals": 4,
+          "sgl_terminals": 0
+        }
+      ]
+    }
+  },
+  "hardware": {
+    "accelerator": "h200_sxm",
+    "compute_payload": {
+      "accelerator_count": 4,
+      "purchase_cost_per_unit_usd": 50000
+    },
+    "communication": {
+      "isl_terminal_count": 6,
+      "isl_terminal_bandwidth_gbps": 100,
+      "ground_link_bandwidth_gbps": 1
+    },
+    "power": {
+      "battery_capacity_wh": 10000,
+      "solar_array_power_w": 10000
+    }
+  },
+  "communication_hardware": {
+    "compute_payload": {
+      "accelerator_count": 0
+    },
+    "communication": {
+      "isl_terminal_count": 6,
+      "isl_terminal_bandwidth_gbps": 100,
+      "ground_link_bandwidth_gbps": 1
+    }
+  },
+  "serving": {
+    "max_concurrency": 2,
+    "prompt_length_grid": [
+      1,
+      32,
+      68,
+      128,
+      256
+    ],
+    "context_length_grid": [
+      1,
+      32,
+      68,
+      128,
+      256
+    ],
+    "formation": {
+      "member_count": 4,
+      "topology": "ring",
+      "link_bandwidth_gbps": 100,
+      "link_propagation_delay_s": 5e-06
+    },
+    "parallelism": {
+      "tp": 4
+    }
+  },
+  "workload": {
+    "bundle_dir": "tests/fixtures/workloads/coupled_physical"
+  },
+  "runtime_strategy": {
+    "latency_weight": 1,
+    "kv_reuse_weight": 0,
+    "energy_weight": 0,
+    "compute_load_weight": 0
+  },
+  "local_smoke_workload": true
+}

@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Astermind 星鉴 · 完整场景</title>
+  <link rel="stylesheet" href="/assets/pages.css">
+  <link rel="stylesheet" href="/assets/workspace-overview.css">
+</head>
+<body>
+<main class="constellation-workspace">
+  <header class="constellation-heading">
+    <div><p class="studio-eyebrow">CONSTELLATION / WORKSPACE</p><h1>完整场景仿真</h1></div>
+    <div class="actions"><a class="button primary" href="/configuration">新建任务 ↗</a><a class="button" href="/experiments">查看运行记录</a></div>
+  </header>
+  <figure class="constellation-scene" aria-label="自转的地球、环绕卫星与地面站">
+    <div id="overviewScene" class="constellation-canvas" aria-hidden="true"></div>
+    <svg class="constellation-fallback" viewBox="0 0 800 500" aria-hidden="true">
+      <defs>
+        <radialGradient id="earthShade" cx="35%" cy="30%" r="70%"><stop stop-color="#9bc4b9" stop-opacity=".1"/><stop offset=".65" stop-color="#091b22" stop-opacity=".3"/><stop offset="1" stop-color="#071112" stop-opacity=".9"/></radialGradient>
+        <clipPath id="earthClip"><circle cx="400" cy="250" r="137"/></clipPath>
+        <g id="satelliteGlyph" stroke="#9abcb2" stroke-width="1.5"><path fill="#356b72" d="M-28-8h19V8h-19zM9-8h19V8H9z"/><path d="M-19-8V8M19-8V8M-28 0h56"/><rect x="-7" y="-10" width="14" height="20" rx="2" fill="#e1e8d9"/></g>
+        <g id="stationGlyph" stroke="#d4e99e" stroke-width="2.5" fill="#24332b"><path d="m0 0-5 14h13L3 0M-10-7Q-3 12 10-7ZM0 0l9-13M-10 16h20"/><circle cx="9" cy="-13" r="2" fill="#d4e99e"/></g>
+      </defs>
+      <g fill="none" stroke="#8bafa0" stroke-opacity=".45"><ellipse cx="400" cy="250" rx="220" ry="91" transform="rotate(-22 400 250)"/><ellipse cx="400" cy="250" rx="207" ry="118" transform="rotate(62 400 250)"/></g>
+      <image href="/assets/earth.jpg" x="156" y="113" width="488" height="274" preserveAspectRatio="xMidYMid slice" clip-path="url(#earthClip)"/>
+      <circle cx="400" cy="250" r="137" fill="url(#earthShade)" stroke="#86b8a1" stroke-opacity=".6"/>
+      <g fill="none" stroke="#c5e78b" stroke-opacity=".65" stroke-dasharray="4 5"><path d="M338 298 210 307M471 219 575 150"/></g>
+      <use href="#stationGlyph" x="338" y="298"/><use href="#stationGlyph" x="471" y="219"/>
+      <use href="#satelliteGlyph" transform="translate(210 307) rotate(-22)"/><use href="#satelliteGlyph" transform="translate(575 150) rotate(-22)"/><use href="#satelliteGlyph" transform="translate(340 70) rotate(32)"/><use href="#satelliteGlyph" transform="translate(460 428) rotate(32)"/><use href="#satelliteGlyph" transform="translate(576 316) rotate(-22)"/>
+    </svg>
+    <button id="overviewMotion" class="constellation-motion" type="button" hidden>暂停动画</button>
+  </figure>
+</main>
+<script type="module" src="/assets/workspace-overview.js?v=motion-2"></script>
+</body>
+</html>

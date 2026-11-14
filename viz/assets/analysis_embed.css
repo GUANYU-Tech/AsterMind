@@ -1,0 +1,5 @@
+html.analysis-embedded .studio-topbar,html.analysis-embedded .studio-sidebar,html.analysis-embedded body>header,html.analysis-embedded body>.sidebar{display:none!important}html.analysis-embedded main{margin:0!important;padding:20px!important;max-width:none!important}html.analysis-embedded .heading,html.analysis-embedded .case-picker{display:none!important}html.analysis-embedded .scene-record>h1,html.analysis-embedded .scene-record>p:first-of-type{display:none!important}html.analysis-operators #scenePanel,html.analysis-operators #memoryPanel,html.analysis-operators #auditPanel{display:none!important}html.analysis-kv #scenePanel,html.analysis-kv #operatorPanel,html.analysis-kv .detail-grid,html.analysis-kv .transport,html.analysis-kv #metrics{display:none!important}html.analysis-embedded #topology{min-height:0}html.analysis-embedded .result-tabs{position:static}
+
+html.analysis-operators #metrics{display:none!important}
+.paged-batches{display:flex;align-items:center;gap:12px;margin:12px 0 20px}.paged-batches select{max-width:100%;min-width:260px}
+html.recorded-scene #stop,html.recorded-scene #viewResults,html.recorded-scene #fullReplay{display:none!important}

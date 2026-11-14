@@ -1,0 +1,130 @@
+/* Only bridge the six-step editor to the original visual system in styles.css. */
+[hidden] { display: none !important; }
+.config-panel.is-active { opacity: 1; pointer-events: auto; transform: translateX(0); }
+.config-shell { width: min(370px, calc(100vw - 200px)); }
+.home-config-action { font-family: inherit; font-size: 12px; font-weight: 500; letter-spacing: .04em; line-height: 1.5; }
+.history-action { margin-left: auto; }
+.basic-fields, .field-group { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 8px; min-width: 0; margin: 0; padding: 0; border: 0; }
+.editor-section { padding: 18px 0; border-bottom: 1px solid var(--line); }
+.editor-section > summary { cursor: pointer; color: var(--pearl); font-size: 12px; list-style-position: outside; margin-left: 12px; }
+.editor-section > summary::marker { color: var(--violet); }
+.editor-section > .basic-fields { padding-top: 14px; }
+.config-field { position: relative; min-width: 0; margin: 0; padding: 8px 9px; border: 1px solid var(--line); background: rgba(255,255,255,.015); }
+.config-field > label, .field-title, .field-group > legend { display: block; margin-bottom: 5px; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.field-group > legend { padding: 8px 0; color: var(--violet); }
+.field-wide, .field-container, .field-group > legend, .repeat-item { grid-column: 1 / -1; }
+.config-field.field-container { padding: 0; border: 0; background: transparent; }
+.field-group .field-group { padding: 0; border: 0; }
+.field-container > .field-title { margin: 8px 0 10px; }
+.field-container > .small-action { margin-top: 10px; }
+.pool-hardware { color: var(--muted); font-size: 12px; padding: 6px 0; }
+.config-field input:where(:not([type=checkbox]):not([type=range])), .config-field select, .result-select, .config-json {
+  width: 100%; min-width: 0; min-height: 30px; padding: 2px 0; border: 0; border-radius: 0;
+  background: transparent; color: var(--pearl); font-size: 12px;
+}
+.config-field input[type=number] { font-size: 14px; font-weight: 500; }
+.config-field select, .result-select { color-scheme: dark; }
+.config-field select option { background: var(--space); }
+.input-value { display: flex; align-items: center; gap: 10px; }
+.field-unit { flex-shrink: 0; color: var(--muted); font: 11px "SFMono-Regular", Consolas, monospace; }
+.config-field.node-count-block { display: block; margin: 0; }
+.config-field.node-count-block .stepper { justify-content: flex-end; }
+.config-field .stepper input { width: 38px !important; min-height: 30px; padding: 0 4px !important; border: 0 !important; border-bottom: 1px solid rgba(121,215,208,.42) !important; font-size: 14px !important; }
+.config-field .stepper button { flex-shrink: 0; }
+.config-field.node-count-block > label { margin: 0 0 7px; }
+.config-field.range-field, .config-field.formation-field { padding: 12px 0 18px; border: 0; border-bottom: 1px solid var(--line); background: transparent; }
+.range-field .field-line { margin: 0 0 15px; }
+.range-field .field-line label { color: var(--muted); font-size: 12px; }
+.range-value { display: flex; gap: 5px; align-items: center; color: var(--pearl); font: 14px "SFMono-Regular", Consolas, monospace; }
+.range-value input { width: 65px !important; text-align: right; font-size: 14px !important; font-weight: 500; }
+.config-field .range { display: block; width: 100%; background: linear-gradient(90deg, var(--violet) 0 var(--range-progress), var(--line) var(--range-progress)); }
+.config-field .range-labels { margin-top: 10px; font-size: 11px; }
+.config-field .formation-option { min-height: 92px; font-size: 14px; }
+.config-field .formation-option span { font-size: 14px; }
+.config-field .formation-option svg { width: 60px; height: 42px; }
+.formation-field > label { margin-bottom: 14px; }
+.config-field small, .fso-help, .muted { display: block; margin: 6px 0; color: var(--muted); font-size: 10px; line-height: 1.7; overflow-wrap: anywhere; }
+.toggle-field { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.toggle-field > label { margin-bottom: 0; }
+.toggle-field input { accent-color: var(--violet); width: 16px; height: 16px; }
+.read-only-field { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 5px; }
+.read-only-field output { max-width: 100%; color: var(--muted); font: 12px "SFMono-Regular", Consolas, monospace; overflow-wrap: anywhere; }
+.repeat-item { padding: 12px 0; border-bottom: 1px solid var(--line); }
+.repeat-item > summary { cursor: pointer; font-size: 12px; color: var(--cyan); overflow-wrap: anywhere; }
+.repeat-item > .config-field { margin-top: 12px; }
+.small-action { display: inline-block; min-height: 28px; margin: 5px 5px 0 0; padding: 5px 8px; border: 1px solid var(--line); background: transparent; color: var(--muted); font: inherit; font-size: 9px; text-decoration: none; cursor: pointer; }
+.small-action:hover { border-color: var(--violet); color: var(--pearl); }
+.config-json { min-height: 200px; line-height: 1.6; resize: vertical; border: 1px solid var(--line); padding: 8px; font-size: 11px; }
+.tle-input { margin-top: 14px; }
+.upload-status { color: var(--muted); font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.upload-status:empty { display: none; }
+.link-modes { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; }
+.link-mode { min-height: 34px; border: 1px solid transparent; background: transparent; color: var(--muted); font-size: 12px; cursor: pointer; }
+.link-mode.is-selected { color: var(--pearl); border-color: var(--coral); background: rgba(239,132,112,.08); }
+.panel-header h1 { font-size: 22px; }
+.field-error { outline: 1px solid var(--coral); outline-offset: 2px; }
+.hardware-profile { padding: 12px 0; font-size: 10px; }
+.hardware-profile pre, pre { max-width: 100%; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 10px; line-height: 1.6; }
+.config-actions { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 0; }
+.import-row:focus-within { outline: 1px solid var(--cyan); outline-offset: 3px; }
+:is(button,input,select,textarea,summary,a):focus-visible { outline: 1px solid var(--cyan); outline-offset: 3px; }
+button:disabled { opacity: .45; cursor: not-allowed; }
+#web-message { position: fixed; bottom: 8px; left: 160px; right: 420px; z-index: 60; padding: 9px 12px; border: 1px solid var(--line); background: var(--space); color: var(--muted); font-size: 12px; line-height: 1.6; white-space: pre-wrap; max-height: 22dvh; overflow: auto; }
+#web-message:empty { display: none; }
+body[data-stage="home"] #web-message:not(.is-error), body:not([data-stage="analysis"]) #job-status { display: none; }
+#web-message.is-error, .error, .warning { color: #ffb3a5; }
+#job-status { position: fixed; right: 32px; top: 76px; z-index: 30; font-size: 9px; color: var(--cyan); }
+#job-status button { border: 0; background: transparent; color: var(--pearl); font-size: 9px; cursor: pointer; }
+.analysis-shell { grid-template-rows: auto minmax(0,1fr); }
+#analysis-content { min-height: 0; overflow: auto; }
+#simulation-results { min-height: 100%; }
+.result-workspace { display: grid; grid-template-rows: auto auto minmax(0,1fr); }
+.result-tabs { min-height: 42px; overflow: auto; }
+.result-page { padding: 18px 0; }
+.result-section h3 { font-size: 13px; font-weight: 500; }
+.metric-grid { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); margin: 14px 0 24px; border: 1px solid var(--line); }
+.metric-grid > div { padding: 18px; border-right: 1px solid var(--line); }
+.metric-grid > div:last-child { border-right: 0; }
+.metric-grid small { display: block; color: var(--muted); font-size: 9px; }
+.metric-grid strong { display: block; margin-top: 10px; font: 20px "SFMono-Regular", Consolas, monospace; color: var(--pearl); }
+.table-scroll { max-width: 100%; overflow: auto; }
+.table-scroll table { width: 100%; border-collapse: collapse; font-size: 10px; }
+.table-scroll :is(td,th) { padding: 10px 14px; text-align: left; border-bottom: 1px solid var(--line); vertical-align: top; max-width: 420px; overflow-wrap: anywhere; }
+.table-scroll th { color: var(--muted); font-weight: 500; white-space: nowrap; }
+.table-scroll td { font-family: "SFMono-Regular", Consolas, monospace; }
+.result-page button { font-family: inherit; }
+.history-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.request-chart { margin: 14px 0 22px; padding: 14px; border: 1px solid var(--line); }
+.request-chart svg { display: block; width: 100%; height: 150px; }
+.request-chart p { margin: 5px 0; }
+@media (max-width: 900px) {
+  .config-shell { inset: 132px 14px 24px; width: auto; }
+  .config-panel { padding: 20px; }
+  .chapter-rail { display: flex; top: 78px; left: 14px; right: 14px; width: auto; flex-direction: row; justify-content: space-between; gap: 5px; }
+  .chapter-rail::before, .chapter-progress, .chapter-rail b { display: none; }
+  .chapter-rail button { display: block; padding-left: 0; }
+  .chapter-rail button::before { display: none; }
+  .chapter-rail span { font-size: 10px; }
+  .analysis-shell { inset: 130px 14px 30px; }
+  .analysis-header { gap: 12px; }
+  .analysis-title { min-width: 0; }
+  .metric-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .metric-grid > div { padding: 12px; }
+  .platform-title { display: none; }
+  .scene-meta { display: flex; left: 18px; top: 90px; }
+  .scene-meta > span { display: none; }
+  .scene-meta .home-config-action { margin-left: 0; }
+  .home-config-action { font-size: 11px; }
+  #web-message { left: 14px; right: 14px; bottom: 0; }
+  #job-status { top: auto; bottom: 5px; right: 14px; }
+}
+@media (max-width: 430px) {
+  .config-panel { padding: 16px; }
+  .config-field { padding: 9px; }
+  .config-field > label, .field-title { font-size: 11px; }
+  .config-field input[type=number] { font-size: 14px; }
+  .config-field.node-count-block .stepper { gap: 4px; }
+  .config-field .stepper input { width: 32px !important; }
+  .stepper-button { width: 26px; height: 26px; }
+}
+@media (prefers-reduced-motion: reduce) { .config-panel, .analysis-shell { transition: none; } }

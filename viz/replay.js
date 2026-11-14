@@ -19,8 +19,8 @@ const exactDuration = (row) => {
   const ns=Number(BigInt(row.end_ticks)-BigInt(row.start_ticks))/1e9;
   return ns<1000?`${Number(ns.toPrecision(9))} ns`:duration(ns);
 };
-const transportLabel = (data) => data.backend === "simgrid" ? "SimGrid" : data.backend === "ns3" ? "ns-3" : "FlowSim";
-const communicationLabel = (data) => ({
+const transportLabel = (data) => data.backend === "runtime_comm" ? "V1 Runtime Comm" : data.backend === "simgrid" ? "SimGrid" : data.backend === "ns3" ? "ns-3" : "FlowSim";
+const communicationLabel = (data) => data.backend === 'runtime_comm' ? 'V1 Runtime Comm · 整条路径共享资源' : ({
   protobridge_cell: "Cell 内 ProtoBridge · Cell 外 FlowSim",
   protobridge_satellite: "卫星内 ProtoBridge · 星间 FlowSim",
 }[data.provenance?.communication_mode] || (data.backend === "ns3" ? "ns-3 包级" : "全部通信使用 FlowSim")).replaceAll('FlowSim',data.backend==='simgrid'?'SimGrid':'FlowSim');

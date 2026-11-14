@@ -1,0 +1,27 @@
+{
+  "archived_on": "2026-10-20",
+  "timezone": "Asia/Shanghai",
+  "source": "User-provided PDF attachments in this chat",
+  "storage_policy": "Local research materials under the existing /docs/ Git ignore rule; do not upload or force-add to Git.",
+  "papers": [
+    {
+      "project_context_from_user": "OrbitServe",
+      "filename": "OrbitServe.pdf",
+      "original_filename": "OrbitServe.pdf",
+      "title": "Space or Not? Constellation-Scale Simulation and State-Aware Scheduling for Orbital LLM Serving",
+      "pages": 14,
+      "bytes": 1774340,
+      "sha256": "3746d34361ccb9b4d67875c2355a3ddc4d0e8ed8a766308a0971e7121da757d7"
+    },
+    {
+      "project_context_from_user": "AsterMind",
+      "system_name_in_paper": "ProtoBridge",
+      "filename": "astermind-protocol-effects.pdf",
+      "original_filename": "【朱昱 通信部分】Making Protocol Effects Explocit——LLM-to-Packet Simulation for Superpod Interconnect Exploration_副本.pdf",
+      "title": "Making Protocol Effects Explicit: LLM-to-Packet Simulation for Superpod Interconnect Exploration",
+      "pages": 14,
+      "bytes": 1213564,
+      "sha256": "4562e4324064b6e61d0befff0ade22f10849359dde36cee6756cb7ea7781dbf1"
+    }
+  ]
+}
