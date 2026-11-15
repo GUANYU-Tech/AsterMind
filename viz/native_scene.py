@@ -20,6 +20,8 @@ def validate_document(root, document):
         if not data['ready'] or Path(data['physical_dataset']).resolve() != Path(experiment.get('physical_dataset', '')).resolve():
             raise ValueError('场景引用的物理数据与所选已完成模型不一致')
     config = SimulationConfig.model_validate(experiment)
+    from astermind.engine.policies.routing import get_routing_policy
+    get_routing_policy(config.routing.policy)
     config.topology()
     value['experiment'] = config.model_dump(mode='json')
     return value, value['experiment']
@@ -32,7 +34,7 @@ def generate(root, payload):
     from astermind.builder.config.deployment import SceneDeployment
     from astermind.builder.catalog import validate_deployment_choice
     from studio import physical_data
-    if set(payload) - {'physical_model_id', 'deployment', 'requests', 'migrations', 'runtime_network'}:
+    if set(payload) - {'physical_model_id', 'deployment', 'requests', 'migrations', 'runtime_network', 'routing', 'cell_selection'}:
         raise ValueError('生成配置包含未知字段')
     data = physical_data(root, payload['physical_model_id'])
     if not data['ready']:
@@ -45,4 +47,6 @@ def generate(root, payload):
                 if key not in deployment.model_fields_set and hardware[key] is not None}
     deployment = deployment.model_copy(update=defaults)
     return build_scene(data['physical_dataset'], deployment, requests=payload.get('requests',()),
-                       migrations=payload.get('migrations',()), runtime_network=payload.get('runtime_network')).model_dump(mode='json')
+                       migrations=payload.get('migrations',()), runtime_network=payload.get('runtime_network'),
+                       routing=payload.get('routing'),
+                       cell_selection=payload.get('cell_selection', 'least_loaded')).model_dump(mode='json')

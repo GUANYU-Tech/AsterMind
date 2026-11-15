@@ -8,9 +8,61 @@ from pathlib import Path
 import subprocess
 import sys
 import zipfile
+from contextlib import contextmanager
 from paths import VIZ, REPOSITORY, RUNTIME, initialize
 
 _backend = None
+
+
+@contextmanager
+def snapshot_lock(root):
+    """Serialize preparation across frontend/worker processes on Linux."""
+    import fcntl
+    root.parent.mkdir(parents=True, exist_ok=True)
+    with root.with_suffix('.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def extract_source(raw, root):
+    """Validate each archive directory once, including existing symlinks."""
+    checked = set()
+    resolved_root = root.resolve()
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        for entry in archive.infolist():
+            target = root / entry.filename
+            parent = target.parent
+            if parent not in checked:
+                if not parent.resolve().is_relative_to(resolved_root):
+                    raise ValueError('Invalid source archive path')
+                checked.add(parent)
+            if target.is_symlink() or '..' in Path(entry.filename).parts or Path(entry.filename).is_absolute():
+                raise ValueError('Invalid source archive path')
+            archive.extract(entry, root)
+
+
+def source_identity():
+    """Fingerprint tracked backend edits without committing or touching vendors."""
+    head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=REPOSITORY, text=True).strip()
+    changed = subprocess.check_output(['git', 'diff', '--name-only', '-z', 'HEAD', '--',
+        'astermind', 'workloads', 'examples'], cwd=REPOSITORY).decode().split('\0')
+    overlays = {}
+    for name in sorted(filter(None, changed)):
+        path = REPOSITORY / name
+        if path.is_symlink() or not path.resolve().is_relative_to(REPOSITORY.resolve()):
+            raise ValueError('Backend snapshot requires regular repository files')
+        content = path.read_bytes() if path.is_file() else None
+        if content is not None and path.suffix in {'.py', '.json', '.md', '.toml', '.yaml', '.yml', '.txt'}:
+            content = content.replace(b'\r\n', b'\n')
+        overlays[name] = content
+    hashes = {name: hashlib.sha256(data).hexdigest() if data is not None else None
+              for name, data in overlays.items()}
+    fingerprint = hashlib.sha256(json.dumps({'commit': head, 'files': hashes}, sort_keys=True).encode()).hexdigest()
+    return dict(commit=head, source_fingerprint=fingerprint, backend_modified=bool(overlays),
+                modified_files=hashes), overlays
 
 
 def prepare_native_libraries(root):
@@ -48,20 +100,28 @@ def activate():
             sys.path.insert(0, str(path))
     if importlib.util.find_spec('pydantic') is None:
         raise RuntimeError('OS 缺少 pydantic；请将 V1 依赖安装到 viz/.runtime/python 或设置 ASTERMIND_FRONTEND_DEPS。')
-    head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=REPOSITORY, text=True).strip()
-    root = RUNTIME / 'sources' / head
+    provenance, overlays = source_identity()
+    head = provenance['commit']
+    suffix = '-worktree-' + provenance['source_fingerprint'] if overlays else ''
+    root = RUNTIME / 'sources' / (head + suffix)
     marker = root / '.frontend-source.json'
-    if not marker.is_file():
-        root.mkdir(parents=True, exist_ok=True)
-        raw = subprocess.check_output(['git', '-c', 'core.autocrlf=false', 'archive', '--format=zip', head,
-                                       'astermind', 'workloads', 'examples'], cwd=REPOSITORY)
-        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
-            for entry in archive.infolist():
-                target = (root / entry.filename).resolve()
-                if not target.is_relative_to(root.resolve()):
-                    raise ValueError('Invalid source archive path')
-                archive.extract(entry, root)
-        marker.write_text(json.dumps({'commit': head, 'backend_modified': False}))
+    with snapshot_lock(root):
+        if not marker.is_file():
+            root.mkdir(parents=True, exist_ok=True)
+            raw = subprocess.check_output(['git', '-c', 'core.autocrlf=false', 'archive', '--format=zip', head,
+                                           'astermind', 'workloads', 'examples'], cwd=REPOSITORY)
+            extract_source(raw, root)
+            for name, content in overlays.items():
+                target = root / name
+                if content is None:
+                    target.unlink(missing_ok=True)
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(content)
+            marker.write_text(json.dumps(provenance, indent=2))
+        elif json.loads(marker.read_text()) != provenance:
+            # Older clean snapshots predate the provenance fields.
+            marker.write_text(json.dumps(provenance, indent=2))
     # Canonical HEAD bytes keep reference data intact without changing checkout.
     loaded = sys.modules.get('astermind')
     if loaded is not None and not Path(loaded.__file__).resolve().is_relative_to(root.resolve()):
@@ -87,12 +147,13 @@ def activate():
                     if len(value)>2 and value[1]==':':
                         value='/mnt/'+value[0].lower()+'/'+value[3:].replace('\\','/')
                     os.environ.setdefault('ORBITSERVE_'+module.upper()+'_'+suffix, value)
-    prepare_native_libraries(root)
+    with snapshot_lock(root):
+        prepare_native_libraries(root)
     from astermind.common.bootstrap import activate as bootstrap
     bootstrap()
     _backend = root
-    (RUNTIME / 'source.json').write_text(json.dumps({'commit': head, 'root': str(root),
-                                                   'python': sys.executable, 'backend_modified': False}, indent=2))
+    (RUNTIME / 'source.json').write_text(json.dumps({**provenance, 'root': str(root),
+                                                   'python': sys.executable}, indent=2))
     return root
 
 
@@ -116,5 +177,6 @@ def inference_runtime():
 
 def identity():
     root = activate()
-    return {'backend': 'AsterMind V1.0', 'commit': root.name, 'source': str(root),
+    provenance = json.loads((root / '.frontend-source.json').read_text())
+    return {'backend': 'AsterMind V1.0', **provenance, 'source': str(root),
             'python': sys.executable, 'platform': sys.platform, 'old_backend': False}

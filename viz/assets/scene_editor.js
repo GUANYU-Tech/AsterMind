@@ -11,9 +11,7 @@ let requestPage=0;
 const requestPageSize=25;
 let initialTopologyOwner=new URLSearchParams(location.search).get('satellite');
 const signature=()=>JSON.stringify(payload());
-const deploymentFields=['model','hardware','gpus','parallel','concurrency','context','gpuBandwidth','gpuLatency','batchTokens','kvBlocks','expertSeed','timelineMode'];
-function engineLabels(){} // Backend scope is described explicitly in the V1 table.
-const mode=()=>document.querySelector('input[name=communication]:checked').value;
+const deploymentFields=['model','hardware','gpus','parallel','concurrency','context','gpuBandwidth','gpuLatency','batchTokens','kvBlocks','expertSeed'];
 const number=id=>Number($(id).value);
 const topologySection=document.createElement('section');topologySection.className='card';topologySection.hidden=true;
 const topologyHeading=document.createElement('h2');topologyHeading.textContent='计算节点拓扑';const topologyHost=document.createElement('div');topologySection.append(topologyHeading,topologyHost);$('requests').closest('section').before(topologySection);
@@ -21,7 +19,6 @@ const topologyEditor=createCellTopology(topologyHost,{edit:op=>perform(async()=>
 const requestBatch=createRequestBatch({getExperiment:()=>experiment,apply:requests=>{experiment.requests=requests;requestPage=0;validatedSignature='';renderRequests();writeJson();state();$('status').textContent=`已应用 ${requests.length.toLocaleString()} 条业务请求`}});
 for(const [id,kind]of [['importRequests','import'],['generateRequests','generate']])$(id).onclick=()=>{try{requestBatch.open(kind)}catch(error){$('status').textContent=error.message}};
 function state(){
- $('timelineMode').disabled=busy||jsonDirty;
  $('runtimeConfig').disabled=!ready; $('sceneFields').disabled=busy||jsonDirty;
  $('dataset').disabled=busy||jsonDirty; $('name').disabled=busy;
  for(const id of ['save','run','batchRun'])$(id).disabled=busy||(!jsonDirty&&(!experiment||needsBuild));
@@ -57,8 +54,12 @@ function initializeCatalog(value){
  $('model').value=value.defaults.model;$('hardware').value=value.defaults.hardware;refreshChoices(`${value.defaults.tp},${value.defaults.pp}`);hardwareDefaults();
 }
 function validFields(){deploymentValidity();for(const input of document.querySelectorAll('input,select'))if(!input.closest('dialog')&&!input.disabled&&!input.checkValidity()){input.reportValidity();throw Error(input.validationMessage||'请修正无效的表单参数')}if(!$('name').value.trim())throw Error('请填写场景名称')}
-function deployment(){if(mode()!=='v1_runtime')throw Error('V1.0 不支持所选旧通信执行模式');if($('timelineMode').value!=='orbitserve')throw Error('V1.0 使用统一整数时钟，不支持旧 SimGrid 时间轴');const [tp,pp]=$('parallel').value.split(',').map(Number),hardwareId=$('hardware').value,hardware=capabilities.hardware.find(row=>row.id===hardwareId)?.file,choice=choices().find(row=>row.tp===tp&&row.pp===pp);return{model:$('model').value,hardware,hardware_id:hardwareId,gpus_per_satellite:number('gpus'),tp,pp,expert_parallel:!!choice?.expert_parallel,expert_routing_seed:choice?.expert_parallel?number('expertSeed'):null,max_requests:number('concurrency'),max_model_len:number('context'),max_batched_tokens:number('batchTokens'),num_kv_blocks:number('kvBlocks'),gpu_link_bandwidth_gbps:number('gpuBandwidth'),gpu_link_latency_ns:number('gpuLatency'),compute_mode:'midlayer',communication:{retry_limit:number('retryCount'),intra_mode:'IntraSatelliteRoofline'}}}
-function syncRuntime(){if($('failurePolicy').value!=='v1_retry')throw Error('V1.0 使用原生通信等待与重试；旧 failure_policy 不能直接映射。');delete runtime.failure_policy;delete runtime.max_transfer_retries;if(experiment){experiment.communication??={};experiment.communication.retry_limit=number('retryCount');}runtime.fault_timing='continuous';runtime.faults=JSON.parse($('faultList').value);if(experiment)experiment.runtime_network=runtime}
+function deployment(){const [tp,pp]=$('parallel').value.split(',').map(Number),hardwareId=$('hardware').value,hardware=capabilities.hardware.find(row=>row.id===hardwareId)?.file,choice=choices().find(row=>row.tp===tp&&row.pp===pp);return{model:$('model').value,hardware,hardware_id:hardwareId,gpus_per_satellite:number('gpus'),tp,pp,expert_parallel:!!choice?.expert_parallel,expert_routing_seed:choice?.expert_parallel?number('expertSeed'):null,max_requests:number('concurrency'),max_model_len:number('context'),max_batched_tokens:number('batchTokens'),num_kv_blocks:number('kvBlocks'),gpu_link_bandwidth_gbps:number('gpuBandwidth'),gpu_link_latency_ns:number('gpuLatency'),compute_mode:'midlayer',communication:{retry_limit:number('retryCount'),intra_mode:'IntraSatelliteRoofline'}}}
+function syncRuntime(){if($('failurePolicy').value!=='v1_retry')throw Error('V1.0 使用原生通信等待与重试；旧 failure_policy 不能直接映射。');delete runtime.failure_policy;delete runtime.max_transfer_retries;if(experiment){experiment.communication??={};experiment.communication.retry_limit=number('retryCount');}runtime.fault_timing='continuous';runtime.faults=JSON.parse($('faultList').value);if(experiment){experiment.runtime_network=runtime;experiment.routing=routingConfig();experiment.cell_selection=$('cellSelection').value}}
+function routingConfig(){const selected=$('routingPolicy').value;const policy=selected==='custom'?$('customRoutingPolicy').value.trim():selected;if(!/^[a-z][a-z0-9_-]{0,127}$/.test(policy))throw Error('请填写有效的已注册策略名称');return {policy}}
+$('cellSelection').onchange=()=>{if(experiment){experiment.cell_selection=$('cellSelection').value;writeJson()}};
+function reflectRouting(){$('cellSelection').value=experiment?.cell_selection||'least_loaded';const policy=experiment?.routing?.policy||'min_hops';const custom=!['min_hops','min_propagation'].includes(policy);$('routingPolicy').value=custom?'custom':policy;$('customRoutingField').hidden=!custom;$('customRoutingPolicy').required=custom;$('customRoutingPolicy').value=custom?policy:''}
+$('routingPolicy').onchange=$('customRoutingPolicy').oninput=()=>{const custom=$('routingPolicy').value==='custom';$('customRoutingField').hidden=!custom;$('customRoutingPolicy').required=custom;try{if(experiment){experiment.routing=routingConfig();writeJson()}else routingConfig();$('status').textContent=''}catch(error){$('status').textContent=error.message}};
 function renderRuntime(){runtime.faults??=[];runtime.random_faults=normalizeRandomFaults(runtime.random_faults,physicalTime);$('failurePolicy').value='v1_retry';$('retryCount').value=experiment?.communication?.retry_limit??8;$('faultList').value=JSON.stringify(runtime.faults,null,2);renderRandomFaults($('runtimeFaults'),runtime.random_faults,physicalTime)}
 function option(value,text){const o=document.createElement('option');o.value=value;o.textContent=text;return o}
 function renderRequests(){
@@ -85,8 +86,7 @@ function renderRequests(){
 function changeRequestPage(delta){for(const input of $('requests').querySelectorAll('input,select'))if(!input.checkValidity()){input.reportValidity();return}requestPage+=delta;renderRequests()}
 $('previousRequestPage').onclick=()=>changeRequestPage(-1);$('nextRequestPage').onclick=()=>changeRequestPage(1);
 function reflectConfig(){
- $('timelineMode').value=experiment.timeline_mode||'orbitserve';engineLabels();
- const input=document.querySelector(`input[name=communication][value="${experiment.communication_mode||'v1_runtime'}"]`);if(input)input.checked=true;
+ reflectRouting();
  const c=experiment.cells[0];$('deploymentSummary').textContent=`${experiment.cells.length} 个 Cell · ${experiment.physical.devices.filter(d=>d.kind==='gpu').length} 个 GPU`;
  $('concurrency').value=c.max_requests;$('context').value=c.max_model_len;$('batchTokens').value=c.max_batched_tokens;$('kvBlocks').value=c.num_kv_blocks;$('expertSeed').value=c.expert_routing_seed??0;
  for(const [id,value]of [['model',c.model],['hardware',c.hardware_id]]){if(![...$(id).options].some(o=>o.value===value))$(id).append(option(value,value));$(id).value=value}
@@ -103,12 +103,11 @@ async function loadDataset(id){
 }
 async function build(){
  if(jsonDirty)throw Error('请先应用或还原 JSON 草稿');validFields();syncRuntime();
- const value=await post('/native-scene-config',{physical_model_id:modelId,deployment:deployment(),requests:experiment?.requests||[],migrations:experiment?.migrations||[],runtime_network:runtime});
+ const value=await post('/native-scene-config',{physical_model_id:modelId,deployment:deployment(),requests:experiment?.requests||[],migrations:experiment?.migrations||[],runtime_network:runtime,routing:routingConfig(),cell_selection:$('cellSelection').value});
  experiment=value;reflectConfig();$('legacyNotice').hidden=true;$('build').textContent='重新生成 GPU 部署';$('status').textContent='GPU 部署已生成，可添加请求或编辑高级配置。';
 }
 $('build').onclick=()=>perform(build);
-for(const id of deploymentFields)$(id).oninput=()=>{if(['model','hardware','gpus'].includes(id))refreshChoices();if(id==='hardware')hardwareDefaults();deploymentValidity();engineLabels();needsBuild=true;validatedSignature='';state()};
-document.querySelectorAll('input[name=communication]').forEach(input=>input.onchange=()=>{if(mode()!=='v1_runtime'){document.querySelector('input[name=communication][value=v1_runtime]').checked=true;alert('V1.0 不提供此旧执行模式；已恢复 V1.0 Runtime Comm。');return;}if(experiment){experiment.communication??={};writeJson()}});
+for(const id of deploymentFields)$(id).oninput=()=>{if(['model','hardware','gpus'].includes(id))refreshChoices();if(id==='hardware')hardwareDefaults();deploymentValidity();needsBuild=true;validatedSignature='';state()};
 $('addRequest').onclick=()=>{const owners=new Set(experiment.ground_owners),device=experiment.physical.devices.find(d=>owners.has(d.satellite));let i=1;while(experiment.requests.some(r=>r.id==='request-'+i))i++;experiment.requests.push({id:'request-'+i,arrival_ns:0,user_device:device.id,input_tokens:32,output_tokens:4,input_bytes:128,output_bytes_per_token:4,cell:null});requestPage=Math.floor((experiment.requests.length-1)/requestPageSize);renderRequests();writeJson()};
 $('failurePolicy').onchange=$('retryCount').oninput=$('faultList').oninput=()=>{try{syncRuntime();writeJson();$('status').textContent=''}catch(e){$('status').textContent='故障列表 JSON：'+e.message}};
 document.addEventListener('modelchange',()=>{if(experiment){experiment.runtime_network=runtime;writeJson()}});

@@ -1,8 +1,27 @@
 # Astermind 星鉴前端 · V1.0 适配
 
+场景的 `routing.policy` 支持 `min_hops`（默认）、`min_propagation`，
+以及启动仿真前由可信 Python 代码注册的自定义策略名称。前端不执行输入的代码。
+自定义策略需在执行仿真的进程中注册，接口见 `astermind/engine/COMMUNICATION.md`。
+路由更新由引擎根据物理采样与拓扑事件管理，没有更新周期配置项。
+物理路由对比只显示当前路径、跳数、累计距离，不预测消息完成时间。
+Cell 调度默认 `cell_selection: "least_loaded"`：按已分配且仍在上传／计算的请求数排序，
+同负载时选累计路径距离更近的 Cell；也可选 `nearest`，按距离优先、负载次之。
+这两种策略只读取 Cell 负载，不扫描活跃链路流量，不估计传输耗时。
+显式选择 `estimated_arrival` 才在 Cell 调度时读取当前链路竞争，并在相同 Cell 负载下
+按上传估计耗时排序。该估计冻结当前竞争状态，不预测未来流量、切换或真实完成时刻。
+其开销单列为 `cell_estimate_wall_s` 与 `cell_estimate_context_wall_s`，不计入路由开销。
+
+开发时仍在 WSL Linux 的 OS 环境启动。后端快照以 Git HEAD 为基础，叠加
+`astermind/`、`workloads/`、`examples/` 中已追踪文件的未提交修改；不自动提交。
+未修改的依赖数据保留 Git 原始字节。修改后必须重启服务和新建运行；已启动的
+进程不会热切换代码。`/health` 返回 `commit`、`source_fingerprint`、
+`backend_modified` 和修改文件的 SHA-256；`python viz/verify_frontend.py`
+会核对运行中快照与当前工作区一致，并检查变更不超出本轮批准文件清单。
+
 完整场景与计算 Cell 前端位于同一个 `viz` 目录、使用同一个 HTTP 服务。
 保留原界面的布局、页面与编辑流程；执行适配使用当前分支的 AsterMind V1 后端。
-本次恢复没有修改 `viz` 外的源文件，没有提交或推送。
+前端恢复之后，本轮路由优化修改了已批准的后端和验证文件；没有提交或推送。
 
 ## 在 WSL / Linux / OS 启动
 
@@ -22,9 +41,9 @@ python -B -m viz
 
 本次验证基线为 `ae6ee46a93c3d61be8ed00303b0a990d540f6553`，分支 `v1.0-lyz-1`。
 `runtime_environment.py` 从当前 Git HEAD 导出 `astermind`、`workloads`、`examples`
-到 `viz/.runtime/sources/<commit>`。这份源码字节与提交一致，未修改算法。
-这样避免当前工作区换行转换导致 V1 内置数据校验不一致，同时不改动目录外文件。
-因此，未提交的后端源码改动不会被该入口加载；前端文件修改则直接生效。
+到 `viz/.runtime/sources/<commit>`；有已追踪的后端修改时，使用带工作区指纹的独立快照目录。
+未修改的文件仍使用 Git 原始字节，避免换行转换破坏内置数据校验。
+已追踪的未提交修改会叠加到快照；后端修改需重启服务，前端静态文件修改后刷新页面。
 
 所有 Python 执行来自 WSL 的 Conda OS。当前 OS 缺少的依赖只读复用本机已安装目录，
 搜索顺序见 `runtime_environment.py`；可用 `ASTERMIND_FRONTEND_DEPS` 指定依赖目录，

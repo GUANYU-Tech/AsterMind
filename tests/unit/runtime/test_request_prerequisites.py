@@ -3,6 +3,7 @@
 from pathlib import Path
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 from astermind.engine.simulation import Simulation
 from astermind.engine.timeline import GlobalTimeline
@@ -108,7 +109,7 @@ class PrerequisiteLifecycleTests(unittest.TestCase):
                 if callback:
                     cancelled.append(identity)
                     callback(SimpleNamespace(model_dump=lambda:dict(reason=reason)))
-        network = SimpleNamespace(route=lambda *args:dict(isolated_estimate_ns=0),
+        network = SimpleNamespace(route=lambda *args:dict(routing_distance_km=0),
                                   candidate_path=lambda *args:None, cancel=cancel)
         runtime.network = network
         def submit(identity, source, target, size, operation, correlation, done, fail):
@@ -193,6 +194,67 @@ class PrerequisiteLifecycleTests(unittest.TestCase):
                       runtime.state["context1"]["failure"]["message"])
         self.assertFalse(target.admissions or target.calls or runtime.cells["cellA"].calls)
         self.assertFalse(target.paused or runtime.cells["cellA"].paused)
+
+
+class CellSelectionTests(unittest.TestCase):
+    def runtime(self, policy='least_loaded'):
+        from astermind.engine.policies.scheduling import select_cell
+        cells = [SimpleNamespace(id=n, ingress_device=n, max_model_len=128) for n in ('near', 'far')]
+        network = Mock()
+        network.route.side_effect = lambda user, cell: dict(routing_distance_km=1 if cell == 'near' else 10)
+        network.estimate_transfer.side_effect = lambda user, cell, size, **kw: dict(
+            routing_distance_km=1 if cell == 'near' else 10,
+            estimated_transfer_ns=100 if cell == 'near' else 20)
+        runtime = SimpleNamespace(config=SimpleNamespace(cells=cells, cell_selection=policy),
+                                  network=network, state={}, _session_cells={},
+                                  _cell_configs={c.id: c for c in cells})
+        request = SimpleNamespace(id='r', cell=None, session_id=None, input_tokens=1,
+                                  output_tokens=1, input_bytes=100, user_device='user')
+        return runtime, request, lambda: select_cell(runtime, request).id
+
+    def test_default_load_then_distance_never_estimates(self):
+        runtime, request, choose = self.runtime()
+        self.assertEqual(choose(), 'near')
+        runtime.state['busy'] = dict(cell='near', status='computing')
+        self.assertEqual(choose(), 'far')
+        runtime.state['busy']['status'] = 'completed'
+        self.assertEqual(choose(), 'near')
+        runtime.network.estimation_context.assert_not_called()
+        runtime.network.estimate_transfer.assert_not_called()
+
+    def test_nearest_never_estimates_even_when_near_cell_busy(self):
+        runtime, request, choose = self.runtime('nearest')
+        runtime.state['busy'] = dict(cell='near', status='input')
+        self.assertEqual(choose(), 'near')
+        runtime.network.estimation_context.assert_not_called()
+        runtime.network.estimate_transfer.assert_not_called()
+
+    def test_smart_selection_shares_one_context_across_candidates(self):
+        runtime, request, choose = self.runtime('estimated_arrival')
+        self.assertEqual(choose(), 'far')
+        runtime.network.estimation_context.assert_called_once_with()
+        self.assertEqual(runtime.network.estimate_transfer.call_count, 2)
+        context = runtime.network.estimation_context.return_value
+        for call in runtime.network.estimate_transfer.call_args_list:
+            self.assertIs(call.kwargs['context'], context)
+            self.assertEqual(call.args[2], request.input_bytes)
+
+    def test_explicit_cell_and_session_affinity_are_retained(self):
+        runtime, request, choose = self.runtime()
+        request.cell = 'far'
+        self.assertEqual(choose(), 'far')
+        request.cell = None
+        request.session_id = 'session'
+        runtime._session_cells['session'] = 'far'
+        self.assertEqual(choose(), 'far')
+
+    def test_invalid_selection_is_rejected_and_default_is_load_only(self):
+        raw = PrerequisiteConfigTests().scenario()
+        raw.pop('cell_selection', None)
+        self.assertEqual(SimulationConfig.model_validate(raw).cell_selection, 'least_loaded')
+        raw['cell_selection'] = 'unknown'
+        with self.assertRaises(ValueError):
+            SimulationConfig.model_validate(raw)
 
 
 class TraceClockTests(unittest.TestCase):

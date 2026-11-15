@@ -13,6 +13,9 @@ from astermind.engine.cell_bridge import CellTransferEvent
 
 class DeviceRuntimeHost(_EventEngine):
     def __init__(self, topology, config, physical=None):
+        from astermind.engine.policies.routing import get_routing_policy
+        routing_policy = getattr(getattr(config, 'routing', None), 'policy', 'min_hops')
+        get_routing_policy(routing_policy)
         timeline_mode="orbitserve"
         network = DeviceNetworkState(
             topology,
@@ -25,7 +28,7 @@ class DeviceRuntimeHost(_EventEngine):
         network.timeline_mode = timeline_mode
         spec = SimpleNamespace(
             network=network.spec,
-            routing_policy="earliest_arrival",
+            routing_policy=routing_policy,
             time_horizon_s=Time.from_ns(config.horizon_ns),
         )
         environment = SimpleNamespace(
@@ -150,20 +153,59 @@ class DeviceCommunicationRuntime(RuntimeCellNetwork):
         return self.topology.physical_path(path)
 
     def route(self, source, target, size_bytes=0):
-        self.communication_policy._refresh()._publish_forecast()
-        a, b = self.resolve_pair(source, target)
-        arrival, path = self.host.net.transfer(a, b, self.host.now, size_bytes)
-        nodes = (a, *(leg["target_node_id"] for leg in path))
-        return {
-            "path": self.map_path(nodes),
-            "isolated_estimate_ns": (arrival - self.host.now) * 1e9,
-        }
+        return self.communication_policy.route(source, target, size_bytes)
+
+    def estimation_context(self):
+        """One observed competition snapshot per opt-in Cell selection."""
+        from time import perf_counter
+        runtime = self.communication_policy
+        runtime._refresh()
+        started = perf_counter()
+        try:
+            return {'demands': {key: dict(flow['budget']['demand']) for key, flow in runtime.active.items()},
+                    'capacities': dict(runtime.capacities), 'time_s': self.host.now,
+                    'routes': runtime.routes}
+        finally:
+            runtime.stats['cell_estimate_context_calls'] += 1
+            runtime.stats['cell_estimate_context_wall_s'] += perf_counter() - started
+
+    def estimate_transfer(self, source, target, size_bytes, *, context=None):
+        """Explicit Cell scheduling heuristic, never actual completion timing."""
+        from math import ceil
+        from time import perf_counter
+        from astermind.engine.comm.path_budget import isolated_path_ns, path_budget
+
+        runtime = self.communication_policy
+        route = runtime.route(source, target, size_bytes)
+        routes = runtime.routes
+        started = perf_counter()
+        try:
+            if context is not None and (context['time_s'] != self.host.now or context['routes'] is not routes):
+                raise ValueError('Cell estimation context is no longer current')
+            same = len({routes.topology.devices[n].satellite for n in route['path']}) == 1
+            if same:
+                estimate = ceil(route['latency_ns'] + 8 * size_bytes / route['bandwidth_gbps'])
+            elif context is not None and size_bytes:
+                budget = path_budget(routes, route, size_bytes, runtime.policy)
+                candidate = object()
+                demands = {**context['demands'], candidate: budget['demand']}
+                rate = runtime.allocator.rates(demands, context['capacities'])[candidate]
+                estimate = ceil(budget['startup'] + size_bytes / rate + budget['tail']) if rate > 0 else float('inf')
+            else:
+                estimate = isolated_path_ns(routes, route, size_bytes, runtime.policy, capacities=runtime.capacities)
+            return {**route, 'estimated_transfer_ns': estimate}
+        finally:
+            runtime.stats['cell_estimate_calls'] += 1
+            runtime.stats['cell_estimate_wall_s'] += perf_counter() - started
 
     def snapshot(self):
         return {
             "backend": "runtime_comm",
             "timeline_authority": "integer_ticks",
             "clock_s": self.host.now, "clock_ticks": str(self.host.now.ticks), "clock": CLOCK,
+            "routing": {"policy": self.host.spec.routing_policy,
+                        "refresh": "physical_samples_and_observed_topology_events",
+                        **self.host.net.path_route_cache_info()},
             "transport": {"allocator": self.communication_policy.allocator.provenance,
                           "semantics": "whole_path_external_resources",
                           "intra_competition": False},

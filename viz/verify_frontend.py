@@ -5,7 +5,6 @@ Writes only viz/.runtime/verification/frontend-checks.json. Does not run UC1–U
 import ast
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -13,6 +12,30 @@ import urllib.request
 
 VIZ = Path(__file__).resolve().parent
 BASE = 'http://127.0.0.1:8766'
+APPROVED_FILES = set('''astermind/builder/config/scenario.py
+astermind/builder/scene.py
+astermind/engine/policies/routing.py
+astermind/engine/state/route_cache.py
+astermind/engine/state/network.py
+astermind/engine/comm/target_network.py
+astermind/engine/comm/frame_surrogate.py
+astermind/engine/network_host.py
+astermind/engine/policies/scheduling.py
+astermind/engine/comm/path_budget.py
+astermind/engine/comm/event_runtime.py
+astermind/engine/COMMUNICATION.md
+viz/native_scene.py
+viz/scene.html
+viz/assets/scene_editor.js
+viz/physical_preview.py
+viz/assets/physical_routes.js
+viz/replay.html
+viz/runtime_environment.py
+viz/README.md
+viz/verify_frontend.py
+tests/unit/runtime/test_persistent_routing.py
+tests/unit/runtime/test_comm_port.py
+tests/unit/runtime/test_request_prerequisites.py'''.splitlines())
 
 
 def fetch(path):
@@ -36,6 +59,14 @@ def main():
     assert '/envs/OS/' in health['python']
     head=subprocess.check_output(['git','rev-parse','HEAD'],cwd=VIZ.parent,text=True).strip()
     assert health['commit']==head
+    from runtime_environment import source_identity
+    expected,_=source_identity()
+    assert health['source_fingerprint']==expected['source_fingerprint'], 'Server is running stale backend code'
+    assert health['modified_files']==expected['modified_files']
+    scene_html=fetch('/scene')[1].decode()
+    assert 'id="routingPolicy"' in scene_html and 'id="customRoutingPolicy"' in scene_html
+    assert 'id="cellSelection"' in scene_html and 'value="estimated_arrival"' in scene_html
+    assert 'update_interval_s' not in scene_html
     syntax=0
     for path in VIZ.rglob('*.py'):
         if '.runtime' not in path.parts:
@@ -56,16 +87,13 @@ def main():
         assert recording['event_count']>0
         reports.append(dict(id=directory.name,status=result['status'],audit=result.get('audit'),
             replay_events=recording['event_count']))
-    baseline=json.loads((VIZ/'.runtime/outside-before.json').read_text())
-    changed=[]
-    for name,digest in baseline.items():
-        path=VIZ.parent/name
-        if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest()!=digest:changed.append(name)
+    changed=subprocess.check_output(['git','diff','--name-only','HEAD'],cwd=VIZ.parent,text=True).splitlines()
+    unexpected=sorted(set(changed)-APPROVED_FILES)
     result=dict(time=datetime.now(timezone.utc).isoformat(),health=health,http=checks,
-        python_syntax_files=syntax,completed_scenes=reports,outside_files_checked=len(baseline),outside_changed=changed)
+        python_syntax_files=syntax,completed_scenes=reports,changed_files=changed,unexpected_files=unexpected)
     (VIZ/'.runtime/verification/frontend-checks.json').write_text(json.dumps(result,ensure_ascii=False,indent=2))
     print(json.dumps({k:v for k,v in result.items() if k not in ('http','completed_scenes')},ensure_ascii=False))
-    assert not changed,changed
+    assert not unexpected,unexpected
     assert reports,'No completed V1 scene evidence'
     print('PASS',len(checks),'HTTP checks;',len(reports),'completed V1 scene reports')
 

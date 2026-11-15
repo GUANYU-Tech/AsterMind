@@ -40,7 +40,9 @@ class RuntimeCommunication(CommunicationRouting):
         self.closed=False;self.routes=None;self.frame_deadline=None
         self.delivery_paths={};self.used_ids=set()
         self.stats=dict(peak_active_flows=0,max_path_links=0,rate_allocations=0,
-            allocation_wall_s=0.,route_wall_s=0.,retries=0,discarded_application_bytes=0.)
+            allocation_wall_s=0.,route_wall_s=0.,retries=0,discarded_application_bytes=0.,
+            cell_estimate_calls=0,cell_estimate_wall_s=0.,
+            cell_estimate_context_calls=0,cell_estimate_context_wall_s=0.)
 
     @property
     def now_ns(self):return self.loop.now_s.ticks/10**9
@@ -159,6 +161,12 @@ class RuntimeCommunication(CommunicationRouting):
 
     def network_changed(self):
         self._settle();routes=self._refresh(force=True)
+        # Updating path validity never rewrites an in-flight attempt. Only
+        # actual lost resources below trigger retry; capacity changes rebalance.
+        host = getattr(self.network, 'host', None)
+        cache = getattr(host.net, '_path_route_cache', None) if host is not None else None
+        if cache is not None:
+            cache.synchronize(host.net, host.now)
         for f in tuple(self.flows.values()):
             if f['task'] not in self.tasks:continue
             if f['state']=='waiting':self._attempt(f);continue

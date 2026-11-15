@@ -1,9 +1,7 @@
-"""Expose the retained device network to Comm without selecting another route.
+"""Project cached topology paths into Comm's physical resource descriptions.
 
-The original transfer(commit=False) query remains authoritative, including its
-cache and future-contact lookup. Comm can only admit that path when every edge
-is currently available. Gate nodes are collapsed to their public device IDs;
-terminal capacity is a shared pool, not a second bandwidth supply.
+Path selection never forecasts traffic. Comm owns capacity competition,
+protocol budgets, progress, retries and completion events.
 """
 from types import SimpleNamespace
 
@@ -79,64 +77,38 @@ class TargetRoutes(FrameRoutes):
     def __init__(self, network, frame):
         super().__init__(frame)
         self.network = network
+        self.routing_policy = network.host.spec.routing_policy
         for edge in self.edges.values():
             edge['shared_pool_coefficients'] = {
                 pool: 1.0 for pool in edge['shared_pools'] if pool.startswith('device:')
             }
 
-    def _publish_forecast(self):
-        # Retain the route solver's observed-contender inputs. Whole-path Comm
-        # replaces the active transport, but does not replace route selection.
-        net = self.network.host.net
-        net.shared_load, net.shared_pool_load = {}, {}
-        active = self.network.communication_policy.active
-        topology = self.network.topology
-        for flow in active.values():
-            for resource in flow['budget']['demand']:
-                if resource[0] == 'pool':
-                    pool = resource[1]
-                    if pool.startswith('device:'):
-                        identity = pool[len('device:'):]
-                        a, b = topology.ingress[identity], topology.egress[identity]
-                        edge = net._pairs[tuple(sorted((a, b)))]
-                        key = (edge['link_id'], a, b)
-                        net.shared_load[key] = net.shared_load.get(key, 0) + 1
-                    continue
-                edge = self.edges.get(resource)
-                if edge is None:
-                    continue
-                a, b = edge['attributes']['target_native_direction']
-                key = (resource[0], a, b)
-                net.shared_load[key] = net.shared_load.get(key, 0) + 1
-                for pool in net.pools_for_hop(a, b):
-                    net.shared_pool_load[pool] = net.shared_pool_load.get(pool, 0) + 1
-
     def route(self, source, target, size, *, first_hop=None):
         if type(size) is not int or size < 0:
             raise ValueError('payload must be nonnegative integer bytes')
-        self._publish_forecast()
         a, b = self.network.resolve_pair(source, target)
         try:
-            _, legs = self.network.host.net.transfer(a, b, self.network.host.now, size)
+            selected = self.network.host.net.select_route(a, b, self.network.host.now, self.routing_policy)
         except NetworkUnavailable as error:
             raise NoRouteError(str(error)) from error
         topology = self.network.topology
-        path = tuple(topology.physical_path((a, *(leg['target_node_id'] for leg in legs))))
+        path = tuple(topology.physical_path(selected.nodes))
         if first_hop is not None and (len(path) < 2 or path[1] != first_hop):
             raise ValueError('first_hop would change the retained routing policy')
         keys = []
-        for leg in legs:
-            src = topology.node_device[leg['source_node_id']]
-            dst = topology.node_device[leg['target_node_id']]
+        for link_id, first, second in selected.hops:
+            src = topology.node_device[first]
+            dst = topology.node_device[second]
             if src == dst:
                 continue
-            key = (leg['link_id'], src, dst)
+            key = (link_id, src, dst)
             if key not in self.edges:
                 raise NoRouteError('selected path is not simultaneously available')
             keys.append(key)
         result = self._result(path, tuple(keys), size)
-        result['target_route_legs'] = tuple((leg['link_id'], leg['source_node_id'],
-                                          leg['target_node_id']) for leg in legs)
+        result['target_route_legs'] = selected.hops
+        result['routing_cost'] = selected.cost
+        result['routing_distance_km'] = selected.distance_km
         return result
 
     def route_resources(self, route):

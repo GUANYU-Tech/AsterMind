@@ -1,22 +1,22 @@
 const $=id=>document.getElementById(id),runId=location.pathname.split('/')[2];
 const data=window.networkReplayState().data;
-const labels={min_hops:'最少跳数',min_propagation:'最小传播时延',earliest_arrival:'最早到达'};
-const reasons={route_endpoint_or_time_unavailable:'已到场景终点，无后续传输时间',no_feasible_dynamic_route:'当前约束下无可完成路径；可调整数据量或允许等待'};
+const labels={min_hops:'最少跳数',min_propagation:'最短累计传播距离'};
+const reasons={route_endpoint_or_time_unavailable:'已到场景终点，无后续传输时间',no_current_route:'当前拓扑无可用路径'};
 let enabled=false,busy=false,response=null,selectedPolicy='min_hops',lastTime=null,revision=0,failedKey=null;
 const routeCache=new Map();
-function request(){const snapshot=window.physicalSnapshot();return {run_id:runId,time_s:snapshot.time_s,source:$('routeSource').value.trim(),target:$('routeTarget').value.trim(),payload_bytes:Number($('routeBytes').value),allow_wait:$('routeWait').checked}}
+function request(){const snapshot=window.physicalSnapshot();return {run_id:runId,time_s:snapshot.time_s,source:$('routeSource').value.trim(),target:$('routeTarget').value.trim()}}
 function key(payload){return JSON.stringify(payload)}
-function valid(){const p=request();return data.network.nodes.some(n=>n.node_id===p.source)&&data.network.nodes.some(n=>n.node_id===p.target)&&Number.isFinite(p.payload_bytes)&&p.payload_bytes>=0&&p.payload_bytes<=1e12}
+function valid(){const p=request();return data.network.nodes.some(n=>n.node_id===p.source)&&data.network.nodes.some(n=>n.node_id===p.target)}
 function current(){return enabled&&response?.queryKey===key(request())}
 window.physicalRouteActive=()=>enabled;
 window.interactivePhysicalRoute=()=>current()?{...response.routes.find(r=>r.policy===selectedPolicy),probe_revision:revision}:null;
 function render(){const table=$('routeComparison');table.replaceChildren();if(!current())return;
  for(const r of response.routes){const tr=document.createElement('tr'),radio=document.createElement('input');radio.type='radio';radio.name='physicalPolicy';radio.checked=r.policy===selectedPolicy;radio.setAttribute('aria-label','高亮'+labels[r.policy]);radio.onchange=()=>{selectedPolicy=r.policy;revision++;render();window.redrawPhysical()};
  const td=document.createElement('td');td.append(radio);tr.append(td);const pathNodes=[r.source,...r.path.map(l=>l.target_node_id)],nodes=r.completed?(pathNodes.length>5?[...pathNodes.slice(0,2),'…',pathNodes.at(-1)]:pathNodes).join(' → '):(reasons[r.reason]||r.reason);
- for(const text of [labels[r.policy],r.completed?r.hops:'—',...['latency_s','propagation_s','serialization_s','wait_s'].map(k=>r.completed?(r[k]*1000).toFixed(3):'—'),nodes]){const cell=document.createElement('td');cell.textContent=text;tr.append(cell)}
+ for(const text of [labels[r.policy],r.completed?r.hops:'—',r.completed?r.distance_km.toFixed(3):'—',nodes]){const cell=document.createElement('td');cell.textContent=text;tr.append(cell)}
  tr.title=r.completed?pathNodes.join(' → '):r.reason;tr.style.background=r.policy===selectedPolicy?'#263d55':'';tr.style.cursor='pointer';tr.onclick=()=>{selectedPolicy=r.policy;revision++;render();window.showPhysicalDetails(r);window.redrawPhysical()};table.append(tr)}
 }
-function useCached(payload){const queryKey=key(payload),cached=response?.queryKey===queryKey?response:routeCache.get(queryKey);if(!cached)return false;const changed=response!==cached;response=cached;if(changed)revision++;$('routeQueryStatus').textContent=`${payload.time_s} s · ${payload.payload_bytes.toLocaleString()} B · ${payload.allow_wait?'允许等待可用链路':'不等待新接触'} · 黄色仅标出可达的所选预测路径`;render();if(changed)window.redrawPhysical();return true}
+function useCached(payload){const queryKey=key(payload),cached=response?.queryKey===queryKey?response:routeCache.get(queryKey);if(!cached)return false;const changed=response!==cached;response=cached;if(changed)revision++;$('routeQueryStatus').textContent=`${payload.time_s} s · 当前拓扑 · 黄色为所选路径；不预测消息传输时间`;render();if(changed)window.redrawPhysical();return true}
 async function query(payload){if(busy)return;const queryKey=key(payload);busy=true;render();$('routeQueryStatus').textContent=`正在${payload.time_s===request().time_s?'比较':'预取'} ${payload.time_s} s 的路径…`;try{const result=await fetch('/physical-route',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}),value=await result.json();if(!result.ok)throw Error(value.error||'路径查询失败');routeCache.set(queryKey,{...value,queryKey});while(routeCache.size>8)routeCache.delete(routeCache.keys().next().value);failedKey=null;
  }catch(error){failedKey=queryKey;$('routeQueryStatus').textContent=error.message}
  finally{busy=false;if(enabled&&valid())compare()}
@@ -25,9 +25,9 @@ function compare(){if(!enabled||!valid())return;const payload=request();if(useCa
 window.physicalRouteCanAdvance=time=>!enabled||!valid()||routeCache.has(key({...request(),time_s:time}))||failedKey===key({...request(),time_s:time});
 window.preparePhysicalRoute=time=>{if(!enabled||!valid())return;compare();if(current()&&!busy){const payload={...request(),time_s:time};if(!routeCache.has(key(payload))&&failedKey!==key(payload))query(payload)}};
 window.onPhysicalFrame=frame=>{if(lastTime!==frame.time_s){lastTime=frame.time_s;render();if(enabled)compare()}};
-$('compareRoutes').onclick=()=>{if(!valid()){$('routeQueryStatus').textContent='请选择此模型内的节点，并填写 0–1 TB 的探测字节数';return}enabled=true;failedKey=null;compare()};
+$('compareRoutes').onclick=()=>{if(!valid()){$('routeQueryStatus').textContent='请选择此模型内的起点和终点';return}enabled=true;failedKey=null;compare()};
 $('probe').addEventListener('input',()=>{enabled=false;render();window.redrawPhysical()});
-for(const id of ['routeSource','routeTarget','routeBytes','routeWait'])$(id).addEventListener('change',()=>{failedKey=null;render();window.redrawPhysical();if(enabled)compare()});
+for(const id of ['routeSource','routeTarget'])$(id).addEventListener('change',()=>{failedKey=null;render();window.redrawPhysical();if(enabled)compare()});
 $('swapRoute').onclick=()=>{const a=$('routeSource').value;$('routeSource').value=$('routeTarget').value;$('routeTarget').value=a;render();window.redrawPhysical();if(enabled)compare()};
 for(const n of data.network.nodes){const option=document.createElement('option');option.value=n.node_id;option.label=n.role+(n.cell_id?' · '+n.cell_id:'');$('physicalNodes').append(option)}
 const nodes=data.network.nodes;
@@ -50,7 +50,7 @@ window.onPhysicalFrame=frame=>{previousFrame(frame);if(frame.time_s===linkTime)r
 linkSelect.onchange=()=>{if(linkSelect.value)window.inspectNetworkLink(linkSelect.value)};
 if(data.provenance?.transport_execution==='not_run_geometry_and_independent_route_probes_only'){
  $('runtimeViewLink').hidden=true;document.querySelector('h1').textContent='Astermind 星鉴 · 物理场景演示';document.title='Astermind 星鉴 · 物理场景演示';
- document.querySelector('footer').textContent=`几何采样间隔 ${data.time.step_s} s。按存储时间片播放，片内保持位置和几何属性；容量调度保留精确边界。此页只展示物理环境和独立路由预测，未执行 Serving 或流量后端。`;
+ document.querySelector('footer').textContent=`几何采样间隔 ${data.time.step_s} s。按存储时间片播放，片内保持位置和几何属性；容量调度保留精确边界。此页只展示物理环境和路径查询，未执行 Serving 或流量后端。`;
  const edit=document.createElement('a');edit.textContent='返回物理配置';edit.style.color='#8bd8ff';edit.href='/physical';document.querySelector('nav').append(edit);
  fetch(`/runs/${runId}/status`).then(r=>r.json()).then(job=>{if(job.physical_model_id)edit.href='/physical?id='+encodeURIComponent(job.physical_model_id)}).catch(()=>{});
 }

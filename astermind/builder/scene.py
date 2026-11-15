@@ -9,7 +9,8 @@ from astermind.builder.config.deployment import SceneDeployment
 
 
 def build_scene(
-    dataset, deployment, *, requests=(), migrations=(), runtime_network=None
+    dataset, deployment, *, requests=(), migrations=(), runtime_network=None, routing=None,
+    cell_selection='least_loaded'
 ):
     from astermind.builder.physical.physical_dataset import load_dataset
     from astermind.engine import NetworkSpec, candidate_links
@@ -159,6 +160,8 @@ def build_scene(
         migrations=list(migrations),
         compute_mode=deployment.compute_mode,
         communication=deployment.communication,
+        routing=routing or {},
+        cell_selection=cell_selection,
         horizon_ns=round(concrete["time"]["duration_s"] * 1e9),
         runtime_network=runtime_network or {},
     )

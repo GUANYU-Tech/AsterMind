@@ -5,6 +5,7 @@ from dataclasses import replace
 
 from astermind.engine import NetworkState, NetworkUnavailable
 from tests.unit.runtime.test_dynamic_network import network
+from unittest.mock import patch
 
 
 def diamond(*, contact_end=20.0, extra=False):
@@ -145,3 +146,73 @@ class PersistentRoutingTests(unittest.TestCase):
         self.assertAlmostEqual(state.transfer("a", "b", 0.0, 100.0, commit=True)[0], 0.2)
         self.assertAlmostEqual(state.transfer("b", "a", 0.0, 100.0, commit=True)[0], 0.1)
         self.assertEqual(state.route_cache_info()["searches"], 2)
+
+
+class TopologyRoutingTests(unittest.TestCase):
+    def test_hit_never_forecasts_or_reads_traffic(self):
+        state = diamond()
+        first = state.select_route('a', 'd', 0)
+        with patch.object(state, '_edge_transfer', side_effect=AssertionError('transfer forecast')):
+            state.shared_load = {'irrelevant': 12000}
+            for _ in range(1000):
+                self.assertIs(state.select_route('a', 'd', 0), first)
+        self.assertEqual(state.path_route_cache_info()['searches'], 1)
+        self.assertEqual(state.path_route_cache_info()['hits'], 1000)
+
+    def test_two_policies_choose_topology_and_distance_only(self):
+        state = network((('a','d',0.,20.),('a','b',0.,20.),('b','d',0.,20.)))
+        state.distance = lambda edge, at: 100 if {edge['endpoint_a'],edge['endpoint_b']} == {'a','d'} else 10
+        self.assertEqual(state.select_route('a','d',0,'min_hops').nodes, ('a','d'))
+        chosen = state.select_route('a','d',0,'min_propagation')
+        self.assertEqual(chosen.nodes, ('a','b','d'))
+        self.assertEqual(chosen.distance_km, 20)
+
+    def test_negative_cache_and_contact_opening(self):
+        state = network((('a','b',5.,20.),))
+        for _ in range(20):
+            with self.assertRaises(NetworkUnavailable):
+                state.select_route('a','b',0)
+        self.assertEqual(state.path_route_cache_info()['searches'], 1)
+        self.assertEqual(state.select_route('a','b',5).nodes, ('a','b'))
+
+    def test_link_loss_uses_alternative_but_unrelated_change_keeps_path(self):
+        state = diamond(contact_end=5, extra=True)
+        first = state.select_route('a','c',0)
+        self.assertEqual(state.select_route('a','d',0).nodes, ('a','b','d'))
+        self.assertIs(state.select_route('a','c',5), first)
+        self.assertEqual(state.select_route('a','d',5).nodes, ('a','c','d'))
+
+    def test_positive_capacity_change_does_not_reselect(self):
+        state = network(bandwidth=8000., schedule=((5.,.5),))
+        first = state.select_route('a','b',0)
+        self.assertIs(state.select_route('a','b',5), first)
+
+    def test_physical_sample_refreshes_distance_choice(self):
+        original = diamond()
+        original.trace.ephemeris_samples = tuple(
+            {'satellite_id':n,'time_s':t,'position_itrs_km':(7010. if n=='b' and t>=5 else 7000.,0,0)}
+            for t in (0.,5.,20.) for n in 'abcd')
+        state = NetworkState(original.trace, original.spec)
+        self.assertEqual(state.select_route('a','d',0,'min_propagation').nodes, ('a','b','d'))
+        self.assertEqual(state.select_route('a','d',5,'min_propagation').nodes, ('a','c','d'))
+
+    def test_custom_policy_contract_and_unknown_policy(self):
+        from astermind.engine.policies.routing import register_routing_policy
+        state = diamond()
+        name = 'unit-custom-path'
+        with patch.dict('astermind.engine.policies.routing._ROUTING_POLICIES'):
+            register_routing_policy(name, lambda graph, a, b: (a,'c',b))
+            self.assertEqual(state.select_route('a','d',0,name).nodes, ('a','c','d'))
+            register_routing_policy('unit-bad-path', lambda graph,a,b: (a,b,a,b))
+            with self.assertRaises(ValueError):
+                state.select_route('a','d',0,'unit-bad-path')
+            with self.assertRaises(ValueError):
+                state.select_route('a','d',0,'not-registered')
+
+    def test_fork_does_not_mutate_parent_table(self):
+        state = diamond()
+        first = state.select_route('a','d',0)
+        child = state.fork()
+        child.select_route('a','c',0)
+        self.assertIs(state.select_route('a','d',0), first)
+        self.assertEqual(state.path_route_cache_info()['searches'],1)
