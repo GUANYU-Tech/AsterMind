@@ -16,6 +16,16 @@ class TargetNetworkFrames:
         self.host = network.host
         self.horizon = self.host.end
 
+    def state_version(self):
+        """Identity of the observed graph; faults replace it even at one tick.
+
+        Link/sample notifications read a complete precomputed state at host.now.
+        They do not apply individual mutations, so equal time/version pairs
+        describe the same supply even when many link notifications are queued.
+        """
+        net = self.host.net
+        return net.revision, id(net.edges), id(net.link_frames)
+
     def frame_at(self, time_s):
         host, topology = self.host, self.network.topology
         if time_s != host.now:
