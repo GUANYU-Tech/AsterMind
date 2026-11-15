@@ -18,6 +18,31 @@ if (!document.querySelector('[data-studio-theme]')) {
   document.body.prepend(...shell.childNodes);
 }
 
+// Enhance both server-rendered and fallback shells with the reference navigation.
+const sidebar = document.querySelector('.studio-sidebar');
+if (sidebar && !sidebar.querySelector('.studio-nav-hint')) {
+  const hint = document.createElement('p');
+  hint.className = 'studio-nav-hint'; hint.textContent = '沿步骤完成';
+  sidebar.querySelector('.studio-nav-label')?.after(hint);
+  const foot = sidebar.querySelector('.studio-sidefoot');
+  if (foot) {
+    foot.replaceChildren();
+    for (const [href, text, icon] of [['/assets/guide.html', '技术文档', 'docs-icon'], ['/', '返回仿真工作区', 'back-icon']]) {
+      const link = document.createElement('a'); link.href = href;
+      link.className = icon === 'docs-icon' ? 'docs-link' : 'back-link';
+      const mark = document.createElement('span'); mark.className = icon; mark.setAttribute('aria-hidden', 'true');
+      if (icon === 'back-icon') mark.textContent = '←';
+      link.append(mark, document.createTextNode(text)); foot.append(link);
+    }
+  }
+}
+const main = document.querySelector('main');
+if (main && !document.querySelector('.skip-nav')) {
+  main.id ||= 'main-content';
+  const skip = document.createElement('a'); skip.className = 'skip-nav'; skip.href = '#' + main.id; skip.textContent = '跳至主内容';
+  document.body.prepend(skip);
+}
+
 // Keep ordinary workspace navigation in its current browser tab, including
 // dynamically rendered task links. Modified clicks retain browser behavior.
 document.addEventListener('click', event => {

@@ -2,7 +2,7 @@ import * as THREE from "three";
 import { OrbitControls } from "./vendor/OrbitControls.js?v=compact-2";
 import { sceneData } from "./scene-data.mjs?v=compact-2";
 
-import { formationDisplay, orbitDisplay, focusedViewDistance } from "./scene-geometry.mjs?v=scale-3";
+import { formationDisplay, orbitDisplay, focusedViewDistance, contextualGlobeView } from "./scene-geometry.mjs?v=scale-3";
 
 const TAU = Math.PI * 2;
 const DEG = Math.PI / 180;
@@ -578,8 +578,8 @@ export class AsterMindScene {
     this.callbacks = callbacks;
     this.clock = new THREE.Clock();
     this.scene = new THREE.Scene();
-    this.scene.background = new THREE.Color(0x101413);
-    this.scene.fog = new THREE.FogExp2(0x101413, 0.014);
+    this.scene.background = new THREE.Color(0x111111);
+    this.scene.fog = new THREE.FogExp2(0x111111, 0.014);
 
     this.camera = new THREE.PerspectiveCamera(42, 1, 0.05, 80);
     this.camera.position.copy(HOME_CAMERA_POSITION);
@@ -899,7 +899,9 @@ export class AsterMindScene {
   }
 
   prepareConfigAnchor(cluster) {
-    this.configViewRadial.copy(this.camera.position).normalize();
+    this.configViewRadial.copy(cluster ? this.camera.position : HOME_CAMERA_POSITION).normalize();
+    // The entry artwork is static; entering the live editor uses the same Asia-facing orientation.
+    if (!cluster) this.earthSpin.rotation.y = this.earthBaseRotation;
     const view = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0,0,1), this.configViewRadial);
     const group = this.clusterGroups.find(item => item.userData.data === cluster);
     const screen = group ? group.position.clone().normalize().applyQuaternion(view.clone().invert()) : new THREE.Vector3(.9,.4,0);
@@ -1232,6 +1234,7 @@ export class AsterMindScene {
         }
       : this.getCameraTarget(stage);
     this.stage = stage;
+    this.stars.visible = stage === "home";
     this.transitionStart = performance.now();
     this.transitionDuration = preserveConfigView
       ? 220
@@ -1324,7 +1327,13 @@ export class AsterMindScene {
     const world = this.satellites.map(satellite => satellite.getWorldPosition(new THREE.Vector3()));
     const target = world.reduce((center,point)=>center.add(point), new THREE.Vector3()).divideScalar(world.length || 1);
     const points = world.map(point=>point.clone().sub(target).applyQuaternion(inverse).toArray());
-    const distance = focusedViewDistance(points, this.camera.aspect, this.camera.fov);
+    let distance = focusedViewDistance(points, this.camera.aspect, this.camera.fov);
+    if (sceneState.geometrySource === "formation") {
+      const context = contextualGlobeView(this.camera.aspect, this.camera.fov);
+      const view = inverse.clone().invert();
+      target.set(context.offsetX, context.offsetY, 0).applyQuaternion(view);
+      distance = context.distance;
+    }
     this.camera.far = Math.max(80, distance * 6);
     this.camera.position.copy(target).addScaledVector(direction,distance);
     this.controls.target.copy(target);

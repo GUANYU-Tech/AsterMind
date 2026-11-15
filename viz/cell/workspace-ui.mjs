@@ -23,8 +23,12 @@ export function buildWorkspace() {
     const close = action("×", null, "panel-close icon-button"); close.dataset.action = "home"; close.setAttribute("aria-label", "关闭配置"); header.append(heading, close);
     const scroll = element("div", undefined, "panel-scroll");
     for (const [index, [title]] of groups[name].entries()) {
-      const section = element("details", undefined, "editor-section"); section.dataset.group = `${name}-${index}`; section.open = index < 2;
+      const section = element("details", undefined, "editor-section"); section.dataset.group = `${name}-${index}`; section.open = index < 2 || title === "FlowSim";
       section.append(element("summary", title)); const fields = element("fieldset", undefined, "basic-fields"); fields.id = `form-${name}-${index}`; section.append(fields); scroll.append(section);
+      if (name === "network" && title === "FlowSim") {
+        const note = element("p", "当前 V1 使用 Runtime Comm。旧 FlowSim ACK 与 ECMP 固定种子不参与仿真；启用 ACK 或设置非零种子会被运行校验拒绝。", "unsupported-note");
+        section.insertBefore(note, fields);
+      }
       if (name === "formation" && index === 1) {
         const tle = element("div", undefined, "tle-input"); tle.id = "tle-input";
         const status = element("p", "", "upload-status"); status.id = "tle-upload-status";
@@ -32,7 +36,7 @@ export function buildWorkspace() {
       }
     }
     if (name === "formation") {
-      const details = element("details", undefined, "editor-section"); details.open = false; details.append(element("summary", "硬件档案")); const profile = element("div", undefined, "hardware-profile"); profile.id = "hardware-profile"; details.append(profile); scroll.append(details);
+      const details = element("details", undefined, "editor-section"); details.open = true; details.append(element("summary", "硬件档案")); const profile = element("div", undefined, "hardware-profile"); profile.id = "hardware-profile"; details.append(profile); scroll.append(details);
     }
     if (name === "network") {
       const links = element("p", "", "upload-status"); links.id = "link-selection";
@@ -53,7 +57,7 @@ export function buildWorkspace() {
     }
     const footer = element("div", undefined, `panel-actions${i === 0 ? " panel-actions-single" : ""}`);
     if (i) { const back = action("← 上一步", null, "back-action"); back.dataset.stageTarget = stages[i - 1]; footer.append(back); }
-    const next = action("", i === 4 ? "run-simulation" : null, "primary-action"); next.append(element("span", i === 4 ? "发布任务" : stageNames[i + 1]), element("span", "→")); if (i !== 4) next.dataset.stageTarget = stages[i + 1]; footer.append(next);
+    const next = action("", i === 4 ? "run-simulation" : null, "primary-action"); next.append(element("span", i === 4 ? "发布任务" : `进入${stageNames[i + 1]}`)); if (i !== 4) next.dataset.stageTarget = stages[i + 1]; footer.append(next);
     panel.append(header, scroll, footer); shell.append(panel);
   });
 }

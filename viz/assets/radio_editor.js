@@ -46,14 +46,14 @@ function renderLinkDefaults(card,shell,changed){
 
 export function renderRadio(fields, card, shell, profiles, changed) {
   fillMissingGeneration(shell,profiles);
-  const panel=document.createElement('section');panel.className='card';panel.style.gridColumn='1 / -1';
-  fields.append(panel);card=panel;fields=document.createElement('div');fields.className='fields';panel.append(fields);
+  const panel=document.createElement('section');panel.className='radio-panel';
+  card.append(panel);card=panel;fields=document.createElement('div');fields.className='fields radio-profile-fields';panel.append(fields);
   const select=field(fields,shell,'radio_profile','通信卫星硬件代际','text',[
     ['', '自定义工程模型'], ...Object.entries(profiles).map(([id,p])=>[id,p.generation+(id==='starlink_v3_design_160_20261021'?' · 规格页 160 Gbps UL':'')])]);
   select.addEventListener('change',()=>{applyGeneration(shell,select.value,profiles);changed()});
   const profile=profiles[shell.radio_profile];
   if (!profile) return;
-  const reset=document.createElement('button');reset.textContent='重填本代际的全部通信参数';reset.onclick=()=>{applyGeneration(shell,shell.radio_profile,profiles);changed()};card.append(reset);
+  const reset=document.createElement('button');reset.className='radio-reset';reset.textContent='重填本代际的全部通信参数';reset.onclick=()=>{applyGeneration(shell,shell.radio_profile,profiles);changed()};fields.append(reset);
   const info=document.createElement('p'), t=profile.terminals;
   info.textContent=`已公布设备：${t.optical_count} 个光口，标称 ${t.optical_advertised_bps/1e9} Gbps/口（单双向未明确）；${t.rf_feeder_antennas} 副 RF 网关天线；用户波束下行 ${t.user_downlink_beams} / 上行 ${t.user_uplink_beams}。星座构型保持独立。`;
   card.append(info);
@@ -69,11 +69,11 @@ export function renderRadio(fields, card, shell, profiles, changed) {
     else shell.optical_terminal_bandwidth_bps=Number(cap.value)*1e9;
     if(optical?.bandwidth_bps===previous&&cap.value!==''){
       optical.bandwidth_bps=shell.optical_terminal_bandwidth_bps;
-      const input=card.querySelector('[aria-label="通信卫星↔通信卫星（ISL） · 每方向上限 Gbps"]');if(input)input.value=cap.value;
+      const input=card.querySelector('[aria-label="通信卫星↔通信卫星（ISL） · 每方向上限 Gbps"]');if(input){input.value=cap.value;input.dispatchEvent(new Event('design-value-change'))}
     }
     if(optical?.islsim_config?.rx.terminal_cap_gbps===previous/1e9&&cap.value!==''){
       optical.islsim_config.rx.terminal_cap_gbps=shell.optical_terminal_bandwidth_bps/1e9;
-      const input=card.querySelector('[aria-label="ISLSim · 终端总速率上限 Gbps（留空为不限）"]');if(input)input.value=cap.value;
+      const input=card.querySelector('[aria-label="ISLSim · 终端总速率上限 Gbps（留空为不限）"]');if(input){input.value=cap.value;input.dispatchEvent(new Event('design-value-change'))}
     }
     document.dispatchEvent(new Event('modelchange'));
   };

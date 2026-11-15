@@ -3,18 +3,30 @@ import {initISLSim,renderISLSim} from '/assets/islsim_editor.js';
 import {initTleImporter} from '/assets/tle_importer.js';
 import {sourceFields,quotaFields,preferenceOptions,inferredScenario,applyScenario} from '/assets/network_options.js';
 import {get,post,field,group,tabs} from '/assets/studio_common.js';
+import {enhancePhysicalFields} from '/assets/design-controls.js';
 const $=id=>document.getElementById(id);let config,defaultShell,defaultCell,radioProfiles,scenarioCache={};tabs('data-tab');
+for (const [containerId, buttonId] of [['shells','addShell'],['cells','addCell'],['grounds','addGround']]) {
+  const heading = $(containerId).previousElementSibling;
+  if (heading?.tagName !== 'H2') continue;
+  const row = document.createElement('div'); row.className = 'physical-section-heading';
+  heading.before(row); row.append(heading, $(buttonId));
+  $(buttonId).setAttribute('aria-label', $(buttonId).textContent); $(buttonId).textContent = '+';
+}
+$('json').closest('details').open = true;
+$('json').closest('details').classList.add('physical-json');
 function stripRuntime(){for(const key of ['transport_model','faults','random_faults','fault_timing','failure_policy','max_transfer_retries'])delete config.network[key]}
-function removeButton(card,action){const b=document.createElement('button');b.textContent='删除';b.onclick=()=>{action();render()};card.append(b)}
+function removeButton(card,action){const b=document.createElement('button');b.textContent='−';b.className='group-remove';b.setAttribute('aria-label','删除'+(card.querySelector('h3')?.textContent||'此项'));b.title=b.getAttribute('aria-label');b.onclick=()=>{action();render()};card.append(b)}
 function render(){defaultShell??=structuredClone(config.constellations.communication_shells[0]||defaultShell);defaultCell??=structuredClone(config.constellations.compute_formations[0]||defaultCell);stripRuntime();for(const g of config.ground_ingresses){g.terminal_count??=1;g.altitude_km??=0}for(const id of ['time','shells','cells','grounds','access','connections','budgets'])$(id).replaceChildren();
 for(const[path,label,type]of [['epoch_utc','历元 UTC','text'],['duration_s','实验时长 s','number'],['step_s','几何时间片间隔 s','number']])field($('time'),config,'time.'+path,label,type);
 config.constellations.communication_shells.forEach((shell,i)=>{
-const {card,fields}=group($('shells'),'通信壳层 '+(i+1));renderRadio(fields,card,shell,radioProfiles,render);field(fields,shell,'shell_id','壳层 ID','text');
+const {card,fields}=group($('shells'),'通信壳层 '+(i+1));field(fields,shell,'shell_id','壳层 ID','text');
 sourceFields(fields,card,shell,false,render,sync);
 field(fields,shell,'topology','星间拓扑预设','text',[['grid','Grid / 4 邻接'],['honeycomb','Honeycomb / 3 邻接']]);
 shell.topology_repair??='none';field(fields,shell,'topology_repair','缺位处理','text',[['none','baseline · 缺位留空'],['ronchetti_intra_orbit','method1 · Ronchetti 同轨缺口修补']]);
-for(const[k,label,type]of [['isl_terminals','ISL 终端数','number'],['sgl_terminals','每星地面关联总上限','number'],['wrap_planes','轨道面首尾相接','checkbox'],['wrap_slots','轨内闭环','checkbox']])field(fields,shell,k,label,type);
-quotaFields(fields,shell);removeButton(card,()=>config.constellations.communication_shells.splice(i,1))});
+for(const[k,label]of [['isl_terminals','ISL 终端数'],['sgl_terminals','每星地面关联总上限']])field(fields,shell,k,label);
+quotaFields(fields,shell);
+for(const[k,label]of [['wrap_planes','轨道面首尾相接'],['wrap_slots','轨内闭环']])field(fields,shell,k,label,'checkbox');
+renderRadio(fields,card,shell,radioProfiles,render);removeButton(card,()=>config.constellations.communication_shells.splice(i,1))});
 config.constellations.compute_formations.forEach((cell,i)=>{
 const{card,fields}=group($('cells'),'计算编队 '+(i+1));field(fields,cell,'name','编队 ID','text');sourceFields(fields,card,cell,true,render,sync);
 for(const[k,label,type]of [['satellites_per_cluster','每 cell 卫星数','number'],['grid_shape','初始尺寸，例如 5x2','text'],['formation_pitch_m','成员间距 m','number'],['d_keepout_m','安全间距 m','number'],['sigma_navigation_m','导航误差 σ m','number'],['sigma_control_m','控制误差 σ m','number']])field(fields,cell,'cluster.'+k,label,type);
@@ -29,7 +41,7 @@ const handoverNote=document.createElement('p');handoverNote.textContent='适用�
 field($('access'),config,'network.ground_access_policy','地面侧候选偏好','text',preferenceOptions);config.network.ground_matching??='greedy';config.network.satellite_access_policy??='nearest_distance';field($('access'),config,'network.ground_matching','双端关联算法','text',[['greedy','全局偏好排序 · 双端配额约束'],['deferred_acceptance','双向偏好 · 地面提议 / 卫星择优']]);field($('access'),config,'network.satellite_access_policy','卫星侧候选偏好（双向匹配生效）','text',preferenceOptions);const role=document.createElement('label');role.textContent='允许计算 cell 直接接地面';const check=document.createElement('input');check.type='checkbox';check.checked=config.network.ground_roles?.includes('compute');check.disabled=inferredScenario(config)==='compute_only';check.onchange=()=>{config.network.ground_roles=check.checked?['communication','compute']:['communication'];sync()};role.append(check);$('access').append(role);
 field($('connections'),config,'network.inter_cell_links','允许 cell 间直接连接','checkbox');
 for(const[k,label]of [['communication_isl','通信星间'],['cross_layer','计算—通信'],['cell_isl','cell 内部'],['sgl','星地']]){const p=config.network.link_profiles[k];if(!p)continue;const{fields}=group($('budgets'),label);for(const[key,text]of [['setup_time_s','建链时间 s'],['bandwidth_bps','每方向终端速率上限 bps'],['max_distance_km','最大距离 km']])field(fields,p,key,text);if(k!=='sgl')renderISLSim(fields,p,render);if(p.capacity_model==='optical_photon_budget'){for(const[key,text]of [['transmit_power_w','发射功率 W'],['transmit_aperture_m','发射孔径 m'],['receive_aperture_m','接收孔径 m'],['wavelength_m','波长 m'],['required_photons_per_bit','接收光子/bit'],['pointing_loss_db','指向损耗 dB']])field(fields,p,key,text)}else if(p.capacity_model==='free_space_shannon'){for(const[key,text]of [['frequency_hz','频率 Hz'],['channel_bandwidth_hz','信道带宽 Hz'],['transmit_power_w','发射功率 W'],['transmit_gain_db','发射增益 dB'],['receive_gain_db','接收增益 dB'],['noise_temperature_k','噪声温度 K'],['system_loss_db','系统损耗 dB']])field(fields,p,key,text)}field(fields,p,'sun_exclusion_angle_deg','太阳避让角 °')}
-sync()}
+enhancePhysicalFields(document.querySelector('.physical-page'));sync()}
 function sync(){stripRuntime();config.scenario_type=inferredScenario(config);$('scenarioType').value=config.scenario_type;$('next').disabled=config.scenario_type==='communication_only';$('scenarioNote').textContent=config.scenario_type==='communication_only'?'纯通信场景请使用物理演示与路由诊断；当前 LLM Runtime 需要计算节点。':'可保存物理模型、演示拓扑，或进入完整 Serving / Runtime 场景。';$('json').value=JSON.stringify(config,null,2);let comm=0,compute=0;for(const c of config.constellations.communication_shells)comm+=c.source.type!=='tle'?c.source.planes*c.source.satellites_per_plane:(c.source.tle_text||'').split('\n').filter(x=>x.startsWith('1 ')).length;for(const c of config.constellations.compute_formations)compute+=c.source.type==='tle'?(c.source.tle_text||'').split('\n').filter(x=>x.startsWith('1 ')).length:c.source.planes*c.source.clusters_per_plane*c.cluster.satellites_per_cluster;$('count').textContent=comm+' 颗通信卫星 · '+compute+' 颗计算卫星 · '+config.ground_ingresses.length+' 个地面站'}
 document.addEventListener('modelchange',sync);
 $('scenarioType').onchange=()=>{scenarioCache.shells??=defaultShell?[structuredClone(defaultShell)]:[];scenarioCache.cells??=defaultCell?[structuredClone(defaultCell)]:[];applyScenario(config,$('scenarioType').value,scenarioCache);render()};

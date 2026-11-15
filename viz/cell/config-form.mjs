@@ -1,6 +1,7 @@
 import { fieldStage, hardwareForPool, visibleField } from "./config-layout.mjs?v=compact-2";
 import { labels, optionLabels } from "./config-labels.mjs?v=compact-2";
 import { fieldError } from "./config-validation.mjs?v=validation-1";
+import { enhanceSelects } from "../assets/design-controls.js";
 
 export function setAt(root, path, value) {
   if (path.some(key => ["__proto__", "prototype", "constructor"].includes(String(key)))) throw new Error("非法字段名");
@@ -32,6 +33,7 @@ export function renderConfigForm(container, root, keys, schema, onChange, choice
   const button = (text, action, cls = "small-action") => { const n = el("button", text, cls); n.type = "button"; n.addEventListener("click", action); return n; };
   function validation(input, wrap, path, spec, read) {
     const id=JSON.stringify(path), saved=choices.drafts?.get(id);
+    const originalPlaceholder = input.getAttribute('placeholder') || '';
     if(saved) input.value=saved.raw;
     const note=el('small', '', 'field-validation');
     note.id=`error-${path.join('-')}`; note.setAttribute('aria-live','polite');
@@ -40,6 +42,9 @@ export function renderConfigForm(container, root, keys, schema, onChange, choice
       const message=(input.type==='number' && input.value==='') ? '请输入数值' : fieldError(read(),path,root,spec,defs);
       input.setCustomValidity(message); input.setAttribute('aria-invalid',String(!!message));
       note.textContent=message; note.hidden=!message;
+      const emptyNumber = input.type === 'number' && input.value === '';
+      note.classList.toggle('input-placeholder-error', emptyNumber);
+      if (input.type === 'number') input.placeholder = emptyNumber ? message : originalPlaceholder;
       if(!message) wrap.classList?.remove('field-error');
       if(remember) {
         if(message) choices.drafts?.set(id,{raw:input.value,error:message});
@@ -134,6 +139,7 @@ export function renderConfigForm(container, root, keys, schema, onChange, choice
     }
     if (spec.type === "object" || (value !== null && typeof value === "object" && !Array.isArray(value))) {
       wrap.className += " field-container";
+      if (full === "flowsim.acknowledgement") wrap.classList.add("ack-settings");
       const group = el("fieldset", undefined, "field-group");
       if (depth > 0 && typeof key !== "number" && key !== "formation" && !(path[0] === "scheduler" && path.length === 2)) group.append(el("legend", title));
       if (path[1] === "worker_pools" && typeof key === "number") group.append(el("div", `卡型号　${optionLabels[hardwareForPool(root, value.name)] || hardwareForPool(root, value.name)}`, "pool-hardware field-wide"));
@@ -175,13 +181,15 @@ export function renderConfigForm(container, root, keys, schema, onChange, choice
         }); return wrap;
       }
       wrap.className += " field-container";
+      if (full === "topology.inter_satellite.links") wrap.classList.add("link-collection");
       wrap.append(el("div", `${title} · ${value.length}`, "field-title"));
       value.forEach((item, index) => {
         const row = el("details", undefined, "repeat-item"); row.open = true; row.dataset.detailPath = JSON.stringify([...path, index]);
         const desc = item?.name || item?.operation || (item?.worker_pool ? `${item.worker_pool} · PP${item.parallel_coordinate.pp} / TP${item.parallel_coordinate.tp}` : item?.satellite_id ? `${item.satellite_id} / 卡 ${item.local_index}` : item?.source ? `${item.source} → ${item.target}` : `第 ${index + 1} 项`);
         row.append(el("summary", desc));
         const rendered = field(spec.prefixItems?.[index] || spec.items || {}, [...path, index], depth + 1); if (rendered) row.append(rendered);
-        if (!spec.prefixItems && full !== "deployment.placements") row.append(button("删除此项", () => {
+        if (!spec.prefixItems && full !== "deployment.placements") {
+          const remove = button("删除此项", () => {
           for(const [id,draft] of [...(choices.drafts || [])]) {
             const parts=JSON.parse(id);
             if(path.every((k,i)=>parts[i]===k) && typeof parts[path.length]==='number' && parts[path.length]>=index) {
@@ -190,10 +198,17 @@ export function renderConfigForm(container, root, keys, schema, onChange, choice
             }
           }
           value.splice(index, 1); rerender(path);
-        }));
+          });
+          if (full === "topology.inter_satellite.links") { remove.textContent = '−'; remove.classList.add('link-remove'); remove.setAttribute('aria-label', `删除链路 ${desc}`); remove.title = `删除链路 ${desc}`; }
+          row.append(remove);
+        }
         wrap.append(row);
       });
-      if (!spec.prefixItems && full !== "deployment.placements") wrap.append(button(`添加${title}`, () => { value.push(choices.seed?.([...path, value.length], spec.items) ?? defaultValue(spec.items, defs)); rerender(path); }));
+      if (!spec.prefixItems && full !== "deployment.placements") {
+        const add = button(`添加${title}`, () => { value.push(choices.seed?.([...path, value.length], spec.items) ?? defaultValue(spec.items, defs)); rerender(path); });
+        if (full === "topology.inter_satellite.links") { add.textContent = '+'; add.classList.add('link-add'); add.setAttribute('aria-label', `添加${title}`); add.title = `添加${title}`; }
+        wrap.append(add);
+      }
       return wrap;
     }
     // Choice callbacks share this object with field options (e.g. `seed`).
@@ -231,8 +246,16 @@ export function renderConfigForm(container, root, keys, schema, onChange, choice
       const formationCount=key==='satellite_count' && root.topology?.source==='formation';
       const min=formationCount ? 2 : spec.minimum ?? 1, max=formationCount ? 35 : spec.maximum ?? Infinity;
       if(formationCount) { input.min=min; input.max=max; }
-      const step=delta=>{ const current=Number(input.value); input.value=Math.max(min,Math.min(max,(Number.isSafeInteger(current)?current:value)+delta)); commit(); };
-      stepper.append(button("−",()=>step(-1),"stepper-button"),input,button("＋",()=>step(1),"stepper-button")); wrap.append(stepper);
+      const slider = el("input"); slider.type = "range"; slider.min = min;
+      // The slider is a convenience range; the numeric input retains the schema's full bounds.
+      slider.max = Number.isFinite(max) ? max : Math.max(64, Number(value));
+      slider.step = "1"; slider.value = value; slider.setAttribute("aria-label", `${title}滑块`);
+      const paint = () => slider.style.setProperty("--range-progress", `${(Number(slider.value)-Number(slider.min))/(Number(slider.max)-Number(slider.min))*100}%`);
+      paint();
+      slider.addEventListener("input", () => { input.value = slider.value; paint(); });
+      slider.addEventListener("change", commit);
+      input.addEventListener("input", () => { if (input.checkValidity()) { slider.max = Math.max(Number(slider.max),Number(input.value)); slider.value = input.value; paint(); } });
+      stepper.append(input, slider); wrap.append(stepper);
     } else if (["spacing_km", "altitude_km"].includes(key)) {
       wrap.className += " field-wide range-field";
       label.textContent = key === "spacing_km" ? "编队距离" : "轨道高度";
@@ -254,19 +277,21 @@ export function renderConfigForm(container, root, keys, schema, onChange, choice
       }
       wrap.append(modes);
     } else if (key === "layout") {
-      wrap.className += " field-wide formation-field"; label.textContent = "编队构型"; label.removeAttribute("for");
-      const optionsNode = el("div", undefined, "formation-options formation-options-two");
-      for (const option of ["ring", "chain"]) {
-        const choice = button("", () => { input.value = option; commit(); }, `formation-option${value === option ? " is-selected" : ""}`);
-        choice.setAttribute("aria-pressed", String(value === option));
-        const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg"); svg.setAttribute("viewBox", "0 0 64 42"); svg.setAttribute("aria-hidden", "true");
-        const edge = document.createElementNS(svg.namespaceURI, option === "ring" ? "polygon" : "path"); edge.setAttribute(option === "ring" ? "points" : "d", option === "ring" ? "18,7 46,7 46,35 18,35" : "M8 21h48"); svg.append(edge);
-        for (const [x, y] of option === "ring" ? [[18,7],[46,7],[46,35],[18,35]] : [[8,21],[24,21],[40,21],[56,21]]) {
-          const dot = document.createElementNS(svg.namespaceURI,"circle"); dot.setAttribute("cx",x); dot.setAttribute("cy",y); dot.setAttribute("r",3); svg.append(dot);
-        }
-        choice.append(svg, el("span", option === "ring" ? "环形" : "链式")); optionsNode.append(choice);
+      wrap.className += " field-wide formation-field"; label.textContent = "编队构型";
+      for (const option of input.options) option.textContent = option.value === "chain" ? "链式编队" : option.value === "ring" ? "环形编队" : option.textContent;
+      wrap.append(input);
+    } else if (input.type === "checkbox") {
+      const modes = el("div", undefined, "boolean-modes");
+      modes.setAttribute("role", "group"); modes.setAttribute("aria-label", title);
+      input.classList.add("segmented-source"); input.tabIndex = -1; input.setAttribute("aria-hidden", "true");
+      for (const [checked, text] of [[true,"开启"],[false,"关闭"]]) {
+        const choice = button(text, () => {
+          input.checked = checked; commit();
+          for (const item of modes.querySelectorAll("button")) item.setAttribute("aria-pressed", String(item === choice));
+        }, "boolean-mode");
+        choice.setAttribute("aria-pressed", String(input.checked === checked)); modes.append(choice);
       }
-      wrap.append(optionsNode);
+      wrap.append(input, modes);
     } else {
       const unit = title.match(/ \/ (?!含时区)(.+)$/)?.[1];
       if (unit && input.type === "number") { label.textContent = title.split(" / ")[0]; const row = el("div", undefined, "input-value"); row.append(input, el("span", unit, "field-unit")); wrap.append(row); }
@@ -277,6 +302,7 @@ export function renderConfigForm(container, root, keys, schema, onChange, choice
     return wrap;
   }
   container.replaceChildren(...keys.flatMap(key => expand(String(key).split("."))).map(path => field(schemaAt(path), path)).filter(Boolean));
+  enhanceSelects(container);
 }
 
 export function parseConfiguration(text) {
