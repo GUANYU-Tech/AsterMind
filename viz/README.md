@@ -91,5 +91,5 @@ V1 通信事件描述整条路径共享资源，回放显示路径与真实开�
 不会伪造旧 FlowSim 的逐跳排队、到达及重传时间。旧逐跳传输索引不能等价复用。
 交互断链/恢复仍受 V1 终端占用、链路获取和时间边界约束，拒绝时显示真实原因。
 
-文件来源见 `migration-manifest.json`；逐文件职责见 `FILE_CHANGES.md`。
-验证证据与边界检查保存在 `viz/.runtime/verification/`；恢复结论见 `RESTORATION.md`。
+本地迁移清单与历史验收报告不纳入版本控制。
+验证证据与边界检查保存在 `viz/.runtime/verification/`，不随源码分发。

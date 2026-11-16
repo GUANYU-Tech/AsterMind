@@ -26,6 +26,39 @@ __pycache__/
 # Personal network console and visual diagnostics (not distributed).
 /local/
 
+# Local documents and temporary workspaces (case variants included).
+# Root anchors preserve the immutable engine snapshot's source inventory.
+/[Dd][Oo][Cc]/
+/[Dd][Oo][Cc][Ss]/
+/[Tt][Ee][Mm][Pp]/
+/[Tt][Mm][Pp]/
+/[Oo][Uu][Tt][Pp][Uu][Tt]/
+/reports/
+/artifacts/
+
+# Historical local acceptance reports and migration inventories.
+/viz/FILE_CHANGES.md
+/viz/RESTORATION.md
+/viz/migration-manifest.json
+/tests/V1_VALIDATION.md
+
+# Editor backups, temporary files and desktop metadata.
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+.mypy_cache/
+.tox/
+.nox/
+node_modules/
+
 # Local third-party checkouts and their workstation-only build adapter.
 # Keep these on disk, but do not commit or force-add them.
 /third_party/

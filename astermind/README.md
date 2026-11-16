@@ -111,4 +111,5 @@ forecast can be more conservative than whole-path execution near deadlines.
 Hardware prediction accuracy is separate from integration correctness.
 
 `viz/` is unchanged. New reports are raw-only; historical report export is tested.
-See `../tests/README.md` and `../tests/V1_VALIDATION.md` for commands and evidence.
+See `../tests/README.md` for the current test commands and validation requirements.
+Historical acceptance reports are local-only and are not distributed with source.
