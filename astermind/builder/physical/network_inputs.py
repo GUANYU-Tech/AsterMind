@@ -260,6 +260,9 @@ def materialize_network_input(manifest, base_dir="."):
             sources[-1].update(formation_motion='observed_per_member_sgp4_no_synthetic_offsets', keepout_m=keepout)
             continue
         hubs, layout = source_rows(formation["source"], name, True)
+        motion = cluster.get('motion_model', 'free_sgp4')
+        if motion not in {'free_sgp4', 'reference_fixed_lvlh'}:
+            raise ValueError('motion_model must be free_sgp4 or reference_fixed_lvlh')
         shape = cluster.get("grid_shape", f"{count}x1").lower().split("x")
         if (
             len(shape) != 2
@@ -284,6 +287,24 @@ def materialize_network_input(manifest, base_dir="."):
             )
         if cluster.get("formation_frame", "lvlh") != "lvlh":
             raise ValueError("formation_frame must be lvlh")
+        offsets = cluster.get('member_offsets_m')
+        if motion == 'reference_fixed_lvlh':
+            if offsets is None:
+                raise ValueError('reference_fixed_lvlh requires member_offsets_m')
+            if not isinstance(offsets, list) or len(offsets) != count:
+                raise ValueError('member_offsets_m must contain one vector per member in ID order')
+            if any(not isinstance(v, (list, tuple)) or len(v) != 3 or
+                   any(isinstance(x, bool) or not isinstance(x, (float, int)) or not math.isfinite(x) for x in v)
+                   for v in offsets):
+                raise ValueError('member_offsets_m requires finite three-component vectors in metres')
+            if type(cluster.get('reference_member', 0)) is not int or cluster.get('reference_member', 0) != 0 or any(offsets[0]):
+                raise ValueError('reference member must be member 0 with zero offset')
+            for i, a in enumerate(offsets):
+                for b in offsets[i+1:]:
+                    if math.dist(a, b) <= keepout:
+                        raise ValueError('member offsets must be distinct and exceed keepout')
+        elif offsets is not None:
+            raise ValueError('member_offsets_m requires reference_fixed_lvlh')
         for hub, (plane, slot) in zip(hubs, layout):
             cell = hub["satellite_id"]
             cell_topologies[cell] = formation.get("topology", "ring")
@@ -296,37 +317,41 @@ def materialize_network_input(manifest, base_dir="."):
                 row = deepcopy(hub)
                 along = ((member % columns) - (columns - 1) / 2) * pitch / 1000
                 across = ((member // columns) - (rows - 1) / 2) * pitch / 1000
-                if abs(math.sin(inclination)) < 1e-8 and abs(across) > 0:
-                    raise ValueError(
-                        "equatorial cross-track formation requires explicit member elements"
+                if motion == 'reference_fixed_lvlh':
+                    row['satellite_id'] = f'{cell}-m{member:03d}'
+                    row['fixed_lvlh_offset_km'] = [float(x) / 1000 for x in offsets[member]]
+                else:
+                    if abs(math.sin(inclination)) < 1e-8 and abs(across) > 0:
+                        raise ValueError(
+                            "equatorial cross-track formation requires explicit member elements"
+                        )
+                    di = across / radius * math.sin(u)
+                    draan = (
+                        -across / radius * math.cos(u) / math.sin(inclination)
+                        if across
+                        else 0.0
                     )
-                di = across / radius * math.sin(u)
-                draan = (
-                    -across / radius * math.cos(u) / math.sin(inclination)
-                    if across
-                    else 0.0
-                )
-                # Parallel relative eccentricity/inclination vectors keep
-                # radial separation when the cross-track separation vanishes.
-                # Compensate the eccentricity-induced along-track offset so
-                # the requested initial along/cross grid is preserved.
-                du = (along - 2 * across) / radius - math.cos(inclination) * draan
-                row["satellite_id"] = f"{cell}-m{member:03d}"
-                row["raan_deg"] = _wrap_degrees(hub["raan_deg"] + math.degrees(draan))
-                row["inclination_deg"] = hub["inclination_deg"] + math.degrees(di)
-                omega = math.radians(hub['argument_of_perigee_deg'])
-                if across:
-                    ex = hub['eccentricity'] * math.cos(omega) + di
-                    ey = hub['eccentricity'] * math.sin(omega) + math.sin(inclination) * draan
-                    row['eccentricity'] = math.hypot(ex, ey)
-                    omega = math.atan2(ey, ex)
-                    row['argument_of_perigee_deg'] = _wrap_degrees(math.degrees(omega))
-                row["mean_anomaly_deg"] = _wrap_degrees(hub['mean_anomaly_deg'] + hub['argument_of_perigee_deg']
-                                                       + math.degrees(du - omega))
-                if not 0 <= row['eccentricity'] < 1:
-                    raise ValueError('formation offsets exceed eccentricity limits')
-                if not 0 <= row["inclination_deg"] <= 180:
-                    raise ValueError("formation offsets exceed inclination limits")
+                    # Parallel relative eccentricity/inclination vectors keep
+                    # radial separation when the cross-track separation vanishes.
+                    # Compensate the eccentricity-induced along-track offset so
+                    # the requested initial along/cross grid is preserved.
+                    du = (along - 2 * across) / radius - math.cos(inclination) * draan
+                    row["satellite_id"] = f"{cell}-m{member:03d}"
+                    row["raan_deg"] = _wrap_degrees(hub["raan_deg"] + math.degrees(draan))
+                    row["inclination_deg"] = hub["inclination_deg"] + math.degrees(di)
+                    omega = math.radians(hub['argument_of_perigee_deg'])
+                    if across:
+                        ex = hub['eccentricity'] * math.cos(omega) + di
+                        ey = hub['eccentricity'] * math.sin(omega) + math.sin(inclination) * draan
+                        row['eccentricity'] = math.hypot(ex, ey)
+                        omega = math.atan2(ey, ex)
+                        row['argument_of_perigee_deg'] = _wrap_degrees(math.degrees(omega))
+                    row["mean_anomaly_deg"] = _wrap_degrees(hub['mean_anomaly_deg'] + hub['argument_of_perigee_deg']
+                                                           + math.degrees(du - omega))
+                    if not 0 <= row['eccentricity'] < 1:
+                        raise ValueError('formation offsets exceed eccentricity limits')
+                    if not 0 <= row["inclination_deg"] <= 180:
+                        raise ValueError("formation offsets exceed inclination limits")
                 elements.append(row)
                 if (
                     any(
@@ -368,6 +393,12 @@ def materialize_network_input(manifest, base_dir="."):
             keepout_m=keepout + 3 * uncertainty,
             uncertainty_model="three_sigma_clearance_margin_no_stochastic_displacement",
         )
+        if motion == 'reference_fixed_lvlh':
+            sources[-1].update(formation_motion='reference_sgp4_fixed_lvlh',
+                separation_design='prescribed_rigid_offsets_not_free_member_orbits',
+                separation_reference=None, reference_member=0,
+                member_offsets_m=deepcopy(offsets))
+            sources[-1].pop('initial_target_pitch_m', None)
     for station in result["ground_ingresses"]:
         nodes.append(
             dict(

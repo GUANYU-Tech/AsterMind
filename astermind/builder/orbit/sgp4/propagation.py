@@ -123,6 +123,7 @@ def propagate_sgp4_teme(
         element.satellite_id: _initialize_satellite(api, element)
         for element in bundle.satellites
     }
+    offsets = {e.satellite_id: e.fixed_lvlh_offset_km for e in bundle.satellites}
     start_jd, start_fr = _utc_to_julian(canonical_epoch)
     samples: list[Sgp4TemeSample] = []
     for time_s in canonical_times:
@@ -164,10 +165,31 @@ def propagate_sgp4_teme(
                     velocity_teme_km_s=canonical_velocity,
                 )
             )
+            if offsets[satellite_id] is not None:
+                import numpy as np
+                def displacement(r, v):
+                    radial = np.asarray(r) / np.linalg.norm(r)
+                    normal = np.cross(r, v); normal /= np.linalg.norm(normal)
+                    along = np.cross(normal, radial)
+                    return np.asarray(offsets[satellite_id]) @ np.stack((radial, along, normal))
+                delta = displacement(position, velocity)
+                # Velocity of the prescribed rotating offset, including reference-plane motion.
+                side = []
+                for dt in (-0.05, 0.05):
+                    ec, rp, vp = satrec.sgp4(jd, fr + dt / 86400.)
+                    if ec:
+                        raise Sgp4PropagationError(satellite_id=satellite_id, error_code=ec,
+                            error_message='fixed LVLH velocity stencil failed', time_s=time_s)
+                    side.append(displacement(rp, vp))
+                samples[-1] = Sgp4TemeSample(time_s, satellite_id,
+                    tuple(np.asarray(position) + delta),
+                    tuple(np.asarray(velocity) + (side[1] - side[0]) / 0.1))
     return Sgp4PropagationResult(
         element_set_id=bundle.element_set_id,
         simulation_epoch_utc=canonical_epoch,
         samples=tuple(samples),
+        algorithm_version=(SGP4_PROPAGATION_ALGORITHM_VERSION + '+fixed-lvlh-v1'
+            if any(v is not None for v in offsets.values()) else SGP4_PROPAGATION_ALGORITHM_VERSION),
     )
 
 
