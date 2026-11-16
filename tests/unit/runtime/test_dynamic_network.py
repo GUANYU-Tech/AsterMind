@@ -229,12 +229,15 @@ class DynamicNetworkTests(unittest.TestCase):
     def test_piecewise_capacity_is_integrated(self):
         state = network(bandwidth=16.0, schedule=((0.0, 0.5), (1.0, 1.0)))
         done, path = state.transfer("a", "b", 0, 3)
-        self.assertEqual(done, 2.0)
+        self.assertEqual(done, 3.0)  # Snapshot route score at the initial rate.
+        self.assertEqual(path[-1]['arrival_s'], 2.0)  # Feasibility integrates the schedule.
         self.assertEqual([s["bytes"] for s in path[0]["segments"]], [1.0, 2.0])
 
     def test_zero_capacity_pauses_and_resumes(self):
         state = network(schedule=((1.0, 0.0), (3.0, 1.0)))
-        self.assertEqual(state.transfer("a", "b", 0, 2)[0], 4.0)
+        score, path = state.transfer("a", "b", 0, 2)
+        self.assertEqual(score, 2.0)
+        self.assertEqual(path[-1]['arrival_s'], 4.0)
 
     def test_full_duplex_contention_preview_isolation_and_conservation(self):
         state = network()
@@ -251,7 +254,8 @@ class DynamicNetworkTests(unittest.TestCase):
             (("a", "b", 0, 1), ("b", "d", 0, 20), ("a", "c", 0, 20), ("c", "d", 0, 20))
         )
         done, path = state.transfer("a", "d", 0, 2)
-        self.assertEqual(done, 4.0)
+        self.assertEqual(done, 2.0)  # One serialization at the path bottleneck.
+        self.assertEqual(path[-1]['arrival_s'], 4.0)
         self.assertEqual([leg["target_node_id"] for leg in path], ["c", "d"])
 
     def test_range_changes_only_when_the_sampled_position_changes(self):
@@ -304,7 +308,8 @@ class DynamicNetworkTests(unittest.TestCase):
         )
         state = NetworkState(original.trace, original.spec)
         done, path = state.transfer("a", "b", 0.5, 100.0)
-        self.assertAlmostEqual(done, 1.75)
+        self.assertAlmostEqual(done, 2.5)  # Query-time bandwidth score.
+        self.assertAlmostEqual(path[-1]['arrival_s'], 1.75)
         self.assertAlmostEqual(sum(p["bytes"] for p in path[0]["segments"]), 100.0)
         self.assertEqual(
             [(p["start_s"], p["finish_s"]) for p in path[0]["segments"]],

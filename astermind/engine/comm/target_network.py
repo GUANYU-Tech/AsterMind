@@ -79,6 +79,7 @@ class TargetRoutes(FrameRoutes):
     def __init__(self, network, frame):
         super().__init__(frame)
         self.network = network
+        self.routing_policy = network.host.comm_policy.routing_policy
         for edge in self.edges.values():
             edge['shared_pool_coefficients'] = {
                 pool: 1.0 for pool in edge['shared_pools'] if pool.startswith('device:')
@@ -117,7 +118,8 @@ class TargetRoutes(FrameRoutes):
         self._publish_forecast()
         a, b = self.network.resolve_pair(source, target)
         try:
-            _, legs = self.network.host.net.transfer(a, b, self.network.host.now, size)
+            _, legs = self.network.host.net.transfer(
+                a, b, self.network.host.now, size, policy=self.routing_policy, commit=False)
         except NetworkUnavailable as error:
             raise NoRouteError(str(error)) from error
         topology = self.network.topology

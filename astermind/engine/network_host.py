@@ -25,7 +25,7 @@ class DeviceRuntimeHost(_EventEngine):
         network.timeline_mode = timeline_mode
         spec = SimpleNamespace(
             network=network.spec,
-            routing_policy="earliest_arrival",
+            routing_policy=config.communication.routing_policy,
             time_horizon_s=Time.from_ns(config.horizon_ns),
         )
         environment = SimpleNamespace(
@@ -152,7 +152,9 @@ class DeviceCommunicationRuntime(RuntimeCellNetwork):
     def route(self, source, target, size_bytes=0):
         self.communication_policy._refresh()._publish_forecast()
         a, b = self.resolve_pair(source, target)
-        arrival, path = self.host.net.transfer(a, b, self.host.now, size_bytes)
+        arrival, path = self.host.net.transfer(
+            a, b, self.host.now, size_bytes,
+            policy=self.host.comm_policy.routing_policy, commit=False)
         nodes = (a, *(leg["target_node_id"] for leg in path))
         return {
             "path": self.map_path(nodes),
