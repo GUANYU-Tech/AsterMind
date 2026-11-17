@@ -261,6 +261,8 @@ class NetworkState:
         result.windows = dict(self.windows)
         if hasattr(self, '_route_cache'):
             result._route_cache = self._route_cache.fork()
+        if hasattr(self, '_path_route_cache'):
+            result._path_route_cache = self._path_route_cache.fork()
         return result
 
     def observe_fault(self, index, fault, time_s, *, restored=False):
@@ -836,6 +838,16 @@ class NetworkState:
             if cursor <= start:
                 return None
         return None
+
+    def select_route(self, source, target, time_s, policy="min_hops", *, kinds=None, avoid_nodes=()):
+        """Return a reusable path without forecasting a transfer."""
+        from astermind.engine.policies.routing import select_route
+        return select_route(self, source, target, time_s, policy, kinds=kinds, avoid_nodes=avoid_nodes)
+
+    def path_route_cache_info(self):
+        from astermind.engine.state.route_cache import PathRouteCache
+        cache = getattr(self, '_path_route_cache', None)
+        return (cache if cache is not None else PathRouteCache()).info()
 
     def transfer(
         self,

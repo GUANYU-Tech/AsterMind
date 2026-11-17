@@ -23,7 +23,7 @@ class FrameRoutes:
 
     def __init__(self,frame):
         self.frame=frame
-        self.routing_policy="earliest_arrival"
+        self.routing_policy="min_hops"
         self.ground_owners={v.satellite_id for v in frame.node_states.values() if v.role=="ground"}
         self.topology=SimpleNamespace(devices={n:SimpleNamespace(kind=v.attributes["device_kind"],
             satellite=v.satellite_id) for n,v in frame.node_states.items()})
@@ -59,7 +59,6 @@ class FrameRoutes:
             bandwidth = min([bandwidth] + [c for c in switch_caps if c is not None])
         latency=sum(self.edges[k]["latency_ns"] for k in keys)
         return dict(path=list(path),resources=keys,latency_ns=latency,bandwidth_gbps=bandwidth,
-                    isolated_estimate_ns=latency+(0. if bandwidth==float("inf") else 8*size/bandwidth),
                     routing_policy=self.routing_policy)
 
 

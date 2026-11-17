@@ -62,8 +62,8 @@ new-mode frontend rendering is deliberately outside scope. Historical browser ch
 use `tests/browser/native_replay.cjs` with a suitable recorded fixture.
 
 Real ISLSim remains explicit: `ORBITSERVE_ISLSIM_ROOT=/path/to/ISLSim python -m
-unittest discover -s tests/external/islsim -v`. Historical validation records in
-`V1_VALIDATION.md` describe earlier commits and must not be read as current features.
+unittest discover -s tests/external/islsim -v`. Historical validation records are
+local-only and describe earlier commits; they must not be read as current features.
 
 WideEP fixtures disable per-allocation service dumps (`trace_service=false`) to
 avoid quadratic trace volume; operator/dependency/failure records and aggregate

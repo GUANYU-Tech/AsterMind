@@ -1,5 +1,6 @@
 """Real Comm allocator on the retained route/device graph, with analytic oracles."""
 import unittest
+from unittest.mock import patch
 
 from astermind.builder.config import SimulationConfig
 from astermind.engine.network_host import DeviceRuntimeHost, DeviceCommunicationRuntime
@@ -140,18 +141,72 @@ class CommPortTests(unittest.TestCase):
         host.run()
         self.assertEqual(done,[Time.from_ns(1010)])
 
-    def test_route_forecast_reads_current_external_contenders(self):
+    def test_route_does_not_forecast_current_external_contenders(self):
         host,network,comm=self.runtime()
         comm.submit_transfer('r','ag','bg',1000,lambda:None,self.fail)
         observed=[]
         def check():
-            network.route('ag','bg',1)
-            observed.append(dict(host.net.shared_load))
+            with patch.object(host.net,'_edge_transfer',side_effect=AssertionError('route forecast')):
+                route=network.route('ag','bg',1)
+                self.assertNotIn('isolated_estimate_ns',route)
+                observed.append(route['path'])
         host.timeline.schedule(Time.from_ns(50),2,'check',check)
         host.timeline.schedule(Time.from_ns(2000),2,'check',check)
         host.run()
-        self.assertTrue(observed[0]);self.assertTrue(all(n==1 for n in observed[0].values()))
-        self.assertFalse(observed[1])
+        self.assertEqual(observed[0],observed[1])
+        self.assertEqual(comm.stats['cell_estimate_calls'],0)
+        self.assertEqual(host.net.path_route_cache_info()['searches'],1)
+
+    def test_cell_estimate_is_explicit_and_accounted_separately(self):
+        host,network,comm=self.runtime()
+        for _ in range(10):
+            network.route('ag','bg',1000)
+        self.assertEqual(comm.stats['cell_estimate_calls'],0)
+        with patch('astermind.engine.comm.path_budget.resource_capacities',side_effect=AssertionError('global rescan')):
+            estimate=network.estimate_transfer('ag','bg',1000)
+        self.assertEqual(estimate['estimated_transfer_ns'],1010)
+        self.assertEqual(comm.stats['cell_estimate_calls'],1)
+        self.assertGreater(comm.stats['cell_estimate_wall_s'],0)
+        self.assertEqual(comm.stats['route_wall_s'],0)
+        self.assertEqual(host.net.path_route_cache_info()['searches'],1)
+
+    def test_routing_configuration_is_extensible_but_refresh_is_internal(self):
+        raw=scenario()
+        raw['routing']={'policy':'my-policy'}
+        config=SimulationConfig.model_validate(raw)
+        self.assertEqual(config.routing.policy,'my-policy')
+        with self.assertRaisesRegex(ValueError,'Unregistered routing policy'):
+            DeviceRuntimeHost(config.topology(),config)
+        raw['routing']['update_interval_s']=5
+        with self.assertRaises(ValueError):
+            SimulationConfig.model_validate(raw)
+
+    def test_optional_estimate_observes_competition_without_changing_execution(self):
+        from copy import deepcopy
+        host, network, comm = self.runtime()
+        done = []
+        comm.submit_transfer('background', 'ag', 'bg', 1000, lambda: done.append(host.now), self.fail)
+        observed = []
+        def check():
+            active, rates, generation = deepcopy(comm.active), dict(comm.rates), comm.generation
+            isolated = network.estimate_transfer('ag', 'bg', 1000)
+            context = network.estimation_context()
+            competing = network.estimate_transfer('ag', 'bg', 1000, context=context)
+            self.assertEqual(isolated['estimated_transfer_ns'], 1010)
+            self.assertEqual(competing['estimated_transfer_ns'], 2010)
+            self.assertEqual(comm.active, active)
+            self.assertEqual(comm.rates, rates)
+            self.assertEqual(comm.generation, generation)
+            observed.append(context)
+        host.timeline.schedule(Time.from_ns(50), 2, 'estimate', check)
+        def stale_context():
+            with self.assertRaisesRegex(ValueError, 'no longer current'):
+                network.estimate_transfer('ag', 'bg', 1000, context=observed[0])
+        host.timeline.schedule(Time.from_ns(60), 2, 'stale-estimate', stale_context)
+        host.run()
+        self.assertEqual(done, [Time.from_ns(1010)])
+        self.assertEqual(comm.stats['cell_estimate_calls'], 3)
+        self.assertEqual(comm.stats['cell_estimate_context_calls'], 1)
 
     def test_internal_link_fault_retries_then_recovers_with_one_terminal_event(self):
         from astermind.engine.device_controls import apply_device_command

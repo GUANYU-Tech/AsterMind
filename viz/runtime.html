@@ -1,0 +1,202 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>OrbitServe · Runtime 流量</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#0c1422;color:#e2ecfa;font:14px system-ui,sans-serif}main{max-width:1440px;margin:auto;padding:24px}h1{font-size:26px}h2{font-size:17px;margin-top:24px}p{color:#9fb5ce;line-height:1.7}nav,.controls,.metrics{display:flex;gap:14px;flex-wrap:wrap;align-items:center;margin:16px 0}a{color:#80cfff}button,select,input{background:#192a42;border:1px solid #395272;border-radius:6px;color:#edf4ff;padding:9px;font:inherit}button{cursor:pointer}label{display:flex;align-items:center;gap:8px}input[type=range]{flex:1;min-width:180px}.card{background:#142237;border:1px solid #2a405e;border-radius:8px;padding:14px;flex:1;min-width:140px}.card strong{display:block;font-size:22px;margin-top:7px}#status{color:#8ee4b3}#clock{font:22px ui-monospace,monospace;color:#96d9ff}#graph{min-height:220px;overflow:auto;border:1px solid #2a405e;border-radius:8px;background:#101e31}svg{display:block}table{border-collapse:collapse;width:100%;font-size:12px}th,td{text-align:left;padding:9px;border-bottom:1px solid #263a55;white-space:nowrap}.scroll{overflow:auto;max-height:420px;border:1px solid #2a405e;border-radius:7px}.active{background:#244c69}#details{white-space:pre-wrap;overflow-wrap:anywhere;max-height:350px;overflow:auto;font:12px ui-monospace,monospace}.pill{padding:6px 10px;border:1px solid #35506e;border-radius:20px}.transmitting{color:#ffc665}.propagating{color:#bb9dff}.delivered{color:#83dab6}.queued{color:#9eb4cb}.future{color:#69809b}.cancelled{color:#ff8585}.dropped{color:#ff5069}#geometryStatus,#hopInfo,#nodeInfo{color:#a4c6e9;font:13px ui-monospace,monospace;margin:10px 0}#transportModel{padding:12px 16px;background:#101e31;border-left:3px solid #5279a5;color:#a6bed6}.legend{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;margin:14px 0}
+[hidden]{display:none!important}.tabs{display:flex;gap:8px;flex-wrap:wrap;margin:14px 0}.tabs button[aria-selected=true]{background:#245580;border-color:#8bd8ff}.runtimeGrid{display:grid;grid-template-columns:minmax(0,2fr) minmax(340px,1fr);gap:18px}.eventWindowCard{min-width:0;background:#101e31;border-radius:10px;padding:14px;align-self:start;position:sticky;top:16px}.eventWindowCard p{font-size:12px}@media(max-width:1000px){.runtimeGrid{grid-template-columns:minmax(0,1fr)}.eventWindowCard{position:static}} </style><main>
+<nav><a id="resultLink">← 实验结果</a><strong>传输回放</strong><a id="environment">星座与链路快照</a></nav>
+<h1>传输回放</h1><section class="card" aria-label="回放与在线操作"><strong style="font-size:16px">当前为已执行日志回放 · 只读</strong><p>点击节点和链路查看信息。设置故障、恢复、断开或建立链路，请启动在线交互会话；后端会重新执行业务事件。</p><a id="openInteractive" style="display:inline-block;padding:10px 14px;border:1px solid #80cfff;border-radius:7px" href="/live">按本次配置启动在线交互 →</a></section><div class="tabs" role="tablist" aria-label="结果视图"><button data-view="playback" role="tab" aria-selected="true">3D 传输回放</button><button data-view="events" role="tab" aria-selected="false">逐跳与事件</button><button data-view="comparison" role="tab" aria-selected="false">共享 / 故障对照</button><button data-view="cells" role="tab" aria-selected="false">cell 拓扑与预算</button></div>
+<details hidden><summary>运行信息</summary><select id="rerunMode"><option value="flowsim">FlowSim · 原生流级仿真</option><option value="ns3">ns-3 · 包级</option><option value="queue">Queue</option><option value="simgrid">SimGrid</option></select><button id="rerun">重新运行</button><p id="rerunStatus"></p><p id="constellationInfo"></p><div id="metrics"></div></details>
+<div id="status" role="status">正在读取事件索引…</div>
+<details><summary>选择请求、事件页与播放速度</summary><div class="controls"><label>回放范围<select id="scope"><option value="all">全部请求 · 事件交错</option><option value="request">单请求 · 完整路径</option></select></label><label id="globalPageLabel">事件页<select id="globalPage"></select></label><label>请求页<select id="page" aria-label="请求页"></select></label><label>请求<select id="request" aria-label="选择请求"></select></label><label>播放步速<select id="speed"><option value="500">2 事件/秒</option><option value="200" selected>5 事件/秒</option><option value="50">20 事件/秒</option></select></label></div></details>
+<div class="controls"><button id="prev">← 上一事件</button><button id="play">播放事件</button><button id="next">下一事件 →</button><button id="reset">回到请求开始</button><input id="cursor" type="range" min="0" value="0" aria-label="事件序号"><output id="count"></output></div>
+<div class="controls"><button id="continuousPlay">连续播放</button><label>仿真秒 / 实际秒<select id="timeRate"><option value="0.1">0.1×</option><option value="1">1×</option><option value="10" selected>10×</option><option value="60">60×</option><option value="300">300×</option></select></label><label>定位时刻 s<input id="playbackTime" type="number" min="0" step="any" value="0" style="width:125px"></label><button id="seekPlaybackTime">定位到该时刻</button></div>
+<div class="controls"><output id="clock">—</output><span id="eventName" class="pill"></span><span id="compute" class="pill"></span><a id="locate">查看这一秒的环境快照</a></div>
+<details><summary>状态说明与运行详情</summary><div class="legend"><span class="transmitting">━ 正在发送</span><span class="propagating">━ 传播中</span><span class="delivered">━ 已到达</span><span class="queued">━ 排队</span><span class="future">┄ 尚未执行</span><span class="cancelled">━ 中止</span></div>
+<div class="controls" id="liveCounts"></div><p id="backendInfo" class="pill"></p>
+</details><p id="faultInfo" style="color:#ffd16f;white-space:pre-wrap" role="status"></p>
+<section data-view-panel="comparison" hidden><section id="faultPanel" hidden><h2>持续传输 · 10 秒断链与备用路径</h2><div id="faultTimeline" class="card" style="overflow:auto"></div></section><h2>Queue / SimGrid · 同链路实际对照</h2><div id="sharingComparison" class="card" style="overflow:auto">正在加载两次实际运行的对照…</div>
+</section><section data-view-panel="cells" hidden><h2>计算 cell · 逻辑数据中心</h2><p>点击 cell 查看物理拓扑、光学预算、单向净容量和传播时延。内部计算与算子通信由 Serving / AsterMind 负责；Serving 解析通信耗时保持原样。</p><a id="cellExport">查看 Serving / AsterMind 链路参数导出</a><div id="cellDirectory" class="controls"></div>
+</section><section data-view-panel="playback"><section id="recoveryDemo" class="card" hidden></section><h2>3D 故障与传输过程</h2><p id="geometryStatus" role="status">正在加载实际执行事件对应的物理位置…</p><div id="globe" aria-label="Runtime 三维拓扑"></div><p id="hopInfo"></p><p id="nodeInfo"></p>
+<div class="legend"><span style="color:#528dff">┄ 原定路线</span><span style="color:#83dab6">━ 已完成并保留</span><span style="color:#ffc665">━ 当前传输</span><span style="color:#ff354f">✕ 故障链路</span><span style="color:#35e4ef">━ 当前节点改道</span></div>
+<div class="controls" id="scenarioJumps" hidden><button data-seek-time="7">7 s · 原定路线</button><button data-seek-time="9">9 s · 传输途中</button><button data-seek-time="10">10 s · 故障</button><button data-seek-time="11">11 s · 当前节点改道</button></div>
+<div class="eventWindowCard" style="position:static"><h2>事件执行时间线</h2><label>窗口跨度<select id="eventWindowSeconds"><option value="2">2 s</option><option value="5" selected>5 s</option><option value="10">10 s</option><option value="30">30 s</option></select></label><div id="eventWindow" style="height:300px;overflow:hidden"></div><p id="eventWindowInfo"></p><p>此页回放已执行日志。需要改变未来拓扑时，请进入<a href="/live">在线仿真实验台</a>。</p></div><details><summary>传输模型与动画说明</summary><p id="transportModel">当前按整条消息逐跳存储转发。已经完成的跳保留；仅故障跳未完成的传输丢弃，按运行时选择的故障时序策略，从持有完整缓存的当前节点重选后续路线。有限缓冲区和 TCP 包级确认未建模；缓存节点自身失效会报告数据不可恢复。</p><p>原定路线不代表已发送；光点按已执行日志中的发送字节进度或传播时间定位，无法确定进度时不显示光点。路线方案来自实际路由决策。连续播放插值位置，逐事件模式核查日志顺序。</p></details>
+
+<div class="controls"><button id="jumpTraffic">跳到传输过程</button><button id="jumpFailure">跳到故障／恢复</button><button id="jumpRandomFailure">跳到随机故障</button><button id="jumpSunFailure">跳到日凌</button><button id="nextTransmission">下一次开始发送 →</button><span id="trafficHint"></span></div><h2>当前在途传输</h2><div id="currentTraffic" class="metrics"></div>
+</section><section data-view-panel="events" hidden><h2>逐跳流量路径</h2><p>展示本次运行记录的实际路径，各阶段分行。虚线表示尚未执行的路径段；这是逻辑通信图，不映射轨道坐标。</p><div id="graph"></div>
+<h2>链路占用与传输时间</h2><div class="scroll"><table><thead><tr><th>阶段</th><th>发送节点 → 接收节点</th><th>状态</th><th>开始 s</th><th>发送结束 s</th><th>到达 s</th><th>等待 ms</th><th>发送 ms</th><th>传播 ms</th><th>字节</th></tr></thead><tbody id="hops"></tbody></table></div>
+<h2>当前请求的实际带宽分配</h2><p>SimGrid 区间来自真实引擎的已发送字节；共享流加入、结束或容量变化会改变分配。这里仅展示截至当前事件已结束区间的平均速率，传播阶段不占发送带宽。</p><div class="scroll"><table><thead><tr><th>链路</th><th>区间开始 s</th><th>区间结束 s</th><th>分配 Mbit/s</th><th>链路容量 Mbit/s</th><th>同向并发流</th><th>发送字节</th></tr></thead><tbody id="allocations"></tbody></table></div><h2>事件时间线</h2><div class="scroll"><table><thead><tr><th>序号</th><th>仿真时间 s</th><th>事件</th><th>阶段／链路</th></tr></thead><tbody id="events"></tbody></table></div>
+<details><summary>当前事件与完整请求记录</summary><pre id="details"></pre></details>
+<p>播放默认按事件步进，事件间的时间差会显示在时钟旁。传输序列化结束、传播到达、计算完成和响应完成是不同事件。请求目录分页，选中后仅加载该请求的完整记录；没有前 20 个请求的截断。</p></section></main>
+<script src="/assets/event_timeline.js"></script><script src="/assets/runtime_state.js"></script><script src="/assets/runtime_controls.js"></script><script src="/assets/sharing_view.js"></script><script src="/assets/recovery_demo.js"></script><script src="/assets/fault_view.js"></script><script>
+'use strict';
+const $=id=>document.getElementById(id),base=location.pathname.replace(/runtime$/,'runtime-data/'),environment=location.pathname.replace(/runtime$/,'viewer');
+$('environment').href=environment;$('resultLink').href=location.pathname.replace(/runtime$/,'result');
+function selectView(view){const valid=['playback','events','comparison','cells'];if(!valid.includes(view))view='playback';for(const panel of document.querySelectorAll('[data-view-panel]'))panel.hidden=panel.dataset.viewPanel!==view;for(const button of document.querySelectorAll('[data-view]'))button.setAttribute('aria-selected',String(button.dataset.view===view));const url=new URL(location.href);url.searchParams.set('view',view);history.replaceState(null,'',url);window.dispatchEvent(new Event('resize'))}
+for(const button of document.querySelectorAll('[data-view]'))button.onclick=()=>selectView(button.dataset.view);selectView(new URLSearchParams(location.search).get('view')||'playback');
+$('cellExport').href=location.pathname.replace(/runtime$/,'cell-network-export');
+let manifest,payload,index=0,timer=null,selectionVersion=0,globalEvents=[],globalIndex=0,globalInitialTransfers=[];
+const requestCache=new Map();
+async function requestData(name){if(requestCache.has(name))return requestCache.get(name);const value=await read(name);requestCache.set(name,value);while(requestCache.size>4)requestCache.delete(requestCache.keys().next().value);return value}
+const names={scene_preview:'场景预览（尚未发送）',route_plan:'规划路线（预测）',cell_compute_start:'成员计算开始',cell_compute_complete:'成员计算完成',cell_flow_done:'集合通信屏障',route_recovery:'故障后重选路径',retry_transfer:'重传',fault_injected:'注入故障',fault_restored:'故障恢复',link_state:'链路状态 / 太阳避让',bandwidth_update:'带宽分配区间记录',transfer_cancelled:'传输中止',transfer_queued:'本跳入队',transfer_dropped:'传输丢弃',transfer_retried:'重试入队',request_arrival:'请求到达',transmit_start:'开始发送',transmit_complete:'发送完成',hop_arrival:'到达下一跳',access_done:'完成接入',input_done:'输入到达计算节点',compute_start:'开始计算',prefill_complete:'Prefill 完成',first_token_ready:'首 token 就绪',compute_complete:'计算完成',kv_publish:'发布 KV',first_delivered:'首 token 到达客户端',output_delivered:'剩余输出到达',request_complete:'请求完成',request_failed:'请求失败'};
+const stages={cell_prefill:'cell Prefill 通信',cell_decode:'cell Decode 通信',input:'请求输入',first_token:'首 token 回传',output:'剩余输出回传',kv_copy:'KV 复制'};
+const statuses={transmitting:'正在发送',propagating:'传播中',delivered:'已到达',queued:'排队',future:'尚未执行',cancelled:'中止',dropped:'丢弃'};
+const colors={transmitting:'#ffc665',propagating:'#bb9dff',delivered:'#83dab6',queued:'#9eb4cb',future:'#435873',cancelled:'#ff8585',dropped:'#ff5069'};
+async function read(name){const response=await fetch(base+name);if(!response.ok){let error;try{error=(await response.json()).error}catch{}throw Error(error||'读取事件失败')}return response.json()}
+function stop(){window.runtimeTimePlayer?.stop();if(timer)clearInterval(timer);timer=null;$('play').textContent='播放事件'}
+function option(select,label,value){const node=document.createElement('option');node.textContent=label;node.value=value;select.append(node)}
+function cell(row,text){const td=document.createElement('td');td.textContent=text;row.append(td);return td}
+function svgElement(name,attrs,text){const node=document.createElementNS('http://www.w3.org/2000/svg',name);for(const[k,v]of Object.entries(attrs))node.setAttribute(k,v);if(text!==undefined)node.textContent=text;return node}
+function graph(legs){
+const groups=[...new Set(legs.map(l=>l.stage))],count=Math.max(2,...groups.map(g=>legs.filter(l=>l.stage===g).length+1)),width=Math.max(700,count*130),height=Math.max(230,groups.length*120);
+const svg=svgElement('svg',{width,height,viewBox:'0 0 '+width+' '+height,role:'img','aria-label':'实际请求的逐跳流量状态'});
+groups.forEach((group,row)=>{const path=legs.filter(l=>l.stage===group),y=60+row*120;
+svg.append(svgElement('text',{x:16,y:y-30,fill:'#b9d2ed','font-size':13},stages[group]||group));
+path.forEach((leg,j)=>{const x=50+j*130,color=colors[leg.status];
+svg.append(svgElement('line',{x1:x,y1:y,x2:x+130,y2:y,stroke:color,'stroke-width':leg.status==='transmitting'?5:3,'stroke-dasharray':leg.status==='future'?'5 5':'none'}));
+svg.append(svgElement('text',{x:x+65,y:y-10,fill:color,'text-anchor':'middle','font-size':10},statuses[leg.status]));
+if(j===0)node(leg.source_node_id,x,y);
+node(leg.target_node_id,x+130,y);
+});
+function node(id,x,y){svg.append(svgElement('circle',{cx:x,cy:y,r:6,fill:'#91ceff'}));const label=id.length>18?id.slice(0,7)+'…'+id.slice(-9):id;const text=svgElement('text',{x,y:y+24,fill:'#c0d7ee','text-anchor':'middle','font-size':10},label);text.append(svgElement('title',{},id));svg.append(text)}
+});
+$('graph').replaceChildren(svg);
+}
+function render(displayTime){
+if(!payload)return;const state=RuntimePlayback.stateAt(payload.record,payload.events,index,manifest.transport?.backend?.backend);
+state.globalMode=$('scope').value==='all'&&globalEvents.length>0;
+state.cellEvents=payload.events.slice(0,index+1);
+if(state.globalMode){state.event=globalEvents[globalIndex]||{time_s:displayTime??0,kind:'waiting',event_order:-1};state.time_s=state.event.time_s;}
+if(state.globalMode)state.activeTransfers=RuntimePlayback.activeTransfersAt(globalInitialTransfers,globalEvents,globalIndex);
+if(Number.isFinite(displayTime))state.time_s=displayTime;
+RuntimeControls.render(state,payload.record);
+$('clock').textContent=state.time_s.toFixed(9)+' s';
+window.refreshEventTimeline=()=>EventTimeline.render(state.globalMode?globalEvents:payload.events,Number.isFinite(displayTime)?{...state.event,time_s:state.time_s}:state.event);window.refreshEventTimeline();
+FaultView.render(state.time_s);
+const faultEvent=state.event;
+$('faultInfo').textContent=faultEvent.kind==='transfer_cancelled'?'仅故障跳未完成传输丢弃：'+(faultEvent.bytes_discarded??faultEvent.bytes_sent??0).toFixed(3)+' B / 消息 '+faultEvent.payload_bytes+' B；'+faultEvent.reason:faultEvent.kind==='route_recovery'?'故障后重选路由：从 '+faultEvent.source_node_id+' 向 '+faultEvent.target_node_id+' 从当前节点发送 '+faultEvent.retransmit_bytes+' B（第 '+faultEvent.attempt+' 次）':['fault_injected','fault_restored'].includes(faultEvent.kind)?(faultEvent.kind==='fault_injected'?'故障生效：':'故障恢复：')+faultEvent.target_type+' '+faultEvent.target_id:'';
+const previous=$('scope').value==='all'?(globalIndex>0?globalEvents[globalIndex-1].time_s:state.time_s):(index>0?payload.events[index-1].time_s:state.time_s);
+$('eventName').textContent=(names[state.event.kind]||state.event.kind)+' · Δt '+(state.time_s-previous).toFixed(9)+' s';
+if(Number.isFinite(displayTime))$('eventName').textContent='最近事件：'+(names[state.event.kind]||state.event.kind)+' @ '+state.event.time_s.toFixed(6)+' s';
+$('compute').textContent='计算：'+({waiting:'等待输入／准入',prefill:'Prefill',decode:'Decode',finished:'完成',cancelled:'中止'}[state.compute]);
+const backend=manifest.transport?.backend||{backend:'queue'};
+$('backendInfo').textContent=backend.backend==='simgrid'?'网络模式：真实 SimGrid '+backend.simgrid_version+' / '+backend.simgrid_network_model+' · 同向并发共享 · 完成时间由原生引擎决定':'网络模式：简单排队 · 同向链路预约独占';
+if(backend.backend==='fluid')$('backendInfo').textContent='网络模式：自研流式模型 · 同方向流公平共享';if(backend.backend==='ns3')$('backendInfo').textContent='网络模式：真实 ns-3 '+backend.ns3_version+' · 1400 B 数据包轮转 · 不含 TCP';
+const all=$('scope').value==='all';
+$('count').textContent=(all?globalIndex+1:index+1)+' / '+(all?globalEvents.length:payload.events.length);$('cursor').value=all?globalIndex:index;
+const counts=state.event.traffic_counts||{};
+$('liveCounts').textContent='当前关联请求 '+payload.record.request.request_id+' · 全系统等待 '+(counts.queued??'—')+' · 传播中 '+(counts.propagating??'—')+' · 正在发送 '+(counts.transmitting??'—')+' · 正在计算 '+(counts.computing??'—')+' · 已完成 '+(counts.completed??'—')+' · 失败 '+(counts.failed??'—');
+$('locate').href=environment+'?time='+Math.floor(state.time_s);
+window.currentRuntimeState={state,record:payload.record};
+if(window.setRuntimeGeometry)window.runtimeGeometryTask=window.setRuntimeGeometry(state,payload.record);
+graph(state.legs);
+$('allocations').replaceChildren();
+for(const leg of state.legs){for(const segment of leg.segments||[]){if(segment.finish_s>state.time_s)continue;const row=document.createElement('tr');cell(row,leg.source_node_id+' → '+leg.target_node_id);cell(row,segment.start_s.toFixed(9));cell(row,segment.finish_s.toFixed(9));cell(row,(segment.bandwidth_bps/1e6).toFixed(6));cell(row,segment.link_capacity_bps===undefined?'—':(segment.link_capacity_bps/1e6).toFixed(6));cell(row,segment.concurrent_flows??1);cell(row,Number(segment.bytes).toFixed(6));$('allocations').append(row)}}
+$('hops').replaceChildren();
+state.legs.forEach(leg=>{const row=document.createElement('tr');cell(row,stages[leg.stage]||leg.stage);cell(row,leg.source_node_id+' → '+leg.target_node_id);cell(row,statuses[leg.status]).className=leg.status;for(const key of ['start_s','finish_s','arrival_s'])cell(row,leg[key]==null?'待引擎确定':Number(leg[key]).toFixed(9));for(const key of ['queue_wait_s','transmission_s','propagation_delay_s'])cell(row,leg[key]===undefined?'—':(leg[key]*1000).toFixed(6));cell(row,leg.payload_bytes);$('hops').append(row)});
+for(const row of $('events').children)row.classList.toggle('active',Number(row.dataset.index)===($('scope').value==='all'?globalIndex:index));
+$('details').textContent=JSON.stringify({event:state.event,record:payload.record},null,2);
+$('status').textContent='请求 '+payload.record.request.request_id+' · '+(state.completed?'客户端已收到全部响应':state.failed?'请求失败':'回放中')+' · 事件时间不取整';
+}
+async function selectRequest(){
+stop();const version=++selectionVersion,loaded=await requestData($('request').value);
+if(version!==selectionVersion)return;payload=loaded;index=0;$('cursor').max=Math.max(0,payload.events.length-1);
+$('events').replaceChildren();
+payload.events.forEach((event,i)=>{const row=document.createElement('tr');row.dataset.index=i;cell(row,i+1);cell(row,event.time_s.toFixed(9));cell(row,names[event.kind]||event.kind);cell(row,(stages[event.stage]||event.stage||'')+' '+(event.link_id||''));row.onclick=()=>{stop();index=i;render()};$('events').append(row)});
+render();
+}
+async function selectPage(){const rows=await read($('page').value);$('request').replaceChildren();rows.forEach(row=>option($('request'),row.request_id+' · '+(row.completed?'完成':'未完成'),row.artifact));if(rows.length)await selectRequest()}
+
+function eventTable(events,all){
+$('events').replaceChildren();
+events.forEach((event,i)=>{const row=document.createElement('tr');row.dataset.index=i;cell(row,all?event.event_order+1:i+1);cell(row,event.time_s.toFixed(9));cell(row,(event.request_id||'')+' · '+(names[event.kind]||event.kind));cell(row,(stages[event.stage]||event.stage||'')+' '+(event.link_id||''));row.onclick=()=>{stop();if(all){globalIndex=i;showGlobal().catch(fail)}else{index=i;render()}};$('events').append(row)});
+}
+async function showGlobal(displayTime){
+const version=++selectionVersion,event=globalEvents[globalIndex]||{...globalEvents[0],time_s:displayTime??0,event_order:-1};if(!event.request_artifact)return;
+const loaded=await requestData(event.request_artifact);if(version!==selectionVersion)return;
+payload=loaded;index=payload.events.findIndex(e=>e.event_order===event.event_order);if(index<0)index=RuntimePlayback.eventIndexAt(payload.events,event);
+$('cursor').max=globalEvents.length-1;render(displayTime);
+}
+window.runtimeContinuousAdapter={
+ current:()=>window.currentRuntimeState?.state.time_s||0,
+ end:()=>window.networkReplayState?.()?.data.time.end_s??manifest?.event_pages?.at(-1)?.last_time_s??0,
+ stopEvents:()=>{if(timer)clearInterval(timer);timer=null;$('play').textContent='播放事件'},
+ async at(time){
+  if(!manifest?.event_pages?.length)return;
+  $('scope').value='all';$('globalPageLabel').hidden=false;
+  let page=0;for(let i=1;i<manifest.event_pages.length;i++){if(manifest.event_pages[i].first_time_s>time)break;page=i}
+  let changed=page!==$('globalPage').selectedIndex;
+  if(changed){$('globalPage').selectedIndex=page;await selectGlobalPage(false)}
+  const target=RuntimePlayback.heldFrameIndex(globalEvents,time);
+  changed=changed||target!==globalIndex;globalIndex=target;
+  if(changed||!window.currentRuntimeState?.state.globalMode)await showGlobal(time);
+  else{
+   const current=window.currentRuntimeState,state={...current.state,time_s:time};
+   window.currentRuntimeState={state,record:current.record};$('clock').textContent=time.toFixed(9)+' s';
+   $('eventName').textContent='最近事件：'+(names[state.event.kind]||state.event.kind)+' @ '+state.event.time_s.toFixed(6)+' s';
+   $('locate').href=environment+'?time='+time;
+   FaultView.render(time);
+   EventTimeline.render(globalEvents,{...state.event,time_s:time});
+   window.runtimeGeometryTask=window.setRuntimeGeometry?.(state,current.record);
+  }
+  await window.runtimeGeometryTask;
+  $('playbackTime').value=time.toFixed(6);
+ }
+};
+async function selectGlobalPage(stopPlayback=true){
+if(stopPlayback)stop();
+const page=manifest.event_pages[$('globalPage').selectedIndex];
+const [loaded,context]=await Promise.all([read(page.artifact),page.initial_transfers_artifact?read(page.initial_transfers_artifact):Promise.resolve(page.initial_transfers||[])]);
+globalEvents=loaded;globalInitialTransfers=context;globalIndex=0;eventTable(globalEvents,true);await showGlobal();
+}
+async function changeScope(){
+stop();$('globalPageLabel').hidden=$('scope').value!=='all';
+if($('scope').value==='all')await selectGlobalPage();else await selectRequest();
+}
+async function advance(delta){
+if($('scope').value==='all'){
+if(delta>0&&globalIndex>=globalEvents.length-1){
+const page=$('globalPage');if(page.selectedIndex<page.options.length-1){page.selectedIndex++;await selectGlobalPage(false)}else stop();return;
+}
+globalIndex=Math.max(0,globalIndex+delta);await showGlobal();
+}else{if(delta>0&&index>=payload.events.length-1){stop();return}index=Math.max(0,index+delta);render()}
+}
+async function jumpTransmission(next=false,focus=true){
+stop();if(focus)window.focusRuntimeTransmission?.();
+if($('scope').value==='all'){
+ const first=next?$('globalPage').selectedIndex:0;
+ for(let page=first;page<manifest.event_pages.length;page++){
+  const offset=next&&page===first?globalIndex+1:0;
+  if(page!==$('globalPage').selectedIndex){$('globalPage').selectedIndex=page;await selectGlobalPage()}
+  const found=globalEvents.findIndex((e,i)=>i>=offset&&e.kind==='transmit_start');
+  if(found>=0){globalIndex=found;await showGlobal();return}
+ }
+}else{const found=payload.events.findIndex((e,i)=>i>=(next?index+1:0)&&e.kind==='transmit_start');if(found>=0){index=found;render();return}}
+$('trafficHint').textContent='当前范围内没有后续开始发送事件，可点击“跳到传输过程”重看。';
+}
+async function jumpSpecial(predicate){stop();$('scope').value='all';$('globalPageLabel').hidden=false;for(let page=0;page<manifest.event_pages.length;page++){$('globalPage').selectedIndex=page;await selectGlobalPage();const found=globalEvents.findIndex(predicate);if(found>=0){globalIndex=found;await showGlobal();return}}$('trafficHint').textContent='本次运行没有此类事件，请运行新版场景。'}
+$('jumpFailure').onclick=()=>jumpSpecial(e=>e.kind==='transfer_cancelled'||e.kind==='fault_injected'||e.kind==='route_recovery'||e.reason==='sun_exclusion').catch(fail);
+for(const [id,source,predicate]of [['jumpRandomFailure','random',e=>e.kind==='fault_injected'&&e.source==='random'],['jumpSunFailure','sun',e=>e.kind==='link_state'&&e.reason==='sun_exclusion']])$(id).onclick=()=>{window.focusRuntimeFault?.(source);jumpSpecial(predicate).catch(fail)};
+window.seekRuntimeTime=async time=>{stop();$('scope').value='all';$('globalPageLabel').hidden=false;const page=manifest.event_pages.findIndex(p=>p.last_time_s>=time);if(page<0)return;$('globalPage').selectedIndex=page;await selectGlobalPage();const special=globalEvents.findIndex(e=>Math.abs(e.time_s-time)<1e-8&&((time===11&&e.kind==='route_plan'&&e.reason==='recovery')||(time===10&&e.kind==='transfer_cancelled')));const found=special>=0?special:globalEvents.findIndex(e=>e.time_s>=time);globalIndex=found<0?0:found;await showGlobal()};
+for(const button of document.querySelectorAll('[data-seek-time]'))button.onclick=()=>window.seekRuntimeTime(Number(button.dataset.seekTime)).catch(fail);
+$('jumpTraffic').onclick=()=>jumpTransmission().catch(fail);$('nextTransmission').onclick=()=>jumpTransmission(true).catch(fail);
+window.seekSharedInterval=async time=>{stop();$('scope').value='all';$('globalPageLabel').hidden=false;const page=manifest.event_pages.findIndex(p=>p.last_time_s>=time);if(page<0)return;$('globalPage').selectedIndex=page;await selectGlobalPage();globalIndex=globalEvents.findIndex(e=>e.time_s>=time&&e.kind==='bandwidth_update');if(globalIndex<0)globalIndex=0;window.focusRuntimeTransmission?.();await showGlobal()};
+
+$('next').onclick=()=>{stop();advance(1).catch(fail)};$('prev').onclick=()=>{stop();advance(-1).catch(fail)};$('reset').onclick=()=>{stop();if($('scope').value==='all'){globalIndex=0;showGlobal().catch(fail)}else{index=0;render()}};
+$('play').onclick=async()=>{if(timer){stop();return}if(($('scope').value==='all'?globalIndex>=globalEvents.length-1&&$('globalPage').selectedIndex===manifest.event_pages.length-1:index>=payload.events.length-1))await jumpTransmission();$('play').textContent='暂停事件';let busy=false;timer=setInterval(async()=>{if(busy)return;busy=true;try{await advance(1)}catch(error){fail(error)}finally{busy=false}},Number($('speed').value))};
+$('speed').onchange=stop;$('cursor').oninput=()=>{stop();if($('scope').value==='all'){globalIndex=Number($('cursor').value);showGlobal().catch(fail)}else{index=Number($('cursor').value);render()}};
+$('scope').onchange=()=>changeScope().catch(fail);$('globalPage').onchange=()=>selectGlobalPage().catch(fail);
+$('request').onchange=()=>{$('scope').value='request';changeScope().catch(fail)};$('page').onchange=()=>{$('scope').value='request';$('globalPageLabel').hidden=true;selectPage().catch(fail)};
+function fail(error){stop();$('status').textContent='无法播放：'+error.message}
+(async()=>{
+manifest=await read('index.json');
+RuntimeControls.initialize(manifest);
+SharingView.initialize();
+FaultView.initialize();
+const summary=manifest.summary;
+for(const[label,value]of [['总请求',summary.total_request_count],['完成',summary.completed_request_count],['未完成',summary.uncompleted_request_count],['回放模式','逐事件']]){
+const card=document.createElement('div');card.className='card';card.textContent=label;const number=document.createElement('strong');number.textContent=value;card.append(number);$('metrics').append(card)}
+manifest.requests.forEach((page,i)=>option($('page'),'第 '+(i+1)+' 页 · '+page.count+' 个请求',page.artifact));
+(manifest.event_pages||[]).forEach((page,i)=>option($('globalPage'),'第 '+(i+1)+' 页 · '+page.first_time_s.toFixed(3)+'–'+page.last_time_s.toFixed(3)+' s',page.artifact));
+if(manifest.requests.length){await selectPage();await changeScope();const requestedTime=new URLSearchParams(location.search).get('time');if(requestedTime!==null&&Number.isFinite(Number(requestedTime))&&Number(requestedTime)>=0)await window.runtimeContinuousAdapter.at(Number(requestedTime));else if(!manifest.has_scene_preview)await jumpTransmission(false,false)}else $('status').textContent='本次运行没有请求';
+})().catch(fail);
+</script><script type="importmap">{"imports":{"three":"/assets/three.module.js","three/webgpu":"/assets/three.module.js"}}</script>
+<script src="/assets/constellation_layout.js"></script><script src="/assets/visual_state.js"></script><script type="module" src="/assets/runtime_scene.js"></script><script src="/assets/global_multiflow.js"></script></html>

@@ -13,6 +13,11 @@ class CellLinkAddition(Contract):
     target: Identifier
 
 
+class RoutingConfig(Contract):
+    """Policy selection only; the engine owns routing refresh boundaries."""
+    policy: str = Field(default="min_hops", pattern=r"^[a-z][a-z0-9_-]{0,127}$")
+
+
 class SimulationConfig(Contract):
     schema_version: Literal[1, "orbitserve.native_cells.v1"] = 1
     # Ground resources are explicit in the outer model. The current network
@@ -27,6 +32,8 @@ class SimulationConfig(Contract):
     migrations: tuple[Migration, ...] = ()
     compute_mode: Literal["midlayer", "roofline"] = "midlayer"
     communication: CommPolicy = Field(default_factory=CommPolicy)
+    routing: RoutingConfig = Field(default_factory=RoutingConfig)
+    cell_selection: Literal['least_loaded', 'nearest', 'estimated_arrival'] = 'least_loaded'
     horizon_ns: Positive = 1_000_000_000
     physical_dataset: str | None = None
     physical_network: dict | str | None = None

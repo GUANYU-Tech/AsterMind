@@ -1,0 +1,8 @@
+/* Original, unmodified brand fonts are provisioned on the deployment host. */
+@font-face { font-family: Switzer; src: url('./fonts/Switzer-Regular.otf') format('opentype'); font-weight: 100 500; font-style: normal; font-display: swap; }
+@font-face { font-family: Switzer; src: url('./fonts/Switzer-Bold.otf') format('opentype'); font-weight: 501 900; font-style: normal; font-display: swap; }
+@font-face { font-family: MiSans; src: url('./fonts/MiSans-Regular.otf') format('opentype'); font-weight: 100 500; font-style: normal; font-display: swap; }
+@font-face { font-family: MiSans; src: url('./fonts/MiSans-Semibold.otf') format('opentype'); font-weight: 501 900; font-style: normal; font-display: swap; }
+:root { --brand-font: Switzer, MiSans, sans-serif; }
+/* Override the inherited legacy Latin/Chinese/monospace stacks consistently. */
+body, body * { font-family: var(--brand-font) !important; }

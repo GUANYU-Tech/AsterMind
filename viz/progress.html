@@ -1,0 +1,23 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>OrbitServe · 运行进度</title><link rel="stylesheet" href="/assets/pages.css"><main>
+<nav><a href="/experiments?state=running">正在运行的任务</a><a href="/experiments">任务管理</a><a href="/">← 实验配置</a><a href="/experiments">历史实验</a></nav>
+<div class="steps">① 配置 <strong>② 运行</strong> ③ 结果</div><h1 id="heading">实验运行中</h1><p id="runId"></p>
+<section class="card" aria-live="polite"><h2 id="state">正在读取运行状态…</h2><p id="phase">完成后自动进入结果页。可以离开此页，稍后通过此地址继续查看。</p><p id="error" class="error"></p><div class="actions"><a id="result" class="button primary" hidden>查看结果</a><button id="refresh">刷新状态</button></div></section>
+<h2>执行日志</h2><pre id="log">等待日志…</pre><p>当前阶段由后端实际状态确定；没有可用的整体完成百分比时，仅展示阶段与日志。</p><section class="card"><h2>手动管理</h2><div id="taskActions"></div></section></main>
+<script>
+'use strict';const $=id=>document.getElementById(id),base=location.pathname.replace(/progress$/,'');let poll;
+$('runId').textContent=base.split('/')[2];
+async function update(){clearTimeout(poll);try{const response=await fetch(base+'status'),job=await response.json();if(!response.ok)throw Error(job.error||'无法读取任务');
+const labels={running:'正在运行',completed:'运行完成',failed:'运行失败',interrupted:'运行已中断',cancelled:'已手动停止',stopping:'正在停止'};$('state').textContent=labels[job.state]||job.state;
+$('heading').textContent=job.state==='completed'?'实验已完成':job.state==='running'?'实验运行中':'实验需要检查';
+$('phase').textContent=job.state==='running'?(job.phase?'对照运行：'+job.phase+' 阶段。完成后自动进入结果页。':'正在执行仿真与生成展示数据，完成后自动进入结果页。'):'运行状态已保存。';
+$('log').textContent=job.log_tail||'尚无执行日志。';$('error').textContent=job.error||'';
+if(job.preview_url&&job.state==='running'){$('heading').textContent='准备物理场景演示';$('phase').textContent='只生成位置、拓扑和链路属性；完成后进入物理回放。';$('result').textContent='查看物理场景'}
+if(job.state==='completed'){const query=new URLSearchParams(location.search),destination=query.get('next')==='scene'&&job.physical_model_id?'/scene?model='+encodeURIComponent(query.get('model')||job.physical_model_id):(job.native_preset||job.native_scene)?job.result_url:job.preview_url||job.runtime_url||job.result_url;$('result').hidden=false;$('result').href=destination;if(query.get('next')==='scene'){$('result').textContent='进入第二步';$('heading').textContent='完整物理数据已生成'}if(!query.has('stay'))location.replace(destination)}
+else if(['running','stopping'].includes(job.state))poll=setTimeout(update,1500);
+}catch(error){$('state').textContent='暂时无法读取状态';$('error').textContent=error.message;poll=setTimeout(update,4000)}}
+$('refresh').onclick=update;update();
+</script><script type="module">
+import {get} from '/assets/studio_common.js';import {renderTask} from '/assets/task_manager.js';
+const id=location.pathname.split('/')[2];
+async function controls(){try{const job=await get('/runs/'+encodeURIComponent(id)+'/status');const target=document.getElementById('taskActions');if(!target.querySelector('button:disabled')){target.replaceChildren();renderTask(target,{...job,title:id})}}catch{}setTimeout(controls,5000)}controls();
+</script></html>

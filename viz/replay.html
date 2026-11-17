@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OrbitServe · 动态网络检查</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#101722;color:#e6edf5;font:14px system-ui,sans-serif}main{max-width:1500px;margin:auto;padding:24px}h1{font-size:23px;margin:0 0 8px}p{color:#a9b9cc}header{display:flex;gap:20px;justify-content:space-between;flex-wrap:wrap}.controls{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:20px 0}button,select,input{font:inherit}button,select{padding:8px 12px;border:1px solid #51617a;border-radius:5px;background:#1c2a3c;color:#fff}input[type=range]{flex:1;min-width:160px}label{display:flex;align-items:center;gap:8px}.views{display:grid;grid-template-columns:1.35fr 1fr;gap:20px}section{min-width:0}canvas{display:block;width:100%;height:390px;background:#131e2e;border-radius:8px;touch-action:none}.local{height:260px}h2{font-size:16px;margin:12px 0}.legend{display:flex;flex-wrap:wrap;gap:16px;margin:12px 0;font-size:13px}.ground{color:#f3be63}.communication{color:#64c9ff}.compute{color:#c6a0ff}#status{color:#9de5b7}#details{white-space:pre-wrap;overflow-wrap:anywhere;font:12px ui-monospace,monospace;max-height:340px;overflow:auto;background:#182439;padding:12px;border-radius:5px}#summary,#routeInfo,#cellInfo{line-height:1.8}#warnings{font-size:12px;color:#d9c495}footer{font-size:12px;color:#a9b9cc;margin-top:20px}@media(max-width:800px){main{padding:14px}.views{grid-template-columns:1fr}canvas{height:330px}}
+#interactiveRouting{align-self:start}#interactiveRouting .controls{margin:12px 0}#interactiveRouting .controls label{flex:1 1 165px;flex-wrap:wrap}#interactiveRouting input:not([type=checkbox]):not([type=radio]){max-width:100%;width:190px;padding:8px;border:1px solid #51617a;border-radius:5px;background:#101e31;color:#edf4ff}#interactiveRouting table{font-size:12px;white-space:nowrap}#interactiveRouting p{font-size:12px;line-height:1.6}#interactiveRouting h2{margin-top:0}</style>
+<main><nav style="display:flex;gap:18px;margin-bottom:16px"><strong>星座与链路</strong><a id="runtimeViewLink" href="runtime" style="color:#8bd8ff">Runtime 流量 →</a><a href="/" style="color:#8bd8ff">配置与实验列表</a></nav><header><div><h1>OrbitServe · 动态网络检查</h1><p id="subtitle"></p></div><div id="status" role="status"></div></header>
+<div class="controls"><button id="prev" aria-label="上一时间片">←</button><button id="play">播放</button><button id="next" aria-label="下一时间片">→</button><label for="time">仿真时间</label><input id="time" type="range" min="0" value="0"><output id="clock"></output></div>
+<div class="legend"><span class="ground">▲ 地面站</span><span class="communication">● 通信卫星</span><span class="compute">■ 计算卫星</span><span>实线：UP</span><span>虚线：建链中</span><span>点线：DOWN 候选</span><span style="color:#ffdd79">粗黄线：所选探测路径</span></div>
+
+<div class="controls"><button id="motionMode">运动规律</button><button id="linkMode">链路连接</button><label><input id="candidates" type="checkbox">显示 DOWN 候选</label><label>链路类型<select id="kind"><option value="all">全部</option><option value="communication_isl">通信 ISL</option><option value="cross_layer">跨星座</option><option value="cell_isl">cell 内部</option><option value="sgl">星地链路</option><option value="inter_cell">cell 间直连</option></select></label><label>路径探测<select id="probe"></select></label></div>
+<div class="views"><section><h2>地固坐标 · 三维回放（拖动旋转）</h2><canvas id="globe" aria-label="地球、物理节点和动态链路"></canvas><div id="summary"></div></section><section id="interactiveRouting" style="padding:16px;background:#182439;border:1px solid #344c69;border-radius:10px">
+<h2>物理路径对比</h2><p>按当前播放时刻，比较最小跳数和最短累计传播距离两种策略。只查询当前拓扑路径，不估计消息传输耗时，不预留资源或产生业务流量；查询只使用已发生的故障。</p>
+<div class="controls"><label>起点 src <input id="routeSource" list="physicalNodes" aria-label="起点 src"></label><button id="swapRoute" aria-label="交换起终点">⇄</button><label>终点 dst <input id="routeTarget" list="physicalNodes" aria-label="终点 dst"></label><datalist id="physicalNodes"></datalist><button id="compareRoutes">对比两种策略</button></div>
+<p id="routeQueryStatus" role="status">输入节点 ID，或点击节点后设为起点 / 终点。播放时会合并查询到最新时间片。</p>
+<div style="overflow:auto"><table style="width:100%;text-align:left;border-spacing:12px 8px"><thead><tr><th>高亮</th><th>算法</th><th>跳数</th><th>累计距离 km</th><th>路径 / 原因</th></tr></thead><tbody id="routeComparison"></tbody></table></div>
+</section><section><h2>通信星座 · 轨道面 / 轨内编号</h2><label>壳层 <select id="shell"></select></label><label>起始轨道面 <input id="planeFrom" type="number" min="0" value="0" style="width:80px">（显示相邻 6 面）</label><p id="gridNote"></p><canvas id="layout" aria-label="通信星座逻辑拓扑"></canvas><div id="routeInfo"></div></section><section><h2>cell 物理成员 · 局部放大</h2><label>选择 cell <select id="cell"></select></label><canvas id="local" class="local" aria-label="cell 成员和内部链路"></canvas><div id="cellInfo"></div></section><section><h2>节点 / 链路详情（点击图中对象）</h2><pre id="details">选择节点或链路查看后端记录。</pre></section></div>
+<p id="warnings"></p><footer>默认 1 秒一个环境快照，片内位置、几何可用关系、距离和环境链路属性保持不变，不插值。此视图每 250 毫秒展示下一个存储帧（默认 4 倍速）。建链、传输、排队和计算仍按精确事件时间推进；请切换 Runtime 流量视图检查。历史插值结果需重新运行后才能用于当前模型验收。</footer></main>
+<script type="importmap">{"imports":{"three":"/assets/three.module.js"}}</script><script id="replay" type="application/json">__REPLAY_JSON__</script>
+<script src="/assets/constellation_layout.js"></script>
+<script>
+"use strict";
+const data=JSON.parse(document.getElementById('replay').textContent), $=id=>document.getElementById(id);
+let index=0,yaw=.5,pitch=.25,timer=null,selected=null,hit={},currentFrame=null,loadingIndex=null;
+let phase=0,drawBusy=false;
+const frameCache=new Map(),pendingFrames=new Map(),loadQueue=[];
+const CACHE_LIMIT=8,PREFETCH_AHEAD=4;let inflight=0;
+const frameDescriptors=data.artifacts?.frames||data.snapshots;
+function evictFrames(){while(frameCache.size>CACHE_LIMIT){const keys=[...frameCache.keys()].filter(k=>k!==index&&k!==index+1).sort((a,b)=>Math.abs(b-index)-Math.abs(a-index));frameCache.delete(keys[0])}}
+function pumpFrames(){loadQueue.sort((a,b)=>Math.abs(a.i-index)-Math.abs(b.i-index));while(inflight<2&&loadQueue.length){const task=loadQueue.shift();inflight++;fetch(basePath+frameDescriptors[task.i].artifact).then(r=>{if(!r.ok)throw Error('时间片读取失败');return r.json()}).then(frame=>{frameCache.set(task.i,frame);evictFrames();task.resolve(frame)},task.reject).finally(()=>{pendingFrames.delete(task.i);inflight--;pumpFrames()})}}
+function loadFrame(i){if(i<0||i>=frameDescriptors.length)return Promise.resolve(null);if(frameCache.has(i))return Promise.resolve(frameCache.get(i));if(pendingFrames.has(i))return pendingFrames.get(i);const promise=new Promise((resolve,reject)=>loadQueue.push({i,resolve,reject}));pendingFrames.set(i,promise);pumpFrames();return promise}
+function prefetch(){for(let d=1;d<=PREFETCH_AHEAD;d++)loadFrame(index+d).catch(()=>{});loadFrame(index-1).catch(()=>{})}
+function animatedFrame(frame){return frame}
+const basePath=location.pathname.replace(/viewer$/, "");
+const colors={ground:'#f3be63',communication:'#64c9ff',compute:'#c6a0ff'};
+const probes=[...new Set(data.routes.map(r=>JSON.stringify([r.source,r.target,r.policy])))];
+function option(select,label,value){const o=document.createElement('option');o.textContent=label;o.value=value;select.append(o)}
+option($('probe'),'无','');probes.forEach((v,i)=>{const [a,b,p]=JSON.parse(v);option($('probe'),`${a} → ${b} · ${p}`,String(i))});
+const shellIds=[...new Set(data.network.nodes.filter(n=>n.role==='communication').map(n=>n.shell_id||'default'))].sort();shellIds.forEach(s=>option($('shell'),s,s));
+const cells=[...new Set(data.network.nodes.map(n=>n.cell_id).filter(Boolean))].sort();cells.forEach(c=>option($('cell'),c,c));
+data.snapshots=frameDescriptors;
+const requestedTime=Number(new URLSearchParams(location.search).get('time')||0);
+index=Math.max(0,frameDescriptors.findIndex((f,i)=>f.time_s<=requestedTime&&(!frameDescriptors[i+1]||frameDescriptors[i+1].time_s>requestedTime)));
+
+$('time').max=data.snapshots.length-1;
+$('runtimeViewLink').href=location.pathname.replace(/viewer$/,'runtime');
+$('subtitle').textContent=`${(data.network.communication_shells||[]).map(s=>s.shell_id+":"+s.topology).join(" / ")||data.network.communication_topology} · ${data.snapshots.length-1} 个区间 / ${data.snapshots.length} 个边界帧 · ${data.checks.physical_satellites} 颗物理卫星 · ${data.checks.ground_nodes} 个地面站`;
+$('status').textContent=data.checks.passed?'✓ 后端不变量检查通过':'检查失败';$('warnings').textContent=data.warnings.join(' · ');
+function context(id){const c=$(id),r=c.getBoundingClientRect(),d=devicePixelRatio||1;c.width=r.width*d;c.height=r.height*d;const ctx=c.getContext('2d');ctx.scale(d,d);ctx.clearRect(0,0,r.width,r.height);hit[id]=[];return [ctx,r.width,r.height]}
+function route(){if(window.physicalRouteActive?.())return window.interactivePhysicalRoute();if($('probe').value==='')return null;const p=probes[Number($('probe').value)];return data.routes.find(r=>r.time_s===data.snapshots[index].time_s&&JSON.stringify([r.source,r.target,r.policy])===p)}
+function show(obj){selected=obj;$('details').textContent=JSON.stringify(obj,null,2);window.onPhysicalSelection?.(obj)}
+function edgeVisible(e){return ($('candidates').checked||e.state!=='DOWN')&&($('kind').value==='all'||e.kind===$('kind').value)}
+function draw(id,nodes,links,project,setup){const [ctx,w,h]=context(id);if(setup)setup(ctx,w,h);const positions=new Map(nodes.map(n=>[n.node_id,project(n,w,h)]));const r=route(),path=new Set((r?.path||[]).map(e=>e.link_id));
+for(const e of links){if(!edgeVisible(e))continue;const a=positions.get(e.endpoint_a),b=positions.get(e.endpoint_b);if(!a||!b||a.hidden||b.hidden)continue;ctx.strokeStyle=path.has(e.link_id)?'#ffdd79':e.state==='UP'?'#639bba':e.state==='SETTING_UP'?'#f5a65b':'#465468';ctx.lineWidth=path.has(e.link_id)?3:e.state==='UP'?1.25:1;ctx.setLineDash(e.state==='UP'?[]:e.state==='SETTING_UP'?[6,4]:[2,6]);ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();hit[id].push({a,b,obj:e});}ctx.setLineDash([]);
+for(const n of nodes){const p=positions.get(n.node_id);if(p.hidden)continue;ctx.fillStyle=colors[n.role];ctx.beginPath();if(n.role==='ground'){ctx.moveTo(p.x,p.y-5);ctx.lineTo(p.x+5,p.y+4);ctx.lineTo(p.x-5,p.y+4);ctx.closePath()}else if(n.role==='compute'){ctx.rect(p.x-4,p.y-4,8,8)}else ctx.arc(p.x,p.y,3.5,0,2*Math.PI);ctx.fill();hit[id].push({p,obj:n});if(id!=='globe'&&nodes.length<65){ctx.fillStyle='#c4d2e2';ctx.font='10px system-ui';ctx.fillText(n.role==='communication'?`${n.plane}:${n.slot}`:n.node_id.split('-').at(-1),p.x+7,p.y-7)}}}
+async function redraw(){
+const requested=index, descriptor=data.snapshots[requested];
+if(!descriptor.nodes && !frameCache.has(requested)){
+ loadingIndex=requested;$('status').textContent='正在加载 '+descriptor.time_s+' s 完整时间片…';
+ try{await loadFrame(requested);if(index!==requested){loadingIndex=null;return}loadingIndex=null}
+ catch(error){loadingIndex=null;$('status').textContent=error.message;return}
+}
+window.motionPhysicalFrame=null;
+const base=descriptor.nodes?descriptor:frameCache.get(requested),raw=animatedFrame(base,frameCache.get(requested+1)),s={...raw,links:raw.links};
+currentFrame=s;prefetch();
+$('status').textContent='✓ 检查通过 · 缓存 '+frameCache.size+'/'+CACHE_LIMIT+' 帧 · 预取 '+PREFETCH_AHEAD+' 帧';
+if(data.candidate_links&&$('candidates').checked){const active=new Set(s.links.map(e=>e.link_id)),latest=new Map();for(const e of data.events){if(e.time_s>raw.time_s)break;latest.set(e.link_id,e)}for(const edge of data.candidate_links){if(!active.has(edge.link_id))s.links.push({...edge,...latest.get(edge.link_id),state:'DOWN'})}}$('time').value=index;$('clock').textContent=`${s.time_s.toFixed(1)} s / ${data.time.end_s} s`;const all=s.nodes,maxR=Math.max(6378,...all.map(n=>Math.hypot(...n.position_itrs_km)));
+const rotate=v=>{const [x,y,z]=v,a=x*Math.cos(yaw)-y*Math.sin(yaw),b=x*Math.sin(yaw)+y*Math.cos(yaw);return [a,z*Math.cos(pitch)-b*Math.sin(pitch),z*Math.sin(pitch)+b*Math.cos(pitch)]};
+if($('globe').style.display!=='none')draw('globe',all,s.links,(n,w,h)=>{const [x,y,z]=rotate(n.position_itrs_km),scale=.43*Math.min(w,h)/maxR;return {x:w/2+x*scale,y:h/2-y*scale,hidden:z<0&&Math.hypot(x,y)<6378}},(ctx,w,h)=>{const radius=6378/maxR*.43*Math.min(w,h),g=ctx.createRadialGradient(w/2-radius*.3,h/2-radius*.3,0,w/2,h/2,radius);g.addColorStop(0,'#245479');g.addColorStop(1,'#142e48');ctx.fillStyle=g;ctx.beginPath();ctx.arc(w/2,h/2,radius,0,Math.PI*2);ctx.fill();ctx.strokeStyle='#4c6b87';ctx.stroke();ctx.fillStyle='#96b2cb';ctx.font='12px system-ui';ctx.fillText('ITRS · km',12,20)});
+const grid=ConstellationLayout.layout(all,data.network.communication_shells||[],$('shell').value,$('planeFrom').value);$('planeFrom').max=grid.shape[0]-1;$('planeFrom').value=grid.start;
+$('gridNote').textContent=`网格 ${grid.shape.join('×')} · 已映射 ${grid.assigned.length} 星 · 未映射 ${grid.unplaced} 星（仍在三维中显示） · 空槽 ${grid.empty}；未映射节点不占用第 0 面。`;
+draw('layout',grid.visible,s.links.filter(e=>e.kind==='communication_isl'),(n,w,h)=>({x:35+n.slot*(w-80)/grid.slotScale,y:35+(n.plane-grid.start)*(h-75)/grid.planeScale}));
+const members=all.filter(n=>n.cell_id===$('cell').value),origin=members[0]?.position_itrs_km||[0,0,0];
+const offsets=members.map(n=>n.position_itrs_km.map((x,i)=>x-origin[i]));let axis=[1,0,0];if(offsets.length>1){const v=offsets.reduce((a,b)=>Math.hypot(...a)>Math.hypot(...b)?a:b);const norm=Math.hypot(...v);if(norm)axis=v.map(x=>x/norm)}
+const radial=origin.map(x=>x/(Math.hypot(...origin)||1)),cross=[axis[1]*radial[2]-axis[2]*radial[1],axis[2]*radial[0]-axis[0]*radial[2],axis[0]*radial[1]-axis[1]*radial[0]],cn=Math.hypot(...cross)||1,axis2=cross.map(x=>x/cn),dot=(a,b)=>a.reduce((s,x,i)=>s+x*b[i],0),projected=offsets.map(v=>[dot(v,axis),dot(v,axis2)]),extent=Math.max(.001,...projected.flat().map(Math.abs));
+draw('local',members,s.links.filter(e=>e.kind==='cell_isl'),(n,w,h)=>{const v=n.position_itrs_km.map((x,i)=>x-origin[i]),scale=.36*Math.min(w,h)/extent;return{x:w*.32+dot(v,axis)*scale,y:h*.5-dot(v,axis2)*scale}},(ctx)=>{ctx.fillStyle='#a9b9cc';ctx.font='12px system-ui';ctx.fillText(`局部投影范围 ±${extent.toFixed(3)} km`,12,20)});
+$('cellInfo').textContent=members.length?`${members.length} 个物理成员 · 逻辑计算目标：${members.filter(n=>n.compute_target).map(n=>n.node_id).join(', ')} · 接入成员：${members.filter(n=>n.cell_ingress).map(n=>n.node_id).join(', ')}`:'无 cell';
+window.onPhysicalFrame?.(s);
+const count=state=>s.links.filter(e=>e.state===state).length;$('summary').textContent=`UP ${count('UP')} · 建链中 ${count('SETTING_UP')} · DOWN ${count('DOWN')} · 当前事件区间结束 ${s.valid_until_s.toFixed(3)} s`;
+const r=route();$('routeInfo').textContent=r?(r.completed?(r.distance_km!==undefined?`${r.path.length} 跳 · 累计距离 ${r.distance_km.toFixed(3)} km`:`离线探测到达 ${r.arrival_s.toFixed(3)} s · ${r.path.length} 跳`):`不可达：${r.reason}`):'未选择路径探测';if(selected){const updated=s.links.find(e=>e.link_id===selected.link_id)||s.nodes.find(n=>n.node_id===selected.node_id);if(updated)show(updated)}}
+for(const id of ['time','candidates','kind','probe','cell','shell','planeFrom'])$(id).addEventListener('input',()=>{if(id==='time'){index=Number($('time').value);phase=0}redraw()});
+$('prev').onclick=()=>{index=Math.max(0,index-1);phase=0;redraw()};$('next').onclick=()=>{index=Math.min(data.snapshots.length-1,index+1);phase=0;redraw()};
+$('play').onclick=()=>{
+if(timer){clearInterval(timer);timer=null;$('play').textContent='播放';return}
+$('play').textContent='暂停';
+timer=setInterval(async()=>{
+ if(drawBusy)return;
+ if(index>=data.snapshots.length-1){clearInterval(timer);timer=null;$('play').textContent='播放';return}
+ if(!frameCache.has(index+1)){prefetch();return}
+ const nextTime=data.snapshots[index+1].time_s;if(window.physicalRouteCanAdvance&&!window.physicalRouteCanAdvance(nextTime)){window.preparePhysicalRoute(nextTime);return}
+ index++;drawBusy=true;
+ try{await redraw()}finally{drawBusy=false}
+},250);
+};
+
+for(const id of ['globe','layout','local'])$(id).addEventListener('click',event=>{const rect=$(id).getBoundingClientRect(),p={x:event.clientX-rect.left,y:event.clientY-rect.top};for(const h of [...hit[id]].reverse()){if(h.p&&Math.hypot(p.x-h.p.x,p.y-h.p.y)<10){show(h.obj);return}if(h.a){const dx=h.b.x-h.a.x,dy=h.b.y-h.a.y,t=Math.max(0,Math.min(1,((p.x-h.a.x)*dx+(p.y-h.a.y)*dy)/(dx*dx+dy*dy||1)));if(Math.hypot(p.x-h.a.x-t*dx,p.y-h.a.y-t*dy)<5){show(h.obj);return}}}});
+let drag=null;$('globe').onpointerdown=e=>{drag=[e.clientX,e.clientY];$('globe').setPointerCapture(e.pointerId)};$('globe').onpointermove=e=>{if(!drag)return;yaw+=(e.clientX-drag[0])*.008;pitch=Math.max(-1.5,Math.min(1.5,pitch+(e.clientY-drag[1])*.008));drag=[e.clientX,e.clientY];redraw()};$('globe').onpointerup=()=>drag=null;$('globe').onpointercancel=()=>drag=null;
+$('motionMode').onclick=()=>{$('showOrbits').checked=true;$('showLinks').checked=false;redraw()};
+$('linkMode').onclick=()=>{$('showOrbits').checked=false;$('showLinks').checked=true;redraw()};
+window.seekPhysicalSample=async number=>{index=number;phase=0;await redraw()};
+window.networkReplayState=()=>({snapshot:window.motionPhysicalFrame||currentFrame||data.snapshots[index],data,route:route(),kind:$('kind').value});
+window.physicalSnapshot=()=>currentFrame||data.snapshots[index];
+window.inspectNetworkNode=id=>show((currentFrame||data.snapshots[index]).nodes.find(n=>n.node_id===id));
+window.inspectNetworkLink=id=>show((currentFrame||data.snapshots[index]).links.find(n=>n.link_id===id));
+window.showPhysicalDetails=show;
+window.redrawPhysical=redraw;
+window.addEventListener('resize',redraw);redraw();
+</script><script type="module" src="/assets/physical_routes.js"></script><script type="module" src="/assets/globe.js"></script></html>

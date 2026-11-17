@@ -10,6 +10,111 @@ from __future__ import annotations
 import bisect
 from collections import OrderedDict
 from dataclasses import dataclass, replace
+from types import MappingProxyType
+from copy import copy
+import math
+
+
+class PathRouteCache:
+    """Path table refreshed at physical samples and observed topology events.
+
+    No message sizes, reservations, shared-load scans or transfer forecasts.
+    Snapshot construction is amortized across every query in that snapshot.
+    """
+    def __init__(self, max_entries=16384):
+        self.max_entries = max_entries
+        self.entries = OrderedDict()
+        self.hits = self.searches = self.invalidations = self.snapshot_builds = 0
+        self.negative_hits = 0
+        self.marker = None
+        self.start = self.deadline = None
+        self.period = None
+        self.adjacency = MappingProxyType({})
+        self.edges = {}
+        self.boundaries = self.geometry_times = ()
+
+    def fork(self):
+        result = copy(self)
+        result.entries = self.entries.copy()
+        result.hits = result.searches = result.invalidations = result.snapshot_builds = 0
+        result.negative_hits = 0
+        return result
+
+    def synchronize(self, net, time_s):
+        from astermind.engine.policies.routing import RoutingEdge
+
+        marker = (net.revision, id(net.edges), id(net.link_frames))
+        if marker == self.marker and self.start <= time_s < self.deadline:
+            return
+        if marker != self.marker:
+            # Construct the supply-boundary index once per graph version.
+            times = set(net.environment_times)
+            times.update(t for rows in net.link_times.values() for t in rows)
+            times.update(t for rows in getattr(net, 'attribute_boundaries', {}).values() for t in rows)
+            self.boundaries = tuple(sorted(times))
+            physical = getattr(net, 'physical', None) or net
+            self.geometry_times = tuple(sorted({t for rows in getattr(physical, 'sample_times', {}).values() for t in rows}))
+        period = bisect.bisect_right(self.geometry_times, time_s) - 1
+        index = bisect.bisect_right(self.boundaries, time_s)
+        deadline = self.boundaries[index] if index < len(self.boundaries) else net.end_s
+        adjacency, edges = {}, {}
+        allows = getattr(net, 'allows_hop', lambda a, b: True)
+        for edge in net.edges:
+            row = net.link_at(edge['link_id'], time_s)
+            if row['state'] != 'UP' or row.get('ready_s', net.start_s) > time_s:
+                continue
+            distance = net.distance(edge, time_s)
+            if not math.isfinite(distance) or distance < 0:
+                raise ValueError('routing distance must be finite and nonnegative')
+            a, b = edge['endpoint_a'], edge['endpoint_b']
+            for source, target in ((a, b), (b, a)):
+                if not allows(source, target):
+                    continue
+                attrs = net.directional_attributes(edge, source, target, time_s)
+                if attrs['bandwidth_bps'] <= 0 or attrs.get('direction_blocked'):
+                    continue
+                item = RoutingEdge(edge['link_id'], source, target, distance)
+                edges[item.key] = item
+                adjacency.setdefault(source, []).append(item)
+        rewind = self.start is not None and time_s < self.start
+        periodic = self.period is not None and period != self.period
+        changed = edges != self.edges
+        for key, route in tuple(self.entries.items()):
+            # Periodic geometry refresh may choose a new optimum. Between
+            # samples, only affected paths are removed; restored links wake
+            # negative entries. Custom policies may depend on the whole graph.
+            invalid = rewind or periodic or (route is None and changed)
+            if route is not None:
+                invalid |= any(hop not in edges for hop in route.hops)
+                invalid |= key[2] not in {'min_hops', 'min_propagation'} and changed
+            if invalid:
+                del self.entries[key]
+                self.invalidations += 1
+        self.adjacency = MappingProxyType({node: tuple(sorted(rows, key=lambda e: (e.target, e.link_id)))
+                                           for node, rows in adjacency.items()})
+        self.edges = edges
+        self.marker, self.start, self.deadline, self.period = marker, time_s, deadline, period
+        self.snapshot_builds += 1
+
+    def get(self, key):
+        if key not in self.entries:
+            return False, None
+        result = self.entries[key]
+        self.entries.move_to_end(key)
+        self.hits += 1
+        self.negative_hits += result is None
+        return True, result
+
+    def remember(self, key, route):
+        self.entries[key] = route
+        self.entries.move_to_end(key)
+        while len(self.entries) > self.max_entries:
+            self.entries.popitem(last=False)
+
+    def info(self):
+        return dict(entries=len(self.entries), hits=self.hits, searches=self.searches,
+                    invalidations=self.invalidations, negative_hits=self.negative_hits,
+                    snapshot_builds=self.snapshot_builds)
 
 
 @dataclass(frozen=True)

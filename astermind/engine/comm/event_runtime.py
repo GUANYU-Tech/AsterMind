@@ -38,9 +38,13 @@ class RuntimeCommunication(CommunicationRouting):
         self.tasks={};self.flows={};self.active={};self.capacities={};self.rates={}
         self.last_time=self.loop.now_s;self.last_ns=self.now_ns;self.serial=0;self.generation=0;self.trace=TickTrace(loop)
         self.closed=False;self.routes=None;self.frame_deadline=None
+        self._frame_version=None;self._frame_ticks=None;self._observed_network_state=None
         self.delivery_paths={};self.used_ids=set()
         self.stats=dict(peak_active_flows=0,max_path_links=0,rate_allocations=0,
-            allocation_wall_s=0.,route_wall_s=0.,retries=0,discarded_application_bytes=0.)
+            allocation_wall_s=0.,route_wall_s=0.,retries=0,discarded_application_bytes=0.,
+            cell_estimate_calls=0,cell_estimate_wall_s=0.,
+            cell_estimate_context_calls=0,cell_estimate_context_wall_s=0.,
+            network_notifications=0,coalesced_network_notifications=0,network_frame_builds=0)
 
     @property
     def now_ns(self):return self.loop.now_s.ticks/10**9
@@ -50,12 +54,24 @@ class RuntimeCommunication(CommunicationRouting):
         at=self.loop.now_s+Time.from_ns(delay_ns)
         self.loop.schedule(at,priority,kind,callback)
 
+    def _network_version(self):
+        version=getattr(self.network,'state_version',None)
+        return version() if version is not None else None
+
     def _refresh(self,force=False):
-        if self.routes is not None and not force:
-            valid_until=self.routes.frame.valid_until_s
-            if valid_until is None or self.loop.now_s<valid_until:return self.routes
+        version=self._network_version()
+        if self.routes is not None and version==self._frame_version:
+            # A forced notification can refer to the exact frame already read
+            # by another notification or a route query at this same tick.
+            if version is not None and self._frame_ticks==self.loop.now_s.ticks:
+                return self.routes
+            if not force:
+                valid_until=self.routes.frame.valid_until_s
+                if valid_until is None or self.loop.now_s<valid_until:return self.routes
         frame=self.network.frame_at(self.loop.now_s);self.routes=self.network.routes(frame)
         self.capacities=resource_capacities(self.routes,self.policy)
+        self._frame_version=version;self._frame_ticks=self.loop.now_s.ticks
+        self.stats['network_frame_builds']+=1
         deadline=frame.valid_until_s
         if deadline is not None and deadline>self.loop.now_s and deadline!=self.frame_deadline:
             self.frame_deadline=deadline
@@ -158,7 +174,19 @@ class RuntimeCommunication(CommunicationRouting):
         self.flows[identity]=f;self._attempt(f)
 
     def network_changed(self):
+        self.stats['network_notifications']+=1
+        version=self._network_version()
+        observed=(self.loop.now_s.ticks,version) if version is not None else None
+        if observed is not None and observed==self._observed_network_state:
+            self.stats['coalesced_network_notifications']+=1
+            return
         self._settle();routes=self._refresh(force=True)
+        # Updating path validity never rewrites an in-flight attempt. Only
+        # actual lost resources below trigger retry; capacity changes rebalance.
+        host = getattr(self.network, 'host', None)
+        cache = getattr(host.net, '_path_route_cache', None) if host is not None else None
+        if cache is not None:
+            cache.synchronize(host.net, host.now)
         for f in tuple(self.flows.values()):
             if f['task'] not in self.tasks:continue
             if f['state']=='waiting':self._attempt(f);continue
@@ -179,6 +207,9 @@ class RuntimeCommunication(CommunicationRouting):
                     # Once the tail is scheduled, its arrival time is not rewritten.
                     f['budget']['tail']=updated['tail']
         self._rebalance()
+        # Only mark a successfully applied update. Providers without an
+        # explicit version contract retain their original forced-refresh path.
+        self._observed_network_state=observed
 
     def _register(self,identity,on_failure,deadline_s):
         if self.closed:raise RuntimeError('communication runtime closed')

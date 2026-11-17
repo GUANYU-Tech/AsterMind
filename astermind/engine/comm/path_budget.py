@@ -53,12 +53,13 @@ def resource_capacities(routes, policy):
     return capacities
 
 
-def isolated_path_ns(routes, route, size, policy):
+def isolated_path_ns(routes, route, size, policy, *, capacities=None):
     """The runtime whole-path model with exactly one flow and a frozen Frame."""
     if not size:
         return 0
     budget = path_budget(routes, route, size, policy)
-    capacities = resource_capacities(routes, policy)
+    if capacities is None:
+        capacities = resource_capacities(routes, policy)
     limits = []
     for key, coefficient in budget['demand'].items():
         if key not in capacities:
