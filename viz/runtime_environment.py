@@ -6,12 +6,23 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import shutil
 import sys
 import zipfile
 from contextlib import contextmanager
 from paths import VIZ, REPOSITORY, RUNTIME, initialize
 
 _backend = None
+
+
+def source_git():
+    # Native Git scans a Windows checkout without one WSL filesystem roundtrip
+    # per file. Use the installed executable only; Linux workspaces keep Git.
+    if sys.platform=='linux' and str(REPOSITORY.resolve()).startswith('/mnt/'):
+        native=shutil.which('git.exe')
+        if native:
+            return native
+    return 'git'
 
 
 @contextmanager
@@ -45,12 +56,15 @@ def extract_source(raw, root):
 
 
 def source_identity():
-    """Fingerprint tracked backend edits without committing or touching vendors."""
-    head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=REPOSITORY, text=True).strip()
-    changed = subprocess.check_output(['git', 'diff', '--name-only', '-z', 'HEAD', '--',
+    """Fingerprint local backend edits and additions without touching Git state."""
+    git=source_git()
+    head = subprocess.check_output([git, 'rev-parse', 'HEAD'], cwd=REPOSITORY, text=True).strip()
+    changed = subprocess.check_output([git, 'diff', '--name-only', '-z', 'HEAD', '--',
+        'astermind', 'workloads', 'examples'], cwd=REPOSITORY).decode().split('\0')
+    changed += subprocess.check_output([git, 'ls-files', '--others', '--exclude-standard', '-z', '--',
         'astermind', 'workloads', 'examples'], cwd=REPOSITORY).decode().split('\0')
     overlays = {}
-    for name in sorted(filter(None, changed)):
+    for name in sorted(set(filter(None, changed))):
         path = REPOSITORY / name
         if path.is_symlink() or not path.resolve().is_relative_to(REPOSITORY.resolve()):
             raise ValueError('Backend snapshot requires regular repository files')
@@ -108,7 +122,7 @@ def activate():
     with snapshot_lock(root):
         if not marker.is_file():
             root.mkdir(parents=True, exist_ok=True)
-            raw = subprocess.check_output(['git', '-c', 'core.autocrlf=false', 'archive', '--format=zip', head,
+            raw = subprocess.check_output([source_git(), '-c', 'core.autocrlf=false', 'archive', '--format=zip', head,
                                            'astermind', 'workloads', 'examples'], cwd=REPOSITORY)
             extract_source(raw, root)
             for name, content in overlays.items():
@@ -151,6 +165,14 @@ def activate():
         prepare_native_libraries(root)
     from astermind.common.bootstrap import activate as bootstrap
     bootstrap()
+    # Spawned schedulers import thousands of CPU dependency modules. Preserve
+    # the original dynamic-link frontend's Linux-local import priority instead
+    # of probing the Windows source tree for each dependency first.
+    fast=[str(path) for path in dependencies if str(path).startswith('/tmp/')
+          and (path/'vllm').is_dir() and (path/'torch').is_dir()
+          and not (path/'astermind').exists() and not (path/'src').exists()]
+    sys.path[:]=fast+[entry for entry in sys.path if entry not in fast]
+    os.environ['PYTHONPATH']=os.pathsep.join(sys.path)
     _backend = root
     (RUNTIME / 'source.json').write_text(json.dumps({**provenance, 'root': str(root),
                                                    'python': sys.executable}, indent=2))

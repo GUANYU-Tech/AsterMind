@@ -90,8 +90,9 @@ class FlowPathWindow:
         self.paths={k:r for k,r in self.paths.items() if k in recent or 'terminal_order' not in r or r.get('request_id') not in self.completed_requests}
         return dict(schema='orbitserve.live_paths.v1',through_event_count=self.cursor,paths=list(self.paths.values()))
 
-    def save(self, output):
+    def save(self, output, *, force=False):
         folder=Path(output)/'native-replay';folder.mkdir(exist_ok=True)
         target=folder/'live-paths.json';temporary=folder/'live-paths.json.tmp'
         temporary.write_text(json.dumps(self.capture(),ensure_ascii=False),encoding='utf8')
         temporary.replace(target)
+        if self.archive is not None:self.archive.publish(force=force)

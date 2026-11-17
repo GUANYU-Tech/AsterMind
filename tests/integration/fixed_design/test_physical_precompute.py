@@ -127,8 +127,12 @@ class PhysicalPrecomputeTests(unittest.TestCase):
             self.assertIsNotNone(reader._packed)
             with patch.object(reader,'connect',side_effect=AssertionError('reopened database')):
                 for i in range(5000):
-                    saved.distance(edge,5.+i/10000.)
-                self.assertEqual(reader.at.cache_info().misses,1)
+                    t=5.+i/10000.
+                    self.assertEqual(saved.distance(edge,t),state.distance(edge,t))
+                # Scalar distance reads share one decoded block without
+                # expanding a complete geometry/directions record into the LRU.
+                self.assertEqual(reader.block_loads,1)
+                self.assertEqual(reader.at.cache_info().misses,0)
                 for t in (0.,4.99,5.,6.249,6.25,6.251,14.99,15.,19.9,20.):
                     self.assertEqual(json.loads(json.dumps(saved.snapshot(t))),json.loads(json.dumps(state.snapshot(t))))
             with patch('astermind.engine.state.physical_dataset.COMPRESSED_READ_CACHE_BYTES',0):

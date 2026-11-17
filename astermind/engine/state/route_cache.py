@@ -13,6 +13,7 @@ from dataclasses import dataclass, replace
 from types import MappingProxyType
 from copy import copy
 import math
+from time import perf_counter
 
 
 class PathRouteCache:
@@ -31,13 +32,17 @@ class PathRouteCache:
         self.period = None
         self.adjacency = MappingProxyType({})
         self.edges = {}
+        self.link_states = {}
+        self.directional_attributes = {}
         self.boundaries = self.geometry_times = ()
+        self.snapshot_wall_s = self.search_wall_s = 0.
 
     def fork(self):
         result = copy(self)
         result.entries = self.entries.copy()
         result.hits = result.searches = result.invalidations = result.snapshot_builds = 0
         result.negative_hits = 0
+        result.snapshot_wall_s = result.search_wall_s = 0.
         return result
 
     def synchronize(self, net, time_s):
@@ -46,6 +51,7 @@ class PathRouteCache:
         marker = (net.revision, id(net.edges), id(net.link_frames))
         if marker == self.marker and self.start <= time_s < self.deadline:
             return
+        started = perf_counter()
         if marker != self.marker:
             # Construct the supply-boundary index once per graph version.
             times = set(net.environment_times)
@@ -57,11 +63,12 @@ class PathRouteCache:
         period = bisect.bisect_right(self.geometry_times, time_s) - 1
         index = bisect.bisect_right(self.boundaries, time_s)
         deadline = self.boundaries[index] if index < len(self.boundaries) else net.end_s
-        adjacency, edges = {}, {}
+        adjacency, edges, states, directions = {}, {}, {}, {}
         allows = getattr(net, 'allows_hop', lambda a, b: True)
         for edge in net.edges:
             row = net.link_at(edge['link_id'], time_s)
-            if row['state'] != 'UP' or row.get('ready_s', net.start_s) > time_s:
+            states[edge['link_id']] = row
+            if row['state'] != 'UP':
                 continue
             distance = net.distance(edge, time_s)
             if not math.isfinite(distance) or distance < 0:
@@ -71,7 +78,9 @@ class PathRouteCache:
                 if not allows(source, target):
                     continue
                 attrs = net.directional_attributes(edge, source, target, time_s)
-                if attrs['bandwidth_bps'] <= 0 or attrs.get('direction_blocked'):
+                directions[edge['link_id'], source, target] = attrs
+                if (row.get('ready_s', net.start_s) > time_s
+                        or attrs['bandwidth_bps'] <= 0 or attrs.get('direction_blocked')):
                     continue
                 item = RoutingEdge(edge['link_id'], source, target, distance)
                 edges[item.key] = item
@@ -93,8 +102,12 @@ class PathRouteCache:
         self.adjacency = MappingProxyType({node: tuple(sorted(rows, key=lambda e: (e.target, e.link_id)))
                                            for node, rows in adjacency.items()})
         self.edges = edges
+        # Communication and routing read one physical snapshot. Records are
+        # replaced at boundaries; readers never mutate a retained snapshot.
+        self.link_states, self.directional_attributes = states, directions
         self.marker, self.start, self.deadline, self.period = marker, time_s, deadline, period
         self.snapshot_builds += 1
+        self.snapshot_wall_s += perf_counter() - started
 
     def get(self, key):
         if key not in self.entries:
@@ -114,7 +127,8 @@ class PathRouteCache:
     def info(self):
         return dict(entries=len(self.entries), hits=self.hits, searches=self.searches,
                     invalidations=self.invalidations, negative_hits=self.negative_hits,
-                    snapshot_builds=self.snapshot_builds)
+                    snapshot_builds=self.snapshot_builds,
+                    snapshot_wall_s=self.snapshot_wall_s, search_wall_s=self.search_wall_s)
 
 
 @dataclass(frozen=True)

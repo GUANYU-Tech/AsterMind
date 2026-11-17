@@ -328,6 +328,11 @@ class PhysicalAttributes:
         block, index = self._locate(link, time_s)
         return block.geometry(index)
 
+    def geometry_value_at(self, link, time_s, key):
+        """Read one immutable column without expanding geometry/direction dicts."""
+        block, index = self._locate(link, time_s)
+        return block.geometry_value(index, key)
+
     def direction_at(self, link, time_s, source, target):
         block, index = self._locate(link, time_s)
         return block.direction(index, source, target)

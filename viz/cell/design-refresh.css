@@ -5,7 +5,7 @@ html, body.cell-studio { background: #000; }
 .cell-studio .app-header { height: clamp(76px,5vw,104px); padding: 0 clamp(20px,1.4vw,30px); }
 .cell-studio .studio-topbar .studio-logo { font-size: clamp(17px,1.2vw,25px); }
 .cell-studio .studio-sidebar { z-index: 91; }
-.cell-studio .cell-overview { display: none; }
+.cell-studio .cell-overview { display: block; position: absolute; top: 8px; right: 20px; width: 32px; min-height: 32px; height: 32px; padding: 0; margin: 0; color: #aaa; background: transparent; border: 0; font-size: 22px; }
 .cell-studio .chapter-rail { position: static; display: flex; flex-direction: column; justify-content: flex-start; align-items: stretch; gap: clamp(8px,.6vw,12px); width: 100%; transform: none; opacity: 1; }
 .cell-studio .chapter-rail button { min-height: clamp(46px,3.05vw,64px); margin: 0; background: transparent; border: 0; transform: none; padding: 13px clamp(16px,1.4vw,30px); gap: clamp(12px,1.1vw,24px); justify-content: flex-start; }
 .cell-studio .chapter-rail button.is-current { background: #202020; color: var(--ink); border: 0; }
@@ -14,10 +14,8 @@ html, body.cell-studio { background: #000; }
 .cell-studio .studio-sidefoot { gap: 12px; }
 .cell-studio .studio-sidefoot button { display: flex; align-items: center; gap: 24px; padding: 10px clamp(16px,1.4vw,30px); margin: 0; min-height: clamp(46px,3.05vw,64px); font-size: var(--ui-font); color: var(--ink); }
 .cell-studio #scene { position: fixed; left: var(--sidebar); top: var(--edge); width: calc(100vw - var(--sidebar) - var(--edge)); height: calc(100dvh - var(--edge)*2); border: 1px solid var(--border); border-radius: 12px; background: #111; }
-.cell-studio[data-stage=home] #scene, .cell-studio[data-stage=home] #orbit-node-actions { visibility: hidden; }
-.cell-home-frame { position: fixed; inset: var(--edge) var(--edge) var(--edge) var(--sidebar); border: 1px solid var(--border); border-radius: 12px; background: #111; overflow: hidden; }
-.cell-home-frame .workspace-entry-art { top: 8%; right: 7.8%; width: 60%; }
-.cell-studio:not([data-stage=home]) .cell-home-frame { display: none; }
+.cell-studio[data-stage=home] #scene { visibility: visible; }
+.cell-studio[data-stage=home] #orbit-node-actions { visibility: visible; }
 .cell-studio .cell-home { position: fixed; left: calc(var(--sidebar) + (100vw - var(--sidebar))* .048); top: calc(var(--edge) + (100dvh - var(--edge)*2)*.13); max-width: none; pointer-events: none; z-index: 5; }
 .cell-home h1 { font-size: clamp(32px,2.65vw,56px); margin: 0 0 20px; letter-spacing: 0; font-weight: 500; line-height: 1.32; }
 .cell-home > p:not(.eyebrow) { font-size: clamp(16px,1.15vw,24px); margin: 0 0 34px; line-height: 1.4; }
@@ -83,6 +81,9 @@ html, body.cell-studio { background: #000; }
 .cell-studio :is(.link-modes,.boolean-modes) { display: grid; grid-template-columns: 1fr 1fr; gap: 0; border-radius: 9px; overflow: hidden; background: #202020; }
 .cell-studio :is(.link-mode,.boolean-mode) { min-height: 36px; margin: 0; padding: 6px; color: #999; background: transparent; border: 0; border-radius: 9px; font-size: .85em; }
 .cell-studio :is(.link-mode.is-selected,.boolean-mode[aria-pressed=true]) { color: #111; background: #e9e9e9; border: 0; }
+.cell-studio .global-link-mode .link-modes { min-width: 0; }
+.cell-studio .link-mode-note { margin: 0 0 12px; color: #999; font-size: 12px; line-height: 1.65; }
+.cell-studio .optical-migration-note { padding: 12px; background: #202020; border-radius: 8px; color: #ccc; }
 .cell-studio .segmented-source { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
 .cell-studio .toggle-field:focus-within .boolean-modes { outline: 1px solid #83cfe3; }
 .cell-studio .panel-actions { padding: 14px; background: #111; border: 0; gap: 12px; }
@@ -90,7 +91,7 @@ html, body.cell-studio { background: #000; }
 .cell-studio .panel-actions .primary-action span { font: inherit; letter-spacing: 0; }
 .cell-studio .panel-actions .back-action { flex: 1; min-height: 48px; border-radius: 11px; border: 0; background: #202020; color: #bbb; font-size: var(--ui-font); }
 .cell-studio:not([data-stage=home]):not([data-stage=analysis]) #scene { width: calc(100vw - var(--sidebar) - var(--inspector) - var(--edge) - var(--scene-gap)); }
-.cell-studio .scene-caption { left: var(--sidebar); top: var(--edge); width: calc(100vw - var(--sidebar) - var(--inspector) - var(--edge) - var(--scene-gap)); height: clamp(64px,3.85vw,82px); padding: 16px clamp(20px,1.6vw,34px); flex-direction: row; align-items: center; gap: 14px; border-bottom: 1px solid var(--border); }
+.cell-studio .scene-caption { left: var(--sidebar); top: var(--edge); width: calc(100vw - var(--sidebar) - var(--inspector) - var(--edge) - var(--scene-gap)); height: clamp(64px,3.85vw,82px); padding: 16px clamp(20px,1.6vw,34px); flex-direction: row; align-items: center; gap: 14px; border-bottom: 1px solid var(--border); background: #111; border-radius: 12px 12px 0 0; }
 .cell-studio .scene-caption strong { font-size: clamp(18px,1.3vw,28px); }
 .cell-studio .scene-caption > :is(.eyebrow,span:last-of-type) { display: none; }
 .cell-studio .scene-caption #scene-links { position: absolute; top: calc(100% + 12px); left: 24px; max-width: calc(100% - 48px); color: #999; font-size: 11px; opacity: .65; }
@@ -111,6 +112,13 @@ html, body.cell-studio { background: #000; }
 .cell-studio .field-validation.input-placeholder-error { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); margin: 0; }
 .cell-studio input[aria-invalid=true]::placeholder { color: #ef8585; opacity: 1; }
 .cell-studio .unsupported-note { color: #bcbcbc; font-size: 12px; margin: 16px 0 0; line-height: 1.7; }
+.cell-studio .deployment-assistant { padding: 24px; border-bottom: 1px solid var(--border); }
+.cell-studio .deployment-assistant p { margin: 0 0 12px; font-size: 13px; line-height: 1.7; }
+.cell-studio .deployment-assistant p:first-child { color: var(--ink); }
+.cell-studio .deployment-tools { display: flex; flex-wrap: wrap; gap: 10px; }
+.cell-studio .deployment-assistant .boolean-modes { margin-bottom: 12px; }
+.cell-studio :is(.resource-sync-note,.configuration-check) { margin: 0; padding: 18px 24px; font-size: 13px; line-height: 1.7; border-bottom: 1px solid var(--border); color: #bbb; }
+.cell-studio .deployment-tools button { min-height: 36px; padding: 8px 12px; border-radius: 8px; font-size: 13px; }
 @supports (appearance: base-select) {
   .cell-studio .config-field select { appearance: base-select; display: block; background-image: none; padding: 5px 26px 5px 10px; text-align: center; text-align-last: center; line-height: calc(clamp(34px,1.95vw,42px) - 12px); height: clamp(34px,1.95vw,42px); }
   .cell-studio .config-field select::picker-icon { right: 14px; width: 8px; height: 8px; }
@@ -131,17 +139,17 @@ html, body.cell-studio { background: #000; }
   .cell-studio .app-header { height: 64px; width: 100%; }
   .cell-studio .studio-topbar .studio-logo { font-size: 20px; }
   .cell-studio .studio-sidebar { position: relative; inset: auto; height: auto; min-height: 58px; margin: 0; padding: 8px 12px; background: #000; overflow-x: auto; }
+  .cell-studio .cell-overview { position: static; align-self: flex-start; flex-shrink: 0; }
   .cell-studio .chapter-rail { flex-direction: row; width: auto; gap: 4px; }
   .cell-studio .chapter-rail button { min-height: 42px; padding: 10px 12px; width: auto; }
   .cell-studio .chapter-rail button b { display: none; }
   .cell-studio .chapter-rail button span { font-size: 14px; }
   .cell-studio .studio-sidefoot { gap: 4px; }
   .cell-studio .studio-sidefoot button { font-size: 14px; }
-  .cell-studio .cell-home-frame { position: absolute; inset: 134px 12px auto; height: max(650px,calc(100svh - 146px)); }
-  .cell-home-frame .workspace-entry-art { width: 100%; right: 0; top: auto; bottom: 20px; }
   .cell-studio .cell-home { position: absolute; left: 38px; top: 172px; max-width: calc(100% - 76px); }
   .cell-home h1 { font-size: 32px; }
   .cell-studio #scene,.cell-studio:not([data-stage=home]):not([data-stage=analysis]) #scene { position: absolute; top: 134px; left: 12px; width: calc(100% - 24px); height: 28svh; }
+  .cell-studio[data-stage=home] #scene { top: 134px; height: max(650px,calc(100svh - 146px)); }
   .cell-studio .scene-caption { position: absolute; left: 12px; top: 134px; width: calc(100% - 24px); height: 52px; padding: 12px 18px; }
   .cell-studio .scene-caption strong { font-size: 16px; }
   .cell-studio .scene-caption button { font-size: 12px; }

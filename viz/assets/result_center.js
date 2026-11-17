@@ -1,7 +1,7 @@
 import {get} from '/assets/studio_common.js';
 import {setupResultSelection} from '/assets/result_selection.js';
 const $=id=>document.getElementById(id),q=new URLSearchParams(location.search),pathId=location.pathname.match(/^\/runs\/([^/]+)\/result$/)?.[1];
-let identity=q.get('run')||pathId,data=null,view=q.get('view')||'requests',offset=0,filtered=[],frames=new Map();
+let identity=q.get('run')||pathId,data=null,view=q.get('view')||'requests',offset=0,filtered=[],frames=new Map(),replayState=null,replayError='';
 const views=['requests','charts','scene','operators','kv'],size=25;
 const fmt=n=>Number.isFinite(n)?n.toLocaleString('zh-CN',{maximumFractionDigits:6}):'—';
 const communicationLabel=value=>value?.backend==='runtime_comm'?'V1 Runtime Comm':value?.timeline_mode==='simgrid'||value?.backend==='simgrid'?'SimGrid':'FlowSim';
@@ -32,7 +32,10 @@ function charts(){const key=$('chartMetric').value,rows=data.requests.filter(r=>
  const t=chart('requestChart','逐请求时延，点击请求查看表格');const shown=rows.slice(0,200),unit=640/shown.length,peak=Math.max(...shown.map(r=>r[key]),1e-9);shown.forEach((r,i)=>{const bar=svg('rect',{x:52+i*unit,y:210-r[key]/peak*180,width:Math.max(1,unit*.65),height:Math.max(1,r[key]/peak*180),fill:'#8ebbc9',tabindex:0,role:'button','aria-label':'查看请求 '+r.id});bar.append(svg('title',{},r.id+' · '+fmt(r[key])+' s'));const pick=()=>{$('requestSearch').value=r.id;$('requestCell').value='';$('requestState').value='';offset=0;requests();selectView('requests')};bar.onclick=pick;bar.onkeydown=e=>{if(e.key==='Enter')pick()};t.append(bar)});t.append(svg('text',{x:48,y:237},`${shown.length} 个请求${rows.length>200?'（前 200 个）':''}`));
 }
 $('chartMetric').onchange=charts;
-function tool(kind){const host=$(kind==='scene'?'sceneTool':kind==='operators'?'operatorTool':'kvTool');if(frames.has(kind))return;let src;
+function tool(kind){const host=$(kind==='scene'?'sceneTool':kind==='operators'?'operatorTool':'kvTool');if(frames.has(kind))return;
+ if(replayState==='preparing'){host.replaceChildren(el('p','计算结果已保存，正在整理回放。可先查看请求结果，整理完成后这里会自动加载。','card'));return}
+ if(replayState==='failed'){host.replaceChildren(el('p','计算结果已保存；回放整理失败：'+replayError,'card'));return}
+ let src;
  if(data.kind==='native'&&kind==='scene'){
   const surface=el('div',null,'analysis-scene');host.replaceChildren(surface);frames.set(kind,surface);
   import('/assets/recorded_scene.js').then(({mountRecordedScene})=>mountRecordedScene(surface,identity)).catch(error=>{surface.textContent='回放读取失败：'+error.message});return;
@@ -48,10 +51,21 @@ function toolsSummary(){if(data.kind==='legacy'){$('operatorSummary').append(el(
 async function load(){try{if(!identity){$('resultState').textContent='未选择实验';$('resultNotice').textContent='读取实验列表…';$('resultSelection').hidden=false;await setupResultSelection({get,select:$('resultRunSelect'),button:$('openSelectedResult'),status:$('resultNotice'),navigate:url=>location.assign(url)});return}
  $('changeExperiment').hidden=false;
  $('runIdentity').textContent=identity;if(!pathId&&!q.has('run')){const url=new URL(location.href);url.searchParams.set('run',identity);history.replaceState(null,'',url)}const base='/runs/'+encodeURIComponent(identity)+'/',job=await get(base+'status');$('configureRun').hidden=false;$('configureRun').href='/scene?run='+encodeURIComponent(identity);
- if(job.state!=='completed'){$('resultState').textContent={running:'执行中',paused:'已暂停',failed:'执行失败',cancelled:'已停止',interrupted:'已中断'}[job.state]||job.state;$('resultNotice').textContent=job.error||'实验完成后，此处显示服务响应表和分析工具。';const a=el('a','进入在线仿真 →','button primary');a.href=job.runtime_url||base+'progress';$('pendingActions').replaceChildren(a);if(['running','paused','preparing','stopping'].includes(job.state))setTimeout(load,1800);return}
+ if(job.state!=='completed'){$('resultState').textContent={running:'执行中',paused:'已暂停',failed:'执行失败',cancelled:'已停止',interrupted:'已中断'}[job.state]||job.state;$('resultNotice').textContent=job.error||'实验完成后，此处显示服务响应表和分析工具。';const a=el('a','查看运行进度 →','button primary');a.href=base+'progress?next=replay';$('pendingActions').replaceChildren(a);if(['running','paused','preparing','stopping'].includes(job.state))setTimeout(load,1800);return}
+ replayState=job.replay_state;replayError=job.replay_error||'';
  data=await get(base+'analysis');$('resultState').textContent='已完成';$('pendingActions').replaceChildren();if(data.kind==='physical'){$('resultNotice').textContent='本记录只生成物理数据，没有用户业务响应指标。';const a=el('a','查看物理场景','button');a.href=base+'viewer';$('pendingActions').append(a);return}
  $('resultNotice').textContent='';$('resultBody').hidden=false;const s=data.summary;metric('完成请求',`${s.completed} / ${s.total}`,`${s.total-s.completed} 个未完成`);metric('平均响应时间',fmt(s.latency.average)+' s','P95 '+fmt(s.latency.p95)+' s');metric('平均 TTFT',fmt(s.ttft.average)+' s','首 Token 到达客户端');metric('平均 TPOT',fmt(s.tpot.average)+' s','后续 Token 平均间隔');
  const cells=[...new Set(data.requests.map(r=>r.cell).filter(Boolean))];for(const cell of cells){const option=el('option',cell);option.value=cell;$('requestCell').append(option)}$('resultMethod').textContent=({protobridge_cell:'Cell 内通信使用 ProtoBridge',protobridge_satellite:'卫星内通信使用 ProtoBridge',flowsim:'全部通信使用 FlowSim',legacy:'历史服务模型'}[data.communication_mode]||data.communication_mode||'已保存的运行记录').replaceAll('FlowSim',communicationLabel(data))+' / '+fmt(s.requests_per_s)+' 请求/s';$('rawResult').href=data.raw_url;$('rawResult').textContent=data.kind==='legacy'?'下载结果索引':'下载完整结果';
- requests();toolsSummary();selectView(view,false);
+ requests();toolsSummary();selectView(view,false);if(replayState==='preparing')watchReplay();
  }catch(e){$('resultNotice').textContent='结果读取失败：'+e.message;$('resultState').textContent='读取失败'}}
+async function watchReplay(){
+ $('resultNotice').textContent='计算结果已就绪，正在整理回放。请求表格和统计图已可查看。';
+ try{
+  const job=await get('/runs/'+encodeURIComponent(identity)+'/status');
+  replayState=job.replay_state;replayError=job.replay_error||'';
+  if(replayState==='preparing'){setTimeout(watchReplay,document.hidden?5000:2000);return}
+  $('resultNotice').textContent=replayState==='failed'?'回放整理失败：'+replayError:'';
+  selectView(view,false);
+ }catch{setTimeout(watchReplay,4000)}
+}
 load();

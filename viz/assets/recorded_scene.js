@@ -1,4 +1,5 @@
 import {get} from '/assets/studio_common.js';
+import {loadReplayJson} from '/assets/replay_page_loader.js';
 import {isTransmissionEvent,watchTimeline,communicationPositionAt,countAt,compareTime,formatTime} from '/assets/communication_clock.js';
 import {renderEventRows} from '/assets/event_view.js';
 import '/assets/visual_state.js';
@@ -47,19 +48,14 @@ window.inspectRuntimePath=async path=>{
 };
 async function loadPage(index){
  if(!pages.has(index)){
-  let page=await get(base+'native-replay/'+catalog.pages[index].file);
-  if(page.encoding==='gzip-base64'){
-   const bytes=Uint8Array.from(atob(page.data),c=>c.charCodeAt(0));
-   page=await new Response(new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'))).json();
-  }
-  page.visible=page.events.flatMap((event,i)=>isTransmissionEvent(event)?[i]:[]);
+  const page=await loadReplayJson(base+'native-replay/'+catalog.pages[index].file,{events:true});
   pages.set(index,page);while(pages.size>3)pages.delete(pages.keys().next().value);
  }
  return pages.get(index);
 }
 async function physical(at){
  const descriptors=model.artifacts.frames,index=Math.max(0,descriptors.findLastIndex(f=>f.time_s<=at)),descriptor=descriptors[index];
- if(!frames.has(descriptor.artifact)){frames.set(descriptor.artifact,await get(base+descriptor.artifact));while(frames.size>3)frames.delete(frames.keys().next().value)}
+ if(!frames.has(descriptor.artifact)){frames.set(descriptor.artifact,await loadReplayJson(base+descriptor.artifact));while(frames.size>3)frames.delete(frames.keys().next().value)}
  return frames.get(descriptor.artifact);
 }
 async function pageAt(at){

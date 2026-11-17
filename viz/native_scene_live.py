@@ -35,7 +35,8 @@ class DeviceLiveSession(LiveSession):
         self.config, self.automatic = config, automatic
         from live_paths import FlowPathWindow
         self.flow_paths=FlowPathWindow(archive=output)
-        self.projected_events=[]
+        from live_record_store import LiveRecords
+        self.projected_events=LiveRecords(output=output,name='projected-events')
         self.event_cursors={}
 
     def command_engine(self, engine):
@@ -53,13 +54,13 @@ class DeviceLiveSession(LiveSession):
         streams={'host':engine.log,'comm':engine.communication_policy.trace}
         if hasattr(self,'simulation'):
             streams['requests']=self.simulation.request_state_events
+        from heapq import merge
         fresh=[]
         owners={**engine.net.owner,**{device['id']:device['satellite'] for device in self.config.physical['devices']}}
         for name,rows in streams.items():
-            fresh.extend(project(e,owners) for e in rows[self.event_cursors.get(name,0):])
+            fresh.append(map(lambda e: project(e,owners), rows[self.event_cursors.get(name,0):]))
             self.event_cursors[name]=len(rows)
-        fresh.sort(key=lambda e:int(e.get('time_ticks') or round(e['time_s']*1e18)))
-        self.projected_events.extend(fresh)
+        self.projected_events.extend(merge(*fresh,key=lambda e:int(e.get('time_ticks') or round(e['time_s']*1e18))))
         def project(event):
             row = dict(event)
             for key in ('source_node_id', 'target_node_id', 'resume_node_id', 'original_source_node_id', 'compute_node_id', 'flow_source_node_id', 'flow_target_node_id'):
@@ -81,34 +82,35 @@ class DeviceLiveSession(LiveSession):
                                log=RecordView(self.projected_events, range(len(self.projected_events)), project_event), jobs=self.config.requests,
                                env=SimpleNamespace(time=physical.trace.time))
 
-    def persist_paths(self, view):
+    def persist_paths(self, view, *, force=False):
         for order in range(self.flow_paths.cursor,len(view.log)):
             self.flow_paths.observe(view.log[order],order)
         if self.output is not None:
-            self.flow_paths.save(self.output)
+            self.flow_paths.save(self.output,force=force)
 
     def _capture(self, engine, state='paused'):
         view = self.record_view(engine)
         physical = engine.net.physical
-        super()._capture(view, state)
-        self.persist_paths(view)
-        for link in self.payload['links']:
+        payload = super()._build_capture(view, state)
+        self.persist_paths(view,force=state=='finalizing')
+        for link in payload['links']:
             link['configuration_disabled'] = (link['manual_disconnected']
                 and link['link_id'] in self.config.disabled_physical_links)
         from astermind.engine.clock import CLOCK
-        self.payload.update(communication_mode='runtime_comm',
+        payload.update(communication_mode='runtime_comm',
                             clock=CLOCK,
                             time_ticks=str(engine.now.ticks),
                             communication_label=execution_label(self.config),timeline_mode=self.config.timeline_mode,
                             backend=self.config.backend,timeline_authority='simgrid_engine' if self.config.timeline_mode=='simgrid' else 'orbitserve_runtime',
                             gpu_count=sum(d.kind == 'gpu' for d in engine.net.topology.devices.values()),
                             execution_model='native_gpu_operator_graph')
-        self.payload['device_links'] = [dict(id=l.id,source=l.source,target=l.target,
+        payload['device_links'] = [dict(id=l.id,source=l.source,target=l.target,
             state='DOWN' if not l.enabled or l.id in engine.net.disabled_device_links or l.id in engine.net.failed_device_links
             or any(f['target_type']=='node' and f['target_id']==engine.net.topology.devices[l.source].satellite
                    for f in physical.active_faults.values()) else 'UP')
             for l in engine.net.topology.links
             if engine.net.topology.devices[l.source].satellite==engine.net.topology.devices[l.target].satellite]
+        self.payload = payload
 
     def checkpoint(self, engine, force=False):
         if self.automatic:
@@ -138,8 +140,13 @@ def start(root, value, *, automatic=False):
         raise ValueError('三维场景需要物理数据包；静态设备计算请使用计算 Cell 工作区')
     root = Path(root)
     with LOCK:
-        if any(s.payload['state'] in {'preparing','paused','advancing','finalizing'} for s in SESSIONS.values()):
-            raise ValueError('已有在线仿真，请先结束当前会话')
+        active = next((s for s in SESSIONS.values() if s.payload['state'] in {'preparing','paused','advancing','finalizing'}), None)
+        if active is not None:
+            if active.payload['state']=='finalizing':
+                raise ValueError('上一次实验正在整理回放，请稍后再启动')
+            if active.payload['state']=='paused':
+                raise ValueError('旧在线调试会话仍处于暂停状态，请在任务管理结束后再启动')
+            raise ValueError('已有实验正在运行，请等待完成或先在任务管理停止当前任务')
         identity = 'native-scene-' + datetime.now().strftime('%Y%m%d-%H%M%S-%f')
         output = root/'local/results/network'/identity
         inputs = root/'local/inputs/network'/identity
@@ -149,7 +156,7 @@ def start(root, value, *, automatic=False):
         (output/'run_metadata.json').write_text(json.dumps(dict(title=execution_label(config),timeline_mode=config.timeline_mode)), encoding='utf-8')
         session = DeviceLiveSession(identity, output, config, automatic)
         SESSIONS[identity] = session
-    job = dict(id=identity, state='running', interactive=True, native_scene=True,
+    job = dict(id=identity, state='running', interactive=True, automatic=automatic, native_scene=True,
                input=str((inputs/'manifest.json').relative_to(root)), output=str(output),
                runtime_url=f'/live/{identity}')
     console.JOBS[identity] = job
@@ -158,12 +165,19 @@ def start(root, value, *, automatic=False):
     select(root, identity)
 
     def worker():
+        results_ready = False
         try:
             from astermind.engine import runtime_control
             from astermind.engine.simulation import Simulation
             from astermind.__main__ import json_default
             from astermind.engine.audit import audit
-            from native_live import physical_export
+            def phase(label):
+                console.status(job,'completed' if results_ready else 'running',phase=label)
+            def ready():
+                nonlocal results_ready
+                results_ready = True
+                console.status(job,'completed',phase='计算结果已就绪，正在整理回放',
+                               replay_state='preparing',result_url=f'/runs/{identity}/result')
             def progress(stage):
                 label={'bootstrap':'加载执行环境','physics':'读取已生成的物理拓扑','network':'建立通信资源与全局时间轴','ready':'初始化完成，准备推进仿真'}.get(stage['phase'])
                 if stage['phase']=='cell':
@@ -182,14 +196,18 @@ def start(root, value, *, automatic=False):
                 console.status(job,'running',phase=label)
             with runtime_control(session), Simulation(config,startup_progress=progress,physical_output_dir=output/'physical') as simulation:
                 session.simulation = simulation
+                from live_network_updates import coalesce_network_updates
+                coalesce_network_updates(simulation.host)
+                from live_record_store import compact_communication_trace
+                compact_communication_trace(simulation.host,output)
                 console.status(job, 'running', phase='执行全局事件时间轴')
                 result = simulation.run()
                 from native_result_store import save_audited_result
                 save_audited_result(output/'native_result.json', result,
-                                    auditor=audit, default=json_default)
+                                    auditor=audit, default=json_default,progress=phase)
                 from scene_outputs import export
-                export(output,result,config,simulation.physical)
-            console.status(job, 'completed', result_url=f'/runs/{identity}/result')
+                export(output,result,config,simulation.physical,progress=phase,on_ready=ready)
+            console.status(job, 'completed',phase='结果与回放已就绪',replay_state='ready',result_url=f'/runs/{identity}/result')
             with session.condition:
                 session.version += 1
                 session.payload.update(state='completed', version=session.version, message='仿真完成，算子与通信记录已保存')
@@ -199,8 +217,16 @@ def start(root, value, *, automatic=False):
         except Exception as error:
             import traceback
             (output/'execution.log').write_text(traceback.format_exc(), encoding='utf-8')
-            state = 'cancelled' if isinstance(error, SessionStopped) else 'failed'
-            console.status(job, state, error=str(error))
+            try:
+                session.flow_paths.archive.publish(force=True)
+            except Exception:
+                with (output/'execution.log').open('a',encoding='utf-8') as stream:
+                    stream.write('\nPath index publication failed:\n'+traceback.format_exc())
+            state = 'completed' if results_ready else 'cancelled' if isinstance(error, SessionStopped) else 'failed'
+            if results_ready:
+                console.status(job,state,replay_state='failed',replay_error=str(error),phase='计算结果已保存，回放整理失败')
+            else:
+                console.status(job, state, error=str(error))
             with session.condition:
                 session.version += 1
                 session.payload.update(state=state, version=session.version, message=str(error))

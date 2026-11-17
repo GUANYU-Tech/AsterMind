@@ -15,6 +15,9 @@ from console import Handler as SceneHandler
 
 class Handler(SceneHandler):
     def raw(self,data,content_type):
+        if content_type.startswith('text/html') and urlparse(self.path).path.startswith('/cell/'):
+            from simulation_platforms import control
+            data=control(data,'v1')
         self.send_response(200)
         self.send_header('Content-Type',content_type)
         self.send_header('Content-Length',str(len(data)))
@@ -57,6 +60,9 @@ class Handler(SceneHandler):
             job=parts[2]
             if len(parts)==3:return self.respond(jobs.status(job))
             name=parts[3]
+            if name=='analysis':
+                from cell_result_view import report
+                return self.respond(report(jobs.folder(job),query))
             if name in ('configuration','result'):
                 return self.respond(json.loads((jobs.folder(job)/(name+'.json')).read_text()))
             if name=='artifacts': return self.respond(jobs.artifacts(job))
@@ -69,6 +75,19 @@ class Handler(SceneHandler):
 
     def do_POST(self):
         path=urlparse(self.path).path
+        if path=='/simulation-platform':
+            host=self.allowed_authority()
+            if not host or (self.headers.get('Origin') and self.headers['Origin'].lower()!=f'http://{host}'):
+                return self.respond({'error':'same origin required'},code=403)
+            try:
+                length=int(self.headers.get('Content-Length',0))
+                if not 0<length<=1024:raise ValueError('无效的平台请求')
+                value=json.loads(self.rfile.read(length))
+                if set(value)!={'platform'}:raise ValueError('无效的平台选择')
+                from simulation_platforms import select
+                return self.respond(select(value['platform'],self.server.server_port))
+            except Exception as error:
+                return self.respond({'error':str(error)},code=400)
         if not path.startswith('/cell/api/'): return super().do_POST()
         try:
             host=self.allowed_authority()
@@ -119,6 +138,11 @@ def main():
     server.allowed_hosts={f'localhost:{args.port}',f'127.0.0.1:{args.port}'}
     print(json.dumps(identity()),flush=True)
     print(f'Open http://localhost:{args.port}/',flush=True)
+    # The handoff viewer consumes lossless live communication pages on its own
+    # clock. Starting only the HTTP server left it stuck in event-step fallback.
+    import threading
+    from live_communication import watch
+    threading.Thread(target=watch,args=(WORKSPACE,),kwargs={'wait_for_lock':True},daemon=True,name='live-communication-publisher').start()
     server.serve_forever()
 
 

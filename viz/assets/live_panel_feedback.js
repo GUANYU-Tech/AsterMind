@@ -14,18 +14,10 @@ export function attachLivePanelFeedback(container){
  }
  legend.append(list);container.append(legend);
 
- const waiting=document.createElement('div');waiting.className='live-compute-wait';waiting.hidden=true;waiting.setAttribute('role','status');waiting.setAttribute('aria-live','polite');
- const spinner=document.createElement('span');spinner.className='live-wait-spinner';spinner.setAttribute('aria-hidden','true');
- const copy=document.createElement('div'),title=document.createElement('strong'),detail=document.createElement('span');copy.append(title,detail);
- const elapsed=document.createElement('span');elapsed.className='live-wait-elapsed';elapsed.setAttribute('aria-hidden','true');waiting.append(spinner,copy,elapsed);container.append(waiting);
- let phase=null,since=0,lastSecond=-1;
+ // Execution status belongs to the page toolbar. The globe keeps its geometry
+ // and traffic visible while the solver prepares the next batch.
  return {
-  update(feedback,now=performance.now()){
-   if(!feedback){if(phase!==null){waiting.hidden=true;container.setAttribute('aria-busy','false');phase=null}return}
-   if(phase!==feedback.phase){phase=feedback.phase;since=now;lastSecond=-1;title.textContent=feedback.title;detail.textContent=feedback.detail;waiting.hidden=false;container.setAttribute('aria-busy','true')}
-   const seconds=Math.floor(Math.max(0,now-since)/1000);
-   if(seconds!==lastSecond){lastSecond=seconds;elapsed.textContent=seconds+' s'}
-  },
-  dispose(){legend.remove();waiting.remove();container.removeAttribute('aria-busy')},
+  update(){},
+  dispose(){legend.remove()},
  };
 }

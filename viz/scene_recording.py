@@ -5,13 +5,15 @@ import gzip
 import json
 from pathlib import Path
 import sqlite3
+from contextlib import closing
 
 from event_catalog import annotate, is_playback_event
 from live_replay import LiveReplayWindow
 
 
 def page_paths(output, data):
-    archive=Path(output)/'native-replay'/'flow-paths.sqlite3'
+    from flow_archive import query_path
+    archive=query_path(output)
     if not archive.is_file():return []
     identities=set()
     for event in [*data['initial'].get('active_transfers',[]),*data['events']]:
@@ -19,14 +21,14 @@ def page_paths(output, data):
         identity=(event.get('v1_flow_id') or event.get('id')) if event.get('time_semantics')=='whole_path_shared_resources' else event.get('cell_transfer_id') or (request[len('__cell_transfer__/'):] if request.startswith('__cell_transfer__/') else None)
         if identity:identities.add(identity)
     rows=[];identities=sorted(identities)
-    with sqlite3.connect(archive.as_uri()+'?mode=ro',uri=True) as db:
+    with closing(sqlite3.connect(archive.as_uri()+'?mode=ro',uri=True)) as db:
         for start in range(0,len(identities),256):
             part=identities[start:start+256]
             rows.extend(json.loads(row[0]) for row in db.execute('SELECT data FROM paths WHERE id IN ('+','.join('?' for _ in part)+')',part))
     return rows
 
 
-def build_recording(output, page_size=4096, *, force=False):
+def build_recording(output, page_size=4096, *, force=False, configuration=None):
     output=Path(output);folder=output/'native-replay';folder.mkdir(exist_ok=True)
     target=folder/'scene-recording.json'
     if target.is_file() and not force:
@@ -37,8 +39,10 @@ def build_recording(output, page_size=4096, *, force=False):
     state=LiveReplayWindow();links={};commands={};pages=[];events=[];visible=0;offset=0;last_time=0
     from runtime_events import project
     from live_paths import FlowPathWindow
-    saved=json.loads((output/'native_result.json').read_text())
-    owners={d['id']:d['satellite'] for d in saved['configuration']['physical']['devices']}
+    if configuration is None:
+        from astermind.common.result_storage import load_result
+        configuration=load_result(output/'native_result.json')['configuration']
+    owners={d['id']:d['satellite'] for d in configuration['physical']['devices']}
     paths=FlowPathWindow(archive=output)
     def context():
         return deepcopy(dict(active_transfers=list(state.flows.values()),route_plans=list(state.plans.values()),
@@ -73,7 +77,7 @@ def build_recording(output, page_size=4096, *, force=False):
             if raw['kind']=='topology_command':commands[raw.get('target_id',raw.get('link_id',''))]=raw
             if visible>=page_size or len(events)>=page_size*2:flush()
     flush()
-    paths.save(output)
+    paths.save(output,force=True)
     result=dict(schema='orbitserve.scene_recording.v1',pages=pages,event_count=offset,end_s=last_time,end_ticks=raw.get('time_ticks'))
     if raw.get('time_ticks') is not None:
         from astermind.engine.clock import CLOCK

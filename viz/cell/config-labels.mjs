@@ -13,7 +13,7 @@ export const labels = {
   timestamp:"冻结时刻 / 含时区", earth_orientation_mode:"地球定向模式", tle_file:"已导入 TLE",
   type:"拓扑类型", gateway_local_index:"网关卡 ID", max_range_km:"最大距离 / km", drop_infeasible_links:"剔除不可行光链路",
   links:"星间连接", target:"目标卫星", tx_power_w:"发射功率 / W", tx_aperture_m:"发射口径 / m", wavelength_m:"波长 / m",
-  beam_waist_m:"束腰 / m", baud_rate_options_ghz:"候选波特率 / GHz", wdm_channels:"WDM 通道数", fec_overhead:"FEC 开销比例",
+  baud_rate_ghz:"波特率 / GBaud", preamp_gain_db:"前置放大增益 / dB", wdm_channels:"WDM 通道数", fec_overhead:"FEC 开销比例",
   dual_polarization:"双偏振", wdm_power_mode:"WDM 功率模式", modulation_pool:"调制方式集合", rx_aperture_m:"接收口径 / m",
   preamp_nf_db:"前置放大噪声系数 / dB", ber_threshold:"BER 阈值", terminal_cap_gbps:"终端带宽上限 / Gbps",
   link_margin_db:"链路余量 / dB", optical_efficiency:"光学效率", wdm_loss_db:"WDM 损耗 / dB", pointing_error_rad:"指向误差 / rad",

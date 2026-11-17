@@ -1,9 +1,10 @@
 import {get,post} from '/assets/studio_common.js';
-import {livePlaybackState,shouldAdvanceLive,liveWaitingFeedback} from '/assets/live_playback_state.js';
+import {acceptsLiveState,requestLiveState,livePlaybackState,shouldAdvanceLive,liveWaitingFeedback,liveAdvancePlan} from '/assets/live_playback_state.js';
 import {eventGroups,eventDescription,renderEventRows} from '/assets/event_view.js';
 import {updateLiveScene,inspectLiveEvent,viewingLive,hasPendingLiveEvents,nextLiveEvent,showCurrentLiveEvent,setLivePlayback,setLivePhysicalSource,advanceLiveWatch,streamingLive,bufferedWatchSeconds,watchedThrough,executedThroughTime,latestCommunicationTime,watchDidMove,watchingSelectedPath,selectedPathComplete,liveWatchError,resumeLiveWatch} from '/assets/live_scene.js';
 import '/assets/fault_state.js';
 import {createCellTopology} from '/assets/cell_topology.js';
+import {formatTime} from '/assets/communication_clock.js';
 const $=id=>document.getElementById(id),ns='http://www.w3.org/2000/svg';
 const observeOnly=new URLSearchParams(location.search).get('observe')==='1';
 const recordedScene=new URLSearchParams(location.search).get('recorded')==='1';
@@ -15,6 +16,7 @@ if(recordedScene){
 let identity=location.pathname.split('/')[2]||null,state=null,version=null,playing=new URLSearchParams(location.search).get('autostart')==='1',busy=false,selectedNode='',selectedLink='',pendingConnections=new Set();
 const pageOpenedAt=Date.now()/1000;
 let commandPending=false,advanceInFlight=Promise.resolve();
+let pollError=null;
 let nextDisplayAt=0,singleStep=false;
 let nativeConfig=null;
 const topologyHost=document.createElement('div');$('selection').after(topologyHost);
@@ -29,9 +31,11 @@ const labels={request_arrival:'请求到达',route_plan:'路线规划',route_rec
 const stateLabels={preparing:'准备场景',paused:'当前时刻已暂停',advancing:'正在执行',completed:'已完成',failed:'执行失败',cancelled:'已结束',finalizing:'保存执行日志'};
 function trafficStatus(flows,label){const host=$('trafficState');host.replaceChildren();for(const [status,text]of [['transmitting','正在传输'],['queued','排队'],['propagating','传播']]){const item=document.createElement('span'),name=document.createElement('span'),value=document.createElement('strong');item.className='traffic-stat';name.textContent=text;value.textContent=flows.filter(f=>f.status===status).length;item.append(name,value);host.append(item)}const event=document.createElement('span');event.className='traffic-event';event.textContent=label;host.append(event)}
 function notice(message,type=''){const host=$('notice'),classes='notice '+type;if(host.textContent!==message)host.textContent=message;if(host.className!==classes)host.className=classes}
+function controlText(id,text){if($(id).textContent!==text)$(id).textContent=text}
 function displayClock(){
- const seconds=value=>Number(value).toFixed(6).replace(/\.?0+$/,''),time=Math.max(state?.time_s||0,executedThroughTime()),recent=latestCommunicationTime();
- const clock=seconds(time)+' s',info=recent===null?'暂无通信':`最近一次通信：${seconds(recent)} s`;
+ const seconds=value=>Number(value).toFixed(6).replace(/\.?0+$/,''),view=window.networkReplayState?.()?.runtime,time=view?.time_s??state?.time_s??0;
+ const exact=$('livePlaybackMode')?.value==='inspect'&&view?.event?.time_ticks!=null;
+ const clock=(exact?formatTime(view.event):seconds(time))+' s',info=state?.nodes?`后端已执行至 ${seconds(Math.max(state.time_s||0,executedThroughTime()))} s`:'等待场景初始化';
  if($('clock').textContent!==clock)$('clock').textContent=clock;
  if($('stepInfo').textContent!==info)$('stepInfo').textContent=info;
 }
@@ -99,17 +103,18 @@ function menus(){
 }
 function render(){
  document.querySelector('h1').textContent=recordedScene?'场景回放':'在线仿真';
- $('sessionState').textContent=playing&&state.state==='paused'?'在线运行中':stateLabels[state.state]||state.state;$('launcher').hidden=!!identity;
+ $('launcher').hidden=!!identity;
  $('viewResults').hidden=state.state!=='completed';$('viewResults').href=`/results?run=${encodeURIComponent(identity)}`;
  $('liveBackend').textContent=state.backend?state.backend.toUpperCase():'';
  const replay=state.replay,flows=replay?RuntimeVisual.stateAt(replay.initial,replay.events,replay.events.length-1).activeTransfers:[];
  const counts=status=>flows.filter(flow=>flow.status===status).length;
- if(state.nodes)trafficStatus(flows,'已完成请求 '+(state.completed??0));else $('trafficState').textContent='正在准备在线通信场景…';
+ $('runningTraffic').hidden=!state.nodes;
+ if(state.nodes)trafficStatus(flows,'已完成请求 '+(state.completed??0));
  $('fullReplay').hidden=state.state!=='completed';$('fullReplay').href=state.execution_model==='native_gpu_operator_graph'?`/runs/${encodeURIComponent(identity)}/native-replay/index.html`:`/runs/${encodeURIComponent(identity)}/runtime?view=playback`;
  $('fullReplay').textContent=state.execution_model==='native_gpu_operator_graph'?'GPU 算子与通信回放 →':'完整 3D 回放 →';
  displayClock();
  $('stop').disabled=!['preparing','paused','advancing'].includes(state.state)||commandPending;
- if(!state.nodes){notice(state.message||'正在准备…',state.state==='failed'?'error':'');return}
+ if(!state.nodes){playbackControls();if(['failed','cancelled'].includes(state.state))notice(state.message,'error');return}
  $('eventCount').textContent=(state.event_groups?.counts.business||0).toLocaleString();$('upCount').textContent=state.links.filter(e=>e.state==='UP').length.toLocaleString();$('linkCount').textContent=`${state.links.length.toLocaleString()} 条候选链路，${state.nodes.length} 个节点`;
  const faults=FaultVisual.collect(state);$('faultCount').textContent=faults.filter(f=>f.type==='node').length+' / '+faults.filter(f=>f.type==='link').length;$('requests').textContent=state.completed+' / '+state.failed;$('requestCount').textContent=state.request_count+' 个实际业务请求'+(state.communication_label?'，'+state.communication_label:'');$('revision').textContent='网络状态修订号 '+state.topology_revision;
  menus();updateLiveScene(state,{onNode:selectNode,onLink:selectLink,onEvent:inspectEvent,onMode:inspectSelection,onPresent:presentEvent,onHistory:pauseForHistory,onWatchPlay:()=>{playing=true;playbackControls()},onWatchEnd:terminal=>{playing=false;playbackControls();notice(terminal==='completed'?'所选传输已到达终点':terminal==='failed'?'所选传输已失败':'已到达当前已执行的时刻')},label:labels});inspectSelection();topology();timeline();tables();playbackControls();
@@ -125,37 +130,45 @@ function presentEvent(runtime){
 function pauseForHistory(){playing=false;singleStep=false;playbackControls();if(!observeOnly&&state?.state==='advancing')post(`/live/${identity}/pause`,{}).catch(error=>notice(error.message,'error'))}
 function playbackControls(){
  displayClock();
- const pending=hasPendingLiveEvents(),playback=livePlaybackState(state,{playing,pending,stream:streamingLive(),through:watchedThrough(),observeOnly}),disabled=commandPending||busy;
- const feedback=liveWaitingFeedback(state,{waiting:playback.waiting,pending,error:liveWatchError(),observeOnly});
+ const pending=hasPendingLiveEvents(),playback=livePlaybackState(state,{playing,pending,stream:streamingLive(),through:watchedThrough(),observeOnly}),disabled=commandPending||singleStep;
+ const feedback=liveWaitingFeedback(state,{waiting:playback.waiting,pending,error:liveWatchError(),observeOnly,playing});
  setLivePlayback(playing,Number($('eventRate').value),feedback);
- $('sessionState').textContent=playing?(playback.waiting?(liveWatchError()?'通信记录读取失败':feedback?.title||'等待通信数据'):'正在播放通信'):stateLabels[state?.state]||state?.state||'准备场景';
+ controlText('sessionState',pollError?'连接恢复中':state?.state==='preparing'||!state?'正在准备场景':playing?'在线运行中':stateLabels[state.state]||state.state);
  $('advance').disabled=!playback.ready||disabled;$('play').disabled=!playback.canToggle||commandPending;
  if($('returnLive'))$('returnLive').hidden=viewingLive();
- if($('previousTime'))$('previousTime').disabled=!streamingLive();
- $('play').textContent=playback.label;
+ if($('previousTime'))$('previousTime').disabled=!streamingLive()||commandPending||singleStep;
+ controlText('play',playback.label);
  return {...playback,feedback};
 }
 async function advanceEvent(batch=false){
  if(observeOnly)return;
  busy=true;playbackControls();
- try{const payload=batch?{mode:'time',until_s:Math.min(state.end_s,state.time_s+2)}:{mode:'event'},before=state.version;advanceInFlight=post(`/live/${identity}/advance`,payload);const reply=await advanceInFlight;if(state.version===before){state.state=reply.state;state.version=reply.version??before+1}version=null}
+ try{const replay=state.replay,flows=replay?RuntimeVisual.stateAt(replay.initial,replay.events,replay.events.length-1).activeTransfers:[];
+  const payload=liveAdvancePlan(state,{stream:batch,activeTransfers:flows.some(flow=>['transmitting','queued','propagating'].includes(flow.status)),singleStep}),before=state.version;
+  advanceInFlight=post(`/live/${identity}/advance`,payload);const reply=await advanceInFlight;if(state.version===before){state.state=reply.state;state.version=reply.version??before+1}version=null}
  finally{busy=false;playbackControls()}
 }
 async function refresh(){
  if(!identity)return;
  try{
-  const update=['completed','cancelled','failed'].includes(state?.state)?{unchanged:true}:await get(`/live/${encodeURIComponent(identity)}/state`+(version==null?'':'?after='+version));
-  if(!update.unchanged&&(!state||update.version>=state.version)){state=update;version=update.version??null;render();if(state.nodes&&['paused','advancing'].includes(state.state))notice(playing?'正在播放通信传输':'已暂停观看，可检查下一时刻')}
-  if(state?.state==='preparing'){const waited=Math.max(0,Math.floor(Date.now()/1000-(state.preparation_started_at||pageOpenedAt)));notice(`${state.message||'初始化仿真环境'}，已等待 ${waited} 秒`,'working')}
- }catch(error){notice(error.message,'error')}
- finally{setTimeout(refresh,250)}
+  const update=['completed','cancelled','failed'].includes(state?.state)?{unchanged:true}:await requestLiveState(`/live/${encodeURIComponent(identity)}/state`+(version==null?'':'?after='+version));
+  pollError=null;
+  if(acceptsLiveState(state,update)){state=update;version=update.version??null;render()}
+ }catch(error){pollError=error.name==='TimeoutError'?'状态读取超时，正在自动重试，无需刷新页面':error.message;notice(pollError,'error')}
+ finally{setTimeout(refresh,document.hidden?2000:state?.state==='preparing'?1000:playing?500:1000)}
 }
 // A slow state snapshot or advance acknowledgement must not block rendering
 // communication that has already arrived in the independent page buffer.
 function requestAdvance(batch){if(!busy&&!commandPending)advanceEvent(batch).catch(error=>{version=null;notice(error.message,'error')})}
 async function playbackTick(){
  try{
-  if(singleStep&&!commandPending){if(await advanceLiveWatch(performance.now(),1,true)){if(watchDidMove())singleStep=false;else if(state?.state==='paused'&&state.time_s<state.end_s)requestAdvance(true);playbackControls()}else if(hasPendingLiveEvents()){nextLiveEvent();singleStep=false;playbackControls()}}
+  if(singleStep&&!commandPending&&!busy){
+   const stream=await advanceLiveWatch(performance.now(),1,true);
+   if(stream&&watchDidMove()){singleStep=false;playbackControls()}
+   else if(!stream&&hasPendingLiveEvents()){nextLiveEvent();singleStep=false;playbackControls()}
+   else if(!observeOnly&&state?.state==='paused'&&state.time_s<state.end_s)requestAdvance(stream);
+   else if(['completed','cancelled','failed'].includes(state?.state)){singleStep=false;playbackControls()}
+  }
   if(playing&&!commandPending){
    const inspect=$('livePlaybackMode')?.value==='inspect';
    const due=performance.now()>=nextDisplayAt;
@@ -167,11 +180,18 @@ async function playbackTick(){
    if(!observeOnly&&shouldAdvanceLive(state,{stream,pending:hasPendingLiveEvents(),remaining:bufferedWatchSeconds(),selectedComplete:watchingSelectedPath()&&selectedPathComplete()}))requestAdvance(stream);
   }
   const playback=playbackControls();
-  if(playback.drained){
+  if(pollError){
+   notice(pollError,'error');
+  }else if(playback.drained){
    playing=false;singleStep=false;playbackControls();notice(state.message||'仿真已结束，可查看实验结果',state.state==='failed'?'error':'');
+  }else if(playback.feedback?.phase==='preparing'){
+   const waited=Math.max(0,Math.floor(Date.now()/1000-(state?.preparation_started_at||pageOpenedAt)));
+   notice(`${playback.feedback.title}：${state?.message||'初始化仿真环境'}，已等待 ${waited} 秒。${playback.feedback.detail}`,'working');
+  }else if(playing&&!['finalizing','failed'].includes(state?.state)){
+   notice(liveWatchError()||'正在播放通信，数据就绪后会自动继续。',liveWatchError()?'error':'');
   }else if(playback.waiting||playback.feedback){
    notice(liveWatchError()||(state?.state==='failed'?state.message:playback.feedback?.title+'，'+playback.feedback?.detail),liveWatchError()||state?.state==='failed'?'error':'working');
-  }else if($('notice').className==='notice working'){
+  }else if($('notice').className==='notice working'||state?.nodes&&$('notice').textContent==='等待任务运行。'){
    notice(playing?'正在播放通信传输':'已暂停观看，可检查下一时刻');
   }
  }catch(error){notice(error.message,'error')}
@@ -203,7 +223,7 @@ $('connect').onclick=()=>command({action:'connect',endpoint_a:$('endpointA').val
 $('reconnect').onclick=()=>{const link=state?.links.find(e=>e.link_id===selectedLink);if(link)command({action:'connect',endpoint_a:link.endpoint_a,endpoint_b:link.endpoint_b})};
 $('endpointA').onchange=$('endpointB').onchange=inspectSelection;
 for(const endpoint of ['A','B'])$('useEndpoint'+endpoint).onclick=()=>{$('endpoint'+endpoint).value=selectedNode;inspectSelection()};
-$('advance').onclick=async()=>{playing=false;singleStep=true;playbackControls();if(!streamingLive()&&!hasPendingLiveEvents())try{await advanceEvent()}catch(error){singleStep=false;notice(error.message,'error')}};
+$('advance').onclick=()=>{if(commandPending||singleStep)return;playing=false;singleStep=true;playbackControls()};
 if($('previousTime'))$('previousTime').onclick=async()=>{playing=false;try{await advanceLiveWatch(performance.now(),1,-1);playbackControls()}catch(error){notice(error.message,'error')}};
 if($('returnLive'))$('returnLive').onclick=()=>{playing=false;showCurrentLiveEvent();playbackControls()};
 $('play').onclick=()=>{playing=!playing;singleStep=false;nextDisplayAt=0;if(playing)resumeLiveWatch();playbackControls();if(!observeOnly&&!playing&&state.state==='advancing')post('/live/'+identity+'/pause',{}).catch(error=>notice(error.message,'error'));notice(playing?'正在播放通信传输':'已暂停观看，可检查下一时刻')};

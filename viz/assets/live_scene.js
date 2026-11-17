@@ -4,6 +4,7 @@ import '/assets/constellation_layout.js';
 import {createLiveEventCursor,isPlaybackEvent} from '/assets/live_event_cursor.js';
 import {eventsForPath} from '/assets/live_traffic_model.js';
 import {LiveCommunicationWatch} from '/assets/live_watch.js';
+import {loadReplayJson} from '/assets/replay_page_loader.js';
 import {formatTime} from '/assets/communication_clock.js';
 
 const $=id=>document.getElementById(id),liveCursor=createLiveEventCursor();
@@ -12,6 +13,7 @@ let livePlaying=false,liveRate=1,historyPlaying=false,liveWaiting=null;
 let pathReplay=null;
 let watchPlayer=null,watchView=null,watchPollAt=0,watchRevision=0,watchLast=null,watchBusy=false,watchIndexRequest=null;
 let watchMoved=false;
+let detachedWatch=false;
 const watchFrames=new Map(),recentTransfers=new Map();
 export function streamingLive(){return !!watchPlayer?.index}
 export function bufferedWatchSeconds(){return watchPlayer?.remaining||0}
@@ -29,7 +31,6 @@ export function watchingSelectedPath(){return !!watchPlayer?.selected}
 export function selectedPathComplete(){return !!pathReplay?.path?.terminal}
 export function resumeLiveWatch(){watchLast=null;if(watchPlayer?.selected&&selectedPathComplete()&&!watchPlayer.pending){watchPlayer.time=watchPlayer.selected.toSimulation(0);watchPlayer.exact=null}}
 async function streamIndex(){
- if(latest?.communication_mode==='runtime_comm')return;
  if(watchIndexRequest)return watchIndexRequest;
  if(!latest?.id||performance.now()<watchPollAt)return;
  watchPollAt=performance.now()+200;
@@ -37,7 +38,7 @@ async function streamIndex(){
  const response=await fetch(`/runs/${encodeURIComponent(latest.id)}/native-replay/live-communication.json`,{cache:'no-store'});
  if(!response.ok)return;
  const index=await response.json();
- if(!watchPlayer)watchPlayer=new LiveCommunicationWatch(async name=>{const response=await fetch(`/runs/${encodeURIComponent(latest.id)}/native-replay/${name}`);if(!response.ok)throw Error('读取在线通信记录失败');return response.json()});
+ if(!watchPlayer)watchPlayer=new LiveCommunicationWatch(name=>loadReplayJson(`/runs/${encodeURIComponent(latest.id)}/native-replay/${name}`,{events:true}));
  watchPlayer.update(index);
  })();
  try{await watchIndexRequest}finally{watchIndexRequest=null}
@@ -70,6 +71,7 @@ export async function advanceLiveWatch(now,rate=1,inspect=false){
   const elapsed=watchLast===null ? .08 : Math.max(0,(now-watchLast)/1000);watchLast=now;
   const view=inspect?await watchPlayer.next(typeof inspect==='number'?inspect:1):await watchPlayer.advance(elapsed,rate);
   if(view){
+   if(typeof inspect==='number'&&inspect<0)detachedWatch=true;
    if(physicalSource&&![...watchFrames.values()].some(frame=>frame.time_s<=view.time)){
     const base='/runs/'+encodeURIComponent(physicalSource)+'/';
     if(!physicalIndex){const response=await fetch(base+'environment-index');if(response.ok)physicalIndex=await response.json()}
@@ -192,7 +194,7 @@ export function updateLiveScene(state,handlers){
  loadPaths();
 }
 export function hasPendingLiveEvents(){return streamingLive()?watchPlayer.pending:liveCursor.pending>0}
-export function showCurrentLiveEvent(){pathRequest++;stop();pathReplay=null;history=false;watchView=null;if(watchPlayer){watchPlayer.time=latest.time_s;watchPlayer.select(null)}liveCursor.catchUp();cursor=liveCursor.index;render()}
+export function showCurrentLiveEvent(){pathRequest++;stop();pathReplay=null;history=false;detachedWatch=false;watchView=null;if(watchPlayer){watchPlayer.time=latest.time_s;watchPlayer.select(null)}liveCursor.catchUp();cursor=liveCursor.index;render()}
 export function nextLiveEvent(){
  pathRequest++;stop();pathReplay=null;history=false;const next=liveCursor.next();if(next===null)return false;
  cursor=next;render();callbacks.onEvent?.(latest.replay.events[cursor],false);return true;
@@ -202,4 +204,6 @@ export function inspectLiveEvent(event){
  pathReplay=null;
  const index=latest?.replay?.events.findIndex(e=>e.event_order===event.event_order)??-1;if(index>=0)seek(index);
 }
-export function viewingLive(){return !history&&(watchView?watchView.time>=latest.time_s:!liveCursor.pending)}
+// Buffered live playback is still live mode. Only explicit history/path/back
+// navigation detaches the view; new solver batches never reveal Return Live.
+export function viewingLive(){return !history&&!pathReplay&&!detachedWatch}

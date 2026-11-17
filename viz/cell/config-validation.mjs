@@ -1,4 +1,6 @@
 import { fieldStage } from './config-layout.mjs?v=compact-2';
+import {linkMode} from './link-mode.mjs';
+import {resourceSyncError} from './resource-sync.mjs';
 
 const resolve = (spec, defs) => spec?.$ref ? defs[spec.$ref.split('/').at(-1)] || {} : spec || {};
 export function schemaAt(schema, path) {
@@ -155,6 +157,7 @@ export function configurationErrors(root, schema, stage = null) {
     } else add(path,fieldError(value,path,root,spec,schema.$defs));
   }
   walk(root,schema,[]);
+  if (root.hardware && root.deployment && resourceSyncError(root)) add(['hardware','satellite_count'],resourceSyncError(root));
   if(root.hardware && root.hardware.satellite_count!==root.hardware.satellite_ids?.length) add(['hardware','satellite_ids'],'ID 数量必须与卫星数量一致');
   if(root.topology?.source==='orbit' && !root.constellation?.tle_file) add(['constellation','tle_file'],'请先导入 TLE 文件');
   if(root.topology?.source==='formation' && !root.constellation?.formation) add(['constellation','formation'],'请设置静态编队');
@@ -164,10 +167,12 @@ export function configurationErrors(root, schema, stage = null) {
   for(const [i,link] of (root.topology?.inter_satellite?.links || []).entries()) {
     if(link.mode==='fixed' && link.bandwidth_gbps==null) add(['topology','inter_satellite','links',i,'bandwidth_gbps'],'默认模式必须填写链路带宽');
   }
+  if (root.topology?.inter_satellite && linkMode(root) === null) add(['topology','inter_satellite'],'请在星间连接中选择一个全局模式，统一所有链路');
   if(root.deployment?.placements && root.hardware) {
     const rows=root.deployment.placements, pools=root.deployment.worker_pools || [];
     const expected=pools.reduce((n,p)=>n+p.parallelism.tensor_parallel_size*p.parallelism.pipeline_parallel_size,0);
-    if(expected!==root.hardware.satellite_count*root.hardware.accelerators_per_satellite) add(['deployment','worker_pools'],'并行规模与物理卡数量不一致，请调整 TP / PP 或资源数量');
+    const physical=root.hardware.satellite_count*root.hardware.accelerators_per_satellite;
+    if(expected>physical) add(['deployment','worker_pools'],`当前只有 ${physical} 张物理卡，并行部署需要 ${expected} 张卡。请启用自动适配资源，或减少 TP / PP。`);
     if(rows.length!==expected) add(['deployment','placements'],'部署映射数量与并行规模不一致');
     const locations=new Set(), ranks=new Set();
     for(const [i,row] of rows.entries()) {

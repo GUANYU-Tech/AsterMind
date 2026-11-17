@@ -160,7 +160,10 @@ def status(job, state, **extra):
     with LOCK:
         job.update(state=state, **extra)
         if job.get("output"):
-            (Path(job["output"]) / "status.json").write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
+            target = Path(job["output"]) / "status.json"
+            temporary = target.with_suffix('.json.tmp')
+            temporary.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
+            temporary.replace(target)
 
 
 def run_status(run_id):
@@ -200,15 +203,19 @@ def run_status(run_id):
         from live import SESSIONS
         session = SESSIONS.get(run_id)
         active = session is not None and session.payload['state'] in {'preparing', 'paused', 'advancing', 'finalizing'}
-        job.update(can_stop=active, can_rerun=not active, can_delete=not active,
+        job.update(can_stop=active and job['state']!='completed', can_rerun=not active, can_delete=not active,
                    can_stop_and_delete=False)
     if job.get('native_preset'):
         job['can_rerun'] = False  # The native preset is restarted from its dedicated entry.
     log = output / 'execution.log'
     if log.is_file():
         with log.open('rb') as stream:
-            stream.seek(max(0, log.stat().st_size - 12000))
+            offset = max(0, log.stat().st_size - 12000)
+            stream.seek(offset)
+            if offset:
+                stream.readline()  # The byte tail can begin inside a JSON string or UTF-8 character.
             job['log_tail'] = stream.read().decode('utf-8', errors='replace')
+            job['log_tail_truncated'] = bool(offset)
     job['result_url'] = f'/runs/{run_id}/result'
     return job
 
@@ -343,15 +350,35 @@ class Handler(BaseHTTPRequestHandler):
                 content = content.replace(b'</head>', b'<link rel="stylesheet" href="/assets/analysis_embed.css"><script src="/assets/analysis_embed.js" defer></script></head>', 1)
             navigation = b'<script src="/assets/navigation.js" defer></script>'
             content = content.replace(b'</html>', navigation + b'</html>', 1) if b'</html>' in content else content + navigation
+        if kind == 'application/json' and not encoding and len(content) >= 64 * 1024:
+            for entry in self.headers.get('Accept-Encoding', '').split(','):
+                parts = [part.strip().lower() for part in entry.split(';')]
+                if parts[0] != 'gzip':
+                    continue
+                try:
+                    quality = next((float(part.split('=', 1)[1]) for part in parts[1:] if part.startswith('q=')), 1.)
+                except ValueError:
+                    quality = 0
+                if 0 < quality <= 1:
+                    import gzip
+                    content = gzip.compress(content, compresslevel=1)
+                    encoding = 'gzip'
+                break
         self.send_response(code)
         self.send_header("Content-Type", kind + "; charset=utf-8")
         self.send_header("Content-Length", str(len(content)))
         if encoding:
             self.send_header("Content-Encoding", encoding)
+            self.send_header("Vary", "Accept-Encoding")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(content)
+        try:
+            self.end_headers()
+            self.wfile.write(content)
+        except (BrokenPipeError, ConnectionResetError):
+            # The viewer may cancel an obsolete poll or leave a replay page.
+            # A closed socket cannot receive a second 400 response.
+            return
 
     def do_GET(self):
         if not self.allowed_authority():

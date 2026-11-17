@@ -1,13 +1,26 @@
 (function(root){
 'use strict';
 const faultKey=e=>JSON.stringify([e.target_type,e.target_id,e.source,e.start_s,e.end_s]);
+const reducers=new WeakMap();
 function stateAt(initial={},events=[],index=events.length-1,requested){
- const flows=new Map((initial.active_transfers||[]).map(e=>[e.transfer_id,{...e}])),legs=new Map(flows);
- const plans=new Map((initial.route_plans||[]).map(e=>[[e.request_id,e.stage,e.reason].join('|'),e]));
- const faults=new Map((initial.faults||[]).map(e=>[faultKey(e),e]));
- const recoveries=[...(initial.recovery_events||[])],losses=[...(initial.loss_events||[])];
- let event={kind:'control_boundary',time_s:0},compute='waiting';
- for(const e of events.slice(0,index+1)){
+ index=Math.min(events.length-1,Math.max(-1,Math.trunc(index)));
+ let state=reducers.get(events);
+ // Pages are immutable. Forward playback consumes only newly crossed events;
+ // an explicit seek backward rebuilds from the page's saved causal boundary.
+ if(!state||state.initial!==initial||index<state.index||state.last!==events[state.index]){
+  const flows=new Map((initial.active_transfers||[]).map(e=>[e.transfer_id,{...e}]));
+  state={initial,index:-1,last:undefined,flows,legs:new Map(flows),
+   plans:new Map((initial.route_plans||[]).map(e=>[[e.request_id,e.stage,e.reason].join('|'),e])),
+   faults:new Map((initial.faults||[]).map(e=>[faultKey(e),e])),
+   recoveries:[...(initial.recovery_events||[])],losses:[...(initial.loss_events||[])],kinds:new Map()};
+  reducers.set(events,state);
+ }
+ const {flows,legs,plans,faults,recoveries,losses}=state;
+ let event=state.last||{kind:'control_boundary',time_s:0},compute='waiting';
+ for(let i=state.index+1;i<=index;i++){
+  const e=events[i];
+  if(!state.kinds.has(e.request_id))state.kinds.set(e.request_id,new Set());
+  state.kinds.get(e.request_id).add(e.kind);
   if(e.kind==='v1_admit')for(const part of e.path_legs||[]){const leg={...e,...part,status:'transmitting',v1_flow_id:e.id};flows.set(part.transfer_id,leg);legs.set(part.transfer_id,leg)}
   if(['v1_p2p_complete','v1_retry','v1_failed'].includes(e.kind))for(const[id,leg]of flows)if(leg.v1_flow_id===e.id){flows.delete(id);legs.set(id,{...leg,status:e.kind==='v1_p2p_complete'?'delivered':'cancelled'})}
   event=e;const status=({transfer_queued:'queued',transmit_start:'transmitting',transmit_complete:'propagating',hop_arrival:'delivered',transfer_cancelled:'cancelled'})[e.kind];
@@ -20,8 +33,9 @@ function stateAt(initial={},events=[],index=events.length-1,requested){
   if(e.kind==='fault_restored')faults.delete(faultKey(e));
   if(['request_failed','request_complete'].includes(e.kind))for(const [id,leg]of flows)if(leg.request_id===e.request_id){flows.delete(id);legs.set(id,{...leg,status:'cancelled'})}
  }
+ state.index=index;state.last=index>=0?events[index]:undefined;
  const request=requested||event.request_id||[...flows.values()][0]?.request_id||[...plans.values()].at(-1)?.request_id||'';
- const seen=events.slice(0,index+1).filter(e=>e.request_id===request),kinds=new Set(seen.map(e=>e.kind));
+ const kinds=state.kinds.get(request)||new Set();
  if(kinds.has('compute_start'))compute='prefill';if(kinds.has('prefill_complete'))compute='decode';if(kinds.has('compute_complete'))compute='finished';
  return {time_s:event.time_s,event,globalMode:true,activeTransfers:[...flows.values()],legs:[...legs.values()].filter(e=>e.request_id===request),
   routePlans:[...plans.values()].filter(e=>e.request_id===request),recoveryEvents:recoveries.filter(e=>e.request_id===request),

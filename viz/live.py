@@ -29,6 +29,7 @@ class LiveSession:
         self.persisted_events = 0
         self.counted_events = 0
         self.completed_requests = self.failed_requests = 0
+        self.terminal_requests = {}
         self.target_s = None
         self.advance_mode = 'event'
         self.event_start = 0
@@ -55,6 +56,9 @@ class LiveSession:
         import gzip
         import shutil
         with self.record_lock:
+            if not hasattr(self, 'capacity_snapshots'):
+                from live_evidence import CapacitySnapshots
+                self.capacity_snapshots = CapacitySnapshots(self.output)
             folder = self.output/'runtime-chunks'
             folder.mkdir(exist_ok=True)
             target = self.output/'runtime_events.jsonl.gz'
@@ -67,7 +71,7 @@ class LiveSession:
                 # remains compatible with existing result/export readers.
                 with gzip.open(temporary, 'wt', encoding='utf-8', compresslevel=1) as stream:
                     for event in engine.log[self.persisted_events:end]:
-                        stream.write(json.dumps(event, ensure_ascii=False)+'\n')
+                        stream.write(json.dumps(self.capacity_snapshots.encode(event), ensure_ascii=False)+'\n')
                 original_size = target.stat().st_size if target.exists() else 0
                 try:
                     with temporary.open('rb') as source, target.open('ab') as stream:
@@ -80,11 +84,20 @@ class LiveSession:
                     raise
                 self.persisted_events = end
 
-    def _capture(self, engine, state='paused'):
+    def _count_requests(self, engine):
         for event in engine.log[self.counted_events:]:
-            self.completed_requests += event['kind']=='request_complete'
-            self.failed_requests += event['kind']=='request_failed'
+            if event['kind'] in {'request_complete', 'request_failed'}:
+                # Host and request-state streams can describe the same
+                # completion. Business totals count request identities once.
+                identity = event.get('request_id')
+                if identity is not None:
+                    self.terminal_requests[identity] = event['kind']
         self.counted_events = len(engine.log)
+        self.completed_requests = sum(kind=='request_complete' for kind in self.terminal_requests.values())
+        self.failed_requests = sum(kind=='request_failed' for kind in self.terminal_requests.values())
+
+    def _build_capture(self, engine, state='paused'):
+        self._count_requests(engine)
         self._persist_events(engine)
         frame = engine.net.snapshot(engine.now)
         faults = list(engine.net.active_faults.values())
@@ -106,11 +119,12 @@ class LiveSession:
         self.version += 1
         replay = self.replay.capture(engine.log, dict(time_s=engine.now, nodes=nodes, links=links),
                                      preserve_from=self.event_start if self.advance_mode == 'event' else None)
-        self.payload = dict(id=self.id, state=state, time_s=engine.now, end_s=engine.end,
+        from event_catalog import annotate
+        payload = dict(id=self.id, state=state, time_s=engine.now, end_s=engine.end,
                             step_s=engine.env.time.get('step_s'), version=self.version,
                             geometry_sample_s=engine.net.sample_time(engine.now),
                             topology_revision=engine.net.revision, nodes=nodes, links=links,
-                            events=[dict(e, event_order=i) for i, e in enumerate(engine.log[-300:], max(0, len(engine.log)-300))],
+                            events=[annotate(dict(e, event_order=i)) for i, e in enumerate(engine.log[-300:], max(0, len(engine.log)-300))],
                             event_count=len(engine.log), event_groups=self.event_window.capture(engine.log),
                             request_count=len(engine.jobs),
                             completed=self.completed_requests,
@@ -121,7 +135,11 @@ class LiveSession:
                             message='当前仿真时刻已暂停；操作由后端校验并执行' if state=='paused' else '仿真执行完成，日志已保留')
         from astermind.engine.clock import Time
         if isinstance(engine.now, Time) and getattr(engine,'transport_provenance',{}).get('clock'):
-            self.payload.update(clock=engine.transport_provenance['clock'],time_ticks=str(engine.now.ticks))
+            payload.update(clock=engine.transport_provenance['clock'],time_ticks=str(engine.now.ticks))
+        return payload
+
+    def _capture(self, engine, state='paused'):
+        self.payload = self._build_capture(engine, state)
 
     def poll(self, engine):
         with self.condition:
@@ -218,10 +236,15 @@ class LiveSession:
             self.condition.notify_all()
 
     def state(self, after=None):
-        with self.condition:
-            if after is not None and after == self.payload.get('version'):
-                return dict(unchanged=True, state=self.payload['state'], version=after)
-            return deepcopy(self.payload)
+        # Captures can flush a large evidence batch while holding the command
+        # condition. Readers use the last complete published snapshot instead
+        # of queueing behind that work and timing out/retrying in parallel.
+        # Nested snapshot values are immutable after publication; state changes
+        # only replace top-level entries or publish a new complete dictionary.
+        payload = dict(self.payload)
+        if after is not None and after == payload.get('version'):
+            return dict(unchanged=True, state=payload['state'], version=after)
+        return deepcopy(payload)
 
     def advance(self, until_s=None, mode=None):
         with self.condition:
@@ -279,6 +302,29 @@ class LiveSession:
         return dict(id=self.id, state='stopping')
 
 
+def terminal_snapshot(output, identity):
+    """Recover a terminal task without reading its potentially huge report."""
+    status_path = output/'status.json'
+    if not status_path.is_file():
+        return None
+    status = json.loads(status_path.read_text(encoding='utf-8'))
+    state = status.get('state')
+    if state not in {'completed', 'failed', 'cancelled', 'interrupted'}:
+        return None
+    summary_path = output/'native_summary.json'
+    summary = json.loads(summary_path.read_text(encoding='utf-8')) if summary_path.is_file() else {}
+    requests = summary.get('requests', {})
+    elapsed_ns = summary.get('measurement', {}).get('simulated_time_ns', 0)
+    return dict(id=identity, state='cancelled' if state=='interrupted' else state, version=1,
+                time_s=elapsed_ns/1e9, end_s=elapsed_ns/1e9, time_ticks=str(elapsed_ns*10**9),
+                request_count=len(requests), completed=sum(row.get('status')=='completed' for row in requests.values()),
+                failed=sum(row.get('status')=='failed' for row in requests.values()),
+                execution_model='native_gpu_operator_graph' if status.get('native_scene') else None,
+                result_url=f'/runs/{identity}/result', replay_url=f'/runs/{identity}/result?view=scene',
+                snapshot_available=False,
+                message=status.get('error') or ('实验已完成，结果与场景回放已保存。' if state=='completed' else '此在线会话已结束。'))
+
+
 def get(identity):
     from studio import key
     with LOCK:
@@ -287,15 +333,22 @@ def get(identity):
             root = __import__('paths').WORKSPACE
             output = root/'local/results/network'/key(identity)
             snapshot = output/'live_state.json'
-            if not snapshot.is_file():
+            try:
+                payload = json.loads(snapshot.read_text(encoding='utf-8')) if snapshot.is_file() else None
+            except (OSError, ValueError):
+                payload = None
+            terminal = terminal_snapshot(output, identity)
+            if not isinstance(payload, dict) or payload.get('state') not in {'completed','cancelled','failed'} or payload.get('id') != identity:
+                payload = terminal
+            elif terminal is not None and (output/'native_summary.json').is_file():
+                # Old saved frames may have counted both terminal streams.
+                # The small audited summary supplies authoritative totals.
+                payload.update({name:terminal[name] for name in ('request_count','completed','failed')})
+            if payload is None:
                 raise ValueError('在线会话不存在或服务已重启；已完成日志可从实验结果查看')
-            payload = json.loads(snapshot.read_text(encoding='utf-8'))
-            if payload.get('state') not in {'completed','cancelled','failed'} or payload.get('id') != identity:
-                raise ValueError('已保存的场景状态无效')
             session = LiveSession(identity, output)
-            if 'event_groups' not in payload and (output/'native_result.json').is_file():
-                from result_analysis import scene_events
-                payload['event_groups'] = session.event_window.capture(scene_events(root, identity)['events'])
+            if 'event_groups' not in payload:
+                payload['event_groups'] = session.event_window.capture(payload.get('events', []))
             session.payload = payload
             session.version = payload['version']
             SESSIONS[identity] = session

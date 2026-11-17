@@ -7,6 +7,9 @@
 .live-focused .inspector #operationStatus.success { color: var(--accent); }
 .live-focused .toolbar>.clock { flex: 0 0 auto; min-width: 210px; }
 .live-focused .toolbar>.clock small,.live-focused .toolbar>.clock>span { white-space: nowrap; }
+.live-focused .toolbar #play { min-inline-size: 9em; white-space: nowrap; }
+.live-focused #sessionState { min-inline-size: 12em; text-align: center; }
+.live-focused #notice { min-block-size: 46px; }
 .live-focused .inspector .actions { margin-top: 9px; }
 .studio-shell .live-focused .inspector select { width: 100%; }
 .live-focused #closeInspector { display: none; }

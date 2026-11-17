@@ -1,5 +1,7 @@
 import { defaultValue, resolveSchema } from "./config-form.mjs?v=validation-1";
 import { mappingDraft } from "./config-layout.mjs?v=compact-2";
+import {newInterSatelliteLink} from './link-mode.mjs';
+import {synchronizeResources,setAutomaticDeployment} from './resource-sync.mjs';
 
 export const networkInputs = config => Object.fromEntries(["hardware", "topology", "constellation", "fso"].map(key => [key, config[key]]));
 
@@ -9,7 +11,7 @@ export function syncFormationLinks(config) {
   const links = config.topology.inter_satellite.links;
   const key = (a,b) => JSON.stringify([a,b].sort());
   const existing = new Map(links.map(link => [key(link.source,link.target),link]));
-  const template = links[0] || {mode:"islsim",bandwidth_gbps:null};
+  const template = links[0] || newInterSatelliteLink(config, '', '');
   const pairs = ids.slice(1).map((id,index) => [ids[index],id]);
   if (config.constellation.formation.layout === "ring" && ids.length > 2) pairs.push([ids.at(-1),ids[0]]);
   config.topology.inter_satellite.links = pairs.map(([source,target]) => ({
@@ -54,6 +56,7 @@ export function newWebConfiguration(capabilities) {
   if (config.constellation) config.constellation.earth_orientation_mode = "stk11_compat";
   config.runtime_inputs.expert_routing = defaultModelRouting(config.model, capabilities.default_configuration.runtime_inputs.expert_routing);
   syncFormationLinks(config);
+  config.deployment.placements = mappingDraft(config);
   return config;
 }
 
@@ -70,6 +73,14 @@ export function editorChoices(config, capabilities) {
     configured_mode: ["NONE", "FULL", "PIECEWISE", "FULL_DECODE_ONLY", "FULL_AND_PIECEWISE"],
     source_kind: ["not_applicable", "explicit_assumption", "profile_observation", "replay_observation"],
     options(path) {
+      if (capabilities.compatibility) {
+        const full=path.join('.');
+        if(full==='deployment.mode') return ['colocated','pd_disagg'];
+        if(path[0]==='scheduler' && path.at(-1)==='framework') return ['vllm'];
+        if(full==='runtime_inputs.graph_execution.configured_mode') return ['NONE'];
+        if(full==='runtime.timing_mode') return ['device_only'];
+        if(full==='launch_policy') return ['analytical_launch'];
+      }
       if (path.at(-1) !== "algorithm" || path[0] !== "deployment") return undefined;
       if (!path.includes("collectives")) return ["send_recv"];
       const operation = path.slice(0, -1).reduce((v, k) => v[k], config).operation;
@@ -89,7 +100,7 @@ export function editorChoices(config, capabilities) {
       if (parent === "collectives") return {operation:"all_reduce", algorithm:"ring", link:"rdma", topology:"ring", resource_id:"physical-network", backend:"runtime_comm"};
       if (parent === "pipeline_p2p") return {source_stage:0, destination_stage:1, algorithm:"send_recv", link:"infiniband", topology:"point_to_point", resource_id:"pipeline-network", backend:"runtime_comm"};
       if (parent === "routes") return {source_pool:"", destination_pool:"", payload:"activation", algorithm:"send_recv", link:"rdma", topology:"point_to_point", resource_id:"route-network", backend:"runtime_comm"};
-      if (parent === "links") return {source:config.hardware.satellite_ids[0] || "", target:config.hardware.satellite_ids[1] || "", mode:"fixed", bandwidth_gbps:400};
+      if (parent === "links") return newInterSatelliteLink(config, config.hardware.satellite_ids[0] || '', config.hardware.satellite_ids[1] || '');
       return defaultValue(resolveSchema(raw, definitions), definitions);
     },
   };
@@ -97,8 +108,23 @@ export function editorChoices(config, capabilities) {
 
 export function editDependencies(config, path, value, capabilities, previous) {
   const key = path.at(-1), full = path.join(".");
+  if (full === 'deployment.mode' && ['colocated','pd_disagg'].includes(value)) {
+    const roles=value==='colocated'?['colocated']:['prefill','decode'];
+    const existing=config.deployment.worker_pools;
+    config.deployment.worker_pools=roles.map(role=>{
+      const matched=existing.find(pool=>pool.role===role);
+      if(matched) return matched;
+      const pool=structuredClone(existing[0] || capabilities.default_configuration.deployment.worker_pools[0]);
+      pool.name=role==='colocated'?'main':role; pool.role=role; return pool;
+    });
+    config.deployment.routes=[];
+    syncDeployment(config,capabilities,path,previous); synchronizeResources(config,capabilities); return true;
+  }
+  if (full === 'topology.inter_satellite.links') return true;
   if (path[0] === "deployment" && path[1] === "worker_pools" && (path.length === 2 || (path.length === 4 && ["name", "role"].includes(key)) || path[3] === "parallelism")) {
+    if (path[3] === 'parallelism') setAutomaticDeployment(config, false);
     syncDeployment(config, capabilities, path, previous);
+    synchronizeResources(config, capabilities);
     return true;
   }
   if (path.includes("links") && key === "mode") {
@@ -109,14 +135,16 @@ export function editDependencies(config, path, value, capabilities, previous) {
   if (full === "hardware.satellite_count") {
     const ids = config.hardware.satellite_ids.slice(0, value);
     for (let i = 0; ids.length < value; i++) if (!ids.includes(`sat-${i}`)) ids.push(`sat-${i}`);
-    config.hardware.satellite_ids = ids; // Rank placements remain explicit.
+    config.hardware.satellite_ids = ids;
     syncFormationLinks(config);
   }
   if (full === "hardware.satellite_ids") config.hardware.satellite_count = config.hardware.satellite_ids.length;
+  if (["hardware.satellite_count", "hardware.satellite_ids", "hardware.accelerators_per_satellite"].includes(full)) synchronizeResources(config, capabilities);
   if (["constellation.formation.layout", "hardware.satellite_ids"].includes(full)) syncFormationLinks(config);
   if (full === "model") {
     for (const settings of Object.values(config.scheduler)) if (settings.vllm) settings.vllm.model = value;
     config.runtime_inputs.expert_routing = defaultModelRouting(value, capabilities.default_configuration.runtime_inputs.expert_routing);
+    synchronizeResources(config, capabilities);
   }
   if (full === "topology.source") {
     config.topology.file = null;
@@ -163,7 +191,7 @@ export function editDependencies(config, path, value, capabilities, previous) {
       replay:null, profile:null, request_stream_sha256:null, vllm_runtime_binding_sha256:null,
     });
   }
-  return ["topology.source", "requests.source", "constellation.formation.layout", "runtime_inputs.expert_routing.source_kind", "hardware.default_hardware_id", "hardware.satellite_count", "hardware.satellite_ids", "model"].includes(full)
+  return ["topology.source", "requests.source", "constellation.formation.layout", "runtime_inputs.expert_routing.source_kind", "hardware.default_hardware_id", "hardware.satellite_count", "hardware.satellite_ids", "hardware.accelerators_per_satellite", "model"].includes(full)
     || (path[0] === "scheduler" && key === "framework") || (path.includes("collectives") && ["operation", "algorithm"].includes(key));
 }
 

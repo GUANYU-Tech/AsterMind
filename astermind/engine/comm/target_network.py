@@ -31,6 +31,7 @@ class TargetNetworkFrames:
         if time_s != host.now:
             raise ValueError("Comm may only read the current physical state")
         net = host.net
+        snapshot = net.path_route_snapshot(time_s)
         nodes = {}
         pools = dict(net.pool_capacities)
         for identity, device in topology.devices.items():
@@ -45,7 +46,7 @@ class TargetNetworkFrames:
                 pools[f'device:{identity}'] = device.capacity_gbps * 1e9
         established = []
         for edge in net.edges:
-            state = net.link_at(edge['link_id'], host.now)
+            state = snapshot.link_states[edge['link_id']]
             if state['state'] != 'UP':
                 continue
             a, b = edge['endpoint_a'], edge['endpoint_b']
@@ -53,7 +54,7 @@ class TargetNetworkFrames:
                 metadata = net.metadata(edge, source, target)
                 if metadata is None or metadata.get('gate'):
                     continue
-                attrs = net.directional_attributes(edge, source, target, host.now)
+                attrs = snapshot.directional_attributes[edge['link_id'], source, target]
                 if attrs['bandwidth_bps'] <= 0:
                     continue
                 src, dst = topology.node_device[source], topology.node_device[target]
@@ -67,12 +68,11 @@ class TargetNetworkFrames:
                     shared_capacity_pools=tuple(dict.fromkeys(shared)),
                     attributes={**attrs, 'bidirectional': False,
                         'target_native_direction': (source, target)}))
-        # All physical updates are pushed by the host. The expiry only names
-        # actual known supply boundaries, never an artificial polling interval.
-        boundaries = [Time(t) for t in net.environment_times if t > host.now]
-        boundaries += [Time(t) for rows in net.link_times.values() for t in rows if t > host.now]
+        # The shared snapshot already indexed real sample/contact/capacity
+        # boundaries. Do not scan every link's future history a second time.
         return SimpleNamespace(start_time_s=host.now,
-            valid_until_s=min(boundaries, default=None), revision=net.revision,
+            valid_until_s=Time(snapshot.deadline) if snapshot.deadline > host.now else None,
+            revision=net.revision,
             node_states=nodes, established_topology_graph=tuple(established),
             shared_capacity_pools_bps=pools)
 
