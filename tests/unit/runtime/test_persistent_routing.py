@@ -45,7 +45,8 @@ class PersistentRoutingTests(unittest.TestCase):
         state.spec = replace(state.spec, transport_model="runtime_comm")
         arrival, reused = state.transfer("a", "d", 1.0, 100.0)
         self.assertEqual(nodes(reused), ["b", "d"])
-        self.assertAlmostEqual(arrival, 1.5)
+        # 800 bits / (8000 / 4) bps: serialize once at the bottleneck.
+        self.assertAlmostEqual(arrival, 1.4)
         self.assertEqual(state.route_cache_info()["searches"], 1)
         _, fresh = state.transfer("a", "d", 1.0, 100.0, recompute=True)
         self.assertEqual(nodes(fresh), ["c", "d"])
@@ -133,7 +134,7 @@ class PersistentRoutingTests(unittest.TestCase):
         state.transfer("a", "d", 0.0, 100.0)
         arrival, route = state.transfer("a", "d", 4.0, 1000.0)
         self.assertEqual(nodes(route), ["c", "d"])
-        self.assertAlmostEqual(arrival, 6.0)
+        self.assertAlmostEqual(arrival, 5.0)
         self.assertEqual(state.route_cache_info()["replay_failures"], 1)
 
     def test_reservations_are_fresh_and_preview_calendars_are_isolated(self):

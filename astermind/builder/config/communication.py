@@ -41,6 +41,7 @@ class CommPolicy(BaseModel):
     model_config=ConfigDict(extra="forbid", frozen=True)
     mode: Literal["surrogate"]="surrogate"
     execution: Literal["runtime"]="runtime"
+    routing_policy: Literal["min_hops", "min_propagation", "earliest_arrival"]="min_propagation"
     ground_processing_ns: float=Field(default=0,ge=0,allow_inf_nan=False)
     intra: Literal["protobridge_h200"]="protobridge_h200"
     _intra_hierarchy: IntraHierarchy | None = PrivateAttr(default=None)
