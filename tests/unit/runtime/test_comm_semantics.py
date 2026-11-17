@@ -67,7 +67,13 @@ class CommSemanticsTests(unittest.TestCase):
 
     def test_whole_hierarchical_and_ragged_decomposition_keep_source_boundaries(self):
         f=fixtures.CommPortTests();self.addCleanup(f.doCleanups)
-        host,network,comm=f.runtime(scene('DS05'))
+        raw=scene('DS05')
+        # Isolate the supported SO topology from an optional terminal detour.
+        raw['communication']['routing_policy']='earliest_arrival'
+        for link in raw['physical']['links']:
+            if 'terminal' in link['source'] or 'terminal' in link['target']:
+                link['latency_ns']=1_000_000
+        host,network,comm=f.runtime(raw)
         participants=tuple(f'satA-gpu-{i}' for i in range(8))
         task=CommunicationOperator('all_reduce','ring',participants,4096,'per_rank_input',reduction='sum',cell_id='cellA')
         plan=plan_communication(comm.network,comm.policy,task,host.now)

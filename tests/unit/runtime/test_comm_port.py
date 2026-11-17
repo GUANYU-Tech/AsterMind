@@ -279,7 +279,7 @@ class CommPortTests(unittest.TestCase):
         for field in ('backend','timeline_mode','communication_mode','protobridge_startup_us'):
             raw=scenario();raw[field]='old'
             with self.subTest(field=field),self.assertRaises(ValueError):SimulationConfig.model_validate(raw)
-        raw=scenario();raw['communication']['routing_policy']='min_hops'
+        raw=scenario();raw['communication']['routing_policy']='unknown'
         with self.assertRaises(ValueError):SimulationConfig.model_validate(raw)
 
 
