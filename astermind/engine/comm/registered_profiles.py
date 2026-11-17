@@ -75,6 +75,11 @@ def p2p_timing(size, scope, hardware, policy):
         profile, placeholder = _p2p_profile(card, scope)
         protocol, startup = profile.protocol_policy.select(max(1, size))
         fixed = profile.protocol_policy.phase_fixed_for_protocol(protocol)
+        if profile.hardware_id == 'nvidia_h200' and profile.link == 'nvlink':
+            # Estimate the H200 P2P phase cost using A800's ratio for this protocol.
+            reference = registered('nvidia_a800', 'send_recv', 'send_recv', 'nvlink').protocol_policy
+            fixed = startup * (reference.phase_fixed_for_protocol(protocol)
+                               / reference.startup_for_protocol(protocol))
         parameters = dict(profile.model_parameters)
         overrides = (policy.resolved_intra_profile.so if scope == 'intra_cross_su'
                      else policy.resolved_intra_profile.su).overrides
