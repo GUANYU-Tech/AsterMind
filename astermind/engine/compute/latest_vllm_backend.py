@@ -233,14 +233,17 @@ class LatestSchedulerProcess:
         self.process.start()
         child.close()
         try:
-            self.runtime_info = self.receive()
+            # CPU-only vLLM imports and integrity validation can exceed an RPC
+            # deadline on a cold WSL filesystem. Preserve the dynamic-link
+            # platform's separate startup budget; ordinary RPCs retain 60 s.
+            self.runtime_info = self.receive(timeout=180)
         except BaseException:
             self.close()
             raise
 
-    def receive(self):
-        if not self.pipe.poll(60):
-            raise TimeoutError("latest Scheduler worker exceeded 60 seconds")
+    def receive(self, timeout=60):
+        if not self.pipe.poll(timeout):
+            raise TimeoutError(f"latest Scheduler worker exceeded {timeout} seconds")
         status, value = self.pipe.recv()
         if status != "ok":
             raise RuntimeError(value)

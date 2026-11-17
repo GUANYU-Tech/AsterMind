@@ -28,6 +28,7 @@ class CommunicationPublisher:
         self.generation = uuid.uuid4().hex[:12]
         self.state = LiveReplayWindow()
         self.open = {}
+        self.v1_attempts = {}
         self.links = {}
         self.intervals = []
         self.end = 0
@@ -113,6 +114,15 @@ class CommunicationPublisher:
                 start = self.open.pop(row.get('transfer_id'), None)
                 if start is not None:
                     self.intervals.append([start, row['time_s']])
+            if row['kind'] == 'v1_admit':
+                self.v1_attempts[row['id']] = row
+            if row['kind'] in {'v1_p2p_complete', 'v1_retry', 'v1_failed'}:
+                matches = [row['id']] if row['id'] in self.v1_attempts else [
+                    key for key, start in self.v1_attempts.items()
+                    if row['kind'] == 'v1_failed' and start.get('task') == row['id']]
+                for key in matches:
+                    start = self.v1_attempts.pop(key)
+                    self.intervals.append([start['time_s'], row['time_s']])
             if len(events) >= 2048:
                 flush()
 
@@ -138,16 +148,17 @@ class CommunicationPublisher:
                     merged.append([start, end])
             return merged
         self.intervals = merge(self.intervals)
-        merged = merge(self.intervals + [[start, self.end] for start in self.open.values()])
+        merged = merge(self.intervals + [[start, self.end] for start in self.open.values()]
+                       + [[row['time_s'], self.end] for row in self.v1_attempts.values()])
         self.write('live-communication.json', dict(schema='orbitserve.live_communication.v1', through_order=self.order, end_s=self.end, end_ticks=self.end_ticks, pages=self.pages, busy_intervals=merged))
 
 
-def watch(root):
+def watch(root, *, wait_for_lock=False):
     root = Path(root)
     import fcntl
     lock = (root / 'local/communication-publisher.lock').open('w')
     try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(lock, fcntl.LOCK_EX | (0 if wait_for_lock else fcntl.LOCK_NB))
     except BlockingIOError:
         return
     publishers = {}

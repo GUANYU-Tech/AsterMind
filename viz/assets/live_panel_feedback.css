@@ -4,14 +4,8 @@
 .live-traffic-legend li{display:flex;align-items:center;gap:7px;white-space:nowrap}
 .live-traffic-legend i{display:block;flex:none;width:9px;height:9px;border:1px solid #ffffff38;border-radius:2px;background:var(--traffic-color);box-shadow:inset -2px -2px 0 #0003}
 .globe-viewport:has(.live-traffic-legend) [aria-label="三维故障图例"]{max-width:calc(100% - 232px)!important;box-sizing:border-box;font-size:10px!important;line-height:1.6!important}
-.live-compute-wait{position:absolute;top:60px;left:50%;transform:translateX(-50%);z-index:4;display:flex;align-items:center;gap:12px;max-width:calc(100% - 32px);padding:12px 15px;border:1px solid #4c6145;border-radius:7px;background:#152019f2;color:#dcebcf;pointer-events:none;box-sizing:border-box;box-shadow:0 6px 22px #0003}
-.live-compute-wait>div{display:flex;flex-direction:column;gap:4px;min-width:0}
-.live-compute-wait strong{font-size:12px;font-weight:500;white-space:nowrap}
-.live-compute-wait>div>span{font-size:10px;color:#a5b99a;white-space:nowrap}
-.live-wait-spinner{display:block;flex:none;width:19px;height:19px;border:2px solid #c7e78925;border-top-color:#c7e789;border-right-color:#c7e78990;border-radius:50%;animation:live-wait-turn 1s linear infinite}
-.live-wait-elapsed{margin-left:5px;min-width:29px;font:11px Consolas,monospace;color:#b5cc9c;text-align:right;white-space:nowrap}
 .notice.working{display:flex;align-items:center;gap:10px}
 .notice.working::before{content:'';display:block;flex:none;width:12px;height:12px;border:2px solid #c7e78930;border-top-color:#c7e789;border-radius:50%;animation:live-wait-turn 1s linear infinite}
 @keyframes live-wait-turn{to{transform:rotate(360deg)}}
-@media(max-width:600px){.live-traffic-legend{right:9px;bottom:9px;width:174px;padding:9px 10px;font-size:10px}.live-traffic-legend ul{gap:6px 9px}.globe-viewport:has(.live-traffic-legend) [aria-label="三维故障图例"]{left:9px!important;bottom:9px!important;max-width:calc(100% - 201px)!important;padding:6px 8px!important}.live-compute-wait{top:60px;gap:9px;padding:10px 12px}.live-compute-wait strong{font-size:11px}.live-compute-wait>div>span{font-size:9px}.live-wait-elapsed{font-size:10px}}
-@media(prefers-reduced-motion:reduce){.live-wait-spinner,.notice.working::before{animation:none}}
+@media(max-width:600px){.live-traffic-legend{right:9px;bottom:9px;width:174px;padding:9px 10px;font-size:10px}.live-traffic-legend ul{gap:6px 9px}.globe-viewport:has(.live-traffic-legend) [aria-label="三维故障图例"]{left:9px!important;bottom:9px!important;max-width:calc(100% - 201px)!important;padding:6px 8px!important}}
+@media(prefers-reduced-motion:reduce){.notice.working::before{animation:none}}

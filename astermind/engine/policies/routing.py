@@ -3,8 +3,9 @@ import heapq
 import math
 import re
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass
-from types import MappingProxyType
+from time import perf_counter
 
 
 @dataclass(frozen=True)
@@ -24,6 +25,40 @@ class RoutingGraph:
     """Read-only, currently usable directed links; no traffic or payload inputs."""
     adjacency: object
     time_s: object
+
+
+class _QueryAdjacency(Mapping):
+    """Read-only endpoint restrictions over a shared snapshot, never a graph copy.
+
+    Built-in searches test only newly visited neighbors. Custom selectors retain
+    the same filtered Mapping contract and materialize only rows they request.
+    """
+    def __init__(self, base, net, source, target, kinds, avoid_nodes):
+        self.base, self.net = base, net
+        self.source, self.target = source, target
+        self.kinds, self.avoid_nodes = kinds, avoid_nodes
+
+    def node_allowed(self, node):
+        return node not in self.avoid_nodes and (
+            node == self.source or self.net.route_node_allowed(node, self.source, self.target))
+
+    def allows(self, edge):
+        return self.node_allowed(edge.target) and (
+            self.kinds is None or self.net.edge_by_id[edge.link_id]['kind'] in self.kinds)
+
+    def candidates(self, node):
+        return self.base.get(node, ()) if self.node_allowed(node) else ()
+
+    def __getitem__(self, node):
+        if node not in self.base or not self.node_allowed(node):
+            raise KeyError(node)
+        return tuple(edge for edge in self.base[node] if self.allows(edge))
+
+    def __iter__(self):
+        return (node for node in self.base if self.node_allowed(node))
+
+    def __len__(self):
+        return sum(1 for _ in self)
 
 
 @dataclass(frozen=True)
@@ -71,19 +106,25 @@ def _unwind(parent, source, target):
 
 
 def min_hops(graph, source, target):
+    adjacency = graph.adjacency
+    restricted = isinstance(adjacency, _QueryAdjacency)
+    neighbors = adjacency.candidates if restricted else lambda node: adjacency.get(node, ())
     parent, queue = {source: None}, deque([source])
     while queue:
         node = queue.popleft()
         if node == target:
             return _unwind(parent, source, target)
-        for edge in graph.adjacency.get(node, ()):
-            if edge.target not in parent:
+        for edge in neighbors(node):
+            if edge.target not in parent and (not restricted or adjacency.allows(edge)):
                 parent[edge.target] = node
                 queue.append(edge.target)
     return None
 
 
 def min_propagation(graph, source, target):
+    adjacency = graph.adjacency
+    restricted = isinstance(adjacency, _QueryAdjacency)
+    neighbors = adjacency.candidates if restricted else lambda node: adjacency.get(node, ())
     parent, costs, queue = {source: None}, {source: 0.0}, [(0.0, source)]
     while queue:
         cost, node = heapq.heappop(queue)
@@ -91,9 +132,9 @@ def min_propagation(graph, source, target):
             continue
         if node == target:
             return _unwind(parent, source, target)
-        for edge in graph.adjacency.get(node, ()):
+        for edge in neighbors(node):
             candidate = cost + edge.distance_km
-            if candidate < costs.get(edge.target, math.inf):
+            if candidate < costs.get(edge.target, math.inf) and (not restricted or adjacency.allows(edge)):
                 parent[edge.target], costs[edge.target] = node, candidate
                 heapq.heappush(queue, (candidate, edge.target))
     return None
@@ -106,32 +147,24 @@ register_routing_policy("min_propagation", min_propagation)
 def select_route(net, source, target, time_s, policy="min_hops", *, kinds=None, avoid_nodes=()):
     """Look up a path; search only on a miss or engine-controlled invalidation."""
     from astermind.engine.state.network import NetworkUnavailable
-    from astermind.engine.state.route_cache import PathRouteCache
 
     selector = get_routing_policy(policy)
     if source not in net.nodes or target not in net.nodes or not net.start_s <= time_s < net.end_s:
         raise NetworkUnavailable("route_endpoint_or_time_unavailable")
-    cache = getattr(net, "_path_route_cache", None)
-    if cache is None:
-        cache = net._path_route_cache = PathRouteCache()
-    cache.synchronize(net, time_s)
+    cache = net.path_route_snapshot(time_s)
     kinds = None if kinds is None else frozenset(kinds)
     avoid_nodes = frozenset(avoid_nodes or ())
     key = (source, target, policy, kinds, avoid_nodes)
     found, result = cache.get(key)
     if not found:
-        # Filtering is done only for a new search, never for a cache hit.
-        allowed = {n for n in net.nodes if n not in avoid_nodes and
-                   (n == source or net.route_node_allowed(n, source, target))}
-        if len(allowed) == len(net.nodes) and kinds is None:
-            adjacency = cache.adjacency
-        else:
-            adjacency = MappingProxyType({n: tuple(e for e in edges if e.target in allowed and
-                (kinds is None or net.edge_by_id[e.link_id]['kind'] in kinds))
-                for n, edges in cache.adjacency.items() if n in allowed})
+        adjacency = _QueryAdjacency(cache.adjacency, net, source, target, kinds, avoid_nodes)
         graph = RoutingGraph(adjacency, time_s)
         cache.searches += 1
-        nodes = selector(graph, source, target)
+        started = perf_counter()
+        try:
+            nodes = selector(graph, source, target)
+        finally:
+            cache.search_wall_s += perf_counter() - started
         result = None
         if nodes is not None:
             nodes = tuple(nodes)

@@ -10,7 +10,10 @@ export class LiveCommunicationWatch {
  select(path,{restart=true}={}){this.selectedPath=path;this.refreshSelected();if(restart){this.time=this.selected?.toSimulation(0)??this.time;this.exact=null}}
  refreshSelected(path=this.selectedPath){
   this.selectedPath=path;
-  this.selected=path?watchTimeline(path.hops.filter(h=>h.source_node_id!==h.target_node_id&&h.sent_s!=null).map(h=>[h.sent_s,h.arrived_s??h.cancelled_s??Math.max(h.sent_s,this.index?.end_s??h.sent_s)]),.35):null;
+  const intervals=path?.time_semantics==='whole_path_shared_resources'
+   ? [[path.start_s,path.terminal_s??Math.max(path.start_s,this.index?.end_s??path.start_s)]]
+   : (path?.hops||[]).filter(h=>h.source_node_id!==h.target_node_id&&h.sent_s!=null).map(h=>[h.sent_s,h.arrived_s??h.cancelled_s??Math.max(h.sent_s,this.index?.end_s??h.sent_s)]);
+  this.selected=path?watchTimeline(intervals,.35):null;
  }
  async at(target){
   if(!this.index?.pages.length||this.index.pages.every(page=>page.count===0))return null;

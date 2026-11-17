@@ -91,9 +91,8 @@ function fail(error) {
   state.playing = false;
 }
 async function get(url) {
-  const response = await fetch(url);
-  if (!response.ok) throw Error(`${url} · HTTP ${response.status}`);
-  return response.json();
+  const {loadReplayJson} = await import('/assets/replay_page_loader.js');
+  return loadReplayJson(url);
 }
 function setTime(value) {
   if (!state.data) return;

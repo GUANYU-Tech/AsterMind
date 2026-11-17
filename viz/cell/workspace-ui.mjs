@@ -3,6 +3,8 @@ import { renderConfigForm } from "./config-form.mjs?v=validation-1";
 import { editorChoices } from "./config-edit.mjs?v=validation-1";
 import { element } from "./results.mjs?v=compact-2";
 import { renderHardwareProfiles } from "./hardware-profile.mjs?v=profile-1";
+import {deploymentCapacity} from './deployment-mapping.mjs';
+import {automaticDeployment, resourceSyncError} from './resource-sync.mjs';
 
 function action(text, id, cls = "small-action") { const b = element("button", text, cls); b.type = "button"; if (id) b.id = id; return b; }
 function upload(title, id, accept) {
@@ -22,6 +24,16 @@ export function buildWorkspace() {
     heading.append(element("span", `${["RESOURCES","NETWORK","WORKLOAD","DEPLOYMENT","RUNTIME"][i]} / 0${i + 1}`, "eyebrow"), element("h1", stageNames[i]));
     const close = action("×", null, "panel-close icon-button"); close.dataset.action = "home"; close.setAttribute("aria-label", "关闭配置"); header.append(heading, close);
     const scroll = element("div", undefined, "panel-scroll");
+    if (name === 'deployment') {
+      const summary = element('section', undefined, 'deployment-assistant');
+      const capacity = element('p'); capacity.id = 'deployment-capacity'; capacity.setAttribute('role', 'status');
+      const note = element('p', '默认自动适配资源与模型，生成 TP / PP 和卡映射。不能参与当前并行方案的卡保持空闲；可切换手动配置。', 'muted');
+      const modes = element('div', undefined, 'boolean-modes'); modes.setAttribute('role','group'); modes.setAttribute('aria-label','部署配置方式');
+      modes.append(action('自动适配资源','automatic-deployment','boolean-mode'),action('手动配置','manual-deployment','boolean-mode'));
+      const actions = element('div', undefined, 'deployment-tools');
+      actions.append(action('按资源匹配 TP / PP', 'match-parallelism'), action('重新生成卡映射', 'generate-mapping'));
+      summary.append(capacity, note, modes, actions); scroll.append(summary);
+    }
     for (const [index, [title]] of groups[name].entries()) {
       const section = element("details", undefined, "editor-section"); section.dataset.group = `${name}-${index}`; section.open = index < 2 || title === "FlowSim";
       section.append(element("summary", title)); const fields = element("fieldset", undefined, "basic-fields"); fields.id = `form-${name}-${index}`; section.append(fields); scroll.append(section);
@@ -36,6 +48,9 @@ export function buildWorkspace() {
       }
     }
     if (name === "formation") {
+      const note = element('p', '', 'resource-sync-note'); note.id='resource-sync-note'; note.setAttribute('role','status');
+      scroll.prepend(note);
+      scroll.append(action('恢复默认配置','restore-defaults'));
       const details = element("details", undefined, "editor-section"); details.open = true; details.append(element("summary", "硬件档案")); const profile = element("div", undefined, "hardware-profile"); profile.id = "hardware-profile"; details.append(profile); scroll.append(details);
     }
     if (name === "network") {
@@ -47,6 +62,7 @@ export function buildWorkspace() {
     }
     if (name === "workload") { scroll.append(upload("请求流 · CSV / JSONL / Parquet", "request-upload", ".csv,.jsonl,.parquet")); const status = element("p", "", "muted"); status.id = "request-upload-status"; scroll.append(status); }
     if (name === "runtime") {
+      const check = element('p','','configuration-check'); check.id='configuration-check'; check.setAttribute('role','status'); scroll.prepend(check);
       scroll.append(action("为 MTP 假设绑定当前请求流", "bind-request-identity"));
       const pool = element("select"); pool.id = "kv-replay-pool"; pool.className = "result-select"; pool.setAttribute("aria-label", "KV 回放目标 pool");
       scroll.append(element("p", "KV 回放目标 pool", "fso-help"), pool, upload("KV 生命周期回放", "kv-replay-upload", ".json"));
@@ -74,6 +90,13 @@ export function renderWorkspaceForms(config, capabilities, changed, onEdit, onEr
     const present=new Set([...document.querySelectorAll('.basic-fields [data-config-path]')].map(n=>n.dataset.configPath));
     for(const path of validation.drafts.keys()) if(!present.has(path)) validation.drafts.delete(path);
   }
+  const capacity = deploymentCapacity(config);
+  const idle = Math.max(0,capacity.physical-capacity.required);
+  const status = resourceSyncError(config) || (capacity.required > capacity.physical ? '资源不足，请启用自动适配资源。' : `已分配 ${capacity.required} 张卡，空闲 ${idle} 张。`);
+  document.querySelector('#deployment-capacity').textContent = `${config.hardware.satellite_ids.length} 颗卫星 × 每星 ${config.hardware.accelerators_per_satellite} 张卡 = ${capacity.physical} 张物理卡；${status}`;
+  document.querySelector('#automatic-deployment').setAttribute('aria-pressed',String(automaticDeployment(config)));
+  document.querySelector('#manual-deployment').setAttribute('aria-pressed',String(!automaticDeployment(config)));
+  document.querySelector('#resource-sync-note').textContent = resourceSyncError(config) || (automaticDeployment(config) ? `自动适配已开启：ID、TP / PP、卡映射随资源更新。已分配 ${capacity.required} 张卡，空闲 ${idle} 张。` : '手动部署已开启：保留自定义 TP / PP 与有效卡映射。');
   const optical = config.topology.inter_satellite.links.some(link => (link.mode || "islsim") === "islsim") || !config.topology.inter_satellite.links.length;
   for (const i of [2, 3, 4]) document.querySelector(`[data-group="network-${i}"]`).hidden = !optical;
   const profile = document.querySelector("#hardware-profile");

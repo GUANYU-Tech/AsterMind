@@ -11,7 +11,8 @@ def read(path):
     path=Path(path)
     if path.suffix=='.gz':
         with gzip.open(path,'rt',encoding='utf-8') as stream:return json.load(stream)
-    return json.loads(path.read_text(encoding='utf-8'))
+    from astermind.common.result_storage import restore_result
+    return restore_result(json.loads(path.read_text(encoding='utf-8')))
 
 
 def duration(end, start):

@@ -3,6 +3,9 @@ import { parseConfiguration } from "./config-form.mjs?v=validation-1";
 import { buildWorkspace, renderWorkspaceForms } from "./workspace-ui.mjs?v=profile-1";
 import { stages, stageNames, importResourceHardware, validationTarget } from "./config-layout.mjs?v=compact-2";
 import { editDependencies, bindRequestIdentity, newWebConfiguration, networkInputs } from "./config-edit.mjs?v=validation-1";
+import {mappingDraft, matchParallelismToResources} from './deployment-mapping.mjs';
+import {linkMode, setLinkMode, rememberEmptyLinkMode, newInterSatelliteLink, migrateOpticalConfig} from './link-mode.mjs';
+import {automaticDeployment,setAutomaticDeployment,synchronizeResources,clearDependentDrafts} from './resource-sync.mjs';
 import { renderResults, renderArtifacts, renderNetworkPreview, element } from "./results.mjs?v=compact-2";
 import { appUrl, appStorageKey } from "./app-path.mjs?v=compact-2";
 import { sceneData } from "./scene-data.mjs?v=compact-2";
@@ -11,9 +14,10 @@ import { configurationErrors, validationError } from "./config-validation.mjs?v=
 const $ = selector => document.querySelector(selector);
 buildWorkspace();
 const statuses = { queued: "排队", running: "运行中", success: "成功", failed: "失败", interrupted: "已中断", cancelled: "已取消", rejected: "校验失败" };
-const phases = { queued: "等待执行", configuration: "解析配置", topology: "构建网络", serving: "请求调度与计算 / 通信仿真", completed: "完成" };
+const phases = { queued: "等待执行", preparing_environment:"准备运行环境", configuration: "解析配置", topology: "构建网络", serving: "请求调度与计算 / 通信仿真", completed: "完成" };
 let config, capabilities, scene, dirty = false, busy = false, jobId = null, pollVersion = 0, previewVersion = 0, refreshForms = false;
 let previewTimer, previewAbort, previewKey = "", networkPreview = null;
+let preflightTimer, preflightVersion = 0, preflightKey = '', preflightStatus = 'pending';
 const drafts = new Map();
 
 function draftChanged() {
@@ -21,6 +25,35 @@ function draftChanged() {
     ++previewVersion; previewKey=''; clearTimeout(previewTimer); previewAbort?.abort();
     $('#scene-links').textContent='请修正输入 · 预览未更新';
   } else if(config) { message(''); scheduleNetworkPreview(); }
+  if(config) scheduleConfigurationPreflight();
+}
+
+function scheduleConfigurationPreflight() {
+  clearTimeout(preflightTimer); const version = ++preflightVersion;
+  if (!config || !capabilities) return;
+  const output = $('#configuration-check');
+  const issues = configurationErrors(config,capabilities.schema);
+  if (dirty || drafts.size || issues.length) {
+    preflightStatus='invalid'; preflightKey='';
+    output.textContent=dirty ? '请先应用或放弃 JSON 编辑。' : drafts.size ? '请修正输入框下方的提示。' : issues[0].msg;
+    lockFields(); return;
+  }
+  const key=JSON.stringify(config);
+  if (preflightStatus==='valid' && preflightKey===key) { lockFields(); return; }
+  preflightStatus='pending'; output.textContent='进入调度运行后自动检查配置。'; lockFields();
+  if (document.body.dataset.stage!=='runtime') return;
+  output.textContent='正在进行后端预检…';
+  preflightTimer=setTimeout(async()=>{
+    try {
+      await post('/api/config/validate',config);
+      if (version!==preflightVersion) return;
+      preflightStatus='valid'; preflightKey=key; output.textContent='配置预检通过，可以发布任务。';
+    } catch(error) {
+      if (version!==preflightVersion) return;
+      preflightStatus='invalid'; preflightKey=''; output.textContent=`配置需调整：${error.message}`;
+    }
+    lockFields();
+  },500);
 }
 
 function scheduleNetworkPreview() {
@@ -89,6 +122,16 @@ function focusField(target) {
 }
 function stored(key, fallback) { try { return JSON.parse(localStorage.getItem(appStorageKey(key))) ?? fallback; } catch { return fallback; } }
 function save(key, value) { try { localStorage.setItem(appStorageKey(key), JSON.stringify(value)); } catch { message("浏览器存储不可用，刷新前请保存任务链接和配置。", true); } }
+function prepareOpticalSettings(value) {
+  const previous = structuredClone(value.fso);
+  const note = migrateOpticalConfig(value, capabilities.default_configuration.fso);
+  if (note) save('astermind-legacy-optics', {fso:previous, note});
+  rememberEmptyLinkMode(value, stored('astermind-link-mode', null));
+  const mode = linkMode(value); if (mode) setLinkMode(value, mode);
+  setAutomaticDeployment(value,stored('astermind-automatic-deployment',true));
+  synchronizeResources(value,capabilities);
+  return value;
+}
 
 async function api(path, options = {}) {
   const response = await fetch(appUrl(path), { cache: "no-store", ...options });
@@ -107,7 +150,7 @@ function validateFormInputs(name = null) {
   if(pending.length) throw validationError(pending);
   const selector=name ? `.config-panel[data-panel="${name}"] .basic-fields` : '.basic-fields';
   for (const input of document.querySelectorAll(`${selector} input[data-config-path], ${selector} select[data-config-path]`)) {
-    if (!input.checkValidity()) { const error = new Error(`输入格式或范围无效：${input.labels?.[0]?.textContent || input.id}`); error.detail = [{loc:JSON.parse(input.dataset.configPath || "[]"),msg:error.message}]; throw error; }
+    if (!input.checkValidity()) { const error = new Error(`${input.labels?.[0]?.textContent || input.id}：${input.validationMessage || '请检查输入格式或范围'}`); error.detail = [{loc:JSON.parse(input.dataset.configPath || "[]"),msg:error.message}]; throw error; }
   }
   const error=validationError(configurationErrors(config,capabilities.schema,name));
   if(error) throw error;
@@ -118,6 +161,7 @@ function lockFields() {
   document.querySelectorAll('.chapter-rail button, .cell-overview, #show-history, .orbit-node-action').forEach(control => { control.disabled = !config; });
   document.querySelectorAll(".basic-fields").forEach(field => { field.disabled = dirty || busy; });
   document.querySelectorAll("input[type=file], #run-simulation, #export-config, #bind-request-identity").forEach(control => { control.disabled = dirty || busy || !config; });
+  $('#run-simulation').disabled = dirty || busy || !config || drafts.size>0 || preflightStatus!=='valid';
   $("#advanced-config").disabled = busy;
   $("#apply-json").disabled = $("#discard-json").disabled = busy;
 }
@@ -128,16 +172,22 @@ function changed(path) {
   $("#scene-summary").textContent = `${layout} · ${config.hardware.satellite_ids.length} 颗卫星`;
   $("#advanced-config").value = JSON.stringify(config, null, 2);
   save("astermind-config", config);
+  save('astermind-automatic-deployment',automaticDeployment(config));
+  if (linkMode(config)) save('astermind-link-mode', linkMode(config));
   if (scene) syncSceneConfiguration(scene, config, networkPreview);
   if (refreshForms) { refreshForms = false; renderForms(); }
+  scheduleConfigurationPreflight();
 }
 
 function renderForms() {
   renderWorkspaceForms(config, capabilities, changed, (path, value, previous) => {
+    if (path[0]==='hardware' || path[0]==='model' || path[0]==='deployment' && ['worker_pools','mode'].includes(path[1])) clearDependentDrafts(drafts);
     refreshForms = editDependencies(config, path, value, capabilities, previous);
+    if (path[0]==='deployment' && path[1]==='placements') { setAutomaticDeployment(config,false); refreshForms=true; }
   }, text => message(text, true), {drafts,onDraftChange:draftChanged});
   $("#advanced-config").value = JSON.stringify(config, null, 2); lockFields();
   scheduleNetworkPreview();
+  scheduleConfigurationPreflight();
 }
 
 function stage(name, anchor = null, revealError = false) {
@@ -168,6 +218,7 @@ function stage(name, anchor = null, revealError = false) {
 
 function selectNode(index) {
   if (!config || dirty || busy || config.topology.source === "file") return;
+  if (!linkMode(config)) { message('请先选择统一的星间链路模式', true); return; }
   if (sceneState.linkBuildStart === null) {
     sceneState.linkBuildStart = index;
     $("#link-selection").textContent = `已选 ${config.hardware.satellite_ids[index]}，请选择另一颗卫星`;
@@ -175,7 +226,7 @@ function selectNode(index) {
   }
   const source = config.hardware.satellite_ids[sceneState.linkBuildStart], target = config.hardware.satellite_ids[index];
   const links = config.topology.inter_satellite.links;
-  if (source !== target && !links.some(link => [link.source, link.target].includes(source) && [link.source, link.target].includes(target))) links.push({ source, target, mode:"fixed", bandwidth_gbps:400 });
+  if (source !== target && !links.some(link => [link.source, link.target].includes(source) && [link.source, link.target].includes(target))) links.push(newInterSatelliteLink(config, source, target));
   sceneState.linkBuildStart = null; $("#link-selection").textContent = ""; renderForms(); changed();
 }
 
@@ -264,7 +315,7 @@ async function historyView() {
     const row = element("div", undefined, "history-row"); const open = element("button", id); open.onclick = () => watch(id, true);
     const reuse = element("button", "载入配置"); reuse.onclick = () => guarded(async () => {
       if (dirty) throw new Error("请先应用或放弃高级 JSON 编辑");
-      config = importResourceHardware(await api(`/api/simulations/${id}/configuration`)); renderForms(); changed(); stage("formation");
+      config = prepareOpticalSettings(importResourceHardware(await api(`/api/simulations/${id}/configuration`))); config.deployment.placements = mappingDraft(config); renderForms(); changed(); stage("formation");
     });
     row.append(open, reuse); list.append(row);
   }
@@ -274,7 +325,8 @@ async function historyView() {
 async function initialize() {
   bindScene(); stage("home"); lockFields();
   capabilities = await api("/api/capabilities");
-  config = importResourceHardware(stored("astermind-config", null) || newWebConfiguration(capabilities));
+  config = prepareOpticalSettings(importResourceHardware(stored("astermind-config", null) || newWebConfiguration(capabilities)));
+  config.deployment.placements = mappingDraft(config);
   renderForms(); changed();
   const current = new URLSearchParams(location.hash.slice(1)).get("job") || stored("astermind-active-job", null);
   if (current && /^AM-\d{8}-[0-9a-f]{32}$/.test(current)) { jobId = current; if (location.hash) watch(current, true); }
@@ -287,9 +339,40 @@ $("#show-history").onclick = historyView;
 $("#reset-view").onclick = () => scene?.resetConfigView();
 $("#open-job").onclick = () => { if (jobId) stage("analysis"); };
 $("#advanced-config").oninput = () => { dirty = true; ++previewVersion; previewKey = ""; clearTimeout(previewTimer); previewAbort?.abort(); lockFields(); };
-$("#apply-json").onclick = () => { try { const next = importResourceHardware(parseConfiguration($("#advanced-config").value)); for (const key of ["hardware", "deployment", "scheduler", "requests", "topology", "runtime_inputs", "runtime"]) if (!next[key]) throw new Error(`缺少配置段：${key}`); const error=validationError(configurationErrors(next,capabilities.schema)); if(error) throw error; config = next; drafts.clear(); dirty = false; renderForms(); changed(); message("JSON 已应用"); } catch (error) { message(`JSON 未应用：${error.message}`, true); } };
+$("#apply-json").onclick = () => { try { const next = importResourceHardware(parseConfiguration($("#advanced-config").value)); for (const key of ["hardware", "deployment", "scheduler", "requests", "topology", "runtime_inputs", "runtime"]) if (!next[key]) throw new Error(`缺少配置段：${key}`); prepareOpticalSettings(next); const error=validationError(configurationErrors(next,capabilities.schema)); if(error) throw error; config = next; drafts.clear(); dirty = false; renderForms(); changed(); message("JSON 已应用"); } catch (error) { message(`JSON 未应用：${error.message}`, true); } };
 $("#discard-json").onclick = () => { dirty = false; renderForms(); changed(); message(''); };
 $("#export-config").onclick = () => { try { validateFormInputs(); const link = document.createElement("a"); link.href = URL.createObjectURL(new Blob([JSON.stringify(config, null, 2)], {type:"application/json"})); link.download = "astermind-config.json"; link.click(); setTimeout(() => URL.revokeObjectURL(link.href), 1000); } catch(error) { showError(error); } };
+$('#match-parallelism').onclick = () => {
+  try {
+    if (dirty || busy || drafts.size) throw Error('请先应用或放弃 JSON 编辑，并修正未完成的输入');
+    const {tp, pp} = matchParallelismToResources(config,{modelShape:capabilities.model_shapes?.[config.model]});
+    clearDependentDrafts(drafts);
+    renderForms(); changed(); message(`已按资源设置各 pool：TP ${tp} × PP ${pp}，并生成卡映射`);
+  } catch (error) { showError(error); }
+};
+$('#automatic-deployment').onclick = () => {
+  if(dirty || busy) return;
+  setAutomaticDeployment(config,true); clearDependentDrafts(drafts); synchronizeResources(config,capabilities); renderForms(); changed();
+};
+$('#manual-deployment').onclick = () => {
+  if(dirty || busy) return;
+  setAutomaticDeployment(config,false); renderForms(); changed();
+};
+$('#restore-defaults').onclick = () => {
+  if(busy) return;
+  save('astermind-before-defaults',config);
+  config=newWebConfiguration(capabilities); setAutomaticDeployment(config,true); synchronizeResources(config,capabilities);
+  dirty=false; drafts.clear(); renderForms(); changed(); stage('formation'); message('已恢复可运行的默认配置');
+};
+$('#generate-mapping').onclick = () => {
+  try {
+    if (dirty || busy || drafts.size) throw Error('请先应用或放弃 JSON 编辑，并修正未完成的输入');
+    const rows = mappingDraft(config, {reset:true});
+    if (rows === config.deployment.placements) throw Error('当前资源或并行配置无效，请先调整后再生成卡映射');
+    config.deployment.placements = rows;
+    renderForms(); changed(); message('已按当前 TP / PP、卫星顺序和星内卡号重新生成映射');
+  } catch (error) { showError(error); }
+};
 $("#bind-request-identity").onclick = () => guarded(async () => {
   const identity = await post("/api/requests/identity", config.requests);
   const count = bindRequestIdentity(config, identity);
@@ -302,6 +385,9 @@ $("#run-simulation").onclick = () => guarded(async () => {
 bindUpload("#tle-upload", "tle", resource => {
   config.constellation ||= { timestamp: new Date().toISOString(), earth_orientation_mode: "stk11_compat" };
   config.constellation.tle_file = resource.path; config.constellation.formation = null; config.topology.source = "orbit"; config.topology.file = null;
+  config.hardware.satellite_ids=resource.satellite_ids; config.hardware.satellite_count=resource.satellite_ids.length;
+  config.topology.inter_satellite.links=resource.satellite_ids.slice(1).map((id,index)=>newInterSatelliteLink(config,resource.satellite_ids[index],id));
+  clearDependentDrafts(drafts); synchronizeResources(config,capabilities);
   message(`已导入 TLE：${resource.satellite_ids.join(", ")}`);
 });
 bindUpload("#request-upload", "requests", resource => {

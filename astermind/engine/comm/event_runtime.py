@@ -36,6 +36,7 @@ class RuntimeCommunication(CommunicationRouting):
         self.network,self.loop,self.policy=network,loop,policy
         self.allocator=allocator or FlowAllocator()
         self.tasks={};self.flows={};self.active={};self.capacities={};self.rates={}
+        self._trace_capacity_source=None;self._trace_capacities=None
         self.last_time=self.loop.now_s;self.last_ns=self.now_ns;self.serial=0;self.generation=0;self.trace=TickTrace(loop)
         self.closed=False;self.routes=None;self.frame_deadline=None
         self._frame_version=None;self._frame_ticks=None;self._observed_network_state=None
@@ -44,7 +45,8 @@ class RuntimeCommunication(CommunicationRouting):
             allocation_wall_s=0.,route_wall_s=0.,retries=0,discarded_application_bytes=0.,
             cell_estimate_calls=0,cell_estimate_wall_s=0.,
             cell_estimate_context_calls=0,cell_estimate_context_wall_s=0.,
-            network_notifications=0,coalesced_network_notifications=0,network_frame_builds=0)
+            network_notifications=0,coalesced_network_notifications=0,network_frame_builds=0,
+            network_frame_wall_s=0.)
 
     @property
     def now_ns(self):return self.loop.now_s.ticks/10**9
@@ -68,8 +70,10 @@ class RuntimeCommunication(CommunicationRouting):
             if not force:
                 valid_until=self.routes.frame.valid_until_s
                 if valid_until is None or self.loop.now_s<valid_until:return self.routes
+        started=perf_counter()
         frame=self.network.frame_at(self.loop.now_s);self.routes=self.network.routes(frame)
         self.capacities=resource_capacities(self.routes,self.policy)
+        self.stats['network_frame_wall_s']+=perf_counter()-started
         self._frame_version=version;self._frame_ticks=self.loop.now_s.ticks
         self.stats['network_frame_builds']+=1
         deadline=frame.valid_until_s
@@ -108,7 +112,14 @@ class RuntimeCommunication(CommunicationRouting):
         started=perf_counter();self.rates=self.allocator.rates(demands,capacities)
         self.stats['allocation_wall_s']+=perf_counter()-started;self.stats['rate_allocations']+=1
         if self.policy.trace_service:
-            self.trace.append(dict(kind='allocation',capacities={str(k):v for k,v in capacities.items()},
+            # Physical refresh replaces the capacity mapping. Between those
+            # boundaries only flow rates change; share the immutable evidence
+            # table instead of rebuilding every pool's label per allocation.
+            if self._trace_capacity_source is not self.capacities:
+                if self._trace_capacity_source != self.capacities:
+                    self._trace_capacities={str(k):v for k,v in capacities.items()}
+                self._trace_capacity_source=self.capacities
+            self.trace.append(dict(kind='allocation',capacities=self._trace_capacities,
                 flows={i:dict(rate_bytes_per_ns=self.rates[i],demand={str(k):v for k,v in d.items()})
                        for i,d in demands.items()}))
         self.stats['peak_active_flows']=max(self.stats['peak_active_flows'],len(self.active))

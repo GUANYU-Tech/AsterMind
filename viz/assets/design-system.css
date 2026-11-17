@@ -109,7 +109,7 @@ body summary { cursor: pointer; color: var(--ink); }
   min-height: calc(100svh - var(--edge)*2); max-width: none; min-width: 0;
   background: var(--bg); border: 1px solid var(--border); border-radius: 12px;
 }
-.studio-shell main > nav { display: none; }
+.studio-shell main > nav { display: flex; align-items: center; flex-wrap: wrap; gap: 14px; margin: 0 0 22px; padding-bottom: 16px; border-bottom: 1px solid var(--border); }
 .studio-shell main > h1 { margin: 6px 0 8px; font-weight: 500; }
 .studio-shell .card { padding: clamp(24px,2.45vw,52px); margin: 22px 0; }
 .studio-shell .actions { gap: 14px; }
@@ -133,6 +133,7 @@ html.studio-shell.portal-shell, .portal-shell body { background: #111; min-heigh
 .entry-arrow { position: relative; flex: 0 0 clamp(34px,2.34vw,48px); width: clamp(34px,2.34vw,48px); height: clamp(34px,2.34vw,48px); font-size: 0; color: #ddd; }
 .entry-arrow::before { content: ''; position: absolute; top: calc(50% - 2px); left: 0; right: 2px; height: 4px; border-radius: 2px; background: currentColor; }
 .entry-arrow::after { content: ''; position: absolute; width: 60%; height: 60%; top: 20%; right: 3px; border-top: 4px solid; border-right: 4px solid; border-radius: 2px; transform: rotate(45deg); }
+.portal-foot { display: flex; justify-content: flex-end; margin-top: 24px; font-size: 14px; }
 .studio-shell main.workspace-entry { position: relative; padding: 0; overflow: hidden; height: calc(100svh - var(--edge)*2); }
 .workspace-entry-copy { position: absolute; left: 4.8%; top: 13%; z-index: 2; }
 .workspace-entry-copy h1 { font-size: clamp(32px,2.65vw,56px); margin: 0 0 20px; font-weight: 500; line-height: 1.32; }
@@ -142,6 +143,13 @@ html.studio-shell.portal-shell, .portal-shell body { background: #111; min-heigh
 .workspace-entry-art { position: absolute; pointer-events: none; right: 1.8%; top: 4.5%; width: 63%; aspect-ratio: 1; background-repeat: no-repeat; }
 .scene-entry-art { background-image: url('/cell/assets/design/scene-reference.png'); background-size: 195.05% 109.71%; background-position: 95.19% 68.63%; }
 .cell-entry-art { background-image: url('/cell/assets/design/cell-reference.png'); background-size: 204.8% 115.2%; background-position: 85.88% 72.37%; }
+.workspace-entry .constellation-scene { position: absolute; right: 1.8%; top: 4.5%; width: 63%; height: 91%; margin: 0; }
+.workspace-entry :is(.constellation-canvas,.constellation-fallback) { position: absolute; inset: 0; width: 100%; height: 100%; background-repeat: no-repeat; }
+.workspace-entry .constellation-canvas { visibility: hidden; }
+.workspace-entry .constellation-canvas canvas { display: block; width: 100%; height: 100%; }
+.workspace-entry .constellation-scene[data-rendered] .constellation-canvas { visibility: visible; }
+.workspace-entry .constellation-scene[data-rendered] .constellation-fallback { display: none; }
+.workspace-entry .constellation-motion { position: absolute; right: 16px; bottom: 16px; padding: 8px 14px; min-height: 36px; color: #bbb; font-size: 14px; background: #202020; }
 .studio-shell .configuration-lead { margin: 0 0 clamp(38px,3.14vw,70px); font-size: var(--ui-font); line-height: 1.5; }
 .configuration-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 22px; }
 .studio-shell .configuration-grid .card { margin: 0; padding: clamp(28px,2.54vw,52px); }
@@ -265,7 +273,7 @@ html.studio-shell.portal-shell, .portal-shell body { background: #111; min-heigh
   .studio-sidebar > a b { display: none; }
   .studio-sidefoot { display: flex; padding: 0; margin: 0 0 0 auto; gap: 4px; }
   .studio-sidefoot a,.cell-studio .studio-sidefoot button { white-space: nowrap; padding: 10px; }
-  .studio-sidefoot .docs-link { display: none; }
+  .studio-sidefoot .docs-link { display: flex; }
   .studio-shell main { margin: 12px; min-height: calc(100svh - 150px); padding: 22px; }
   .portal-shell .studio-topbar { height: 64px; }
   .portal-shell main.portal { margin: 0 auto !important; padding: 46px 0 !important; width: calc(100% - 40px); }
@@ -277,6 +285,7 @@ html.studio-shell.portal-shell, .portal-shell body { background: #111; min-heigh
   .workspace-entry-copy { position: relative; inset: auto; padding: 38px 26px; }
   .workspace-entry-copy h1 { font-size: 32px; }
   .workspace-entry-art { top: auto; bottom: 16px; right: 0; width: 100%; max-height: 420px; }
+  .workspace-entry .constellation-scene { top: auto; bottom: 0; right: 0; width: 100%; height: 420px; }
   .configuration-grid { grid-template-columns: 1fr; }
   .saved-selection { grid-template-columns: minmax(0,1fr) auto; }
   .configuration-grid .card { padding: 24px; }

@@ -25,6 +25,10 @@ directed native device graph, including internal resource gates; physical-only
 route probes use physical links. No implicit hop-count granularity change is made.
 Positive link capacity is an availability condition, never a routing weight.
 Message size and current traffic are absent from the path selector and cache key.
+Routing and Comm share one physical snapshot and adjacency table per valid
+interval. Endpoint restrictions are checked during search rather than by copying
+the whole graph for each new endpoint pair. Offline distance reads use numeric
+columns without expanding full link-attribute records.
 
 The engine owns refresh timing; there is no routing interval setting. Paths
 expire at orbital geometry samples. Between samples, observed path loss or a
@@ -47,6 +51,11 @@ explicit callers by omitting the context. Neither path invokes offline routing.
 `cell_estimate_calls`, `cell_estimate_wall_s`, `cell_estimate_context_calls` and
 `cell_estimate_context_wall_s` account for this work separately from `route_wall_s`.
 Network reports also include path-table hits, searches, invalidations and builds.
+`snapshot_wall_s` measures shared physical snapshot construction;
+`search_wall_s` measures path searches. Comm's `network_frame_wall_s` includes
+snapshot acquisition and resource-frame construction. These timings overlap and
+must not be added together. The existing `route_wall_s` covers execution route
+queries after resource-frame refresh, not total topology processing.
 The legacy `NetworkState.transfer()` remains an offline forecast API, never the
 production communication route selector.
 

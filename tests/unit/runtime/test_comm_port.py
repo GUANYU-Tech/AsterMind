@@ -48,6 +48,18 @@ class CommPortTests(unittest.TestCase):
         self.assertEqual(comm.stats['peak_active_flows'],2)
         self.assertFalse(comm.tasks or comm.flows or comm.active)
 
+    def test_allocation_evidence_reuses_unchanged_supply_and_refreshes_changed_supply(self):
+        host,network,comm=self.runtime(capacity_schedule_ns=((500,0.5),));done=[]
+        comm.submit_transfer('r','ag','bg',1000,lambda:done.append(host.now),self.fail)
+        host.run()
+        self.assertEqual(done,[Time.from_ns(1510)])
+        allocations=[row for row in comm.trace if row['kind']=='allocation']
+        self.assertGreater(len(allocations),2)
+        first=allocations[0]['capacities']
+        changed=next(row['capacities'] for row in allocations if row['capacities']!=first)
+        self.assertIsNot(changed,first)
+        self.assertTrue(all(row['capacities'] is changed for row in allocations if row['capacities']==changed))
+
     def test_capacity_change_settles_old_service_before_reallocation(self):
         host,network,comm=self.runtime(capacity_schedule_ns=((500,0.5),));done=[]
         comm.submit_transfer('r','ag','bg',1000,lambda:done.append(host.now),self.fail)

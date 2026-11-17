@@ -29,7 +29,7 @@ export function formationDisplay(count, layout, spacingKm, altitudeKm) {
     separation = Math.min(separation, Math.hypot(...positions[a].map((v,i)=>v-positions[b][i])));
   }
   return {positions, orbitRadius, displayRadius, physicalRadius,
-    satelliteScale: Math.min(.8, separation * 1.2)};
+    satelliteScale: Math.min(.38, separation * 1.2)};
 }
 
 export function orbitDisplay(config, preview) {
@@ -47,14 +47,4 @@ export function focusedViewDistance(points, aspect, fov = 42) {
   const horizontal = vertical * Math.max(.1, aspect);
   return Math.max(2.4, ...points.map(([x,y,z]) =>
     z + Math.max((Math.abs(x)+.18)/horizontal, (Math.abs(y)+.18)/vertical))) * 1.08;
-}
-
-// Frame a live globe like the reference composition, while preserving world geometry.
-export function contextualGlobeView(aspect, fov = 42) {
-  const tangent = Math.tan(fov * Math.PI / 360);
-  const wide = aspect > .65;
-  const radiusFraction = wide ? .4 : .28;
-  const distance = Math.hypot(EARTH_RADIUS, EARTH_RADIUS / (2 * radiusFraction * tangent));
-  const halfHeight = distance * tangent;
-  return {distance, offsetX: wide ? .72 * halfHeight * aspect : 0, offsetY: wide ? .6 * halfHeight : -.08 * halfHeight};
 }

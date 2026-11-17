@@ -2,6 +2,7 @@ import {get,post} from '/assets/studio_common.js';
 import {normalizeRandomFaults,renderRandomFaults} from '/assets/random_faults.js';
 import {createCellTopology} from '/assets/cell_topology.js';
 import {createRequestBatch} from '/assets/request_batch.js';
+import {startBatchExperiment} from '/assets/experiment_flow.js';
 const $=id=>document.getElementById(id);
 let experiment=null,modelId=null,physicalTime={},runtime={},jsonDirty=false,baseline='',busy=false,needsBuild=true,ready=false;
 let validatedSignature='';
@@ -21,7 +22,7 @@ for(const [id,kind]of [['importRequests','import'],['generateRequests','generate
 function state(){
  $('runtimeConfig').disabled=!ready; $('sceneFields').disabled=busy||jsonDirty;
  $('dataset').disabled=busy||jsonDirty; $('name').disabled=busy;
- for(const id of ['save','run','batchRun'])$(id).disabled=busy||(!jsonDirty&&(!experiment||needsBuild));
+ for(const id of ['save','run','liveRun'])$(id).disabled=busy||(!jsonDirty&&(!experiment||needsBuild));
  $('apply').disabled=busy||!experiment;$('discardJson').hidden=!jsonDirty;
  $('buildStatus').textContent=needsBuild?'部署参数待生成':'';
  for(const id of ['addRequest','importRequests','generateRequests'])$(id).disabled=!experiment||needsBuild||jsonDirty||busy;
@@ -124,8 +125,21 @@ async function validate(){
 }
 async function perform(action,rethrow=false){if(busy){if(rethrow)throw Error('请等待当前操作完成');return}try{$('status').textContent='';if(!jsonDirty)validFields();busy=true;state();return await action()}catch(e){$('status').textContent=e.message;$('jsonStatus').textContent=jsonDirty?'草稿未应用：'+e.message:$('jsonStatus').textContent;if(rethrow)throw e}finally{busy=false;state()}}
 $('apply').onclick=()=>perform(validate);
-async function save(kind){await validate();$('status').textContent=kind?'正在启动仿真…':'正在保存…';const doc=await post('/save-scene',payload());history.replaceState(null,'','/scene?id='+doc.id);$('status').textContent='场景已保存';if(kind){const job=await post(kind==='live'?'/live/start':'/launch-scene',kind==='live'?{scene_id:doc.id}:{id:doc.id});location.href=kind==='live'?job.url+'?autostart=1':'/runs/'+job.id+'/progress'}}
-$('save').onclick=()=>perform(()=>save());$('run').onclick=()=>perform(()=>save('live'));$('batchRun').onclick=()=>perform(()=>save('batch'));
+async function save(kind){
+ await validate();
+ $('status').textContent=kind?'正在提交实验…':'正在保存…';
+ const doc=await post('/save-scene',payload());
+ history.replaceState(null,'','/scene?id='+doc.id);
+ $('status').textContent='场景已保存';
+ if(kind==='batch'){
+  $('status').textContent='正在启动后台实验，随后进入运行进度…';
+  await startBatchExperiment(post,doc.id,url=>location.assign(url));
+ }else if(kind==='live'){
+  const job=await post('/live/start',{scene_id:doc.id});
+  location.assign(job.url+'?autostart=1');
+ }
+}
+$('save').onclick=()=>perform(()=>save());$('run').onclick=()=>perform(()=>save('batch'));$('liveRun').onclick=()=>perform(()=>save('live'));
 $('dataset').onchange=()=>perform(async()=>{experiment=null;needsBuild=true;baseline='';runtime={};$('json').value='';topologySection.hidden=true;topologyEditor.clear();renderRequests();const id=$('dataset').value;if(!id){ready=false;return}await loadDataset(id)});
 (async()=>{
  const [datasets,catalog]=await Promise.all([get('/physical-datasets'),get('/native-scene-catalog')]);initializeCatalog(catalog);for(const d of datasets)$('dataset').append(option(d.id,d.name));

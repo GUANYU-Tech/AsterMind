@@ -2,6 +2,7 @@ import { fieldStage, hardwareForPool, visibleField } from "./config-layout.mjs?v
 import { labels, optionLabels } from "./config-labels.mjs?v=compact-2";
 import { fieldError } from "./config-validation.mjs?v=validation-1";
 import { enhanceSelects } from "../assets/design-controls.js";
+import {linkMode, setLinkMode, opticalMigrationNote} from './link-mode.mjs';
 
 export function setAt(root, path, value) {
   if (path.some(key => ["__proto__", "prototype", "constructor"].includes(String(key)))) throw new Error("非法字段名");
@@ -80,6 +81,7 @@ export function renderConfigForm(container, root, keys, schema, onChange, choice
   function field(raw, path, depth = 0) {
     const key = path.at(-1), full = path.join(".");
     const linkField = path[0] === "topology" && path.includes("links");
+    if (linkField && key === 'mode') return null;
     if (linkField && key === "bandwidth_gbps" && root.topology.inter_satellite.links[path[3]].mode !== "fixed") return null;
     if (!visibleField(path)) return null;
     if (choices.stage && fieldStage(path) !== choices.stage) return null;
@@ -141,8 +143,21 @@ export function renderConfigForm(container, root, keys, schema, onChange, choice
       wrap.className += " field-container";
       if (full === "flowsim.acknowledgement") wrap.classList.add("ack-settings");
       const group = el("fieldset", undefined, "field-group");
+      if (full === 'topology.inter_satellite') {
+        const modeField = el('div', undefined, 'config-field field-wide global-link-mode');
+        modeField.append(el('span', '全部星间链路模式', 'field-title'));
+        const modes = el('div', undefined, 'link-modes'); modes.setAttribute('role', 'group'); modes.setAttribute('aria-label', '全部星间链路模式');
+        for (const [mode, text] of [['fixed','默认模式'], ['islsim','精细模式']]) {
+          const choice = button(text, () => { setLinkMode(root, mode); rerender(['topology','inter_satellite','links']); }, `link-mode${linkMode(root) === mode ? ' is-selected' : ''}`);
+          choice.setAttribute('aria-pressed', String(linkMode(root) === mode)); modes.append(choice);
+        }
+        modeField.append(modes); group.append(modeField);
+        const note = el('p', linkMode(root) === null ? '已有链路使用不同模式，请选择一个模式统一应用。' : '对现有及新增链路统一生效。默认模式使用配置带宽；精细模式使用下方统一光学参数计算。', 'link-mode-note');
+        note.setAttribute('role', 'status'); group.append(note);
+        if (opticalMigrationNote(root)) group.append(el('p', opticalMigrationNote(root), 'link-mode-note optical-migration-note'));
+      }
       if (depth > 0 && typeof key !== "number" && key !== "formation" && !(path[0] === "scheduler" && path.length === 2)) group.append(el("legend", title));
-      if (path[1] === "worker_pools" && typeof key === "number") group.append(el("div", `卡型号　${optionLabels[hardwareForPool(root, value.name)] || hardwareForPool(root, value.name)}`, "pool-hardware field-wide"));
+      if (path[1] === "worker_pools" && path.length === 3 && typeof key === "number") group.append(el("div", `卡型号　${optionLabels[hardwareForPool(root, value.name)] || hardwareForPool(root, value.name)}`, "pool-hardware field-wide"));
       for (const [child, sub] of Object.entries(spec.properties || {})) { const rendered = field(sub, [...path, child], depth + 1); if (rendered) group.append(rendered); }
       if (spec.additionalProperties && typeof spec.additionalProperties === "object") {
         for (const child of Object.keys(value)) {
@@ -206,14 +221,14 @@ export function renderConfigForm(container, root, keys, schema, onChange, choice
       });
       if (!spec.prefixItems && full !== "deployment.placements") {
         const add = button(`添加${title}`, () => { value.push(choices.seed?.([...path, value.length], spec.items) ?? defaultValue(spec.items, defs)); rerender(path); });
-        if (full === "topology.inter_satellite.links") { add.textContent = '+'; add.classList.add('link-add'); add.setAttribute('aria-label', `添加${title}`); add.title = `添加${title}`; }
+        if (full === "topology.inter_satellite.links") { add.textContent = '+'; add.classList.add('link-add'); add.setAttribute('aria-label', `添加${title}`); add.title = `添加${title}`; add.disabled = !linkMode(root); }
         wrap.append(add);
       }
       return wrap;
     }
     // Choice callbacks share this object with field options (e.g. `seed`).
     // Only arrays are dropdown data; a same-named callback is not iterable.
-    const candidate = full === "topology.source" ? ["formation", "orbit"] : spec.enum || choices.options?.(path) || choices[full] || choices[key];
+    const candidate = full === "topology.source" ? ["formation", "orbit"] : choices.options?.(path) || spec.enum || choices[full] || choices[key];
     const options = Array.isArray(candidate) ? candidate : undefined;
     const input = el(options ? "select" : "input");
     input.id = `field-${path.map(x => encodeURIComponent(x)).join("-")}`; input.dataset.configPath = JSON.stringify(path);
@@ -236,7 +251,7 @@ export function renderConfigForm(container, root, keys, schema, onChange, choice
       const previous = path.reduce((v, k) => v?.[k], root);
       setAt(root, path, next); choices.onEdit?.(path, next, previous); onChange(path);
     };
-    const commitEvent=options || key === "satellite_count" || (path[1] === "worker_pools" && ((path.length === 4 && key === "name") || path[3] === "parallelism")) ? "change" : "input";
+    const commitEvent=options || ["satellite_count", "accelerators_per_satellite"].includes(key) || (path[1] === "worker_pools" && ((path.length === 4 && key === "name") || path[3] === "parallelism")) ? "change" : "input";
     input.addEventListener(commitEvent,commit);
     if(commitEvent==='change') input.addEventListener('input',()=>state.check());
     if (input.type === "checkbox") wrap.className += " toggle-field";
@@ -268,14 +283,6 @@ export function renderConfigForm(container, root, keys, schema, onChange, choice
       slider.addEventListener("input", () => { updateRange(); input.value = slider.value; commit(); });
       input.addEventListener("input", () => { if(input.checkValidity()) { slider.value = input.value; updateRange(); } });
       wrap.replaceChildren(line, slider, endpoints, state.note);
-    } else if (linkField && key === "mode") {
-      wrap.className += " field-wide";
-      const modes = el("div", undefined, "link-modes");
-      for (const [mode, text] of [["fixed", "默认模式"], ["islsim", "精细模式"]]) {
-        const choice = button(text, () => { input.value = mode; commit(); }, `link-mode${value === mode ? " is-selected" : ""}`);
-        choice.setAttribute("aria-pressed", String(value === mode)); modes.append(choice);
-      }
-      wrap.append(modes);
     } else if (key === "layout") {
       wrap.className += " field-wide formation-field"; label.textContent = "编队构型";
       for (const option of input.options) option.textContent = option.value === "chain" ? "链式编队" : option.value === "ring" ? "环形编队" : option.textContent;

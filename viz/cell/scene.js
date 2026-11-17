@@ -2,7 +2,7 @@ import * as THREE from "three";
 import { OrbitControls } from "./vendor/OrbitControls.js?v=compact-2";
 import { sceneData } from "./scene-data.mjs?v=compact-2";
 
-import { formationDisplay, orbitDisplay, focusedViewDistance, contextualGlobeView } from "./scene-geometry.mjs?v=scale-3";
+import { formationDisplay, orbitDisplay, focusedViewDistance } from "./scene-geometry.mjs?v=scale-3";
 
 const TAU = Math.PI * 2;
 const DEG = Math.PI / 180;
@@ -10,6 +10,7 @@ const VISUAL_EARTH_ROTATION_SECONDS = 450;
 const VISUAL_ORBIT_TIME_SCALE = 30;
 const HOME_CAMERA_POSITION = new THREE.Vector3(0.46, 0.72, 7.76);
 const HOME_CAMERA_TARGET = new THREE.Vector3(0, 0.08, 0);
+const homeViewportScale = aspect => Math.max(1, 1 / Math.max(.1, aspect));
 const prefersReducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
 export const sceneState = {
@@ -899,9 +900,7 @@ export class AsterMindScene {
   }
 
   prepareConfigAnchor(cluster) {
-    this.configViewRadial.copy(cluster ? this.camera.position : HOME_CAMERA_POSITION).normalize();
-    // The entry artwork is static; entering the live editor uses the same Asia-facing orientation.
-    if (!cluster) this.earthSpin.rotation.y = this.earthBaseRotation;
+    this.configViewRadial.copy(this.camera.position).normalize();
     const view = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0,0,1), this.configViewRadial);
     const group = this.clusterGroups.find(item => item.userData.data === cluster);
     const screen = group ? group.position.clone().normalize().applyQuaternion(view.clone().invert()) : new THREE.Vector3(.9,.4,0);
@@ -1327,13 +1326,7 @@ export class AsterMindScene {
     const world = this.satellites.map(satellite => satellite.getWorldPosition(new THREE.Vector3()));
     const target = world.reduce((center,point)=>center.add(point), new THREE.Vector3()).divideScalar(world.length || 1);
     const points = world.map(point=>point.clone().sub(target).applyQuaternion(inverse).toArray());
-    let distance = focusedViewDistance(points, this.camera.aspect, this.camera.fov);
-    if (sceneState.geometrySource === "formation") {
-      const context = contextualGlobeView(this.camera.aspect, this.camera.fov);
-      const view = inverse.clone().invert();
-      target.set(context.offsetX, context.offsetY, 0).applyQuaternion(view);
-      distance = context.distance;
-    }
+    const distance = focusedViewDistance(points, this.camera.aspect, this.camera.fov);
     this.camera.far = Math.max(80, distance * 6);
     this.camera.position.copy(target).addScaledVector(direction,distance);
     this.controls.target.copy(target);
@@ -1428,7 +1421,7 @@ export class AsterMindScene {
     }
     const targets = {
       home: {
-        position: HOME_CAMERA_POSITION.clone(),
+        position: HOME_CAMERA_POSITION.clone().multiplyScalar(homeViewportScale(this.camera.aspect)),
         lookAt: HOME_CAMERA_TARGET.clone(),
       },
       analysis: {
@@ -1508,8 +1501,8 @@ export class AsterMindScene {
       this.controls.enableRotate = this.stage !== "analysis";
       this.controls.rotateSpeed = this.stage === "home" ? 0.34 : 0.13;
       this.controls.zoomSpeed = this.stage === "home" ? 1 : 0.42;
-      this.controls.minDistance = this.stage === "home" ? 6.7 : 2.15;
-      this.controls.maxDistance = this.stage === "home" ? 9.4 : 7.85;
+      this.controls.minDistance = this.stage === "home" ? 6.7 * homeViewportScale(this.camera.aspect) : 2.15;
+      this.controls.maxDistance = this.stage === "home" ? 9.4 * homeViewportScale(this.camera.aspect) : 7.85;
       if (this.stage === "home") {
         this.controls.minAzimuthAngle = -Infinity;
         this.controls.maxAzimuthAngle = Infinity;
@@ -1587,7 +1580,20 @@ export class AsterMindScene {
     const width = this.canvas.clientWidth;
     const height = this.canvas.clientHeight;
     if (!width || !height) return;
+    const previousHomeScale = homeViewportScale(this.camera.aspect);
     this.camera.aspect = width / height;
+    const homeScale = homeViewportScale(this.camera.aspect);
+    if (this.stage === "home" && homeScale !== previousHomeScale) {
+      // Fit the same live globe and orbit targets on narrow viewports, while
+      // keeping the user's viewing direction and zoom ratio.
+      this.camera.position.sub(this.controls.target).multiplyScalar(homeScale / previousHomeScale).add(this.controls.target);
+      this.controls.minDistance = 6.7 * homeScale;
+      this.controls.maxDistance = 9.4 * homeScale;
+      if (this.cameraTransition) {
+        this.cameraTransition.toPosition.copy(this.getCameraTarget("home").position);
+        this.cameraTransition.toRadius = this.cameraTransition.toPosition.length();
+      }
+    }
     this.renderer.setSize(width, height, false);
     if (!this.cameraTransition) {
       this.currentViewOffset = this.stage === "formation"

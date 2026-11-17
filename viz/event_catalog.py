@@ -42,6 +42,13 @@ def is_playback_event(event):
 def annotate(event):
     row = dict(event)
     kind = row['kind']
+    if kind == 'v1_allocation':
+        # A diagnostic table can contain every pool in the constellation.
+        # HTTP/replay panels need counts, while the lossless native trace and
+        # runtime_events archive retain the complete allocation evidence.
+        capacities, flows = row.pop('capacities', None), row.pop('flows', None)
+        row.update(capacity_pool_count=len(capacities) if capacities is not None else row.get('capacity_pool_count', row.get('capacity_snapshot', {}).get('pool_count', 0)),
+                   flow_count=len(flows) if flows is not None else row.get('flow_count', 0))
     row['category'] = 'business' if kind in BUSINESS else 'network' if kind in NETWORK else 'diagnostic'
     row['event_label'] = (BUSINESS | NETWORK | DIAGNOSTIC).get(kind, '内部记录：' + kind)
     return row

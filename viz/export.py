@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 import re
@@ -574,18 +573,15 @@ def export_reports(reports, destination, *, loaded_results=None):
     used = set()
     for report in reports:
         report = Path(report)
-        digest = hashlib.sha256()
-        with report.open('rb') as stream:
-            for block in iter(lambda: stream.read(1024*1024), b''):
-                digest.update(block)
+        from astermind.common.result_storage import load_result, result_digest
+        digest = result_digest(report)
         result = (loaded_results or {}).get(str(report))
         if result is None:
-            with report.open(encoding='utf-8') as stream:
-                result = json.load(stream)
+            result = load_result(report)
         data = replay_data(
             result,
             source_name=report.name,
-            source_sha256=digest.hexdigest(),
+            source_sha256=digest,
         )
         identity = re.sub(r"[^a-zA-Z0-9_-]", "-", report.stem)
         if identity in used:

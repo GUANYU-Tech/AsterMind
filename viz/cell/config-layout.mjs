@@ -23,7 +23,7 @@ export const groups = {
   ],
   deployment: [
     ["部署模式", ["deployment.mode"]], ["Worker pools", ["deployment.worker_pools"]],
-    ["显式部署映射", ["deployment.placements"]], ["跨 pool 通信", ["deployment.routes"]],
+    ["卡映射（自动生成，可手动调整）", ["deployment.placements"]], ["跨 pool 通信", ["deployment.routes"]],
   ],
   runtime: [
     ["调度器", ["scheduler"]],
@@ -101,15 +101,4 @@ export function importResourceHardware(config) {
   return config;
 }
 
-export function mappingDraft(config) {
-  const rows = [];
-  for (const pool of config.deployment.worker_pools) {
-    const parallel = pool.parallelism;
-    for (let pp = 0; pp < parallel.pipeline_parallel_size; pp++) for (let tp = 0; tp < parallel.tensor_parallel_size; tp++) {
-      const coordinate = {dp:0, pp, cp:0, tp};
-      const old = config.deployment.placements.find(p => p.worker_pool === pool.name && p.parallel_coordinate.pp === pp && p.parallel_coordinate.tp === tp && (p.parallel_coordinate.dp || 0) === 0 && (p.parallel_coordinate.cp || 0) === 0);
-      rows.push(old || {worker_pool:pool.name, parallel_coordinate:coordinate, satellite_id:"", local_index:null});
-    }
-  }
-  return rows;
-}
+export {mappingDraft} from './deployment-mapping.mjs';

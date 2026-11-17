@@ -212,7 +212,8 @@ class NetworkState:
 
     def distance(self, edge: dict, time_s: float) -> float:
         if self.physical_attributes is not None and edge['link_id'] not in self.added_edge_ids:
-            return self._saved_attributes(edge,time_s)['geometry']['distance_km']
+            return self.physical_attributes.geometry_value_at(
+                edge['link_id'], self._attribute_time(edge, time_s), 'distance_km')
         return math.dist(
             self.position(edge["endpoint_a"], time_s),
             self.position(edge["endpoint_b"], time_s),
@@ -843,6 +844,15 @@ class NetworkState:
         """Return a reusable path without forecasting a transfer."""
         from astermind.engine.policies.routing import select_route
         return select_route(self, source, target, time_s, policy, kinds=kinds, avoid_nodes=avoid_nodes)
+
+    def path_route_snapshot(self, time_s):
+        """Share one physical snapshot between Comm resources and path queries."""
+        from astermind.engine.state.route_cache import PathRouteCache
+        cache = getattr(self, '_path_route_cache', None)
+        if cache is None:
+            cache = self._path_route_cache = PathRouteCache()
+        cache.synchronize(self, time_s)
+        return cache
 
     def path_route_cache_info(self):
         from astermind.engine.state.route_cache import PathRouteCache

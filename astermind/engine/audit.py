@@ -2,6 +2,7 @@
 import argparse
 import json
 from pathlib import Path
+from math import isfinite
 from astermind.engine.clock import Time
 from astermind.engine.timeline import nanoseconds
 
@@ -103,11 +104,25 @@ def audit(result):
                 counts['kernels']+=1
         if not failed:
             assert int(batch['end_time_ticks'])==max(int(c['end_time_ticks']) for c in calls.values())
+    previous_capacities = None
     for row in result.get('communication_events',()):
         if row['kind']!='allocation':continue
-        for resource,capacity in row['capacities'].items():
-            used=sum(f['rate_bytes_per_ns']*f['demand'].get(resource,0) for f in row['flows'].values())
-            assert used<=capacity+max(1e-12,capacity*1e-10),(resource,used,capacity)
+        capacities = row['capacities']
+        # Unused pools have zero demand. Check their zero-load constraint once
+        # per immutable snapshot, then sum only resources actually consumed.
+        if capacities is not previous_capacities:
+            for resource, capacity in capacities.items():
+                assert 0 <= capacity + max(1e-12, capacity*1e-10), (resource, 0, capacity)
+            previous_capacities = capacities
+        used = {}
+        for flow in row['flows'].values():
+            rate = flow['rate_bytes_per_ns']
+            assert isfinite(rate) and rate >= 0, flow
+            for resource, demand in flow['demand'].items():
+                used[resource] = used.get(resource, 0.) + rate*demand
+        for resource, amount in used.items():
+            capacity = capacities[resource]
+            assert amount<=capacity+max(1e-12,capacity*1e-10),(resource,amount,capacity)
         counts['allocations']+=1
     for migration in result.get('migrations',{}).values():
         if migration['state']!='completed':continue
@@ -141,7 +156,8 @@ def main():
     parser.add_argument('reports',nargs='+',type=Path)
     parser.add_argument('--output',type=Path,required=True)
     args=parser.parse_args()
-    result={p.stem:audit(json.loads(p.read_text())) for p in args.reports}
+    from astermind.common.result_storage import load_result
+    result={p.stem:audit(load_result(p)) for p in args.reports}
     args.output.parent.mkdir(parents=True,exist_ok=True)
     args.output.write_text(json.dumps(result,indent=2))
 
