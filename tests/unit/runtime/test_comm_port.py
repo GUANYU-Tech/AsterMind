@@ -46,6 +46,10 @@ class CommPortTests(unittest.TestCase):
         host.run()
         self.assertEqual(done,[Time.from_ns(2010)]*2)
         self.assertEqual(comm.stats['peak_active_flows'],2)
+        allocations = [r for r in comm.trace if r['kind']=='allocation' and r['flows']]
+        self.assertEqual(len(allocations), 1)
+        self.assertEqual(len(allocations[0]['flows']), 2)
+        self.assertAlmostEqual(sum(r['application_bytes'] for r in comm.trace if r['kind']=='service'),2000)
         self.assertFalse(comm.tasks or comm.flows or comm.active)
 
     def test_capacity_change_settles_old_service_before_reallocation(self):

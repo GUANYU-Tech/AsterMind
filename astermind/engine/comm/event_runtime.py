@@ -41,6 +41,7 @@ class RuntimeCommunication(CommunicationRouting):
         self.tasks={};self.flows={};self.active={};self.capacities={};self.rates={}
         self.last_time=self.loop.now_s;self.last_ns=self.now_ns;self.serial=0;self.generation=0;self.trace=TickTrace(loop)
         self.closed=False;self.routes=None;self.frame_deadline=None
+        self._admission_rebalance_pending = False
         self._frame_version=None;self._frame_ticks=None;self._observed_network_state=None
         self.delivery_paths={};self.used_ids=set()
         self.stats=dict(peak_active_flows=0,max_path_links=0,rate_allocations=0,
@@ -88,7 +89,11 @@ class RuntimeCommunication(CommunicationRouting):
         return self.flows.get(f['id']) is f and f['attempt']==attempt and f['task'] in self.tasks
 
     def _settle(self):
-        dt=max(0.,(self.loop.now_s.ticks-self.last_time.ticks)/10**9);finished=[]
+        now = self.loop.now_s
+        elapsed_ticks = now.ticks - self.last_time.ticks
+        if elapsed_ticks <= 0:
+            return
+        dt=elapsed_ticks/10**9;finished=[]
         for identity,f in tuple(self.active.items()):
             rate=self.rates.get(identity,0.)
             sent=min(f['remaining'],rate*dt);f['remaining']-=sent;f['sent']+=sent
@@ -104,6 +109,20 @@ class RuntimeCommunication(CommunicationRouting):
             self.active.pop(f['id'],None);f['state']='tail';attempt=f['attempt']
             self._later(f['budget']['tail'],lambda f=f,a=attempt:self._arrive(f,a),'comm:arrival')
 
+    def _schedule_admission_rebalance(self):
+        if self._admission_rebalance_pending:
+            return
+        self._admission_rebalance_pending = True
+
+        def flush():
+            self._admission_rebalance_pending = False
+            if not self.closed:
+                self._rebalance()
+
+        # Admissions (priority 1) settle old service and join individually.
+        # Allocate once after all of them, before Cell kernel starts (priority 3).
+        self._later(0, flush, 'comm:admission_rebalance', priority=2)
+
     def _rebalance(self):
         self.generation+=1;generation=self.generation
         demands={i:dict(f['budget']['demand']) for i,f in self.active.items()}
@@ -118,7 +137,7 @@ class RuntimeCommunication(CommunicationRouting):
         waits=[f['remaining']/self.rates[i] for i,f in self.active.items() if self.rates[i]>0]
         if waits:
             def wake():
-                if generation!=self.generation or self.closed:return
+                if generation!=self.generation or self.closed or self._admission_rebalance_pending:return
                 self._settle();self._rebalance()
             self._later(max(min(waits),1e-6),wake,'comm:serialization_complete')
 
@@ -182,7 +201,7 @@ class RuntimeCommunication(CommunicationRouting):
             self.trace.append(dict(kind='admit',id=f['id'],task=f['task'],attempt_id=attempt,time_ns=self.now_ns,
                 path=f['budget']['path'],budgets=f['budget']['budgets'],startup_ns=f['budget']['startup'],
                 tail_ns=f['budget']['tail'],sampled_errors=False,ack_flows=False))
-            self._rebalance()
+            self._schedule_admission_rebalance()
         self._later(f['budget']['startup'],admit,'comm:admit')
 
     def _p2p(self,task,source,target,size,done,*,wave_limit=None,initial_route=None):
