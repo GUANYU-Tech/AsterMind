@@ -8870,7 +8870,7 @@ _SOURCE_CONTRACT_HARDWARE = {
     'vllm_0_18_full_fia_split_fuse': ('ascend_910b',),
     'vllm_0_18_eager_fia_direct_kv': ('ascend_910b',),
     'vllm_0_18_bf16_routed_expert_native_projection': ('ascend_910b',),
-    'vllm_0_11_masked_embedding_pipeline_endpoint': ('nvidia_a800',),
+    'vllm_0_11_masked_embedding_pipeline_endpoint': ('nvidia_a800', 'nvidia_h200'),
     'pytorch_2_8_advanced_indexing_int64_launch': ('nvidia_a800',),
     'vllm_0_27_1_symbolic_embedding': ('nvidia_h200',),
     'vllm_0_27_1_symbolic_masked_embedding': ('nvidia_h200',),

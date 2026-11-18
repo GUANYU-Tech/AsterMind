@@ -38,8 +38,6 @@ class NetworkBatchExecutor:
 
     def _build_operator(self, call, execution=None, step_id=None):
         use_native = native_enabled(getattr(self.comm, 'policy', None), self.cell_id)
-        if not use_native and call.kernel_spec.hardware_id != "nvidia_h200":
-            raise NotImplementedError("strict surrogate run: only the H200 intra profile is verified")
         transfer = call.kernel_spec.transfer
         if transfer is None:
             raise ValueError("communication kernel has no transfer contract")

@@ -1,3 +1,5 @@
+from .k3_tp_contract import allowed_node as _k3_tp_allowed_node
+from .k3_ep_contract import allowed_node as _k3_ep_allowed_node
 """Explicit WorkloadNode-to-KernelSpec lowering rules."""
 
 import dataclasses
@@ -1323,6 +1325,9 @@ def _validate_routing_provenance(node: WorkloadNode) -> Mapping[str, object]:
         raise ValueError(
             f"FUSED_MOE node {node.node_id!r} lacks moe_invocation_id")
     routing_tokens = node.shape["tokens"]
+    if node.attributes.get("source_padding_routing") == "hash_topk_masked_ids_minus_one":
+        from .v4_modelsp_math_binding import valid_tokens
+        routing_tokens = valid_tokens(node)
     domain = _graph_token_domain(node)
     if domain is not None:
         logical_tokens, model_input_tokens, _ = domain
@@ -2003,7 +2008,8 @@ def _validate_ep_fused_moe_graph(
         if any(key.startswith("source_fp8_") for key in node.attributes) and not (
                 _symbolic_glm_fp8_rank_local_mtp_ep_projection(node, source_pool)
                 or _symbolic_glm_mtp_data_projection(node, source_pool)
-                or _symbolic_glm_fp8_target_dp_projection(node, source_pool)):
+                or _symbolic_glm_fp8_target_dp_projection(node, source_pool)
+                or _symbolic_glm53_dp1_ep8_deferred_projection(node, source_pool)):
             raise ValueError("deferred FP8 expert metadata requires its exact source scope; legacy mapped EP8 is distinct")
         if _symbolic_glm_fp8_rank_local_mtp_ep_projection(node, source_pool):
             _validate_glm_rank_local_fp8_expert_node(node, source_pool)
@@ -2042,6 +2048,16 @@ def _validate_ep_fused_moe_graph(
     ep_pool_name = next(iter(ep_pool_names))
     ep_pool = deployment.worker_pools[ep_pool_name]
     parallelism = ep_pool.parallel_plan.config
+    if all(n.attributes.get("source_component") == "symbolic_dsv3_routed_experts" for n in ep_nodes):
+        if deployment.mode != "colocated" or len(deployment.worker_pools) != 1:
+            raise NotImplementedError("V3 EP8 initial contract requires one colocated pool")
+        from .v3_dp_contract import applicable as dp_applicable
+        if dp_applicable(ep_pool):
+            from .v3_dp_contract import validate
+        else:
+            from .v3_ep_contract import validate
+        validate(graph, ep_pool, ep_nodes, _CURRENT_DSPARK_SOURCE_GRAPH.get()[2])
+        return
     if parallelism.data_parallel_size > 1 and all(_symbolic_kimi_dp_projection(node, ep_pool) for node in ep_nodes):
         return  # Dedicated Kimi DP graph validator already checked dispatch/combine/ownership.
     if ((parallelism.context_parallel_size > 1 or parallelism.data_parallel_size > 1)
@@ -2051,6 +2067,14 @@ def _validate_ep_fused_moe_graph(
     if (parallelism.context_parallel_size == parallelism.data_parallel_size == parallelism.sequence_parallel_size == 1
             and all(_symbolic_glm_pcp_projection(node, ep_pool) for node in ep_nodes)):
         _validate_glm_tensor_expert_graph(graph, ep_pool, ep_nodes)
+        return
+    if all(n.attributes.get("source_component") == "vllm_0_30_symbolic_v4_marlin" for n in ep_nodes):
+        from .v4_ep_contract import validate
+        validate(graph, ep_pool, ep_nodes, _CURRENT_DSPARK_SOURCE_GRAPH.get()[2])
+        return
+    if all(n.attributes.get("source_component") == "vllm_0_30_kimi_k3_marlin_experts" for n in ep_nodes):
+        from .k3_ep_contract import validate
+        validate(graph, ep_pool, ep_nodes, _CURRENT_DSPARK_SOURCE_GRAPH.get()[2])
         return
     common_ep2 = (
         len(ep_pool.ranks) == 2
@@ -2131,7 +2155,16 @@ def _validate_ep_fused_moe_graph(
         and attention_pools[0].parallel_plan.config.context_parallel_size == 1
         and attention_pools[0].parallel_plan.config.data_parallel_size == 1
     )
-    if not (kimi_ep8 or glm_ep8 or (common_ep2 and (independently_scheduled_ep2 or af_ep2))
+    stage_ep2 = (deployment.mode == "colocated" and len(deployment.worker_pools) == 1
+        and parallelism.tensor_parallel_size == parallelism.expert_parallel_size == 2
+        and parallelism.pipeline_parallel_size > 1
+        and len(ep_pool.ranks) == parallelism.worker_count == 2 * parallelism.pipeline_parallel_size
+        and parallelism.sequence_parallel_size == parallelism.context_parallel_size == parallelism.data_parallel_size == 1
+        and all(node.attributes.get("source_component") == "symbolic_unquantized_experts"
+            and (ep_pool.hardware_id,node.attributes.get("model_execution_version"),node.attributes.get("routing_weight_dtype"))
+            in (("metax_c500","vllm_0_24_0","fp32"),("ascend_910b","vllm_0_18_0","bf16"))
+            for node in ep_nodes))
+    if not (kimi_ep8 or glm_ep8 or stage_ep2 or (common_ep2 and (independently_scheduled_ep2 or af_ep2))
             or (source_ep and independently_scheduled_ep2)):
         raise NotImplementedError(
             "rank-local EP lowering supports independently scheduled "
@@ -3134,6 +3167,12 @@ def _compute_spec(node: WorkloadNode, hardware_id: str, hardware) -> KernelSpec:
                 "routing_input_dtype": "bf16"}, hardware)
         return KernelSpec(KernelKind.VECTOR, hardware_id, {"element_count": tokens * experts},
             "bf16", "elementwise", attributes=semantic, launch=launch)
+    from .v4_modelsp_contract import handles_fill
+    if handles_fill(node):
+        a=node.attributes
+        if hardware_id!="nvidia_h200" or node.dtype not in ("bf16","int32") or a.get("model_source_profile")!="vllm_0_30_v4_sync_fp8_ds_mla" or a.get("model_execution_version")!="vllm_0_30_0" or (a.get("operation"),a.get("reads"),a.get("writes"),a.get("source_constant"))!=("fill",0,1,0):
+            raise ValueError("V4 model-SP zero requires its proved typed source write")
+        return KernelSpec(kind=KernelKind.VECTOR,hardware_id=hardware_id,shape={"element_count":node.shape["elements"],"dtype_bytes":2 if node.dtype=="bf16" else 4},dtype=node.dtype,variant="elementwise",attributes={"operation":"fill","reads":0,"writes":1,"mathematical_program":"v4_modelsp_zero_fill_v1"},launch=None,execution_support="unsupported",unsupported_reason="launch_selector_unavailable")
     kind = _SINGLE_COMPUTE_KIND[node.kind]
     if kind is KernelKind.VECTOR and node.kind is WorkloadKind.NORM:
         physical_shape = node.shape
@@ -4655,6 +4694,16 @@ def _target_fused_moe_specs(
     model_contract: str,
 ) -> tuple[KernelSpec, ...]:
     routed_weight_dtype = node.attributes["routed_weight_dtype"]
+    if model_contract == "deepseek_v4_vllm_0_30_0_logical_v1" and node.attributes["expert_parallel_size"] > 1:
+        from .v4_ep_contract import expert_attributes
+        attrs = expert_attributes(node)
+        shape = dict(node.shape)
+        if attrs.get("mathematical_program") == "v4_modelsp_masked_marlin_ep_v1":
+            from .v4_modelsp_math_binding import valid_tokens
+            shape["tokens"] = valid_tokens(node)
+        return (KernelSpec(kind=KernelKind.FUSED_MOE, hardware_id=hardware_id, shape=shape,
+            dtype=node.dtype, variant="routed_experts", attributes=attrs, launch=None,
+            execution_support="unsupported", unsupported_reason="launch_selector_unavailable"),)
     if (HWSpec.source_contract_supported("unbound_grouped_bf16_expert_source_math", hardware_id) and routed_weight_dtype == "bf16"
             and node.attributes["launch_policy"] == "analytical_launch"
             and node.attributes["source_component"] == "symbolic_grouped_routed_experts"
@@ -4705,6 +4754,15 @@ def _target_fused_moe_specs(
                 or owned != tuple(range(node.shape["experts"]))
                 or node.attributes["expert_rank"] != 0):
             raise ValueError("V4 EP-off expert assignment requires identical global/local counts and full expert ownership")
+    if (model_contract == "deepseek_v4_vllm_0_30_0_logical_v1"
+            and node.attributes["source_logical_intermediate"] != node.shape["intermediate"]):
+        from .v4_padded_contract import PROGRAM
+        attributes = _fused_moe_prediction_attributes(node)
+        attributes.update(swiglu_limit=node.attributes["swiglu_limit"], logical_intermediate=192,
+                          mathematical_program=PROGRAM)
+        return (KernelSpec(kind=KernelKind.FUSED_MOE, hardware_id=hardware_id, shape=node.shape,
+            dtype=node.dtype, variant="routed_experts", attributes=attributes, launch=None,
+            execution_support="unsupported", unsupported_reason="launch_selector_unavailable"),)
     attributes = _fused_moe_prediction_attributes(node)
     if "swiglu_limit" in node.attributes:
         attributes["swiglu_limit"] = node.attributes["swiglu_limit"]
@@ -4854,22 +4912,68 @@ def _dense_tp_producer_output_bytes(node: WorkloadNode) -> int:
     return elements * 2
 
 
+def _ascend_dense_logits_source(pool, node):
+    config = pool.parallel_plan.config
+    return (pool.hardware_id == "ascend_910b" and pool.parallel_plan.num_experts == 0 and config.is_rank_local
+        and not config.enable_expert_parallel and node.kind is WorkloadKind.VECTOR
+        and node.attributes["source_component"] in (
+            "vllm_0_18_symbolic_logits_boundary", "vllm_0_18_symbolic_plain_greedy"))
+
+
+def _a800_tp16_logits_source(pool, node):
+    config = pool.parallel_plan.config
+    if (pool.hardware_id != "nvidia_a800" or len(pool.ranks) != 16
+            or config.tensor_parallel_size != 16 or config.pipeline_parallel_size != 1
+            or not config.is_rank_local or config.enable_expert_parallel
+            or node.kind is not WorkloadKind.VECTOR):
+        return False
+    component = node.attributes["source_component"]
+    if component == "vllm_0_11_symbolic_logits_boundary":
+        return node.dtype == "bf16" and node.variant in ("vllm_logits_row_select", "vllm_logits_gather_reorder")
+    if component != "vllm_0_11_symbolic_plain_greedy":
+        return False
+    return (node.variant == "vllm_logits_fp32_cast" and node.dtype == "bf16"
+        and node.attributes.get("sampling_source") == "vllm_0_11_plain_sampler_bf16"
+        or node.variant == "vllm_plain_greedy_sample" and node.dtype in ("fp32","int64")
+        and node.attributes.get("sampling_source") == "vllm_0_11_plain_greedy_bf16")
+
+
+def _collective_data_predecessors(graph):
+    """Index only this lowering invocation's actual data edges."""
+    incoming = {}
+    for edge in graph.edges:
+        if edge.kind == "data":
+            incoming.setdefault(edge.destination, set()).add(edge.source)
+    return incoming
+
+
 def _validate_collective_node(
     node: WorkloadNode,
     pool,
     graph: WorkloadGraph,
     *, gqa_source: bool = False,
+    data_predecessors=None,
 ) -> None:
     attributes = node.attributes
     operation = attributes["operation"]
     collective = pool.collective_for(operation)
+    from .k3_tp_contract import handles_collective as k3_tp_collective
+    if k3_tp_collective(node,pool,graph):return
     logical_rank = pool.logical_rank_for_physical_rank(node.rank)
     variable = operation in ("all_gatherv", "reduce_scatterv")
+    from .v4_dp_contract import handles_collective as v4_dp_collective
+    from .v4_modelsp_contract import handles_collective as v4_sp_collective
+    from .k3_sp_contract import handles_collective as k3_sp_collective
+    from .k3_dp_contract import handles_collective as k3_dp_collective
     if variable:
+        from .v3_dp_contract import collective_supported
+        v3_dp_group = collective_supported(node, pool, graph)
         dimension = attributes["collective_group"]
         if dimension not in ("expert", "data", "data_context", "context", "tensor") or (dimension != "expert"
                 and pool.parallel_plan.config.enable_expert_parallel and not (
-                    _symbolic_kimi_dp_projection(node, pool) and (
+                    (v3_dp_group and dimension in ("data", "expert")) or v4_dp_collective(node, pool, graph) or v4_sp_collective(node,pool,graph) or
+                    k3_dp_collective(node, pool, graph) or k3_sp_collective(node, pool, graph)
+                    or _symbolic_kimi_dp_projection(node, pool) and (
                         dimension == "data" and pool.parallel_plan.config.tensor_parallel_size == 1
                         or dimension == "tensor" and operation == "reduce_scatterv"
                         and pool.parallel_plan.config.pipeline_parallel_size == 1)
@@ -4881,7 +4985,7 @@ def _validate_collective_node(
                         and pool.parallel_plan.config.tensor_parallel_size > 1
                         and pool.parallel_plan.config.sequence_parallel_size in (1, pool.parallel_plan.config.tensor_parallel_size)))):
             raise ValueError("variable MoE collective requires the declared expert or EP-off data group")
-        if dimension in ("context", "tensor") and not (_symbolic_glm_pcp_projection(node, pool)
+        if dimension in ("context", "tensor") and not (k3_sp_collective(node,pool,graph) or v4_sp_collective(node,pool,graph) or _symbolic_glm_pcp_projection(node, pool)
                 or dimension == "tensor" and operation == "reduce_scatterv" and _symbolic_kimi_dp_projection(node, pool)
                 and pool.parallel_plan.config.pipeline_parallel_size == 1):
             raise ValueError("variable TP/PCP collective requires its explicit GLM PCP source scope")
@@ -4968,7 +5072,8 @@ def _validate_collective_node(
             producers = attributes["symbolic_collective_input_producers"]
             if len(producers) != expected_inputs or any(not isinstance(name, str) or name == node.node_id for name in producers):
                 raise ValueError("GLM PCP collective requires each actual payload producer identity")
-            incoming = {edge.source for edge in graph.edges if edge.destination == node.node_id and edge.kind == "data"}
+            incoming = ({edge.source for edge in graph.edges if edge.destination == node.node_id and edge.kind == "data"}
+                if data_predecessors is None else data_predecessors.get(node.node_id, set()))
             if not set(producers) <= incoming:
                 raise ValueError("GLM PCP collective requires each actual payload producer completion dependency")
         return
@@ -4978,7 +5083,8 @@ def _validate_collective_node(
                 or node.dtype not in DTYPE_BYTES or prod(shape) * DTYPE_BYTES[node.dtype] != attributes["bytes"]):
             raise ValueError("GLM source collective bytes must match its actual public payload shape")
         producers = attributes["symbolic_collective_input_producers"]
-        incoming = {edge.source for edge in graph.edges if edge.destination == node.node_id and edge.kind == "data"}
+        incoming = ({edge.source for edge in graph.edges if edge.destination == node.node_id and edge.kind == "data"}
+                if data_predecessors is None else data_predecessors.get(node.node_id, set()))
         if "symbolic_collective_external_inputs" in attributes:
             from src.kernel.memory_access import TensorView, region_end
             origins = attributes["symbolic_collective_external_inputs"]
@@ -5155,7 +5261,14 @@ def _validate_pipeline_p2p_node(node: WorkloadNode, pool) -> None:
         dense_pipeline = ((pool.parallel_plan.config.is_rank_local or _qwen030_dp_sp(pool.parallel_plan.config))
             and (HWSpec.source_contract_supported("glm_tp8_pp4_ep8_source_projection", pool.hardware_id)
                 or HWSpec.source_contract_supported("glm_tp8_pp2_ep1_source_projection", pool.hardware_id)))
-        if (tp not in (1, 2) and not dense_pipeline and not _symbolic_mla_pipeline_projection(node, pool)
+        config = pool.parallel_plan.config
+        device_dense_pipeline = (pool.hardware_id in ("metax_c500", "ascend_910b")
+            and isinstance(attributes.get("payload_tensor"), Mapping)
+            and attributes["payload_tensor"].get("dtype") == "bf16"
+            and config.is_rank_local and not config.enable_expert_parallel
+            and config.pipeline_parallel_size > 1
+            and config.sequence_parallel_size == config.context_parallel_size == config.data_parallel_size == 1)
+        if (tp not in (1, 2) and not dense_pipeline and not device_dense_pipeline and not _symbolic_mla_pipeline_projection(node, pool)
                 and not _symbolic_v4_pipeline_topology_projection(node, pool) and not _symbolic_mla_dp_pipeline_projection(node, pool)
                 and not _symbolic_k3_pipeline_topology_projection(node, pool)):
             raise NotImplementedError("symbolic pipeline ports require TP1, TP2/PP2 or the declared GLM TP8/PP2 projection")
@@ -6239,6 +6352,22 @@ def _symbolic_glm_fp8_rank_local_mtp_ep_projection(node, pool):
         and node.attributes["model_source_profile"] == "vllm_0_30_v32_fp8_sync_explicit_allreduce")
 
 
+def _symbolic_glm53_dp1_ep8_deferred_projection(node, pool):
+    """DP1 replicated inputs with local FlashInfer experts and existing AR combine."""
+    from src.serving.workload.model_config import GLM_MOE_DSA_5_3_CONFIG_SHA256
+    config, attrs = pool.parallel_plan.config, node.attributes
+    return (pool.hardware_id == "nvidia_h200" and pool.role == "colocated"
+        and config.is_rank_local and config.tensor_parallel_size == 8
+        and config.enable_expert_parallel and config.expert_parallel_size == 8
+        and config.pipeline_parallel_size == 1 and len(pool.ranks) == 8
+        and pool.parallel_plan.num_layers == 78 and pool.parallel_plan.num_experts == 256
+        and pool.parallel_plan.layer_to_pipeline_stage == (0,) * 78
+        and attrs.get("source_glm53_dp1_ep8_deferred") is True
+        and attrs.get("model_config_sha256") == GLM_MOE_DSA_5_3_CONFIG_SHA256
+        and attrs.get("model_execution_version") == "vllm_0_30_0"
+        and attrs.get("model_source_profile") == "vllm_0_30_v32_fp8_sync_explicit_allreduce")
+
+
 def _symbolic_glm_fp8_target_dp_projection(node, pool):
     """Ordinary target source identity; never impersonates an MTP pass."""
     config, attrs = pool.parallel_plan.config, node.attributes
@@ -6599,6 +6728,18 @@ def _validate_glm_pcp_expert_graph(graph, pool, nodes):
     config = pool.parallel_plan.config
     by_invocation = {}
     checked_dispatches = set()
+    combines_by_group = {}
+    data_predecessors = None
+
+    def data_parent_ids(destination):
+        nonlocal data_predecessors
+        if data_predecessors is None:
+            data_predecessors = {}
+            for edge in graph.edges:
+                if edge.kind == "data":
+                    data_predecessors.setdefault(edge.destination, []).append(edge.source)
+        return data_predecessors.get(destination, ())
+
     for node in nodes:
         fp8 = ((_symbolic_glm_mtp_data_projection(node, pool) or _symbolic_glm_fp8_target_dp_projection(node, pool))
             and node.attributes["model_source_profile"] == "vllm_0_30_v32_fp8_sync_explicit_allreduce")
@@ -6622,8 +6763,7 @@ def _validate_glm_pcp_expert_graph(graph, pool, nodes):
         inputs = node.attributes["symbolic_tensor_inputs"]
         if len(inputs) != 3:
             raise ValueError("GLM PCP EP requires hidden, routing weights and expert IDs")
-        predecessors = tuple(graph.node(edge.source) for edge in graph.edges
-            if edge.destination == node.node_id and edge.kind == "data")
+        predecessors = tuple(graph.node(source) for source in data_parent_ids(node.node_id))
         dimension = "expert" if config.data_parallel_size > 1 else "data_context"
         expected_group = pool.physical_rank_group(dimension, pool.logical_rank_for_physical_rank(node.rank))
         rank_index = expected_group.index(node.rank)
@@ -6678,16 +6818,17 @@ def _validate_glm_pcp_expert_graph(graph, pool, nodes):
                 if (len(gates) != 1 or gates[0].rank != rank
                         or gates[0].shape != {"b": 1, "m": count, "n": node.shape["experts"], "k": node.shape["hidden"]}
                         or _source_linear_data_inputs(gates[0]) != (hidden.attributes["symbolic_tensor_inputs"][index],)
-                        or not any(edge.source == hidden.attributes["symbolic_collective_input_producers"][index]
-                            and edge.destination == gates[0].node_id and edge.kind == "data" for edge in graph.edges)):
+                        or hidden.attributes["symbolic_collective_input_producers"][index] not in data_parent_ids(gates[0].node_id)):
                     raise ValueError("GLM PCP EP gate and hidden dispatch must share the actual rank-local payload producer")
             checked_dispatches.add(dispatch_key)
-        combines = tuple(item for item in graph.nodes if item.kind is WorkloadKind.COLLECTIVE
-            and item.attributes["operation"] == "reduce_scatterv"
-            and "moe_invocation_id" in item.attributes and item.attributes["moe_invocation_id"] == invocation
-            and item.attributes["participants"] == expected_group)
-        if len(combines) != 1 or not any(edge.source == node.node_id and edge.destination == combines[0].node_id
-                and edge.kind == "data" for edge in graph.edges):
+        combine_key = (invocation, expected_group)
+        if combine_key not in combines_by_group:
+            combines_by_group[combine_key] = tuple(item for item in graph.nodes if item.kind is WorkloadKind.COLLECTIVE
+                and item.attributes["operation"] == "reduce_scatterv"
+                and "moe_invocation_id" in item.attributes and item.attributes["moe_invocation_id"] == invocation
+                and item.attributes["participants"] == expected_group)
+        combines = combines_by_group[combine_key]
+        if len(combines) != 1 or node.node_id not in data_parent_ids(combines[0].node_id):
             raise ValueError("GLM PCP EP requires its matching routed-output sum-scatter dependency")
         combine = combines[0]
         attrs = combine.attributes
@@ -6729,6 +6870,14 @@ def _symbolic_glm_pipeline_projection(node, pool):
 
 def _symbolic_v3_parallel_projection(node, pool):
     config = pool.parallel_plan.config
+    from .v3_ep_contract import applicable, source_node
+    from .v3_dp_contract import applicable as dp_applicable, marker as dp_marker
+    if dp_applicable(pool) and dp_marker(node):
+        return True
+    if (applicable(pool) and node.attributes.get("source_projection_only") is True
+            and node.attributes.get("model_execution_version")=="vllm_0_27_1"
+            and node.attributes.get("model_source_profile")=="vllm_0_27_1_deepseek_v3_sync_fp8"):
+        return True
     return (HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id) and config.is_rank_local and not config.enable_expert_parallel
         and len(pool.ranks) == config.worker_count
         and "source_projection_only" in node.attributes and node.attributes["source_projection_only"] is True
@@ -6910,10 +7059,25 @@ def _validate_kimi_dp_expert_graph(graph, deployment):
 
 
 
+def _a800_extended_kimi_scope(pool):
+    """A800 uses the existing unbound INT4/BF16 Kimi source math.
+
+    Preserve the two legacy A800 projections; no H200 launch contract is
+    enabled, and graph-wide expert-port/ownership validation remains active.
+    """
+    c = pool.parallel_plan.config
+    legacy = (c.is_rank_local and ((c.tensor_parallel_size == 1 and c.pipeline_parallel_size == 1
+        and not c.enable_expert_parallel) or (c.tensor_parallel_size == c.expert_parallel_size == 8
+        and c.pipeline_parallel_size == 2 and c.enable_expert_parallel)))
+    return (pool.hardware_id == "nvidia_a800" and not legacy
+        and (c.enable_expert_parallel or pool.role == "colocated" and c.is_rank_local)
+        and HWSpec.source_contract_supported("kimi_ep_marlin_swiglu_math", pool.hardware_id))
+
+
 def _symbolic_kimi_dp_projection(node, pool):
     """Versioned K2 DP program marker; exact expert ports checked graph-wide."""
     config = pool.parallel_plan.config
-    return (HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id) and config.data_parallel_size > 1
+    return ((HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id) or _a800_extended_kimi_scope(pool)) and config.data_parallel_size > 1
         and config.context_parallel_size == config.sequence_parallel_size == 1
         and len(pool.ranks) == config.worker_count
         and "source_projection_only" in node.attributes and node.attributes["source_projection_only"] is True
@@ -6928,9 +7092,9 @@ def _symbolic_mla_dp_pipeline_projection(node, pool):
 
 
 def _symbolic_kimi_parallel_projection(node, pool):
-    """H200 K2 source marker, with stage-local TP/EP and nonempty layers."""
+    """K2 source marker, with stage-local TP/EP and nonempty layers."""
     config = pool.parallel_plan.config
-    return (HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id) and config.is_rank_local
+    return ((HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id) or _a800_extended_kimi_scope(pool)) and config.is_rank_local
         and len(pool.ranks) == config.worker_count
         and all(pool.parallel_plan.layer_to_pipeline_stage.count(stage) > 0
             for stage in range(config.pipeline_parallel_size))
@@ -7006,10 +7170,12 @@ def _is_k3_source_pipeline_graph(graph, pool):
 
 
 def _symbolic_v4_parallel_projection(node, pool):
+    from .v4_ep_contract import applicable as v4_ep_applicable
     config = pool.parallel_plan.config
     # The two pinned V4 targets have8/16 output groups. The model boundary
     # checks its own exact group count and whole quantized intermediate.
-    return (HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id) and config.is_rank_local and not config.enable_expert_parallel
+    return (HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id)
+        and ((config.is_rank_local and not config.enable_expert_parallel) or v4_ep_applicable(pool))
         and 16 % config.tensor_parallel_size == 0 and 1 <= config.pipeline_parallel_size <= pool.parallel_plan.num_layers
         and len(pool.ranks) == config.worker_count
         and "source_projection_only" in node.attributes and node.attributes["source_projection_only"] is True
@@ -7478,8 +7644,13 @@ def _validate_mla_dp_pipeline_frontier(graph, pool, producer, source_ranks, stag
     sequence = bool(stage_experts) and config.enable_expert_parallel and tp > 1
     local_rows = -(-rows // tp) if sequence else rows
 
+    data_predecessors = {}
+    for edge in graph.edges:
+        if edge.kind == "data":
+            data_predecessors.setdefault(edge.destination, []).append(edge.source)
+
     def parents(node):
-        return tuple(graph.node(edge.source) for edge in graph.edges if edge.destination == node.node_id and edge.kind == "data")
+        return tuple(graph.node(source) for source in data_predecessors.get(node.node_id, ()))
 
     if tp > 1:
         attrs = producer.attributes
@@ -8061,7 +8232,12 @@ def _validate_symbolic_sliced_pipeline_boundary(graph, pool, p2p_nodes, stage, *
                                 and node.shape["m"] == rows and node.shape["n"] == hidden)
                             or (node.kind is WorkloadKind.FUSED_MOE
                                 and node.attributes["source_component"] == "symbolic_unquantized_experts"
-                                and node.attributes["model_execution_version"] == "vllm_0_30_0"
+                                and (node.attributes["model_execution_version"] == "vllm_0_30_0" or
+                                    (pool.hardware_id,node.attributes["model_execution_version"],node.attributes.get("routing_weight_dtype"))
+                                    in (("metax_c500","vllm_0_24_0","fp32"),("ascend_910b","vllm_0_18_0","bf16"))
+                                    and tp==2 and node.attributes.get("expert_parallel_size")==tp
+                                    and node.rank in source_ranks and node.attributes.get("expert_rank")==source_ranks.index(node.rank)
+                                    and node.dtype=="bf16" and pool.parallel_plan.config.enable_expert_parallel)
                                 and node.shape["tokens"] == rows and node.shape["hidden"] == hidden)
                             for node in inputs))
                     if len(inputs) != tp or not valid_inputs or {node.rank for node in inputs} != set(source_ranks):
@@ -9432,6 +9608,32 @@ def _bind_plan_source_launch_inputs(plan, inputs, hardware_by_id, graph):
                 kernel.variant, attrs, hardware=hardware)
             updates[call_id] = dataclasses.replace(call, source_launches=(("native_main", launch),))
             continue
+        if kernel.kind is KernelKind.VECTOR and kernel.attributes.get("mathematical_program")=="v4_modelsp_hash_top6_masked_v1":
+            from .v4_modelsp_contract import handles_hash_route
+            if len(call.source_node_ids)!=1:
+                raise ValueError("V4 masked hash requires one proved source call")
+            node=graph.node(call.source_node_ids[0])
+            expected={"expert_id_selection":"hash_table","routed_scaling_factor":node.attributes["routed_scaling_factor"],"routing_source":None,"mathematical_program":"v4_modelsp_hash_top6_masked_v1","valid_rows":node.attributes["symbolic_padding_valid_prefix"]}
+            if not handles_hash_route(node) or dict(kernel.attributes)!=expected or dict(kernel.shape)!=dict(KernelSpec(kind=KernelKind.VECTOR,hardware_id="nvidia_h200",shape=_vector_shape(node),dtype=node.dtype,variant="dsv4_moe_route",attributes=expected,launch=None,execution_support="unsupported",unsupported_reason="launch_selector_unavailable").shape) or kernel.dtype!=node.dtype or kernel.launch is not None:
+                raise ValueError("V4 masked hash math differs from its validated source mask")
+            continue
+        if kernel.kind is KernelKind.FUSED_MOE and kernel.attributes.get("mathematical_program") in ("v4_masked_marlin_ep_v1", "v4_modelsp_masked_marlin_ep_v1"):
+            from .v4_ep_contract import expert_attributes
+            if len(call.source_node_ids) != 1:
+                raise ValueError("V4 EP math requires one actual source expert call")
+            node = graph.node(call.source_node_ids[0]); expected = expert_attributes(node)
+            shape={**node.shape,"dtype_bytes":2}
+            if expected.get("mathematical_program")=="v4_modelsp_masked_marlin_ep_v1":
+                from .v4_modelsp_math_binding import valid_tokens
+                shape["tokens"]=valid_tokens(node)
+            if dict(kernel.attributes) != expected or dict(kernel.shape) != shape or kernel.launch is not None:
+                raise ValueError("V4 EP mathematical call differs from its source")
+            attrs = binding["attributes"]
+            if (attrs["source_has_expert_map"] is not True or attrs["source_weight_type"] != "float4_e2m1f"
+                    or attrs["source_scale_dtype"] != "float8_e8m0fnu" or attrs["source_activation"] != "silu_clamped"
+                    or attrs["source_clamp_limit"] != 10.0 or attrs["source_group_size"] != 32):
+                raise ValueError("V4 EP source weight/activation binding mismatch")
+            continue  # Partial useful math deliberately carries no native launch recipe.
         if (HWSpec.source_contract_supported("marlin_routed_expert_source_launch_binding", kernel.hardware_id) and kernel.kind is KernelKind.FUSED_MOE
                 and kernel.variant == "routed_experts"
                 and (kernel.attributes["routed_weight_dtype"] == "mxfp4"
@@ -9666,6 +9868,11 @@ def lower_workload(
     _validate_tp2_pp2_pipeline_graph(graph, deployment)
     _validate_glm_mtp_dp_expert_graph(graph, deployment)
     _validate_kimi_dp_expert_graph(graph, deployment)
+    from .k3_tp_contract import applicable as tp_k3_applicable,validate as validate_k3_tp
+    for tp_pool in deployment.worker_pools.values():
+        if tp_k3_applicable(tp_pool):
+            tp_nodes=tuple(n for n in graph.nodes if n.pool_name==tp_pool.name and n.attributes.get('source_component')=='vllm_0_30_kimi_k3_marlin_experts')
+            validate_k3_tp(graph,tp_pool,tp_nodes,_CURRENT_DSPARK_SOURCE_GRAPH.get()[2])
     ep_source_validation_reused = False
     if graph.nodes and all(is_heterogeneous_moe(n) for n in graph.nodes):
         validate_heterogeneous_graph(graph, deployment)
@@ -9683,6 +9890,7 @@ def lower_workload(
     fusion_heads, fusion_member_heads = (
         _ascend_qkv_rmsnorm_rope_fusions(
             graph, deployment, hardware_by_id))
+    collective_data_predecessors = None
     if compact_source_layers:
         # The complete EP graph was checked above. Validate every real routing
         # record before comparing raw physical contracts across source layers.
@@ -9702,14 +9910,18 @@ def lower_workload(
             if current.kind is WorkloadKind.COLLECTIVE:
                 if current.pool_name not in deployment.worker_pools:
                     raise ValueError(f"workload node references unknown pool {current.pool_name!r}")
+                if collective_data_predecessors is None:
+                    collective_data_predecessors = _collective_data_predecessors(graph)
                 _validate_collective_node(current, deployment.worker_pools[current.pool_name],
-                    graph, gqa_source=gqa_source)
+                    graph, gqa_source=gqa_source, data_predecessors=collective_data_predecessors)
             if current.kind is WorkloadKind.FUSED_MOE:
                 if not routing_certificates_valid:
                     _validate_routing_provenance(current)
                 logical_node_contracts[current.node_id] = (_logical_node_contract(current)
                     if moe_physical_contracts is None else moe_physical_contracts[current.node_id])
         graph = memo.compact_source_layers(graph, logical_node_contracts)
+        # Folding produces a different graph; never reuse its source index.
+        collective_data_predecessors = None
     calls = []
     final_call_by_node = {}
     call_ids_by_node = {}
@@ -9724,7 +9936,8 @@ def lower_workload(
                 and node.attributes["source_component"] == "vllm_0_30_symbolic_v4_marlin"
                 and "source_logical_intermediate" in node.attributes
                 and node.attributes["source_logical_intermediate"] != node.shape["intermediate"]):
-            raise NotImplementedError("V4 padded Marlin source requires separate logical-work and physical-storage pricing bindings")
+            from .v4_padded_contract import validate as validate_padded_pro
+            validate_padded_pro(node, deployment.worker_pools[node.pool_name])
         if (node_id in fusion_member_heads
                 and fusion_member_heads[node_id] != node_id):
             continue
@@ -9826,7 +10039,10 @@ def lower_workload(
                 WorkloadKind.AF_ACTIVATION_TRANSFER) and not is_heterogeneous_moe(node):
             _validate_graph_domain_boundary(node, graph)
         if node.kind is WorkloadKind.COLLECTIVE and not compact_source_layers:
-            _validate_collective_node(node, pool, graph, gqa_source=gqa_source)
+            if collective_data_predecessors is None:
+                collective_data_predecessors = _collective_data_predecessors(graph)
+            _validate_collective_node(node, pool, graph, gqa_source=gqa_source,
+                data_predecessors=collective_data_predecessors)
         if node.kind is WorkloadKind.P2P:
             if is_heterogeneous_moe(node):
                 validate_heterogeneous_transfer(node, deployment)
@@ -9853,6 +10069,10 @@ def lower_workload(
                 routing_relabelling = _fused_moe_routing_relabelling(
                     node, hardware_id, hardware)
         def build_specs():
+            if (_k3_tp_allowed_node(node,pool) and node.attributes.get('source_component')=='vllm_0_30_kimi_k3_latent_tp_tail'):
+                return (KernelSpec(kind=KernelKind.GEMM,hardware_id=hardware_id,shape=node.shape,dtype='bf16',variant='gemm',
+                    attributes={'mathematical_program':'k3_tp_column_addmm_v1','weight_dtype':'bf16','weight_group_size':0,'has_bias':False},
+                    launch=None,execution_support='unsupported',unsupported_reason='launch_selector_unavailable'),)
             _require_source_lowering_contract(node)
             if "source_dspark_standalone" in node.attributes or "source_v4_aux_capture" in node.attributes:
                 adapted = _dspark_typed_math_specs(node, hardware_id)
@@ -9880,6 +10100,8 @@ def lower_workload(
             a800_kimi_pipeline = _symbolic_kimi_pipeline_projection(node, pool)
             kimi_parallel = _symbolic_kimi_parallel_projection(node, pool) or _symbolic_kimi_dp_projection(node, pool)
             v3_parallel = _symbolic_v3_parallel_projection(node, pool)
+            from .v3_dp_contract import applicable as dp_applicable, marker as dp_marker
+            v3_active_dp = dp_applicable(pool) and dp_marker(node)
             a800_kimi_single = (HWSpec.source_contract_supported("kimi_tp1_unbound_source_lowering", hardware_id)
                 and _symbolic_kimi_single_rank_projection(node, pool))
             a800_glm_pcp = (HWSpec.source_contract_supported("glm_tp8_pp4_ep8_source_projection", hardware_id)
@@ -9887,8 +10109,10 @@ def lower_workload(
             unbound_target_source = structural_target or a800_glm_pipeline or a800_kimi_pipeline or a800_kimi_single or a800_glm_pcp or kimi_parallel or v3_parallel
             projection_scope = ("a800_tp8_pp4_ep8_glm_source_v1" if a800_glm_pipeline else
                 ("vllm_0_30_kimi_parallel_source_v1" if HWSpec.source_contract_supported("h200_partial_source_programs", hardware_id)
+                    else "a800_kimi_parallel_source_v1" if _a800_extended_kimi_scope(pool)
                     else "a800_tp8_pp2_ep8_kimi_source_v1") if a800_kimi_pipeline else
                 "a800_tp1_kimi_source_v1" if a800_kimi_single else
+                "a800_kimi_parallel_source_v1" if kimi_parallel and _a800_extended_kimi_scope(pool) else
                 "vllm_0_30_glm_pcp_source_v1" if a800_glm_pcp else source_projection_scope)
             if is_heterogeneous_moe(node):
                 return heterogeneous_moe_specs(node, hardware_id)
@@ -9984,10 +10208,10 @@ def lower_workload(
             if ("source_component" in node.attributes
                     and node.attributes["source_component"] == "vllm_0_30_symbolic_k3_prefill_attention"):
                 config = pool.parallel_plan.config
-                if (not hardware.supports_source_contract(node.attributes["source_component"]) or config.enable_expert_parallel
+                if ((not hardware.supports_source_contract(node.attributes["source_component"]) or config.enable_expert_parallel
                         or (config.pipeline_parallel_size != 1 and not _symbolic_k3_pipeline_projection(node, pool))
                         or any(value != 1 for value in (config.tensor_parallel_size,
-                            config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))):
+                            config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))) and not _k3_tp_allowed_node(node,pool)):
                     raise NotImplementedError("K3 prefill source requires H200 TP1 nonempty PP SP/CP/DP1 EP-off")
                 if (node.kind is not WorkloadKind.FLASH_ATTN or node.variant != "mla_prefill" or node.dtype != "bf16"
                         or node.attributes["prefill_output_source"] != "supports_out"
@@ -10003,7 +10227,7 @@ def lower_workload(
                     and node.attributes["source_component"] in ("symbolic_mla_decode_mathematical", "symbolic_mla_cache_update")):
                 config = pool.parallel_plan.config
                 supported_tp = (1, 4, 8) if _symbolic_dsv3_l32_tp4_projection(node, pool) else (1, 8)
-                if (not kimi_parallel and not v3_parallel and not _symbolic_glm_pcp_projection(node, pool) and ((not unbound_target_source and (not hardware.supports_source_contract(node.attributes["source_component"])
+                if (not kimi_parallel and not v3_parallel and not (_k3_ep_allowed_node(node, pool) or _k3_tp_allowed_node(node,pool)) and not _symbolic_glm_pcp_projection(node, pool) and ((not unbound_target_source and (not hardware.supports_source_contract(node.attributes["source_component"])
                             or config.tensor_parallel_size not in supported_tp))
                         or (config.enable_expert_parallel and config.expert_parallel_size != 8)
                         or ((config.pipeline_parallel_size != 1 and not _symbolic_mla_pipeline_projection(node, pool))
@@ -10033,6 +10257,14 @@ def lower_workload(
                     dtype=node.dtype, variant=node.variant, attributes={name: node.attributes[name] for name in (
                         "causal", "kv_layout", "kv_dist", "q_lens", "kv_lens", "full_cuda_graphs",
                         "max_cudagraph_capture_size", "mathematical_program")}, launch=None,
+                    execution_support="unsupported", unsupported_reason="launch_selector_unavailable"),)
+            if node.attributes.get("source_component") == "vllm_0_27_1_symbolic_expert_input_quant":
+                from .v3_dp_contract import applicable as dp_applicable, quant_attributes
+                if not dp_applicable(pool):
+                    raise NotImplementedError("V3 external input quant requires active TP1 DP2/4/8 PP1")
+                return (KernelSpec(kind=KernelKind.VECTOR, hardware_id=hardware_id,
+                    shape={"element_count":node.shape["elements"], "rows":node.shape["rows"], "columns":node.shape["hidden"]},
+                    dtype="bf16", variant="fp8_group_quant", attributes=quant_attributes(node), launch=None,
                     execution_support="unsupported", unsupported_reason="launch_selector_unavailable"),)
             if ("source_component" in node.attributes
                     and node.attributes["source_component"] == "symbolic_block_fp8_linear"):
@@ -10158,12 +10390,17 @@ def lower_workload(
                         and node.attributes["model_execution_version"] == "vllm_0_30_0")
                     or (node.attributes["source_component"] == "symbolic_softmax_topk"
                         and node.attributes["source_program"] == "vllm_0_30_bf16_softmax_topk"))
+                vendor_stage = (config.enable_expert_parallel and config.tensor_parallel_size == config.expert_parallel_size == 2
+                    and ((hardware_id, node.attributes.get("source_program")) in (
+                        ("metax_c500","vllm_0_24_bf16_softmax_topk"), ("ascend_910b","vllm_0_18_bf16_softmax_topk"))
+                        or (hardware_id,node.attributes.get("model_execution_version"),node.attributes.get("routing_weight_dtype"))
+                        in (("metax_c500","vllm_0_24_0","fp32"),("ascend_910b","vllm_0_18_0","bf16"))))
                 if (not hardware.supports_source_contract(contract)
                         or node.dtype != ("fp32" if fp32_route011 else "bf16")
                         or (config.enable_expert_parallel and (
                             (config.expert_parallel_size != config.tensor_parallel_size and not (source030 and _qwen030_dp_sp(config)))
                             or (config.expert_parallel_size != 2 and not source030)))
-                        or (config.pipeline_parallel_size != 1 and not source030)
+                        or (config.pipeline_parallel_size != 1 and not (source030 or vendor_stage))
                         or (not (source030 and _qwen030_dp_sp(config)) and any(value != 1 for value in (config.sequence_parallel_size,
                             config.context_parallel_size, config.data_parallel_size)))):
                     raise NotImplementedError("virtual Qwen3 MoE requires BF16, PP/SP/CP/DP1 and EP1 or TP=EP=2")
@@ -10181,8 +10418,10 @@ def lower_workload(
             if ("source_component" in node.attributes and node.attributes["source_component"] in (
                     "vllm_0_27_1_symbolic_grouped_routing", "vllm_0_11_symbolic_grouped_routing", "symbolic_dsv3_routed_experts")):
                 config = pool.parallel_plan.config
+                from .v3_ep_contract import applicable as v3_ep_applicable, source_node as v3_ep_source
+                v3_ep = v3_ep_applicable(pool) and v3_ep_source(node)
                 if (not hardware.supports_source_contract("symbolic_dsv3_routed_experts")
-                        or (not v3_parallel and ((config.tensor_parallel_size not in (1, 8) and not _symbolic_dsv3_l32_tp4_projection(node, pool)) or config.enable_expert_parallel
+                        or (not (v3_parallel or v3_ep) and ((config.tensor_parallel_size not in (1, 8) and not _symbolic_dsv3_l32_tp4_projection(node, pool)) or config.enable_expert_parallel
                             or config.pipeline_parallel_size != 1 or not config.is_rank_local))):
                     raise NotImplementedError("DSV3 grouped source requires its declared ordinary FP8 TP/PP EP-off binding")
                 if node.attributes["source_component"] in ("vllm_0_27_1_symbolic_grouped_routing", "vllm_0_11_symbolic_grouped_routing"):
@@ -10202,6 +10441,18 @@ def lower_workload(
                             "source_program", "mathematical_program", "normalize_topk_probability",
                             "expert_group_count", "topk_group_count", "routed_scaling_factor")},
                         launch=None, execution_support="unsupported", unsupported_reason="launch_selector_unavailable"),)
+                from .v3_dp_contract import applicable as dp_applicable, expert_attributes as dp_attributes
+                if dp_applicable(pool):
+                    _validate_routing_provenance(node)
+                    return (KernelSpec(kind=KernelKind.FUSED_MOE, hardware_id=hardware_id, shape=node.shape,
+                        dtype="bf16", variant="routed_experts", attributes=dp_attributes(node), launch=None,
+                        execution_support="unsupported", unsupported_reason="launch_selector_unavailable"),)
+                if v3_ep:
+                    _validate_routing_provenance(node)
+                    from .v3_ep_contract import expert_attributes
+                    return (KernelSpec(kind=KernelKind.FUSED_MOE, hardware_id=hardware_id, shape=node.shape,
+                        dtype="bf16", variant="routed_experts", attributes=expert_attributes(node), launch=None,
+                        execution_support="unsupported", unsupported_reason="launch_selector_unavailable"),)
                 if (node.kind is not WorkloadKind.FUSED_MOE or node.variant != "full" or node.dtype != "bf16"
                         or (node.shape["experts"], node.shape["topk"], node.shape["hidden"], node.shape["intermediate"])
                             != (256, 8, 7168, 2048 // config.tensor_parallel_size)
@@ -10303,7 +10554,19 @@ def lower_workload(
                             or _symbolic_glm_mtp_data_projection(node, pool)
                             or _symbolic_glm_fp8_target_dp_projection(node, pool)
                             or _symbolic_glm_fp8_rank_local_mtp_ep_projection(node, pool)):
-                        raise NotImplementedError("GLM block-FP8 EP source uses deferred Cutlass input quantization; Goal05 pricing is unbound, mapped Triton EP8 is not this source")
+                        from src.serving.workload.traced_glm_pcp import glm_fp8_deferred_expert_source_metadata
+                        source_facts = glm_fp8_deferred_expert_source_metadata()
+                        if (hardware_id != "nvidia_h200" or not (_symbolic_glm_fp8_target_dp_projection(node, pool)
+                                or _symbolic_glm53_dp1_ep8_deferred_projection(node, pool))
+                                or any(node.attributes.get(key) != value or type(node.attributes.get(key)) is not type(value)
+                                    for key, value in source_facts.items())
+                                or node.attributes.get("model_source_profile") != "vllm_0_30_v32_fp8_sync_explicit_allreduce"):
+                            raise NotImplementedError("GLM deferred FP8 pricing requires exact H200 GLM deferred expert source")
+                        attributes = _fused_moe_prediction_attributes(node)
+                        attributes["mathematical_program"] = "glm_flashinfer_block128_deferred_ep_v1"
+                        return (KernelSpec(kind=KernelKind.FUSED_MOE, hardware_id=hardware_id,
+                            shape=node.shape, dtype="bf16", variant="routed_experts", attributes=attributes,
+                            launch=None, execution_support="unsupported", unsupported_reason="launch_selector_unavailable"),)
                     # The existing H200 block-FP8 launch census is for
                     # DeepSeek-V3, not this GLM geometry/provider. Preserve
                     # the expert operation without borrowing BF16 pricing.
@@ -10476,14 +10739,18 @@ def lower_workload(
             if ("source_component" in node.attributes and node.attributes["source_component"] in (
                     "vllm_0_30_symbolic_v4_routing", "vllm_0_30_symbolic_v4_marlin")):
                 config = pool.parallel_plan.config
-                if (not hardware.supports_source_contract(node.attributes["source_component"]) or config.enable_expert_parallel
+                from .v4_ep_contract import applicable
+                if (not hardware.supports_source_contract(node.attributes["source_component"]) or (config.enable_expert_parallel and not applicable(pool))
                         or 16 % config.tensor_parallel_size != 0
-                        or not config.is_rank_local
+                        or not (config.is_rank_local or applicable(pool))
                         or (config.pipeline_parallel_size != 1 and not _symbolic_v4_pipeline_projection(node, pool))):
                     raise NotImplementedError("symbolic V4 modular routing/experts require H200 legal TP rank-local EP-off and a declared PP projection")
                 if node.attributes["source_component"] == "vllm_0_30_symbolic_v4_routing":
                     if node.kind is not WorkloadKind.VECTOR or node.variant != "dsv4_moe_route":
                         raise ValueError("symbolic V4 routing has an unexpected operation")
+                    from .v4_modelsp_contract import handles_hash_route
+                    if handles_hash_route(node):
+                        return (KernelSpec(kind=KernelKind.VECTOR,hardware_id=hardware_id,shape=_vector_shape(node),dtype=node.dtype,variant=node.variant,attributes={"expert_id_selection":"hash_table","routed_scaling_factor":node.attributes["routed_scaling_factor"],"routing_source":None,"mathematical_program":"v4_modelsp_hash_top6_masked_v1","valid_rows":node.attributes["symbolic_padding_valid_prefix"]},launch=None,execution_support="unsupported",unsupported_reason="launch_selector_unavailable"),)
                     return (_selected_target_compute_spec(node, hardware_id, hardware,
                         KernelKind.VECTOR, node.variant, _vector_shape(node),
                         {key: node.attributes[key] for key in (
@@ -10563,6 +10830,19 @@ def lower_workload(
                         or (config.pipeline_parallel_size != 1 and not (
                             node.attributes["source_component"] == "vllm_0_11_symbolic_masked_embedding"
                             and hardware.supports_source_contract("vllm_0_11_masked_embedding_pipeline_endpoint")
+                            and _symbolic_pipeline_endpoint(node, pool, 0)) and not (
+                            ((hardware_id == "metax_c500"
+                            and (node.attributes["source_component"], node.attributes.get("mask_program")) in (
+                                ("vllm_0_30_symbolic_masked_embedding", "vllm_0_30"),
+                                ("vllm_0_24_symbolic_masked_embedding", "vllm_0_24")))
+                            or (hardware_id == "ascend_910b"
+                            and node.attributes["source_component"] == "vllm_0_18_symbolic_masked_embedding"
+                            and node.attributes.get("mask_program") == "vllm_ascend_no_added_vocab"))
+                            and node.dtype in ("bf16", "int32", "bool")
+                            and (not config.enable_expert_parallel or
+                                config.tensor_parallel_size == config.expert_parallel_size == 2
+                                and node.attributes["source_component"] in (
+                                    "vllm_0_18_symbolic_masked_embedding", "vllm_0_24_symbolic_masked_embedding"))
                             and _symbolic_pipeline_endpoint(node, pool, 0)))
                         or any(value != 1 for value in (config.sequence_parallel_size,
                             config.context_parallel_size, config.data_parallel_size))):
@@ -10702,13 +10982,15 @@ def lower_workload(
                     raise ValueError("symbolic logits source component disagrees with model_execution_version")
                 if (not hardware.supports_source_contract(node.attributes["source_component"]) or node.kind is not WorkloadKind.VECTOR
                         or (config.tensor_parallel_size not in (1, 2, 4, 8) and not v3_parallel
+                            and not _a800_tp16_logits_source(pool, node)
+                            and not _ascend_dense_logits_source(pool, node)
                             and node.attributes["model_execution_version"] != "vllm_0_30_0")
-                        or (config.enable_expert_parallel and not (_symbolic_kimi_dp_projection(node, pool) or _symbolic_glm_pcp_projection(node, pool) or (config.tensor_parallel_size, config.expert_parallel_size) == (2, 2)
+                        or (config.enable_expert_parallel and not (v3_parallel or _symbolic_kimi_dp_projection(node, pool) or _symbolic_glm_pcp_projection(node, pool) or (config.tensor_parallel_size, config.expert_parallel_size) == (2, 2)
                             or (node.attributes["model_execution_version"] == "vllm_0_30_0" and (config.expert_parallel_size == config.tensor_parallel_size or _qwen030_dp_sp(config)))
                             or ((hardware.supports_source_contract("mla_tp8_ep8_source_projection") or _symbolic_mla_pipeline_projection(node, pool)) and (config.tensor_parallel_size, config.expert_parallel_size) == (8, 8))))
                         or (config.pipeline_parallel_size != 1 and not _symbolic_pipeline_endpoint(
                             node, pool, config.pipeline_parallel_size - 1))
-                        or (not (_symbolic_kimi_dp_projection(node, pool) or _symbolic_glm_pcp_projection(node, pool)
+                        or (not (v3_active_dp or _symbolic_kimi_dp_projection(node, pool) or _symbolic_glm_pcp_projection(node, pool)
                             or node.attributes["model_execution_version"] == "vllm_0_30_0" and _qwen030_dp_sp(config))
                             and any(value != 1 for value in (config.sequence_parallel_size,
                                 config.context_parallel_size, config.data_parallel_size)))):
@@ -10776,14 +11058,16 @@ def lower_workload(
                         "vllm_0_18_symbolic_plain_greedy", "vllm_0_24_symbolic_plain_greedy", "vllm_0_27_1_symbolic_plain_greedy")):
                 config = pool.parallel_plan.config
                 if (not hardware.supports_source_contract(node.attributes["source_component"])
-                        or (config.enable_expert_parallel and not (_symbolic_kimi_dp_projection(node, pool) or _symbolic_glm_pcp_projection(node, pool) or (config.tensor_parallel_size, config.expert_parallel_size) == (2, 2)
+                        or (config.enable_expert_parallel and not (v3_parallel or _symbolic_kimi_dp_projection(node, pool) or _symbolic_glm_pcp_projection(node, pool) or (config.tensor_parallel_size, config.expert_parallel_size) == (2, 2)
                             or (node.attributes["source_component"] == "vllm_0_30_symbolic_plain_greedy" and (config.expert_parallel_size == config.tensor_parallel_size or _qwen030_dp_sp(config)))
                             or ((hardware.supports_source_contract("mla_tp8_ep8_source_projection") or _symbolic_mla_pipeline_projection(node, pool)) and (config.tensor_parallel_size, config.expert_parallel_size) == (8, 8))))
                         or (config.tensor_parallel_size not in (1, 2, 4, 8) and not v3_parallel
+                            and not _a800_tp16_logits_source(pool, node)
+                            and not _ascend_dense_logits_source(pool, node)
                             and node.attributes["source_component"] != "vllm_0_30_symbolic_plain_greedy")
                         or (config.pipeline_parallel_size != 1 and not _symbolic_pipeline_endpoint(
                             node, pool, config.pipeline_parallel_size - 1))
-                        or (not (_symbolic_kimi_dp_projection(node, pool) or _symbolic_glm_pcp_projection(node, pool)
+                        or (not (v3_active_dp or _symbolic_kimi_dp_projection(node, pool) or _symbolic_glm_pcp_projection(node, pool)
                             or node.attributes["source_component"] == "vllm_0_30_symbolic_plain_greedy" and _qwen030_dp_sp(config))
                             and any(value != 1 for value in (config.sequence_parallel_size, config.context_parallel_size,
                                 config.data_parallel_size)))):
@@ -10916,11 +11200,11 @@ def lower_workload(
             if ("source_component" in node.attributes
                     and node.attributes["source_component"] == "vllm_0_30_kimi_k3_plain_greedy"):
                 config = pool.parallel_plan.config
-                if (not hardware.supports_source_contract(node.attributes["source_component"]) or config.enable_expert_parallel
+                if ((not hardware.supports_source_contract(node.attributes["source_component"]) or config.enable_expert_parallel
                         or (config.pipeline_parallel_size != 1 and not _symbolic_k3_pipeline_projection(node, pool))
                         or any(value != 1 for value in (
                             config.tensor_parallel_size,
-                            config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))):
+                            config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))) and not _k3_tp_allowed_node(node,pool)):
                     raise NotImplementedError("K3 plain greedy source requires H200 TP1 nonempty PP SP/CP/DP1 EP-off")
                 if node.kind is not WorkloadKind.VECTOR or node.variant not in (
                         "vllm_logits_fp32_cast", "vllm_plain_greedy_sample"):
@@ -10965,11 +11249,11 @@ def lower_workload(
             if ("source_component" in node.attributes
                     and node.attributes["source_component"] == "vllm_0_30_kimi_k3_nope_decode"):
                 config = pool.parallel_plan.config
-                if (not hardware.supports_source_contract(node.attributes["source_component"]) or config.enable_expert_parallel
+                if (((not hardware.supports_source_contract(node.attributes["source_component"]) or config.enable_expert_parallel
                         or (config.pipeline_parallel_size != 1 and not _symbolic_k3_pipeline_projection(node, pool))
                         or any(value != 1 for value in (
                             config.tensor_parallel_size,
-                            config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))):
+                            config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))) and not (_k3_ep_allowed_node(node, pool) or _k3_tp_allowed_node(node,pool))) and not _k3_tp_allowed_node(node,pool)):
                     raise NotImplementedError("K3 NoPE decode source requires H200 TP1 nonempty PP SP/CP/DP1 EP-off")
                 if node.kind is WorkloadKind.LINEAR and node.variant == "kimi_k3_nope_bmm":
                     return (KernelSpec(
@@ -10993,11 +11277,11 @@ def lower_workload(
             if ("source_component" in node.attributes
                     and node.attributes["source_component"] == "vllm_0_30_kimi_k3_nope_mixed"):
                 config = pool.parallel_plan.config
-                if (not hardware.supports_source_contract(node.attributes["source_component"]) or config.enable_expert_parallel
+                if ((not hardware.supports_source_contract(node.attributes["source_component"]) or config.enable_expert_parallel
                         or (config.pipeline_parallel_size != 1 and not _symbolic_k3_pipeline_projection(node, pool))
                         or any(value != 1 for value in (
                             config.tensor_parallel_size,
-                            config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))):
+                            config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))) and not _k3_tp_allowed_node(node,pool)):
                     raise NotImplementedError("K3 NoPE mixed source requires H200 TP1 nonempty PP SP/CP/DP1 EP-off")
                 if node.kind is WorkloadKind.LINEAR and node.variant == "kimi_k3_nope_bmm":
                     return (KernelSpec(
@@ -11021,8 +11305,8 @@ def lower_workload(
             if ("source_component" in node.attributes
                     and node.attributes["source_component"] == "vllm_0_27_1_symbolic_embedding"):
                 config = pool.parallel_plan.config
-                if (not hardware.supports_source_contract("vllm_0_27_1_symbolic_embedding") or config.enable_expert_parallel
-                        or config.tensor_parallel_size != 1 or not config.is_rank_local
+                if (not hardware.supports_source_contract("vllm_0_27_1_symbolic_embedding") or (config.enable_expert_parallel and not v3_active_dp)
+                        or config.tensor_parallel_size != 1 or (not config.is_rank_local and not v3_active_dp)
                         or (config.pipeline_parallel_size != 1 and not (v3_parallel
                             and _symbolic_pipeline_endpoint(node, pool, 0)))
                         or node.kind is not WorkloadKind.VECTOR or node.variant != "vllm_embedding_id_widen"
@@ -11045,7 +11329,8 @@ def lower_workload(
                     and (_qwen030_dp_sp(config) or _symbolic_glm_pcp_projection(node, pool)))
                 if (not hardware.supports_source_contract(node.attributes["source_component"]) or (config.enable_expert_parallel and not distributed_embedding)
                         or (config.pipeline_parallel_size != 1 and not (
-                            node.attributes["source_component"] in ("vllm_0_30_symbolic_embedding", "vllm_0_11_symbolic_embedding")
+                            (node.attributes["source_component"] in ("vllm_0_30_symbolic_embedding", "vllm_0_11_symbolic_embedding")
+                             or (hardware_id == "ascend_910b" and node.attributes["source_component"] == "vllm_0_18_symbolic_embedding"))
                             and _symbolic_pipeline_endpoint(node, pool, 0)))
                         or config.tensor_parallel_size != 1
                         or (not distributed_embedding and any(value != 1 for value in (
@@ -11081,11 +11366,11 @@ def lower_workload(
             if ("source_component" in node.attributes
                     and node.attributes["source_component"] == "vllm_0_30_kimi_k3_fresh_prefill_logits"):
                 config = pool.parallel_plan.config
-                if (not hardware.supports_source_contract(node.attributes["source_component"]) or config.enable_expert_parallel
+                if ((not hardware.supports_source_contract(node.attributes["source_component"]) or config.enable_expert_parallel
                         or (config.pipeline_parallel_size != 1 and not _symbolic_k3_pipeline_projection(node, pool))
                         or any(value != 1 for value in (
                             config.tensor_parallel_size,
-                            config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))):
+                            config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))) and not _k3_tp_allowed_node(node,pool)):
                     raise NotImplementedError("K3 logits source requires H200 TP1 nonempty PP SP/CP/DP1 EP-off")
                 if node.kind is WorkloadKind.VECTOR and node.variant == "vllm_logits_row_select":
                     return (KernelSpec(
@@ -11113,11 +11398,11 @@ def lower_workload(
                                                                "vllm_0_30_kimi_k3_triton_mixed",
                                                                "vllm_0_30_kimi_k3_triton_context_prefill")):
                 config = pool.parallel_plan.config
-                if (not hardware.supports_source_contract(node.attributes["source_component"]) or config.enable_expert_parallel
+                if (((not hardware.supports_source_contract(node.attributes["source_component"]) or config.enable_expert_parallel
                         or (config.pipeline_parallel_size != 1 and not _symbolic_k3_pipeline_projection(node, pool))
                         or any(value != 1 for value in (
                             config.tensor_parallel_size,
-                            config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))):
+                            config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))) and not (_k3_ep_allowed_node(node, pool) or _k3_tp_allowed_node(node,pool))) and not _k3_tp_allowed_node(node,pool)):
                     raise NotImplementedError("K3 fresh Triton prefill source requires H200 TP1 nonempty PP SP/CP/DP1 EP-off")
                 if node.kind is WorkloadKind.VECTOR and node.variant in ("kimi_k3_kda_prefill", "kimi_k3_kda_mixed", "kimi_k3_kda_context_prefill"):
                     return (KernelSpec(
@@ -11132,11 +11417,11 @@ def lower_workload(
             if ("source_component" in node.attributes
                     and node.attributes["source_component"] == "vllm_0_30_kimi_k3_native_marlin_moe"):
                 config = pool.parallel_plan.config
-                if (not hardware.supports_source_contract(node.attributes["source_component"]) or config.enable_expert_parallel
+                if (((not hardware.supports_source_contract(node.attributes["source_component"]) or config.enable_expert_parallel
                         or (config.pipeline_parallel_size != 1 and not _symbolic_k3_pipeline_projection(node, pool))
                         or any(value != 1 for value in (
                             config.tensor_parallel_size,
-                            config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))):
+                            config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))) and not (_k3_ep_allowed_node(node, pool) or _k3_tp_allowed_node(node,pool))) and not _k3_tp_allowed_node(node,pool)):
                     raise NotImplementedError("K3 native Marlin MoE source requires H200 TP1 nonempty PP SP/CP/DP1 EP-off")
                 if node.kind is WorkloadKind.VECTOR and node.variant == "kimi_k3_moe_route":
                     return (KernelSpec(
@@ -11152,11 +11437,21 @@ def lower_workload(
             if ("source_component" in node.attributes
                     and node.attributes["source_component"] == "vllm_0_30_kimi_k3_marlin_experts"):
                 config = pool.parallel_plan.config
-                if (not hardware.supports_source_contract(node.attributes["source_component"]) or config.enable_expert_parallel
+                if _k3_tp_allowed_node(node,pool):
+                    from .k3_tp_contract import expert_attributes as tp_attributes
+                    return (KernelSpec(kind=KernelKind.FUSED_MOE,hardware_id=hardware_id,shape=node.shape,dtype=node.dtype,
+                        variant='routed_experts',attributes=tp_attributes(node,pool),launch=None,
+                        execution_support='unsupported',unsupported_reason='launch_selector_unavailable'),)
+                from .k3_ep_contract import applicable, expert_attributes
+                if applicable(pool):
+                    return (KernelSpec(kind=KernelKind.FUSED_MOE, hardware_id=hardware_id, shape=node.shape,
+                        dtype=node.dtype, variant="routed_experts", attributes=expert_attributes(node), launch=None,
+                        execution_support="unsupported", unsupported_reason="launch_selector_unavailable"),)
+                if ((not hardware.supports_source_contract(node.attributes["source_component"]) or config.enable_expert_parallel
                         or (config.pipeline_parallel_size != 1 and not _symbolic_k3_pipeline_projection(node, pool))
                         or any(value != 1 for value in (
                             config.tensor_parallel_size,
-                            config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))):
+                            config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))) and not _k3_tp_allowed_node(node,pool)):
                     raise NotImplementedError("K3 Marlin expert source requires H200 TP1 nonempty PP SP/CP/DP1 EP-off")
                 if node.kind is not WorkloadKind.FUSED_MOE or node.variant != "full":
                     raise ValueError("K3 Marlin expert source requires its explicit logical aggregate")
@@ -11172,11 +11467,11 @@ def lower_workload(
             if ("source_component" in node.attributes
                     and node.attributes["source_component"] == "vllm_0_30_kimi_k3_tp1_native_latent_output"):
                 config = pool.parallel_plan.config
-                if (not hardware.supports_source_contract(node.attributes["source_component"]) or config.enable_expert_parallel
+                if ((not hardware.supports_source_contract(node.attributes["source_component"]) or config.enable_expert_parallel
                         or (config.pipeline_parallel_size != 1 and not _symbolic_k3_pipeline_projection(node, pool))
                         or any(value != 1 for value in (
                             config.tensor_parallel_size,
-                            config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))):
+                            config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))) and not _k3_tp_allowed_node(node,pool)):
                     raise NotImplementedError("K3 native latent output source chain requires H200 TP1 nonempty PP SP/CP/DP1 EP-off")
                 if node.kind not in (WorkloadKind.NORM, WorkloadKind.LINEAR, WorkloadKind.ELEMENTWISE):
                     raise ValueError("K3 native latent output has an unexpected source operation")
@@ -11193,11 +11488,11 @@ def lower_workload(
             if ("source_component" in node.attributes
                     and node.attributes["source_component"] == "vllm_0_30_kimi_k3_nope_fresh_prefill"):
                 config = pool.parallel_plan.config
-                if (not hardware.supports_source_contract(node.attributes["source_component"]) or config.enable_expert_parallel
+                if (((not hardware.supports_source_contract(node.attributes["source_component"]) or config.enable_expert_parallel
                         or (config.pipeline_parallel_size != 1 and not _symbolic_k3_pipeline_projection(node, pool))
                         or any(value != 1 for value in (
                             config.tensor_parallel_size,
-                            config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))):
+                            config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))) and not (_k3_ep_allowed_node(node, pool) or _k3_tp_allowed_node(node,pool))) and not _k3_tp_allowed_node(node,pool)):
                     raise NotImplementedError("K3 NoPE prefill source chain requires H200 TP1 nonempty PP SP/CP/DP1 EP-off")
                 if node.kind is WorkloadKind.VECTOR and node.variant == "kimi_k3_nope_prefill":
                     return (KernelSpec(
@@ -11214,11 +11509,11 @@ def lower_workload(
             if ("source_component" in node.attributes
                     and node.attributes["source_component"] == "vllm_0_30_kimi_k3_triton_decode"):
                 config = pool.parallel_plan.config
-                if (not hardware.supports_source_contract(node.attributes["source_component"]) or config.enable_expert_parallel
+                if (((not hardware.supports_source_contract(node.attributes["source_component"]) or config.enable_expert_parallel
                         or (config.pipeline_parallel_size != 1 and not _symbolic_k3_pipeline_projection(node, pool))
                         or any(value != 1 for value in (
                             config.tensor_parallel_size,
-                            config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))):
+                            config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))) and not (_k3_ep_allowed_node(node, pool) or _k3_tp_allowed_node(node,pool))) and not _k3_tp_allowed_node(node,pool)):
                     raise NotImplementedError("K3 Triton decode source chain requires H200 TP1 nonempty PP SP/CP/DP1 EP-off")
                 if node.kind is WorkloadKind.VECTOR and node.variant == "kimi_k3_kda_decode":
                     return (KernelSpec(
@@ -11232,11 +11527,11 @@ def lower_workload(
             if ("source_component" in node.attributes
                     and node.attributes["source_component"] == "vllm_0_30_kimi_k3_ordinary_mlp"):
                 config = pool.parallel_plan.config
-                if (not hardware.supports_source_contract(node.attributes["source_component"]) or config.enable_expert_parallel
+                if (((not hardware.supports_source_contract(node.attributes["source_component"]) or config.enable_expert_parallel
                         or (config.pipeline_parallel_size != 1 and not _symbolic_k3_pipeline_projection(node, pool))
                         or any(value != 1 for value in (
                             config.tensor_parallel_size,
-                            config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))):
+                            config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))) and not (_k3_ep_allowed_node(node, pool) or _k3_tp_allowed_node(node,pool))) and not _k3_tp_allowed_node(node,pool)):
                     raise NotImplementedError("K3 ordinary MLP component requires H200 TP1 nonempty PP SP/CP/DP1 EP-off")
                 if node.kind is WorkloadKind.ACTIVATION and node.variant == "kimi_k3_situ":
                     return (KernelSpec(
@@ -11250,7 +11545,7 @@ def lower_workload(
             if node.kind is WorkloadKind.VECTOR and node.variant == "kimi_k3_attn_res":
                 if node.attributes["source_component"] != "vllm_0_30_kimi_k3_attention_residual":
                     raise ValueError("K3 attention residual requires an explicit source component")
-                if ((pool.parallel_plan.config.pipeline_parallel_size != 1 and not _symbolic_k3_pipeline_projection(node, pool))
+                if ((pool.parallel_plan.config.pipeline_parallel_size != 1 and not _symbolic_k3_pipeline_projection(node, pool) and not (_k3_ep_allowed_node(node, pool) or _k3_tp_allowed_node(node,pool)))
                         or pool.parallel_plan.config.sequence_parallel_size != 1):
                     raise NotImplementedError("K3 attention residual source component requires nonempty PP and SP1")
                 return (KernelSpec(
@@ -11416,6 +11711,9 @@ def lower_workload(
                         launch=None, execution_support="unsupported",
                         unsupported_reason="launch_selector_unavailable"),)
                 if node.kind is WorkloadKind.VECTOR and node.variant == "dsv4_moe_route":
+                    from .v4_modelsp_contract import handles_hash_route
+                    if handles_hash_route(node):
+                        return (KernelSpec(kind=KernelKind.VECTOR,hardware_id=hardware_id,shape=_vector_shape(node),dtype=node.dtype,variant=node.variant,attributes={"expert_id_selection":"hash_table","routed_scaling_factor":node.attributes["routed_scaling_factor"],"routing_source":None,"mathematical_program":"v4_modelsp_hash_top6_masked_v1","valid_rows":node.attributes["symbolic_padding_valid_prefix"]},launch=None,execution_support="unsupported",unsupported_reason="launch_selector_unavailable"),)
                     route_attributes = {name: node.attributes[name] for name in (
                         "expert_id_selection", "routed_scaling_factor", "routing_source")}
                     if route_attributes["routing_source"] is not None:
@@ -12152,9 +12450,12 @@ def lower_workload(graph, deployment, hardware_by_id, memo=None, *, source_proje
     token = _CURRENT_GEMM_SOURCE_BINDINGS.set(set())
     dspark_token = _CURRENT_DSPARK_SOURCE_GRAPH.set((graph, {}, source_memory_context))
     try:
-        return _lower_workload_with_current_source_inputs(graph, deployment, hardware_by_id, memo,
+        result = _lower_workload_with_current_source_inputs(graph, deployment, hardware_by_id, memo,
             source_projection_scope=source_projection_scope, compact_source_layers=compact_source_layers,
             source_launch_inputs=source_launch_inputs)
+        from .v4_modelsp_contract import validate_lowered
+        validate_lowered(graph,result)
+        return result
     finally:
         _CURRENT_DSPARK_SOURCE_GRAPH.reset(dspark_token)
         _CURRENT_GEMM_SOURCE_BINDINGS.reset(token)

@@ -199,10 +199,10 @@ class PipelineP2PConfig:
                     "pipeline P2P backend_config_sha256 must be a lowercase "
                     "SHA256")
         if self.backend == "analytical_roofline_v1":
-            if self.link not in ("nvlink", "infiniband"):
+            if self.link not in ("nvlink", "metaxlink", "hccs", "infiniband"):
                 raise ValueError(
                     "analytical Roofline pipeline P2P supports only the "
-                    "NVLink or InfiniBand paths")
+                    "NVLink, MetaXLink, HCCS or InfiniBand paths")
             if self.backend_config_sha256 is not None:
                 raise ValueError(
                     "analytical Roofline pipeline P2P does not accept a "

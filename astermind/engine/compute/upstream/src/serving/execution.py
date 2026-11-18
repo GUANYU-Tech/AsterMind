@@ -991,6 +991,9 @@ class ServingExecutionContext:
         workload = build_symbolic_workload(schedule, self.model, self.deployment,
             launch_policy=self.launch_policy, kv_cache_events=kv_cache_events,
             runtime_inputs=runtime, hardware_by_id=self.hardware_by_id, trace_observer=observe_source,
+            # Retained input values carry no compiled-plan representation.
+            kimi_input_history=(self._source_program_cache.kimi_input_history
+                if self.model.model_type == "kimi_k2" else None),
             # GLM's new source/compiled-plan representation belongs to fast
             # mode. Detailed execution preserves its complete call layout,
             # including equality between PD pools and colocated references.

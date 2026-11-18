@@ -1915,6 +1915,12 @@ def _bind_native_storage(program, trace, allocations, views):
     return True
 
 
+class KimiInputBufferHistory:
+    """Run-owned retained input values, without compiled source programs."""
+    def __init__(self):
+        self.states = {}
+
+
 class SourceProgramCache:
     """Bounded run-local source programs; eviction resumes actual source execution."""
 
@@ -1930,6 +1936,7 @@ class SourceProgramCache:
         # Legacy dummy calls read the last prepared input buffer. These value
         # declarations live with the run, independently of template eviction.
         self.qwen_legacy_inputs = {}
+        self.kimi_input_history = KimiInputBufferHistory()
         self.glm_legacy_inputs = {}
         # MTP dummy_run retains the real proposer's indexer toggle. This is
         # structural run history, independent of evictable graph templates.

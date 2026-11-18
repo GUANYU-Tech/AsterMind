@@ -1146,17 +1146,18 @@ class VLLMBackend:
                 or scheduler_config.dtype not in ("bfloat16", "float16")):
             raise NotImplementedError("0.30 prepared bridge requires synchronous depth1 or ordinary TP1/TP2 async depth2, with only bounded trace_no_hit prefix caching")
         if scheduler_config.dtype == "float16":
-            from src.serving.workload.model_config import load_model_config
+            from src.serving.workload.model_config import load_model_config, is_dense_parallel_model_scope
             fp16_model = load_model_config(scheduler_config.model)
             if (fp16_model.model_type != "qwen3" or fp16_model.attention_layout != "standard_gqa"
                     or fp16_model.num_experts != 0 or fp16_model.compute_dtype != "fp16"
                     or fp16_model.weight_dtype != "fp16" or config.role != "colocated"
-                    or scheduler_config.tensor_parallel_size not in (1, 2)
-                    or scheduler_config.pipeline_parallel_size != 1 or scheduler_config.enable_expert_parallel
+                    or not is_dense_parallel_model_scope(fp16_model, scheduler_config.tensor_parallel_size,
+                        scheduler_config.pipeline_parallel_size)
+                    or scheduler_config.enable_expert_parallel
                     or scheduler_config.mtp_num_speculative_tokens != 0 or scheduler_config.async_scheduling
                     or scheduler_config.enable_prefix_caching
                     or scheduler_config.simple_cpu_offload_bytes_per_rank is not None):
-                raise NotImplementedError("FP16 native source requires synchronous dense Qwen TP1/2 PP/CP/DP1 EP/MTP-off")
+                raise NotImplementedError("FP16 native source requires synchronous dense Qwen legal TP/PP, CP/DP1 and EP/MTP-off")
         _validate_vllm030_host_profiles(scheduler_config.scheduler_host_profile,
             scheduler_config.engine_core_host_round_profile)
         from src.serving.backend.vllm_scheduler_process import vllm030_source_identity
@@ -4324,6 +4325,21 @@ def _validate_ep_scheduler_model_scope(
             "layers, and no shared experts")
 
 
+def _llama_dense_scheduler_scope(scheduler_config, model) -> bool:
+    # Native 0.11 Llama uses standard GQA pages and hidden/residual PP ports.
+    # Match the existing dense source geometry, not a tiny fixture identity.
+    from src.serving.workload.model_config import is_dense_parallel_model_scope
+    return (model.model_type == "llama"
+        and model.compute_dtype == model.weight_dtype == "bf16"
+        and scheduler_config.dtype == "bfloat16"
+        and not scheduler_config.enable_expert_parallel
+        and scheduler_config.mtp_num_speculative_tokens == 0
+        and model.num_hidden_layers % scheduler_config.pipeline_parallel_size == 0
+        and is_dense_parallel_model_scope(model,
+            scheduler_config.tensor_parallel_size,
+            scheduler_config.pipeline_parallel_size))
+
+
 def _validate_tp2_scheduler_model_scope(
     scheduler_config: VLLMSchedulerConfig,
     model,
@@ -4348,7 +4364,7 @@ def _validate_tp2_scheduler_model_scope(
         )
     elif model.model_type == "llama":
         supported_model = (
-            is_validated_llama_tp2_model_scope(model)
+            _llama_dense_scheduler_scope(scheduler_config, model)
             and model.compute_dtype == "bf16"
             and model.weight_dtype == "bf16"
             and scheduler_config.dtype == "bfloat16"
@@ -4363,7 +4379,7 @@ def _validate_tp2_scheduler_model_scope(
         raise NotImplementedError(
             "the validated vLLM TP=2 Scheduler slice requires dense BF16 or "
             "FP16 Qwen3 with matching model and Scheduler dtypes, or the "
-            "exact source-backed Llama fixture in BF16, with standard GQA and "
+            "source-backed dense Llama in BF16, with standard GQA and "
             "expert parallelism disabled")
 
 
@@ -4375,7 +4391,8 @@ def _validate_tp2_pp2_scheduler_model_scope(
             scheduler_config.pipeline_parallel_size) != (2, 2):
         return
     if (scheduler_config.enable_expert_parallel
-            or model.model_type != "qwen3"
+            or (model.model_type != "qwen3"
+                and not _llama_dense_scheduler_scope(scheduler_config, model))
             or model.num_experts != 0
             or model.attention_layout != "standard_gqa"
             or model.compute_dtype != "bf16"
@@ -4383,7 +4400,7 @@ def _validate_tp2_pp2_scheduler_model_scope(
             or scheduler_config.dtype != "bfloat16"):
         raise NotImplementedError(
             "the validated vLLM TP=2, PP=2 Scheduler slice requires dense "
-            "BF16 Qwen3 with standard GQA and expert parallelism disabled")
+            "BF16 Qwen3 or Llama with standard GQA and expert parallelism disabled")
 
 
 def _validate_tp1_pp_scheduler_model_scope(
@@ -4413,18 +4430,22 @@ def _validate_tp1_pp_scheduler_model_scope(
                 "target Scheduler requires Kimi-K2.6 TP1/PP16 or "
                 "GLM-5.2 TP1/PP32 with EP and MTP disabled")
         return
+    # Native Qwen3 supports PP with tied embedding/head weights: the first
+    # and last stages each materialize embed_tokens, and the last-stage head
+    # aliases that local embedding. This does not change attention KV pages.
+    # Keep the BF16, dense, EP-off and uniform-layer Scheduler constraints.
     if (scheduler_config.tensor_parallel_size != 1
             or scheduler_config.enable_expert_parallel
-            or model.model_type != "qwen3"
+            or (model.model_type != "qwen3"
+                and not _llama_dense_scheduler_scope(scheduler_config, model))
             or model.num_experts != 0
-            or model.tie_word_embeddings
             or model.attention_layout != "standard_gqa"
             or model.compute_dtype != "bf16"
             or model.weight_dtype != "bf16"
             or scheduler_config.dtype != "bfloat16"):
         raise NotImplementedError(
             "the validated vLLM TP=1 uniform PP Scheduler path requires "
-            "untied dense BF16 Qwen3 with standard GQA and expert "
+            "dense BF16 Qwen3 or Llama with standard GQA and expert "
             "parallelism disabled")
     if model.num_hidden_layers % pipeline_size:
         raise NotImplementedError(

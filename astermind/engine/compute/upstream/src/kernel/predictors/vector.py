@@ -17840,7 +17840,7 @@ def _kimi_k3_kda_chunk_logical_work(kernel: KernelSpec):
         operand("post_conv", "bf16", elements, "write")
         fma, sfu, alu = 9 * elements, 2 * elements, elements
         source = "vllm/model_executor/layers/mamba/ops/causal_conv1d.py:causal_conv1d_fn/_causal_conv1d_fwd_kernel"
-        launch = {"grid": (conv_tiles, channels // 256, 1), "block_m": 8, "block_n": 256,
+        launch = {"grid": (conv_tiles, -(-channels // 256), 1), "block_m": 8, "block_n": 256,
                   "num_stages": 2, "default_warps_not_assigned": True}
     elif stage == "initial_state":
         operand("state_index", "int32", sequences, "read")
@@ -20520,6 +20520,9 @@ def dsv32_draft_int32_bookkeeping_roofline_work(kernel: KernelSpec) -> tuple[int
 
 
 def fp8_group_quant_source_work(kernel: KernelSpec):
+    if kernel.attributes.get("source_program") == "vllm_0_27_1_group_fp8_row_major":
+        from .v3_dp_math import quant_work
+        return quant_work(kernel)
     """Conditional vLLM 0.30 quantizer, with no invented backend/scale mode.
 
     Hopper stores FP32 scales both with and without UE8M0 rounding. The
@@ -21919,6 +21922,18 @@ class VectorPredictor(KernelPredictor):
         return _model(kernel, hardware)
 
     def roofline_without_launch(self, kernel: KernelSpec, hardware):
+        if kernel.attributes.get("mathematical_program")=="v4_modelsp_hash_top6_masked_v1":
+            from .v4_modelsp_hash_math import logical_work
+            if kernel.hardware_id!=hardware.hardware_id or kernel.hardware_id!="nvidia_h200" or kernel.variant!="dsv4_moe_route" or kernel.launch is not None or kernel.execution_support!="unsupported":
+                raise ValueError("V4 masked hash requires its H200 partial source scope")
+            work=logical_work(kernel.shape,kernel.attributes)
+            return prediction_from_ns(roofline_ns(work["demand"],hardware,work["logical_bytes"]),"partial_v4_modelsp_masked_hash")
+        if kernel.attributes.get("mathematical_program")=="v4_modelsp_zero_fill_v1":
+            if kernel.hardware_id!=hardware.hardware_id or hardware.hardware_id!="nvidia_h200" or kernel.variant!="elementwise" or kernel.dtype not in ("bf16","int32") or kernel.launch is not None or kernel.execution_support!="unsupported" or (kernel.attributes["operation"],kernel.attributes["reads"],kernel.attributes["writes"])!=("fill",0,1):
+                raise ValueError("V4 model-SP zero fill requires unbound typed write source")
+            from src.kernel.memory_access_builder import mathematical_prediction_memory_bytes
+            payload=mathematical_prediction_memory_bytes(kernel,hardware)
+            return prediction_from_ns(payload/hardware.resource_by_role("dram").capacity*1e9,"partial_v4_modelsp_zero_payload")
         if ("mathematical_program" in kernel.attributes
                 and kernel.attributes["mathematical_program"] == "vllm_0_30_dspark_typed_role_bytes_v1"):
             if (kernel.hardware_id != hardware.hardware_id

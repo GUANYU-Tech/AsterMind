@@ -8618,6 +8618,11 @@ class GEMMPredictor(KernelPredictor):
                 seconds = max(cycles / execution["clock_hz"] / utilization,
                     logical_bytes / hardware.resource_by_role("dram").capacity)
                 return self._mathematical_prediction(hardware, seconds * 1e9)
+            if kernel.attributes['mathematical_program']=='k3_tp_column_addmm_v1':
+                m,n,k=(kernel.shape[x] for x in ('m','n','k'))
+                demand={role:0.0 for role in ('compute_tensor','compute_vector','compute_reduction','compute_fma','compute_sfu','compute_alu')}
+                demand['compute_tensor']=float(2*m*n*k);demand['compute_fma']=float(m*n)
+                return self._mathematical_prediction(hardware,roofline_ns(demand,hardware,2*(m*k+n*k+2*m*n)))
             if kernel.attributes["mathematical_program"] in ("unquantized_fp16_flops_bytes_v1", "unquantized_bf16_flops_bytes_v1"):
                 work = {"fp16": unquantized_fp16_gemm_logical_work, "bf16": unquantized_bf16_gemm_logical_work}[kernel.dtype](kernel)
                 demand = {role: 0.0 for role in (
