@@ -37,8 +37,13 @@ class FormationEstimator(CommunicationEstimator):
 
     def _p2p(self, route, size):
         if len({self._sat(x) for x in route["path"]})==1:
-            from .intra_topology import p2p_ns
-            return p2p_ns(self.network,route,size,self.intra_hierarchy)
+            from .registered_profiles import p2p_duration, route_scope
+            scope = route_scope(self.network, route, self.intra_hierarchy)
+            hardware = tuple(self.policy.gpu_hardware.get(gpu, self.policy.default_hardware_id)
+                             for gpu in (route['path'][0], route['path'][-1]))
+            duration, _ = p2p_duration(self.network, route, size, scope, hardware, self.policy,
+                                       include_startup=True)
+            return duration
         from .path_budget import isolated_path_ns
         return isolated_path_ns(self.network,route,size,self.policy)
 
@@ -49,6 +54,11 @@ class FormationEstimator(CommunicationEstimator):
         if (len(p)<2 or len(set(p))!=len(p) or type(size) is not int or size<0
                 or any(g not in self.topology.devices or self.topology.devices[g].kind!="gpu" for g in p)):
             raise ValueError("expected distinct physical GPUs and nonnegative bytes")
+        if op == 'reduce_scatter' and len({self._sat(gpu) for gpu in p}) == 1:
+            from .topology_collective import partitions
+            return CommunicationEstimator.estimate(self, replace(
+                task, operation='reduce_scatterv', partition_bytes=tuple(partitions(task).values()),
+                algorithm=task.algorithm or 'pairwise'))
         if op in ("all_gatherv","reduce_scatterv","broadcast") or (op=="all_to_all" and task.traffic_matrix_bytes):
             return CommunicationEstimator.estimate(self,replace(task,algorithm=task.algorithm or "pairwise"))
         if task.partition_bytes or task.traffic_matrix_bytes:
@@ -63,6 +73,13 @@ class FormationEstimator(CommunicationEstimator):
             raise NotImplementedError(f"unsupported formation operation: {op}")
         if task.bytes_semantics!="per_rank_input" or task.reduction!=("sum" if op=="all_reduce" else None):
             raise ValueError("uniform collective requires its per-rank input and reduction contract")
+        if task.algorithm == 'hierarchical':
+            from .intra_hierarchical import expansion
+            waves = tuple(tuple((self._route(a, b, n), n) for a, b, n in wave if n)
+                          for wave in expansion(task, self.intra_hierarchy))
+            ns = sum(self._wave_ns(wave) for wave in waves)
+            paths = tuple(route for wave in waves for route, _ in wave)
+            return Estimate(ns, 'explicit_hierarchical', len(waves), len(paths), 0, 0, paths)
         requested={"mesh":"fullmesh","fc2":"fullmesh"}.get(task.algorithm,task.algorithm)
         if requested in ("fullmesh","tree") and op!="all_to_all":
             from .collective_plan import collective_waves
@@ -70,9 +87,6 @@ class FormationEstimator(CommunicationEstimator):
                 raise ValueError("tree/fullmesh do not accept ring_order")
             if requested=='tree' and op!='all_reduce':
                 raise NotImplementedError('tree is only supported for all_reduce')
-            from .intra_topology import whole_estimate
-            whole=whole_estimate(replace(task,algorithm=requested),self.network,self.intra_hierarchy)
-            if whole is not None:return whole
             waves=collective_waves(op,requested,p,size)
             routed=[[(self._route(a,b,n),n) for a,b,n in wave] for wave in waves]
             flows=[item for wave in routed for item in wave]
@@ -88,7 +102,4 @@ class FormationEstimator(CommunicationEstimator):
         if task.ring_order and (algo!="ring" or len(task.ring_order)!=len(p) or set(task.ring_order)!=set(p)):
             raise ValueError("invalid ring order")
         order=task.ring_order or p
-        from .intra_topology import whole_estimate
-        whole=whole_estimate(replace(task,algorithm=algo),self.network,self.intra_hierarchy)
-        if whole is not None:return whole
         return CommunicationEstimator.estimate(self,replace(task,algorithm=algo,ring_order=order if algo=="ring" else ()))

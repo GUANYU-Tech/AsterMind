@@ -4647,6 +4647,12 @@ def has_mathematical_memory_source(kernel):
     if 'mathematical_program' not in kernel.attributes:
         return False
     program = kernel.attributes['mathematical_program']
+    if program == 'vllm_idle_replica_payload_v1':
+        return (kernel.hardware_id == 'nvidia_h200' and kernel.kind is KernelKind.VECTOR
+            and kernel.variant == 'elementwise' and kernel.dtype in ('int32', 'int64', 'bf16')
+            and (kernel.attributes['operation'], kernel.attributes['reads'], kernel.attributes['writes']) in (('read', 1, 0), ('fill', 0, 1)))
+    if program=='v4_modelsp_zero_fill_v1':
+        return kernel.hardware_id=='nvidia_h200' and kernel.kind is KernelKind.VECTOR and kernel.variant=='elementwise' and kernel.dtype in ('bf16','int32') and (kernel.attributes['operation'],kernel.attributes['reads'],kernel.attributes['writes'])==('fill',0,1)
     if kernel.kind is KernelKind.VECTOR and program in ('dense_fp16_source_flops_bytes_v1', 'dense_bf16_source_flops_bytes_v1'):
         return kernel.variant in ('rmsnorm','add_rmsnorm','silu','elementwise')
     if kernel.kind is KernelKind.FLASH_ATTN:

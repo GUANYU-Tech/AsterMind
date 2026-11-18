@@ -26,11 +26,11 @@ def dsv4_swa_insert_tensor_objects(kernel: KernelSpec):
     if kernel.kind is not KernelKind.KV_CACHE or kernel.variant != "dsv4_qnorm_rope_kv_insert":
         raise ValueError("V4 SWA insert objects require their typed KV_CACHE contract")
     rows, heads, padded = (kernel.shape[name] for name in ("seq_len", "num_query_heads", "padded_query_heads"))
-    partial = ("mathematical_program" in kernel.attributes and kernel.attributes["mathematical_program"]
-        == "vllm_0_30_dspark_partial_context_insert_v1")
+    partial = (kernel.attributes.get("mathematical_program")
+        in ("vllm_0_30_dspark_partial_context_insert_v1", "v4_idle_swa_insert_v1"))
     valid = kernel.attributes["valid_token_count"] if partial else rows
-    return {"program": "vllm_0_30_dspark_partial_context_insert_v1" if partial else "vllm_0_30_packed_swa_insert_objects",
-        "condition": ("eager BF16 full six Q/KV rows; slots[0:S]>=0 and slots[S:6]=-1; only cache writes masked"
+    return {"program": kernel.attributes["mathematical_program"] if partial else "vllm_0_30_packed_swa_insert_objects",
+        "condition": ("eager BF16 Q/KV rows; only valid KV slots are stored"
             if partial else "eager dict metadata, BF16 Q/KV, uint8 fp8_ds_mla cache, no DP padding, all slots nonnegative"),
         "q_input": {"dtype": "bf16", "shape": [rows, heads, 512], "read_only": True},
         "kv_input": {"dtype": "bf16", "shape": [rows, 512], "read_only": True},
@@ -64,7 +64,7 @@ def dsv4_swa_insert_source_work(kernel: KernelSpec):
         raise ValueError("V4 SWA source arithmetic requires BF16/512/64 and packed584 records")
     values = tokens * heads * dim
     valid = kernel.attributes["valid_token_count"] if ("mathematical_program" in kernel.attributes
-        and kernel.attributes["mathematical_program"] == "vllm_0_30_dspark_partial_context_insert_v1") else tokens
+        and kernel.attributes["mathematical_program"] in ("vllm_0_30_dspark_partial_context_insert_v1", "v4_idle_swa_insert_v1")) else tokens
     # All N Q and KV inputs are decoded and RoPE'd before the slot guard.
     # Only valid KV rows execute the post-RoPE BF16 roundtrip/quant/store.
     # Q warpSum adds are floating-point additions. KV fmaxf is a typed
@@ -539,7 +539,7 @@ class KVCacheUpdatePredictor(KernelPredictor):
 
     def analytical_without_launch(self, kernel: KernelSpec, hardware):
         if (kernel.variant == "dsv4_qnorm_rope_kv_insert" and "mathematical_program" in kernel.attributes
-                and kernel.attributes["mathematical_program"] == "vllm_0_30_dspark_partial_context_insert_v1"):
+                and kernel.attributes["mathematical_program"] in ("vllm_0_30_dspark_partial_context_insert_v1", "v4_idle_swa_insert_v1")):
             return replace(self.roofline_without_launch(kernel, hardware),
                 bottleneck_group="analytical_partial_context_insert")
         if ("mathematical_program" in kernel.attributes
@@ -549,7 +549,7 @@ class KVCacheUpdatePredictor(KernelPredictor):
 
     def resource_input(self, kernel: KernelSpec, hardware):
         if (kernel.variant == "dsv4_qnorm_rope_kv_insert" and "mathematical_program" in kernel.attributes
-                and kernel.attributes["mathematical_program"] == "vllm_0_30_dspark_partial_context_insert_v1"):
+                and kernel.attributes["mathematical_program"] in ("vllm_0_30_dspark_partial_context_insert_v1", "v4_idle_swa_insert_v1")):
             raise NotImplementedError("DSpark partial context insert native provider and physical slot services are unbound")
         return _model(kernel, hardware)
 
@@ -570,7 +570,7 @@ class KVCacheUpdatePredictor(KernelPredictor):
 
     def roofline_without_launch(self, kernel: KernelSpec, hardware):
         if (kernel.variant == "dsv4_qnorm_rope_kv_insert" and "mathematical_program" in kernel.attributes
-                and kernel.attributes["mathematical_program"] == "vllm_0_30_dspark_partial_context_insert_v1"):
+                and kernel.attributes["mathematical_program"] in ("vllm_0_30_dspark_partial_context_insert_v1", "v4_idle_swa_insert_v1")):
             work = target_cache_logical_work(kernel)
             demand = {role: 0 for role in ("compute_tensor", "compute_vector", "compute_reduction",
                 "compute_fma", "compute_sfu", "compute_alu")}

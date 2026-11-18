@@ -1470,6 +1470,14 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
             "routed_weight_dtype", "weight_group_size",
         }
         optional = {"swiglu_limit", "mathematical_program"}
+        if normalized.get("mathematical_program") in ("k3_tp_sharded_marlin_v1","k3_tp_padded_marlin_v1"):
+            required.update(("activation_beta","activation_linear_beta","tensor_parallel_size","tensor_rank","logical_intermediate"))
+        if normalized.get("mathematical_program") == "v4_modelsp_masked_marlin_ep_v1":
+            optional.add("physical_tokens")
+        if normalized.get("mathematical_program") == "v4_pro_tp16_padded_marlin_w4a16_v1":
+            required.add("logical_intermediate")
+        if normalized.get("mathematical_program") == "k3_masked_marlin_ep_v1":
+            required.update(("activation_beta", "activation_linear_beta"))
         if ("mathematical_program" in normalized
                 and normalized["mathematical_program"] == "sglang_0_5_19_fp8_fused_shared_swiglu_v1"):
             required.add("fused_shared_experts")
@@ -1514,6 +1522,10 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
                     and (shape["experts"], shape["topk"], shape["hidden"], shape["intermediate"]) == (256, 8, 7168, 256)
                     and type(normalized["fused_shared_experts"]) is int and normalized["fused_shared_experts"] == 1
                     and normalized["routed_scaling_factor"] == 1.0 and "graph_runtime_mode" not in normalized)
+            elif program == "glm_flashinfer_block128_deferred_ep_v1":
+                from src.kernel.predictors.glm_fp8_ep_math import logical_work
+                logical_work(shape, normalized)
+                valid = compute_dtype == "bf16" and "graph_runtime_mode" not in normalized
             elif program == "block_fp8_replicated_ep_swiglu_v1":
                 valid = (compute_dtype == "bf16" and normalized["routed_weight_dtype"] == "fp8"
                     and normalized["weight_group_size"] == 0 and normalized["expert_parallel_size"] == 8
@@ -1529,9 +1541,41 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
                         and shape["experts"] % normalized["expert_parallel_size"] == 0)
                     and normalized["expert_weight_tile_rows"] is None and limit is None
                     and (shape["experts"], shape["topk"], shape["hidden"]) == (384, 8, 7168)
-                    and ((normalized["expert_parallel_size"] == 1 and shape["intermediate"] in (2048, 1024, 512, 256))
+                    and ((normalized["expert_parallel_size"] == 1 and shape["intermediate"] in (2048, 1024, 512, 256, 128, 64))
                         or normalized["expert_parallel_size"] >= 2 and shape["intermediate"] == 2048)
                     and normalized["routed_scaling_factor"] == 1.0 and "graph_runtime_mode" not in normalized)
+            elif program == "k3_masked_marlin_ep_v1":
+                from src.kernel.predictors.moe_ep_math import marlin_ep_work
+                marlin_ep_work(shape, normalized, model="k3")
+                valid = compute_dtype == "bf16" and "graph_runtime_mode" not in normalized
+            elif program == "v4_modelsp_masked_marlin_ep_v1":
+                from src.kernel.predictors.v4_modelsp_math import logical_work
+                logical_work(shape,normalized)
+                valid = compute_dtype == "bf16" and "graph_runtime_mode" not in normalized
+            elif program == "v3_fp8_dispatched_ep_fused_quant_v1":
+                from src.kernel.predictors.v3_dp_math import logical_work
+                logical_work(shape, normalized)
+                valid = compute_dtype == "bf16" and "graph_runtime_mode" not in normalized
+            elif program in ("v3_fp8_ep8_fused_quant_v1", "v3_fp8_replicated_ep_fused_quant_v1"):
+                from src.kernel.predictors.v3_ep_math import logical_work
+                logical_work(shape, normalized)
+                valid = (compute_dtype == "bf16" and "graph_runtime_mode" not in normalized)
+            elif program == "v4_masked_marlin_ep_v1":
+                from src.kernel.predictors.moe_ep_math import marlin_ep_work
+                marlin_ep_work(shape, normalized, model="v4")
+                valid = compute_dtype == "bf16" and "graph_runtime_mode" not in normalized
+            elif program in ("k3_tp_sharded_marlin_v1","k3_tp_padded_marlin_v1"):
+                from src.kernel.predictors.k3_tp_math import validate as validate_k3_tp
+                validate_k3_tp(shape,normalized)
+                valid=compute_dtype=='bf16' and 'graph_runtime_mode' not in normalized
+            elif program == "v4_pro_tp16_padded_marlin_w4a16_v1":
+                valid = (compute_dtype == "bf16" and normalized["routed_weight_dtype"] == "mxfp4"
+                    and normalized["weight_group_size"] == 32 and normalized["expert_parallel_size"] == 1
+                    and normalized["expert_weight_tile_rows"] is None and limit == 10.0
+                    and normalized["routed_scaling_factor"] == 2.5
+                    and type(normalized["logical_intermediate"]) is int and normalized["logical_intermediate"] == 192
+                    and (shape["experts"],shape["topk"],shape["hidden"],shape["intermediate"]) == (384,6,7168,256)
+                    and "graph_runtime_mode" not in normalized)
             elif program == "dsv4_mxfp4_w4a16_swiglu_v1":
                 valid = (compute_dtype == "bf16" and normalized["routed_weight_dtype"] == "mxfp4"
                     and normalized["weight_group_size"] == 32 and normalized["expert_parallel_size"] == 1
@@ -1706,7 +1750,7 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
             }
             optional = {"mathematical_program"}
             if "mathematical_program" in normalized:
-                if normalized["mathematical_program"] != "vllm_0_30_dspark_partial_context_insert_v1":
+                if normalized["mathematical_program"] not in ("vllm_0_30_dspark_partial_context_insert_v1", "v4_idle_swa_insert_v1"):
                     raise ValueError("unknown DSpark partial context insert mathematical program")
                 required.add("valid_token_count")
         elif variant == "dsv4_compressor_state_cache":
@@ -1721,7 +1765,7 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
         required = {"reads", "writes", "operation"}
         optional = {"helper_launch", "tensor_iterator_source", "copy_dispatch", "mathematical_program"}
         if ("mathematical_program" in normalized
-                and normalized["mathematical_program"] not in ("vllm_0_30_fa3_aot_tail_clear", "vllm_0_30_dspark_typed_role_bytes_v1")) and (
+                and normalized["mathematical_program"] not in ("vllm_0_30_fa3_aot_tail_clear", "vllm_0_30_dspark_typed_role_bytes_v1", "v4_modelsp_zero_fill_v1", "vllm_idle_replica_payload_v1")) and (
                 normalized["mathematical_program"] != "dense_bf16_source_flops_bytes_v1"
                 or compute_dtype != "bf16" or variant != "elementwise"
                 or "operation" not in normalized
@@ -1731,6 +1775,12 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
                 and (variant != "elementwise" or compute_dtype not in ("bool", "int32", "int64", "fp32", "bf16")
                     or normalized["operation"] not in ("read", "fill"))):
             raise ValueError("DSpark typed payload requires explicit read/write-only roles in their original dtype")
+        if normalized.get("mathematical_program")=="v4_modelsp_zero_fill_v1" and (compute_dtype not in ("bf16","int32") or variant!="elementwise" or (normalized["operation"],normalized["reads"],normalized["writes"])!=("fill",0,1)):
+            raise ValueError("V4 model-SP zero fill requires BF16 or INT32 write-only payload")
+        if normalized.get('mathematical_program') == 'vllm_idle_replica_payload_v1' and (
+                compute_dtype not in ('int32', 'int64', 'bf16') or variant != 'elementwise'
+                or (normalized['operation'], normalized['reads'], normalized['writes']) not in (('read', 1, 0), ('fill', 0, 1))):
+            raise ValueError('Idle worker payload requires one typed read or fill')
         materialization_fields = {
             "input_materialization",
             "input_outer_groups",
@@ -1866,6 +1916,11 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
     elif kind is KernelKind.VECTOR and variant == "dsv4_moe_route":
         required = {"expert_id_selection", "routed_scaling_factor"}
         optional = {"routing_source"}
+        if normalized.get("mathematical_program")=="v4_modelsp_hash_top6_masked_v1":
+            if compute_dtype!="fp32":raise ValueError("V4 masked hash requires FP32 logits")
+            optional.update(("mathematical_program","valid_rows"))
+            from src.kernel.predictors.v4_modelsp_hash_math import logical_work
+            logical_work(shape,normalized)
         if "routing_source" not in normalized:
             normalized["routing_source"] = None
     elif kind is KernelKind.VECTOR and variant == "dsv4_inv_rope_fp8_quant":
@@ -2150,14 +2205,14 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
     if kind is KernelKind.VECTOR and variant in ("dsv32_moe_route", "kimi_moe_route"):
         optional.add("source_projection_scope")
         if ("source_projection_scope" in normalized
-                and normalized["source_projection_scope"] not in ("a800_tp1_target_representative_layers_v1", "a800_tp8_pp4_ep8_glm_source_v1", "a800_tp8_pp2_ep8_kimi_source_v1", "a800_tp1_kimi_source_v1", "vllm_0_30_glm_pcp_source_v1")):
+                and normalized["source_projection_scope"] not in ("a800_tp1_target_representative_layers_v1", "a800_tp8_pp4_ep8_glm_source_v1", "a800_tp8_pp2_ep8_kimi_source_v1", "a800_kimi_parallel_source_v1", "a800_tp1_kimi_source_v1", "vllm_0_30_glm_pcp_source_v1")):
             raise ValueError("target structural route requires its exact source projection scope")
         if ("source_projection_scope" in normalized
                 and normalized["source_projection_scope"] == "a800_tp8_pp4_ep8_glm_source_v1"
                 and variant != "dsv32_moe_route"):
             raise ValueError("GLM pipeline source scope cannot authorize another model's router")
         if ("source_projection_scope" in normalized
-                and normalized["source_projection_scope"] in ("a800_tp8_pp2_ep8_kimi_source_v1", "a800_tp1_kimi_source_v1")
+                and normalized["source_projection_scope"] in ("a800_tp8_pp2_ep8_kimi_source_v1", "a800_kimi_parallel_source_v1", "a800_tp1_kimi_source_v1")
                 and variant != "kimi_moe_route"):
             raise ValueError("Kimi pipeline source scope cannot authorize another model's router")
     if kind is KernelKind.GEMM:
@@ -2225,6 +2280,12 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
                 if program == "unquantized_fp32_flops_bytes_v1":
                     if compute_dtype != "fp32" or output_dtype not in (None, "fp32") or shape["b"] != 1:
                         raise ValueError("unquantized FP32 mathematical GEMM requires FP32 A/B/C")
+                elif program == 'k3_tp_column_addmm_v1':
+                    required.update(('weight_dtype','weight_group_size','has_bias'))
+                    if (compute_dtype!='bf16' or output_dtype not in (None,'bf16') or shape['b']!=1 or shape['k']!=3584
+                        or shape['n'] not in (3584,1792,896,448,224) or normalized.get('weight_dtype')!='bf16'
+                        or normalized.get('weight_group_size')!=0 or normalized.get('has_bias') is not False):
+                        raise ValueError('K3 column addmm requires BF16 H/TP by latent3584')
                 elif program in ("unquantized_fp16_flops_bytes_v1", "unquantized_bf16_flops_bytes_v1"):
                     required.update({"weight_dtype", "weight_group_size", "has_bias"})
                     source_dtype = {"unquantized_fp16_flops_bytes_v1": "fp16",
@@ -3171,8 +3232,10 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
         elif variant == "dsv4_qnorm_rope_kv_insert":
             partial_context = ("mathematical_program" in normalized and normalized["mathematical_program"]
                 == "vllm_0_30_dspark_partial_context_insert_v1")
+            idle = normalized.get("mathematical_program") == "v4_idle_swa_insert_v1"
             if (normalized["cache_write_semantics"] != "append" and not (partial_context
-                    and normalized["cache_write_semantics"] == "masked_target_context_overwrite")):
+                    and normalized["cache_write_semantics"] == "masked_target_context_overwrite")
+                    and not (idle and normalized["cache_write_semantics"] == "all_PAD_no_store")):
                 raise ValueError("DSV4 fused cache requires append semantics or its exact partial DSpark overwrite program")
             if normalized["cache_layout"] != "paged_dsv4_swa":
                 raise ValueError("DSV4 fused cache requires paged_dsv4_swa")
@@ -3188,6 +3251,11 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
                         or type(normalized["slot_mapping_all_valid"]) is not bool
                         or normalized["slot_mapping_all_valid"] != (valid == 6)):
                     raise ValueError("DSpark partial context insert requires full six rows and explicit valid prefix1..6")
+            elif idle:
+                if (normalized["cache_write_semantics"] != "all_PAD_no_store"
+                        or type(normalized["valid_token_count"]) is not int or normalized["valid_token_count"] != 0
+                        or normalized["slot_mapping_all_valid"] is not False or shape["seq_len"] != 1):
+                    raise ValueError("Idle V4 SWA insert requires one all-PAD row")
             elif normalized["slot_mapping_all_valid"] is not True:
                 raise ValueError("DSV4 fused cache requires valid token slots")
             if (shape["head_dim"] != 512 or shape["rope_dim"] != 64
@@ -3197,7 +3265,7 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
             padded = shape["padded_query_heads"]
             if padded not in (8, 16, 32, 64, 128) or not 0 < heads <= padded:
                 raise ValueError("DSV4 fused cache has invalid Q head padding")
-            expected_elements = shape["seq_len"] * (heads + 1) * 512
+            expected_elements = shape["seq_len"] * (heads + (0 if idle else 1)) * 512
         elif variant == "dsv4_compressor_state_cache":
             # FP32 partial kv/score states written once per token
             # (deepseek_v4/compressor.py _SAVE_PARTIAL_STATES_KERNEL):
@@ -3452,16 +3520,19 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
         if stage not in ("q_kv_norm", *concat_stages, "output_gate"):
             raise ValueError("K3 NoPE requires an explicit source stage for its prefill/decode branch")
         slots, capacity = normalized["slot_mapping"], normalized["cache_capacity_tokens"]
+        idle_decode = (variant == "kimi_k3_nope_decode" and shape["rows"] == 1
+            and isinstance(slots, (tuple, list)) and len(slots) == 1
+            and type(slots[0]) is int and slots[0] == -1)
         if (type(capacity) is not int or capacity <= 0
                 or not isinstance(slots, (tuple, list)) or len(slots) != shape["rows"]
-                or any(type(slot) is not int or not 0 <= slot < capacity for slot in slots)
+                or (not idle_decode and any(type(slot) is not int or not 0 <= slot < capacity for slot in slots))
                 or len(set(slots)) != len(slots)):
-            raise ValueError("K3 NoPE prefill requires distinct valid nonnegative INT64 slot mappings")
+            raise ValueError("K3 NoPE requires distinct valid slots or a single PAD slot for idle decode")
         normalized["slot_mapping"] = tuple(slots)
         eps = normalized["rms_norm_eps"]
         if type(eps) not in (int, float) or not math.isfinite(eps) or eps <= 0:
             raise ValueError("K3 NoPE prefill requires a positive finite RMSNorm epsilon")
-        if (shape["rows"] <= 0 or shape["heads"] not in (12, 96)
+        if (shape["rows"] <= 0 or shape["heads"] not in ((12, 96) if variant == "kimi_k3_nope_mixed" else (3, 6, 12, 24, 48, 96))
                 or (shape["q_lora_rank"], shape["kv_lora_rank"]) != (1536, 512)):
             raise ValueError("K3 NoPE prefill requires exact checkpoint latent/head geometry")
         per_row = (2048 if stage == "q_kv_norm" else
@@ -3497,13 +3568,14 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
             if valid_flags:
                 normalized["has_initial_state"] = tuple(flags)
         prefill_rows = shape["rows"] - (sequences - 1)
+        # Fresh KDA supports a single masked chunk; keep mixed/context admission unchanged.
         if (not valid_flags or type(normalized["gate_lower_bound"]) not in (int, float)
                 or normalized["gate_lower_bound"] != -5.0
-                or not 64 <= prefill_rows < 2**31 - (sequences - 1)
-                or (shape["heads"], shape["head_dim"]) != (96, 128)):
+                or not (1 if variant == "kimi_k3_kda_prefill" else 64) <= prefill_rows < 2**31 - (sequences - 1)
+                or shape["heads"] not in (3, 6, 12, 24, 48, 96) or shape["head_dim"] != 128):
             raise ValueError("K3 KDA chunk requires full/tail64-token fresh prefill, 96x128 heads and source gate bound-5")
-        elements = (sequences * 96 * 128 * 128 if stage in ("initial_state", "final_state_scatter")
-                    else shape["rows"] * 96 * 128)
+        elements = (sequences * shape["heads"] * 128 * 128 if stage in ("initial_state", "final_state_scatter")
+                    else shape["rows"] * shape["heads"] * 128)
         if shape["element_count"] != elements:
             raise ValueError("K3 KDA prefill element count must preserve its complete source output")
     elif kind is KernelKind.VECTOR and variant == "kimi_k3_kda_decode":
@@ -3515,10 +3587,11 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
                 or not isinstance(indices, (tuple, list)) or len(indices) != shape["rows"]
                 or any(type(index) is not int for index in indices)):
             raise ValueError("K3 KDA decode requires one integer state index per row and a positive pool")
-        if any(not 0 < index < slots for index in indices) or len(set(indices)) != len(indices):
-            raise ValueError("K3 KDA decode supports distinct positive active state indices only; null/padding is separate")
+        stateless_tail = normalized["stage"] in ("output_copy", "output_norm") and tuple(indices) == (0,)
+        if not stateless_tail and (any(not 0 < index < slots for index in indices) or len(set(indices)) != len(indices)):
+            raise ValueError("K3 KDA decode requires positive state indices for stateful operations")
         normalized["state_indices"] = tuple(indices)
-        if (shape["head_dim"] != 128 or shape["heads"] not in (12, 96)
+        if (shape["head_dim"] != 128 or shape["heads"] not in (3, 6, 12, 24, 48, 96)
                 or shape["rows"] <= 0 or shape["element_count"] != shape["rows"] * shape["heads"] * 128):
             raise ValueError("K3 KDA decode requires exact TP1/8 head geometry and complete rows")
         if type(normalized["gate_lower_bound"]) not in (int, float) or normalized["gate_lower_bound"] != -5.0:
@@ -4129,7 +4202,7 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
             raise ValueError(
                 "VECTOR/fp8_group_quant needs whole quantisation groups")
         source_program = normalized["source_program"]
-        if source_program not in (None, "vllm_0_30_group_fp8_fp32_scales"):
+        if source_program not in (None, "vllm_0_27_1_group_fp8_row_major", "vllm_0_30_group_fp8_fp32_scales"):
             raise ValueError("unknown FP8 group quantization source program")
         if source_program is not None:
             if (group_size != 128 or compute_dtype != "bf16" or "rows" not in shape or "columns" not in shape
@@ -5986,11 +6059,13 @@ class KernelSpec:
             raise TypeError("KernelSpec.attributes must be a mapping")
         if ("mathematical_program" in self.attributes
                 and self.attributes["mathematical_program"] in (
-                    "dense_bf16_source_flops_bytes_v1", "unquantized_bf16_flops_bytes_v1",
+                    "k3_tp_column_addmm_v1", "dense_bf16_source_flops_bytes_v1", "unquantized_bf16_flops_bytes_v1",
                     "unquantized_bf16_swiglu_v1", "unquantized_bf16_grouped_swiglu_v1",
                     "unquantized_bf16_legacy_grouped_swiglu_v1")
                 and (hardware_id != "nvidia_h200" or self.execution_support != "unsupported" or self.launch is not None)):
             raise ValueError("BF16 source math requires an unbound H200 contract; native launch support is separate")
+        if self.attributes.get('mathematical_program') in ('k3_tp_sharded_marlin_v1','k3_tp_padded_marlin_v1') and hardware_id!='nvidia_h200':
+            raise ValueError('K3 TP mathematical program is H200-only')
         if (isinstance(self.anonymous_l2_dirty_bytes, bool)
                 or not isinstance(self.anonymous_l2_dirty_bytes, int)):
             raise TypeError(
@@ -6165,7 +6240,7 @@ class KernelSpec:
                     raise ValueError("FA3 prepare requires its H200 INT32 source launch")
             if (kind is KernelKind.KV_CACHE and normalized_variant == "dsv4_qnorm_rope_kv_insert"
                     and "mathematical_program" in self.attributes
-                    and self.attributes["mathematical_program"] == "vllm_0_30_dspark_partial_context_insert_v1"
+                    and self.attributes["mathematical_program"] in ("vllm_0_30_dspark_partial_context_insert_v1", "v4_idle_swa_insert_v1")
                     and (self.hardware_id != "nvidia_h200" or self.execution_support != "unsupported"
                         or self.launch is not None)):
                 raise ValueError("DSpark partial context insert requires its H200 unbound mathematical contract")
@@ -6267,6 +6342,9 @@ class KernelSpec:
                     and self.attributes["mathematical_program"] == "sglang_0_5_19_fp8_fused_shared_swiglu_v1"
                     and self.hardware_id != "nvidia_h200"):
                 raise ValueError("SGLang0.5.19 mathematical experts require the declared H200 source contract")
+            if (kind is KernelKind.FUSED_MOE and self.attributes.get("mathematical_program") == "glm_flashinfer_block128_deferred_ep_v1"
+                    and self.hardware_id != "nvidia_h200"):
+                raise ValueError("GLM FlashInfer block128 source currently requires H200")
             if (kind is KernelKind.FUSED_MOE and "mathematical_program" in self.attributes
                     and self.attributes["mathematical_program"] == "block_fp8_replicated_ep_swiglu_v1"
                     and self.hardware_id != "nvidia_h200"):
@@ -6277,8 +6355,11 @@ class KernelSpec:
                 raise ValueError("Kimi EP mathematical experts require an unbound NVIDIA source contract")
             if (kind is KernelKind.FUSED_MOE and "mathematical_program" in self.attributes
                     and self.attributes["mathematical_program"] == "kimi_ep_marlin_swiglu_v1"
-                    and normalized_shape["intermediate"] in (256, 512, 1024) and self.hardware_id != "nvidia_h200"):
+                    and normalized_shape["intermediate"] in (64, 128, 256, 512, 1024) and self.hardware_id != "nvidia_h200"):
                 raise ValueError("Kimi TP-sharded mathematical experts require the H200 source domain")
+            if (kind is KernelKind.FUSED_MOE and self.attributes.get("mathematical_program") in ("v4_pro_tp16_padded_marlin_w4a16_v1", "v3_fp8_dispatched_ep_fused_quant_v1", "v3_fp8_ep8_fused_quant_v1", "v3_fp8_replicated_ep_fused_quant_v1", "v4_masked_marlin_ep_v1", "k3_masked_marlin_ep_v1", "v4_modelsp_masked_marlin_ep_v1")
+                    and self.hardware_id != "nvidia_h200"):
+                raise ValueError("V4 masked EP mathematical source is currently H200-only")
             if (kind is KernelKind.FUSED_MOE and "mathematical_program" in self.attributes
                     and self.attributes["mathematical_program"] == "dsv4_mxfp4_w4a16_swiglu_v1"
                     and self.hardware_id not in ("hygon_bw1100", "nvidia_rtx_pro_5500")):
@@ -6522,7 +6603,7 @@ class KernelSpec:
             if (kind is KernelKind.VECTOR and normalized_variant in ("dsv32_moe_route", "kimi_moe_route")
                     and (self.execution_support != "unsupported" or (self.hardware_id != "nvidia_h200"
                         and not (self.hardware_id == "nvidia_a800" and "source_projection_scope" in self.attributes
-                            and self.attributes["source_projection_scope"] in ("a800_tp1_target_representative_layers_v1", "a800_tp8_pp4_ep8_glm_source_v1", "a800_tp8_pp2_ep8_kimi_source_v1", "a800_tp1_kimi_source_v1", "vllm_0_30_glm_pcp_source_v1"))))):
+                            and self.attributes["source_projection_scope"] in ("a800_tp1_target_representative_layers_v1", "a800_tp8_pp4_ep8_glm_source_v1", "a800_tp8_pp2_ep8_kimi_source_v1", "a800_kimi_parallel_source_v1", "a800_tp1_kimi_source_v1", "vllm_0_30_glm_pcp_source_v1"))))):
                 source_model = "GLM V32" if normalized_variant == "dsv32_moe_route" else "Kimi"
                 raise ValueError(f"{source_model} route requires an unbound H200 source contract")
             if (kind is KernelKind.VECTOR and normalized_variant in ("dsv32_moe_route", "kimi_moe_route")
@@ -6744,6 +6825,8 @@ class KernelSpec:
                 if (self.hardware_id not in ("nvidia_h200", "hygon_bw1100", "nvidia_rtx_pro_5500") or self.execution_support != "unsupported" or self.launch is not None):
                     raise ValueError("V4 indexer Q source projection requires unbound H200 execution")
             if kind is KernelKind.VECTOR and normalized_variant == "dsv4_moe_route":
+                if normalized_attributes.get("mathematical_program")=="v4_modelsp_hash_top6_masked_v1" and (self.hardware_id!="nvidia_h200" or self.execution_support!="unsupported" or self.launch is not None):
+                    raise ValueError("V4 masked hash source is H200 partial math without native launch")
                 source_bound = normalized_attributes["routing_source"] is not None
                 if source_bound != (self.execution_support == "supported"):
                     raise ValueError("unbound H200 route must remain unsupported; source routing requires a launch")

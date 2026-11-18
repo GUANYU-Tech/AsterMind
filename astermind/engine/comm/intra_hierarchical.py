@@ -1,93 +1,135 @@
-"""Single-satellite hierarchical adapter for equal complete su groups.
-
-Supports two or more su stars with uniform access links and a symmetric,
-uniform direct so switch fullmesh. This physical contract is narrower than
-upstream's abstract topology catalogue.
-"""
+"""Uniform hierarchical collective admission and its explicit alternative."""
 from itertools import permutations
-from math import ceil, isfinite
+from math import ceil
+
 from .estimator import Estimate
-from ._vendor.intra_theory.hierarchical_upstream import make_h200_hierarchical_theory, make_h200_ring_theory
+from .frame_surrogate import NoRouteError
+
 
 class HierarchyNotApplicable(ValueError):
-    """Valid task, but physical fabric does not fit the whole H-S model."""
+    """Valid hierarchy that the uniform whole-model shortcut cannot price."""
 
 
-from astermind.engine.comm.intra_hierarchy import IntraHierarchy
+def participating_groups(task, config):
+    if config is None:
+        raise ValueError('hierarchical requires SU membership')
+    p = set(task.participants)
+    groups = tuple(tuple(gpu for gpu in group if gpu in p) for group in config.su_groups)
+    groups = tuple(group for group in groups if group)
+    if len(groups) < 2 or len(set(map(len, groups))) != 1 or len(groups[0]) < 2:
+        raise ValueError('hierarchical requires at least two equal participating SU groups')
+    if set().union(*map(set, groups)) != p:
+        raise ValueError('hierarchical participants must belong to a configured SU')
+    return groups
 
 
-def estimate_hierarchical(task, routes, config):
-    """Return None for ordinary algorithms; never silently replace their plan."""
+def validate_task(task):
+    if task.operation not in ('all_reduce', 'all_gather', 'all_to_all'):
+        raise NotImplementedError('hierarchical supports uniform all_reduce/all_gather/all_to_all')
+    if task.bytes_semantics != 'per_rank_input' or task.partition_bytes or task.traffic_matrix_bytes or task.ring_order:
+        raise ValueError('hierarchical requires per_rank_input without a global ring order')
+    if task.reduction != ('sum' if task.operation == 'all_reduce' else None):
+        raise ValueError('invalid hierarchical reduction')
+
+
+def _ring(groups, chunk, direction):
+    return [
+        tuple((gpu, g[(index + direction) % len(g)], chunk)
+              for g in groups for index, gpu in enumerate(g))
+        for _ in range(len(groups[0]) - 1)
+    ]
+
+
+def expansion(task, config):
+    """Expand the same SU/SO stages as the whole model."""
+    validate_task(task)
+    groups = participating_groups(task, config)
+    width = len(groups[0])
+    stages = tuple(zip(*groups))
+    size = task.bytes
+    if task.operation == 'all_gather':
+        return _ring(groups, size, 1) + _ring(stages, size * width, 1)
+    chunk, extra = divmod(size, len(task.participants))
+    if extra:
+        raise ValueError('hierarchical equal partitions require divisible per-rank input')
+    if task.operation == 'all_reduce':
+        return (_ring(groups, size // width, 1) + _ring(stages, chunk, 1)
+                + _ring(stages, chunk, -1) + _ring(groups, size // width, -1))
+    return [
+        tuple((a, b, chunk) for group in groups for a in group for b in task.participants
+              if b != a and (b in group) == local)
+        for local in (True, False)
+    ]
+
+
+def estimate_hierarchical(task, routes, config, profile=None, *, policy=None, selection=None):
     if task.algorithm != 'hierarchical':
         return None
-    if config is None:
-        raise ValueError('algorithm=hierarchical requires intra_hierarchy configuration')
-    if task.operation not in ('all_reduce', 'all_gather', 'all_to_all'):
-        raise NotImplementedError('intra hierarchical supports uniform all_reduce/all_gather/all_to_all')
-    if task.bytes_semantics != 'per_rank_input' or task.partition_bytes or task.traffic_matrix_bytes or task.ring_order:
-        raise ValueError('hierarchical requires per_rank_input, no variable partitions/matrix/global ring_order')
-    if type(task.bytes) is not int or task.bytes < 0:
-        raise ValueError('bytes must be a nonnegative integer')
-    if task.operation == 'all_reduce' and task.reduction != 'sum':
-        raise ValueError('hierarchical all_reduce requires reduction=sum')
-    if task.operation != 'all_reduce' and task.reduction is not None:
-        raise ValueError('non-reducing operation does not accept reduction')
-    selected=[(g,s) for g,s in zip(config.su_groups,config.su_switches) if set(g)&set(task.participants)]
-    groups=tuple(g for g,s in selected);switches=tuple(s for g,s in selected)
-    if len(groups)<2:raise ValueError('hierarchical needs at least two complete su groups')
-    gpus = sum(groups,())
-    if len(task.participants) != len(gpus) or set(task.participants) != set(gpus):
-        raise ValueError('hierarchical task must cover complete configured su groups')
-    devices = routes.topology.devices
-    ids = gpus + switches
-    if any(x not in devices for x in ids):
-        raise ValueError('configured su device missing from Network Frame')
-    if len({devices[x].satellite for x in ids}) != 1:
-        raise ValueError('intra hierarchical cannot span satellites')
-    if any(devices[x].kind != 'gpu' for x in gpus) or any(devices[x].kind != 'switch' for x in switches):
-        raise ValueError('su groups must contain GPUs and su_switches must be switches')
-    from .intra_topology import nonblocking_switches
-    if not nonblocking_switches(routes,switches):
-        raise HierarchyNotApplicable('declared switch aggregate capacity cannot sustain all fabric ports; whole H-S does not model this bottleneck')
-    # Check the actual route, not just the supplied grouping labels.
-    paths = []
-    group_of = {g: i for i, group in enumerate(groups) for g in group}
-    for a, b in permutations(gpus, 2):
-        i, j = group_of[a], group_of[b]
-        expected = [a, switches[i], b] if i == j else [a, switches[i], switches[j], b]
-        from .frame_surrogate import NoRouteError
-        try:route = routes.route(a, b, task.bytes)
-        except NoRouteError as error:raise HierarchyNotApplicable(str(error)) from error
-        if route['path'] != expected:
-            raise HierarchyNotApplicable('hierarchical requires su stars and a direct so switch fullmesh')
-        paths.append(route)
-    trunk = [e for e in routes.edges.values() if e['source'] in switches and e['target'] in switches]
-    if len(trunk) != len(groups)*(len(groups)-1) or len({(e['bandwidth_gbps'], e['latency_ns']) for e in trunk}) != 1:
-        raise HierarchyNotApplicable('so switch fullmesh must be symmetric and uniform')
-    access = [e for e in routes.edges.values() if e['source'] in gpus or e['target'] in gpus]
-    if len(access)!=2*len(gpus) or len({(e['bandwidth_gbps'], e['latency_ns']) for e in access}) != 1:
-        raise HierarchyNotApplicable('hierarchical requires uniform su access links')
-    # Upstream factory argument named gbps is actually GB/s (50 == 400GbE).
-    # One shared trunk per su domain, not one independently duplicated per GPU.
-    rate, latency = trunk[0]['bandwidth_gbps'], trunk[0]['latency_ns']
-    model = make_h200_hierarchical_theory(len(groups[0]), len(groups),
-        so_per_link_gbps=rate / 8, so_links_per_gpu=len(groups)-1,
-        link_latency_us=latency / 1000)
-    # Bound the calibrated su schedule by the configured GPU access rate.
-    # This remains a uniform analytical fabric, not switch queue simulation.
-    su_rate = access[0]['bandwidth_gbps'] * 125  # B/us
-    model.su = make_h200_ring_theory(ring_bw_bytes_per_us=min(177000, su_rate),
-        packet_bw_bytes_per_us=min(177000, su_rate),
-        link_latency_us=2 * access[0]['latency_ns'] / 1000)
-    data = task.bytes * len(gpus) if task.operation == 'all_gather' else task.bytes
-    if task.operation in ('all_reduce','all_to_all') and task.bytes % len(gpus):
-        raise ValueError('equal hierarchical partitions require bytes divisible by participant count')
-    us = model.predict(data, 'ring', 128, collective=task.operation.replace('_', '')) if data else 0
-    if not isfinite(us) or us < 0:
-        raise ValueError('invalid hierarchical duration')
-    inputs=dict(su_groups=groups,su_switches=switches,gpus_per_domain=len(groups[0]),domains=len(groups),
-        operation=task.operation,application_bytes=task.bytes,upstream_data_bytes=data,
-        su_access_gbps=access[0]['bandwidth_gbps'],su_path_latency_ns=2*access[0]['latency_ns'],
-        so_link_gbps=rate,so_links_per_domain=len(groups)-1,so_link_latency_ns=latency,
-        credits=128,su_profile='h200_ring',so_profile='h200_roce',upstream_commit='c0e4bdc434bd1f18bd3f8e80d80ca2263369ff1f')
-    return Estimate(ceil(us * 1000), 'intra_hierarchical', 0, 0, 0, 0, tuple(paths),inputs)
+    validate_task(task)
+    groups = participating_groups(task, config)
+    if len({routes.topology.devices[gpu].satellite for gpu in task.participants}) != 1:
+        raise HierarchyNotApplicable('whole hierarchy cannot span satellites')
+    if task.operation != 'all_gather' and task.bytes % len(task.participants):
+        raise ValueError('hierarchical equal partitions require divisible per-rank input')
+    if policy is None:
+        from astermind.builder.config.communication import CommPolicy
+        policy = CommPolicy(intra_profile=profile)
+    from .registered_profiles import LINKS, gpu_port_bandwidth, p2p_timing, route_scope, upstream_theory
+    theory = upstream_theory()
+    cards = set(selection['hardware_by_gpu'].values()) if selection else {policy.default_hardware_id}
+    if len(cards) != 1 or next(iter(cards)) not in LINKS:
+        raise HierarchyNotApplicable('whole hierarchy requires homogeneous GPUs with a known SU profile')
+    hardware = cards.pop()
+    membership = {gpu: order for order, group in enumerate(groups) for gpu in group}
+    paths_by_scope = {'single_su': [], 'intra_cross_su': []}
+    try:
+        for a, b in permutations(task.participants, 2):
+            route = routes.route(a, b, task.bytes)
+            scope = route_scope(routes, route, config)
+            expected = 'single_su' if membership[a] == membership[b] else 'intra_cross_su'
+            if scope != expected:
+                raise HierarchyNotApplicable('peer path leaves its declared fabric')
+            if scope == 'single_su' and any(edge['attributes'].get('comm_technology', LINKS[hardware]) != LINKS[hardware]
+                                           for edge in routes.route_resources(route)):
+                raise HierarchyNotApplicable('SU path technology differs from reference profile')
+            if scope == 'intra_cross_su':
+                for edge in routes.route_resources(route):
+                    technology = edge['attributes'].get('comm_technology')
+                    if technology is not None and technology not in (LINKS[hardware], 'roce', 'rocev2', 'infiniband'):
+                        raise HierarchyNotApplicable('SO path technology differs from RoCE reference')
+            paths_by_scope[scope].append(route)
+    except NoRouteError as error:
+        raise HierarchyNotApplicable(str(error)) from error
+
+    width, domains = len(groups[0]), len(groups)
+    data = task.bytes * len(task.participants) if task.operation == 'all_gather' else task.bytes
+    so_size = task.bytes // width if task.operation == 'all_reduce' else task.bytes
+    parameters = {}
+    models = []
+    for scope, size in (('single_su', task.bytes), ('intra_cross_su', so_size)):
+        paths = paths_by_scope[scope]
+        signatures = {(r['bandwidth_gbps'], r['latency_ns'], len(r['resources'])) for r in paths}
+        if len(signatures) != 1:
+            raise HierarchyNotApplicable(f'{scope} paths are not uniform')
+        bandwidth, latency, _ = signatures.pop()
+        timing, = p2p_timing(size, scope, (hardware,), policy)
+        if timing['placeholder']:
+            raise HierarchyNotApplicable('no registered whole SO profile for this GPU; use P2P placeholder')
+        capacity = bandwidth * 125
+        ports = [gpu_port_bandwidth(gpu, hardware, policy) for gpu in task.participants]
+        rate = min(capacity, timing['rate'] or capacity, *(port or capacity for port in ports))
+        fixed = max(latency / 1000, timing['phase_fixed_us'])
+        models.append(theory.TheoryDerivedSurrogate(**dict(timing['parameters'], ring_bw_bytes_per_us=rate,
+                                                    packet_bw_bytes_per_us=rate, link_latency_us=fixed,
+                                                    wire_efficiency=timing['wire_efficiency'])))
+        parameters[scope] = dict(protocol=timing['protocol'], profile_sha=timing['profile_sha'],
+                                 startup_us=timing['startup_us'], phase_fixed_us=fixed,
+                                 ring_bw_bytes_per_us=rate, wire_efficiency=timing['wire_efficiency'])
+    startup = max(item['startup_us'] for item in parameters.values()) if data else 0.
+    model = theory.HierarchicalSurrogate(*models, width, domains)
+    duration = model.predict(data, 'ring', timing['credits'], startup_us=0.,
+                             collective=task.operation.replace('_', '')) if data else 0.
+    paths = tuple(path for options in paths_by_scope.values() for path in options)
+    return Estimate(ceil((duration + startup) * 1000), 'intra_hierarchical', 0, 0, 0, 0, paths,
+                    dict(hardware_id=hardware, domains=domains, gpus_per_domain=width,
+                         upstream_data_bytes=data, startup_us=startup, effective_parameters=parameters))

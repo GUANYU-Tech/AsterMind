@@ -93,14 +93,17 @@ class TargetRoutes(FrameRoutes):
                 pool: 1.0 for pool in edge['shared_pools'] if pool.startswith('device:')
             }
 
+    def _select_route(self, source, target):
+        a, b = self.network.resolve_pair(source, target)
+        try:
+            return self.network.host.net.select_route(a, b, self.network.host.now, self.routing_policy)
+        except NetworkUnavailable as error:
+            raise NoRouteError(str(error)) from error
+
     def route(self, source, target, size, *, first_hop=None):
         if type(size) is not int or size < 0:
             raise ValueError('payload must be nonnegative integer bytes')
-        a, b = self.network.resolve_pair(source, target)
-        try:
-            selected = self.network.host.net.select_route(a, b, self.network.host.now, self.routing_policy)
-        except NetworkUnavailable as error:
-            raise NoRouteError(str(error)) from error
+        selected = self._select_route(source, target)
         topology = self.network.topology
         path = tuple(topology.physical_path(selected.nodes))
         if first_hop is not None and (len(path) < 2 or path[1] != first_hop):

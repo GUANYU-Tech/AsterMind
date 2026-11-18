@@ -132,6 +132,11 @@ def _runtime_inputs(config, model):
         target_sampling_source="vllm_0_30_plain_greedy_bf16",
         symbolic_source_max_model_len=config.max_model_len,
         symbolic_source_max_batched_tokens=config.max_batched_tokens)
+    if (config.hardware_id == "nvidia_a800" and model.model_type == "glm_moe_dsa"
+            and model.weight_dtype == "bf16" and config.data_parallel_size > 1
+            and config.pipeline_parallel_size == 1):
+        # The existing distributed BF16 forward requires sparse MQA during prefill.
+        return replace(runtime, glm_prefill_attention_source="force_sparse_mqa")
     if (config.data_parallel_size > 1 and model.model_type == "glm_moe_dsa"
             and model.weight_dtype == "bf16" and config.hardware_id == "nvidia_h200"):
         ranks = config.tensor_parallel_size * config.pipeline_parallel_size * config.data_parallel_size
@@ -155,11 +160,7 @@ def create_midlayer_runtime(config: MidlayerCellConfig, *, with_scheduler: bool 
     if config.root.resolve() != loaded_root:
         raise ValueError("Cell root differs from the selected Mid-Layer source")
     model = load_model_config(config.root / config.model_file)
-    if _SOURCE_INPUTS:
-        from src.serving.workload.model_config import DEEPSEEK_V3_L32_CONFIG_SHA256
-        if model.config_sha256 == DEEPSEEK_V3_L32_CONFIG_SHA256:
-            raise NotImplementedError("DeepSeek-V3 L32 has no bound symbolic Serving source in this snapshot")
-    elif (config.deployment != "colocated" or config.scheduler_adapter in ("vllm_0_30", "vllm_0_31")
+    if not _SOURCE_INPUTS and (config.deployment != "colocated" or config.scheduler_adapter in ("vllm_0_30", "vllm_0_31")
           or config.host_launch_profile_file is not None):
         raise NotImplementedError("the logical main uses colocated CPU scheduling and device timing")
     if config.scheduler_adapter == "auto":
@@ -199,13 +200,16 @@ def create_midlayer_runtime(config: MidlayerCellConfig, *, with_scheduler: bool 
         pools, roles, routes = ("main",), ("colocated",), ()
         build_plan = build_deployment_plan
         plan_options["pipeline_layer_partition"] = tuple(end - start for start, end in layer_ranges)
-    collectives = tuple(CollectiveConfig(op, "ring", "nvlink", "ring", "main-nvlink-fabric",
+    # Preserve the colocated default's local-fabric assumption with the correct
+    # hardware label. This does not resolve physical cross-domain PP routes.
+    local_link = {"ascend_910b": "hccs", "metax_c500": "metaxlink"}.get(config.hardware_id, "nvlink")
+    collectives = tuple(CollectiveConfig(op, "ring", local_link, "ring", f"main-{local_link}-fabric",
                                         "analytical_roofline_v1")
                         for op in ("all_reduce", "all_gather")) if parallel.worker_count > 1 else ()
     if config.data_parallel_size > 1 and config.enable_expert_parallel:
-        collectives += tuple(CollectiveConfig(op, "pairwise", "nvlink", "fully_connected", "main-ep-fabric",
+        collectives += tuple(CollectiveConfig(op, "pairwise", local_link, "fully_connected", "main-ep-fabric",
                             "analytical_roofline_v1") for op in ("all_gatherv", "reduce_scatterv"))
-    pipeline_p2p = tuple(PipelineP2PConfig(stage, stage + 1, "send_recv", "nvlink",
+    pipeline_p2p = tuple(PipelineP2PConfig(stage, stage + 1, "send_recv", local_link,
                                          "point_to_point", "main-pipeline-fabric", "analytical_roofline_v1")
                          for stage in range(config.pipeline_parallel_size - 1))
     deployment = build_plan(
@@ -230,8 +234,9 @@ def create_midlayer_runtime(config: MidlayerCellConfig, *, with_scheduler: bool 
         # Older explicit snapshots provide eager Host intervals with the device timeline.
         materialize_timeline_details=host_profiles is not None,
     )
-    source_options = ({"runtime_inputs": execution.runtime_inputs}
-                      if config.scheduler_adapter == "vllm_0_30" or config.data_parallel_size>1 else {})
+    # Emission validates the bound compute source, independently of which
+    # Scheduler adapter produced (or will produce) the batch.
+    source_options = {"runtime_inputs": execution.runtime_inputs}
     validate_workload_emission_parallelism(deployment, model, allow_single_pool_tp2=True,
         allow_single_pool_ep2=True, allow_single_pool_tp1_pp=True, allow_single_pool_tp2_pp2=True,
         **source_options)
@@ -241,8 +246,8 @@ def create_midlayer_runtime(config: MidlayerCellConfig, *, with_scheduler: bool 
     if config.pipeline_parallel_size == 1:
         kv_bytes = math.ceil(model.kv_bytes_per_token_per_parallel_rank(config.tensor_parallel_size, 1))
     else:
-        kv_bytes = max(model.kv_bytes_per_token_for_layer_range(config.tensor_parallel_size, start, end)
-                       for start, end in layer_ranges)
+        kv_bytes = math.ceil(max(model.kv_bytes_per_token_for_layer_range(config.tensor_parallel_size, start, end)
+                       for start, end in layer_ranges))
     backends = {}
     try:
         for pool, role in zip(pools, roles, strict=True):

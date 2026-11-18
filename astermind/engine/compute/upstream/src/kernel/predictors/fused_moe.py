@@ -5694,7 +5694,7 @@ def dsv4_marlin_moe_source_work(kernel: KernelSpec):
     reads stay a coefficient rather than an invented expert assignment.
     """
     mathematical = ("mathematical_program" in kernel.attributes
-        and kernel.attributes["mathematical_program"] == "dsv4_mxfp4_w4a16_swiglu_v1")
+        and kernel.attributes["mathematical_program"] in ("dsv4_mxfp4_w4a16_swiglu_v1", "v4_pro_tp16_padded_marlin_w4a16_v1"))
     if (kernel.kind is not KernelKind.FUSED_MOE or kernel.variant != "routed_experts"
             or kernel.dtype != "bf16" or (not mathematical and (kernel.launch is None
                 or kernel.launch.algorithm != "vllm_marlin_moe_mxfp4_aggregate"))
@@ -5912,6 +5912,20 @@ def dsv4_marlin_moe_source_work(kernel: KernelSpec):
         work.update(stages=tuple(stages), active_experts=active, physical_launch_bound=False,
             normal_capacity_accepted=False, complete_source_service=False,
             source_condition="declared TP8 BF16/MXFP4 W4A16 mathematical projection of the retained source; no actual BW1100 Marlin/provider binding")
+        if kernel.attributes["mathematical_program"] == "v4_pro_tp16_padded_marlin_w4a16_v1":
+            logical=kernel.attributes["logical_intermediate"]
+            primitives=work["mathematical_primitives"]
+            for label,factor in (("w13",4),("w2",2)):
+                primitives["executed_"+label+"_tensor_flops"]=factor*rows*hidden*intermediate
+                primitives["useful_"+label+"_tensor_flops"]=factor*rows*hidden*logical
+                primitives["padding_"+label+"_tensor_flops"]=factor*rows*hidden*(intermediate-logical)
+            work["logical_intermediate"]=logical
+            work["physical_intermediate"]=intermediate
+            work["logical_useful_tensor_flops"]=6*rows*hidden*logical
+            work["padding_tensor_flops"]=6*rows*hidden*(intermediate-logical)
+            work["source_executed_tensor_flops"]=6*rows*hidden*intermediate
+            work["source_condition"]="vLLM0.30 Pro TP16 EPoff; zero-padded intermediate192 to256; physical256 GEMMs/activation and payload; no native launch"
+            work["scope"]="physical channel-padded source math; logical192 useful work recorded separately; M-row alignment/scratch/cache/dequant service unbound"
         return work
     experts = kernel.shape["experts"]
     # Host source chooses this tile before the alignment custom op. This
@@ -6853,9 +6867,9 @@ def _fp8_block_model(kernel: KernelSpec, hardware) -> Tuple[PredictionInput, flo
 
 
 def kimi_ep_marlin_logical_work(kernel: KernelSpec):
-    """Useful EP-off I shards or EP8 W4A16 matrices and unmasked SiLU.
+    """Useful EP-off I shards or uniform EP W4A16 matrices and unmasked SiLU.
 
-    EP-off retains all384 experts at the producer's actual local I. EP8
+    EP-off retains all384 experts at the producer's actual local I. Uniform EP
     DP/SP1 keeps token rows replicated while the linear expert map masks
     each rank's assignments. Ordinary (unclamped) apply_moe_activation still
     consumes every token/top-k row, including rows no local GEMM wrote.
@@ -6870,14 +6884,15 @@ def kimi_ep_marlin_logical_work(kernel: KernelSpec):
             or kernel.attributes["mathematical_program"] != "kimi_ep_marlin_swiglu_v1"
             or kernel.attributes["routed_weight_dtype"] != "int4"
             or kernel.attributes["weight_group_size"] != 32
-            or kernel.attributes["expert_parallel_size"] not in (1, 8)
+            or (kernel.attributes["expert_parallel_size"] < 1 or 384 % kernel.attributes["expert_parallel_size"])
             or kernel.attributes["routed_scaling_factor"] != 1.0
             or kernel.attributes["swiglu_limit"] is not None
             or (kernel.shape["experts"], kernel.shape["topk"], kernel.shape["hidden"]) != (384, 8, 7168)
-            or (kernel.attributes["expert_parallel_size"], kernel.shape["intermediate"]) not in (
-                (1, 2048), (1, 1024), (1, 512), (1, 256), (8, 2048))
+            or (kernel.shape["intermediate"] not in (2048, 1024, 512, 256, 128, 64) if kernel.attributes["expert_parallel_size"] == 1
+                else kernel.shape["intermediate"] != 2048)
             or kernel.shape["intermediate"] in (512, 1024) and not HWSpec.source_contract_supported("kimi_grouped_marlin_source_math", kernel.hardware_id)
-            or kernel.shape["intermediate"] == 256 and not HWSpec.source_contract_supported("kimi_marlin_i256_source_math", kernel.hardware_id)):
+            or kernel.shape["intermediate"] == 256 and not HWSpec.source_contract_supported("kimi_marlin_i256_source_math", kernel.hardware_id)
+            or kernel.shape["intermediate"] in (128, 64) and kernel.hardware_id != "nvidia_h200"):
         raise ValueError("Kimi EP Marlin work requires its exact unbound BF16/INT4 source program")
     tokens, topk, hidden, width = (kernel.shape[name] for name in ("tokens", "topk", "hidden", "intermediate"))
     counts, local = _routing(kernel)
@@ -7558,6 +7573,12 @@ class FusedMoEPredictor(KernelPredictor):
         self._cached_resource_value = None
 
     def analytical_without_launch(self, kernel: KernelSpec, hardware):
+        if kernel.attributes.get("mathematical_program") == "glm_flashinfer_block128_deferred_ep_v1":
+            return dataclasses.replace(self.roofline_without_launch(kernel, hardware), bottleneck_group="analytical_glm_flashinfer_fp8_source")
+        if kernel.attributes.get("mathematical_program") == "v3_fp8_dispatched_ep_fused_quant_v1":
+            return dataclasses.replace(self.roofline_without_launch(kernel, hardware), bottleneck_group="analytical_v3_dispatched_fp8_source")
+        if kernel.attributes.get("mathematical_program") in ("v3_fp8_ep8_fused_quant_v1", "v3_fp8_replicated_ep_fused_quant_v1"):
+            return dataclasses.replace(self.roofline_without_launch(kernel, hardware), bottleneck_group="analytical_v3_fp8_source")
         if (kernel.variant == "routed_experts" and "mathematical_program" in kernel.attributes
                 and kernel.attributes["mathematical_program"] == "sglang_0_5_19_fp8_fused_shared_swiglu_v1"):
             return dataclasses.replace(self.roofline_without_launch(kernel, hardware),
@@ -7569,6 +7590,12 @@ class FusedMoEPredictor(KernelPredictor):
         return super().analytical_without_launch(kernel, hardware)
 
     def resource_input(self, kernel: KernelSpec, hardware):
+        if kernel.attributes.get("mathematical_program") == "glm_flashinfer_block128_deferred_ep_v1":
+            raise NotImplementedError("GLM deferred FP8 useful work has no bound native provider resource schedule")
+        if kernel.attributes.get("mathematical_program") == "v3_fp8_dispatched_ep_fused_quant_v1":
+            raise NotImplementedError("V3 dispatched useful work has no bound native provider")
+        if kernel.attributes.get("mathematical_program") in ("v3_fp8_ep8_fused_quant_v1", "v3_fp8_replicated_ep_fused_quant_v1"):
+            raise NotImplementedError("V3 EP8 useful mathematical work has no native provider resource schedule")
         if (kernel.variant == "routed_experts" and "mathematical_program" in kernel.attributes
                 and kernel.attributes["mathematical_program"] == "sglang_0_5_19_fp8_fused_shared_swiglu_v1"):
             raise NotImplementedError("SGLang0.5.19 mathematical experts have no native launch/resource schedule")
@@ -7635,6 +7662,15 @@ class FusedMoEPredictor(KernelPredictor):
         return resource_input, compulsory
 
     def roofline_without_launch(self, kernel: KernelSpec, hardware):
+        if kernel.attributes.get("mathematical_program") == "glm_flashinfer_block128_deferred_ep_v1":
+            from .glm_fp8_ep_math import predict
+            return predict(kernel, hardware)
+        if kernel.attributes.get("mathematical_program") == "v3_fp8_dispatched_ep_fused_quant_v1":
+            from .v3_dp_math import predict
+            return predict(kernel, hardware)
+        if kernel.attributes.get("mathematical_program") in ("v3_fp8_ep8_fused_quant_v1", "v3_fp8_replicated_ep_fused_quant_v1"):
+            from .v3_ep_math import predict
+            return predict(kernel, hardware)
         if kernel.variant == "routed_experts" and "mathematical_program" in kernel.attributes:
             if kernel.attributes["mathematical_program"] == "sglang_0_5_19_fp8_fused_shared_swiglu_v1":
                 work = sglang0519_fp8_fused_shared_logical_work(kernel)
@@ -7649,6 +7685,32 @@ class FusedMoEPredictor(KernelPredictor):
                     diagnostics=PredictionDiagnostics(compute_time_s={}, memory=(), memory_access_classes=(),
                         memory_arbitration=(), pipeline=None, critical_path=work["source_stage_order"],
                         support_level="partial", limitations=work["limitations"]))
+            if kernel.attributes["mathematical_program"] in ("v4_masked_marlin_ep_v1", "k3_masked_marlin_ep_v1", "v4_modelsp_masked_marlin_ep_v1"):
+                from src.kernel.predictors.moe_ep_math import marlin_ep_work
+                if kernel.attributes["mathematical_program"] == "v4_modelsp_masked_marlin_ep_v1":
+                    from .v4_modelsp_math import logical_work
+                    work=logical_work(kernel.shape,kernel.attributes)
+                else:
+                    work = marlin_ep_work(kernel.shape, kernel.attributes, model="v4" if kernel.attributes["mathematical_program"] == "v4_masked_marlin_ep_v1" else "k3")
+                times = {s["stage"]: roofline_ns(s["demand"], hardware, s["logical_bytes"])*1e-9 for s in work["stages"]}
+                result = prediction_from_ns(sum(times.values())*1e9, "roofline")
+                return dataclasses.replace(result, t_per_group=times,
+                    diagnostics=PredictionDiagnostics(compute_time_s={}, memory=(), memory_access_classes=(),
+                        memory_arbitration=(), pipeline=None, critical_path=tuple(times),
+                        support_level="partial", limitations=work["limitations"]))
+            if kernel.attributes["mathematical_program"] in ("k3_tp_sharded_marlin_v1","k3_tp_padded_marlin_v1"):
+                from .k3_tp_math import source_work
+                work=source_work(kernel)
+                return prediction_from_ns(sum(roofline_ns(stage['demand'],hardware,stage['logical_bytes']) for stage in work['stages']),'roofline')
+            if kernel.attributes["mathematical_program"] == "v4_pro_tp16_padded_marlin_w4a16_v1":
+                work=dsv4_marlin_moe_source_work(kernel)
+                times={stage["stage"]:roofline_ns(stage["demand"],hardware,sum(stage["read_write_bytes"].values()))*1e-9 for stage in work["stages"]}
+                result=prediction_from_ns(sum(times.values())*1e9,"roofline")
+                return dataclasses.replace(result,t_per_group=times,
+                    diagnostics=PredictionDiagnostics(compute_time_s={},memory=(),memory_access_classes=(),
+                        memory_arbitration=(),pipeline=None,critical_path=tuple(times),support_level="partial",
+                        limitations=("physical256_channel_work_logical192_useful_work", "native_launch_and_M_row_alignment_unbound",
+                                     "unique_expert_weights_not_cache_replay", "typed_router_weight_dequant_conversion_service_unpriced")))
             if kernel.attributes["mathematical_program"] == "dsv4_mxfp4_w4a16_swiglu_v1":
                 work = dsv4_marlin_moe_source_work(kernel)
                 if (HWSpec.source_contract_supported("aggregate_gpu_source_roofline", hardware.hardware_id)

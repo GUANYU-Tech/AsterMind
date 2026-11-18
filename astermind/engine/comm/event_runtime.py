@@ -13,6 +13,9 @@ from .frame_surrogate import NoRouteError,CommunicationRouting
 from .planner import plan_communication
 from .operator import OperatorEstimate
 from .path_budget import path_budget, resource_capacities
+from .registered_profiles import p2p_duration
+from .intra_wave import local_wave_limits
+from .intra_topology import p2p_ns as legacy_p2p_ns
 
 
 @dataclass(frozen=True)
@@ -39,6 +42,7 @@ class RuntimeCommunication(CommunicationRouting):
         self._trace_capacity_source=None;self._trace_capacities=None
         self.last_time=self.loop.now_s;self.last_ns=self.now_ns;self.serial=0;self.generation=0;self.trace=TickTrace(loop)
         self.closed=False;self.routes=None;self.frame_deadline=None
+        self._admission_rebalance_pending = False
         self._frame_version=None;self._frame_ticks=None;self._observed_network_state=None
         self.delivery_paths={};self.used_ids=set()
         self.stats=dict(peak_active_flows=0,max_path_links=0,rate_allocations=0,
@@ -89,7 +93,11 @@ class RuntimeCommunication(CommunicationRouting):
         return self.flows.get(f['id']) is f and f['attempt']==attempt and f['task'] in self.tasks
 
     def _settle(self):
-        dt=max(0.,(self.loop.now_s.ticks-self.last_time.ticks)/10**9);finished=[]
+        now = self.loop.now_s
+        elapsed_ticks = now.ticks - self.last_time.ticks
+        if elapsed_ticks <= 0:
+            return
+        dt=elapsed_ticks/10**9;finished=[]
         for identity,f in tuple(self.active.items()):
             rate=self.rates.get(identity,0.)
             sent=min(f['remaining'],rate*dt);f['remaining']-=sent;f['sent']+=sent
@@ -104,6 +112,20 @@ class RuntimeCommunication(CommunicationRouting):
         for f in finished:
             self.active.pop(f['id'],None);f['state']='tail';attempt=f['attempt']
             self._later(f['budget']['tail'],lambda f=f,a=attempt:self._arrive(f,a),'comm:arrival')
+
+    def _schedule_admission_rebalance(self):
+        if self._admission_rebalance_pending:
+            return
+        self._admission_rebalance_pending = True
+
+        def flush():
+            self._admission_rebalance_pending = False
+            if not self.closed:
+                self._rebalance()
+
+        # Admissions (priority 1) settle old service and join individually.
+        # Allocate once after all of them, before Cell kernel starts (priority 3).
+        self._later(0, flush, 'comm:admission_rebalance', priority=2)
 
     def _rebalance(self):
         self.generation+=1;generation=self.generation
@@ -126,7 +148,7 @@ class RuntimeCommunication(CommunicationRouting):
         waits=[f['remaining']/self.rates[i] for i,f in self.active.items() if self.rates[i]>0]
         if waits:
             def wake():
-                if generation!=self.generation or self.closed:return
+                if generation!=self.generation or self.closed or self._admission_rebalance_pending:return
                 self._settle();self._rebalance()
             self._later(max(min(waits),1e-6),wake,'comm:serialization_complete')
 
@@ -137,11 +159,13 @@ class RuntimeCommunication(CommunicationRouting):
         self.trace.append(dict(kind='p2p_complete',id=f['id'],task=f['task'],attempt_id=attempt,time_ns=self.now_ns))
         f['done']()
 
-    def _attempt(self,f):
+    def _attempt(self,f,initial_route=None):
         if f['task'] not in self.tasks:return
         routes=self._refresh();started=perf_counter()
         first_hop=self.tasks[f['task']].get('first_hop')
-        try:route=routes.route(f['source'],f['target'],f['size'],first_hop=first_hop)
+        try:
+            route = initial_route if initial_route is not None else routes.route(
+                f['source'], f['target'], f['size'], first_hop=first_hop)
         except NoRouteError:
             f['state']='waiting'
             self.trace.append(dict(kind='route_wait',id=f['id'],task=f['task'],time_ns=self.now_ns));return
@@ -153,16 +177,30 @@ class RuntimeCommunication(CommunicationRouting):
         same=routes.topology.devices[f['source']].satellite==routes.topology.devices[f['target']].satellite
         if same and all(e['source_owner']==e['target_owner'] for e in routes.route_resources(route)):
             f['state']='local'
+            details={}
+            shared=False
             if all(routes.topology.devices[n].kind=='gpu' for n in (f['source'],f['target'])):
-                from .intra_topology import p2p_ns
                 from astermind.engine.comm.intra_hierarchy import classify_participants
-                _, hierarchy, _, _ = classify_participants(routes.frame, (f['source'], f['target']))
-                duration=p2p_ns(routes,route,f['size'],hierarchy)
+                scope, hierarchy, _, _ = classify_participants(routes.frame, (f['source'], f['target']))
+                task_state = self.tasks[f['task']]
+                if not task_state.get('local_runtime'):
+                    duration = legacy_p2p_ns(routes, route, f['size'], hierarchy)
+                else:
+                    effective = task_state.get('policy', self.policy)
+                    cards = task_state.get('hardware_by_gpu', {})
+                    hardware = tuple(cards.get(gpu, self.policy.gpu_hardware.get(gpu, self.policy.default_hardware_id))
+                                     for gpu in (f['source'], f['target']))
+                    plan_limit = f.get('wave_limit')
+                    shared = plan_limit is not None and plan_limit[0] == tuple(route['resources'])
+                    duration, details = p2p_duration(routes, route, f['size'], scope, hardware, effective,
+                                                     include_startup=not task_state.get('collective'),
+                                                     wave_rate_limit=plan_limit[1] if shared else None)
+                    details['intra_profile']=effective.resolved_intra_profile.summary(custom=effective.intra_profile is not None)
             else:duration=8*f['size']/route['bandwidth_gbps']+route['latency_ns']
             if self.policy.trace_service:
                 self.trace.append(dict(kind='intra_service',id=f['id'],task=f['task'],path=route['path'],
                     bandwidth_gbps=route['bandwidth_gbps'],latency_ns=route['latency_ns'],duration_ns=duration,
-                    intra_competition=False))
+                    intra_competition=shared,**details))
             self._later(duration,lambda:self._arrive(f,attempt),'comm:intra_complete');return
         f['budget']=path_budget(routes,route,f['size'],self.policy);f['state']='startup'
         def admit():
@@ -174,15 +212,15 @@ class RuntimeCommunication(CommunicationRouting):
             self.trace.append(dict(kind='admit',id=f['id'],task=f['task'],attempt_id=attempt,time_ns=self.now_ns,
                 path=f['budget']['path'],budgets=f['budget']['budgets'],startup_ns=f['budget']['startup'],
                 tail_ns=f['budget']['tail'],sampled_errors=False,ack_flows=False))
-            self._rebalance()
+            self._schedule_admission_rebalance()
         self._later(f['budget']['startup'],admit,'comm:admit')
 
-    def _p2p(self,task,source,target,size,done):
+    def _p2p(self,task,source,target,size,done,*,wave_limit=None,initial_route=None):
         if not size or source==target:self._later(0,lambda:done() if task in self.tasks else None);return
         self.serial+=1;identity=f'{task}/p2p/{self.serial}'
         f=dict(id=identity,task=task,source=source,target=target,size=size,done=done,
-               attempt=0,retries=0,sent=0.,state='new',path_keys=())
-        self.flows[identity]=f;self._attempt(f)
+               attempt=0,retries=0,sent=0.,state='new',path_keys=(),wave_limit=wave_limit)
+        self.flows[identity]=f;self._attempt(f,initial_route)
 
     def network_changed(self):
         self.stats['network_notifications']+=1
@@ -254,13 +292,38 @@ class RuntimeCommunication(CommunicationRouting):
     def cancel(self,identity,reason='cancelled'):
         self._settle();self._fail(identity,reason)
 
+    def _local_wave(self, transfers, plan):
+        routes = self._refresh()
+        # Local physical paths are resolved together at the wave's
+        # release, before their sends allocate any shared capacity.
+        current = []
+        local_routes = {}
+        for i, (route, size) in enumerate(transfers):
+            source, target = route['path'][0], route['path'][-1]
+            if routes.topology.devices[source].satellite == routes.topology.devices[target].satellite:
+                try:
+                    route = routes.route(source, target, size)
+                    if all(edge['source_owner'] == edge['target_owner']
+                           for edge in routes.route_resources(route)):
+                        local_routes[i] = route
+                except NoRouteError:
+                    route = {**route, 'unavailable': True}
+            current.append((route,size))
+        limits = local_wave_limits(routes, current, plan.policy,
+                                   plan.selection['hardware_by_gpu'], self.capacities)
+        return current, local_routes, limits
+
     def submit(self,operator,on_complete,on_failure=None,*,task_id=None,deadline_s=None):
         self.serial+=1;identity=task_id or f'communication-{self.serial}'
         self._register(identity,on_failure,deadline_s)
         try:
             self._settle();routes=self._refresh()
             plan=plan_communication(self.network,self.policy,operator,self.loop.now_s,routes=routes)
-            self.tasks[identity]['policy']=plan.policy
+            task = self.tasks[identity]
+            task['policy'] = plan.policy
+            if plan.local_runtime:
+                task.update(local_runtime=True, hardware_by_gpu=plan.selection['hardware_by_gpu'],
+                            collective=operator.operation != 'send_recv')
             self.trace.append(dict(kind='comm_plan',id=identity,time_ns=self.now_ns,**plan.selection,
                 model=plan.estimate.mode,whole=not bool(plan.waves),model_inputs=plan.estimate.model_inputs))
             def complete():
@@ -280,8 +343,32 @@ class RuntimeCommunication(CommunicationRouting):
                         nonlocal pending
                         pending-=1
                         if not pending:self._later(0,lambda:wave(index+1))
-                    for route,size in plan.waves[index]:self._p2p(identity,route['path'][0],route['path'][-1],size,arrived)
-                wave(0)
+                    if not plan.local_runtime:
+                        for route, size in plan.waves[index]:
+                            self._p2p(identity, route['path'][0], route['path'][-1], size, arrived)
+                        return
+                    try:
+                        current, local_routes, limits = self._local_wave(plan.waves[index], plan)
+                    except Exception as error:
+                        self._fail(identity, error)
+                        return
+                    for i,(route,size) in enumerate(current):
+                        if identity not in self.tasks:
+                            break
+                        try:
+                            self._p2p(identity, route['path'][0], route['path'][-1], size, arrived,
+                                      wave_limit=limits.get(i), initial_route=local_routes.get(i))
+                        except Exception as error:
+                            if identity not in self.tasks:
+                                raise
+                            self._fail(identity,error)
+                if plan.startup_ns:
+                    self.trace.append(dict(kind='collective_startup', id=identity,
+                                           duration_ns=plan.startup_ns,
+                                           by_scope_us=plan.selection['startup_us_by_scope']))
+                    self._later(plan.startup_ns, lambda: wave(0), 'comm:collective_started')
+                else:
+                    wave(0)
         except Exception as error:
             if identity not in self.tasks:raise
             self._fail(identity,error)

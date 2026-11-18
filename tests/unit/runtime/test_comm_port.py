@@ -46,6 +46,10 @@ class CommPortTests(unittest.TestCase):
         host.run()
         self.assertEqual(done,[Time.from_ns(2010)]*2)
         self.assertEqual(comm.stats['peak_active_flows'],2)
+        allocations = [r for r in comm.trace if r['kind']=='allocation' and r['flows']]
+        self.assertEqual(len(allocations), 1)
+        self.assertEqual(len(allocations[0]['flows']), 2)
+        self.assertAlmostEqual(sum(r['application_bytes'] for r in comm.trace if r['kind']=='service'),2000)
         self.assertFalse(comm.tasks or comm.flows or comm.active)
 
     def test_allocation_evidence_reuses_unchanged_supply_and_refreshes_changed_supply(self):
@@ -265,6 +269,66 @@ class CommPortTests(unittest.TestCase):
                 if op.operation=='all_to_all':
                     self.assertEqual((done[0].flow_count,done[0].cross_satellite_bytes),(2,30))
                 self.assertFalse(comm.tasks or comm.active or comm.flows)
+
+    def test_cross_satellite_waves_build_physical_routes_only_when_launched(self):
+        from astermind.engine.comm.operator import CommunicationOperator
+        from astermind.engine.comm.planner import plan_communication
+
+        participants = ('ag', 'bg')
+        cases = [
+            ('all_gatherv', 'direct', 'aggregate_input', {'partition_bytes': (800, 200)}, 2),
+            ('all_gatherv', 'pairwise', 'aggregate_input', {'partition_bytes': (800, 200)}, 2),
+            ('reduce_scatterv', 'pairwise', 'per_rank_input',
+             {'partition_bytes': (800, 200), 'reduction': 'sum'}, 2),
+            ('all_to_all', 'pairwise', 'per_rank_input', {}, 2),
+            ('all_to_all', 'pairwise', 'aggregate_input',
+             {'traffic_matrix_bytes': ((0, 800), (200, 0))}, 2),
+            ('all_gather', 'ring', 'per_rank_input', {}, 2),
+            ('all_gather', 'fullmesh', 'per_rank_input', {}, 2),
+            ('all_reduce', 'ring', 'per_rank_input', {'reduction': 'sum'}, 4),
+            ('all_reduce', 'tree', 'per_rank_input', {'reduction': 'sum'}, 2),
+            ('all_reduce', 'fullmesh', 'per_rank_input', {'reduction': 'sum'}, 4),
+            ('broadcast', 'direct', 'payload', {}, 1),
+            ('send_recv', 'send_recv', 'payload', {}, 1),
+        ]
+        for operation, algorithm, semantics, options, flow_count in cases:
+            with self.subTest(operation=operation, algorithm=algorithm, semantics=semantics):
+                host, network, comm = self.runtime()
+                routes = comm._refresh()
+                op = CommunicationOperator(operation, algorithm, participants, 1000, semantics, **options)
+                done = []
+                with patch.object(routes, 'route', wraps=routes.route) as lookup:
+                    plan = plan_communication(comm.network, comm.policy, op, host.now, routes=routes)
+                    self.assertEqual(sum(map(len, plan.waves)), flow_count)
+                    lookup.assert_not_called()
+                    comm.submit(op, done.append, self.fail)
+                    host.run()
+                    self.assertEqual(lookup.call_count, flow_count)
+                self.assertEqual(len(done), 1)
+
+    def test_cross_satellite_tree_retains_later_wave_route_after_link_restores(self):
+        from astermind.engine.comm.operator import CommunicationOperator
+
+        raw = scenario(capacity_schedule_ns=((0, 0), (100, 1)))
+        physical = raw['physical']
+        physical['cells'].append(dict(id='relay', satellites=['c']))
+        physical['satellites'].append(dict(id='c'))
+        physical['devices'].append(dict(id='ct', satellite='c', kind='terminal', external_access=True))
+        for device in physical['devices']:
+            if device['kind'] == 'terminal':
+                device['max_external_links'] = 2
+        for endpoint in ('at', 'bt'):
+            physical['links'].append(dict(id=f'{endpoint}-ct', source=endpoint, target='ct',
+                                          bandwidth_gbps=8, latency_ns=10))
+        host, network, comm = self.runtime(raw)
+        done = []
+        op = CommunicationOperator('all_reduce', 'tree', ('ag', 'bg'), 1000,
+                                   'per_rank_input', reduction='sum')
+        comm.submit(op, done.append, self.fail)
+        host.run()
+        paths = [tuple(row['path']) for row in comm.trace if row['kind'] == 'admit']
+        self.assertEqual(paths, [('bg', 'bt', 'ct', 'at', 'ag'), ('ag', 'at', 'ct', 'bt', 'bg')])
+        self.assertEqual(len(done), 1)
 
     def test_zero_capacity_candidate_does_not_break_other_reachable_routes(self):
         from examples.native.compute_comm_matrix import scene

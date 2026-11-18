@@ -1,21 +1,6 @@
 """Physical su declarations and communication-scope classification."""
-from pydantic import BaseModel, ConfigDict, model_validator
-
-class IntraHierarchy(BaseModel):
-    model_config = ConfigDict(extra='forbid', frozen=True)
-    su_groups: tuple[tuple[str, ...], ...]
-    su_switches: tuple[str, ...]
-
-    @model_validator(mode='after')
-    def validate_groups(self):
-        if len(self.su_groups)<2 or len(self.su_groups)!=len(self.su_switches):
-            raise ValueError('at least two su groups and one switch per group required')
-        if min(map(len,self.su_groups))<2 or len(set(map(len,self.su_groups)))!=1:
-            raise ValueError('equal su groups of at least two GPUs required')
-        ids = sum(self.su_groups,()) + self.su_switches
-        if len(set(ids)) != len(ids):
-            raise ValueError('su GPU and switch IDs must be distinct')
-        return self
+# Compatibility import: physical declarations belong to Builder, not a model.
+from astermind.builder.config.intra_topology import IntraHierarchy
 
 
 def classify_participants(frame, participants):

@@ -676,6 +676,8 @@ def _bind_mla_cache(call, source):
 
 
 def _bind_v4_insert(call, source):
+    if call.kernel_spec.attributes.get('mathematical_program') == 'v4_idle_swa_insert_v1':
+        return None, 'v4_idle_insert_has_no_cache_output'
     if ("mathematical_program" in call.kernel_spec.attributes and call.kernel_spec.attributes["mathematical_program"]
             == "vllm_0_30_dspark_partial_context_insert_v1"):
         return None, "dspark_partial_context_native_slot_values_unbound"

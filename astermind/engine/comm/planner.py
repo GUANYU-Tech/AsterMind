@@ -3,11 +3,14 @@
 Reuse FormationEstimator's validated rules instead of maintaining a second
 operator switch in Execution. Whole-operation intra predictions remain intact.
 """
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
+from .estimator import Estimate
 from .formation import FormationEstimator
 from .frame_surrogate import NoRouteError
 from .task import CommunicationTask
 from .policy import resolve_task_policy
+from .registered_profiles import collective_startup, route_scope
+from .topology_collective import layered_plan
 
 
 @dataclass(frozen=True)
@@ -17,12 +20,15 @@ class PlannedCommunication:
     model: object
     policy: object = None
     selection: object = None
+    startup_ns: int = 0
+    local_runtime: bool = False
 
 
 class _Recorder(FormationEstimator):
-    def __init__(self, routes, settings, hierarchy=None):
-        super().__init__(routes,settings,routes.ground_owners,share_isl=False,intra_hierarchy=hierarchy)
+    def __init__(self, routes, settings, hierarchy=None, policy=None, *, defer_cross_routes=False):
+        super().__init__(routes,settings,routes.ground_owners,share_isl=False,intra_hierarchy=hierarchy,policy=policy)
         self.waves=[]
+        self.defer_cross_routes = defer_cross_routes
 
     def _wave_ns(self, transfers):
         self.waves.append(tuple(transfers))
@@ -32,20 +38,79 @@ class _Recorder(FormationEstimator):
         self.waves.append(((route,size),))
         return 0
 
-    def _route(self,a,b,size):
-        try:return self.network.route(a,b,size)
-        except NoRouteError:
-            if self._sat(a)==self._sat(b):raise
-            return dict(path=[a,b],resources=(),unavailable=True)
+    def _route(self, a, b, size):
+        if self._sat(a) == self._sat(b):
+            return self.network.route(a, b, size)
+        if not self.defer_cross_routes:
+            # Preserve cached route choices across later waves and topology
+            # changes. Runtime builds the physical path only when it needs it.
+            select = getattr(self.network, '_select_route', None)
+            try:
+                if select is None:
+                    self.network.route(a, b, size)
+                else:
+                    select(a, b)
+            except NoRouteError:
+                pass
+        return {'path': (a, b)}
+
+
+def _from_layers(task, policy, selection, routes, network):
+    members = set(task.participants)
+    hierarchy = policy.intra_hierarchy
+    groups = (task.participants,)
+    if hierarchy:
+        groups = tuple(tuple(gpu for gpu in group if gpu in members) for group in hierarchy.su_groups)
+        groups = tuple(group for group in groups if group)
+    waves, stages, schedules = layered_plan(task, groups, routes, hierarchy, selection['layer_choices'])
+    selection['stages'] = stages
+    if len(groups) == 1:
+        _, layout = schedules[groups[0], 'single_su']
+        if task.algorithm == 'ring':
+            task = replace(task, ring_order=layout)
+        # Tree stages use the actual spanning tree; the registered tree
+        # formula assumes a pre-defined heap tree and cannot price it.
+        if (task.algorithm in ('ring', 'fullmesh', 'fc2', 'mesh')
+                and task.operation in ('all_gather', 'all_reduce')):
+            from .model_selection import select_whole
+            _, result = select_whole(task, policy, selection, routes, network)
+            if result is not None:
+                return PlannedCommunication(result, (), None, policy, selection)
+    else:
+        selection['algorithm'] = 'hierarchical'
+        if any(stage['algorithm_source'] == 'cell_policy' for stage in stages):
+            selection['algorithm_source'] = 'cell_policy'
+    paths = tuple(route for wave in waves for route, _ in wave)
+    estimate = Estimate(0, 'explicit_layered', len(waves), len(paths), 0, 0, paths)
+    startup, by_scope = collective_startup(task, waves, routes, policy, selection)
+    selection.update(collective_startup_ns=startup, startup_us_by_scope=by_scope)
+    return PlannedCommunication(estimate, waves, None, policy, selection, startup, local_runtime=True)
 
 
 def plan_communication(network, policy, operator, time_s, routes=None):
     routes=routes or network.routes(network.frame_at(time_s))
     task=CommunicationTask(**asdict(operator))
+    if (len(task.participants) < 2 or len(set(task.participants)) != len(task.participants)
+            or type(task.bytes) is not int or task.bytes < 0):
+        raise ValueError('expected distinct participants and nonnegative integer bytes')
     task,effective,selection=resolve_task_policy(policy,task,routes)
-    model=_Recorder(routes,effective.inter_parameters.model_dump(),effective.intra_hierarchy)
+    if 'layer_choices' in selection and effective.intra_mode == 'surrogate':
+        return _from_layers(task, effective, selection, routes, network)
+    # Only skip the initial cache lookup for plans that release every
+    # distinct cross-satellite pair immediately, in this simulation tick.
+    defer_cross_routes = task.bytes > 0 and (
+        task.operation in ('all_gatherv', 'reduce_scatterv', 'broadcast', 'send_recv')
+        or (task.operation == 'all_gather' and task.algorithm != 'hierarchical')
+        or (task.operation == 'all_to_all' and len(task.participants) == 2
+            and task.algorithm in (None, 'pairwise'))
+    )
+    model=_Recorder(routes,effective.inter_parameters.model_dump(),effective.intra_hierarchy,effective,
+                    defer_cross_routes=defer_cross_routes)
     from .model_selection import select_whole
-    task,result=select_whole(task,effective,selection,routes,network)
+    cross_satellite = selection['scope'] == 'inter_satellite'
+    result = None
+    if not cross_satellite:
+        task,result=select_whole(task,effective,selection,routes,network)
     if result is None:
         result=model.estimate(task)
     waves=tuple(model.waves)
@@ -58,4 +123,12 @@ def plan_communication(network, policy, operator, time_s, routes=None):
             waves=(waves[0],)*steps+(waves[1],)*steps
         else:
             waves=waves*result.rounds
-    return PlannedCommunication(result,waves,model,effective,selection)
+    if cross_satellite or any(
+        route_scope(routes, route, effective.intra_hierarchy) == 'inter_satellite'
+        for wave in waves for route, _ in wave
+    ):
+        return PlannedCommunication(result, waves, model, effective, selection)
+    startup_ns, startup_by_scope = collective_startup(task, waves, routes, effective, selection)
+    if waves:
+        selection.update(collective_startup_ns=startup_ns, startup_us_by_scope=startup_by_scope)
+    return PlannedCommunication(result, waves, model, effective, selection, startup_ns, local_runtime=True)

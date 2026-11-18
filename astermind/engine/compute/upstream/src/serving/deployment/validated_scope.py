@@ -111,7 +111,7 @@ def is_kimi_k3_runtime_source_scope(pool, model, runtime_inputs):
     return (is_kimi_k3_parallel_model_scope(model, config.tensor_parallel_size, config.pipeline_parallel_size,
                 expert_parallel=config.enable_expert_parallel)
         and (runtime_inputs.k3_latent_tail_tier is None if config.enable_expert_parallel or config.tensor_parallel_size == 1
-            else runtime_inputs.k3_latent_tail_tier in ("ALLREDUCE_OVERLAP", "COLUMN_PARALLEL")))
+            else runtime_inputs.k3_latent_tail_tier in (None, "ALLREDUCE_OVERLAP", "COLUMN_PARALLEL")))
 
 
 def is_dspark_runtime_source_scope(pool, model, runtime_inputs):
@@ -131,16 +131,46 @@ def is_dspark_runtime_source_scope(pool, model, runtime_inputs):
 
 def is_dense_parallel_source_scope(pool, model, *, model_execution_version,
                                    symbolic_forward_source, graph_enabled):
-    """General eager CUDA0.30 16-bit dense source; no provider acceptance.
+    """Eager CUDA0.30 / Ascend0.18 dense sources; no provider acceptance.
 
     TP/PP are checked by source geometry rather than a topology allowlist.
     DP replicas are routed as separate pools by the existing deployment owner.
     Captured and other vendor/version programs keep their existing gates.
     """
     config = pool.parallel_plan.config
+    if (model_execution_version == "vllm_0_18_0"
+            and symbolic_forward_source == "vllm_ascend_eager"
+            and pool.hardware_id == "ascend_910b"):
+        return (not graph_enabled and pool.role == "colocated"
+            and config.is_rank_local and not config.enable_expert_parallel
+            and len(pool.ranks) == config.worker_count
+            and model.compute_dtype == model.weight_dtype == "bf16"
+            and is_dense_parallel_model_scope(model, config.tensor_parallel_size,
+                config.pipeline_parallel_size))
+    if (symbolic_forward_source == "cuda_eager_inplace"
+            and (pool.hardware_id, model_execution_version) in (
+                ("nvidia_a800", "vllm_0_11_0"), ("nvidia_h200", "vllm_0_11_0"),
+                ("metax_c500", "vllm_0_24_0"))):
+        return (not graph_enabled and pool.role == "colocated"
+            and config.is_rank_local and not config.enable_expert_parallel
+            and len(pool.ranks) == config.worker_count
+            and model.compute_dtype == model.weight_dtype == "bf16"
+            and (config.tensor_parallel_size in (1, 2, 4, 8)
+                or (pool.hardware_id == "nvidia_a800" and model.model_type == "llama"
+                    and model_execution_version == "vllm_0_11_0"
+                    and config.tensor_parallel_size == 16 and config.pipeline_parallel_size == 1))
+            and (config.pipeline_parallel_size == 1
+                or model.model_type == "qwen3" and not model.tie_word_embeddings)
+            and is_dense_parallel_model_scope(model, config.tensor_parallel_size,
+                config.pipeline_parallel_size))
+    # MetaX's eager TP source handles both 16-bit Qwen precisions. Its
+    # pipeline source and the Llama adapter require homogeneous BF16.
+    metax_dense = (pool.hardware_id == "metax_c500"
+        and (model.compute_dtype == "bf16" or
+             model.model_type == "qwen3" and config.pipeline_parallel_size == 1))
     return (model_execution_version == "vllm_0_30_0"
         and symbolic_forward_source == "cuda_eager_inplace" and not graph_enabled
-        and pool.hardware_id in ("nvidia_a800", "nvidia_h200") and pool.role == "colocated"
+        and (pool.hardware_id in ("nvidia_a800", "nvidia_h200") or metax_dense) and pool.role == "colocated"
         and config.is_rank_local and not config.enable_expert_parallel
         and len(pool.ranks) == config.worker_count
         and model.compute_dtype == model.weight_dtype and model.compute_dtype in ("bf16", "fp16")
@@ -148,12 +178,16 @@ def is_dense_parallel_source_scope(pool, model, *, model_execution_version,
 
 
 def is_kimi_k2_rank_local_source_scope(pool, model):
-    """Eager H200 K2 text source geometry; GPU provider remains unvalidated."""
+    """Eager K2 text source geometry; timing uses the selected hardware profile."""
     config = pool.parallel_plan.config
     pd_pool = (pool.role in ("prefill", "decode")
         and config.tensor_parallel_size == config.expert_parallel_size == 8
         and config.pipeline_parallel_size == 1 and config.enable_expert_parallel)
-    return (pool.hardware_id == "nvidia_h200" and (pool.role == "colocated" or pd_pool)
+    legacy_a800 = (config.tensor_parallel_size == config.expert_parallel_size == 8
+        and config.pipeline_parallel_size == 2 and config.enable_expert_parallel)
+    hardware_scope = (pool.hardware_id == "nvidia_h200" or pool.hardware_id == "nvidia_a800"
+        and pool.role == "colocated" and not legacy_a800)
+    return (hardware_scope and (pool.role == "colocated" or pd_pool)
         and config.is_rank_local and len(pool.ranks) == config.worker_count
         and is_kimi_k2_parallel_model_scope(model, config.tensor_parallel_size,
             config.pipeline_parallel_size, expert_parallel=config.enable_expert_parallel))
@@ -168,7 +202,7 @@ def is_kimi_k2_data_parallel_source_scope(pool, model, *, model_execution_versio
     return (type(graph_enabled) is bool and not graph_enabled
         and model_execution_version == "vllm_0_30_0"
         and symbolic_forward_source == "vllm_0_30_k2_6_int4_sync_explicit_allreduce"
-        and pool.hardware_id == "nvidia_h200" and pool.role == "colocated"
+        and (pool.hardware_id == "nvidia_h200" or pool.hardware_id == "nvidia_a800" and config.enable_expert_parallel) and pool.role == "colocated"
         and len(pool.ranks) == config.worker_count and len(mapping) == model.num_hidden_layers
         and mapping == tuple(sorted(mapping)) and set(mapping) == set(range(config.pipeline_parallel_size))
         and is_kimi_k2_data_parallel_model_scope(model, config))
@@ -178,6 +212,11 @@ def is_qwen3_moe_rank_local_source_scope(pool, model, *, model_execution_version
     """Ordinary CUDA0.30 expert TP or stage-local EP, with actual PP owners."""
     from src.serving.parallelism.tp import validate_gqa_parallelism
     config = pool.parallel_plan.config
+    if model_execution_version in ("vllm_0_18_0", "vllm_0_24_0"):
+        from src.serving.workload.traced_models import _versioned_qwen3_moe_ep2_source
+        expected = "vllm_ascend_eager" if model_execution_version == "vllm_0_18_0" else "cuda_eager_inplace"
+        return (not graph_enabled and symbolic_forward_source == expected and pool.role == "colocated"
+            and _versioned_qwen3_moe_ep2_source(model, pool, model_execution_version, pipeline=True))
     if (model_execution_version != "vllm_0_30_0" or symbolic_forward_source != "cuda_eager_inplace"
             or graph_enabled or not is_qwen3_moe_source_model_scope(model)
             or pool.hardware_id not in ("nvidia_a800", "nvidia_h200") or pool.role != "colocated"
@@ -809,6 +848,21 @@ def is_glm_fp8_mtp_rank_local_source_scope(pool, model):
         and pool.parallel_plan.num_layers == model.num_hidden_layers == len(mapping)
         and mapping == tuple(sorted(mapping)) and set(mapping) == set(range(config.pipeline_parallel_size))
         and is_glm_mtp_tensor_model_scope(model, config.tensor_parallel_size, expert_parallel=True))
+
+
+def is_glm53_legacy_tp8_ep8_source_scope(pool, model: ModelConfig) -> bool:
+    """Existing replicated-input EP8 GLM source; no DP dispatch or PP extension."""
+    from src.serving.workload.model_config import GLM_MOE_DSA_5_3_CONFIG_SHA256, is_glm_fp8_tensor_model_scope
+    config = pool.parallel_plan.config
+    return (model.config_sha256 == GLM_MOE_DSA_5_3_CONFIG_SHA256
+        and model.compute_dtype == "bf16" and model.weight_dtype == "fp8"
+        and is_glm_fp8_tensor_model_scope(model, 8)
+        and pool.hardware_id == "nvidia_h200" and pool.role == "colocated"
+        and config.is_rank_local and config.tensor_parallel_size == 8
+        and config.enable_expert_parallel and config.expert_parallel_size == 8
+        and config.pipeline_parallel_size == 1 and len(pool.ranks) == 8
+        and pool.parallel_plan.num_experts == model.num_experts
+        and pool.parallel_plan.layer_to_pipeline_stage == (0,) * model.num_hidden_layers)
 
 
 def is_glm_fp8_rank_local_source_scope(pool, model: ModelConfig) -> bool:
