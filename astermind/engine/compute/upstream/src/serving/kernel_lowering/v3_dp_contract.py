@@ -34,7 +34,6 @@ def validate(graph,pool,nodes,memory_context):
  _PROOF.set(None);proven=set()
  if not applicable(pool):raise NotImplementedError('V3 active DP source supports only H200 TP1 PP1 SP1 CP1 DP=EP2/4/8')
  if memory_context is None:raise ValueError('V3 DP requires source memory ports')
- if any(n.attributes.get('source_dummy_run') is True for n in graph.nodes):raise NotImplementedError('V3 DP idle/dummy replicas are not supported')
  c=pool.parallel_plan.config;dp=c.data_parallel_size;tp=c.tensor_parallel_size;pp=c.pipeline_parallel_size;ep=dp*tp;dimension='expert' if tp>1 else 'data';participants=tuple(pool.ranks);byid={n.node_id:n for n in graph.nodes};out=defaultdict(list);succ=defaultdict(list);pred=defaultdict(list);memory=memory_context._by_node
  for n in graph.nodes:
   for v in n.attributes.get('symbolic_tensor_outputs',()):out[v].append(n)
@@ -60,9 +59,20 @@ def validate(graph,pool,nodes,memory_context):
  fail(len(groups)!=layers-3 or {n.attributes['routing_provenance']['layer_index'] for n in nodes}!=set(range(3,layers)),'incomplete MoE layers')
  norms=[n for n in graph.nodes if n.node_id.endswith(':layer-0:input-norm')]
  first_ranks=tuple(pool.physical_rank_for_logical_rank(r*pp*tp+lane) for r in range(dp) for lane in range(tp))
- fail(len(norms)!=ep or {n.rank for n in norms}!=set(first_ranks) or any(n.shape['rows']<=0 for n in norms),'all replicas must have active initial rows')
- logical_rows=tuple(next(n.shape['rows'] for n in norms if n.rank==first_ranks[r*tp]) for r in range(dp))
- fail(any(next(n.shape['rows'] for n in norms if n.rank==first_ranks[r*tp+lane])!=logical_rows[r] for r in range(dp) for lane in range(tp)),'initial full hidden rows must agree within TP')
+ by_rank = {n.rank: n for n in norms}
+ fail(len(norms)!=ep or set(by_rank)!=set(first_ranks) or any(n.shape['rows']<=0 for n in norms),'complete physical initial rows')
+ logical_rows = []
+ active_replicas = 0
+ for replica in range(dp):
+  members = [by_rank[r] for r in first_ranks[replica*tp:(replica+1)*tp]]
+  rows = members[0].shape['rows']
+  idle = [n.attributes.get('source_dummy_run') is True for n in members]
+  fail(any(n.shape['rows'] != rows for n in members), 'initial full hidden rows must agree within TP')
+  fail(any(idle) and (not all(idle) or rows != 1 or any(
+   n.attributes.get('source_actual_request_count') != 0 for n in members)), 'idle TP group requires one dummy row and zero requests')
+  active_replicas += int(not any(idle))
+  logical_rows.append(rows)
+ fail(active_replicas == 0, 'at least one replica must have a real request')
  initial_rows=tuple(-(-count//tp) for count in logical_rows for lane in range(tp))
  for invocation,members in groups.items():
   layer=members[0].attributes['routing_provenance']['layer_index'];stage=pool.parallel_plan.layer_to_pipeline_stage[layer]
@@ -73,7 +83,7 @@ def validate(graph,pool,nodes,memory_context):
   dispatch=[]
   for idx,(width,dtype,size) in enumerate(((h,'fp8',1),(8,'fp32',4),(8,'int32',4),(56,'fp32',4))):
    d=unique([x for x in out[ins(first)[idx]] if x.kind.value=='collective'],'unique dispatch collective');a=d.attributes;rows=tuple(a['symbolic_variable_rows'])
-   fail(rows!=initial_rows or any(type(x) is not int or x<=0 for x in rows) or sum(rows)!=t,'all-active DP rows and global expert extent')
+   fail(rows!=initial_rows or any(type(x) is not int or x<=0 for x in rows) or sum(rows)!=t,'physical DP rows and global expert extent')
    fail(a.get('operation')!='all_gatherv' or a.get('reduction') is not None or a.get('collective_group')!=dimension or tuple(a['participants'])!=participants or tuple(a['symbolic_variable_row_shape'])!=(width,) or tuple(a['partition_bytes'])!=tuple(x*width*size for x in rows) or a.get('bytes')!=t*width*size or a.get('bytes_semantics')!='aggregate_input' or len(ins(d))!=ep or len(outs(d))!=ep,'dispatch bytes/group/operation')
    fail(tuple(x.node_id for x in pred[d.node_id])!=tuple(a['symbolic_collective_input_producers']) and set(x.node_id for x in pred[d.node_id])!=set(a['symbolic_collective_input_producers']),'dispatch data dependencies')
    for lane,n in enumerate(members):

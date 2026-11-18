@@ -1,4 +1,4 @@
-"""V4 all-active WideEP model-SP: full EP experts and typed TP sequence restoration."""
+"""V4 WideEP model-SP: full EP experts and typed TP sequence restoration."""
 from collections import defaultdict
 from contextvars import ContextVar
 
@@ -14,8 +14,10 @@ def handles_fill(node):
     return proof is not None and node.node_id in proof[3] and proof[0].node(node.node_id) is node
 
 def handles_hash_route(node):
+    from .v4_dp_contract import handles_hash_route as handles_dp_hash_route
     proof=_validated_variables.get()
-    return proof is not None and node.node_id in proof[4] and proof[0].node(node.node_id) is node
+    return ((proof is not None and node.node_id in proof[4] and proof[0].node(node.node_id) is node)
+            or handles_dp_hash_route(node))
 
 def applicable(pool):
     c=pool.parallel_plan.config
@@ -28,12 +30,11 @@ def applicable(pool):
 def validate(graph,pool,nodes,memory_context):
     _validated_variables.set(None)
     from .v4_modelsp_math_binding import expert_attributes
-    if not applicable(pool):raise NotImplementedError('V4 model-SP requires H200 all-active DP, TP>1 PP1, uniform TP*DP experts')
+    if not applicable(pool):raise NotImplementedError('V4 model-SP requires H200 DP, TP>1 PP1, uniform TP*DP experts')
     if memory_context is None:raise ValueError('V4 WideEP requires actual typed tensor ports')
     c=pool.parallel_plan.config;tp,dp,pp=c.tensor_parallel_size,c.data_parallel_size,c.pipeline_parallel_size
     memory=memory_context._by_node;out=defaultdict(list);succ=defaultdict(list);edges=set();byid={n.node_id:n for n in graph.nodes}
     for n in graph.nodes:
-        if n.attributes.get('source_dummy_run') is True:raise NotImplementedError('V4 WideEP idle/dummy rows require a separate retained-state contract')
         for v in n.attributes.get('symbolic_tensor_outputs',()):out[v].append(n)
     for e in graph.edges:
         edges.add((e.source,e.destination))
@@ -155,26 +156,36 @@ def validate(graph,pool,nodes,memory_context):
 
 def validate_lowered(graph,plan):
     """Check the actual returned plan, including ordinary no-launch-input calls."""
-    proof=_validated_variables.get()
-    if proof is None or proof[0] is not graph:
+    proof = _validated_variables.get()
+    if proof is not None and proof[0] is graph:
+        fill_ids, hash_ids, expert_ids = proof[3:6]
+    else:
+        from .v4_dp_contract import masked_source_nodes
+        fill_ids = frozenset()
+        hash_ids, expert_ids = masked_source_nodes(graph)
+    wanted = fill_ids | hash_ids | expert_ids
+    if not wanted:
         if any(str(c.kernel_spec.attributes.get('mathematical_program','')).startswith('v4_modelsp_') for c in plan.calls):
-            raise ValueError('V4 model-SP plan lacks current graph proof')
+            raise ValueError('V4 masked plan call lacks current graph proof')
         return
     from .v4_ep_contract import expert_attributes
     from .v4_modelsp_math_binding import valid_tokens
     from src.kernel.kernel_spec import KernelSpec, KernelKind
-    wanted=proof[3]|proof[4]|proof[5];seen=set()
+    seen = set()
     for call in plan.calls:
         ids=set(call.source_node_ids)&wanted
-        if not ids:continue
+        if not ids:
+            if str(call.kernel_spec.attributes.get('mathematical_program','')).startswith('v4_modelsp_'):
+                raise ValueError('V4 masked plan call lacks current graph proof')
+            continue
         if len(ids)!=1 or len(call.source_node_ids)!=1 or seen&ids:
             raise ValueError('V4 model-SP requires exactly one call per proved source node')
         identity=next(iter(ids));seen.add(identity);node=graph.node(identity);k=call.kernel_spec
-        if identity in proof[4]:
+        if identity in hash_ids:
             kind,variant=KernelKind.VECTOR,'dsv4_moe_route'
             expected={'expert_id_selection':'hash_table','routed_scaling_factor':node.attributes['routed_scaling_factor'],'routing_source':None,'mathematical_program':'v4_modelsp_hash_top6_masked_v1','valid_rows':node.attributes['symbolic_padding_valid_prefix']}
             shape={'element_count':node.shape['elements'],'rows':node.shape['rows'],'experts':node.shape['experts'],'topk':6,'dtype_bytes':4}
-        elif identity in proof[3]:
+        elif identity in fill_ids:
             kind,variant=KernelKind.VECTOR,'elementwise'
             expected={'operation':'fill','reads':0,'writes':1,'mathematical_program':'v4_modelsp_zero_fill_v1'}
             shape={'element_count':node.shape['elements'],'dtype_bytes':2 if node.dtype=='bf16' else 4}
@@ -192,8 +203,31 @@ def validate_lowered(graph,plan):
 def validate_sequence(graph,pool,memory_context,experts):
     """Prove the SP lane split, each attention gather/scatter, and final restore."""
     from math import prod
+    import re
+
     c=pool.parallel_plan.config;tp=c.tensor_parallel_size;dp=c.data_parallel_size
     ns={n.node_id:n for n in graph.nodes};mem=memory_context._by_node;pred=defaultdict(list);succ=defaultdict(list)
+    rank_suffix = defaultdict(list)
+    group_suffix = defaultdict(list)
+    embeddings = defaultdict(list)
+    first_routes = defaultdict(list)
+    rank_pattern = re.compile(r'(?:layer-0:pre|sp-(?:embedding|input-ids):(?:copy|pad-zero)|'
+        r'layer-\d+:(?:attn:out:wo-b|sp-attention-scatter:(?:copy|pad-zero)))$')
+    group_pattern = re.compile(r'(?:embedding:all-reduce|layer-\d+:sp-attention-(?:gather|scatter)|'
+        r'sp-final-hidden-gather)$')
+    for node in graph.nodes:
+        if node.kind.value == 'collective':
+            suffix = group_pattern.search(node.node_id)
+            if suffix is not None:
+                group_suffix[tuple(node.attributes['participants']), suffix[0]].append(node)
+            continue
+        if node.kind.value == 'gather' and node.variant == 'embedding':
+            embeddings[node.rank].append(node)
+        if node.variant == 'dsv4_moe_route' and ':layer-0:' in node.node_id:
+            first_routes[node.rank].append(node)
+        suffix = rank_pattern.search(node.node_id)
+        if suffix is not None:
+            rank_suffix[node.rank, suffix[0]].append(node)
     for edge in graph.edges:
         if edge.kind=='data':pred[edge.destination].append(ns[edge.source]);succ[edge.source].append(ns[edge.destination])
     def require(ok,msg):
@@ -207,27 +241,33 @@ def validate_sequence(graph,pool,memory_context,experts):
         for dim,step in reversed(tuple(zip(v.shape,v.strides_bytes))):require(dim<=1 or step==stride,'contiguous typed view');stride*=dim
         return v
     def alias(a,b):require(a.allocation_id==b.allocation_id and a.offset_bytes==b.offset_bytes,'actual storage alias')
-    logical=[];groups=[];h=experts[0].shape['hidden'];layers=pool.parallel_plan.num_layers;proved=set();fills=set()
+    logical=[];real_rows=[];groups=[];h=experts[0].shape['hidden'];layers=pool.parallel_plan.num_layers;proved=set();fills=set()
     for d in range(dp):
         group=tuple(pool.physical_rank_for_logical_rank(d*tp+lane) for lane in range(tp));groups.append(group)
-        embeds=[one([n for n in graph.nodes if n.rank==r and n.kind.value=='gather' and n.variant=='embedding'],'one original embedding') for r in group]
-        count=embeds[0].shape['rows'];require(type(count) is int and count>0 and all(n.shape['rows']==count for n in embeds),'active logical replica rows');logical.append(count)
+        embeds=[one(embeddings[r],'one original embedding') for r in group]
+        count=embeds[0].shape['rows'];require(type(count) is int and count>0 and all(n.shape['rows']==count for n in embeds),'physical replica rows');logical.append(count)
+        dummy = tuple(n.attributes.get('source_dummy_run') is True for n in embeds)
+        require(not any(dummy) or all(dummy) and count == 1
+                and all(n.attributes.get('source_actual_request_count') == 0 for n in embeds),
+                'idle replica must agree on one dummy row and no requests')
+        real_rows.append(0 if all(dummy) else count)
+    require(any(real_rows), 'at least one real request')
     expected_rows=tuple(-(-count//tp) for count in logical for _ in range(tp));total=sum(expected_rows)
     for n in graph.nodes:
         if n.kind.value=='collective' and n.attributes.get('collective_group')=='expert':
             require(tuple(n.attributes['symbolic_variable_rows'])==expected_rows,'EP physical partitions follow actual SP lanes')
     for n in experts:
         layer=n.attributes['routing_provenance']['layer_index'];v=n.attributes.get('source_valid_tokens',n.shape['tokens'])
-        require(n.shape['tokens']==total and v==(sum(logical) if layer<3 else total),'valid hash versus physical score routing extent')
+        require(n.shape['tokens']==total and v==(sum(real_rows) if layer<3 else total),'valid hash versus physical score routing extent')
     # The full set is required, not merely whichever source nodes happened to appear.
     require({n.attributes['routing_provenance']['layer_index'] for n in experts}==set(range(layers)),'complete model layers')
     for d,group in enumerate(groups):
         count=logical[d];local=-(-count//tp);padded=local*tp
         for lane,r in enumerate(group):
-            embed=one([n for n in graph.nodes if n.kind.value=='collective' and n.node_id.endswith('embedding:all-reduce') and tuple(n.attributes['participants'])==group],'embedding reduction')
+            embed=one(group_suffix[group, 'embedding:all-reduce'],'embedding reduction')
             # This collective node has all TP output ports and may carry another rank.
-            first=one([n for n in graph.nodes if n.rank==r and n.node_id.endswith('layer-0:pre')],'initial mHC')
-            routes=[n for n in graph.nodes if n.rank==r and n.variant=='dsv4_moe_route' and ':layer-0:' in n.node_id]
+            first=one(rank_suffix[r, 'layer-0:pre'],'initial mHC')
+            routes=first_routes[r]
             route=one(routes,'first hash route')
             for label,consumer,input_name,shape,dtype,size,source_name in (
                 ('sp-embedding',first,iv(first)[0],(local,h),'bf16',2,ov(embed)[lane]),
@@ -239,8 +279,8 @@ def validate_sequence(graph,pool,memory_context,experts):
                         require(target.allocation_id==source.allocation_id and target.offset_bytes==source.offset_bytes+lane*local*width*size,'initial lane offset')
                     else:require(target.allocation_id.endswith(':input_ids') and target.offset_bytes==lane*local*size,'input IDs lane offset')
                 else:
-                    cp=one([n for n in graph.nodes if n.rank==r and n.node_id.endswith(label+':copy')],'initial padding copy')
-                    zero=one([n for n in graph.nodes if n.rank==r and n.node_id.endswith(label+':pad-zero')],'initial padding zero')
+                    cp=one(rank_suffix[r, label+':copy'],'initial padding copy')
+                    zero=one(rank_suffix[r, label+':pad-zero'],'initial padding zero')
                     require(cp.dtype==dtype and cp.kind.value=='gather' and cp.shape['rows']==count and cp.shape['hidden']==width and tuple(cp.attributes.get(k) for k in ('gather_factor','index_count','scattered','materialized_output'))==(1,0,False,True),'initial exact copy')
                     if source_name is not None:require(iv(cp)==(source_name,) and embed in pred[cp.node_id],'copy reduced embedding')
                     else:require(mem[cp.node_id].inputs[0].allocation_id.endswith(':input_ids'),'copy original IDs')
@@ -249,8 +289,8 @@ def validate_sequence(graph,pool,memory_context,experts):
                     require(cv.allocation_id==zv.allocation_id==target.allocation_id and cv.offset_bytes==0 and zv.offset_bytes==count*width*size and target.offset_bytes==lane*local*width*size,'initial physical backing/lane')
                     fills.add(zero.node_id)
         for layer in range(layers):
-            gather=one([n for n in graph.nodes if n.kind.value=='collective' and n.node_id.endswith(f'layer-{layer}:sp-attention-gather') and tuple(n.attributes['participants'])==group],'attention gather')
-            scatter=one([n for n in graph.nodes if n.kind.value=='collective' and n.node_id.endswith(f'layer-{layer}:sp-attention-scatter') and tuple(n.attributes['participants'])==group],'attention scatter')
+            gather=one(group_suffix[group, f'layer-{layer}:sp-attention-gather'],'attention gather')
+            scatter=one(group_suffix[group, f'layer-{layer}:sp-attention-scatter'],'attention scatter')
             ga,sa=gather.attributes,scatter.attributes
             require(ga['operation']=='all_gather' and ga['reduction'] is None and ga['bytes']==2*local*h and ga['bytes_semantics']=='per_rank_input' and ga['symbolic_collective_dim']==0 and ga['symbolic_collective_storage']=='fresh','attention gather geometry')
             require(sa['operation']=='reduce_scatterv' and sa['reduction']=='sum' and sa['collective_group']=='tensor' and tuple(sa['symbolic_variable_rows'])==(local,)*tp and tuple(sa['symbolic_variable_row_shape'])==(h,) and tuple(sa['partition_bytes'])==(2*local*h,)*tp and sa['bytes']==2*padded*h and sa['bytes_semantics']=='per_rank_input','attention scatter geometry')
@@ -264,13 +304,13 @@ def validate_sequence(graph,pool,memory_context,experts):
                 linear=one([x for x in succ[gather.node_id] if x.rank==r and x.kind.value=='linear' and x.node_id.endswith(f'layer-{layer}:attn:fused-wqa-wkv')],'full attention input')
                 lv=port(linear,iv(linear)[0],(count,h),'bf16');alias(go,lv)
                 sv=port(scatter,iv(scatter)[lane],(padded,h),'bf16');so=port(scatter,ov(scatter)[lane],(local,h),'bf16',True)
-                wo=one([x for x in graph.nodes if x.rank==r and x.node_id.endswith(f'layer-{layer}:attn:out:wo-b')],'attention full output')
+                wo=one(rank_suffix[r, f'layer-{layer}:attn:out:wo-b'],'attention full output')
                 require(wo.shape['m']==count and wo.shape['n']==h,'attention output logical extent')
                 if count==padded:
                     require(iv(scatter)[lane]==ov(wo)[0] and wo in pred[scatter.node_id],'direct full attention reduction')
                 else:
-                    cp=one([x for x in graph.nodes if x.rank==r and x.node_id.endswith(f'layer-{layer}:sp-attention-scatter:copy')],'attention padding copy')
-                    zero=one([x for x in graph.nodes if x.rank==r and x.node_id.endswith(f'layer-{layer}:sp-attention-scatter:pad-zero')],'attention padding zero')
+                    cp=one(rank_suffix[r, f'layer-{layer}:sp-attention-scatter:copy'],'attention padding copy')
+                    zero=one(rank_suffix[r, f'layer-{layer}:sp-attention-scatter:pad-zero'],'attention padding zero')
                     require(cp.kind.value=='gather' and cp.dtype=='bf16' and cp.shape['rows']==count and cp.shape['hidden']==h and iv(cp)==(ov(wo)[0],) and wo in pred[cp.node_id],'attention valid copy')
                     require(tuple(cp.attributes.get(k) for k in ('gather_factor','index_count','scattered','materialized_output'))==(1,0,False,True),'copy semantics')
                     require(zero.kind.value=='elementwise' and zero.dtype=='bf16' and dict(zero.shape)=={'elements':(padded-count)*h} and tuple(zero.attributes.get(k) for k in ('operation','reads','writes','source_constant'))==('fill',0,1,0) and cp in pred[zero.node_id] and zero in pred[scatter.node_id],'attention zero and data dependency')
@@ -279,7 +319,7 @@ def validate_sequence(graph,pool,memory_context,experts):
                     require(cv.allocation_id==zv.allocation_id==sv.allocation_id and cv.offset_bytes==sv.offset_bytes==0 and zv.offset_bytes==count*h*2,'attention padded backing')
                 ffn=one([x for x in succ[scatter.node_id] if x.rank==r and x.node_id.endswith(f'layer-{layer}:ffn-post-pre')],'mHC after attention scatter')
                 target=port(ffn,iv(ffn)[0],(local,h),'bf16');alias(so,target)
-        final=one([n for n in graph.nodes if n.kind.value=='collective' and n.node_id.endswith('sp-final-hidden-gather') and tuple(n.attributes['participants'])==group],'final hidden restore')
+        final=one(group_suffix[group, 'sp-final-hidden-gather'],'final hidden restore')
         fa=final.attributes;require(fa['operation']=='all_gather' and fa['bytes']==local*4*h*2 and fa['bytes_semantics']=='per_rank_input' and fa['symbolic_collective_dim']==0 and len(iv(final))==len(ov(final))==tp,'final hidden gather geometry')
         require(set(n.node_id for n in pred[final.node_id])==set(fa['symbolic_collective_input_producers']),'final hidden complete dependencies')
         for lane,r in enumerate(group):
@@ -292,6 +332,6 @@ def validate_sequence(graph,pool,memory_context,experts):
         if n.variant!='dsv4_moe_route':continue
         layer=int(n.node_id.split(':layer-')[1].split(':')[0]);rank=pool.logical_rank_for_physical_rank(n.rank);d,lane=divmod(rank,tp);local=expected_rows[rank]
         if layer<3:
-            valid=max(0,min(local,logical[d]-lane*local));require(n.attributes.get('symbolic_padding_valid_prefix')==valid and n.attributes.get('source_padding_expert_ids')==-1 and n.attributes.get('source_padding_weights')==0,'hash local valid mask')
+            valid=max(0,min(local,real_rows[d]-lane*local));require(n.attributes.get('symbolic_padding_valid_prefix')==valid and n.attributes.get('source_padding_expert_ids')==-1 and n.attributes.get('source_padding_weights')==0,'hash local valid mask')
         else:require('symbolic_padding_valid_prefix' not in n.attributes,'score route cannot reuse hash mask')
     return proved,fills

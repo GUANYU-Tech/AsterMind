@@ -1750,7 +1750,7 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
             }
             optional = {"mathematical_program"}
             if "mathematical_program" in normalized:
-                if normalized["mathematical_program"] != "vllm_0_30_dspark_partial_context_insert_v1":
+                if normalized["mathematical_program"] not in ("vllm_0_30_dspark_partial_context_insert_v1", "v4_idle_swa_insert_v1"):
                     raise ValueError("unknown DSpark partial context insert mathematical program")
                 required.add("valid_token_count")
         elif variant == "dsv4_compressor_state_cache":
@@ -1765,7 +1765,7 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
         required = {"reads", "writes", "operation"}
         optional = {"helper_launch", "tensor_iterator_source", "copy_dispatch", "mathematical_program"}
         if ("mathematical_program" in normalized
-                and normalized["mathematical_program"] not in ("vllm_0_30_fa3_aot_tail_clear", "vllm_0_30_dspark_typed_role_bytes_v1", "v4_modelsp_zero_fill_v1")) and (
+                and normalized["mathematical_program"] not in ("vllm_0_30_fa3_aot_tail_clear", "vllm_0_30_dspark_typed_role_bytes_v1", "v4_modelsp_zero_fill_v1", "vllm_idle_replica_payload_v1")) and (
                 normalized["mathematical_program"] != "dense_bf16_source_flops_bytes_v1"
                 or compute_dtype != "bf16" or variant != "elementwise"
                 or "operation" not in normalized
@@ -1777,6 +1777,10 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
             raise ValueError("DSpark typed payload requires explicit read/write-only roles in their original dtype")
         if normalized.get("mathematical_program")=="v4_modelsp_zero_fill_v1" and (compute_dtype not in ("bf16","int32") or variant!="elementwise" or (normalized["operation"],normalized["reads"],normalized["writes"])!=("fill",0,1)):
             raise ValueError("V4 model-SP zero fill requires BF16 or INT32 write-only payload")
+        if normalized.get('mathematical_program') == 'vllm_idle_replica_payload_v1' and (
+                compute_dtype not in ('int32', 'int64', 'bf16') or variant != 'elementwise'
+                or (normalized['operation'], normalized['reads'], normalized['writes']) not in (('read', 1, 0), ('fill', 0, 1))):
+            raise ValueError('Idle worker payload requires one typed read or fill')
         materialization_fields = {
             "input_materialization",
             "input_outer_groups",
@@ -3228,8 +3232,10 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
         elif variant == "dsv4_qnorm_rope_kv_insert":
             partial_context = ("mathematical_program" in normalized and normalized["mathematical_program"]
                 == "vllm_0_30_dspark_partial_context_insert_v1")
+            idle = normalized.get("mathematical_program") == "v4_idle_swa_insert_v1"
             if (normalized["cache_write_semantics"] != "append" and not (partial_context
-                    and normalized["cache_write_semantics"] == "masked_target_context_overwrite")):
+                    and normalized["cache_write_semantics"] == "masked_target_context_overwrite")
+                    and not (idle and normalized["cache_write_semantics"] == "all_PAD_no_store")):
                 raise ValueError("DSV4 fused cache requires append semantics or its exact partial DSpark overwrite program")
             if normalized["cache_layout"] != "paged_dsv4_swa":
                 raise ValueError("DSV4 fused cache requires paged_dsv4_swa")
@@ -3245,6 +3251,11 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
                         or type(normalized["slot_mapping_all_valid"]) is not bool
                         or normalized["slot_mapping_all_valid"] != (valid == 6)):
                     raise ValueError("DSpark partial context insert requires full six rows and explicit valid prefix1..6")
+            elif idle:
+                if (normalized["cache_write_semantics"] != "all_PAD_no_store"
+                        or type(normalized["valid_token_count"]) is not int or normalized["valid_token_count"] != 0
+                        or normalized["slot_mapping_all_valid"] is not False or shape["seq_len"] != 1):
+                    raise ValueError("Idle V4 SWA insert requires one all-PAD row")
             elif normalized["slot_mapping_all_valid"] is not True:
                 raise ValueError("DSV4 fused cache requires valid token slots")
             if (shape["head_dim"] != 512 or shape["rope_dim"] != 64
@@ -3254,7 +3265,7 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
             padded = shape["padded_query_heads"]
             if padded not in (8, 16, 32, 64, 128) or not 0 < heads <= padded:
                 raise ValueError("DSV4 fused cache has invalid Q head padding")
-            expected_elements = shape["seq_len"] * (heads + 1) * 512
+            expected_elements = shape["seq_len"] * (heads + (0 if idle else 1)) * 512
         elif variant == "dsv4_compressor_state_cache":
             # FP32 partial kv/score states written once per token
             # (deepseek_v4/compressor.py _SAVE_PARTIAL_STATES_KERNEL):
@@ -3509,11 +3520,14 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
         if stage not in ("q_kv_norm", *concat_stages, "output_gate"):
             raise ValueError("K3 NoPE requires an explicit source stage for its prefill/decode branch")
         slots, capacity = normalized["slot_mapping"], normalized["cache_capacity_tokens"]
+        idle_decode = (variant == "kimi_k3_nope_decode" and shape["rows"] == 1
+            and isinstance(slots, (tuple, list)) and len(slots) == 1
+            and type(slots[0]) is int and slots[0] == -1)
         if (type(capacity) is not int or capacity <= 0
                 or not isinstance(slots, (tuple, list)) or len(slots) != shape["rows"]
-                or any(type(slot) is not int or not 0 <= slot < capacity for slot in slots)
+                or (not idle_decode and any(type(slot) is not int or not 0 <= slot < capacity for slot in slots))
                 or len(set(slots)) != len(slots)):
-            raise ValueError("K3 NoPE prefill requires distinct valid nonnegative INT64 slot mappings")
+            raise ValueError("K3 NoPE requires distinct valid slots or a single PAD slot for idle decode")
         normalized["slot_mapping"] = tuple(slots)
         eps = normalized["rms_norm_eps"]
         if type(eps) not in (int, float) or not math.isfinite(eps) or eps <= 0:
@@ -3573,8 +3587,9 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
                 or not isinstance(indices, (tuple, list)) or len(indices) != shape["rows"]
                 or any(type(index) is not int for index in indices)):
             raise ValueError("K3 KDA decode requires one integer state index per row and a positive pool")
-        if any(not 0 < index < slots for index in indices) or len(set(indices)) != len(indices):
-            raise ValueError("K3 KDA decode supports distinct positive active state indices only; null/padding is separate")
+        stateless_tail = normalized["stage"] in ("output_copy", "output_norm") and tuple(indices) == (0,)
+        if not stateless_tail and (any(not 0 < index < slots for index in indices) or len(set(indices)) != len(indices)):
+            raise ValueError("K3 KDA decode requires positive state indices for stateful operations")
         normalized["state_indices"] = tuple(indices)
         if (shape["head_dim"] != 128 or shape["heads"] not in (3, 6, 12, 24, 48, 96)
                 or shape["rows"] <= 0 or shape["element_count"] != shape["rows"] * shape["heads"] * 128):
@@ -6225,7 +6240,7 @@ class KernelSpec:
                     raise ValueError("FA3 prepare requires its H200 INT32 source launch")
             if (kind is KernelKind.KV_CACHE and normalized_variant == "dsv4_qnorm_rope_kv_insert"
                     and "mathematical_program" in self.attributes
-                    and self.attributes["mathematical_program"] == "vllm_0_30_dspark_partial_context_insert_v1"
+                    and self.attributes["mathematical_program"] in ("vllm_0_30_dspark_partial_context_insert_v1", "v4_idle_swa_insert_v1")
                     and (self.hardware_id != "nvidia_h200" or self.execution_support != "unsupported"
                         or self.launch is not None)):
                 raise ValueError("DSpark partial context insert requires its H200 unbound mathematical contract")

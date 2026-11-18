@@ -38,13 +38,13 @@ def expert_attributes(node):
 def validate(graph,pool,nodes,memory_context):
     from .v4_modelsp_contract import applicable as sp_applicable, validate as sp_validate
     if sp_applicable(pool):return sp_validate(graph,pool,nodes,memory_context)
+    if pool.parallel_plan.config.data_parallel_size > 1:
+        from .v4_dp_contract import validate as dp_validate
+        return dp_validate(graph,pool,nodes,memory_context)
     for n in nodes:
         valid=n.attributes.get("source_valid_tokens",n.shape["tokens"])
         if type(valid) is not int or valid!=n.shape["tokens"]:
             raise ValueError("V4 non-SP caller requires all physical rows valid")
-    if pool.parallel_plan.config.data_parallel_size>1:
-        from .v4_dp_contract import validate as dp_validate
-        return dp_validate(graph,pool,nodes,memory_context)
     if not applicable(pool):raise NotImplementedError('V4 EP initial source contract requires H200 DP1 legal PP CP1 SP1')
     if memory_context is None:raise ValueError('V4 EP requires current source memory ports for alias validation')
     memory=memory_context._by_node

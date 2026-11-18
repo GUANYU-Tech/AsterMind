@@ -9971,9 +9971,8 @@ def lower_workload(
                     for spec in current_dspark_specs):
                 dspark_typed_role_key = tuple((spec.dtype, spec.shape["element_count"], spec.attributes["operation"])
                     for spec in current_dspark_specs)
-        if (node.variant=='kimi_k3_kda_decode' and (
-                'source_null_state_skip' in node.attributes
-                or 'source_component' in node.attributes and node.attributes['source_component']=='vllm_0_30_kimi_k3_native_decode')):
+        if (node.variant == 'kimi_k3_kda_decode'
+                and node.attributes.get('source_component') == 'vllm_0_30_kimi_k3_native_decode'):
             raise NotImplementedError("K3 null-state/native fused KDA source requires its Goal05 pricing contract; no launch bound")
         if node_id in fusion_heads:
             group = fusion_heads[node_id]
@@ -10068,6 +10067,12 @@ def lower_workload(
                         "symbolic_grouped_routed_experts", "symbolic_dsv3_routed_experts")):
                 routing_relabelling = _fused_moe_routing_relabelling(
                     node, hardware_id, hardware)
+        idle_specs = None
+        if node.attributes.get('source_dummy_run') is True:
+            from .idle_replica import price_idle_operator
+            inputs = _CURRENT_DSPARK_SOURCE_GRAPH.get()
+            idle_specs = price_idle_operator(node, hardware_id, inputs[2] if inputs else None)
+
         def build_specs():
             if (_k3_tp_allowed_node(node,pool) and node.attributes.get('source_component')=='vllm_0_30_kimi_k3_latent_tp_tail'):
                 return (KernelSpec(kind=KernelKind.GEMM,hardware_id=hardware_id,shape=node.shape,dtype='bf16',variant='gemm',
@@ -11263,6 +11268,10 @@ def lower_workload(
                         launch=None, execution_support="unsupported",
                         unsupported_reason="launch_selector_unavailable"),)
                 if node.kind is WorkloadKind.VECTOR and node.variant == "kimi_k3_nope_decode":
+                    if node.attributes['slot_mapping'] == (-1,) and (
+                            node.attributes.get('source_dummy_run') is not True
+                            or node.attributes.get('source_actual_request_count') != 0):
+                        raise ValueError('K3 NoPE PAD slot requires a replica with no scheduled requests')
                     return (KernelSpec(
                         kind=KernelKind.VECTOR, hardware_id=hardware_id,
                         shape=_vector_shape(node), dtype=node.dtype, variant=node.variant,
@@ -11781,7 +11790,10 @@ def lower_workload(
             raise NotImplementedError(
                 f"no lowering rule for {node.kind.value}")
 
-        if memo is None:
+        if idle_specs is not None:
+            # This recipe is derived from the current typed tensor ports.
+            specs = idle_specs
+        elif memo is None:
             specs = build_specs()
         elif dspark_typed_role_key is not None:
             # Current mixed-port effective geometry belongs to this owner's
@@ -12447,18 +12459,30 @@ def lower_workload(graph, deployment, hardware_by_id, memo=None, *, source_proje
     from .memory_bindings import TraceMemoryContext
     if source_memory_context is not None and type(source_memory_context) is not TraceMemoryContext:
         raise TypeError("source memory input requires the existing current TraceMemoryContext")
+    from . import k3_dp_contract, k3_sp_contract, k3_tp_contract
+    from . import v3_dp_contract, v4_dp_contract, v4_modelsp_contract
+
+    # Proofs contain graph and deployment references. Scope them to this
+    # lowering, including failures, memo hits, and re-entrant lowering.
+    proof_slots = (
+        k3_dp_contract._validated_variables, k3_sp_contract._validated_variables,
+        k3_tp_contract._PROOF, v3_dp_contract._PROOF,
+        v4_dp_contract._validated_variables, v4_modelsp_contract._validated_variables,
+    )
+    proof_tokens = [(slot, slot.set(None)) for slot in proof_slots]
     token = _CURRENT_GEMM_SOURCE_BINDINGS.set(set())
     dspark_token = _CURRENT_DSPARK_SOURCE_GRAPH.set((graph, {}, source_memory_context))
     try:
         result = _lower_workload_with_current_source_inputs(graph, deployment, hardware_by_id, memo,
             source_projection_scope=source_projection_scope, compact_source_layers=compact_source_layers,
             source_launch_inputs=source_launch_inputs)
-        from .v4_modelsp_contract import validate_lowered
-        validate_lowered(graph,result)
+        v4_modelsp_contract.validate_lowered(graph, result)
         return result
     finally:
         _CURRENT_DSPARK_SOURCE_GRAPH.reset(dspark_token)
         _CURRENT_GEMM_SOURCE_BINDINGS.reset(token)
+        for slot, previous in reversed(proof_tokens):
+            slot.reset(previous)
 
 
 def lower_vllm030_kda_chunk_source_calls(context, hardware_by_id, *, source_attributes_by_parent):

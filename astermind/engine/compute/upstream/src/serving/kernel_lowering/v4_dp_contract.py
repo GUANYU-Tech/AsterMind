@@ -1,4 +1,4 @@
-"""V4 all-active WideEP, PP>1: DP dispatch/combine followed by local TP tail."""
+"""V4 WideEP, PP>1: DP dispatch/combine followed by local TP tail."""
 from collections import defaultdict
 from contextvars import ContextVar
 
@@ -8,6 +8,10 @@ def handles_collective(node,pool,graph):
     proof=_validated_variables.get()
     return (applicable(pool) and proof is not None and proof[0] is graph
             and node.node_id in proof[1] and node.attributes.get('collective_group')=='data')
+
+def handles_hash_route(node):
+    proof = _validated_variables.get()
+    return proof is not None and node.node_id in proof[2] and proof[0].node(node.node_id) is node
 
 def applicable(pool):
     c=pool.parallel_plan.config
@@ -20,12 +24,11 @@ def applicable(pool):
 def validate(graph,pool,nodes,memory_context):
     _validated_variables.set(None)
     from .v4_ep_contract import expert_attributes
-    if not applicable(pool):raise NotImplementedError('V4 WideEP requires H200 all-active DP, PP>1 non-SP, uniform TP*DP experts')
+    if not applicable(pool):raise NotImplementedError('V4 WideEP requires H200 DP, PP>1 non-SP, uniform TP*DP experts')
     if memory_context is None:raise ValueError('V4 WideEP requires actual typed tensor ports')
     c=pool.parallel_plan.config;tp,dp,pp=c.tensor_parallel_size,c.data_parallel_size,c.pipeline_parallel_size
     memory=memory_context._by_node;out=defaultdict(list);succ=defaultdict(list);edges=set();byid={n.node_id:n for n in graph.nodes}
     for n in graph.nodes:
-        if n.attributes.get('source_dummy_run') is True:raise NotImplementedError('V4 WideEP idle/dummy rows require a separate retained-state contract')
         for v in n.attributes.get('symbolic_tensor_outputs',()):out[v].append(n)
     for e in graph.edges:
         edges.add((e.source,e.destination))
@@ -41,8 +44,12 @@ def validate(graph,pool,nodes,memory_context):
         x=one([x for x in vs if x.view_id==v],'missing typed view')
         check(tuple(x.shape)==shape and x.dtype==dtype,'typed shape/dtype')
     def physical(replica,stage,lane):return pool.physical_rank_for_logical_rank((replica*pp+stage)*tp+lane)
-    groups=defaultdict(list);variable_ids=set()
-    for n in nodes:expert_attributes(n);groups[n.attributes['moe_invocation_id']].append(n)
+    groups=defaultdict(list);variable_ids=set();hash_ids=set();masked_expert_ids=set()
+    for n in nodes:
+        attrs = expert_attributes(n)
+        if attrs['mathematical_program'] == 'v4_modelsp_masked_marlin_ep_v1':
+            masked_expert_ids.add(n.node_id)
+        groups[n.attributes['moe_invocation_id']].append(n)
     for members in groups.values():
         first=members[0];total=first.shape['tokens'];h=first.shape['hidden'];e=first.shape['experts'];layer=first.attributes['routing_provenance']['layer_index']
         check(type(layer) is int and 0<=layer<pool.parallel_plan.num_layers,'layer identity')
@@ -50,6 +57,16 @@ def validate(graph,pool,nodes,memory_context):
         epgroup=tuple(physical(d,stage,l) for d in range(dp) for l in range(tp))
         check(len(members)==tp*dp and {n.rank for n in members}==set(epgroup),'complete stage-local EP group')
         check(sorted(j for n in members for j in n.attributes['owned_experts'])==list(range(e)),'expert coverage')
+        dummy_replicas = set()
+        for replica in range(dp):
+            group = tuple(physical(replica, stage, lane) for lane in range(tp))
+            replica_nodes = [n for n in members if n.rank in group]
+            dummy = [n for n in replica_nodes if n.attributes.get('source_dummy_run') is True]
+            check(not dummy or len(dummy) == tp and all(n.attributes.get('source_actual_request_count') == 0 for n in dummy),
+                  'all TP ranks of an idle replica must have no actual requests')
+            if dummy:
+                dummy_replicas.add(replica)
+        check(len(dummy_replicas) < dp, 'at least one real replica')
         expert_outputs={n.rank:outs(n)[0] for n in members};adds={};reductions={};combines={};row_vectors=set();hidden_ports={}
         for n in members:
             a=n.attributes;r=n.rank;logical=pool.logical_rank_for_physical_rank(r);d=logical//(tp*pp);lane=logical%tp
@@ -76,7 +93,18 @@ def validate(graph,pool,nodes,memory_context):
             check(route.kind.value=='vector' and dict(route.shape)=={'elements':t*e,'rows':t,'experts':e,'topk':6}
                   and route.attributes['routed_scaling_factor']==a['routed_scaling_factor'],'router semantics')
             hash_route=layer<3
-            check(route.attributes['expert_id_selection']==('hash_table' if hash_route else 'score_topk') and len(ins(route))==(2 if hash_route else 1),'hash/score route')
+            masked = hash_route and d in dummy_replicas
+            check(route.attributes['expert_id_selection']==('hash_table' if hash_route else 'score_topk')
+                  and len(ins(route)) == (3 if masked else 2 if hash_route else 1),'hash/score route')
+            check(all(dispatch_rows[i] == 1 for i in dummy_replicas), 'idle replicas have one physical row')
+            expected_valid = total - len(dummy_replicas) if hash_route else total
+            check(a.get('source_valid_tokens', total) == expected_valid, 'expert routing uses the actual hash extent')
+            if masked:
+                check(route.attributes.get('symbolic_padding_valid_prefix') == 0
+                      and route.attributes.get('source_padding_expert_ids') == -1
+                      and route.attributes.get('source_padding_weights') == 0, 'idle hash rows are masked')
+                typed(route, ins(route)[2], (t,), 'bool')
+                hash_ids.add(route.node_id)
             typed(route,weight_port,(t,6),'fp32',True);typed(route,id_port,(t,6),'int32',True)
             gate=one([x for x in out[ins(route)[0]] if x.kind.value=='router' and x.rank==r],'router gate')
             check(dict(gate.shape)=={'b':1,'m':t,'n':e,'k':h} and data_ins(gate)==(hidden_port,),'same original hidden')
@@ -141,4 +169,11 @@ def validate(graph,pool,nodes,memory_context):
                     hidden=hidden_ports[r]
                     pre=one([x for x in out[hidden] if x.attributes.get('source_component')=='vllm_0_30_symbolic_mhc'],'original mHC pre')
                     check(ins(consumer)[1:]==tuple(v for v in outs(pre) if v!=hidden),'original mHC residual/mix')
-    _validated_variables.set((graph,frozenset(variable_ids)))
+    _validated_variables.set((graph, frozenset(variable_ids), frozenset(hash_ids), frozenset(masked_expert_ids)))
+
+
+def masked_source_nodes(graph):
+    proof = _validated_variables.get()
+    if proof is None or proof[0] is not graph:
+        return frozenset(), frozenset()
+    return proof[2], proof[3]

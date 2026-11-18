@@ -74,13 +74,17 @@ def _vllm030_with_byte_budget(config, backend_config, requested, model, hardware
                 if config.data_parallel_size > 1 else
                 is_glm_mtp_tensor_model_scope(model, config.tensor_parallel_size,
                     expert_parallel=config.enable_expert_parallel)))
-    from src.serving.workload.model_config import is_deepseek_v4_parallel_model_scope
+    from src.serving.workload.model_config import (
+        is_deepseek_v4_data_parallel_model_scope, is_deepseek_v4_parallel_model_scope,
+    )
     from src.serving.kv_cache.model_residency import dsv4_parallel_model_buffer_bytes
     v4 = (config.hardware_id == "nvidia_h200" and model.model_type == "deepseek_v4"
           and model.weight_dtype == "fp8" and model.compute_dtype == "bf16"
-          and config.data_parallel_size == config.sequence_parallel_size == 1
-          and is_deepseek_v4_parallel_model_scope(model, config.tensor_parallel_size,
-                config.pipeline_parallel_size, expert_parallel=config.enable_expert_parallel))
+          and config.sequence_parallel_size == 1
+          and (is_deepseek_v4_data_parallel_model_scope(model, parallelism)
+               if config.data_parallel_size > 1 else
+               is_deepseek_v4_parallel_model_scope(model, config.tensor_parallel_size,
+                   config.pipeline_parallel_size, expert_parallel=config.enable_expert_parallel)))
     if v4 and config.kv_block_size_tokens != 256:
         raise ValueError("H200 DeepSeek-V4 indexer requires a 256-token kernel KV block")
     if config.deployment != "colocated" or not (v4 or dense or model.weight_dtype == "bf16" and (glm or qwen)):

@@ -100,7 +100,9 @@ def validate(graph,pool,nodes,memory_context):
                       and add.attributes['reads']==2 and add.attributes['writes']==1 and add.dtype=='bf16' and len(outs(add))==1,'shared addition')
                 other=one([v for v in ins(add) if v!=outs(up)[0]],'shared output port')
                 sr=one([x for x in out[other] if x.kind.value=='collective' and x.attributes.get('operation')=='all_reduce'],'shared reduction')
-            sv=ins(sr)[index];shared=one([x for x in graph.nodes if x.rank==r and x.node_id==n.node_id.rsplit(':experts',1)[0]+':shared:down'],'shared down')
+            sv=ins(sr)[index]
+            shared=byid.get(n.node_id.rsplit(':experts',1)[0]+':shared:down')
+            check(shared is not None and shared.rank==r,'shared down')
             check(outs(shared)==(sv,), 'shared reduction uses original partial backing')
             if tier=='COLUMN_PARALLEL':
                 data=data_ins(up);params=tuple(up.attributes.get('symbolic_parameter_inputs',()))

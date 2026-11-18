@@ -1,4 +1,4 @@
-"""K3 all-active WideEP, PP>1: DP dispatch/combine followed by local TP tail."""
+"""K3 WideEP, PP>1: DP dispatch/combine followed by local TP tail."""
 from collections import defaultdict
 from contextvars import ContextVar
 
@@ -20,12 +20,11 @@ def applicable(pool):
 def validate(graph,pool,nodes,memory_context):
     _validated_variables.set(None)
     from .k3_ep_contract import expert_attributes
-    if not applicable(pool):raise NotImplementedError('K3 WideEP requires H200 all-active DP, PP>1 non-SP, uniform TP*DP experts')
+    if not applicable(pool):raise NotImplementedError('K3 WideEP requires H200 DP, PP>1 non-SP, uniform TP*DP experts')
     if memory_context is None:raise ValueError('K3 WideEP requires actual typed tensor ports')
     c=pool.parallel_plan.config;tp,dp,pp=c.tensor_parallel_size,c.data_parallel_size,c.pipeline_parallel_size
     memory=memory_context._by_node;out=defaultdict(list);succ=defaultdict(list);edges=set();byid={n.node_id:n for n in graph.nodes}
     for n in graph.nodes:
-        if n.attributes.get('source_dummy_run') is True:raise NotImplementedError('K3 WideEP idle/dummy rows require a separate retained-state contract')
         for v in n.attributes.get('symbolic_tensor_outputs',()):out[v].append(n)
     for e in graph.edges:
         edges.add((e.source,e.destination))

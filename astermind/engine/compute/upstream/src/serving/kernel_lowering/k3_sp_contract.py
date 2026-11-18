@@ -25,7 +25,6 @@ def validate(graph,pool,nodes,memory_context):
     c=pool.parallel_plan.config;tp,dp,pp=c.tensor_parallel_size,c.data_parallel_size,c.pipeline_parallel_size
     memory=memory_context._by_node;out=defaultdict(list);succ=defaultdict(list);edges=set();byid={n.node_id:n for n in graph.nodes}
     for n in graph.nodes:
-        if n.attributes.get('source_dummy_run') is True:raise NotImplementedError('K3 WideEP idle/dummy rows require a separate retained-state contract')
         for v in n.attributes.get('symbolic_tensor_outputs',()):out[v].append(n)
     for e in graph.edges:
         edges.add((e.source,e.destination))
