@@ -47,6 +47,7 @@ class CellCommPolicy(BaseModel):
 
 class CommPolicy(BaseModel):
     model_config=ConfigDict(extra="forbid", frozen=True)
+    ep_strategy: Literal["allgather", "direct"]="allgather"
     mode: Literal["surrogate"]="surrogate"
     execution: Literal["runtime"]="runtime"
     routing_policy: Literal["min_hops", "min_propagation", "earliest_arrival"]="min_propagation"

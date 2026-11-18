@@ -1,9 +1,10 @@
 """Event-driven external executor consuming the existing unpriced KernelPlan."""
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from astermind.engine.clock import Time
 from astermind.engine.compute.executor_base import NetworkBatchExecutor
 from astermind.engine.comm.operator import CommunicationOperator
-from astermind.engine.comm.native_intra import clear_native_contexts
+from astermind.engine.comm.native_intra import clear_native_contexts, native_enabled
+from astermind.engine.compute.ep_routing import direct_ep_matrices
 from astermind.engine.timeline import nanoseconds
 from src.kernel.kernel_spec import KernelKind
 from src.serving.kernel_lowering.kernel_plan import KernelPlan
@@ -117,6 +118,11 @@ class RuntimeBatchExecutor(NetworkBatchExecutor):
         start_ns=nanoseconds(start_time)
         inputs=_plan_schedule_inputs(plan);calls=inputs[1]
         logical=tuple(_logical_schedule(plan,*inputs))
+        policy = getattr(self.comm, "policy", None)
+        routed = (direct_ep_matrices(calls, execution, pool_name, step_id)
+                  if getattr(policy, "ep_strategy", "allgather") == "direct" else {})
+        if routed and native_enabled(policy, self.cell_id):
+            raise NotImplementedError("Direct DeepSeek V4 EP requires surrogate communication")
         host_end={};gaps=None
         if execution.host_launch_profiles:
             from src.serving.kernel_lowering.execution_timeline import _DeviceLaunchGapTracker,eager_host_ready_times
@@ -128,7 +134,13 @@ class RuntimeBatchExecutor(NetworkBatchExecutor):
             call=calls[key[0]];communication=call.kernel_spec.kind is KernelKind.COMMUNICATION
             deps=set(deps)
             if communication:
-                operator=self._operator(call,execution,step_id);operators[key]=operator
+                operator=self._operator(call,execution,step_id)
+                if key[0] in routed:
+                    matrix = routed[key[0]]
+                    operator = replace(operator, operation="all_to_all", algorithm=None,
+                                       bytes=sum(map(sum, matrix)), bytes_semantics="aggregate_input",
+                                       reduction=None, partition_bytes=(), traffic_matrix_bytes=matrix)
+                operators[key]=operator
                 resources=tuple(f"network-endpoint:{g}" for g in operator.participants)
                 prediction=None
             else:
@@ -160,6 +172,8 @@ class RuntimeBatchExecutor(NetworkBatchExecutor):
             if estimate is not None:
                 row["communication_estimate"]=asdict(estimate)
                 row["communication_operation"]=operators[key].operation
+                if key[0] in routed:
+                    row["ep_strategy"] = "direct"
             finished.add(key)
             for child in successors.get(key,()):
                 remaining[child]-=1
