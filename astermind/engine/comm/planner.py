@@ -25,9 +25,10 @@ class PlannedCommunication:
 
 
 class _Recorder(FormationEstimator):
-    def __init__(self, routes, settings, hierarchy=None, policy=None):
+    def __init__(self, routes, settings, hierarchy=None, policy=None, *, defer_cross_routes=False):
         super().__init__(routes,settings,routes.ground_owners,share_isl=False,intra_hierarchy=hierarchy,policy=policy)
         self.waves=[]
+        self.defer_cross_routes = defer_cross_routes
 
     def _wave_ns(self, transfers):
         self.waves.append(tuple(transfers))
@@ -37,11 +38,21 @@ class _Recorder(FormationEstimator):
         self.waves.append(((route,size),))
         return 0
 
-    def _route(self,a,b,size):
-        try:return self.network.route(a,b,size)
-        except NoRouteError:
-            if self._sat(a)==self._sat(b):raise
-            return dict(path=[a,b],resources=(),unavailable=True)
+    def _route(self, a, b, size):
+        if self._sat(a) == self._sat(b):
+            return self.network.route(a, b, size)
+        if not self.defer_cross_routes:
+            # Preserve cached route choices across later waves and topology
+            # changes. Runtime builds the physical path only when it needs it.
+            select = getattr(self.network, '_select_route', None)
+            try:
+                if select is None:
+                    self.network.route(a, b, size)
+                else:
+                    select(a, b)
+            except NoRouteError:
+                pass
+        return {'path': (a, b)}
 
 
 def _from_layers(task, policy, selection, routes, network):
@@ -85,7 +96,16 @@ def plan_communication(network, policy, operator, time_s, routes=None):
     task,effective,selection=resolve_task_policy(policy,task,routes)
     if 'layer_choices' in selection and effective.intra_mode == 'surrogate':
         return _from_layers(task, effective, selection, routes, network)
-    model=_Recorder(routes,effective.inter_parameters.model_dump(),effective.intra_hierarchy,effective)
+    # Only skip the initial cache lookup for plans that release every
+    # distinct cross-satellite pair immediately, in this simulation tick.
+    defer_cross_routes = task.bytes > 0 and (
+        task.operation in ('all_gatherv', 'reduce_scatterv', 'broadcast', 'send_recv')
+        or (task.operation == 'all_gather' and task.algorithm != 'hierarchical')
+        or (task.operation == 'all_to_all' and len(task.participants) == 2
+            and task.algorithm in (None, 'pairwise'))
+    )
+    model=_Recorder(routes,effective.inter_parameters.model_dump(),effective.intra_hierarchy,effective,
+                    defer_cross_routes=defer_cross_routes)
     from .model_selection import select_whole
     cross_satellite = selection['scope'] == 'inter_satellite'
     result = None
