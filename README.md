@@ -82,7 +82,7 @@ timebin_demand.csv
 workload_summary.json
 ```
 
-Dataset-specific adapters live under `workloads/<dataset>/`. Native simulations take explicit `SimulationConfig.requests`; the old manifest `workload.bundle_dir` is not a Native input.
+Dataset-specific adapters live under `workloads/<dataset>/`. Native simulations receive explicit `SimulationConfig.requests`. The offline scenario loader below converts its Workload manifest into those requests.
 
 ## Running Examples
 
@@ -97,6 +97,39 @@ SimulationConfig. Both use the same Comm execution path. Set global
 choose a different compute model. Summary mode writes
 `*.artifacts/native_result.json`; `--full` writes the complete raw report.
 See [native setup and contracts](astermind/README.md) before running.
+
+### Offline scenario inputs
+
+The [offline configuration example](examples/native/offline_config/scenario.json) uses
+`astermind.scenario.v1`. The loader converts it to the existing native
+configuration before starting the simulation.
+
+```bash
+python -m astermind --scenario examples/native/offline_config/scenario.json --validate --output results/offline-validation.json
+python -m astermind.experiments.physical_cli compute examples/native/offline_config/scenario.json --out results/offline-physical
+python -m astermind --scenario examples/native/offline_config/scenario.json --output results/offline-result.json
+```
+
+- Set the common UTC epoch and duration in the scene's `time` object. The Network
+  file still owns `step_s`. `physical_network` accepts a Network JSON or the
+  `physical_dataset.json` of a prepared dataset. To reuse the dataset from the
+  second command, point the scene at that manifest instead.
+- Use `workload` to reference a manifest and its relative JSONL path. Set
+  request times as seconds from the scene epoch and use the Network gateway ID
+  in each request. Region and SLO definitions are validated as workload metadata. The optional `gateway_regions` mapping lists the region IDs served by each gateway.
+- An optional `schedule` file contains precomputed request decisions and KV
+  migration declarations. If a decision specifies `history_upload_tokens`,
+  it gives the trailing historical tokens to upload. The leading portion is
+  declared as a reusable complete-block prefix. Cross-Cell reuse requires a migration dependency on the receiving request.
+- Built-in GPU IDs select the matching hardware file and Comm settings. A custom
+  hardware configuration can provide its own file. A KV memory policy needs the exact hardware fingerprint, model fingerprint, and Cell settings referenced by that policy. If a satellite declares no
+  local wiring and has a single external terminal, the loader adds the default
+  local fabric. A prepared network can also supply the external links
+  automatically when each linked node has exactly one external terminal.
+- The native runtime uses fixed request arrival times. Response-triggered
+  arrivals and a live external Scheduler require runtime support. Cells may be
+  assigned across physical formations, subject to the native constraint that
+  each satellite belongs to only one Cell.
 
 ## Physical Network Model
 

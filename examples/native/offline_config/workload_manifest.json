@@ -1,0 +1,20 @@
+{
+  "schema_version": "astermind.workload.v1",
+  "workload_id": "offline-config-audit",
+  "requests": "requests.jsonl",
+  "regions": {
+    "demo": {
+      "name": "Demo",
+      "lat_deg": 0,
+      "lon_deg": 62
+    }
+  },
+  "slo": {
+    "interactive": {
+      "ttft_s": 1,
+      "e2e_s": 2
+    }
+  },
+  "input_bytes_per_token": 5,
+  "output_bytes_per_token": 7
+}
