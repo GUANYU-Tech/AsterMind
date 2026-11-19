@@ -66,7 +66,7 @@ class MidlayerCellConfig:
     hardware_file: str = "configs/hardware/nvidia_a800.yaml"
     hardware_id: str = "nvidia_a800"
     max_model_len: int = 128
-    max_batched_tokens: int = 32
+    max_batched_tokens: int | None = None
     max_requests: int = 4
     num_kv_blocks: int = 64
     kv_block_size_tokens: int = 16
@@ -172,6 +172,17 @@ def create_midlayer_runtime(config: MidlayerCellConfig, *, with_scheduler: bool 
         config = replace(config, scheduler_adapter=adapter)
     if config.scheduler_adapter not in ("vllm_0_31", "vllm_0_30", "vllm_0_11"):
         raise ValueError("unknown Scheduler adapter")
+    if config.max_batched_tokens is None:
+        chunked_prefill = config.enable_chunked_prefill
+        if chunked_prefill is None:
+            chunked_prefill = config.scheduler_adapter != "vllm_0_30"
+        if chunked_prefill:
+            config = replace(config, max_batched_tokens=32)
+        else:
+            # An explicit off setting prevents the CPU MLA fallback from
+            # replacing this inferred budget in the vLLM 0.30 worker.
+            config = replace(config, enable_chunked_prefill=False,
+                             max_batched_tokens=config.max_model_len * config.max_requests)
     if isinstance(config.watermark, bool) or not math.isfinite(config.watermark) or not 0 <= config.watermark < 1:
         raise ValueError("watermark must be in [0, 1)")
     storage_enabled = config.scheduler_adapter == "vllm_0_31"

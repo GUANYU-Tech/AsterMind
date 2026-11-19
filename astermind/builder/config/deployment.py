@@ -42,7 +42,7 @@ class ServingCell(Contract):
     ingress_device: Identifier
     output_device: Identifier
     max_model_len: Positive = 128
-    max_batched_tokens: Positive = 32
+    max_batched_tokens: Positive | None = None
     max_requests: Positive = 4
     num_kv_blocks: Positive = 64
     kv_block_size_tokens: Positive = 16
@@ -115,7 +115,7 @@ class SceneDeployment(Contract):
     expert_routing_seed: Annotated[int, Field(strict=True, ge=0)] | None = None
     max_requests: Annotated[int, Field(strict=True, ge=1, le=1024)] = 4
     max_model_len: Annotated[int, Field(strict=True, ge=2, le=131072)] = 128
-    max_batched_tokens: Positive = 32
+    max_batched_tokens: Positive | None = None
     num_kv_blocks: Positive = 64
     gpu_link_bandwidth_gbps: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 1600
     gpu_link_latency_ns: Annotated[int, Field(strict=True, ge=0)] = 200

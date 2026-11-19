@@ -232,6 +232,45 @@ class SceneOptions(unittest.TestCase):
         raw["cells"][0]["long_prefill_token_threshold"] = 0
         self.assertFalse(self.load(raw).cells[0].enable_chunked_prefill)
 
+    def test_optional_batch_token_budget(self):
+        from unittest.mock import patch
+
+        from astermind.common.bootstrap import activate
+        root = activate()
+        from astermind.engine.compute.runtime import MidlayerCellConfig, create_midlayer_runtime
+
+        for enabled, supplied, expected, effective_switch in (
+            (False, None, 36864, False),
+            (None, None, 36864, False),
+            (True, None, 32, True),
+            (None, 8192, 8192, None),
+            (False, 2048, 2048, False),
+        ):
+            with self.subTest(chunked_prefill=enabled, batch_budget=supplied):
+                raw = scene("DS07-pp1")
+                raw_cell = raw["cells"][0]
+                raw_cell.update(max_model_len=1152, max_requests=32, enable_chunked_prefill=enabled)
+                if supplied is None:
+                    raw_cell.pop("max_batched_tokens")
+                else:
+                    raw_cell["max_batched_tokens"] = supplied
+                cell = self.load(raw).cells[0]
+                self.assertEqual(cell.max_batched_tokens, supplied)
+                options = MidlayerCellConfig(
+                    root, model_file=cell.model, hardware_file=cell.hardware, hardware_id=cell.hardware_id,
+                    scheduler_adapter=cell.scheduler_adapter, max_model_len=cell.max_model_len,
+                    max_requests=cell.max_requests, max_batched_tokens=cell.max_batched_tokens,
+                    enable_chunked_prefill=cell.enable_chunked_prefill,
+                    tensor_parallel_size=cell.parallel.tp, data_parallel_size=cell.parallel.dp,
+                    enable_expert_parallel=True, expert_routing_seed=cell.expert_routing_seed,
+                )
+                with patch("astermind.engine.compute.runtime.create_scheduler") as create:
+                    _, execution, _ = create_midlayer_runtime(options)
+                resolved, backend_config = create.call_args.args[:2]
+                self.assertEqual(resolved.enable_chunked_prefill, effective_switch)
+                self.assertEqual(backend_config.max_batched_tokens, expected)
+                self.assertEqual(execution.runtime_inputs.symbolic_source_max_batched_tokens, expected)
+
     def test_egress_topology_styles_and_roles(self):
         for mode in ("single_gateway", "multi_gateway", "distributed"):
             raw = scene("DS01" if mode == "single_gateway" else "DS03")
