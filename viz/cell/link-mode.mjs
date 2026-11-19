@@ -24,26 +24,12 @@ export function newInterSatelliteLink(config, source, target) {
   return {source, target, mode, bandwidth_gbps:mode === 'fixed' ? 400 : null};
 }
 
-const migrationNotes = new WeakMap();
-export function migrateOpticalConfig(config, defaults) {
-  const previous = config.fso;
-  const legacy = previous && ('beam_waist_m' in (previous.tx || {}) || 'baud_rate_options_ghz' in (previous.tx || {})
-    || 'wdm_loss_db' in (previous.channel || {}) || 'pointing_error_rad' in (previous.channel || {}));
-  if (!legacy) return '';
-  const next = structuredClone(previous);
-  next.tx ||= {}; next.rx ||= {}; next.channel ||= {};
-  const options = next.tx?.baud_rate_options_ghz;
-  const convertedRate = !Object.hasOwn(next.tx, 'baud_rate_ghz');
-  if (convertedRate) {
-    const rates = Array.isArray(options) ? options.filter(value => typeof value === 'number' && Number.isFinite(value) && value > 0) : [];
-    next.tx.baud_rate_ghz = rates.length ? Math.max(...rates) : defaults.tx.baud_rate_ghz;
+export function applyOpticalDefaults(config, defaults) {
+  if (!config.fso || typeof config.fso !== 'object' || Array.isArray(config.fso)) return;
+  for (const [section, values] of Object.entries(defaults)) {
+    const overrides=config.fso[section];
+    if (overrides === undefined || (overrides && typeof overrides === 'object' && !Array.isArray(overrides))) {
+      config.fso[section]={...structuredClone(values), ...overrides};
+    }
   }
-  next.rx.preamp_gain_db ??= defaults.rx.preamp_gain_db;
-  delete next.tx.beam_waist_m; delete next.tx.baud_rate_options_ghz;
-  delete next.channel.wdm_loss_db; delete next.channel.pointing_error_rad;
-  config.fso = next;
-  const note = `旧光学参数已转换：波特率固定为 ${next.tx.baud_rate_ghz} GBaud（${convertedRate ? '取原候选列表最大值，可调整' : '保留原固定波特率'}）。当前 ISLSim 不接收束腰、附加 WDM 损耗和指向误差参数，这些旧字段已移除；请核对光学参数。`;
-  migrationNotes.set(config, note);
-  return note;
 }
-export const opticalMigrationNote = config => migrationNotes.get(config) || '';

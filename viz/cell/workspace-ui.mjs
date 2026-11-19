@@ -84,6 +84,7 @@ export function renderWorkspaceForms(config, capabilities, changed, onEdit, onEr
     const container = document.querySelector(`#form-${stage}-${i}`);
     const opened = new Map([...container.querySelectorAll("details[data-detail-path]")].map(d => [d.dataset.detailPath, d.open]));
     renderConfigForm(container, config, paths, capabilities.schema, changed, {...choices, stage});
+    if (paths.includes('fso')) container.parentElement.hidden = !container.childElementCount;
     for (const d of container.querySelectorAll("details[data-detail-path]")) if (opened.has(d.dataset.detailPath)) d.open = opened.get(d.dataset.detailPath);
   });
   if(validation.drafts) {
