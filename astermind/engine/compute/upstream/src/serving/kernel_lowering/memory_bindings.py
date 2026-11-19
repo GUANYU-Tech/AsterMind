@@ -35,10 +35,11 @@ class SourceCallMemory:
     def __post_init__(self):
         self._validate(None)
 
-    def _validate(self, validated):
+    def _validate(self, validated, *, frozen_attributes=False):
         if not isinstance(self.attributes, Mapping):
             raise TypeError("memory source attributes require the actual source metadata mapping")
-        object.__setattr__(self, "attributes", _source_metadata(self.attributes, frozen=True))
+        if not frozen_attributes:
+            object.__setattr__(self, "attributes", _source_metadata(self.attributes, frozen=True))
         _validate_source_call_header(self, self.rank, self.inputs, self.outputs,
             self.input_producers, self.allocations, self.predecessors)
         allocations = {item.allocation_id: item for item in self.allocations}
@@ -191,10 +192,10 @@ class TraceMemoryContext:
             return replace(call, memory_bindings=None, memory_source=None,
                 memory_unbound_reason="fused_source_operand_mapping_unavailable")
         node_id, = call.source_node_ids
-        if node_id not in self._by_node:
+        source = self._by_node.get(node_id)
+        if source is None:
             return replace(call, memory_bindings=None, memory_source=None,
                 memory_unbound_reason="source_tensor_ports_unavailable")
-        source = self._by_node[node_id]
         if source.rank != call.rank or source.pool_name != call.pool_name:
             raise ValueError("kernel call and source memory rank disagree")
         spec = call.kernel_spec
@@ -313,7 +314,8 @@ def _same_memory_referents(values, previous):
     return True
 
 
-def _source_call_receipt(cache, node, rank, inputs, outputs, producers, allocations, predecessors, validated):
+def _source_call_receipt(cache, node, rank, inputs, outputs, producers, allocations, predecessors, validated,
+                         *, frozen_attributes=False):
     if cache is not None and node.node_id in cache:
         old, referents = cache[node.node_id]
         if (rank is old.rank and node.pool_name == old.pool_name and node.kind is old.kind
@@ -329,7 +331,11 @@ def _source_call_receipt(cache, node, rank, inputs, outputs, producers, allocati
         result = object.__new__(SourceCallMemory)
         for name, value in zip(_SOURCE_CALL_FIELDS, values, strict=True):
             object.__setattr__(result, name, value)
-        result._validate(validated)
+        if (frozen_attributes and
+                (SourceCallMemory._validate, SourceCallMemory._validate.__code__) == _SOURCE_CALL_VALIDATE):
+            result._validate(validated, frozen_attributes=True)
+        else:
+            result._validate(validated)
     if cache is not None:
         cache[node.node_id] = result, _memory_referents((*inputs, *outputs, *allocations))
     return result
@@ -352,8 +358,10 @@ class _DeferredMemorySources(Mapping):
 
     def __getitem__(self, name):
         if name not in self.materialized:
+            # The snapshot already detached and froze these rows' attributes.
+            # Still validate the materialized receipt's header and memory ports.
             self.materialized[name] = _source_call_receipt(
-                self.cache, *self.rows[name], self.validated)
+                self.cache, *self.rows[name], self.validated, frozen_attributes=True)
         return self.materialized[name]
 
 
@@ -887,8 +895,10 @@ def source_memory_events(call, source, operands):
     visibility = f"{call.pool_name}:rank:{call.rank}"
     # The receipt keeps original lifetimes. A single kernel cannot free its
     # caller's storage; its subprogram sees the same actual live backing.
-    allocations = tuple(item.with_lifetime(item.allocation_id, item.allocated_event, None)
-        for item in source.allocations)
+    allocations = tuple(
+        item if item.freed_event is None else item.with_lifetime(item.allocation_id, item.allocated_event, None)
+        for item in source.allocations
+    )
     events = [ProgramEvent(item.allocated_event, EventKind.ALLOCATED,
         item.allocation_id, None, None, ()) for item in allocations]
     barriers = []
