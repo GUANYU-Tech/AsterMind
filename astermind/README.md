@@ -66,6 +66,15 @@ where those package versions differ, as upstream does.
   `scheduler_adapter`, `execution_mode`, `host_launch_profile`,
   `memory_policy_file` and explicit KV limits retain source meanings/restrictions.
   `execution_mode` controls source graph execution, not Midlayer/Roofline selection.
+- Set `enable_chunked_prefill: true` and, optionally,
+  `long_prefill_token_threshold: 128` on a Cell to cap each request's prefill
+  work per scheduler step. A threshold of `0` leaves the per-request cap unset.
+  `max_batched_tokens` remains the shared prefill/decode budget per DP replica.
+  The 0.30 and 0.31 adapters accept explicit on/off settings. With no setting,
+  0.30 retains its disabled default and 0.11/0.31 retain their enabled defaults.
+  vLLM 0.31 applies the per-request cap when requests compete in the same
+  scheduler. A lone request can use the available batch budget.
+  The pinned 0.11 adapter requires chunking and does not support a per-request cap.
 - DP>1 requires supported WideEP configuration. Input distribution assumes input
   already reaches every DP leader; it charges only intra-replica broadcast.
   The pinned source may reject a WideEP batch with idle replicas because token

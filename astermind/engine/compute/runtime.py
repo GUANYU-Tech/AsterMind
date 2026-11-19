@@ -84,6 +84,8 @@ class MidlayerCellConfig:
     deployment: Literal["colocated", "pd_disagg"] = "colocated"
     execution_mode: Literal["accelerated", "fast", "reference"] = "accelerated"
     compute_mode: Literal["midlayer", "roofline"] = "midlayer"
+    enable_chunked_prefill: bool | None = None
+    long_prefill_token_threshold: int = 0
 
 
 def _runtime_inputs(config, model):

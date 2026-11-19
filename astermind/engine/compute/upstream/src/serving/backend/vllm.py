@@ -398,8 +398,17 @@ class VLLMSchedulerConfig:
     async_terminal_guard_source: str | None = None
     speculative_method: str = "mtp"
     dspark_draft_model: str | None = None
+    # Optional Cell policy for scheduler-only projections. None retains the adapter defaults.
+    chunked_prefill_override: bool | None = None
+    long_prefill_token_threshold: int = 0
 
     def __post_init__(self) -> None:
+        if self.chunked_prefill_override is not None and type(self.chunked_prefill_override) is not bool:
+            raise TypeError("chunked_prefill_override must be boolean or None")
+        if type(self.long_prefill_token_threshold) is not int or self.long_prefill_token_threshold < 0:
+            raise ValueError("long_prefill_token_threshold must be a nonnegative integer")
+        if self.long_prefill_token_threshold and self.chunked_prefill_override is not True:
+            raise ValueError("long_prefill_token_threshold requires an explicit chunked prefill enable")
         if self.speculative_method not in ("mtp", "dspark"):
             raise ValueError("Scheduler speculative method must be mtp or dspark")
         if self.speculative_method == "dspark":

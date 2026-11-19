@@ -16,6 +16,11 @@ def create_scheduler(config, backend_config, model, hardware, *, export_embeddin
     source_options = {}
     if export_embedding_token_ids and "export_embedding_token_ids" in VLLMSchedulerConfig.__dataclass_fields__:
         source_options["export_embedding_token_ids"] = True
+    if config.enable_chunked_prefill is not None or config.long_prefill_token_threshold:
+        source_options.update(
+            chunked_prefill_override=config.enable_chunked_prefill,
+            long_prefill_token_threshold=config.long_prefill_token_threshold,
+        )
     requested = VLLMSchedulerConfig(
         str(config.root / config.model_file), dtype={"bf16": "bfloat16", "fp16": "float16"}[model.compute_dtype],
         max_model_len=config.max_model_len, enable_chunked_prefill=True,
@@ -25,6 +30,9 @@ def create_scheduler(config, backend_config, model, hardware, *, export_embeddin
         **source_options,
     )
     if config.scheduler_adapter == "vllm_0_11":
+        if config.enable_chunked_prefill is False or config.long_prefill_token_threshold:
+            raise NotImplementedError(
+                "the vLLM 0.11 adapter keeps chunked prefill enabled without a per-request cap")
         return VLLMBackend.from_model(backend_config, requested)
     if config.scheduler_adapter == "vllm_0_30":
         return _vllm030_with_byte_budget(config, backend_config, requested, model, hardware)
@@ -127,7 +135,7 @@ def _vllm030_with_byte_budget(config, backend_config, requested, model, hardware
     if min(budgets) <= 0:
         raise ValueError("weights and non-KV reserve exceed the configured HBM budget")
     settings = replace(requested, scheduler_version="0.30.0", data_parallel_size=config.data_parallel_size,pipeline_layer_partition=layers,
-                       enable_chunked_prefill=False, gpu_memory_utilization=percentage / 100)
+                       enable_chunked_prefill=config.enable_chunked_prefill is True, gpu_memory_utilization=percentage / 100)
     return VLLMBackend.from_vllm030_byte_budget(
         settings, python_executable=Path(python), source_root=Path(source),
         pool_name=backend_config.pool_name, max_batched_tokens=config.max_batched_tokens,

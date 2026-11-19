@@ -1,6 +1,6 @@
 """Logical model placement and native Scheduler configuration."""
 from typing import Annotated, Literal
-from pydantic import Field, model_validator
+from pydantic import Field, StrictBool, model_validator
 from astermind.common.contracts import Contract, Identifier, Nanoseconds
 
 Positive = Annotated[int, Field(strict=True, gt=0)]
@@ -47,6 +47,8 @@ class ServingCell(Contract):
     num_kv_blocks: Positive = 64
     kv_block_size_tokens: Positive = 16
     scheduler_adapter: Literal["auto", "vllm_0_11", "vllm_0_30", "vllm_0_31"] = "auto"
+    enable_chunked_prefill: StrictBool | None = None
+    long_prefill_token_threshold: Annotated[int, Field(strict=True, ge=0)] = 0
     prefix_caching: bool = False
     native_expert_parallel: bool = False
     wide_ep_enabled: bool = False
@@ -75,6 +77,8 @@ class ServingCell(Contract):
 
     @model_validator(mode="after")
     def validate_placement(self):
+        if self.long_prefill_token_threshold and self.enable_chunked_prefill is not True:
+            raise ValueError("long_prefill_token_threshold requires enable_chunked_prefill=true")
         if self.parallel.dp > 1 and not self.wide_ep_enabled:
             raise ValueError("multiple DP replicas in one Cell require wide_ep_enabled=true")
         if self.wide_ep_enabled and (self.parallel.dp <= 1 or not self.expert_parallel_enabled

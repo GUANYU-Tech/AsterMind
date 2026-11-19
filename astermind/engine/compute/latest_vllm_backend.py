@@ -58,8 +58,10 @@ def construct_scheduler(config, requested, storage_options=None):
     scheduler_config = SchedulerConfig(
         max_model_len=requested.max_model_len, is_encoder_decoder=False,
         max_num_batched_tokens=config.max_batched_tokens, max_num_seqs=config.max_requests,
-        enable_chunked_prefill=True, async_scheduling=False, policy="fcfs",
-        long_prefill_token_threshold=0, watermark=(storage_options or {}).get("watermark", 0.0),
+        enable_chunked_prefill=getattr(requested, "chunked_prefill_override", None) is not False,
+        async_scheduling=False, policy="fcfs",
+        long_prefill_token_threshold=getattr(requested, "long_prefill_token_threshold", 0),
+        watermark=(storage_options or {}).get("watermark", 0.0),
         # Keep the new version's native default; record this difference.
         scheduler_reserve_full_isl=True,
     )

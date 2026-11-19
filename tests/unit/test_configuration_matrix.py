@@ -215,6 +215,23 @@ class SceneOptions(unittest.TestCase):
         self.assertEqual(explicit["num_kv_blocks"], 17)
         self.assertEqual(explicit["kv_block_bytes"], capacity["kv_block_bytes"] * 2)
 
+    def test_chunked_prefill_cell_options(self):
+        raw = scene("DS07-pp1")
+        cell = self.load(raw).cells[0]
+        self.assertIsNone(cell.enable_chunked_prefill)
+        self.assertEqual(cell.long_prefill_token_threshold, 0)
+
+        raw["cells"][0].update(enable_chunked_prefill=True, long_prefill_token_threshold=128)
+        cell = self.load(raw).cells[0]
+        self.assertTrue(cell.enable_chunked_prefill)
+        self.assertEqual(cell.long_prefill_token_threshold, 128)
+
+        raw["cells"][0]["enable_chunked_prefill"] = False
+        with self.assertRaisesRegex(ValueError, "requires enable_chunked_prefill=true"):
+            self.load(raw)
+        raw["cells"][0]["long_prefill_token_threshold"] = 0
+        self.assertFalse(self.load(raw).cells[0].enable_chunked_prefill)
+
     def test_egress_topology_styles_and_roles(self):
         for mode in ("single_gateway", "multi_gateway", "distributed"):
             raw = scene("DS01" if mode == "single_gateway" else "DS03")
