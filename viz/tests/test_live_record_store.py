@@ -51,7 +51,6 @@ class DisplayEvidenceTests(unittest.TestCase):
 class CompactEvidenceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        # These tests run under the real OS environment, just like the server.
         from runtime_environment import activate
         activate()
         from live_record_store import LiveRecords, compact_communication_trace

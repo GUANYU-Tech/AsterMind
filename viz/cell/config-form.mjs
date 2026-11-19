@@ -24,7 +24,7 @@ export function defaultValue(raw, definitions) {
   if (["integer", "number"].includes(spec.type)) return spec.minimum ?? ((spec.exclusiveMinimum ?? -1) + 1);
   return "";
 }
-const fixed = new Set(["data_parallel_size", "sequence_parallel_size", "context_parallel_size", "expert_communication_backend", "enable_eplb", "backend", "trust_remote_code"]);
+const fixed = new Set(["data_parallel_size", "sequence_parallel_size", "context_parallel_size", "expert_communication_backend", "enable_eplb", "backend", "framework", "trust_remote_code"]);
 const blobs = new Set(["profile", "replay", "mtp_acceptance_replay"]);
 const managed = new Set(["output_directory", "host_evidence_directory"]);
 

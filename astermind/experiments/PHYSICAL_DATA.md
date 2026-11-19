@@ -94,8 +94,4 @@ Worker build/encode CPU-stage wall times are reported as worker sums; they overl
 and must not be added to the parent's elapsed time. Core readiness and optional
 export elapsed time are separate measurements.
 
-The example export settings were the fastest median among eight configurations
-tested three times on 1,610 nodes / 61 samples in WSL on the mounted D: drive.
-Eight workers at gzip level 1 took 11.11 seconds, versus 26.34 seconds with one
-worker at the same level. This is a measured recommendation for that machine;
-the API's portable defaults remain eight workers and 32 samples per job.
+The API defaults to eight workers and 32 samples per job.

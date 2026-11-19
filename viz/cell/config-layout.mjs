@@ -16,7 +16,6 @@ export const groups = {
     ["星内网络", ["topology.intra_satellite", "hardware.intra_satellite_bandwidth_gbps", "hardware.intra_satellite_latency_ns"]],
     ["星间连接", ["topology.inter_satellite"]],
     ["光学发射端", ["fso.tx"]], ["光学接收端", ["fso.rx"]], ["光学信道", ["fso.channel"]],
-    ["FlowSim", ["flowsim"]],
   ],
   workload: [
     ["模型", ["model"]], ["请求流", ["requests"]],

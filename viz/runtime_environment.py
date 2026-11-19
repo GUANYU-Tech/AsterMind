@@ -1,4 +1,4 @@
-"""Run the current V1 backend from OS Python; never load the old Cell engine."""
+"""Prepare the V1 backend for the frontend and its workers."""
 import importlib.util
 import hashlib
 import io
@@ -6,23 +6,12 @@ import json
 import os
 from pathlib import Path
 import subprocess
-import shutil
 import sys
 import zipfile
 from contextlib import contextmanager
 from paths import VIZ, REPOSITORY, RUNTIME, initialize
 
 _backend = None
-
-
-def source_git():
-    # Native Git scans a Windows checkout without one WSL filesystem roundtrip
-    # per file. Use the installed executable only; Linux workspaces keep Git.
-    if sys.platform=='linux' and str(REPOSITORY.resolve()).startswith('/mnt/'):
-        native=shutil.which('git.exe')
-        if native:
-            return native
-    return 'git'
 
 
 @contextmanager
@@ -57,11 +46,10 @@ def extract_source(raw, root):
 
 def source_identity():
     """Fingerprint local backend edits and additions without touching Git state."""
-    git=source_git()
-    head = subprocess.check_output([git, 'rev-parse', 'HEAD'], cwd=REPOSITORY, text=True).strip()
-    changed = subprocess.check_output([git, 'diff', '--name-only', '-z', 'HEAD', '--',
+    head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=REPOSITORY, text=True).strip()
+    changed = subprocess.check_output(['git', 'diff', '--name-only', '-z', 'HEAD', '--',
         'astermind', 'workloads', 'examples'], cwd=REPOSITORY).decode().split('\0')
-    changed += subprocess.check_output([git, 'ls-files', '--others', '--exclude-standard', '-z', '--',
+    changed += subprocess.check_output(['git', 'ls-files', '--others', '--exclude-standard', '-z', '--',
         'astermind', 'workloads', 'examples'], cwd=REPOSITORY).decode().split('\0')
     overlays = {}
     for name in sorted(set(filter(None, changed))):
@@ -101,19 +89,11 @@ def activate():
     if _backend is not None:
         return _backend
     if sys.platform != 'linux':
-        raise RuntimeError('Start this frontend in WSL Linux with the OS Python environment.')
+        raise RuntimeError('The AsterMind frontend requires Linux. See viz/README.md.')
     initialize()
     sys.dont_write_bytecode = True
-    candidates = [os.environ.get('ASTERMIND_FRONTEND_DEPS'), str(RUNTIME / 'python'),
-                  '/tmp/orbitserve-native-scene-031-517',
-                  str(REPOSITORY / 'local/validation/native-scene-deps'),
-                  str(REPOSITORY / 'local/validation/astermind-demo/venv/lib/python3.12/site-packages')]
-    dependencies = [Path(p) for p in candidates if p and Path(p).is_dir()]
-    for path in reversed(dependencies):
-        if str(path) not in sys.path:
-            sys.path.insert(0, str(path))
     if importlib.util.find_spec('pydantic') is None:
-        raise RuntimeError('OS 缺少 pydantic；请将 V1 依赖安装到 viz/.runtime/python 或设置 ASTERMIND_FRONTEND_DEPS。')
+        raise RuntimeError('当前 Python 环境缺少 pydantic，请按 viz/README.md 安装项目依赖。')
     provenance, overlays = source_identity()
     head = provenance['commit']
     suffix = '-worktree-' + provenance['source_fingerprint'] if overlays else ''
@@ -122,7 +102,7 @@ def activate():
     with snapshot_lock(root):
         if not marker.is_file():
             root.mkdir(parents=True, exist_ok=True)
-            raw = subprocess.check_output([source_git(), '-c', 'core.autocrlf=false', 'archive', '--format=zip', head,
+            raw = subprocess.check_output(['git', '-c', 'core.autocrlf=false', 'archive', '--format=zip', head,
                                            'astermind', 'workloads', 'examples'], cwd=REPOSITORY)
             extract_source(raw, root)
             for name, content in overlays.items():
@@ -140,7 +120,7 @@ def activate():
     loaded = sys.modules.get('astermind')
     if loaded is not None and not Path(loaded.__file__).resolve().is_relative_to(root.resolve()):
         raise RuntimeError('A different AsterMind backend was imported before frontend initialization')
-    paths = [VIZ, root, *dependencies, REPOSITORY]
+    paths = [VIZ, root, REPOSITORY]
     for path in reversed(paths):
         if str(path) in sys.path:
             sys.path.remove(str(path))
@@ -165,13 +145,6 @@ def activate():
         prepare_native_libraries(root)
     from astermind.common.bootstrap import activate as bootstrap
     bootstrap()
-    # Spawned schedulers import thousands of CPU dependency modules. Preserve
-    # the original dynamic-link frontend's Linux-local import priority instead
-    # of probing the Windows source tree for each dependency first.
-    fast=[str(path) for path in dependencies if str(path).startswith('/tmp/')
-          and (path/'vllm').is_dir() and (path/'torch').is_dir()
-          and not (path/'astermind').exists() and not (path/'src').exists()]
-    sys.path[:]=fast+[entry for entry in sys.path if entry not in fast]
     os.environ['PYTHONPATH']=os.pathsep.join(sys.path)
     _backend = root
     (RUNTIME / 'source.json').write_text(json.dumps({**provenance, 'root': str(root),

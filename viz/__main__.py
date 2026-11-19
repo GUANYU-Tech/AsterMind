@@ -1,4 +1,4 @@
-"""Start with ``conda activate OS; python -B -m viz``."""
+"""Start the AsterMind frontend with ``python -B -m viz``."""
 from pathlib import Path
 import sys
 

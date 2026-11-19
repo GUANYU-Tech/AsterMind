@@ -38,11 +38,9 @@ def capabilities():
     for pool in config['deployment']['worker_pools']:
         for collective in pool['collectives']:
             collective['backend'] = 'runtime_comm'
-    # Keep the old editor schema while exposing the new backend explicitly.
-    for definition in value['schema']['$defs'].values():
-        prop = definition.get('properties', {}).get('backend', {})
-        if 'enum' in prop and 'runtime_comm' not in prop['enum']:
-            prop['enum'].append('runtime_comm')
+    definitions = value['schema']['$defs']
+    definitions['SchedulerConfig']['properties']['framework']['enum'] = ['vllm']
+    definitions['CollectiveConfig']['properties']['backend']['enum'] = ['runtime_comm']
     value['compatibility'] = {'unsupported': ['sglang', 'af_disagg', 'pd_af_disagg',
         'FlowSim ACK', 'SimGrid', 'MTP', 'KV offload replay', 'closed-loop admission'],
         'simulation_horizon_s': 60, 'client_boundary': 'explicit zero-payload ground endpoint; no access time model'}

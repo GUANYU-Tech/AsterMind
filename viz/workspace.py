@@ -9,7 +9,7 @@ LINKS = (
 )
 
 
-def decorate_document(content: bytes, path: str, platform: str = 'v1') -> bytes:
+def decorate_document(content: bytes, path: str) -> bytes:
     if b'data-studio-rendered' in content:
         return content
     # Styles follow page-specific styles, but block initial rendering. Legacy
@@ -55,6 +55,4 @@ def decorate_document(content: bytes, path: str, platform: str = 'v1') -> bytes:
     body = re.search(br'<body\b[^>]*>', content, re.I)
     main = re.search(br'<main\b', content, re.I)
     at = body.end() if body else main.start() if main else len(content)
-    content = content[:at] + shell + content[at:]
-    from simulation_platforms import control
-    return control(content,platform)
+    return content[:at] + shell + content[at:]

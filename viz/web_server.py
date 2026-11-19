@@ -15,9 +15,6 @@ from console import Handler as SceneHandler
 
 class Handler(SceneHandler):
     def raw(self,data,content_type):
-        if content_type.startswith('text/html') and urlparse(self.path).path.startswith('/cell/'):
-            from simulation_platforms import control
-            data=control(data,'v1')
         self.send_response(200)
         self.send_header('Content-Type',content_type)
         self.send_header('Content-Length',str(len(data)))
@@ -75,19 +72,6 @@ class Handler(SceneHandler):
 
     def do_POST(self):
         path=urlparse(self.path).path
-        if path=='/simulation-platform':
-            host=self.allowed_authority()
-            if not host or (self.headers.get('Origin') and self.headers['Origin'].lower()!=f'http://{host}'):
-                return self.respond({'error':'same origin required'},code=403)
-            try:
-                length=int(self.headers.get('Content-Length',0))
-                if not 0<length<=1024:raise ValueError('无效的平台请求')
-                value=json.loads(self.rfile.read(length))
-                if set(value)!={'platform'}:raise ValueError('无效的平台选择')
-                from simulation_platforms import select
-                return self.respond(select(value['platform'],self.server.server_port))
-            except Exception as error:
-                return self.respond({'error':str(error)},code=400)
         if not path.startswith('/cell/api/'): return super().do_POST()
         try:
             host=self.allowed_authority()

@@ -9,7 +9,7 @@
 </section><section data-config-panel="basic"><p class="muted">网络传输模式用于完整系统 Runtime：简单模式预约链路并排队；SimGrid 模式由真实引擎计算并发共享带宽。仅通信拓扑诊断不执行业务传输或带宽共享。</p><h2>系统运行</h2><div class="panel"><div class="fields">
 <label>运行范围<select id="runScope"><option value="system">完整系统：Workload → Architecture → Serving → Runtime</option><option value="network">仅通信拓扑诊断</option></select></label>
 <label>请求来源<select id="workloadMode"><option value="contention">共享演示：6 个合成请求，4 个同时到达、2 个晚加入</option><option value="fault">故障演示：1 条长消息，7.25 s 开始、10 s 断链</option><option value="synthetic">合成测试：3 个请求（非真实业务数据）</option><option value="bundle">已有标准 Workload bundle</option></select></label>
-<label>Workload 目录（项目相对路径或 WSL 绝对路径）<input id="workloadPath" value="local/inputs/workloads/my-bundle"></label>
+<label>Workload 目录（项目相对路径或 Linux 绝对路径）<input id="workloadPath" value="local/inputs/workloads/my-bundle"></label>
 <label>每个物理计算成员的 GPU 数<input id="gpuCount" type="number" min="1" value="4"></label>
 <label>每个 cell 最大并发<input id="concurrency" type="number" min="1" value="12"></label>
 <label>路由方案<select id="routing"><option value="earliest_arrival">最早到达</option><option value="min_hops">最少跳数</option><option value="min_propagation">最小传播时延</option></select></label>
@@ -17,7 +17,7 @@
 </section><div class="actions"><button id="apply">将表单写入配置</button><button id="save">仅保存输入</button><button class="primary" id="run">保存并运行</button><button class="primary" id="compare">运行 Queue / SimGrid 对照</button></div>
 <details><summary>完整输入 JSON（也可直接编辑；运行以此内容为准）</summary><textarea id="input" aria-label="完整实验 JSON 配置"></textarea></details>
 <pre id="status" role="status" aria-live="polite">正在加载…</pre>
-<p class="muted">输入：local/inputs/network/&lt;run-id&gt;/manifest.json　输出：local/results/network/&lt;run-id&gt;/　运行环境：WSL / Conda OS。后端自动分配 CPU，并预留 1 个核。Walker 场景是合成构型；实测轨道请使用 TLE。</p></main>
+<p class="muted">输入：local/inputs/network/&lt;run-id&gt;/manifest.json　输出：local/results/network/&lt;run-id&gt;/。后端自动分配 CPU，并预留 1 个核。Walker 场景是合成构型；实测轨道请使用 TLE。</p></main>
 <script>
 'use strict';const $=id=>document.getElementById(id);let config;
 function setPath(obj,path,value){const parts=path.split('.');let node=obj;for(const k of parts.slice(0,-1))node=node[k]??=( {} );node[parts.at(-1)]=value}

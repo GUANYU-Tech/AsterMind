@@ -1,95 +1,73 @@
-# Astermind 星鉴前端 · V1.0 适配
+# AsterMind 星鉴前端 V1.0
 
-场景的 `routing.policy` 支持 `min_hops`（默认）、`min_propagation`，
-以及启动仿真前由可信 Python 代码注册的自定义策略名称。前端不执行输入的代码。
-自定义策略需在执行仿真的进程中注册，接口见 `astermind/engine/COMMUNICATION.md`。
-路由更新由引擎根据物理采样与拓扑事件管理，没有更新周期配置项。
-物理路由对比只显示当前路径、跳数、累计距离，不预测消息完成时间。
-Cell 调度默认 `cell_selection: "least_loaded"`：按已分配且仍在上传／计算的请求数排序，
-同负载时选累计路径距离更近的 Cell；也可选 `nearest`，按距离优先、负载次之。
-这两种策略只读取 Cell 负载，不扫描活跃链路流量，不估计传输耗时。
-显式选择 `estimated_arrival` 才在 Cell 调度时读取当前链路竞争，并在相同 Cell 负载下
-按上传估计耗时排序。该估计冻结当前竞争状态，不预测未来流量、切换或真实完成时刻。
-其开销单列为 `cell_estimate_wall_s` 与 `cell_estimate_context_wall_s`，不计入路由开销。
+## Linux
 
-开发时仍在 WSL Linux 的 OS 环境启动。后端快照以 Git HEAD 为基础，叠加
-`astermind/`、`workloads/`、`examples/` 中已追踪文件的未提交修改；不自动提交。
-未修改的依赖数据保留 Git 原始字节。修改后必须重启服务和新建运行；已启动的
-进程不会热切换代码。`/health` 返回 `commit`、`source_fingerprint`、
-`backend_modified` 和修改文件的 SHA-256；`python viz/verify_frontend.py`
-会核对运行中快照与当前工作区一致，并检查变更不超出本轮批准文件清单。
-
-完整场景与计算 Cell 前端位于同一个 `viz` 目录、使用同一个 HTTP 服务。
-保留原界面的布局、页面与编辑流程；执行适配使用当前分支的 AsterMind V1 后端。
-前端恢复之后，本轮路由优化修改了已批准的后端和验证文件；没有提交或推送。
-
-## 在 WSL / Linux / OS 启动
+使用 x86-64 Linux。以下以 Ubuntu 24.04 为例，安装 Git、C/C++ 编译器、Python 3.12、Node.js 和 npm。
 
 ```bash
-conda activate OS
-cd /mnt/d/OrbitServe
+sudo apt update
+sudo apt install git build-essential python3.12 python3.12-venv nodejs npm
+```
+
+进入 AsterMind V1.0 的 Git 工作区根目录，继续[安装项目依赖](#安装项目依赖)。
+
+## Windows
+
+在 x64 Windows 上用 WSL 2 运行仿真服务。首次安装时，在管理员 PowerShell 中运行以下命令，按提示重启并完成 Ubuntu 用户初始化。[微软 WSL 安装文档](https://learn.microsoft.com/zh-cn/windows/wsl/install)
+
+```powershell
+wsl --install -d Ubuntu-24.04
+```
+
+从 Windows 开始菜单打开 Ubuntu 24.04。在 Ubuntu 终端执行上面的 [Linux 系统依赖安装命令](#linux)，将 AsterMind V1.0 仓库克隆到 Ubuntu 文件系统中，然后在仓库根目录继续以下步骤。服务启动后，在 Windows 浏览器访问页面。
+
+## 安装项目依赖
+
+在仓库根目录创建 Python 虚拟环境，安装仿真依赖和 vLLM 0.31 CPU 调度依赖。默认 Qwen3-4B 场景使用 vLLM 0.31。
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install \
+  'numpy==2.2.6' 'astropy==6.1.3' 'astropy-iers-data==0.2026.5.11.1.8.52' \
+  'sgp4==2.27' 'pydantic>=2.7,<3' 'jsonschema>=4.18,<5' 'PyYAML>=6,<7'
+python -m pip install --no-deps --extra-index-url https://download.pytorch.org/whl/cpu \
+  -r astermind/engine/compute/scheduler_runtime/requirements-vllm-0.31.lock
+```
+
+需要 vLLM 0.11 的场景可新建独立环境，将 `pip install --no-deps` 命令中的锁文件换成
+`requirements-vllm-0.11-cpu.lock`。vLLM 0.30 的配置方法见 [AsterMind 安装说明](../astermind/README.md#setup)。
+
+安装 Three.js，并复制完整场景和计算 Cell 页面加载的文件。三维预览需要支持 WebGL 2 的浏览器。
+
+```bash
+npm install --prefix viz --no-save --no-package-lock three@0.180.0
+three_dir=viz/node_modules/three
+mkdir -p viz/cell/vendor
+cp "$three_dir"/build/three.module.js "$three_dir"/build/three.core.js viz/assets/
+cp "$three_dir"/build/three.module.min.js "$three_dir"/build/three.core.min.js viz/cell/vendor/
+cp "$three_dir"/examples/jsm/controls/OrbitControls.js viz/assets/
+cp "$three_dir"/examples/jsm/controls/OrbitControls.js viz/cell/vendor/
+```
+
+品牌字体可选，浏览器默认使用系统字体。需要还原任务查询页字体时，将下载的 OTF 文件放到
+`viz/cell/fonts/`。文件名为 `Switzer-Regular.otf`、`Switzer-Bold.otf`、
+`MiSans-Regular.otf` 和 `MiSans-Semibold.otf`。
+[Switzer](https://www.fontshare.com/fonts/switzer) · [MiSans](https://hyperos.mi.com/font/download)
+
+## 启动服务并运行实验
+
+在仓库根目录运行。首次启动会自动编译所需的 C/C++ 扩展。
+
+```bash
+source .venv/bin/activate
+export ORBITSERVE_ISLSIM_ROOT="$PWD/astermind/builder/islsim"
 python -B -m viz
 ```
 
-打开 http://localhost:8766/ 。计算 Cell 入口为 http://localhost:8766/cell/ 。
-健康信息为 http://localhost:8766/health ，显示实际 Python、平台、源码位置和提交。
-关闭服务使用启动终端的 Ctrl+C；先让当前任务完成或通过页面停止任务。
-当前交互会话不能在服务重启后续算，已保存配置与报告仍可读取和重新运行。
-无需启动旧的 4173 服务，也不使用 Windows Python。
+在浏览器打开[星鉴首页](http://localhost:8766/)。也可以访问[健康检查](http://localhost:8766/health)，确认返回的 `status` 为 `ok`。[Windows 浏览器访问 WSL 服务](https://learn.microsoft.com/zh-cn/windows/wsl/networking)
 
-## 源码与依赖
+- **计算 Cell**。打开[计算 Cell](http://localhost:8766/cell/)，沿用默认 Qwen3-4B 配置，预览拓扑后进入任务配置并运行仿真。完成后在仿真结果页查看报告。
+- **完整场景**。从首页进入工作区，在物理场景页面生成拓扑数据，再到场景编辑页面配置计算资源和请求。保存场景并启动仿真，完成后在实验结果页查看报告。
 
-本次验证基线为 `ae6ee46a93c3d61be8ed00303b0a990d540f6553`，分支 `v1.0-lyz-1`。
-`runtime_environment.py` 从当前 Git HEAD 导出 `astermind`、`workloads`、`examples`
-到 `viz/.runtime/sources/<commit>`；有已追踪的后端修改时，使用带工作区指纹的独立快照目录。
-未修改的文件仍使用 Git 原始字节，避免换行转换破坏内置数据校验。
-已追踪的未提交修改会叠加到快照；后端修改需重启服务，前端静态文件修改后刷新页面。
-
-所有 Python 执行来自 WSL 的 Conda OS。当前 OS 缺少的依赖只读复用本机已安装目录，
-搜索顺序见 `runtime_environment.py`；可用 `ASTERMIND_FRONTEND_DEPS` 指定依赖目录，
-或将兼容依赖放入 `viz/.runtime/python`。V1 所需的两个 C/C++ 扩展使用原源码在 viz/.runtime 内自动编译，并记录源文件哈希。需要本机 cc / g++；不会把编译产物写入目录外。
-这不是独立安装包：换机器需要准备 V1 所需的依赖和编译扩展。
-ISLSim / GSLSim 使用本机已配置的依赖路径，只读加载。
-
-Three.js、字体等第三方资源仅保留本地，并由 `viz/.gitignore` 排除。
-新机器需要另行准备这些前端资源；本次不将 third-party 内容提交 Git。
-
-## 页面与运行流程
-
-- `/`：统一首页；`/workspace`：完整场景概览。
-- `/configuration`、`/physical`：物理场景编辑、TLE 导入、物理数据生成与预览。
-- `/scene`：模型、GPU/Rank、请求、故障编辑；保存、批量运行及交互运行。
-- `/live`：实际 V1 时间线、拓扑、事件、暂停/推进和故障操作。
-- `/results`、`/experiments`：报告、运行记录、下载、回放与重新运行。
-- `/cell/`：原六步 Cell 编辑器、三维预览、配置校验、任务运行、报告和产物。
-- `/cell/usage`：任务查询、详情、提交配置与生效配置。
-- `/assets/guide.html`：当前适配说明。
-
-配置、上传文件、缓存、日志、运行结果全部写入 `viz/.runtime`，不写入旧 `local`。
-Cell 结果来自 V1 原始报告，缺少的旧指标显示不可用，不以演示值替代。
-原来的静态原生报告入口保存在 `native_replay.html`，导出时仍提供独立报告。
-
-## 适配语义与明确限制
-
-完整场景默认使用 V1 官方 vLLM Scheduler、Runtime Comm，以及
-`IntraSatelliteRoofline` 卫星内通信模型。默认参数改变是为了真实接入 V1，
-不代表旧后端执行语义与 V1 完全相同。
-
-Cell 的旧 device-only 请求被映射到显式零载荷地面边界；不计算星地接入耗时。
-仿真截止时间为最后一个请求到达后至少 60 秒。请求的实际完成/失败仍由 V1 决定。
-完整星地业务请使用完整场景工作区。流数表示真实通信准入尝试数，不能与旧
-FlowSim 流数直接作等价比较。
-
-下列旧功能当前不能等价运行，接口会明确拒绝或页面说明不可用：
-SGLang、AF/PD+AF、旧 FlowSim ACK、SimGrid/ns-3 独立后端、旧双引擎对照、
-MTP、异步 Scheduler、旧 Host/KV offload、CUDA Graph、闭环 admission、
-逐卡异构硬件覆盖、自定义跨 pool routes，以及当前适配器未覆盖的 CP/SP/DP/EPLB。
-旧独立 serving/collective 演示入口不能作为 V1 运行器使用。
-这些功能需要分别确认 V1 扩展方案，不能通过恢复页面声称已经实现。
-
-V1 通信事件描述整条路径共享资源，回放显示路径与真实开始/结束时刻；
-不会伪造旧 FlowSim 的逐跳排队、到达及重传时间。旧逐跳传输索引不能等价复用。
-交互断链/恢复仍受 V1 终端占用、链路获取和时间边界约束，拒绝时显示真实原因。
-
-本地迁移清单与历史验收报告不纳入版本控制。
-验证证据与边界检查保存在 `viz/.runtime/verification/`，不随源码分发。
+在启动终端按 `Ctrl+C` 停止服务。运行产物保存在 `viz/.runtime/`。

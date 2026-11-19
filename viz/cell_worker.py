@@ -1,9 +1,8 @@
-"""OS subprocess entry point for an actual V1 Cell run."""
+"""Subprocess entry point for a V1 Cell run."""
 import json
 import sys
 import traceback
 from datetime import datetime,timezone
-from pathlib import Path
 
 
 def main():
@@ -14,13 +13,6 @@ def main():
         update(status='running',phase='preparing_environment',progress=2,started_at=datetime.now(timezone.utc).isoformat())
         from runtime_environment import activate
         activate()
-        # These are the same already-installed, integrity-checked dependencies.
-        # Prefer their Linux-local directory during spawned Scheduler imports;
-        # otherwise every third-party import first probes the Windows mount.
-        fast_dependencies = [entry for entry in sys.path if entry.startswith('/tmp/')
-            and (Path(entry)/'vllm').is_dir() and (Path(entry)/'torch').is_dir()
-            and not (Path(entry)/'astermind').exists() and not (Path(entry)/'src').exists()]
-        sys.path[:] = fast_dependencies + [entry for entry in sys.path if entry not in fast_dependencies]
         from astermind.builder.config import SimulationConfig
         from astermind.engine.simulation import Simulation
         from astermind.__main__ import json_default

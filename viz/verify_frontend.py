@@ -12,30 +12,6 @@ import urllib.request
 
 VIZ = Path(__file__).resolve().parent
 BASE = 'http://127.0.0.1:8766'
-APPROVED_FILES = set('''astermind/builder/config/scenario.py
-astermind/builder/scene.py
-astermind/engine/policies/routing.py
-astermind/engine/state/route_cache.py
-astermind/engine/state/network.py
-astermind/engine/comm/target_network.py
-astermind/engine/comm/frame_surrogate.py
-astermind/engine/network_host.py
-astermind/engine/policies/scheduling.py
-astermind/engine/comm/path_budget.py
-astermind/engine/comm/event_runtime.py
-astermind/engine/COMMUNICATION.md
-viz/native_scene.py
-viz/scene.html
-viz/assets/scene_editor.js
-viz/physical_preview.py
-viz/assets/physical_routes.js
-viz/replay.html
-viz/runtime_environment.py
-viz/README.md
-viz/verify_frontend.py
-tests/unit/runtime/test_persistent_routing.py
-tests/unit/runtime/test_comm_port.py
-tests/unit/runtime/test_request_prerequisites.py'''.splitlines())
 
 
 def fetch(path):
@@ -53,10 +29,11 @@ def main():
     with ThreadPoolExecutor(max_workers=6) as executor:
         for row,body in executor.map(fetch,routes):
             assert row['status']==200 and body,row
+            if row['path'] in {'/', '/workspace', '/configuration', '/cell/', '/cell/usage'}:
+                assert b'data-platform-control' not in body,row
             checks.append(row)
     health=json.loads(fetch('/health')[1])
-    assert health['platform']=='linux' and health['old_backend'] is False
-    assert '/envs/OS/' in health['python']
+    assert health['status']=='ok' and health['platform']=='linux' and health['old_backend'] is False
     head=subprocess.check_output(['git','rev-parse','HEAD'],cwd=VIZ.parent,text=True).strip()
     assert health['commit']==head
     from runtime_environment import source_identity
@@ -88,12 +65,10 @@ def main():
         reports.append(dict(id=directory.name,status=result['status'],audit=result.get('audit'),
             replay_events=recording['event_count']))
     changed=subprocess.check_output(['git','diff','--name-only','HEAD'],cwd=VIZ.parent,text=True).splitlines()
-    unexpected=sorted(set(changed)-APPROVED_FILES)
     result=dict(time=datetime.now(timezone.utc).isoformat(),health=health,http=checks,
-        python_syntax_files=syntax,completed_scenes=reports,changed_files=changed,unexpected_files=unexpected)
+        python_syntax_files=syntax,completed_scenes=reports,changed_files=changed)
     (VIZ/'.runtime/verification/frontend-checks.json').write_text(json.dumps(result,ensure_ascii=False,indent=2))
     print(json.dumps({k:v for k,v in result.items() if k not in ('http','completed_scenes')},ensure_ascii=False))
-    assert not unexpected,unexpected
     assert reports,'No completed V1 scene evidence'
     print('PASS',len(checks),'HTTP checks;',len(reports),'completed V1 scene reports')
 

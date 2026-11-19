@@ -81,9 +81,9 @@ def prepare_physical(identity):
         return job
 
 
-def require_os():
+def require_linux():
     if sys.platform != 'linux':
-        raise RuntimeError('请在 WSL Linux OS 环境启动')
+        raise RuntimeError('仿真服务需要 Linux，请参阅 viz/README.md。')
 
 
 def template(name):
@@ -252,7 +252,7 @@ def start(value, comparison=False):
 def start_comparison(value):
     raise ValueError('V1.0 不提供旧 queue / SimGrid 双引擎对照；请分别运行 V1 场景并查看真实结果。')
     from copy import deepcopy
-    require_os()
+    require_linux()
     with LAUNCH_LOCK:
         if any(c['state']=='running' for c in COMPARISONS.values()) or any(j['state']=='running' for j in JOBS.values()):
             raise ValueError('已有实验运行中，请等待完成')
@@ -281,7 +281,7 @@ def start_comparison(value):
 
 
 def _start(value):
-    require_os()
+    require_linux()
     with LOCK:
         if any(j["state"] == "running" for j in JOBS.values()):
             raise ValueError("已有实验运行中，请等待完成；避免多个任务争用预留 CPU")
@@ -409,10 +409,12 @@ class Handler(BaseHTTPRequestHandler):
                 if file.suffix == '.json':
                     return self.respond(gzip.compress(file.read_bytes(), compresslevel=1), kind, encoding='gzip')
                 return self.respond(file.read_bytes(), kind)
-            if path == '/collectives':
-                return self.respond(Path(__file__).with_name('collectives.html').read_bytes(), 'text/html')
-            if path == '/serving':
-                return self.respond(Path(__file__).with_name('serving.html').read_bytes(), 'text/html')
+            if path in {'/collectives', '/serving'}:
+                self.send_response(302)
+                self.send_header('Location', '/configuration')
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+                return
             if path.startswith('/serving/'):
                 import serving_runs
                 query=parse_qs(urlparse(self.path).query)
@@ -820,7 +822,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    require_os()
+    require_linux()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=8766, help="HTTP port (default: 8766)")
     parser.add_argument("--host", default="127.0.0.1", help="Listening address; use 0.0.0.0 for network access")
