@@ -1,1 +1,55 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Astermind · 技术文档</title><link rel="stylesheet" href="/assets/mission.css"><style>main{max-width:880px;margin:60px auto;padding:20px 30px}h1{margin:50px 0 15px}section{padding:25px 0;border-top:1px solid var(--border)}p,li{color:var(--muted);line-height:2}code{color:var(--accent)}.links{display:flex;gap:24px;flex-wrap:wrap}h2{margin-top:0}ol{padding-left:20px}</style></head><body><main><div class="links"><a href="/">← 星鉴首页</a><a href="/workspace">完整场景</a><a href="/cell/">计算 Cell</a></div><p class="studio-eyebrow" style="margin-top:55px">ASTERMIND / DOCUMENTATION</p><h1>技术文档</h1><p>配置语义、执行方式与结果边界。</p><section><h2>完整场景任务</h2><ol><li>在“实验配置”中设置物理场景，生成完整物理数据。</li><li>配置请求负载、计算硬件、模型部署、V1 Runtime Comm 与故障策略，保存完整场景。</li><li>进入“在线运行”发布任务。运行期间可暂停、注入故障并继续执行。</li><li>任务结束后在“实验结果”查看完成率、延迟与执行记录。</li></ol><p>物理配置草稿不能替代完成的物理数据。数据身份、版本或哈希不匹配时需重新准备。更改业务负载、运行策略和故障输入可以复用同一物理数据。</p></section><section><h2>计算 Cell 任务</h2><ol><li>设置卫星数量、每星算力卡、硬件与编队构型，或导入 TLE。</li><li>配置星内网络和星间链路；根据需要展开光学与传输参数。</li><li>选择模型与请求流，配置并行部署、显式 Rank 映射和调度器。</li><li>在“调度运行”发布任务。结果页显示实际运行产物；任务记录保留复用配置的入口。</li></ol><p>选择 Ring 时自动连接相邻卫星并闭环，选择 Chain 时依次连接全部卫星。修改静态编队的卫星数量或 ID 会重新生成相邻链路，保留已有对应链路的模式与预算。可以在“通信网络”中继续自定义连接；Rank 放置与并行策略保持显式配置。</p></section><section><h2>三维预览</h2><p>总览以数据中心图标表示计算 Cell；进入后显示该 Cell 内的卫星。进入配置与“重置视角”会将当前编队中心对准画面中央，地球保留为背景。拖动旋转、滚轮缩放；编辑硬件、卡号及链路参数保持视角。</p><p>静态编队的轨道高度按地球半径的真实换算后放大 2 倍，数值增加时离地间隙同步增加。星间距离使用单调、有界的局部放大：模型坐标下的编队半径小于地球半径的 31%，避免公里级距离跨越整个地球；具体显示尺度不用于物理测量。卫星图标另按可辨识程度缩放。TLE 使用后端 ECEF 地心坐标，不作局部归一化。</p><p>高度和间距编辑只改变对应几何，不自动转动或缩放镜头。预览链路来自配置与后端计算，链路预算、传播时延和任务运行始终使用真实物理参数。总览动画用于示意。</p></section><section><h2>执行与结果</h2><p>计算与通信由 version/AsterMind-V1.0 对应源码执行，使用官方 vLLM Scheduler 与 Runtime Comm。网页不以演示数据替代仿真结果；任务失败时显示后端错误。编队布局不会自动生成 Rank 放置，也不会把不可见或无效物理链路当成可用连接。</p><p>原生算子耗时、显存容量及能耗以模型、硬件配置和实际输出为准。Cell 的 device-only 任务使用零载荷客户端边界，不计算星地接入时间；需要接入过程时使用完整场景。V1 路径事件表示整条路径共享资源，不能当作旧 FlowSim 逐跳传输日志。</p></section><section><h2>尚不能等价运行的旧功能</h2><p>SGLang、AF / PD+AF、FlowSim ACK、SimGrid / ns-3 独立执行、MTP、旧 Host / KV offload、CUDA Graph、闭环 admission 及旧双引擎对照当前不受此 V1 适配器支持。旧选项保留供配置辨识，提交时明确拒绝。没有对应指标的报告位置显示不可用。</p><p>完整说明和运行方式见本项目 <code>viz/README.md</code>。后端身份可查看 <a href="/health">当前服务信息</a>。</p></section></main></body></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Astermind · 技术文档</title>
+  <link rel="stylesheet" href="/assets/mission.css">
+  <style>
+    main { max-width: 880px; margin: 60px auto; padding: 20px 30px; }
+    h1 { margin: 50px 0 15px; }
+    section { padding: 25px 0; border-top: 1px solid var(--border); }
+    p, li { color: var(--muted); line-height: 2; }
+    .links { display: flex; gap: 24px; flex-wrap: wrap; }
+    h2 { margin-top: 0; }
+    ol { padding-left: 20px; }
+  </style>
+</head>
+<body>
+  <main>
+    <nav class="links" aria-label="工作区">
+      <a href="/">← 星鉴首页</a>
+      <a href="/workspace">完整场景</a>
+      <a href="/cell/">计算 Cell</a>
+    </nav>
+    <h1>技术文档</h1>
+
+    <section>
+      <h2>完整场景任务</h2>
+      <ol>
+        <li>在「实验配置」中设置物理场景并生成物理数据。</li>
+        <li>设置计算资源、模型部署、请求负载和故障策略，保存场景后启动仿真。</li>
+        <li>在「在线仿真」中查看运行进度。手动运行时可以暂停、推进和注入故障。</li>
+        <li>任务完成后，在「实验结果」查看请求完成情况、延迟和执行记录。</li>
+      </ol>
+      <p>只调整业务负载、运行策略或故障配置时，可以复用已生成的物理数据。修改物理场景后，请重新生成数据。</p>
+    </section>
+
+    <section>
+      <h2>计算 Cell 任务</h2>
+      <ol>
+        <li>设置卫星数量、每星算力卡和编队构型，或导入 TLE。</li>
+        <li>配置星内网络和星间链路。选择 Ring 时相邻卫星连成环，选择 Chain 时编队两端保持开放。</li>
+        <li>选择模型和请求流，再配置并行部署、Rank 放置和调度参数。</li>
+        <li>在「调度运行」中提交任务。完成后在「仿真结果」查看报告。</li>
+      </ol>
+      <p>要把星地接入过程纳入实验，请使用完整场景工作区。</p>
+    </section>
+
+    <section>
+      <h2>三维预览</h2>
+      <p>拖动旋转，滚轮缩放。点击「重置视角」可将画面重新对准当前编队。预览会放大卫星图标和静态编队间距，实际数值请在配置中查看。</p>
+    </section>
+  </main>
+</body>
+</html>
