@@ -1,0 +1,7 @@
+{
+  "model": "deepseek-v4-pro",
+  "deployment": "wideep",
+  "topology": "ring",
+  "bandwidth_gbps": 1000,
+  "distance_km": 100
+}
