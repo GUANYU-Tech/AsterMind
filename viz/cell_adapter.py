@@ -137,8 +137,9 @@ def topology(config):
         if edge['mode'] == 'islsim':
             from astermind.engine.setup.islsim import resolve_config, calculate
             params, source = resolve_config(config['fso'])
+            cap = params['rx']['terminal_cap_gbps']
             profile = SimpleNamespace(_islsim_binding=None, islsim_source_sha256=source,
-                islsim_config=params, bandwidth_bps=config['fso']['rx']['terminal_cap_gbps']*1e9,
+                islsim_config=params, bandwidth_bps=math.inf if cap is None else cap * 1e9,
                 parameter_sources={}, assumptions=[])
             budget = calculate(profile, distance)
             bandwidth = budget['budget_bandwidth_bps']/1e9

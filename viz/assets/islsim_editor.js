@@ -10,6 +10,51 @@ export function nativeParameters(profile){
   return Object.fromEntries(['tx','rx','channel'].map(section=>[section,{...base?.[section],...overrides?.[section]}]));
 }
 
+export function bindISLSim(profile){
+  const parameters=nativeParameters(profile);
+  if(!Array.isArray(parameters?.tx.baud_rate_options_ghz))return;
+  profile.islsim_config=structuredClone(parameters);
+  if(defaults)profile.islsim_source_sha256=structuredClone(defaults.source_sha256);
+  return parameters;
+}
+
+function renderBaudRate(fields,tx){
+  const fixedLabel=document.createElement('label');
+  fixedLabel.textContent='固定波特率（GBaud，留空时自动选档）';
+  const fixed=document.createElement('input');
+  fixed.type='number';fixed.min='0';fixed.step='any';
+  fixed.value=tx.baud_rate_ghz??'';
+  fixedLabel.append(fixed);
+  const candidatesLabel=document.createElement('label');
+  candidatesLabel.textContent='候选波特率（GBaud，逗号分隔）';
+  const candidates=document.createElement('input');
+  candidates.type='text';candidates.required=true;
+  candidates.value=tx.baud_rate_options_ghz.join(', ');
+  candidatesLabel.append(candidates);
+  const updateVisibility=()=>{
+    candidatesLabel.hidden=tx.baud_rate_ghz!==null;
+    candidates.disabled=candidatesLabel.hidden;
+  };
+  fixed.oninput=()=>{
+    const value=fixed.value===''?null:fixed.valueAsNumber;
+    fixed.setCustomValidity(value!==null&&!(value>0)?'请输入正波特率，或留空自动选档':'');
+    if(!fixed.checkValidity())return;
+    tx.baud_rate_ghz=value;
+    updateVisibility();
+    document.dispatchEvent(new Event('modelchange'));
+  };
+  candidates.oninput=()=>{
+    const values=candidates.value.trim().split(/[,，\s]+/).map(Number);
+    const valid=values.every(value=>Number.isFinite(value)&&value>0);
+    candidates.setCustomValidity(valid?'':'请输入一个或多个正波特率');
+    if(!valid)return;
+    tx.baud_rate_options_ghz=values;
+    document.dispatchEvent(new Event('modelchange'));
+  };
+  updateVisibility();
+  fields.append(fixedLabel,candidatesLabel);
+}
+
 function modulationMode(pool){
   const orders=pool.map(item=>item[0]).join(',');
   return orders==='16,8,4'?'auto':['4','8','16','64'].includes(orders)?orders:'custom';
@@ -47,19 +92,13 @@ export function renderISLSim(fields,profile,changed){
     ['optical_photon_budget','光子预算'],['fixed','固定带宽']]);
   select.addEventListener('change',changed);
   if(profile.capacity_model!=='islsim')return false;
-  const parameters=nativeParameters(profile);
-  if(parameters){profile.islsim_config=structuredClone(parameters);if(!profile.islsim_source_sha256&&defaults)profile.islsim_source_sha256=structuredClone(defaults.source_sha256)}
-  const note=document.createElement('p');
-  note.textContent=parameters?'由外部 ISLSim 原始模型计算接收功率、SNR、调制、带宽和传播时延；链路不满足 BER 门限时不可用。':'ISLSim 尚未配置。请配置外部源码目录，或显式选择其他模型。';fields.append(note);
-  if(!parameters)return true;
-  for(const[path,label]of [['tx.tx_power_w','发射功率 W'],['tx.tx_aperture_m','发射孔径 m'],['tx.wavelength_m','波长 m'],['tx.baud_rate_ghz','波特率 GBaud'],['tx.wdm_channels','WDM 信道数'],['tx.fec_overhead','FEC 开销比例'],['rx.rx_aperture_m','接收孔径 m'],['rx.preamp_gain_db','前置放大增益 dB（当前模型仅校验）'],['rx.preamp_nf_db','噪声系数 dB'],['rx.ber_threshold','BER 门限'],['channel.link_margin_db','链路余量 dB'],['channel.optical_efficiency','光学效率']])field(fields,profile,'islsim_config.'+path,'ISLSim · '+label);
-  const gainNote=document.createElement('p');gainNote.textContent='当前外部 ISLSim 的高增益近似未使用 preamp_gain_db 计算 SNR；修改该值不会改变当前模型结果。';fields.append(gainNote);
-  field(fields,profile,'islsim_config.tx.dual_polarization','ISLSim · 双偏振','checkbox');
-  field(fields,profile,'islsim_config.tx.wdm_power_mode','ISLSim · WDM 功率分配','text',[
-    ['total_power_fixed','总发射功率固定'],['per_channel_power_fixed','每信道功率固定']]);
-  const capLabel=document.createElement('label');capLabel.textContent='ISLSim · 终端总速率上限 Gbps（留空为不限）';
-  const cap=document.createElement('input');cap.type='number';cap.step='any';cap.min='0';cap.setAttribute('aria-label',capLabel.textContent);cap.value=profile.islsim_config.rx.terminal_cap_gbps??'';
-  cap.oninput=()=>{profile.islsim_config.rx.terminal_cap_gbps=cap.value===''?null:Number(cap.value);document.dispatchEvent(new Event('modelchange'))};capLabel.append(cap);fields.append(capLabel);
+  if(!bindISLSim(profile)){
+    const note=document.createElement('p');
+    note.textContent='ISLSim 参数未加载，请检查服务后重试。';
+    fields.append(note);
+    return true;
+  }
+  renderBaudRate(fields,profile.islsim_config.tx);
   renderModulation(fields,profile);
   return true;
 }

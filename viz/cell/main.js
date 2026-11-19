@@ -4,7 +4,7 @@ import { buildWorkspace, renderWorkspaceForms } from "./workspace-ui.mjs?v=profi
 import { stages, stageNames, importResourceHardware, validationTarget } from "./config-layout.mjs?v=compact-2";
 import { editDependencies, bindRequestIdentity, newWebConfiguration, networkInputs } from "./config-edit.mjs?v=validation-1";
 import {mappingDraft, matchParallelismToResources} from './deployment-mapping.mjs';
-import {linkMode, setLinkMode, rememberEmptyLinkMode, newInterSatelliteLink, migrateOpticalConfig} from './link-mode.mjs';
+import {linkMode, setLinkMode, rememberEmptyLinkMode, newInterSatelliteLink, applyOpticalDefaults} from './link-mode.mjs';
 import {automaticDeployment,setAutomaticDeployment,synchronizeResources,clearDependentDrafts} from './resource-sync.mjs';
 import { renderResults, renderArtifacts, renderNetworkPreview, element } from "./results.mjs?v=compact-2";
 import { appUrl, appStorageKey } from "./app-path.mjs?v=compact-2";
@@ -123,9 +123,7 @@ function focusField(target) {
 function stored(key, fallback) { try { return JSON.parse(localStorage.getItem(appStorageKey(key))) ?? fallback; } catch { return fallback; } }
 function save(key, value) { try { localStorage.setItem(appStorageKey(key), JSON.stringify(value)); } catch { message("浏览器存储不可用，刷新前请保存任务链接和配置。", true); } }
 function prepareOpticalSettings(value) {
-  const previous = structuredClone(value.fso);
-  const note = migrateOpticalConfig(value, capabilities.default_configuration.fso);
-  if (note) save('astermind-legacy-optics', {fso:previous, note});
+  applyOpticalDefaults(value, capabilities.default_configuration.fso);
   rememberEmptyLinkMode(value, stored('astermind-link-mode', null));
   const mode = linkMode(value); if (mode) setLinkMode(value, mode);
   setAutomaticDeployment(value,stored('astermind-automatic-deployment',true));

@@ -1,5 +1,5 @@
 import {renderRadio} from '/assets/radio_editor.js';
-import {initISLSim,renderISLSim} from '/assets/islsim_editor.js';
+import {initISLSim,renderISLSim,bindISLSim} from '/assets/islsim_editor.js';
 import {initTleImporter} from '/assets/tle_importer.js';
 import {sourceFields,quotaFields,preferenceOptions,inferredScenario,applyScenario} from '/assets/network_options.js';
 import {get,post,field,group,tabs} from '/assets/studio_common.js';
@@ -54,6 +54,29 @@ document.addEventListener('modelchange',sync);
 $('scenarioType').onchange=()=>{scenarioCache.shells??=defaultShell?[structuredClone(defaultShell)]:[];scenarioCache.cells??=defaultCell?[structuredClone(defaultCell)]:[];applyScenario(config,$('scenarioType').value,scenarioCache);render()};
 $('applyJson').onclick=()=>{try{config=JSON.parse($('json').value);render()}catch(e){$('status').textContent=e.message}};
 $('addShell').onclick=()=>{const row=structuredClone(config.constellations.communication_shells[0]||defaultShell);row.shell_id='shell-'+Date.now();config.constellations.communication_shells.push(row);render()};$('addCell').onclick=()=>{const row=structuredClone(config.constellations.compute_formations[0]||defaultCell);row.name='compute-'+Date.now();config.constellations.compute_formations.push(row);render()};$('addGround').onclick=()=>{config.ground_ingresses.push({ingress_id:'ground-'+Date.now(),lat_deg:0,lon_deg:0,altitude_km:0,min_elevation_deg:10,terminal_count:1});render()};
-async function save(next){try{if(config.network.inter_cell_links&&!config.network.link_profiles?.inter_cell)throw Error(missingInterCellProfile);const invalid=document.querySelector(':invalid');if(invalid){invalid.reportValidity();throw Error('请先修正无效输入')}if(next===true&&inferredScenario(config)==='communication_only')throw Error('纯通信场景请使用物理演示与路由诊断');$('preview').disabled=$('next').disabled=$('save').disabled=true;const doc=await post('/save-physical',{name:$('name').value,physical_network:config});history.replaceState(null,'','/physical?id='+doc.id);$('status').textContent='物理模型已保存到本地：'+doc.name;if(next){$('status').textContent='正在生成完整物理数据：全时域位置、链路与双向预算…';const job=await post('/prepare-physical',{id:doc.id});location.href='/runs/'+job.id+'/progress'+(next===true?'?next=scene&model='+encodeURIComponent(doc.id):'')}}catch(e){$('status').textContent=e.message}finally{$('preview').disabled=$('save').disabled=false;$('next').disabled=inferredScenario(config)==='communication_only'}}
+async function save(next){
+  try{
+    if(config.network.inter_cell_links&&!config.network.link_profiles?.inter_cell)throw Error(missingInterCellProfile);
+    const invalid=document.querySelector(':invalid');
+    if(invalid){invalid.reportValidity();throw Error('请先修正无效输入')}
+    if(next===true&&inferredScenario(config)==='communication_only')throw Error('纯通信场景请使用物理演示与路由诊断');
+    const profiles=[config.network.link_profiles,...config.constellations.communication_shells.map(shell=>shell.hardware_link_profiles)];
+    for(const group of profiles){
+      for(const profile of Object.values(group??{})){
+        if(profile.capacity_model==='islsim'||(!profile.capacity_model&&profile.islsim_source_sha256))bindISLSim(profile);
+      }
+    }
+    $('preview').disabled=$('next').disabled=$('save').disabled=true;
+    const doc=await post('/save-physical',{name:$('name').value,physical_network:config});
+    history.replaceState(null,'','/physical?id='+doc.id);
+    $('status').textContent='物理模型已保存到本地：'+doc.name;
+    if(next){
+      $('status').textContent='正在生成完整物理数据：全时域位置、链路与双向预算…';
+      const job=await post('/prepare-physical',{id:doc.id});
+      location.href='/runs/'+job.id+'/progress'+(next===true?'?next=scene&model='+encodeURIComponent(doc.id):'');
+    }
+  }catch(e){$('status').textContent=e.message}
+  finally{$('preview').disabled=$('save').disabled=false;$('next').disabled=inferredScenario(config)==='communication_only'}
+}
 $('save').onclick=()=>save(false);$('next').onclick=()=>save(true);$('preview').onclick=()=>save('preview');$('loadPreset').onclick=async()=>{try{config=await get('/templates/'+$('preset').value);render()}catch(e){$('status').textContent=e.message}};
 (async()=>{await initISLSim();radioProfiles=await get('/radio-profiles');const initial=await get('/templates/starlink_550');defaultShell=structuredClone(initial.constellations.communication_shells[0]);defaultCell=structuredClone(initial.constellations.compute_formations[0]);const id=new URLSearchParams(location.search).get('id');if(id){const doc=await get('/documents/physical/'+id);config=doc.physical_network;$('name').value=doc.name}else config=initial;render();initTleImporter({readConfig:()=>config,readShell:()=>defaultShell,replaceConfig:value=>{config=value;scenarioCache={}},render});})().catch(e=>$('status').textContent=e.message);

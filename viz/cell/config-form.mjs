@@ -2,7 +2,7 @@ import { fieldStage, hardwareForPool, visibleField } from "./config-layout.mjs?v
 import { labels, optionLabels } from "./config-labels.mjs?v=compact-2";
 import { fieldError } from "./config-validation.mjs?v=validation-1";
 import { enhanceSelects } from "../assets/design-controls.js";
-import {linkMode, setLinkMode, opticalMigrationNote} from './link-mode.mjs';
+import {linkMode, setLinkMode} from './link-mode.mjs';
 
 export function setAt(root, path, value) {
   if (path.some(key => ["__proto__", "prototype", "constructor"].includes(String(key)))) throw new Error("非法字段名");
@@ -84,6 +84,8 @@ export function renderConfigForm(container, root, keys, schema, onChange, choice
     if (linkField && key === 'mode') return null;
     if (linkField && key === "bandwidth_gbps" && root.topology.inter_satellite.links[path[3]].mode !== "fixed") return null;
     if (!visibleField(path)) return null;
+    if (path[0] === 'fso' && linkMode(root) === 'fixed') return null;
+    if (full === 'fso.tx.baud_rate_options_ghz' && root.fso.tx?.baud_rate_ghz != null) return null;
     if (choices.stage && fieldStage(path) !== choices.stage) return null;
     if (key === "hardware_id" && path.includes("worker_pools")) return null;
     if (path[0] === "constellation" && root.topology.source === "file") return null;
@@ -134,8 +136,9 @@ export function renderConfigForm(container, root, keys, schema, onChange, choice
       return wrap;
     }
     const unsetCard = key === "local_index" && path.includes("placements") && value == null;
+    const fixedBaudRate = full === 'fso.tx.baud_rate_ghz';
     if ((value === null || value === undefined) && !unsetCard) {
-      wrap.append(el("span", title, "field-title"), el("small", "未设置 / 未启用"), button("设置", () => {
+      wrap.append(el("span", title, "field-title"), el("small", fixedBaudRate ? "根据候选波特率自动选档" : "未设置 / 未启用"), button(fixedBaudRate ? "设为固定波特率" : "设置", () => {
         setAt(root, path, choices.seed?.(path, spec) ?? defaultValue(spec, defs)); rerender();
       })); return wrap;
     }
@@ -154,7 +157,6 @@ export function renderConfigForm(container, root, keys, schema, onChange, choice
         modeField.append(modes); group.append(modeField);
         const note = el('p', linkMode(root) === null ? '已有链路使用不同模式，请选择一个模式统一应用。' : '对现有及新增链路统一生效。默认模式使用配置带宽；精细模式使用下方统一光学参数计算。', 'link-mode-note');
         note.setAttribute('role', 'status'); group.append(note);
-        if (opticalMigrationNote(root)) group.append(el('p', opticalMigrationNote(root), 'link-mode-note optical-migration-note'));
       }
       if (depth > 0 && typeof key !== "number" && key !== "formation" && !(path[0] === "scheduler" && path.length === 2)) group.append(el("legend", title));
       if (path[1] === "worker_pools" && path.length === 3 && typeof key === "number") group.append(el("div", `卡型号　${optionLabels[hardwareForPool(root, value.name)] || hardwareForPool(root, value.name)}`, "pool-hardware field-wide"));
@@ -305,7 +307,7 @@ export function renderConfigForm(container, root, keys, schema, onChange, choice
       else wrap.append(input);
       if (["timestamp", "default_hardware_id", "resource_id", "source_id", "provenance", "max_total_num_tokens_source"].includes(key)) wrap.className += " field-wide";
     }
-    if (nullable) wrap.append(button("清空", () => { setAt(root, path, null); rerender(); }));
+    if (nullable) wrap.append(button(fixedBaudRate ? "改为自动选档" : "清空", () => { setAt(root, path, null); rerender(); }));
     return wrap;
   }
   container.replaceChildren(...keys.flatMap(key => expand(String(key).split("."))).map(path => field(schemaAt(path), path)).filter(Boolean));

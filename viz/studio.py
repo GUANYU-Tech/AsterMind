@@ -47,7 +47,7 @@ def physical_data(root, identity):
         return dict(state='missing', ready=False, physical_model_id=identity)
     value = json.loads(reference.read_text(encoding='utf-8'))
     folder = Path(root) / 'local/results/network' / key(value['run_id'])
-    from maintenance import dataset_folder, dataset_problem
+    from maintenance import dataset_folder, dataset_islsim_problem, dataset_problem
     import console
     if Path(root).resolve() == console.ROOT.resolve():
         job = console.run_status(value['run_id'])
@@ -56,7 +56,7 @@ def physical_data(root, identity):
         if job['state'] == 'running':
             job['state'] = 'interrupted'
     folder = dataset_folder(folder)
-    problem = dataset_problem(folder) if job['state']=='completed' else None
+    problem = (dataset_problem(folder) or dataset_islsim_problem(folder)) if job['state']=='completed' else None
     ready = job['state'] == 'completed' and problem is None
     result = dict(value, state=job['state'], ready=ready, physical_dataset=str(folder),
                   progress_url=f"/runs/{value['run_id']}/progress")

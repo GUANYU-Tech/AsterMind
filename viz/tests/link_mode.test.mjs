@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import test from 'node:test';
-import {linkMode, setLinkMode, rememberEmptyLinkMode, newInterSatelliteLink, migrateOpticalConfig, opticalMigrationNote} from '../cell/link-mode.mjs';
+import {linkMode, setLinkMode, rememberEmptyLinkMode, newInterSatelliteLink, applyOpticalDefaults} from '../cell/link-mode.mjs';
 import {syncFormationLinks, editorChoices} from '../cell/config-edit.mjs';
+import {visibleField} from '../cell/config-layout.mjs';
 const presentation = JSON.parse(readFileSync(new URL('../cell/presentation.json', import.meta.url)));
 const fixture = () => structuredClone(presentation.default_configuration);
 
@@ -58,18 +59,24 @@ test('mixed imported modes remain explicit until the user chooses; invalid choic
   assert.deepEqual(config,before);
 });
 
-test('legacy optical inputs migrate to the native contract with a visible conversion note', () => {
+test('ISLSim keeps imported optical parameters and defaults to automatic baud selection', () => {
   const config = fixture();
   Object.assign(config.fso.tx,{beam_waist_m:.07,baud_rate_options_ghz:[20,40,50]}); delete config.fso.tx.baud_rate_ghz;
   Object.assign(config.fso.channel,{wdm_loss_db:6,pointing_error_rad:.001}); delete config.fso.rx.preamp_gain_db;
   config.fso.tx.tx_power_w = 7;
-  const note = migrateOpticalConfig(config,presentation.default_configuration.fso);
-  assert.equal(config.fso.tx.baud_rate_ghz,50);
+  applyOpticalDefaults(config,presentation.default_configuration.fso);
+  assert.equal(config.fso.tx.baud_rate_ghz,null);
+  assert.deepEqual(config.fso.tx.baud_rate_options_ghz,[20,40,50]);
+  assert.equal(config.fso.tx.beam_waist_m,.07);
+  assert.equal(config.fso.channel.pointing_error_rad,.001);
   assert.equal(config.fso.tx.tx_power_w,7);
   assert.equal(config.fso.rx.preamp_gain_db,40);
-  assert.equal(opticalMigrationNote(config),note);
   for (const [section,definition] of [['tx','FSOTxConfig'],['rx','FSORxConfig'],['channel','FSOChannelConfig']]) {
     assert.ok(Object.keys(config.fso[section]).every(key => Object.hasOwn(presentation.schema.$defs[definition].properties,key)));
   }
-  assert.equal(migrateOpticalConfig(config,presentation.default_configuration.fso),'');
+  config.fso.tx.baud_rate_ghz=40;
+  applyOpticalDefaults(config,presentation.default_configuration.fso);
+  assert.equal(config.fso.tx.baud_rate_ghz,40);
+  assert.equal(visibleField(['fso','tx','baud_rate_options_ghz']),true);
+  assert.equal(visibleField(['fso','tx','beam_waist_m']),false);
 });

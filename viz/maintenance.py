@@ -23,6 +23,24 @@ def dataset_folder(folder):
     return folder/'network' if (folder/'network/physical_dataset.json').is_file() else folder
 
 
+def dataset_islsim_problem(reference):
+    from astermind.engine.setup.islsim import ISLSimUnavailable, checkout, source_identity
+
+    folder = Path(reference)
+    if folder.is_file():
+        folder = folder.parent
+    try:
+        profiles = read(folder/'materialized_input.json')['network']['link_profiles']
+        optical = [profile for profile in profiles.values() if profile.get('capacity_model') == 'islsim']
+        if optical:
+            current = source_identity(checkout())
+            if any(profile.get('islsim_source_sha256') != current for profile in optical):
+                return '物理数据使用旧版 ISLSim，请打开物理模型并重新生成数据'
+    except (OSError, ValueError, KeyError, TypeError, ISLSimUnavailable) as error:
+        return '无法确认物理数据的 ISLSim 版本：'+str(error)
+    return None
+
+
 def dataset_problem(folder, thorough=False):
     from astermind.builder.physical.physical_dataset import SCHEMA, LEGACY_SCHEMA, PHYSICS_VERSION
     from astermind.builder.physical.network import TERMINAL_ALLOCATION_MODEL

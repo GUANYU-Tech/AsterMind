@@ -4,6 +4,10 @@ export const stageNames = ["星座资源", "通信网络", "模型负载", "并�
 // Presentation policy only: these values remain in imported/exported configs.
 export const hiddenFields = ["hardware.accelerator_overrides", "constellation.earth_orientation_mode", "constellation.tle_file", "topology.file", "runtime_inputs.expert_routing"];
 export function visibleField(path) {
+  if (path[0] === "fso" && path.length > 1) {
+    return path[1] === "tx" && (path.length === 2 ||
+      ["baud_rate_ghz", "baud_rate_options_ghz", "modulation_pool"].includes(path[2]));
+  }
   const name = path.join(".");
   return !hiddenFields.some(key => name === key || name.startsWith(key + "."));
 }
@@ -15,7 +19,7 @@ export const groups = {
   network: [
     ["星内网络", ["topology.intra_satellite", "hardware.intra_satellite_bandwidth_gbps", "hardware.intra_satellite_latency_ns"]],
     ["星间连接", ["topology.inter_satellite"]],
-    ["光学发射端", ["fso.tx"]], ["光学接收端", ["fso.rx"]], ["光学信道", ["fso.channel"]],
+    ["ISLSim 光学链路", ["fso"]],
   ],
   workload: [
     ["模型", ["model"]], ["请求流", ["requests"]],

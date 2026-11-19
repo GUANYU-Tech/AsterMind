@@ -17,8 +17,15 @@ def validate_document(root, document):
         raise ValueError('这是旧执行配置；V1 使用 compute_mode 与 communication，请重新生成配置：' + ', '.join(sorted(retired)))
     if value.get('physical_model_id'):
         data = physical_data(root, value['physical_model_id'])
+        if data.get('reason'):
+            raise ValueError(data['reason'])
         if not data['ready'] or Path(data['physical_dataset']).resolve() != Path(experiment.get('physical_dataset', '')).resolve():
             raise ValueError('场景引用的物理数据与所选已完成模型不一致')
+    elif experiment.get('physical_dataset'):
+        from maintenance import dataset_islsim_problem
+        problem = dataset_islsim_problem(experiment['physical_dataset'])
+        if problem:
+            raise ValueError(problem)
     config = SimulationConfig.model_validate(experiment)
     from astermind.engine.policies.routing import get_routing_policy
     get_routing_policy(config.routing.policy)

@@ -98,7 +98,8 @@ function reflectConfig(){
  topologySection.hidden=false;topologyEditor.update(experiment,null,initialTopologyOwner);initialTopologyOwner=null;
 }
 async function loadDataset(id){
- ready=false;state();const data=await get('/physical-data/'+encodeURIComponent(id));if(!data.ready)throw Error('物理数据尚未就绪，请先完成物理模型生成');
+ ready=false;state();$('physicalLink').href='/physical?id='+encodeURIComponent(id);
+ const data=await get('/physical-data/'+encodeURIComponent(id));if(!data.ready)throw Error(data.reason||'物理数据尚未就绪，请先完成物理模型生成');
  const [doc,catalog]=await Promise.all([get('/documents/physical/'+id),get('/native-scene-catalog?physical_model_id='+encodeURIComponent(id))]);physicalTime=doc.physical_network.time;minCellMembers=Math.min(...Object.values(catalog.cell_members));refreshChoices();modelId=id;$('dataset').value=id;$('physicalLink').href='/physical?id='+id;
  $('datasetStatus').textContent=`物理拓扑已就绪 / ${physicalTime.duration_s} s`;ready=true;renderRuntime();state();
 }
