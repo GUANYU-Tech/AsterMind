@@ -1793,7 +1793,10 @@ def _trace_glm_dsa_source(model, step, pool, expert_routing, *, input_ids, posit
     """One GLM source program, optionally including its plain target chain."""
     from .runtime_inputs import ExpertRoutingInput
     from .runtime_inputs import vllm_0_30_source_model_inputs
-    from src.serving.deployment.validated_scope import is_glm_bf16_tensor_source_scope, is_glm_fp8_rank_local_source_scope
+    from src.serving.deployment.validated_scope import (
+        is_glm_bf16_tensor_source_scope, is_glm_fp8_rank_local_source_scope,
+        is_glm53_rank_local_ep_source_scope, is_glm53_legacy_tp8_ep8_source_scope,
+    )
     if source_program_cache is not None and type(source_program_cache) is not SourceProgramCache:
         raise TypeError("GLM source reuse requires its run-local SourceProgramCache")
     weight_dtype = _glm_source_weight_dtype(source_profile)
@@ -1803,7 +1806,9 @@ def _trace_glm_dsa_source(model, step, pool, expert_routing, *, input_ids, posit
         raise NotImplementedError("symbolic GLM target supports only its declared BF16 plain greedy chain")
     config = pool.parallel_plan.config
     ordinary_parallel = (weight_dtype == "bf16" and is_glm_bf16_tensor_source_scope(pool, model)
-        or weight_dtype == "fp8" and is_glm_fp8_rank_local_source_scope(pool, model))
+        or weight_dtype == "fp8" and (is_glm_fp8_rank_local_source_scope(pool, model)
+            or is_glm53_rank_local_ep_source_scope(pool, model)
+            and not is_glm53_legacy_tp8_ep8_source_scope(pool, model)))
     if (model.model_type != "glm_moe_dsa" or model.compute_dtype != "bf16" or model.weight_dtype != weight_dtype
             or (not ordinary_parallel and (pool.hardware_id != "nvidia_h200" or config.tensor_parallel_size not in (1, 8)))
             or len(pool.ranks) != config.tensor_parallel_size
@@ -1887,16 +1892,21 @@ def _trace_glm_dsa_source(model, step, pool, expert_routing, *, input_ids, posit
                 sample_logits=target_sampling_source == "vllm_0_30_plain_greedy_bf16",
                 cast_logits=target_sampling_source == "vllm_0_30_plain_sampler_bf16")
 
+    glm53_extended_ep = (is_glm53_rank_local_ep_source_scope(pool, model)
+        and not is_glm53_legacy_tp8_ep8_source_scope(pool, model))
+    ep_projection = ({"source_glm53_rank_local_ep": True, "model_config_sha256": model.config_sha256}
+                     if glm53_extended_ep else {})
     for trace, capacity in zip(traces, workspace_initial_capacity_bytes, strict=True):
         rank_forward(trace, capacity, prefix=program is not None)
-        from src.serving.deployment.validated_scope import is_glm53_legacy_tp8_ep8_source_scope
-        if is_glm53_legacy_tp8_ep8_source_scope(pool, model):
+        if is_glm53_rank_local_ep_source_scope(pool, model):
             from .traced_glm_pcp import glm_fp8_deferred_expert_source_metadata
+            source_flag = ("source_glm53_dp1_ep8_deferred"
+                if is_glm53_legacy_tp8_ep8_source_scope(pool, model) else "source_glm53_dp1_deferred")
             for identifier, node in tuple(trace._nodes.items()):
                 if node.kind is WorkloadKind.FUSED_MOE:
                     trace._nodes[identifier] = node.with_attributes({**node.attributes,
                         **glm_fp8_deferred_expert_source_metadata(),
-                        "source_glm53_dp1_ep8_deferred": True,
+                        source_flag: True,
                         "model_config_sha256": model.config_sha256,
                         "model_execution_version": "vllm_0_30_0",
                         "model_source_profile": source_profile})
@@ -1904,12 +1914,12 @@ def _trace_glm_dsa_source(model, step, pool, expert_routing, *, input_ids, posit
             for identifier, node in tuple(trace._nodes.items()):
                 trace._nodes[identifier] = node.with_attributes({**node.attributes,
                     "model_execution_version": "vllm_0_30_0", "model_source_profile": source_profile,
-                    "source_projection_only": True, "glm_parallel_source": True})
+                    "source_projection_only": True, "glm_parallel_source": True, **ep_projection})
     if ordinary_parallel and group is not None:
         for identifier, node in tuple(group._contracts.items()):
             group._contracts[identifier] = node.with_attributes({**node.attributes,
                 "model_execution_version": "vllm_0_30_0", "model_source_profile": source_profile,
-                "source_projection_only": True, "glm_parallel_source": True})
+                "source_projection_only": True, "glm_parallel_source": True, **ep_projection})
     if program is not None:
         return program.bind(group, resolutions=resolutions, invocation_ids=invocation_ids, rows=rows)
     source = traces[0] if group is None else group
@@ -10628,17 +10638,16 @@ def _bind_ordinary_forward_source(model, deployment, runtime_inputs):
                     else "vllm_0_30_v32_fp8_sync_explicit_allreduce")
                 from src.serving.deployment.validated_scope import (
                     is_glm_fp8_data_parallel_source_scope, is_glm_fp8_rank_local_source_scope,
-                    is_glm53_legacy_tp8_ep8_source_scope)
+                    is_glm53_rank_local_ep_source_scope)
                 from src.serving.workload.model_config import GLM_MOE_DSA_5_3_CONFIG_SHA256
                 glm53_rank_local_cold = (model.config_sha256 == GLM_MOE_DSA_5_3_CONFIG_SHA256
                     and all(is_glm_fp8_rank_local_source_scope(pool, model)
                         for pool in deployment.worker_pools.values()))
-                # Existing ordinary TP8/EP8 source also owns a cold per-rank
-                # workspace; keep this legacy geometry separate from EP-off.
-                glm53_legacy_ep8_cold = all(is_glm53_legacy_tp8_ep8_source_scope(pool, model)
+                # FP8 EP also owns a cold workspace per physical rank.
+                glm53_ep_cold = all(is_glm53_rank_local_ep_source_scope(pool, model)
                     for pool in deployment.worker_pools.values())
                 cold_glm_scope = (model.weight_dtype == "bf16" and glm_bf16_source
-                    or model.weight_dtype == "fp8" and (glm53_rank_local_cold or glm53_legacy_ep8_cold
+                    or model.weight_dtype == "fp8" and (glm53_rank_local_cold or glm53_ep_cold
                         or all(is_glm_fp8_data_parallel_source_scope(pool, model)
                             for pool in deployment.worker_pools.values())))
                 if (cold_glm_scope and deployment.mode == "colocated"

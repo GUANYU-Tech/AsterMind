@@ -6,12 +6,13 @@ ports belong to a different, deliberately unsupported contract.
 from math import isfinite
 LEGACY_PROGRAM='v3_fp8_ep8_fused_quant_v1'
 PROGRAM='v3_fp8_replicated_ep_fused_quant_v1'
+DISPATCHED_EP_SIZES = (2, 4, 8, 16, 32, 64)
 
 def logical_work(shape, attrs):
     t,h,i,e,k=(shape[n] for n in ('tokens','hidden','intermediate','experts','topk'))
     if any(type(x) is not int for x in (t,h,i,e,k)) or t<=0 or (h,i,e,k)!=(7168,2048,256,8):
         raise ValueError('V3 EP8 requires positive rows and H7168 I2048 E256 top8')
-    allowed_ep=(2,4,8,16,32) if attrs.get('mathematical_program')=='v3_fp8_dispatched_ep_fused_quant_v1' else (2,4,8,16)
+    allowed_ep=DISPATCHED_EP_SIZES if attrs.get('mathematical_program')=='v3_fp8_dispatched_ep_fused_quant_v1' else (2,4,8,16)
     if (attrs['expert_parallel_size'] not in allowed_ep or type(attrs['expert_parallel_size']) is not int
         or attrs['routed_weight_dtype']!='fp8' or attrs['weight_group_size']!=0
         or attrs['routed_scaling_factor']!=1.0 or attrs.get('swiglu_limit') is not None

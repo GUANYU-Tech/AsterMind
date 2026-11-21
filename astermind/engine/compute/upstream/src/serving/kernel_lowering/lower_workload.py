@@ -4971,7 +4971,8 @@ def _validate_collective_node(
         dimension = attributes["collective_group"]
         if dimension not in ("expert", "data", "data_context", "context", "tensor") or (dimension != "expert"
                 and pool.parallel_plan.config.enable_expert_parallel and not (
-                    (v3_dp_group and dimension in ("data", "expert")) or v4_dp_collective(node, pool, graph) or v4_sp_collective(node,pool,graph) or
+                    (v3_dp_group and (dimension in ("data", "expert")
+                        or dimension == "tensor" and operation == "reduce_scatterv")) or v4_dp_collective(node, pool, graph) or v4_sp_collective(node,pool,graph) or
                     k3_dp_collective(node, pool, graph) or k3_sp_collective(node, pool, graph)
                     or _symbolic_kimi_dp_projection(node, pool) and (
                         dimension == "data" and pool.parallel_plan.config.tensor_parallel_size == 1
@@ -4985,7 +4986,8 @@ def _validate_collective_node(
                         and pool.parallel_plan.config.tensor_parallel_size > 1
                         and pool.parallel_plan.config.sequence_parallel_size in (1, pool.parallel_plan.config.tensor_parallel_size)))):
             raise ValueError("variable MoE collective requires the declared expert or EP-off data group")
-        if dimension in ("context", "tensor") and not (k3_sp_collective(node,pool,graph) or v4_sp_collective(node,pool,graph) or _symbolic_glm_pcp_projection(node, pool)
+        if dimension in ("context", "tensor") and not (
+                v3_dp_group and dimension == "tensor" and operation == "reduce_scatterv" or k3_sp_collective(node,pool,graph) or v4_sp_collective(node,pool,graph) or _symbolic_glm_pcp_projection(node, pool)
                 or dimension == "tensor" and operation == "reduce_scatterv" and _symbolic_kimi_dp_projection(node, pool)
                 and pool.parallel_plan.config.pipeline_parallel_size == 1):
             raise ValueError("variable TP/PCP collective requires its explicit GLM PCP source scope")
@@ -5292,6 +5294,8 @@ def _validate_pipeline_p2p_node(node: WorkloadNode, pool) -> None:
                 required.add("source_glm_fp8_target_only")
             if _symbolic_glm_fp8_rank_local_mtp_ep_projection(node, pool):
                 required.add("source_glm_rank_local_fp8_mtp_ep")
+            if _symbolic_glm53_rank_local_ep_projection(node, pool):
+                required |= {"source_glm53_rank_local_ep", "model_config_sha256"}
             required |= {key for key in ("source_data_parallel_rank", "source_glm_model_sequence_parallel",
                 "source_glm_moe_sequence_parallel") if key in attributes}
         for key in symbolic_fields:
@@ -6352,17 +6356,39 @@ def _symbolic_glm_fp8_rank_local_mtp_ep_projection(node, pool):
         and node.attributes["model_source_profile"] == "vllm_0_30_v32_fp8_sync_explicit_allreduce")
 
 
+def _symbolic_glm53_rank_local_ep_projection(node, pool):
+    from src.serving.workload.model_config import GLM_MOE_DSA_5_3_CONFIG_SHA256
+    config, attrs = pool.parallel_plan.config, node.attributes
+    tp, pp = config.tensor_parallel_size, config.pipeline_parallel_size
+    return (pool.hardware_id == "nvidia_h200" and pool.role == "colocated"
+        and config.is_rank_local and config.enable_expert_parallel
+        and config.expert_parallel_size == tp and tp in (2, 4, 8, 16)
+        and len(pool.ranks) == tp * pp
+        and pool.parallel_plan.num_layers == 78 and pool.parallel_plan.num_experts == 256
+        and attrs.get("source_glm53_rank_local_ep") is True
+        and attrs.get("model_config_sha256") == GLM_MOE_DSA_5_3_CONFIG_SHA256
+        and attrs.get("glm_parallel_source") is True
+        and attrs.get("source_projection_only") is True
+        and attrs.get("model_execution_version") == "vllm_0_30_0"
+        and attrs.get("model_source_profile") == "vllm_0_30_v32_fp8_sync_explicit_allreduce")
+
+
 def _symbolic_glm53_dp1_ep8_deferred_projection(node, pool):
     """DP1 replicated inputs with local FlashInfer experts and existing AR combine."""
     from src.serving.workload.model_config import GLM_MOE_DSA_5_3_CONFIG_SHA256
     config, attrs = pool.parallel_plan.config, node.attributes
-    return (pool.hardware_id == "nvidia_h200" and pool.role == "colocated"
-        and config.is_rank_local and config.tensor_parallel_size == 8
-        and config.enable_expert_parallel and config.expert_parallel_size == 8
-        and config.pipeline_parallel_size == 1 and len(pool.ranks) == 8
-        and pool.parallel_plan.num_layers == 78 and pool.parallel_plan.num_experts == 256
+    tp, pp = config.tensor_parallel_size, config.pipeline_parallel_size
+    legacy = (tp == 8 and pp == 1
         and pool.parallel_plan.layer_to_pipeline_stage == (0,) * 78
-        and attrs.get("source_glm53_dp1_ep8_deferred") is True
+        and attrs.get("source_glm53_dp1_ep8_deferred") is True)
+    extended = (attrs.get("source_glm53_dp1_deferred") is True
+        and _symbolic_glm53_rank_local_ep_projection(node, pool)
+        and (pp == 1 or _symbolic_glm_pcp_projection(node, pool)))
+    return (pool.hardware_id == "nvidia_h200" and pool.role == "colocated"
+        and config.is_rank_local and config.enable_expert_parallel
+        and config.expert_parallel_size == tp and len(pool.ranks) == tp * pp
+        and pool.parallel_plan.num_layers == 78 and pool.parallel_plan.num_experts == 256
+        and (legacy or extended)
         and attrs.get("model_config_sha256") == GLM_MOE_DSA_5_3_CONFIG_SHA256
         and attrs.get("model_execution_version") == "vllm_0_30_0"
         and attrs.get("model_source_profile") == "vllm_0_30_v32_fp8_sync_explicit_allreduce")
@@ -6402,6 +6428,7 @@ def _symbolic_glm_pcp_projection(node, pool):
             and config.context_parallel_size == 1 and HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id)
             and (not config.enable_expert_parallel and config.sequence_parallel_size == 1
                 or _symbolic_glm_fp8_rank_local_mtp_ep_projection(node, pool)
+                or _symbolic_glm53_rank_local_ep_projection(node, pool)
                 or _symbolic_glm_fp8_target_dp_projection(node, pool)
                 or config.enable_expert_parallel and config.data_parallel_size > 1
                 and config.sequence_parallel_size in (1, config.tensor_parallel_size)
@@ -9155,9 +9182,17 @@ def _h200_bf16_expert_math_domain(node, hardware_id):
             and type(node.attributes["expert_parallel_size"]) is int
             and node.attributes["expert_parallel_size"] > 2
             and not {"source_moe_config", "source_routing", "source_batch_invariant", "source_has_expert_map"}.intersection(node.attributes)
-            and {"source_dp_logical_rows", "source_dp_request_rows", "source_dp_lane_rows",
-                "source_dp_row_order", "source_tensor_parallel_size", "source_padding_routing"}.issubset(node.attributes)
-            and node.attributes["source_padding_routing"] == "declared_routing_for_physical_rows_including_padding_not_observed_topk")
+            and (
+                {"source_dp_logical_rows", "source_dp_request_rows", "source_dp_lane_rows",
+                 "source_dp_row_order", "source_tensor_parallel_size", "source_padding_routing"}.issubset(node.attributes)
+                and node.attributes["source_padding_routing"] == "declared_routing_for_physical_rows_including_padding_not_observed_topk"
+                # Qwen3-30B-A3B rank-local EP presents the same grouped BF16
+                # math with prepared top-k ports and no DP padding metadata.
+                or "source_dp_logical_rows" not in node.attributes
+                and node.attributes["expert_parallel_size"] in (4, 8, 16)
+                and node.attributes.get("expert_placement_strategy") == "linear"
+                and tuple(node.shape.get(key) for key in ("experts", "topk", "hidden", "intermediate"))
+                    == (128, 8, 2048, 768)))
         and node.attributes["routing_weight_dtype"] == "fp32"
         and node.attributes["expert_parameter_layout"] == "unquantized_checkpoint_expert_major_nk"
         and "graph_runtime_mode" not in node.attributes)

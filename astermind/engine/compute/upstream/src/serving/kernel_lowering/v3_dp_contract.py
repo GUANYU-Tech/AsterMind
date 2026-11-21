@@ -1,4 +1,4 @@
-"""V3 active TP1 DP2/4/8 EP=DP PP1 four-input source contract."""
+"""V3 active DP2/4/8 four-input source contract."""
 from collections import defaultdict
 from contextvars import ContextVar
 _PROOF=ContextVar('v3_active_dp_collective_proof',default=None)
@@ -6,10 +6,19 @@ def collective_supported(node,pool,graph):
  proof=_PROOF.get()
  return proof is not None and proof[0] is graph and proof[1] is pool and node.node_id in proof[2]
 from src.kernel.predictors.v3_dp_math import PROGRAM,QUANT,logical_work
+from src.kernel.predictors.v3_ep_math import DISPATCHED_EP_SIZES
 PROFILE='vllm_0_27_1_deepseek_v3_sync_fp8'
 def applicable(pool):
  c=pool.parallel_plan.config
- return pool.hardware_id=='nvidia_h200' and c.enable_expert_parallel and c.sequence_parallel_size==c.context_parallel_size==1 and c.tensor_parallel_size in (1,2,4,8,16) and c.data_parallel_size in (2,4,8) and c.expert_parallel_size==c.data_parallel_size*c.tensor_parallel_size and c.expert_parallel_size in (2,4,8,16,32) and (c.tensor_parallel_size==1 and c.pipeline_parallel_size in (1,2,3,4,6,8) or c.tensor_parallel_size in (2,4,8,16) and c.pipeline_parallel_size in (2,3,4,6,8)) and len(pool.ranks)==c.worker_count
+ return (pool.hardware_id == 'nvidia_h200' and c.enable_expert_parallel
+     and c.sequence_parallel_size == c.context_parallel_size == 1
+     and c.tensor_parallel_size in (1, 2, 4, 8, 16)
+     and c.data_parallel_size in (2, 4, 8)
+     and c.expert_parallel_size == c.data_parallel_size * c.tensor_parallel_size
+     and c.expert_parallel_size in DISPATCHED_EP_SIZES
+     and (c.expert_parallel_size < 64 or c.pipeline_parallel_size == 1)
+     and c.pipeline_parallel_size in (1, 2, 3, 4, 6, 8)
+     and len(pool.ranks) == c.worker_count)
 def marker(node):
  a=node.attributes
  return a.get('source_projection_only') is True and a.get('model_execution_version')=='vllm_0_27_1' and a.get('model_source_profile')==PROFILE
@@ -22,7 +31,7 @@ def expert_attributes(node):
  if not source_node(node) or node.kind.value!='fused_moe' or node.variant!='full' or node.dtype!='bf16' or a.get('source_component')!='symbolic_dsv3_routed_experts' or a.get('source_expert_tensor_parallel_size')!=1 or a.get('source_dispatched_input_dtype')!='fp8' or a.get('source_input_quantization')!='pre_dispatch_group128_fp32_scales' or a.get('output_is_reduced') is not False or a.get('checkpoint_weight_dtype')!='fp8' or a.get('expert_placement_strategy')!='linear' or a.get('launch_policy')!='analytical_launch':
   raise ValueError('V3 DP requires exact prequantized four-input FP8 source')
  ep=a['expert_parallel_size'];owned=tuple(a['owned_experts']);counts=tuple(a['tokens_per_expert']);local=tuple(a['local_tokens_per_expert'])
- if type(ep) is not int or ep not in (2,4,8,16,32) or len(owned)!=256//ep or len(local)!=256//ep or any(type(x) is not int for x in (*owned,*local)) or any(not 0<=j<256 for j in owned) or local!=tuple(counts[j] for j in owned):raise ValueError('V3 DP source ownership/counts')
+ if type(ep) is not int or ep not in DISPATCHED_EP_SIZES or len(owned)!=256//ep or len(local)!=256//ep or any(type(x) is not int for x in (*owned,*local)) or any(not 0<=j<256 for j in owned) or local!=tuple(counts[j] for j in owned):raise ValueError('V3 DP source ownership/counts')
  out={k:a[k] for k in ('tokens_per_expert','expert_parallel_size','expert_rank','owned_experts','routed_scaling_factor','routed_weight_dtype','weight_group_size')}
  out.update(local_tokens_per_expert=tuple(x if j in owned else 0 for j,x in enumerate(counts)),expert_weight_tile_rows=None,swiglu_limit=None,mathematical_program=PROGRAM)
  logical_work(node.shape,out);return out
@@ -32,9 +41,10 @@ def quant_attributes(node):
  return {'group_size':128,'source_program':QUANT}
 def validate(graph,pool,nodes,memory_context):
  _PROOF.set(None);proven=set()
- if not applicable(pool):raise NotImplementedError('V3 active DP source supports only H200 TP1 PP1 SP1 CP1 DP=EP2/4/8')
+ if not applicable(pool):raise NotImplementedError('V3 active DP source requires legal H200 TP/PP with uniform EP=TP*DP up to 64, SP1 and CP1')
  if memory_context is None:raise ValueError('V3 DP requires source memory ports')
  c=pool.parallel_plan.config;dp=c.data_parallel_size;tp=c.tensor_parallel_size;pp=c.pipeline_parallel_size;ep=dp*tp;dimension='expert' if tp>1 else 'data';participants=tuple(pool.ranks);byid={n.node_id:n for n in graph.nodes};out=defaultdict(list);succ=defaultdict(list);pred=defaultdict(list);memory=memory_context._by_node
+ model_sp = tp > 1 and pp == 1
  for n in graph.nodes:
   for v in n.attributes.get('symbolic_tensor_outputs',()):out[v].append(n)
  for e in graph.edges:
@@ -102,14 +112,34 @@ def validate(graph,pool,nodes,memory_context):
     prefix=n.node_id.rsplit(':routed',1)[0]+':sequence';logical=logical_rows[lane//tp];padded=local*tp;offset=(lane%tp)*local*h*2
     qv=port(quant,ins(quant)[0],(local,h),'bf16')
     norm=unique([x for x in graph.nodes if x.node_id==n.node_id.rsplit(':mlp:',1)[0]+':post-attn-norm'],'original pre-MoE normalization')
-    fail(norm.kind.value!='norm' or norm.rank!=n.rank or norm.dtype!='bf16' or dict(norm.shape)!={'rows':logical,'hidden':h},'original normalized full hidden rows')
-    nv=port(norm,outs(norm)[0],(logical,h),'bf16',True)
-    if padded==logical:
+    norm_rows = local if model_sp else logical
+    fail(norm.kind.value!='norm' or norm.rank!=n.rank or norm.dtype!='bf16'
+        or dict(norm.shape)!={'rows':norm_rows,'hidden':h},'original normalized hidden rows')
+    nv=port(norm,outs(norm)[0],(norm_rows,h),'bf16',True)
+    if model_sp:
+     group=participants[lane//tp*tp:(lane//tp+1)*tp]
+     reduce=unique([x for x in pred[norm.node_id] if x.kind.value=='collective'
+         and x.node_id.endswith(':sp-attention-output')], 'one TP attention reduce-scatter')
+     ra=reduce.attributes
+     fail(ra.get('operation')!='reduce_scatterv' or ra.get('reduction')!='sum'
+         or ra.get('collective_group')!='tensor' or tuple(ra.get('participants',()))!=group
+         or tuple(ra.get('partition_bytes',()))!=(local*h*2,)*tp
+         or ra.get('bytes')!=padded*h*2 or ra.get('bytes_semantics')!='per_rank_input'
+         or len(outs(reduce))!=tp or ins(norm)[0]!=outs(reduce)[lane%tp],
+         'TP attention reduce-scatter must provide the local hidden slice')
+     port(reduce,outs(reduce)[lane%tp],(local,h),'bf16',True)
+     fail(norm not in pred[quant.node_id] or ins(quant)!=(outs(norm)[0],)
+         or qv.allocation_id!=nv.allocation_id or qv.offset_bytes!=nv.offset_bytes,
+         'model sequence shard must come directly from the local normalized rows')
+     hidden_producer=norm
+     proven.add(reduce.node_id)
+    elif padded==logical:
      sh=unique([x for x in graph.nodes if x.node_id==prefix+':clone-copy'],'exact MoE shard clone')
      fail(sh.rank!=n.rank or sh.kind.value!='gather' or sh.dtype!='bf16' or dict(sh.shape)!={'elements':local*h,'rows':local,'hidden':h} or outs(sh)!=ins(quant) or sh not in pred[quant.node_id] or tuple(sh.attributes.get(k) for k in ('gather_factor','index_count','scattered','materialized_output'))!=(1,0,False,True),'MoE shard clone structure/dependency')
      iv=port(sh,ins(sh)[0],(local,h),'bf16');ov=port(sh,outs(sh)[0],(local,h),'bf16',True)
      fail(iv.offset_bytes!=offset or ov.offset_bytes!=0 or iv.allocation_id==ov.allocation_id,'actual TP lane slice and independent clone')
      fail(norm not in pred[sh.node_id] or iv.allocation_id!=nv.allocation_id or iv.offset_bytes!=nv.offset_bytes+offset,'clone must slice its own normalized hidden allocation')
+     hidden_producer=sh
     else:
      cp=unique([x for x in graph.nodes if x.node_id==prefix+':pad-copy'],'exact MoE pad copy');z=unique([x for x in graph.nodes if x.node_id==prefix+':pad-zero'],'exact MoE pad zero')
      fail(cp.rank!=n.rank or z.rank!=n.rank or cp.kind.value!='gather' or z.kind.value!='elementwise' or tuple(z.attributes.get(k) for k in ('operation','reads','writes','source_constant'))!=('fill',0,1,0) or dict(cp.shape)!={'elements':logical*h,'rows':logical,'hidden':h} or dict(z.shape)!={'elements':(padded-logical)*h},'MoE explicit padding computation')
@@ -118,13 +148,15 @@ def validate(graph,pool,nodes,memory_context):
      pv=port(cp,ins(cp)[0],(logical,h),'bf16');fail(pv.allocation_id!=nv.allocation_id or pv.offset_bytes!=nv.offset_bytes,'padding copy source allocation')
      cv=port(cp,outs(cp)[0],(logical,h),'bf16',True);zv=port(z,outs(z)[0],(padded-logical,h),'bf16',True)
      fail(qv.offset_bytes!=offset or cv.offset_bytes!=0 or zv.offset_bytes!=logical*h*2 or len({qv.allocation_id,cv.allocation_id,zv.allocation_id})!=1,'padding backing allocation and valid/zero regions')
+     hidden_producer=z
    route=byid[dispatch[1].attributes['symbolic_collective_input_producers'][lane]];ra=route.attributes
    fail(route.node_id!=dispatch[2].attributes['symbolic_collective_input_producers'][lane] or route.rank!=n.rank or not source_node(route) or outs(route)!=(ins(dispatch[1])[lane],ins(dispatch[2])[lane]) or route.shape!={**n.shape,'tokens':local} or len(ins(route))!=2,'route identity and local rows')
    expected={'source_component':'vllm_0_27_1_symbolic_grouped_routing','source_program':'vllm_0_27_1_bf16_sigmoid_bias_grouped_topk','mathematical_program':'bf16_sigmoid_bias_grouped_topk_flops_bytes_v1','normalize_topk_probability':True,'expert_group_count':8,'topk_group_count':4,'routed_scaling_factor':1.0}
    fail(any(ra.get(k)!=v for k,v in expected.items()),'grouped source routing semantics')
    gate=unique([x for x in out[ins(route)[0]] if x.kind.value=='router'],'local router gate')
    fail(gate.rank!=n.rank or dict(gate.shape)!={'b':1,'m':local,'n':256,'k':h} or gate.dtype!='bf16' or ins(gate)[0]!=ins(quant)[0] or route not in succ[gate.node_id],'routing and quantization share original BF16 hidden')
-   fail(tp>1 and any(x not in pred[gate.node_id] for x in ([sh] if padded==logical else [z])),'routing gate requires actual hidden shard producers')
+   if tp>1:
+    fail(hidden_producer not in pred[gate.node_id],'routing gate requires actual hidden shard producers')
    port(route,ins(route)[1],(256,),'fp32');port(route,outs(route)[0],(local,8),'fp32',True);port(route,outs(route)[1],(local,8),'int32',True)
   combine=unique([x for x in succ[first.node_id] if x.kind.value=='collective'],'one expert combine');a=combine.attributes
   fail(a.get('operation')!='reduce_scatterv' or a.get('reduction')!='sum' or a.get('collective_group')!=dimension or tuple(a['participants'])!=participants or tuple(a['symbolic_variable_rows'])!=rows or tuple(a['symbolic_variable_row_shape'])!=(h,) or tuple(a['partition_bytes'])!=tuple(x*h*2 for x in rows) or a.get('bytes')!=t*h*2 or a.get('bytes_semantics')!='per_rank_input' or a.get('moe_invocation_id')!=invocation,'combine sum/bytes/rows')
@@ -144,11 +176,19 @@ def validate(graph,pool,nodes,memory_context):
    fail(act.variant!='silu' or dict(act.shape)!={'elements':local*2048,'tok':local,'intermediate':2048} or act.attributes.get('swiglu_limit') is not None,'shared silu geometry')
    up=unique([x for v in ins(act) for x in out[v] if x.kind.value=='linear' and x.rank==n.rank],'shared up');quant=byid[dispatch[0].attributes['symbolic_collective_input_producers'][lane]]
    fail(dict(up.shape)!={'b':1,'m':local,'n':4096,'k':h} or ins(up)!=ins(quant) or up.attributes.get('weight_dtype')!='fp8' or up.attributes.get('weight_group_size')!=128,'shared expert uses original local hidden')
-   if tp>1:
+   if model_sp:
+    prefix=n.node_id.rsplit(':mlp:',1)[0]
+    norm=byid[prefix+':post-attn-norm']
+    fail(norm not in pred[up.node_id], 'shared expert requires the normalized model sequence shard')
+    consumers=[y for y in succ[add.node_id] if y.rank==n.rank
+        and y.node_id.endswith((':input-norm',':sp-final-pair',':final-norm'))]
+    consumer=unique(consumers,'model sequence shard must feed the next layer or final merge')
+    fail(outs(add)[0] not in ins(consumer),'next model stage must consume the local expert contribution')
+   elif tp>1:
     suffix=':clone-copy' if local*tp==logical_rows[lane//tp] else ':pad-zero'
     final_shard=byid[n.node_id.rsplit(':routed',1)[0]+':sequence'+suffix]
     fail(final_shard not in pred[up.node_id],'shared expert requires actual finalized hidden shard')
-  if tp>1:
+  if tp>1 and not model_sp:
    for replica in range(dp):
     group=participants[replica*tp:(replica+1)*tp];local=initial_rows[replica*tp]
     adds=[unique([x for x in graph.nodes if x.rank==rank and x.node_id==members[replica*tp+lane].node_id.rsplit(':routed',1)[0]+':shared-add'],'shared add before restore') for lane,rank in enumerate(group)]

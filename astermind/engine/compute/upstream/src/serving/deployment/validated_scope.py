@@ -865,6 +865,13 @@ def is_glm53_legacy_tp8_ep8_source_scope(pool, model: ModelConfig) -> bool:
         and pool.parallel_plan.layer_to_pipeline_stage == (0,) * model.num_hidden_layers)
 
 
+def is_glm53_rank_local_ep_source_scope(pool, model: ModelConfig) -> bool:
+    """Ordinary, uniform H200 FP8 experts with whole TP blocks in every stage."""
+    from src.serving.workload.model_config import GLM_MOE_DSA_5_3_CONFIG_SHA256
+    return (model.config_sha256 == GLM_MOE_DSA_5_3_CONFIG_SHA256
+        and is_glm_fp8_mtp_rank_local_source_scope(pool, model))
+
+
 def is_glm_fp8_rank_local_source_scope(pool, model: ModelConfig) -> bool:
     """Ordinary FP8 TP/PP source, with whole quantization blocks and no EP."""
     from src.serving.workload.model_config import is_glm_fp8_tensor_model_scope

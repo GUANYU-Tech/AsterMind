@@ -149,7 +149,7 @@ def _runtime_inputs(config, model):
     if (model.model_type == "glm_moe_dsa" and config.hardware_id == "nvidia_a800"
             and config.pipeline_parallel_size == 4):
         # Declare a cold source workspace for every rank in this new Cell.
-        ranks = config.tensor_parallel_size * config.pipeline_parallel_size
+        ranks = config.tensor_parallel_size * config.data_parallel_size * config.pipeline_parallel_size
         return replace(runtime, glm_indexer_selection_source="declared_causal_topk",
                        symbolic_workspace_initial_capacity_bytes=(0,) * ranks)
     return runtime
@@ -256,7 +256,11 @@ def create_midlayer_runtime(config: MidlayerCellConfig, *, with_scheduler: bool 
     if not with_scheduler:
         return {}, execution, storage_enabled
 
-    if config.pipeline_parallel_size == 1:
+    if config.scheduler_adapter == "vllm_0_30" and model.attention_layout == "hybrid_kda_mla":
+        # The native allocator supplies hybrid per-group geometry. A single
+        # byte-per-token rate cannot describe recurrent state and MLA pages.
+        kv_bytes = 0
+    elif config.pipeline_parallel_size == 1:
         kv_bytes = math.ceil(model.kv_bytes_per_token_per_parallel_rank(config.tensor_parallel_size, 1))
     else:
         kv_bytes = math.ceil(max(model.kv_bytes_per_token_for_layer_range(config.tensor_parallel_size, start, end)

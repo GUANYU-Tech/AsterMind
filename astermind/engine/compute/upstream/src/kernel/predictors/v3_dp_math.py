@@ -1,10 +1,10 @@
 """V3 prequantized FP8 + FP32-scales distributed experts; no input quantization."""
-from .v3_ep_math import logical_work as replicated_work
+from .v3_ep_math import DISPATCHED_EP_SIZES, logical_work as replicated_work
 PROGRAM='v3_fp8_dispatched_ep_fused_quant_v1'
 QUANT='vllm_0_27_1_group_fp8_row_major'
 def logical_work(shape,attrs):
-    if attrs.get('mathematical_program')!=PROGRAM or attrs.get('expert_parallel_size') not in (2,4,8,16,32):
-        raise ValueError('V3 dispatched experts require named EP2/4/8/16/32 FP8 four-input program')
+    if attrs.get('mathematical_program')!=PROGRAM or attrs.get('expert_parallel_size') not in DISPATCHED_EP_SIZES:
+        raise ValueError('V3 dispatched experts require named EP2/4/8/16/32/64 FP8 four-input program')
     work=replicated_work(shape,attrs)
     stages=tuple(s for s in work['stages'] if s['stage']!='quantize_input')
     assert len(stages)==4

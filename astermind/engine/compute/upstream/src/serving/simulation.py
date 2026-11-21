@@ -2186,7 +2186,7 @@ def validate_workload_emission_parallelism(
         from src.serving.deployment.validated_scope import (is_glm_distributed_source_scope,
             is_glm_bf16_tensor_source_scope, is_glm_bf16_pipeline_source_scope, is_glm_fp8_rank_local_source_scope,
             is_glm_fp8_mtp_rank_local_source_scope, is_glm_fp8_data_parallel_source_scope,
-            is_glm53_legacy_tp8_ep8_source_scope)
+            is_glm53_rank_local_ep_source_scope)
         from src.serving.workload.model_config import is_glm_mtp_data_parallel_model_scope
         glm_fp8_mtp_dp = (runtime_inputs is not None and model.weight_dtype == "fp8"
             and deployment.mode == "colocated" and len(deployment.worker_pools) == 1
@@ -2206,7 +2206,7 @@ def validate_workload_emission_parallelism(
                         and runtime_inputs.mtp_proposer_execution_source is None
                         and runtime_inputs.model_source_inputs is None
                         and runtime_inputs.target_sampling_source == "vllm_0_30_plain_greedy_bf16"
-                        and is_glm53_legacy_tp8_ep8_source_scope(pool, model)
+                        and is_glm53_rank_local_ep_source_scope(pool, model)
                     or deployment.mode == "colocated" and len(deployment.worker_pools) == 1
                         and runtime_inputs.mtp_draft_sampling_source is None
                         and is_glm_fp8_data_parallel_source_scope(pool, model))
