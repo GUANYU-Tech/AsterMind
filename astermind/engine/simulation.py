@@ -99,9 +99,14 @@ class Simulation:
             for p in c.placements
         )
         from astermind.engine.compute.batch_executor import RuntimeBatchExecutor
+        if config.compute_mode == "fast_mode":
+            from astermind.engine.compute.fast_mode import FastModeExecutor
+            executor_type = FastModeExecutor
+        else:
+            executor_type = RuntimeBatchExecutor
         self.executor = CellTransferExecutor(self.loop, self.network)
         self.executors = {
-            cell.id: RuntimeBatchExecutor(cell.id, self.loop, self.network.communication_policy,
+            cell.id: executor_type(cell.id, self.loop, self.network.communication_policy,
                 tuple(p for p in placements if p.cell_id == cell.id),
                 on_batch_boundary=self.executor.notify_batch_boundary)
             for cell in config.cells
@@ -181,7 +186,7 @@ class Simulation:
             tensor_parallel_size=p.tp, pipeline_parallel_size=p.pp,
             data_parallel_size=p.dp, sequence_parallel_size=p.sp,
             deployment=cell.deployment, execution_mode=cell.execution_mode,
-            compute_mode=self.config.compute_mode)
+            compute_mode=self.config.executor_compute_mode, fast_glm_dsa_score=cell.fast_glm_dsa_score)
         executor = self.executors[cell.id]
         if cell.deployment == "pd_disagg":
             created = PrefillDecodeCell(cell.id, self.loop, config, executor,
@@ -193,6 +198,8 @@ class Simulation:
                 batch_executor=executor, history_store=self.history)
         try:
             validate_cell_deployment(cell, created.execution, executor.placements.values())
+            if self.config.compute_mode == "fast_mode":
+                executor.configure(created.execution, config)
         except BaseException:
             created.close()
             raise
@@ -452,7 +459,7 @@ class Simulation:
                 "midlayer_root": str(self.root),
                 "communication": "runtime_comm",
                 "compute_mode": self.config.compute_mode,
-                "compute_modes": {c.id: self.config.compute_mode for c in self.config.cells},
+                "compute_modes": {c.id: self.config.executor_compute_mode for c in self.config.cells},
                 "native_inputs": self.native_inputs,
                 "source_commit": "9c08c9cad81df5a4fee5e606114753df8dab6c2d",
                 "timeline_mode": "orbitserve",

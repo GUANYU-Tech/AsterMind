@@ -17,10 +17,15 @@ from src.serving.parallelism.parallel_config import ParallelConfig
 from src.serving.parallelism.pp import pipeline_layer_ranges_for_model
 from src.serving.backend.vllm import BackendConfig, VLLMSchedulerConfig
 from src.serving.simulation import validate_workload_emission_parallelism
+from astermind.common.hardware_capabilities import PORTABLE_BATCH_HARDWARE
 from src.serving.workload.model_config import load_model_config
 from src.serving.workload.runtime_inputs import ExpertRoutingInput, RuntimeInputs
 
 from .factory import create_scheduler
+from .fast_mode.admission import (
+    KIMI_VENDOR_PROJECTION_HARDWARE, supports_portable_batch_k3,
+    supports_portable_batch_kimi, supports_portable_fp8_reference,
+)
 
 
 _STEP_PARAMETERS = signature(ServingExecutionContext.execute_step).parameters
@@ -83,10 +88,11 @@ class MidlayerCellConfig:
     host_launch_profile_file: str | None = None
     deployment: Literal["colocated", "pd_disagg"] = "colocated"
     execution_mode: Literal["accelerated", "fast", "reference"] = "accelerated"
-    compute_mode: Literal["midlayer", "roofline"] = "midlayer"
+    compute_mode: Literal["midlayer", "roofline", "fast_mode"] = "midlayer"
+    fast_glm_dsa_score: Literal["bf16_timing_proxy"] | None = None
 
 
-def _runtime_inputs(config, model):
+def _runtime_inputs(config, model, *, portable_fp8=False):
     seed = config.expert_routing_seed
     if model.num_experts:
         if type(seed) is not int or seed < 0:
@@ -102,9 +108,16 @@ def _runtime_inputs(config, model):
         return RuntimeInputs(routing, layout, "uniform")
 
     if model.attention_layout == "standard_gqa":
-        if config.scheduler_adapter == "vllm_0_30":
+        portable_program = _uses_portable_qwen_program(config, model)
+        # Preserve existing vendor references where the detailed forward is
+        # available. The portable Fast program only uses logical rank semantics.
+        vendor_reference = not portable_program and config.compute_mode == "fast_mode" and config.data_parallel_size == 1 and (
+            config.hardware_id == "ascend_910b"
+            or config.hardware_id == "metax_c500" and model.model_type == "qwen3_moe")
+        if config.scheduler_adapter == "vllm_0_30" and not vendor_reference:
             return RuntimeInputs(routing, "paged_varlen", "uniform",
                 model_execution_version="vllm_0_30_0",
+                symbolic_forward_source="cuda_eager_inplace" if portable_program else None,
                 target_sampling_source=f"vllm_0_30_plain_greedy_{model.compute_dtype}")
         version, sampler = {
             "ascend_910b": ("vllm_0_18_0", "vllm_0_18"),
@@ -132,6 +145,28 @@ def _runtime_inputs(config, model):
         target_sampling_source="vllm_0_30_plain_greedy_bf16",
         symbolic_source_max_model_len=config.max_model_len,
         symbolic_source_max_batched_tokens=config.max_batched_tokens)
+    if portable_fp8:
+        ranks = config.tensor_parallel_size * config.pipeline_parallel_size * config.data_parallel_size
+        return replace(runtime, symbolic_forward_source="vllm_0_30_v32_fp8_sync_explicit_allreduce",
+                       glm_indexer_selection_source="declared_causal_topk",
+                       symbolic_workspace_initial_capacity_bytes=(0,) * ranks)
+    if (model.model_type == "kimi_linear" and config.compute_mode == "fast_mode"
+            and config.hardware_id in PORTABLE_BATCH_HARDWARE):
+        # The Fast executor uses the same K3 forward semantics without invoking
+        # the detailed NVIDIA kernel provider.
+        return replace(runtime, symbolic_forward_source="vllm_0_30_k3_mxfp4_sync")
+    if (model.model_type == "kimi_k2" and config.compute_mode == "fast_mode"
+            and config.hardware_id in KIMI_VENDOR_PROJECTION_HARDWARE):
+        # Record the logical source used by the Fast formulas. This mode
+        # does not emit the NVIDIA-specific detailed forward.
+        return replace(runtime, symbolic_forward_source="vllm_0_30_k2_6_int4_sync_explicit_allreduce")
+    if config.fast_glm_dsa_score is not None:
+        ranks = config.tensor_parallel_size * config.pipeline_parallel_size * config.data_parallel_size
+        return replace(runtime, symbolic_forward_source="vllm_0_30_v32_bf16_sync_explicit_allreduce",
+                       glm_indexer_selection_source="declared_causal_topk",
+                       glm_prefill_attention_source=("force_sparse_mqa" if config.data_parallel_size > 1
+                                                     else runtime.glm_prefill_attention_source),
+                       symbolic_workspace_initial_capacity_bytes=(0,) * ranks)
     if (config.hardware_id == "nvidia_a800" and model.model_type == "glm_moe_dsa"
             and model.weight_dtype == "bf16" and config.data_parallel_size > 1
             and config.pipeline_parallel_size == 1):
@@ -144,6 +179,15 @@ def _runtime_inputs(config, model):
                        glm_indexer_selection_source="declared_causal_topk",
                        glm_prefill_attention_source="force_sparse_mqa",
                        symbolic_workspace_initial_capacity_bytes=(0,) * ranks)
+    if (config.compute_mode == "fast_mode" and config.scheduler_adapter == "vllm_0_30"
+            and config.hardware_id == "nvidia_h200" and model.model_type == "glm_moe_dsa" and model.weight_dtype == "fp8"
+            and config.data_parallel_size == 1):
+        from src.serving.workload.model_config import GLM_MOE_DSA_5_3_CONFIG_SHA256
+        if model.config_sha256 == GLM_MOE_DSA_5_3_CONFIG_SHA256:
+            ranks = config.tensor_parallel_size * config.pipeline_parallel_size
+            return replace(runtime, symbolic_forward_source="vllm_0_30_v32_fp8_sync_explicit_allreduce",
+                           glm_indexer_selection_source="declared_causal_topk",
+                           symbolic_workspace_initial_capacity_bytes=(0,) * ranks)
     if (model.model_type == "glm_moe_dsa" and config.hardware_id == "nvidia_a800"
             and config.pipeline_parallel_size == 4):
         # Declare a cold source workspace for every rank in this new Cell.
@@ -154,8 +198,8 @@ def _runtime_inputs(config, model):
 
 
 def create_midlayer_runtime(config: MidlayerCellConfig, *, with_scheduler: bool = True):
-    if config.compute_mode not in ("midlayer", "roofline"):
-        raise ValueError("compute_mode must be midlayer or roofline")
+    if config.compute_mode not in ("midlayer", "roofline", "fast_mode"):
+        raise ValueError("compute_mode must be midlayer, roofline or fast_mode")
     loaded_root = Path(getfile(HWSpec)).resolve().parents[2]
     if config.root.resolve() != loaded_root:
         raise ValueError("Cell root differs from the selected Mid-Layer source")
@@ -172,11 +216,6 @@ def create_midlayer_runtime(config: MidlayerCellConfig, *, with_scheduler: bool 
         raise ValueError("unknown Scheduler adapter")
     if isinstance(config.watermark, bool) or not math.isfinite(config.watermark) or not 0 <= config.watermark < 1:
         raise ValueError("watermark must be in [0, 1)")
-    storage_enabled = config.scheduler_adapter == "vllm_0_31"
-    if not storage_enabled and (
-            config.enable_prefix_caching or config.watermark or config.memory_policy_file):
-        raise NotImplementedError("the current upstream Cell adapter requires explicit KV blocks and no session caching")
-
     hardware = HWSpec(config.root / config.hardware_file)
     if hardware.hardware_id != config.hardware_id:
         raise ValueError("Cell hardware_id does not match the selected hardware profile")
@@ -184,6 +223,20 @@ def create_midlayer_runtime(config: MidlayerCellConfig, *, with_scheduler: bool 
                               sequence_parallel_size=config.sequence_parallel_size, tensor_parallel_size=config.tensor_parallel_size,
                               pipeline_parallel_size=config.pipeline_parallel_size,
                               enable_expert_parallel=config.enable_expert_parallel)
+    _validate_batch_hardware(config, model, parallel)
+    vendor_kimi = (config.hardware_id in KIMI_VENDOR_PROJECTION_HARDWARE
+                   and supports_portable_batch_kimi(config, model, parallel))
+    portable_k3 = supports_portable_batch_k3(config, model, parallel)
+    portable_fp8 = supports_portable_fp8_reference(config, model, parallel)
+    fast_reference_memory = (config.compute_mode == "fast_mode" and config.hardware_id == "nvidia_h200"
+                             and config.scheduler_adapter == "vllm_0_30"
+                             and (model.model_type in ("deepseek_v3", "deepseek_v4", "kimi_k2", "kimi_linear")
+                                  or model.model_type == "glm_moe_dsa" and model.weight_dtype == "fp8"))
+    storage_enabled = config.scheduler_adapter == "vllm_0_31"
+    if not storage_enabled and (config.enable_prefix_caching or config.watermark
+                                or config.memory_policy_file and not (vendor_kimi or portable_k3
+                                                                      or portable_fp8 or fast_reference_memory)):
+        raise NotImplementedError("the current upstream Cell adapter requires explicit KV blocks and no session caching")
     layer_ranges = pipeline_layer_ranges_for_model(model, config.pipeline_parallel_size)
     plan_options = {}
     if config.deployment == "pd_disagg":
@@ -228,20 +281,26 @@ def create_midlayer_runtime(config: MidlayerCellConfig, *, with_scheduler: bool 
         host_profiles = {config.hardware_id: profile}
     execution = ServingExecutionContext(
         model, deployment, {config.hardware_id: hardware}, "analytical_launch",
-        config.compute_mode,
-        _runtime_inputs(config, model), host_launch_profiles=host_profiles,
+        "roofline" if config.compute_mode == "fast_mode" else config.compute_mode,
+        _runtime_inputs(config, model, portable_fp8=portable_fp8), host_launch_profiles=host_profiles,
         execution_mode=config.execution_mode,
         # Older explicit snapshots provide eager Host intervals with the device timeline.
         materialize_timeline_details=host_profiles is not None,
     )
-    # Emission validates the bound compute source, independently of which
-    # Scheduler adapter produced (or will produce) the batch.
-    source_options = {"runtime_inputs": execution.runtime_inputs}
-    validate_workload_emission_parallelism(deployment, model, allow_single_pool_tp2=True,
-        allow_single_pool_ep2=True, allow_single_pool_tp1_pp=True, allow_single_pool_tp2_pp2=True,
-        **source_options)
+    if (not vendor_kimi and not portable_k3 and not portable_fp8 and config.fast_glm_dsa_score is None
+            and not _uses_glm_batch_expert_program(config, model)
+            and not _uses_portable_qwen_program(config, model)):
+        validate_workload_emission_parallelism(deployment, model, allow_single_pool_tp2=True,
+            allow_single_pool_ep2=True, allow_single_pool_tp1_pp=True, allow_single_pool_tp2_pp2=True,
+            runtime_inputs=execution.runtime_inputs)
     if not with_scheduler:
         return {}, execution, storage_enabled
+
+    if (config.compute_mode == "fast_mode" and model.attention_layout == "hybrid_kda_mla"
+            and config.scheduler_adapter == "vllm_0_30"
+            and config.deployment == "colocated"):
+        from .factory import _vllm030_with_byte_budget
+        return {"main": _vllm030_with_byte_budget(config, "main", model, hardware)}, execution, storage_enabled
 
     if config.pipeline_parallel_size == 1:
         kv_bytes = math.ceil(model.kv_bytes_per_token_per_parallel_rank(config.tensor_parallel_size, 1))
@@ -260,3 +319,97 @@ def create_midlayer_runtime(config: MidlayerCellConfig, *, with_scheduler: bool 
             backend.close()
         raise
     return backends, execution, storage_enabled
+
+
+def _uses_glm_batch_expert_program(config, model):
+    if (config.compute_mode != "fast_mode" or config.hardware_id != "nvidia_h200"
+            or config.scheduler_adapter != "vllm_0_30" or config.deployment != "colocated"
+            or config.data_parallel_size != 1 or config.sequence_parallel_size != 1
+            or not config.enable_expert_parallel):
+        return False
+    from src.serving.workload.model_config import (
+        GLM_MOE_DSA_5_3_CONFIG_SHA256, is_glm_fp8_tensor_model_scope,
+    )
+    # Fast Mode owns the rank program while the native runtime still checks
+    # the TP geometry, PP partition, and the per-rank Scheduler capacity.
+    return (model.config_sha256 == GLM_MOE_DSA_5_3_CONFIG_SHA256
+            and is_glm_fp8_tensor_model_scope(model, config.tensor_parallel_size))
+
+
+def _uses_portable_qwen_program(config, model):
+    if config.compute_mode != "fast_mode" or config.hardware_id not in ("ascend_910b", "metax_c500"):
+        return False
+    # Preserve the vendor emitter for its existing precision and parallel
+    # scope. The Fast Mode formulas only need the shared logical rank plan.
+    if model.model_type == "qwen3_moe":
+        return not (config.data_parallel_size == 1 and config.tensor_parallel_size == 2
+                    and config.enable_expert_parallel)
+    return (model.model_type == "qwen3" and model.weight_dtype == model.compute_dtype == "fp16"
+            and (config.hardware_id == "ascend_910b" or config.pipeline_parallel_size > 1))
+
+
+def _validate_batch_hardware(config, model, parallel):
+    if config.fast_glm_dsa_score is not None:
+        from src.serving.workload.model_config import (
+            GLM_MOE_DSA_CONFIG_SHA256, is_glm_mtp_data_parallel_model_scope, is_glm_mtp_tensor_model_scope,
+        )
+        if (config.fast_glm_dsa_score != "bf16_timing_proxy" or config.compute_mode != "fast_mode"
+                or config.hardware_id not in PORTABLE_BATCH_HARDWARE or config.scheduler_adapter != "vllm_0_30"
+                or config.deployment != "colocated" or parallel.sequence_parallel_size != 1
+                or parallel.context_parallel_size != 1 or model.config_sha256 != GLM_MOE_DSA_CONFIG_SHA256):
+            raise ValueError("bf16_timing_proxy requires the supplied GLM-5.2 BF16 and non-H200 colocated Fast Mode with vLLM 0.30 and CP1/SP1")
+        if parallel.data_parallel_size > 1:
+            supported = parallel.enable_expert_parallel and is_glm_mtp_data_parallel_model_scope(model, parallel)
+        else:
+            supported = is_glm_mtp_tensor_model_scope(model, parallel.tensor_parallel_size,
+                                                      expert_parallel=parallel.enable_expert_parallel)
+        if not supported:
+            raise ValueError("GLM-5.2 DSA timing proxy requires supported model sharding and explicit uniform WideEP for DP > 1")
+        return
+    if config.compute_mode != "fast_mode" or config.hardware_id not in PORTABLE_BATCH_HARDWARE:
+        return
+    if (config.scheduler_adapter != "vllm_0_30" or config.deployment != "colocated"
+            or parallel.context_parallel_size != 1 or parallel.sequence_parallel_size != 1):
+        raise ValueError(f"{config.hardware_id} fast_mode currently requires colocated CP1, SP1 and vllm_0_30")
+    tp, pp = parallel.tensor_parallel_size, parallel.pipeline_parallel_size
+    if supports_portable_fp8_reference(config, model, parallel):
+        return
+    if model.model_type == "kimi_linear":
+        if not supports_portable_batch_k3(config, model, parallel):
+            raise ValueError("portable Kimi-K3 requires the exact BF16/MXFP4 model and legal hybrid TP/PP and EP geometry")
+        if not config.memory_policy_file:
+            raise ValueError("portable Kimi-K3 Fast Mode requires an explicit per-Cell memory_policy_file for the BF16/W4A16 reference")
+        return
+    if model.model_type == "kimi_k2":
+        if not supports_portable_batch_kimi(config, model, parallel):
+            raise ValueError("portable Kimi-K2 requires legal group-32 INT4 sharding and explicit uniform EP for DP > 1")
+        if config.hardware_id in KIMI_VENDOR_PROJECTION_HARDWARE and not config.memory_policy_file:
+            raise ValueError("910B/C500 Kimi-K2 Fast Mode requires an explicit per-Cell memory_policy_file")
+        return
+    if model.model_type == "deepseek_v4":
+        raise NotImplementedError(
+            f"{config.hardware_id} has no supported DeepSeek-V4 Fast Mode profile for the pinned "
+            "FP8 projections, FP4 expert residency and compressed FP8 DS-MLA KV layout"
+        )
+    if model.model_type == "glm_moe_dsa" and model.weight_dtype == "fp8":
+        raise NotImplementedError(
+            f"{config.hardware_id} has no supported block-FP8 GLM Fast Mode profile for the pinned "
+            "E4M3 projections, experts and DSA score with the source KV layout"
+        )
+    bf16 = model.weight_dtype == model.compute_dtype == "bf16"
+    fp16_qwen = model.model_type == "qwen3" and model.weight_dtype == model.compute_dtype == "fp16"
+    if model.attention_layout != "standard_gqa" or not (bf16 or fp16_qwen):
+        raise ValueError(f"{config.hardware_id} fast_mode has no reviewed forward profile for the model precision and attention")
+    from src.serving.parallelism.tp import validate_gqa_parallelism
+    from src.serving.workload.model_config import is_dense_parallel_model_scope, is_qwen3_moe_source_model_scope
+    validate_gqa_parallelism(model, parallel)
+    if parallel.is_rank_local and is_dense_parallel_model_scope(model, tp, pp) and not parallel.enable_expert_parallel:
+        return
+    if (is_qwen3_moe_source_model_scope(model) and model.hidden_act == "silu"
+            and model.rope_scaling_type == "default"):
+        if parallel.data_parallel_size > 1 and not parallel.enable_expert_parallel:
+            raise ValueError("portable Qwen3 DP greater than one requires explicit WideEP")
+        if parallel.enable_expert_parallel and model.num_experts % parallel.expert_parallel_size != 0:
+            raise ValueError("portable Qwen3 EP requires even expert ownership")
+        return
+    raise ValueError("selected portable Dense or MoE model source does not support the TP/PP/EP layout")
