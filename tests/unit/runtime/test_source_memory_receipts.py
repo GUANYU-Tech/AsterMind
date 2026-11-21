@@ -38,6 +38,43 @@ def test_deferred_trace_receipt_reuses_the_frozen_snapshot():
     assert ordinary.attributes["metadata"]["rows"] == (1, 2, 3)
 
 
+def test_packed_batch_rows_are_shared_by_source_receipts():
+    from astermind.common.bootstrap import activate
+
+    activate()
+    from src.serving.kernel_lowering.memory_bindings import snapshot_trace_memory
+    from src.serving.schedule.schedule_step import ScheduledRequest, ScheduleStep
+    from src.serving.workload.runtime_inputs import vllm_0_30_source_model_inputs
+    from src.serving.workload.traced_forward import ForwardTrace
+    from src.serving.workload.workload_graph import WorkloadKind, WorkloadNode
+
+    step = ScheduleStep("mixed", "main", (
+        ScheduledRequest("prefill", "prefill", 3, 0),
+        ScheduledRequest("decode", "decode", 0, 1, computed_tokens=5),
+    ))
+    packed, ids, order = vllm_0_30_source_model_inputs(
+        step, embedding_token_ids=(10, 11, 12, 13), prompt_lengths=(3, 5),
+    )
+    assert tuple(request.request_id for request in packed.requests) == ("decode", "prefill")
+    assert ids == (13, 10, 11, 12)
+    assert order["token_row_permutation"] == (3, 0, 1, 2)
+    assert order["model_positions"] == (5, 0, 1, 2)
+
+    trace = ForwardTrace(rank=0, namespace="shared_batch")
+    source = trace.tensor("input", (4,), "bf16")
+    for name in ("first", "second"):
+        node = WorkloadNode(name, WorkloadKind.VECTOR, "main", {"elements": 4},
+                            dtype="bf16", rank=0, attributes={"model_input_order": order})
+        trace.call(node, (source,), shape=(4,), dtype="bf16")
+    graph = trace.graph
+    receipts = snapshot_trace_memory(trace, graph).nodes
+
+    for receipt in receipts:
+        saved = receipt.attributes["model_input_order"]
+        assert saved["token_row_permutation"] is order["token_row_permutation"]
+        assert saved["model_positions"] is order["model_positions"]
+
+
 
 def test_binding_reuses_live_backing_and_preserves_original_free_event():
     from astermind.common.bootstrap import activate
