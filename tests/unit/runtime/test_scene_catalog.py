@@ -111,3 +111,36 @@ class SceneCatalogTests(unittest.TestCase):
         ):
             with self.subTest(update=update), self.assertRaises(ValueError):
                 validate_deployment_choice(SceneDeployment(**update), self.root)
+
+    def test_fast_mode_accepts_user_parallel_degrees_with_explicit_wide_ep(self):
+        model_config = dict(self.dense, model_type="glm_moe_dsa", n_routed_experts=256)
+        model_config["dtype"] = model_config.pop("torch_dtype")
+        (self.root / "configs/model/glm-5.2.json").write_text(
+            json.dumps(model_config)
+        )
+        catalog = scene_catalog(self.root)
+        self.assertIn({"id": "fast_mode", "name": "Fast Mode"}, catalog["compute_modes"])
+        self.assertNotIn("batch_roofline", {mode["id"] for mode in catalog["compute_modes"]})
+        self.assertEqual(SceneDeployment(compute_mode="batch_roofline").model_dump()["compute_mode"], "fast_mode")
+        model = next(row for row in catalog["models"] if row["id"] == "configs/model/glm-5.2.json")
+        self.assertFalse(model["available"])
+        self.assertIn("nvidia_h200", model["fast_hardware"])
+        deployment = SceneDeployment(
+            compute_mode="fast_mode",
+            model=model["id"],
+            hardware="configs/hardware/nvidia_h200.yaml",
+            hardware_id="nvidia_h200",
+            tp=8,
+            pp=1,
+            dp=4,
+            max_batched_tokens=128,
+            expert_parallel=True,
+            wide_ep_enabled=True,
+            expert_routing_seed=0,
+        )
+        validate_deployment_choice(deployment, self.root)
+        validate_deployment_choice(deployment.model_copy(update=dict(dp=2)), self.root)
+        for update in (dict(wide_ep_enabled=False), dict(compute_mode="midlayer"), dict(expert_routing_seed=None),
+                       dict(max_batched_tokens=32)):
+            with self.subTest(update=update), self.assertRaises(ValueError):
+                validate_deployment_choice(deployment.model_copy(update=update), self.root)

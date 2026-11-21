@@ -17,6 +17,13 @@ def build_scene(
     from astermind.engine.state.physical_dataset import PhysicalAttributes
 
     deployment = SceneDeployment.model_validate(deployment)
+    batch = deployment.compute_mode == "fast_mode"
+    communication = dict(deployment.communication)
+    if batch:
+        communication.setdefault("intra_mode", "surrogate")
+        communication.setdefault("default_hardware_id", deployment.hardware_id)
+        if deployment.dp > 1:
+            communication.setdefault("ep_strategy", "direct")
     root, _, _ = load_dataset(dataset)
     concrete = json.loads(
         (root / "materialized_input.json").read_text(encoding="utf-8")
@@ -105,19 +112,25 @@ def build_scene(
             for member in sorted(members)
             for slot in range(deployment.gpus_per_satellite)
         ]
-        workers = deployment.tp * deployment.pp
+        workers = deployment.tp * deployment.pp * deployment.dp
         if workers > len(slots):
             raise ValueError(
-                f"Cell {identity} 的 TP×PP={workers} 超过可用 GPU 数 {len(slots)}"
+                f"Cell {identity} 的 TP×PP×DP={workers} 超过可用 GPU 数 {len(slots)}"
             )
+        parallel = dict(tp=deployment.tp, pp=deployment.pp, dp=deployment.dp)
+        if batch and deployment.expert_parallel:
+            parallel["ep"] = deployment.tp * deployment.dp
         cells.append(
             dict(
                 id=identity,
                 model=deployment.model,
                 hardware=deployment.hardware,
                 hardware_id=deployment.hardware_id,
-                parallel=dict(tp=deployment.tp, pp=deployment.pp),
+                parallel=parallel,
+                scheduler_adapter="vllm_0_30" if batch else "auto",
                 native_expert_parallel=deployment.expert_parallel,
+                wide_ep_enabled=deployment.wide_ep_enabled,
+                fast_glm_dsa_score=deployment.fast_glm_dsa_score,
                 expert_routing_seed=deployment.expert_routing_seed,
                 placements=[
                     dict(rank=rank, device=gpu)
@@ -159,7 +172,7 @@ def build_scene(
         requests=list(requests),
         migrations=list(migrations),
         compute_mode=deployment.compute_mode,
-        communication=deployment.communication,
+        communication=communication,
         routing=routing or {},
         cell_selection=cell_selection,
         horizon_ns=round(concrete["time"]["duration_s"] * 1e9),

@@ -44,6 +44,21 @@ class ServingScheduler:
             raise TypeError("failure callback must be callable")
         self._on_failure = on_failure
         self._kv_bytes = 0
+        self._native_dp_kv_ceiling = None
+        self._kv_event_scope = "representative_rank"
+        if getattr(batch_executor, "compute_mode", None) == "fast_mode":
+            model = getattr(execution, "model", None)
+            model_type = getattr(model, "model_type", None)
+            if getattr(model, "attention_layout", None) == "hybrid_kda_mla":
+                from .fast_mode.source_memory import native_kv_event_ceiling
+                self._native_dp_kv_ceiling = native_kv_event_ceiling(backend, hybrid=True)
+                self._kv_event_scope = "native_hybrid_group_page_events"
+            elif (getattr(backend, "data_parallel_size", 1) > 1
+                  and (model_type in ("deepseek_v3", "kimi_k2", "qwen3_moe")
+                       or model_type == "glm_moe_dsa" and model.weight_dtype == "fp8")):
+                from .fast_mode.source_memory import native_kv_event_ceiling
+                self._native_dp_kv_ceiling = native_kv_event_ceiling(backend, hybrid=False)
+                self._kv_event_scope = "native_dp_group_page_events"
         self._inflight = None
         self._dispatch_pending = False
         self._closed = False
@@ -149,11 +164,10 @@ class ServingScheduler:
             self._record_load()
             return
         self._blocked = False
-        plan = prepare_scheduled_step(
-            self.execution, step,
-            source_prompt_lengths=tuple(self._requests[row.request_id].input_tokens
-                                        for row in step.schedule.requests),
-        )
+        prompt_lengths = tuple(self._requests[row.request_id].input_tokens for row in step.schedule.requests)
+        prepare_batch = getattr(self.batch_executor, "prepare_batch", None)
+        plan = (prepare_batch(step, prompt_lengths) if prepare_batch is not None
+                else prepare_scheduled_step(self.execution, step, source_prompt_lengths=prompt_lengths))
         start = self.loop.now_s
         self._inflight = (step, start)
         for request_id in step.schedule.preempted_request_ids:
@@ -228,8 +242,10 @@ class ServingScheduler:
                     self._kv_bytes -= event.bytes
             elif event.action in (KVCacheAction.LOAD, KVCacheAction.EVICT):
                 raise NotImplementedError("offload/migration is outside first cell scope")
-        capacity = (self.backend.config.num_kv_blocks * self.backend.config.kv_block_size_tokens
-                    * self.backend.config.kv_bytes_per_token)
+        capacity = self._native_dp_kv_ceiling
+        if capacity is None:
+            capacity = (self.backend.config.num_kv_blocks * self.backend.config.kv_block_size_tokens
+                        * self.backend.config.kv_bytes_per_token)
         if not 0 <= self._kv_bytes <= capacity:
             raise RuntimeError("KV event accounting exceeds the configured capacity")
 
@@ -322,7 +338,7 @@ class ServingScheduler:
                 "pipeline_parallel_size": pool.parallel_plan.config.pipeline_parallel_size,
                 "expert_parallel_size": pool.parallel_plan.config.expert_parallel_size,
                 "worker_count": len(pool.ranks),
-                "kv_allocated_bytes_scope": "representative_rank",
+                "kv_allocated_bytes_scope": self._kv_event_scope,
             },
             "host_timing": "native_launch_profile" if self.execution.host_launch_profiles else "device_only",
             "device_communication_timing": (
@@ -337,7 +353,7 @@ class ServingScheduler:
         from .provenance import contract
         return dict(native_contract=dict(model_id=self.execution.model.model_id,
                         model_config_sha256=self.execution.model.config_sha256,
-                        compute_mode=self.execution.prediction_method,
+                        compute_mode=getattr(self.batch_executor, "compute_mode", self.execution.prediction_method),
                         runtime_inputs=contract(self.execution.runtime_inputs)),steps=self.steps, load_history=self.load_history, final_load=self.snapshot(),
                     execution_performance=self.execution.performance_stats(),
                     scheduler_runtime=runtime if isinstance(runtime, dict) else asdict(runtime))

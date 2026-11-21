@@ -3,10 +3,11 @@ import json
 from pathlib import Path
 from typing import Annotated, Literal
 from pydantic import Field, model_validator
-from astermind.common.contracts import Contract, Identifier, Nanoseconds
+from astermind.common.contracts import Contract, ComputeMode, Identifier, Nanoseconds
 from .deployment import Positive, ServingCell
 from .requests import Request, Migration
 from .communication import CommPolicy
+from astermind.common.hardware_capabilities import FAST_MODE_HARDWARE, PORTABLE_BATCH_HARDWARE
 
 class CellLinkAddition(Contract):
     source: Identifier
@@ -30,7 +31,7 @@ class SimulationConfig(Contract):
     cells: tuple[ServingCell, ...]
     requests: tuple[Request, ...]
     migrations: tuple[Migration, ...] = ()
-    compute_mode: Literal["midlayer", "roofline"] = "midlayer"
+    compute_mode: ComputeMode = "midlayer"
     communication: CommPolicy = Field(default_factory=CommPolicy)
     routing: RoutingConfig = Field(default_factory=RoutingConfig)
     cell_selection: Literal['least_loaded', 'nearest', 'estimated_arrival'] = 'least_loaded'
@@ -100,6 +101,30 @@ class SimulationConfig(Contract):
                 raise ValueError("duplicate Cell/request ID")
         if not self.cells:
             raise ValueError("at least one serving Cell required")
+        if self.compute_mode == "fast_mode":
+            if self.migrations:
+                raise ValueError("fast_mode does not support KV migrations")
+            portable_scene = any(cell.hardware_id in PORTABLE_BATCH_HARDWARE for cell in self.cells)
+            for cell in self.cells:
+                if cell.hardware_id not in FAST_MODE_HARDWARE:
+                    raise ValueError(f"fast_mode has no hardware profile for {cell.hardware_id}")
+                if cell.deployment != "colocated" or cell.parallel.sp != 1:
+                    raise ValueError(f"fast_mode requires colocated SP1 in Cell {cell.id}")
+                override = self.communication.cell_policies.get(cell.id)
+                intra_mode = (override and override.intra_mode) or self.communication.intra_mode
+                if intra_mode != "surrogate":
+                    raise ValueError(f"fast_mode requires surrogate intra communication in Cell {cell.id}")
+                if cell.parallel.dp > 1 and self.communication.ep_strategy != "direct":
+                    raise ValueError(f"fast_mode requires direct EP in Cell {cell.id}")
+                if (cell.hardware_id in PORTABLE_BATCH_HARDWARE
+                        and cell.scheduler_adapter != "vllm_0_30"):
+                    raise ValueError(f"{cell.hardware_id} fast_mode requires vllm_0_30 in Cell {cell.id}")
+                if portable_scene:
+                    comm_hardware = (override and override.hardware_id) or self.communication.default_hardware_id
+                    for placement in cell.placements:
+                        actual = self.communication.gpu_hardware.get(placement.device, comm_hardware)
+                        if actual != cell.hardware_id:
+                            raise ValueError(f"Cell {cell.id} GPU {placement.device} uses {actual} for Comm, expected {cell.hardware_id}")
         known = {c.id for c in self.cells}
         if set(self.communication.cell_policies) - known:
             raise ValueError("communication policy refers to an unknown Cell")

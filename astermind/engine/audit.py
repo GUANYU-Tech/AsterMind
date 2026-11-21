@@ -76,10 +76,32 @@ def audit(result):
         for key in ('input_ready_ticks', 'parent_ready_ticks', 'kv_ready_ticks'):
             if key in state:
                 assert ready >= int(state[key]), state
+    fast_modes = ('fast_mode', 'batch_roofline')
+    legacy_pricing = {'reused_jt': 'reused', 'partial_jt_reuse': 'partial_reuse',
+                      'isolated_jt': 'isolated', 'runtime_jt': 'runtime'}
     for batch in result['batches']:
         failed=batch.get('status')=='failed'
         counts['failed_batches']+=failed
         assert batch.get('native_communication_duration_charged_s',0)==0
+        if batch.get('mode') in fast_modes and not failed:
+            assert result['configuration']['compute_mode'] in fast_modes, batch
+            assert not batch['calls'], batch
+            pricing = batch['communication_pricing']
+            if batch['mode'] == 'batch_roofline':
+                pricing = legacy_pricing.get(pricing, pricing)
+            assert pricing in ('reused', 'partial_reuse', 'isolated', 'runtime'), batch
+            compute, communication = batch['compute_s'], batch['communication_s']
+            assert all(isfinite(value) and value >= 0 for value in (compute, communication)), batch
+            start, end = int(batch['start_time_ticks']), int(batch['end_time_ticks'])
+            if pricing == 'runtime':
+                compute_ticks = int(batch['compute_elapsed_ticks'])
+                communication_ticks = int(batch['communication_ticks'])
+                assert compute_ticks >= 0 and communication_ticks >= 0, batch
+                assert end - start == compute_ticks + communication_ticks, batch
+            else:
+                assert end - start == Time(compute + communication).ticks, batch
+            counts['fast_mode_batches'] = counts.get('fast_mode_batches', 0) + 1
+            continue
         calls={(c['call_id'],c['occurrence']):c for c in batch['calls']}
         for call in calls.values():
             if call['end_time_ns'] is None:

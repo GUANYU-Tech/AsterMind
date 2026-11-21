@@ -1,7 +1,7 @@
 """Logical model placement and native Scheduler configuration."""
 from typing import Annotated, Literal
 from pydantic import Field, model_validator
-from astermind.common.contracts import Contract, Identifier, Nanoseconds
+from astermind.common.contracts import Contract, ComputeMode, Identifier, Nanoseconds
 
 Positive = Annotated[int, Field(strict=True, gt=0)]
 
@@ -60,6 +60,7 @@ class ServingCell(Contract):
     external_terminals: tuple[Identifier, ...]
     execution_mode: Literal["accelerated", "fast", "reference"] = "accelerated"
     graph_backend: Literal["midlayer"] = "midlayer"
+    fast_glm_dsa_score: Literal["bf16_timing_proxy"] | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -100,14 +101,17 @@ class ServingCell(Contract):
 
 
 class SceneDeployment(Contract):
-    compute_mode: Literal["midlayer", "roofline"] = "midlayer"
+    compute_mode: ComputeMode = "midlayer"
     model: str = "configs/model/qwen3-8b.json"
     hardware: str = "configs/hardware/nvidia_a800.yaml"
     hardware_id: str = "nvidia_a800"
     gpus_per_satellite: Annotated[int, Field(strict=True, ge=1, le=64)] = 1
     tp: Positive = 2
     pp: Positive = 2
+    dp: Positive = 1
     expert_parallel: bool = False
+    wide_ep_enabled: bool = False
+    fast_glm_dsa_score: Literal["bf16_timing_proxy"] | None = None
     expert_routing_seed: Annotated[int, Field(strict=True, ge=0)] | None = None
     max_requests: Annotated[int, Field(strict=True, ge=1, le=1024)] = 4
     max_model_len: Annotated[int, Field(strict=True, ge=2, le=131072)] = 128

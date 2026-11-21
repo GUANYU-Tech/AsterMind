@@ -1,7 +1,14 @@
 from __future__ import annotations
 
-from typing import Annotated
-from pydantic import BaseModel, ConfigDict, Field
+from typing import Annotated, Literal
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
+
+
+def normalize_compute_mode(value):
+    return "fast_mode" if isinstance(value, str) and value == "batch_roofline" else value
+
+
+ComputeMode = Annotated[Literal["midlayer", "roofline", "fast_mode"], BeforeValidator(normalize_compute_mode)]
 
 
 Identifier = Annotated[str, Field(min_length=1, pattern=r"^[A-Za-z0-9_.:/-]+$")]

@@ -30,6 +30,22 @@ class CellTimeRecordTests(unittest.TestCase):
     def test_distribution_batch_and_communication_share_exact_tick_authority(self):
         self.assertTrue(audit(result())['passed'])
 
+    def test_fast_mode_audits_compute_and_communication_without_kernel_records(self):
+        data = result()
+        data['configuration']['compute_mode'] = 'fast_mode'
+        batch = data['batches'][0]
+        batch.update(mode='fast_mode', calls=[], compute_s=3e-18, communication_s=1e-18,
+                     communication_pricing='isolated')
+        self.assertEqual(audit(data)['fast_mode_batches'], 1)
+        legacy = deepcopy(data)
+        legacy['configuration']['compute_mode'] = 'batch_roofline'
+        legacy['batches'][0].update(mode='batch_roofline', communication_pricing='isolated_jt')
+        self.assertEqual(audit(legacy)['fast_mode_batches'], 1)
+        for update in (dict(end_time_ticks='10'), dict(communication_pricing='unknown'),
+                       dict(compute_s=-1)):
+            with self.subTest(update=update), self.assertRaises(AssertionError):
+                audit({**data, 'batches': [{**batch, **update}]})
+
     def test_audit_rejects_one_tick_distribution_dependency_and_clock_errors(self):
         mutations=[lambda r:r['input_distributions'][0].update(completed_ticks='6'),
                    lambda r:r['batches'][0]['calls'][1].update(start_time_ticks='7'),
