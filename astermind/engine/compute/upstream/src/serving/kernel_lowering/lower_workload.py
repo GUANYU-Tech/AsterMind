@@ -837,7 +837,7 @@ def _fused_moe_routing_relabelling(node, hardware_id, hardware, canonical_axes=N
         # Its existing external router also supplies the fused shared column.
         # Keep the declared axis; a vLLM recipe cannot identify this caller.
         return None
-    if _h200_bf16_expert_math_domain(node, hardware_id):
+    if _unbound_bf16_expert_math_domain(node, hardware_id):
         if "owned_experts" not in node.attributes or not node.attributes["owned_experts"]:
             return None
         counts, owned = node.attributes["tokens_per_expert"], node.attributes["owned_experts"]
@@ -2736,6 +2736,12 @@ def _target_gemm_specs(
     hardware,
     block_fp8_checkpoint: bool,
 ) -> tuple[KernelSpec, ...]:
+    if (block_fp8_checkpoint and node.kind is WorkloadKind.LINEAR and node.variant == "gemm"
+            and node.attributes.get("model_source_profile") == "vllm_0_30_v32_fp8_sync_explicit_allreduce"
+            and hardware.supports_source_contract("glm_fp8_weight_only_roofline")):
+        return (KernelSpec(kind=KernelKind.GEMM, hardware_id=hardware_id, shape=node.shape,
+            dtype="bf16", variant="gemm", attributes={"mathematical_program": "block_fp8_weight_only_bf16_v1"},
+            launch=None, execution_support="unsupported", unsupported_reason="launch_selector_unavailable"),)
     if node.variant == "batched_gemm":
         attributes = {
             name: node.attributes[name]
@@ -2999,6 +3005,8 @@ def _target_kv_cache_update_spec(
     node: WorkloadNode,
     hardware_id: str,
     hardware,
+    *,
+    logical_only: bool = False,
 ) -> KernelSpec:
     shape = _vector_shape(node)
     if node.variant == "mla_kv_cache":
@@ -3038,6 +3046,10 @@ def _target_kv_cache_update_spec(
     }
     if node.variant == "dsv4_compressed_state_cache" and "finish_stage" in node.attributes:
         attributes["finish_stage"] = node.attributes["finish_stage"]
+    if logical_only:
+        return KernelSpec(kind=KernelKind.KV_CACHE, hardware_id=hardware_id, shape=shape,
+            dtype=node.dtype, variant=node.variant, attributes=attributes, launch=None,
+            execution_support="unsupported", unsupported_reason="launch_selector_unavailable")
     return _selected_target_compute_spec(
         node, hardware_id, hardware, KernelKind.KV_CACHE,
         node.variant, shape, attributes)
@@ -3170,7 +3182,7 @@ def _compute_spec(node: WorkloadNode, hardware_id: str, hardware) -> KernelSpec:
     from .v4_modelsp_contract import handles_fill
     if handles_fill(node):
         a=node.attributes
-        if hardware_id!="nvidia_h200" or node.dtype not in ("bf16","int32") or a.get("model_source_profile")!="vllm_0_30_v4_sync_fp8_ds_mla" or a.get("model_execution_version")!="vllm_0_30_0" or (a.get("operation"),a.get("reads"),a.get("writes"),a.get("source_constant"))!=("fill",0,1,0):
+        if (hardware_id != "nvidia_h200" and not hardware.supports_source_contract("deepseek_v4_portable_roofline")) or node.dtype not in ("bf16","int32") or a.get("model_source_profile")!="vllm_0_30_v4_sync_fp8_ds_mla" or a.get("model_execution_version")!="vllm_0_30_0" or (a.get("operation"),a.get("reads"),a.get("writes"),a.get("source_constant"))!=("fill",0,1,0):
             raise ValueError("V4 model-SP zero requires its proved typed source write")
         return KernelSpec(kind=KernelKind.VECTOR,hardware_id=hardware_id,shape={"element_count":node.shape["elements"],"dtype_bytes":2 if node.dtype=="bf16" else 4},dtype=node.dtype,variant="elementwise",attributes={"operation":"fill","reads":0,"writes":1,"mathematical_program":"v4_modelsp_zero_fill_v1"},launch=None,execution_support="unsupported",unsupported_reason="launch_selector_unavailable")
     kind = _SINGLE_COMPUTE_KIND[node.kind]
@@ -3337,6 +3349,13 @@ def _compute_spec(node: WorkloadNode, hardware_id: str, hardware) -> KernelSpec:
                 prediction_attributes["swiglu_limit"] = node.attributes["swiglu_limit"]
                 if selection_attributes["launch_policy"] != "analytical_launch":
                     raise NotImplementedError("clamped SiLU actual launch binding is unavailable")
+            if (hardware_id == "ascend_910b" and node.kind is WorkloadKind.NORM
+                    and node.attributes.get("model_source_profile") == "vllm_0_27_1_deepseek_v3_sync_fp8"):
+                # The V3 graph does not own a CANN FP32 rstd output buffer.
+                return KernelSpec(kind=kind, hardware_id=hardware_id, shape=shape, dtype=node.dtype,
+                    variant=variant, attributes={**prediction_attributes,
+                        "mathematical_program": "dense_bf16_source_flops_bytes_v1"},
+                    launch=None, execution_support="unsupported", unsupported_reason="launch_selector_unavailable")
         elif node.kind is WorkloadKind.ELEMENTWISE:
             elementwise_variants = {
                 "elementwise": "elementwise",
@@ -3348,6 +3367,16 @@ def _compute_spec(node: WorkloadNode, hardware_id: str, hardware) -> KernelSpec:
                     "unsupported elementwise workload variant: "
                     f"{node.variant!r}")
             variant = elementwise_variants[node.variant]
+            if (hardware_id == "ascend_910b"
+                    and node.attributes.get("model_source_profile") == "vllm_0_27_1_deepseek_v3_sync_fp8"
+                    and node.attributes.get("operation") == "unary"
+                    and "scalar_value" in node.attributes):
+                # A scalar multiply reads one tensor. Keep the logical
+                # memory interface distinct from CANN's two-input Mul launch.
+                return KernelSpec(kind=kind, hardware_id=hardware_id, shape=shape, dtype=node.dtype,
+                    variant=variant, attributes={"operation": "unary", "reads": 1, "writes": 1,
+                        "mathematical_program": "dense_bf16_source_flops_bytes_v1"},
+                    launch=None, execution_support="unsupported", unsupported_reason="launch_selector_unavailable")
         elif node.kind in vector_variants:
             variant = vector_variants[node.kind]
             if node.kind is WorkloadKind.ROTARY and node.variant == "rope":
@@ -3471,7 +3500,7 @@ def _compute_spec(node: WorkloadNode, hardware_id: str, hardware) -> KernelSpec:
             return KernelSpec(kind=kind, hardware_id=hardware_id, shape=shape, dtype="fp16", variant=variant,
                 attributes={**prediction_attributes, "mathematical_program": "dense_fp16_source_flops_bytes_v1"},
                 launch=None, execution_support="unsupported", unsupported_reason="launch_selector_unavailable")
-        raise NotImplementedError("this FP16 source operator has no bound C500 launch or explicit mathematical program")
+        raise NotImplementedError("this FP16 source operator has no declared device launch or mathematical program")
     if (HWSpec.source_contract_supported("bf16_fp32_symbolic_matmul_source_math", hardware_id) and node.dtype == "bf16" and kind is KernelKind.GEMM
             and {"has_bias", "weight_dtype", "weight_group_size"}.issubset(node.attributes)
             and selection_attributes["launch_policy"] == "analytical_launch"
@@ -4704,7 +4733,8 @@ def _target_fused_moe_specs(
         return (KernelSpec(kind=KernelKind.FUSED_MOE, hardware_id=hardware_id, shape=shape,
             dtype=node.dtype, variant="routed_experts", attributes=attrs, launch=None,
             execution_support="unsupported", unsupported_reason="launch_selector_unavailable"),)
-    if (HWSpec.source_contract_supported("unbound_grouped_bf16_expert_source_math", hardware_id) and routed_weight_dtype == "bf16"
+    if ((HWSpec.source_contract_supported("unbound_grouped_bf16_expert_source_math", hardware_id)
+            or HWSpec.source_contract_supported("glm_bf16_portable_roofline", hardware_id)) and routed_weight_dtype == "bf16"
             and node.attributes["launch_policy"] == "analytical_launch"
             and node.attributes["source_component"] == "symbolic_grouped_routed_experts"
             and node.attributes["routing_source_stage"] == "dsv32_moe_route"
@@ -4728,7 +4758,8 @@ def _target_fused_moe_specs(
     if routed_weight_dtype != "int4" and routed_weight_dtype != "mxfp4":
         raise ValueError(
             f"unsupported target routed weight dtype: {routed_weight_dtype!r}")
-    if (HWSpec.source_contract_supported("kimi_grouped_marlin_source_math", hardware_id) and routed_weight_dtype == "int4"
+    if ((HWSpec.source_contract_supported("kimi_grouped_marlin_source_math", hardware_id)
+            or HWSpec.source_contract_supported("kimi_k2_portable_roofline", hardware_id)) and routed_weight_dtype == "int4"
             and node.attributes["launch_policy"] == "analytical_launch"
             and node.attributes["source_component"] == "symbolic_grouped_routed_experts"
             and node.attributes["routing_source_stage"] == "kimi_moe_route"):
@@ -5266,7 +5297,9 @@ def _validate_pipeline_p2p_node(node: WorkloadNode, pool) -> None:
         config = pool.parallel_plan.config
         device_dense_pipeline = (pool.hardware_id in ("metax_c500", "ascend_910b")
             and isinstance(attributes.get("payload_tensor"), Mapping)
-            and attributes["payload_tensor"].get("dtype") == "bf16"
+            and (attributes["payload_tensor"].get("dtype") == "bf16"
+                 or attributes["payload_tensor"].get("dtype") == "fp16"
+                 and HWSpec.source_contract_supported("symbolic_fp16_unbound_source_lowering", pool.hardware_id))
             and config.is_rank_local and not config.enable_expert_parallel
             and config.pipeline_parallel_size > 1
             and config.sequence_parallel_size == config.context_parallel_size == config.data_parallel_size == 1)
@@ -6360,7 +6393,8 @@ def _symbolic_glm53_rank_local_ep_projection(node, pool):
     from src.serving.workload.model_config import GLM_MOE_DSA_5_3_CONFIG_SHA256
     config, attrs = pool.parallel_plan.config, node.attributes
     tp, pp = config.tensor_parallel_size, config.pipeline_parallel_size
-    return (pool.hardware_id == "nvidia_h200" and pool.role == "colocated"
+    return ((pool.hardware_id == "nvidia_h200" or HWSpec.source_contract_supported(
+        "glm_fp8_weight_only_roofline", pool.hardware_id)) and pool.role == "colocated"
         and config.is_rank_local and config.enable_expert_parallel
         and config.expert_parallel_size == tp and tp in (2, 4, 8, 16)
         and len(pool.ranks) == tp * pp
@@ -6384,11 +6418,12 @@ def _symbolic_glm53_dp1_ep8_deferred_projection(node, pool):
     extended = (attrs.get("source_glm53_dp1_deferred") is True
         and _symbolic_glm53_rank_local_ep_projection(node, pool)
         and (pp == 1 or _symbolic_glm_pcp_projection(node, pool)))
-    return (pool.hardware_id == "nvidia_h200" and pool.role == "colocated"
+    return ((pool.hardware_id == "nvidia_h200" or HWSpec.source_contract_supported(
+        "glm_fp8_weight_only_roofline", pool.hardware_id)) and pool.role == "colocated"
         and config.is_rank_local and config.enable_expert_parallel
         and config.expert_parallel_size == tp and len(pool.ranks) == tp * pp
         and pool.parallel_plan.num_layers == 78 and pool.parallel_plan.num_experts == 256
-        and (legacy or extended)
+        and ((legacy and pool.hardware_id == "nvidia_h200") or extended)
         and attrs.get("model_config_sha256") == GLM_MOE_DSA_5_3_CONFIG_SHA256
         and attrs.get("model_execution_version") == "vllm_0_30_0"
         and attrs.get("model_source_profile") == "vllm_0_30_v32_fp8_sync_explicit_allreduce")
@@ -6398,7 +6433,9 @@ def _symbolic_glm_fp8_target_dp_projection(node, pool):
     """Ordinary target source identity; never impersonates an MTP pass."""
     config, attrs = pool.parallel_plan.config, node.attributes
     tp, dp = config.tensor_parallel_size, config.data_parallel_size
-    return (HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id) and pool.role == "colocated" and config.context_parallel_size == 1
+    return ((HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id)
+             or HWSpec.source_contract_supported("glm_fp8_weight_only_roofline", pool.hardware_id))
+        and pool.role == "colocated" and config.context_parallel_size == 1
         and dp > 1 and 2048 % (tp * 128) == 0
         and (256 % config.expert_parallel_size == 0 if config.enable_expert_parallel else 2048 % (tp * dp * 128) == 0)
         and config.sequence_parallel_size in ((1, tp) if config.enable_expert_parallel else (1,))
@@ -6411,6 +6448,8 @@ def _symbolic_glm_fp8_target_dp_projection(node, pool):
 
 
 def _symbolic_glm_pcp_projection(node, pool):
+    from src.serving.deployment.validated_scope import is_portable_glm_bf16_pool
+
     config = pool.parallel_plan.config
     pcp = ("pcp_source" in node.attributes and node.attributes["pcp_source"] is True
         and config.context_parallel_size > 1)
@@ -6425,7 +6464,9 @@ def _symbolic_glm_pcp_projection(node, pool):
         and node.attributes["model_execution_version"] == "vllm_0_30_0"
         and (node.attributes["model_source_profile"] == "vllm_0_30_v32_bf16_sync_explicit_allreduce"
             or ordinary and node.attributes["model_source_profile"] == "vllm_0_30_v32_fp8_sync_explicit_allreduce"
-            and config.context_parallel_size == 1 and HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id)
+            and config.context_parallel_size == 1 and (
+                HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id)
+                or HWSpec.source_contract_supported("glm_fp8_weight_only_roofline", pool.hardware_id))
             and (not config.enable_expert_parallel and config.sequence_parallel_size == 1
                 or _symbolic_glm_fp8_rank_local_mtp_ep_projection(node, pool)
                 or _symbolic_glm53_rank_local_ep_projection(node, pool)
@@ -6434,7 +6475,11 @@ def _symbolic_glm_pcp_projection(node, pool):
                 and config.sequence_parallel_size in (1, config.tensor_parallel_size)
                 and "source_data_parallel_rank" in node.attributes))
         and (HWSpec.source_contract_supported("glm_tp8_pp4_ep8_source_projection", pool.hardware_id)
-            or HWSpec.source_contract_supported("glm_tp8_pp2_ep1_source_projection", pool.hardware_id))
+            or HWSpec.source_contract_supported("glm_tp8_pp2_ep1_source_projection", pool.hardware_id)
+            or node.attributes["model_source_profile"] == "vllm_0_30_v32_fp8_sync_explicit_allreduce"
+            and HWSpec.source_contract_supported("glm_fp8_weight_only_roofline", pool.hardware_id)
+            or ordinary and node.attributes["model_source_profile"] == "vllm_0_30_v32_bf16_sync_explicit_allreduce"
+            and is_portable_glm_bf16_pool(pool))
         and pipeline
         and (config.sequence_parallel_size == 1 and (not config.enable_expert_parallel or config.data_parallel_size == 1)
             or config.enable_expert_parallel and config.data_parallel_size > 1
@@ -6905,7 +6950,9 @@ def _symbolic_v3_parallel_projection(node, pool):
             and node.attributes.get("model_execution_version")=="vllm_0_27_1"
             and node.attributes.get("model_source_profile")=="vllm_0_27_1_deepseek_v3_sync_fp8"):
         return True
-    return (HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id) and config.is_rank_local and not config.enable_expert_parallel
+    source_scope = (HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id)
+        or HWSpec.source_contract_supported("deepseek_v3_portable_roofline", pool.hardware_id))
+    return (source_scope and config.is_rank_local and not config.enable_expert_parallel
         and len(pool.ranks) == config.worker_count
         and "source_projection_only" in node.attributes and node.attributes["source_projection_only"] is True
         and "model_execution_version" in node.attributes and node.attributes["model_execution_version"] == "vllm_0_27_1"
@@ -6916,7 +6963,9 @@ def _symbolic_v3_parallel_projection(node, pool):
 def _symbolic_v3_dp_pipeline_projection(node, pool):
     """Versioned distributed PP topology; operator pricing stays separate."""
     config = pool.parallel_plan.config
-    return (HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id) and config.context_parallel_size == config.sequence_parallel_size == 1
+    return ((HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id)
+        or HWSpec.source_contract_supported("deepseek_v3_expert_roofline", pool.hardware_id))
+        and config.context_parallel_size == config.sequence_parallel_size == 1
         and config.data_parallel_size > 1 and config.pipeline_parallel_size > 1
         and len(pool.ranks) == config.worker_count
         and "source_projection_only" in node.attributes and node.attributes["source_projection_only"] is True
@@ -7104,7 +7153,9 @@ def _a800_extended_kimi_scope(pool):
 def _symbolic_kimi_dp_projection(node, pool):
     """Versioned K2 DP program marker; exact expert ports checked graph-wide."""
     config = pool.parallel_plan.config
-    return ((HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id) or _a800_extended_kimi_scope(pool)) and config.data_parallel_size > 1
+    return ((HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id)
+        or HWSpec.source_contract_supported("kimi_k2_portable_roofline", pool.hardware_id)
+        or _a800_extended_kimi_scope(pool)) and config.data_parallel_size > 1
         and config.context_parallel_size == config.sequence_parallel_size == 1
         and len(pool.ranks) == config.worker_count
         and "source_projection_only" in node.attributes and node.attributes["source_projection_only"] is True
@@ -7121,7 +7172,9 @@ def _symbolic_mla_dp_pipeline_projection(node, pool):
 def _symbolic_kimi_parallel_projection(node, pool):
     """K2 source marker, with stage-local TP/EP and nonempty layers."""
     config = pool.parallel_plan.config
-    return ((HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id) or _a800_extended_kimi_scope(pool)) and config.is_rank_local
+    return ((HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id)
+        or HWSpec.source_contract_supported("kimi_k2_portable_roofline", pool.hardware_id)
+        or _a800_extended_kimi_scope(pool)) and config.is_rank_local
         and len(pool.ranks) == config.worker_count
         and all(pool.parallel_plan.layer_to_pipeline_stage.count(stage) > 0
             for stage in range(config.pipeline_parallel_size))
@@ -7177,8 +7230,11 @@ def _symbolic_k3_pipeline_projection(node, pool):
 
 def _symbolic_k3_pipeline_topology_projection(node, pool):
     """K3 PP transport identity, independent of operator pricing scope."""
+    from src.serving.deployment.validated_scope import is_portable_kimi_k3_pool
+
     config = pool.parallel_plan.config
-    return (HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id) and pool.parallel_plan.num_layers == 93
+    return ((HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id)
+        or is_portable_kimi_k3_pool(pool)) and pool.parallel_plan.num_layers == 93
         and 1 < config.pipeline_parallel_size <= pool.parallel_plan.num_layers
         and config.context_parallel_size == config.sequence_parallel_size == 1
         and len(pool.ranks) == config.worker_count
@@ -7188,7 +7244,10 @@ def _symbolic_k3_pipeline_topology_projection(node, pool):
 
 
 def _is_k3_source_pipeline_graph(graph, pool):
-    return (HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id) and pool.parallel_plan.num_layers == 93
+    from src.serving.deployment.validated_scope import is_portable_kimi_k3_pool
+
+    return ((HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id)
+        or is_portable_kimi_k3_pool(pool)) and pool.parallel_plan.num_layers == 93
         and pool.parallel_plan.config.pipeline_parallel_size > 1
         and any(node.pool_name == pool.name and node.variant == "kimi_k3_attn_res"
             and "source_projection_only" in node.attributes and node.attributes["source_projection_only"] is True
@@ -7201,7 +7260,8 @@ def _symbolic_v4_parallel_projection(node, pool):
     config = pool.parallel_plan.config
     # The two pinned V4 targets have8/16 output groups. The model boundary
     # checks its own exact group count and whole quantized intermediate.
-    return (HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id)
+    return ((HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id)
+        or HWSpec.source_contract_supported("deepseek_v4_portable_roofline", pool.hardware_id))
         and ((config.is_rank_local and not config.enable_expert_parallel) or v4_ep_applicable(pool))
         and 16 % config.tensor_parallel_size == 0 and 1 <= config.pipeline_parallel_size <= pool.parallel_plan.num_layers
         and len(pool.ranks) == config.worker_count
@@ -7218,7 +7278,9 @@ def _symbolic_v4_pipeline_projection(node, pool):
 def _symbolic_v4_pipeline_topology_projection(node, pool):
     """Versioned V4 PP geometry, independent of operator pricing support."""
     config = pool.parallel_plan.config
-    return (HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id) and config.context_parallel_size == config.sequence_parallel_size == 1
+    return ((HWSpec.source_contract_supported("h200_partial_source_programs", pool.hardware_id)
+        or HWSpec.source_contract_supported("deepseek_v4_portable_roofline", pool.hardware_id))
+        and config.context_parallel_size == config.sequence_parallel_size == 1
         and 16 % config.tensor_parallel_size == 0 and 1 < config.pipeline_parallel_size <= pool.parallel_plan.num_layers
         and len(pool.ranks) == config.worker_count
         and "source_projection_only" in node.attributes and node.attributes["source_projection_only"] is True
@@ -9165,8 +9227,15 @@ def _eager_attn_specs(node: WorkloadNode, hardware_id: str, hardware):
     return tuple(result)
 
 
-def _h200_bf16_expert_math_domain(node, hardware_id):
-    return (HWSpec.source_contract_supported("unbound_bf16_expert_source_math", hardware_id) and node.kind is WorkloadKind.FUSED_MOE
+def _unbound_bf16_expert_math_domain(node, hardware_id):
+    portable_qwen = (HWSpec.source_contract_supported("qwen3_moe_eager_source", hardware_id)
+        and node.attributes.get("model_execution_version") == "vllm_0_30_0"
+        and (node.attributes.get("expert_parallel_size") == 1
+            or node.attributes.get("expert_parallel_size", 0) > 2
+            and "source_dp_logical_rows" in node.attributes)
+        and tuple(node.shape.get(key) for key in ("experts", "topk", "hidden")) == (128, 8, 2048))
+    return ((HWSpec.source_contract_supported("unbound_bf16_expert_source_math", hardware_id) or portable_qwen)
+        and node.kind is WorkloadKind.FUSED_MOE
         and node.variant == "full" and node.dtype == "bf16"
         and "source_component" in node.attributes
         and node.attributes["source_component"] == "symbolic_unquantized_experts"
@@ -9228,7 +9297,7 @@ def _explicit_source_expert_specs(node, hardware_id, hardware, routing_relabelli
             raise ValueError("explicit source experts consume existing top-k weights and IDs")
         source["source_router_state"] = "prepared_topk_weights_and_ids"
         return _fused_moe_specs(node.with_attributes(source), hardware_id, hardware, routing_relabelling)
-    if _h200_bf16_expert_math_domain(node, hardware_id):
+    if _unbound_bf16_expert_math_domain(node, hardware_id):
         attributes = _fused_moe_prediction_attributes(node, routing_relabelling)
         return (KernelSpec(kind=KernelKind.FUSED_MOE, hardware_id=hardware_id, shape=node.shape,
             dtype="bf16", variant="routed_experts", attributes={**attributes,
@@ -9763,7 +9832,7 @@ def _bind_plan_source_launch_inputs(plan, inputs, hardware_by_id, graph):
                 if attrs["source_router_state"] != "prepared_topk_weights_and_ids":
                     raise ValueError("FP8 expert sidecar must consume its actual external router outputs")
             else:
-                source_domain = (_h200_bf16_expert_math_domain(node, kernel.hardware_id)
+                source_domain = (_unbound_bf16_expert_math_domain(node, kernel.hardware_id)
                     and attrs["model_execution_version"] == node.attributes["model_execution_version"]
                     and graph.source_model_execution_version == node.attributes["model_execution_version"])
                 if kernel.attributes["mathematical_program"] == "unquantized_bf16_legacy_grouped_swiglu_v1":
@@ -10139,23 +10208,82 @@ def lower_workload(
                 and _symbolic_glm_pipeline_projection(node, pool))
             a800_kimi_pipeline = _symbolic_kimi_pipeline_projection(node, pool)
             kimi_parallel = _symbolic_kimi_parallel_projection(node, pool) or _symbolic_kimi_dp_projection(node, pool)
+            portable_kimi = kimi_parallel and hardware.supports_source_contract("kimi_k2_portable_roofline")
             v3_parallel = _symbolic_v3_parallel_projection(node, pool)
+            portable_v3 = v3_parallel and hardware.supports_source_contract("deepseek_v3_portable_roofline")
             from .v3_dp_contract import applicable as dp_applicable, marker as dp_marker
             v3_active_dp = dp_applicable(pool) and dp_marker(node)
             a800_kimi_single = (HWSpec.source_contract_supported("kimi_tp1_unbound_source_lowering", hardware_id)
                 and _symbolic_kimi_single_rank_projection(node, pool))
-            a800_glm_pcp = (HWSpec.source_contract_supported("glm_tp8_pp4_ep8_source_projection", hardware_id)
+            a800_glm_pcp = ((HWSpec.source_contract_supported("glm_tp8_pp4_ep8_source_projection", hardware_id)
+                or hardware.supports_source_contract("glm_fp8_weight_only_roofline")
+                or hardware.supports_source_contract("glm_bf16_portable_roofline"))
                 and _symbolic_glm_pcp_projection(node, pool))
-            unbound_target_source = structural_target or a800_glm_pipeline or a800_kimi_pipeline or a800_kimi_single or a800_glm_pcp or kimi_parallel or v3_parallel
-            projection_scope = ("a800_tp8_pp4_ep8_glm_source_v1" if a800_glm_pipeline else
+            portable_k3 = (hardware.supports_source_contract("kimi_k3_portable_roofline")
+                and pool.parallel_plan.num_layers == 93
+                and node.attributes.get("model_execution_version") == "vllm_0_30_0"
+                and node.attributes.get("source_projection_only") is True
+                and (_symbolic_k3_pipeline_projection(node, pool)
+                     or _k3_tp_allowed_node(node, pool) or _k3_ep_allowed_node(node, pool)
+                     or node.kind is WorkloadKind.ROUTER and node.attributes.get("output_dtype") == "fp32"
+                     or node.attributes.get("source_component") == "vllm_0_30_symbolic_vocab_embedding"
+                     or node.kind is WorkloadKind.NORM and hardware_id == "ascend_910b"))
+            unbound_target_source = (structural_target or a800_glm_pipeline or a800_kimi_pipeline
+                or a800_kimi_single or a800_glm_pcp or kimi_parallel or v3_parallel or portable_k3)
+            projection_scope = ("vllm_0_30_portable_kimi_k2_source_v1" if portable_kimi else
+                "a800_tp8_pp4_ep8_glm_source_v1" if a800_glm_pipeline else
                 ("vllm_0_30_kimi_parallel_source_v1" if HWSpec.source_contract_supported("h200_partial_source_programs", hardware_id)
                     else "a800_kimi_parallel_source_v1" if _a800_extended_kimi_scope(pool)
                     else "a800_tp8_pp2_ep8_kimi_source_v1") if a800_kimi_pipeline else
                 "a800_tp1_kimi_source_v1" if a800_kimi_single else
                 "a800_kimi_parallel_source_v1" if kimi_parallel and _a800_extended_kimi_scope(pool) else
-                "vllm_0_30_glm_pcp_source_v1" if a800_glm_pcp else source_projection_scope)
+                "vllm_0_30_glm_pcp_source_v1" if a800_glm_pcp else
+                "vllm_0_30_portable_k3_source_v1" if portable_k3 else source_projection_scope)
             if is_heterogeneous_moe(node):
                 return heterogeneous_moe_specs(node, hardware_id)
+            if (hardware.supports_source_contract("deepseek_v4_portable_roofline")
+                    and node.attributes.get("model_source_profile") == "vllm_0_30_v4_sync_fp8_ds_mla"
+                    and node.kind not in (WorkloadKind.COLLECTIVE, WorkloadKind.P2P, WorkloadKind.MEMCPY)
+                    and not (node.kind is WorkloadKind.GATHER
+                             and "symbolic_pipeline" in node.attributes)):
+                from .heterogeneous_moe import v4_logical_compute_specs
+                from .v4_modelsp_contract import handles_fill
+
+                if handles_fill(node):
+                    return (_compute_spec(node, hardware_id, hardware),)
+                if node.kind is WorkloadKind.VECTOR and node.variant == "dsv4_moe_route":
+                    from .v4_modelsp_contract import handles_hash_route
+
+                    if handles_hash_route(node):
+                        return (KernelSpec(kind=KernelKind.VECTOR, hardware_id=hardware_id, shape=_vector_shape(node),
+                            dtype=node.dtype, variant=node.variant, attributes={
+                                "expert_id_selection": "hash_table",
+                                "routed_scaling_factor": node.attributes["routed_scaling_factor"],
+                                "routing_source": None, "mathematical_program": "v4_modelsp_hash_top6_masked_v1",
+                                "valid_rows": node.attributes["symbolic_padding_valid_prefix"]},
+                            launch=None, execution_support="unsupported", unsupported_reason="launch_selector_unavailable"),)
+                if (node.kind is WorkloadKind.FUSED_MOE and (
+                        pool.parallel_plan.config.enable_expert_parallel
+                        or node.attributes["source_logical_intermediate"] != node.shape["intermediate"])):
+                    return _target_fused_moe_specs(node, hardware_id, hardware,
+                        model_contract="deepseek_v4_vllm_0_30_0_logical_v1")
+                return v4_logical_compute_specs(node, hardware_id)
+            if (hardware_id == "ascend_910b" and portable_kimi
+                    and node.kind is WorkloadKind.ELEMENTWISE and node.variant == "elementwise"
+                    and node.dtype == "bf16" and node.attributes.get("operation") == "unary"
+                    and "scalar_value" in node.attributes):
+                return (KernelSpec(kind=KernelKind.VECTOR, hardware_id=hardware_id, shape=_vector_shape(node),
+                    dtype=node.dtype, variant=node.variant, attributes={
+                        "mathematical_program": "dense_bf16_source_flops_bytes_v1",
+                        **{key: node.attributes[key] for key in ("operation", "reads", "writes")}},
+                    launch=None, execution_support="unsupported", unsupported_reason="launch_selector_unavailable"),)
+            if (hardware_id == "ascend_910b" and (portable_k3 or a800_glm_pcp or portable_kimi)
+                    and node.kind is WorkloadKind.NORM and node.variant in ("rmsnorm", "add_rmsnorm")):
+                return (KernelSpec(kind=KernelKind.VECTOR, hardware_id=hardware_id, shape=node.shape,
+                    dtype=node.dtype, variant=node.variant, attributes={
+                        "mathematical_program": "dense_bf16_source_flops_bytes_v1",
+                        **({"epsilon": node.attributes.get("epsilon")} if node.variant == "rmsnorm" else {})},
+                    launch=None, execution_support="unsupported", unsupported_reason="launch_selector_unavailable"),)
             if (unbound_target_source and node.kind in (WorkloadKind.LINEAR, WorkloadKind.ROUTER)
                     and "output_dtype" in node.attributes and node.attributes["output_dtype"] == "fp32"):
                 return (KernelSpec(kind=KernelKind.GEMM, hardware_id=hardware_id, shape=node.shape,
@@ -10251,8 +10379,9 @@ def lower_workload(
                 if ((not hardware.supports_source_contract(node.attributes["source_component"]) or config.enable_expert_parallel
                         or (config.pipeline_parallel_size != 1 and not _symbolic_k3_pipeline_projection(node, pool))
                         or any(value != 1 for value in (config.tensor_parallel_size,
-                            config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size))) and not _k3_tp_allowed_node(node,pool)):
-                    raise NotImplementedError("K3 prefill source requires H200 TP1 nonempty PP SP/CP/DP1 EP-off")
+                            config.sequence_parallel_size, config.context_parallel_size, config.data_parallel_size)))
+                        and not (_k3_tp_allowed_node(node, pool) or _k3_ep_allowed_node(node, pool))):
+                    raise NotImplementedError("K3 prefill source requires a validated TP/EP/PP source geometry")
                 if (node.kind is not WorkloadKind.FLASH_ATTN or node.variant != "mla_prefill" or node.dtype != "bf16"
                         or node.attributes["prefill_output_source"] != "supports_out"
                         or node.attributes["q_lens"] != node.attributes["kv_lens"]
@@ -10277,7 +10406,8 @@ def lower_workload(
                 if node.attributes["source_component"] == "symbolic_mla_cache_update":
                     if node.kind is not WorkloadKind.KV_UPDATE or node.variant != "mla_kv_cache" or node.dtype != "bf16":
                         raise ValueError("symbolic MLA cache update has an unexpected operation")
-                    return (_target_kv_cache_update_spec(node, hardware_id, hardware),)
+                    return (_target_kv_cache_update_spec(node, hardware_id, hardware,
+                        logical_only=portable_v3 or portable_kimi),)
                 if node.kind is not WorkloadKind.FLASH_ATTN or node.variant != "mla_decode" or node.dtype != "bf16":
                     raise ValueError("symbolic MLA decode has an unexpected operation")
                 kimi_multiquery = (kimi_parallel or _symbolic_kimi_single_rank_projection(node, pool) or a800_kimi_pipeline
@@ -10317,6 +10447,11 @@ def lower_workload(
                         or node.attributes["symbolic_scale_layout"] != "logical_group128_fp32"
                         or node.attributes["symbolic_workspace_complete"] is not False):
                     raise ValueError("symbolic block-FP8 linear requires its logical FP32-scale source")
+                if portable_v3 or (hardware.supports_source_contract("glm_fp8_weight_only_roofline")
+                        and node.attributes.get("model_source_profile") == "vllm_0_30_v32_fp8_sync_explicit_allreduce"):
+                    return (KernelSpec(kind=KernelKind.GEMM, hardware_id=hardware_id, shape=node.shape,
+                        dtype="bf16", variant="gemm", attributes={"mathematical_program": "block_fp8_weight_only_bf16_v1"},
+                        launch=None, execution_support="unsupported", unsupported_reason="launch_selector_unavailable"),)
                 rows, columns = node.shape["m"], node.shape["k"]
                 return (KernelSpec(kind=KernelKind.VECTOR, hardware_id=hardware_id,
                     shape={"element_count": rows * columns, "rows": rows, "columns": columns},
@@ -10460,7 +10595,7 @@ def lower_workload(
                 config = pool.parallel_plan.config
                 from .v3_ep_contract import applicable as v3_ep_applicable, source_node as v3_ep_source
                 v3_ep = v3_ep_applicable(pool) and v3_ep_source(node)
-                if (not hardware.supports_source_contract("symbolic_dsv3_routed_experts")
+                if ((not hardware.supports_source_contract("symbolic_dsv3_routed_experts") and not portable_v3)
                         or (not (v3_parallel or v3_ep) and ((config.tensor_parallel_size not in (1, 8) and not _symbolic_dsv3_l32_tp4_projection(node, pool)) or config.enable_expert_parallel
                             or config.pipeline_parallel_size != 1 or not config.is_rank_local))):
                     raise NotImplementedError("DSV3 grouped source requires its declared ordinary FP8 TP/PP EP-off binding")
@@ -10511,9 +10646,10 @@ def lower_workload(
                         or type(node.attributes["expert_parallel_size"]) is not int
                         or node.attributes["expert_parallel_size"] != 1):
                     raise ValueError("DSV3 EP-off experts must preserve identical global/local counts and full expert ownership")
-                if HWSpec.source_contract_supported("symbolic_dsv3_routed_experts", hardware_id) and node.attributes["launch_policy"] == "analytical_launch":
+                if (hardware.supports_source_contract("symbolic_dsv3_routed_experts") or portable_v3) and node.attributes["launch_policy"] == "analytical_launch":
                     attributes = _fused_moe_prediction_attributes(node)
-                    attributes["mathematical_program"] = "block_fp8_swiglu_v1"
+                    attributes["mathematical_program"] = ("block_fp8_weight_only_swiglu_v1"
+                        if portable_v3 else "block_fp8_swiglu_v1")
                     return (KernelSpec(kind=KernelKind.FUSED_MOE, hardware_id=hardware_id,
                         shape=node.shape, dtype="bf16", variant="routed_experts", attributes=attributes,
                         launch=None, execution_support="unsupported", unsupported_reason="launch_selector_unavailable"),)
@@ -10596,7 +10732,8 @@ def lower_workload(
                             or _symbolic_glm_fp8_rank_local_mtp_ep_projection(node, pool)):
                         from src.serving.workload.traced_glm_pcp import glm_fp8_deferred_expert_source_metadata
                         source_facts = glm_fp8_deferred_expert_source_metadata()
-                        if (hardware_id != "nvidia_h200" or not (_symbolic_glm_fp8_target_dp_projection(node, pool)
+                        if ((hardware_id != "nvidia_h200" and not hardware.supports_source_contract("glm_fp8_weight_only_roofline"))
+                                or not (_symbolic_glm_fp8_target_dp_projection(node, pool)
                                 or _symbolic_glm53_dp1_ep8_deferred_projection(node, pool))
                                 or any(node.attributes.get(key) != value or type(node.attributes.get(key)) is not type(value)
                                     for key, value in source_facts.items())
@@ -10612,7 +10749,9 @@ def lower_workload(
                     # the expert operation without borrowing BF16 pricing.
                     attributes = _fused_moe_prediction_attributes(node)
                     attributes["mathematical_program"] = ("block_fp8_replicated_ep_swiglu_v1"
-                        if grouped_ep8 else "block_fp8_swiglu_v1")
+                        if grouped_ep8 else "block_fp8_weight_only_swiglu_v1"
+                        if glm_source and hardware.supports_source_contract("glm_fp8_weight_only_roofline")
+                        else "block_fp8_swiglu_v1")
                     return (KernelSpec(kind=KernelKind.FUSED_MOE, hardware_id=hardware_id,
                         shape=node.shape, dtype="bf16", variant="routed_experts", attributes=attributes,
                         launch=None, execution_support="unsupported", unsupported_reason="launch_selector_unavailable"),)
@@ -10864,9 +11003,15 @@ def lower_workload(
                             and graph.source_model_execution_version != "vllm_0_27_1")
                         or (node.attributes["stage"] == "mask_output" and node.dtype != "bf16")):
                     raise ValueError("vLLM0.27.1 masked embedding requires its exact BF16 TP4/8 caller")
+                portable_embedding = (hardware.supports_source_contract("qwen3_moe_eager_source")
+                    and node.attributes["source_component"] == "vllm_0_30_symbolic_masked_embedding"
+                    and node.attributes.get("mask_program") == (
+                        "vllm_ascend_no_added_vocab" if hardware_id == "ascend_910b" else "vllm_0_30")
+                    and node.dtype in ("bf16", "fp16", "int32", "bool")
+                    and (config.is_rank_local and not config.enable_expert_parallel or _qwen030_dp_sp(config)))
                 if (not hardware.supports_source_contract(node.attributes["source_component"])
                         or config.tensor_parallel_size < 2
-                        or (config.enable_expert_parallel and not ((config.tensor_parallel_size, config.expert_parallel_size) == (2, 2) or ((hardware.supports_source_contract("mla_tp8_ep8_source_projection") or _symbolic_mla_pipeline_projection(node, pool)) and (config.tensor_parallel_size, config.expert_parallel_size) == (8, 8))))
+                        or (not portable_embedding and config.enable_expert_parallel and not ((config.tensor_parallel_size, config.expert_parallel_size) == (2, 2) or ((hardware.supports_source_contract("mla_tp8_ep8_source_projection") or _symbolic_mla_pipeline_projection(node, pool)) and (config.tensor_parallel_size, config.expert_parallel_size) == (8, 8))))
                         or (config.pipeline_parallel_size != 1 and not (
                             node.attributes["source_component"] == "vllm_0_11_symbolic_masked_embedding"
                             and hardware.supports_source_contract("vllm_0_11_masked_embedding_pipeline_endpoint")
@@ -10878,18 +11023,22 @@ def lower_workload(
                             or (hardware_id == "ascend_910b"
                             and node.attributes["source_component"] == "vllm_0_18_symbolic_masked_embedding"
                             and node.attributes.get("mask_program") == "vllm_ascend_no_added_vocab"))
-                            and node.dtype in ("bf16", "int32", "bool")
+                            and (node.dtype in ("bf16", "int32", "bool")
+                                or hardware_id == "metax_c500" and node.dtype == "fp16"
+                                and node.attributes["source_component"] == "vllm_0_30_symbolic_masked_embedding")
                             and (not config.enable_expert_parallel or
                                 config.tensor_parallel_size == config.expert_parallel_size == 2
                                 and node.attributes["source_component"] in (
                                     "vllm_0_18_symbolic_masked_embedding", "vllm_0_24_symbolic_masked_embedding"))
-                            and _symbolic_pipeline_endpoint(node, pool, 0)))
-                        or any(value != 1 for value in (config.sequence_parallel_size,
-                            config.context_parallel_size, config.data_parallel_size))):
-                    raise NotImplementedError("masked TP embedding requires its CUDA-alike EP-off source")
+                            and _symbolic_pipeline_endpoint(node, pool, 0)) and not (
+                                portable_embedding and _symbolic_pipeline_endpoint(node, pool, 0)))
+                        or (not portable_embedding and any(value != 1 for value in (config.sequence_parallel_size,
+                            config.context_parallel_size, config.data_parallel_size)))):
+                    raise NotImplementedError("masked TP embedding requires its declared eager source")
+                tp_rank = pool.logical_rank_for_physical_rank(node.rank) % config.tensor_parallel_size
                 if (node.kind is not WorkloadKind.VECTOR or node.variant != "vllm_masked_embedding"
                         or node.attributes["tensor_parallel_size"] != config.tensor_parallel_size
-                        or node.attributes["tensor_parallel_rank"] != pool.ranks.index(node.rank)):
+                        or node.attributes["tensor_parallel_rank"] != tp_rank):
                     raise ValueError("masked embedding stage disagrees with deployment")
                 return (KernelSpec(kind=KernelKind.VECTOR, hardware_id=hardware_id,
                     shape=_vector_shape(node), dtype=node.dtype, variant=node.variant,
@@ -10907,8 +11056,10 @@ def lower_workload(
                 return (_source_vocab_embedding_spec(node, pool, hardware_id),)
             if ("source_component" in node.attributes
                     and node.attributes["source_component"] in ("vllm_0_30_symbolic_vocab_embedding", "sglang_0_5_19_symbolic_vocab_embedding")):
-                if not hardware.supports_source_contract(node.attributes["source_component"]):
-                    raise NotImplementedError("symbolic fused TP embedding requires a NVIDIA CUDA source")
+                if not hardware.supports_source_contract(node.attributes["source_component"]) and not (
+                        (portable_k3 or a800_glm_pcp or portable_kimi)
+                        and node.attributes["source_component"] == "vllm_0_30_symbolic_vocab_embedding"):
+                    raise NotImplementedError("symbolic fused TP embedding requires a declared source")
                 return (_source_vocab_embedding_spec(node, pool, hardware_id),)
             if ("source_component" in node.attributes
                     and node.attributes["source_component"] == "vllm_0_30_dspark_regular_mhc_pre"):
@@ -11020,7 +11171,8 @@ def lower_workload(
                 }
                 if node.attributes["model_execution_version"] != source_versions[node.attributes["source_component"]]:
                     raise ValueError("symbolic logits source component disagrees with model_execution_version")
-                if (not hardware.supports_source_contract(node.attributes["source_component"]) or node.kind is not WorkloadKind.VECTOR
+                if ((not hardware.supports_source_contract(node.attributes["source_component"]) and not portable_v3)
+                        or node.kind is not WorkloadKind.VECTOR
                         or (config.tensor_parallel_size not in (1, 2, 4, 8) and not v3_parallel
                             and not _a800_tp16_logits_source(pool, node)
                             and not _ascend_dense_logits_source(pool, node)
@@ -11097,7 +11249,7 @@ def lower_workload(
                         "vllm_0_30_symbolic_plain_greedy", "vllm_0_11_symbolic_plain_greedy",
                         "vllm_0_18_symbolic_plain_greedy", "vllm_0_24_symbolic_plain_greedy", "vllm_0_27_1_symbolic_plain_greedy")):
                 config = pool.parallel_plan.config
-                if (not hardware.supports_source_contract(node.attributes["source_component"])
+                if ((not hardware.supports_source_contract(node.attributes["source_component"]) and not portable_v3)
                         or (config.enable_expert_parallel and not (v3_parallel or _symbolic_kimi_dp_projection(node, pool) or _symbolic_glm_pcp_projection(node, pool) or (config.tensor_parallel_size, config.expert_parallel_size) == (2, 2)
                             or (node.attributes["source_component"] == "vllm_0_30_symbolic_plain_greedy" and (config.expert_parallel_size == config.tensor_parallel_size or _qwen030_dp_sp(config)))
                             or ((hardware.supports_source_contract("mla_tp8_ep8_source_projection") or _symbolic_mla_pipeline_projection(node, pool)) and (config.tensor_parallel_size, config.expert_parallel_size) == (8, 8))))
@@ -11349,7 +11501,8 @@ def lower_workload(
             if ("source_component" in node.attributes
                     and node.attributes["source_component"] == "vllm_0_27_1_symbolic_embedding"):
                 config = pool.parallel_plan.config
-                if (not hardware.supports_source_contract("vllm_0_27_1_symbolic_embedding") or (config.enable_expert_parallel and not v3_active_dp)
+                if ((not hardware.supports_source_contract("vllm_0_27_1_symbolic_embedding") and not portable_v3)
+                        or (config.enable_expert_parallel and not v3_active_dp)
                         or config.tensor_parallel_size != 1 or (not config.is_rank_local and not v3_active_dp)
                         or (config.pipeline_parallel_size != 1 and not (v3_parallel
                             and _symbolic_pipeline_endpoint(node, pool, 0)))
@@ -12511,7 +12664,7 @@ def lower_workload(graph, deployment, hardware_by_id, memo=None, *, source_proje
         result = _lower_workload_with_current_source_inputs(graph, deployment, hardware_by_id, memo,
             source_projection_scope=source_projection_scope, compact_source_layers=compact_source_layers,
             source_launch_inputs=source_launch_inputs)
-        v4_modelsp_contract.validate_lowered(graph, result)
+        v4_modelsp_contract.validate_lowered(graph, result, deployment)
         return result
     finally:
         _CURRENT_DSPARK_SOURCE_GRAPH.reset(dspark_token)

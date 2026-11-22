@@ -16,7 +16,7 @@ from src.kernel.kernel_spec import (
     KernelSpec,
 )
 from src.kernel.predictors.vector import clamped_silu_source_arithmetic, silu_source_arithmetic, VectorPredictor
-from src.kernel.predictors.gemm_block_fp8 import _block_fp8_matmul_payloads
+from src.kernel.predictors.gemm_block_fp8 import _block_fp8_matmul_payloads, weight_only_fp8_service_s
 from src.kernel.predictors.gemm import _unquantized_matmul_math
 from src.kernel.cache_traffic_sim import (
     simulate_cann_grouped_moe_operands,
@@ -5694,7 +5694,7 @@ def dsv4_marlin_moe_source_work(kernel: KernelSpec):
     reads stay a coefficient rather than an invented expert assignment.
     """
     mathematical = ("mathematical_program" in kernel.attributes
-        and kernel.attributes["mathematical_program"] in ("dsv4_mxfp4_w4a16_swiglu_v1", "v4_pro_tp16_padded_marlin_w4a16_v1"))
+        and kernel.attributes["mathematical_program"] in ("dsv4_mxfp4_w4a16_swiglu_v1", "dsv4_portable_mxfp4_w4a16_swiglu_v1", "v4_pro_tp16_padded_marlin_w4a16_v1"))
     if (kernel.kind is not KernelKind.FUSED_MOE or kernel.variant != "routed_experts"
             or kernel.dtype != "bf16" or (not mathematical and (kernel.launch is None
                 or kernel.launch.algorithm != "vllm_marlin_moe_mxfp4_aggregate"))
@@ -6890,9 +6890,10 @@ def kimi_ep_marlin_logical_work(kernel: KernelSpec):
             or (kernel.shape["experts"], kernel.shape["topk"], kernel.shape["hidden"]) != (384, 8, 7168)
             or (kernel.shape["intermediate"] not in (2048, 1024, 512, 256, 128, 64) if kernel.attributes["expert_parallel_size"] == 1
                 else kernel.shape["intermediate"] != 2048)
-            or kernel.shape["intermediate"] in (512, 1024) and not HWSpec.source_contract_supported("kimi_grouped_marlin_source_math", kernel.hardware_id)
-            or kernel.shape["intermediate"] == 256 and not HWSpec.source_contract_supported("kimi_marlin_i256_source_math", kernel.hardware_id)
-            or kernel.shape["intermediate"] in (128, 64) and kernel.hardware_id != "nvidia_h200"):
+            or (not HWSpec.source_contract_supported("kimi_k2_portable_roofline", kernel.hardware_id)
+                and (kernel.shape["intermediate"] in (512, 1024) and not HWSpec.source_contract_supported("kimi_grouped_marlin_source_math", kernel.hardware_id)
+                    or kernel.shape["intermediate"] == 256 and not HWSpec.source_contract_supported("kimi_marlin_i256_source_math", kernel.hardware_id)
+                    or kernel.shape["intermediate"] in (128, 64) and kernel.hardware_id != "nvidia_h200"))):
         raise ValueError("Kimi EP Marlin work requires its exact unbound BF16/INT4 source program")
     tokens, topk, hidden, width = (kernel.shape[name] for name in ("tokens", "topk", "hidden", "intermediate"))
     counts, local = _routing(kernel)
@@ -6957,12 +6958,17 @@ def unquantized_bf16_experts_logical_work(kernel: KernelSpec):
     claim about native padding, backend choice or deployed launch geometry.
     """
     if (kernel.kind is not KernelKind.FUSED_MOE or kernel.variant != "routed_experts"
-            or not HWSpec.source_contract_supported("unbound_bf16_expert_source_math", kernel.hardware_id) or kernel.dtype != "bf16"
-            or kernel.attributes["mathematical_program"] not in (
+            or not (HWSpec.source_contract_supported("unbound_bf16_expert_source_math", kernel.hardware_id)
+                or kernel.attributes["mathematical_program"] == "unquantized_bf16_grouped_swiglu_v1"
+                and HWSpec.source_contract_supported("glm_bf16_portable_roofline", kernel.hardware_id)
+                or kernel.attributes["mathematical_program"] in (
+                    "unquantized_bf16_swiglu_v1", "unquantized_bf16_grouped_swiglu_v1")
+                and HWSpec.source_contract_supported("qwen3_moe_eager_source", kernel.hardware_id))
+            or kernel.dtype != "bf16" or kernel.attributes["mathematical_program"] not in (
                 "unquantized_bf16_swiglu_v1", "unquantized_bf16_grouped_swiglu_v1",
                 "unquantized_bf16_legacy_grouped_swiglu_v1")
             or kernel.launch is not None or kernel.execution_support != "unsupported"):
-        raise ValueError("BF16 experts require their unbound H200 mathematical program")
+        raise ValueError("BF16 experts require a supported unbound mathematical program")
     tokens, topk, hidden, width = (kernel.shape[name] for name in ("tokens", "topk", "hidden", "intermediate"))
     counts, local = _routing(kernel)
     ep_size, rank = (kernel.attributes[name] for name in ("expert_parallel_size", "expert_rank"))
@@ -7027,7 +7033,8 @@ def block_fp8_experts_logical_work(kernel: KernelSpec):
     """
     if (kernel.kind is not KernelKind.FUSED_MOE or kernel.variant != "routed_experts"
             or "mathematical_program" not in kernel.attributes
-            or kernel.attributes["mathematical_program"] not in ("block_fp8_swiglu_v1", "block_fp8_replicated_ep_swiglu_v1")
+            or kernel.attributes["mathematical_program"] not in (
+                "block_fp8_swiglu_v1", "block_fp8_weight_only_swiglu_v1", "block_fp8_replicated_ep_swiglu_v1")
             or kernel.launch is not None or kernel.execution_support != "unsupported"):
         raise ValueError("FP8 expert logical work requires its unbound mathematical program")
     tokens, topk, hidden, width = (kernel.shape[name] for name in ("tokens", "topk", "hidden", "intermediate"))
@@ -7711,7 +7718,8 @@ class FusedMoEPredictor(KernelPredictor):
                         memory_arbitration=(),pipeline=None,critical_path=tuple(times),support_level="partial",
                         limitations=("physical256_channel_work_logical192_useful_work", "native_launch_and_M_row_alignment_unbound",
                                      "unique_expert_weights_not_cache_replay", "typed_router_weight_dequant_conversion_service_unpriced")))
-            if kernel.attributes["mathematical_program"] == "dsv4_mxfp4_w4a16_swiglu_v1":
+            if kernel.attributes["mathematical_program"] in (
+                    "dsv4_mxfp4_w4a16_swiglu_v1", "dsv4_portable_mxfp4_w4a16_swiglu_v1"):
                 work = dsv4_marlin_moe_source_work(kernel)
                 if (HWSpec.source_contract_supported("aggregate_gpu_source_roofline", hardware.hardware_id)
                         and hardware.gpu_vector_memory_only):
@@ -7735,9 +7743,10 @@ class FusedMoEPredictor(KernelPredictor):
             bf16 = kernel.attributes["mathematical_program"] in ("unquantized_bf16_swiglu_v1",
                 "unquantized_bf16_grouped_swiglu_v1", "unquantized_bf16_legacy_grouped_swiglu_v1")
             work = unquantized_bf16_experts_logical_work(kernel) if bf16 else block_fp8_experts_logical_work(kernel)
+            weight_only = kernel.attributes["mathematical_program"] == "block_fp8_weight_only_swiglu_v1"
             vector = VectorPredictor()
             seconds = 0.0
-            for rows, columns in work["quantization_inputs"]:
+            for rows, columns in (() if weight_only else work["quantization_inputs"]):
                 quant = KernelSpec(kind=KernelKind.VECTOR, hardware_id=kernel.hardware_id,
                     shape={"element_count": rows * columns, "rows": rows, "columns": columns}, dtype="bf16",
                     variant="fp8_group_quant", attributes={"group_size": 128,
@@ -7747,6 +7756,11 @@ class FusedMoEPredictor(KernelPredictor):
             bandwidth = float(hardware.resource_by_role("dram").capacity)
             seconds += work["output_initialization_bytes"] / bandwidth
             for stage in work["matrix_stages"]:
+                if weight_only:
+                    if stage["mathematical_fp8_flops"]:
+                        seconds += weight_only_fp8_service_s(hardware, stage["mathematical_fp8_flops"],
+                                                             stage["payload_bytes"])
+                    continue
                 seconds += max(stage["mathematical_tensor_flops" if bf16 else "mathematical_fp8_flops"]
                     / float(hardware.resource_by_role("compute_tensor" if bf16 else "compute_tensor_fp8").capacity),
                     stage["logical_bytes"] / bandwidth)

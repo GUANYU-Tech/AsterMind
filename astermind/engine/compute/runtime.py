@@ -104,7 +104,13 @@ def _runtime_inputs(config, model):
         return RuntimeInputs(routing, layout, "uniform")
 
     if model.attention_layout == "standard_gqa":
-        if config.scheduler_adapter == "vllm_0_30":
+        # The CPU scheduler version can differ from the modeled device forward.
+        vendor_ep2 = (config.hardware_id in ("metax_c500", "ascend_910b")
+            and model.model_type == "qwen3_moe" and config.data_parallel_size == 1
+            and config.tensor_parallel_size == 2 and config.enable_expert_parallel)
+        ascend_dense = config.hardware_id == "ascend_910b" and model.num_experts == 0
+        vendor_forward = model.compute_dtype == model.weight_dtype == "bf16" and (vendor_ep2 or ascend_dense)
+        if config.scheduler_adapter == "vllm_0_30" and not vendor_forward:
             return RuntimeInputs(routing, "paged_varlen", "uniform",
                 model_execution_version="vllm_0_30_0",
                 target_sampling_source=f"vllm_0_30_plain_greedy_{model.compute_dtype}")
@@ -134,9 +140,10 @@ def _runtime_inputs(config, model):
         target_sampling_source="vllm_0_30_plain_greedy_bf16",
         symbolic_source_max_model_len=config.max_model_len,
         symbolic_source_max_batched_tokens=config.max_batched_tokens)
-    if (config.hardware_id == "nvidia_a800" and model.model_type == "glm_moe_dsa"
-            and model.weight_dtype == "bf16" and config.data_parallel_size > 1
-            and config.pipeline_parallel_size == 1):
+    if (model.model_type == "glm_moe_dsa" and model.weight_dtype == "bf16"
+            and config.data_parallel_size > 1 and config.pipeline_parallel_size == 1
+            and (config.hardware_id == "nvidia_a800"
+                or HWSpec.source_contract_supported("glm_bf16_portable_roofline", config.hardware_id))):
         # The existing distributed BF16 forward requires sparse MQA during prefill.
         return replace(runtime, glm_prefill_attention_source="force_sparse_mqa")
     if (config.data_parallel_size > 1 and model.model_type == "glm_moe_dsa"
@@ -162,6 +169,22 @@ def create_midlayer_runtime(config: MidlayerCellConfig, *, with_scheduler: bool 
     if config.root.resolve() != loaded_root:
         raise ValueError("Cell root differs from the selected Mid-Layer source")
     model = load_model_config(config.root / config.model_file)
+    if (model.model_type == "glm_moe_dsa" and model.weight_dtype == "fp8"
+            and HWSpec.source_contract_supported("glm_fp8_weight_only_roofline", config.hardware_id)
+            and config.compute_mode != "roofline"):
+        raise NotImplementedError("the portable GLM FP8 projection requires Roofline")
+    if (model.model_type == "deepseek_v4"
+            and HWSpec.source_contract_supported("deepseek_v4_portable_roofline", config.hardware_id)
+            and config.compute_mode != "roofline"):
+        raise NotImplementedError("the portable DeepSeek-V4 projection requires Roofline")
+    if (model.model_type == "kimi_linear"
+            and HWSpec.source_contract_supported("kimi_k3_portable_roofline", config.hardware_id)
+            and config.compute_mode != "roofline"):
+        raise NotImplementedError("the portable Kimi K3 projection requires Roofline")
+    if (model.model_type == "deepseek_v3"
+            and HWSpec.source_contract_supported("deepseek_v3_portable_roofline", config.hardware_id)
+            and config.compute_mode != "roofline"):
+        raise NotImplementedError("the portable DeepSeek-V3 projection requires Roofline")
     if not _SOURCE_INPUTS and (config.deployment != "colocated" or config.scheduler_adapter in ("vllm_0_30", "vllm_0_31")
           or config.host_launch_profile_file is not None):
         raise NotImplementedError("the logical main uses colocated CPU scheduling and device timing")

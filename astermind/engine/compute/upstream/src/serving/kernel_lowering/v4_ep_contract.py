@@ -1,6 +1,7 @@
 """V4 DP1/legal-PP expert caller validation, independent of the generic EP graph."""
 from collections import defaultdict
 from math import prod
+from src.kernel.hardware_spec import HWSpec
 from src.kernel.predictors.moe_ep_math import compact_counts_to_global,marlin_ep_work
 
 def applicable(pool):
@@ -9,7 +10,9 @@ def applicable(pool):
     from .v4_dp_contract import applicable as dp_applicable
     if dp_applicable(pool):return True
     c=pool.parallel_plan.config
-    return (pool.hardware_id=='nvidia_h200' and c.enable_expert_parallel
+    return ((pool.hardware_id == "nvidia_h200"
+        or HWSpec.source_contract_supported("deepseek_v4_portable_roofline", pool.hardware_id))
+            and c.enable_expert_parallel
             and c.tensor_parallel_size==c.expert_parallel_size
             and c.tensor_parallel_size in (2,4,8,16)
             and c.data_parallel_size==c.context_parallel_size==c.sequence_parallel_size==1

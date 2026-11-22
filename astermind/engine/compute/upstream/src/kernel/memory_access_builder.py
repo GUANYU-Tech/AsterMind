@@ -4638,11 +4638,13 @@ def has_mathematical_gemm_source(kernel):
 
 def has_mathematical_memory_source(kernel):
     """Public mathematical operands, without claiming a native launch."""
+    from src.kernel.hardware_spec import HWSpec
     from src.kernel.kernel_spec import KernelKind
     if kernel.execution_support != 'unsupported' or kernel.launch is not None:
         return False
-    if (kernel.hardware_id == 'nvidia_h200' and kernel.kind is KernelKind.VECTOR
-            and kernel.variant == 'silu' and kernel.attributes['swiglu_limit'] is not None):
+    if (HWSpec.source_contract_supported("unbound_clamped_silu_source_math", kernel.hardware_id)
+            and kernel.kind is KernelKind.VECTOR and kernel.variant == "silu"
+            and kernel.attributes["swiglu_limit"] is not None):
         return True
     if 'mathematical_program' not in kernel.attributes:
         return False
@@ -4652,7 +4654,8 @@ def has_mathematical_memory_source(kernel):
             and kernel.variant == 'elementwise' and kernel.dtype in ('int32', 'int64', 'bf16')
             and (kernel.attributes['operation'], kernel.attributes['reads'], kernel.attributes['writes']) in (('read', 1, 0), ('fill', 0, 1)))
     if program=='v4_modelsp_zero_fill_v1':
-        return kernel.hardware_id=='nvidia_h200' and kernel.kind is KernelKind.VECTOR and kernel.variant=='elementwise' and kernel.dtype in ('bf16','int32') and (kernel.attributes['operation'],kernel.attributes['reads'],kernel.attributes['writes'])==('fill',0,1)
+        return (kernel.hardware_id == "nvidia_h200"
+            or HWSpec.source_contract_supported("deepseek_v4_portable_roofline", kernel.hardware_id)) and kernel.kind is KernelKind.VECTOR and kernel.variant=='elementwise' and kernel.dtype in ('bf16','int32') and (kernel.attributes['operation'],kernel.attributes['reads'],kernel.attributes['writes'])==('fill',0,1)
     if kernel.kind is KernelKind.VECTOR and program in ('dense_fp16_source_flops_bytes_v1', 'dense_bf16_source_flops_bytes_v1'):
         return kernel.variant in ('rmsnorm','add_rmsnorm','silu','elementwise')
     if kernel.kind is KernelKind.FLASH_ATTN:

@@ -19,7 +19,7 @@ DEPLOYMENTS = {
 SATELLITES = ("a", "b", "c", "d")
 
 
-def scenario(case, *, smoke=False):
+def scenario(case, *, smoke=False, prefill_chunk_tokens=None):
     parallel = DEPLOYMENTS[case["deployment"]]
     model = case["model"]
     wideep = parallel["ep"] > 1
@@ -62,6 +62,14 @@ def scenario(case, *, smoke=False):
         scheduler_adapter="vllm_0_30", wide_ep_enabled=wideep, expert_routing_seed=0,
         enable_chunked_prefill=False, prefix_caching=False,
     )
+    if prefill_chunk_tokens is not None:
+        if not 0 < prefill_chunk_tokens <= cell["max_model_len"]:
+            raise ValueError("prefill chunk tokens must be between 1 and the Cell's max_model_len")
+        cell.update(
+            enable_chunked_prefill=True,
+            long_prefill_token_threshold=prefill_chunk_tokens,
+            max_batched_tokens=cell["max_model_len"] * cell["max_requests"],
+        )
     communication = dict(
         mode="surrogate", intra_mode="surrogate", execution="runtime", trace_service=False,
         default_hardware_id="nvidia_h200", runtime_protocol="inter_reference",
@@ -122,12 +130,17 @@ def main():
     parser.add_argument("case", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("source_commit")
+    parser.add_argument("--prefill-chunk-tokens", type=int, metavar="TOKENS",
+                        help="Enable chunked prefill with this per-request token cap.")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--smoke", action="store_true", help="Run four requests with 96 input and 2 output tokens.")
     mode.add_argument("--validate", action="store_true", help="Validate the production workload and topology.")
     args = parser.parse_args()
     case = json.loads(args.case.read_bytes())
-    raw = scenario(case, smoke=args.smoke)
+    try:
+        raw = scenario(case, smoke=args.smoke, prefill_chunk_tokens=args.prefill_chunk_tokens)
+    except ValueError as error:
+        parser.error(str(error))
     config = SimulationConfig.model_validate(raw)
     config.topology()
     save(args.output / "config.json", raw)
@@ -152,7 +165,10 @@ def main():
         with Simulation(config, startup_progress=print) as sim:
             runtime = sim.cells["l2"].backend.runtime_info
             result["effective_scheduler"] = [
-                {k: info[k] for k in ("effective_chunked_prefill", "effective_max_num_batched_tokens")}
+                {k: info[k] for k in (
+                    "effective_chunked_prefill", "effective_max_num_batched_tokens",
+                    "effective_long_prefill_token_threshold",
+                )}
                 for info in runtime.get("replicas", [runtime])
             ]
             print(f"Effective scheduler: {result['effective_scheduler']}", flush=True)

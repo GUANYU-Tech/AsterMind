@@ -2,13 +2,17 @@
 from collections import defaultdict
 from src.kernel.predictors.moe_ep_math import marlin_ep_work
 
+from src.kernel.hardware_spec import HWSpec
+
+
 def applicable(pool):
     from .k3_sp_contract import applicable as sp_applicable
     if sp_applicable(pool):return True
     from .k3_dp_contract import applicable as dp_applicable
     if dp_applicable(pool):return True
     c=pool.parallel_plan.config
-    return (pool.hardware_id=='nvidia_h200' and pool.parallel_plan.num_layers==93 and c.enable_expert_parallel
+    return ((pool.hardware_id == "nvidia_h200" or HWSpec.source_contract_supported(
+            "kimi_k3_portable_roofline", pool.hardware_id)) and pool.parallel_plan.num_layers==93 and c.enable_expert_parallel
             and c.tensor_parallel_size==c.expert_parallel_size and c.tensor_parallel_size in (2,4,8,16,32)
             and c.data_parallel_size==c.context_parallel_size==c.sequence_parallel_size==1
             and 1<=c.pipeline_parallel_size<=pool.parallel_plan.num_layers)
@@ -38,6 +42,11 @@ def allowed_node(node,pool):
     if component in ('vllm_0_30_kimi_k3_nope_fresh_prefill','vllm_0_30_kimi_k3_nope_decode'):
         return (node.kind.value=='vector' and s.get('heads')==heads and s.get('q_lora_rank')==1536
                 and s.get('kv_lora_rank')==512 and node.variant == ('kimi_k3_nope_prefill' if component.endswith('fresh_prefill') else 'kimi_k3_nope_decode'))
+    if (component == "vllm_0_30_symbolic_k3_prefill_attention"
+            and HWSpec.source_contract_supported("kimi_k3_portable_roofline", pool.hardware_id)):
+        return (node.kind.value == "flash_attn" and node.variant == "mla_prefill"
+            and s.get("num_query_heads") == heads and s.get("qk_head_dim") == 192
+            and s.get("v_head_dim") == 128 and s.get("kv_lora_rank") == 512)
     if component=='symbolic_mla_decode_mathematical':
         return (node.kind.value=='flash_attn' and node.variant=='mla_decode'
                 and s.get('num_query_heads')==heads and s.get('qk_head_dim')==576

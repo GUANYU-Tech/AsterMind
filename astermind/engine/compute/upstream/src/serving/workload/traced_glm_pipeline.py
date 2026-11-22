@@ -21,7 +21,8 @@ def trace_glm_pipeline_forward(model, step, pool, expert_routing, *, input_ids, 
     from .runtime_inputs import ExpertRoutingInput, vllm_0_30_source_model_inputs
     from src.serving.schedule.schedule_step import schedule_step_sha256
     from src.serving.deployment.validated_scope import (is_glm_fp8_rank_local_source_scope,
-        is_glm_fp8_data_parallel_source_scope, is_glm53_rank_local_ep_source_scope)
+        is_glm_fp8_data_parallel_source_scope, is_glm53_rank_local_ep_source_scope,
+        is_glm_bf16_pipeline_source_scope)
     config = pool.parallel_plan.config
     glm53_ep = is_glm53_rank_local_ep_source_scope(pool, model)
     tp = config.tensor_parallel_size
@@ -37,6 +38,7 @@ def trace_glm_pipeline_forward(model, step, pool, expert_routing, *, input_ids, 
         and config.pipeline_parallel_size > 1 and model.num_attention_heads % tp == 0
         and model.hidden_size % tp == 0 and model.intermediate_size % tp == 0
         and (config.enable_expert_parallel or model.moe_intermediate_size % tp == 0)
+        or is_glm_bf16_pipeline_source_scope(pool, model)
         or config.pipeline_parallel_size > 1 and (is_glm_fp8_rank_local_source_scope(pool, model)
             or is_glm_fp8_data_parallel_source_scope(pool, model) or glm53_ep))
     sequence_size = tp if config.enable_expert_parallel and config.data_parallel_size > 1 and tp > 1 else 1

@@ -1,6 +1,7 @@
 """V3 active DP2/4/8 four-input source contract."""
 from collections import defaultdict
 from contextvars import ContextVar
+from src.kernel.hardware_spec import HWSpec
 _PROOF=ContextVar('v3_active_dp_collective_proof',default=None)
 def collective_supported(node,pool,graph):
  proof=_PROOF.get()
@@ -10,7 +11,9 @@ from src.kernel.predictors.v3_ep_math import DISPATCHED_EP_SIZES
 PROFILE='vllm_0_27_1_deepseek_v3_sync_fp8'
 def applicable(pool):
  c=pool.parallel_plan.config
- return (pool.hardware_id == 'nvidia_h200' and c.enable_expert_parallel
+ return ((pool.hardware_id == 'nvidia_h200' or
+          HWSpec.source_contract_supported("deepseek_v3_expert_roofline", pool.hardware_id))
+     and c.enable_expert_parallel
      and c.sequence_parallel_size == c.context_parallel_size == 1
      and c.tensor_parallel_size in (1, 2, 4, 8, 16)
      and c.data_parallel_size in (2, 4, 8)

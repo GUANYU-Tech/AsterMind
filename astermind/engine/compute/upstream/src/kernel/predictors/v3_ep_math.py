@@ -1,9 +1,10 @@
-"""V3 H200 TP8/EP8 useful FP8 work, source vLLM 0.27.1 Triton branch.
+"""DeepSeek-V3 replicated expert work, source vLLM 0.27.1 Triton branch.
 
 Not a native launch model. Input quantization is internal; prequantized DP
 ports belong to a different, deliberately unsupported contract.
 """
 from math import isfinite
+from src.kernel.hardware_spec import HWSpec
 LEGACY_PROGRAM='v3_fp8_ep8_fused_quant_v1'
 PROGRAM='v3_fp8_replicated_ep_fused_quant_v1'
 DISPATCHED_EP_SIZES = (2, 4, 8, 16, 32, 64)
@@ -53,20 +54,43 @@ def logical_work(shape, attrs):
             'input_quantizer_ideal_unrounded_group128_scope_not_numerical_equivalence'))
 
 def kernel_work(kernel):
-    if (kernel.hardware_id!='nvidia_h200' or kernel.kind.value!='FUSED_MOE' or kernel.variant!='routed_experts'
+    admitted = (kernel.hardware_id == "nvidia_h200" or (
+        kernel.attributes.get("mathematical_program") == PROGRAM
+        and HWSpec.source_contract_supported("deepseek_v3_expert_roofline", kernel.hardware_id)))
+    if (not admitted or kernel.kind.value!='FUSED_MOE' or kernel.variant!='routed_experts'
         or kernel.dtype!='bf16' or kernel.launch is not None or kernel.execution_support!='unsupported'
         or kernel.attributes.get('mathematical_program') not in (PROGRAM,LEGACY_PROGRAM)):
-        raise ValueError('V3 EP8 mathematical program requires unbound H200 source KernelSpec')
+        raise ValueError('V3 replicated experts require a supported unbound source KernelSpec')
     return logical_work(kernel.shape,kernel.attributes)
+
+def stage_seconds(stages, hardware, *, dequantize_to_bf16=False):
+    from .fused_moe import roofline_ns
+
+    if not dequantize_to_bf16:
+        fp8 = float(hardware.resource_by_role("compute_tensor_fp8").capacity)
+        return {s["stage"]: max(s["mathematical_fp8_flops"] / fp8,
+            roofline_ns(s["demand"], hardware, s["logical_bytes"]) * 1e-9) for s in stages}
+    tensor = hardware.resource_by_role("compute_tensor").capacity
+    times = {}
+    for stage in stages:
+        payload = stage["payload_bytes"]
+        elements = payload.get("fp8_input_read", 0) + payload.get("fp8_weight_read", 0)
+        demand = dict(stage["demand"])
+        # Expanding FP8 inputs and weights inside the tile preserves the
+        # dispatched bytes. Charge scale and conversion on this device.
+        demand["compute_fma"] += elements
+        demand["compute_alu"] += 2 * elements
+        times[stage["stage"]] = max(stage["mathematical_fp8_flops"] / tensor,
+            roofline_ns(demand, hardware, stage["logical_bytes"]) * 1e-9)
+    return times
 
 def predict(kernel,hardware):
     # Imports use the shared predictor namespace to preserve existing conversion conventions.
     from src.kernel.predictors import fused_moe as fm
     from dataclasses import replace
-    work=kernel_work(kernel);bw=float(hardware.resource_by_role('dram').capacity)
-    fp8=float(hardware.resource_by_role('compute_tensor_fp8').capacity)
-    times={s['stage']:max(s['mathematical_fp8_flops']/fp8,
-        fm.roofline_ns(s['demand'],hardware,s['logical_bytes'])*1e-9) for s in work['stages']}
+    work=kernel_work(kernel)
+    times=stage_seconds(work["stages"], hardware, dequantize_to_bf16=
+        hardware.supports_source_contract("deepseek_v3_expert_roofline"))
     result=fm.prediction_from_ns(sum(times.values())*1e9,'roofline')
     return replace(result,t_per_group=times,diagnostics=fm.PredictionDiagnostics(compute_time_s={},memory=(),
         memory_access_classes=(),memory_arbitration=(),pipeline=None,critical_path=work['source_stage_order'],

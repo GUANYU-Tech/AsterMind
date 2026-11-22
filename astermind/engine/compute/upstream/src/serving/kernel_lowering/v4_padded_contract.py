@@ -1,8 +1,11 @@
 """Pinned vLLM0.30 Pro EP-off TP16: logical192, physically padded256."""
+from src.kernel.hardware_spec import HWSpec
+
 PROGRAM='v4_pro_tp16_padded_marlin_w4a16_v1'
 def validate(node,pool):
  a=node.attributes;c=pool.parallel_plan.config
- if not (pool.hardware_id=='nvidia_h200' and c.tensor_parallel_size==16 and not c.enable_expert_parallel and c.expert_parallel_size==1 and c.data_parallel_size==c.context_parallel_size==c.sequence_parallel_size==1 and c.pipeline_parallel_size in (1,2,3,4) and pool.parallel_plan.num_layers==61):
+ if not ((pool.hardware_id == "nvidia_h200" or HWSpec.source_contract_supported(
+     "deepseek_v4_portable_roofline", pool.hardware_id)) and c.tensor_parallel_size==16 and not c.enable_expert_parallel and c.expert_parallel_size==1 and c.data_parallel_size==c.context_parallel_size==c.sequence_parallel_size==1 and c.pipeline_parallel_size in (1,2,3,4) and pool.parallel_plan.num_layers==61):
   raise NotImplementedError('Padded Pro source requires H200 TP16 DP1 EPoff PP1/2/3/4 CP/SP1')
  if node.dtype!='bf16' or a.get('source_component')!='vllm_0_30_symbolic_v4_marlin' or a.get('model_execution_version')!='vllm_0_30_0' or a.get('model_source_profile')!='vllm_0_30_v4_sync_fp8_ds_mla':
   raise ValueError('Padded Pro requires its pinned BF16 source identity')

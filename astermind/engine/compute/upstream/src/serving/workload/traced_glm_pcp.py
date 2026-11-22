@@ -459,8 +459,11 @@ def trace_glm_pcp_forward(model, step, pool, expert_routing, *, input_ids, posit
     tp, cp, dp = config.tensor_parallel_size, config.context_parallel_size, config.data_parallel_size
     sequence_parallel = config.enable_expert_parallel and dp > 1 and tp > 1
     analytical_global_ep = config.enable_expert_parallel and dp > 1 and tp == 1 and cp > 1
-    from src.serving.deployment.validated_scope import is_glm_fp8_data_parallel_source_scope
+    from src.serving.deployment.validated_scope import (
+        is_glm_distributed_source_scope, is_glm_fp8_data_parallel_source_scope,
+    )
     fp8_target = is_glm_fp8_data_parallel_source_scope(pool, model)
+    bf16_target = is_glm_distributed_source_scope(pool, model)
     # CP1 already delegates to the original attention source. Preserve its
     # automatic fresh-dense/decode choice rather than forcing sparse MQA.
     default_fp8_attention = (fp8_target and cp == 1 and prefill_attention_source is None
@@ -472,7 +475,8 @@ def trace_glm_pcp_forward(model, step, pool, expert_routing, *, input_ids, posit
             for request in step.requests):
         raise NotImplementedError("ordinary GLM FP8 DP source requires MTP-off requests")
     if (model.model_type != "glm_moe_dsa" or model.weight_dtype != "bf16" and not fp8_target or model.compute_dtype != "bf16"
-            or pool.hardware_id not in ("nvidia_a800", "nvidia_h200") or cp < 1 or (cp == 1 and dp == 1)
+            or not (fp8_target or bf16_target or pool.hardware_id in ("nvidia_a800", "nvidia_h200"))
+            or cp < 1 or (cp == 1 and dp == 1)
             or config.pipeline_parallel_size != 1
             or config.sequence_parallel_size not in ((1, tp) if sequence_parallel else (1,))
             or model.num_attention_heads % tp or (not config.enable_expert_parallel and model.moe_intermediate_size % (tp * cp * dp))

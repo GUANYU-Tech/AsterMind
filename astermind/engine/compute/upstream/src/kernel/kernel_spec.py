@@ -1509,7 +1509,7 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
                     and shape["experts"] % 2 == 0 and normalized["routed_scaling_factor"] == 1.0
                     and normalized["expert_weight_tile_rows"] is None and limit is None
                     and "graph_runtime_mode" not in normalized)
-            elif program == "block_fp8_swiglu_v1":
+            elif program in ("block_fp8_swiglu_v1", "block_fp8_weight_only_swiglu_v1"):
                 valid = (compute_dtype == "bf16" and normalized["routed_weight_dtype"] == "fp8"
                     and normalized["weight_group_size"] == 0 and normalized["expert_parallel_size"] == 1
                     and normalized["expert_weight_tile_rows"] is None and limit is None
@@ -1576,12 +1576,16 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
                     and type(normalized["logical_intermediate"]) is int and normalized["logical_intermediate"] == 192
                     and (shape["experts"],shape["topk"],shape["hidden"],shape["intermediate"]) == (384,6,7168,256)
                     and "graph_runtime_mode" not in normalized)
-            elif program == "dsv4_mxfp4_w4a16_swiglu_v1":
+            elif program in ("dsv4_mxfp4_w4a16_swiglu_v1", "dsv4_portable_mxfp4_w4a16_swiglu_v1"):
+                geometry = shape["experts"], shape["topk"], shape["hidden"], shape["intermediate"]
+                supported = {(256, 6, 4096, 256)}
+                if program == "dsv4_portable_mxfp4_w4a16_swiglu_v1":
+                    supported.update((256, 6, 4096, size) for size in (512, 1024, 2048))
+                    supported.update((384, 6, 7168, size) for size in (384, 768, 1536, 3072))
                 valid = (compute_dtype == "bf16" and normalized["routed_weight_dtype"] == "mxfp4"
                     and normalized["weight_group_size"] == 32 and normalized["expert_parallel_size"] == 1
                     and normalized["expert_weight_tile_rows"] is None and limit == 10.0
-                    and (shape["experts"], shape["topk"], shape["hidden"], shape["intermediate"]) == (256, 6, 4096, 256)
-                    and "graph_runtime_mode" not in normalized)
+                    and geometry in supported and "graph_runtime_mode" not in normalized)
             else:
                 valid = False
             if not valid:
@@ -2205,21 +2209,21 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
     if kind is KernelKind.VECTOR and variant in ("dsv32_moe_route", "kimi_moe_route"):
         optional.add("source_projection_scope")
         if ("source_projection_scope" in normalized
-                and normalized["source_projection_scope"] not in ("a800_tp1_target_representative_layers_v1", "a800_tp8_pp4_ep8_glm_source_v1", "a800_tp8_pp2_ep8_kimi_source_v1", "a800_kimi_parallel_source_v1", "a800_tp1_kimi_source_v1", "vllm_0_30_glm_pcp_source_v1")):
+                and normalized["source_projection_scope"] not in ("a800_tp1_target_representative_layers_v1", "a800_tp8_pp4_ep8_glm_source_v1", "a800_tp8_pp2_ep8_kimi_source_v1", "a800_kimi_parallel_source_v1", "a800_tp1_kimi_source_v1", "vllm_0_30_portable_kimi_k2_source_v1", "vllm_0_30_glm_pcp_source_v1", "vllm_0_30_portable_k3_source_v1", "vllm_0_30_portable_v4_source_v1")):
             raise ValueError("target structural route requires its exact source projection scope")
         if ("source_projection_scope" in normalized
                 and normalized["source_projection_scope"] == "a800_tp8_pp4_ep8_glm_source_v1"
                 and variant != "dsv32_moe_route"):
             raise ValueError("GLM pipeline source scope cannot authorize another model's router")
         if ("source_projection_scope" in normalized
-                and normalized["source_projection_scope"] in ("a800_tp8_pp2_ep8_kimi_source_v1", "a800_kimi_parallel_source_v1", "a800_tp1_kimi_source_v1")
+                and normalized["source_projection_scope"] in ("a800_tp8_pp2_ep8_kimi_source_v1", "a800_kimi_parallel_source_v1", "a800_tp1_kimi_source_v1", "vllm_0_30_portable_kimi_k2_source_v1")
                 and variant != "kimi_moe_route"):
             raise ValueError("Kimi pipeline source scope cannot authorize another model's router")
     if kind is KernelKind.GEMM:
         optional.add("source_projection_scope")
         optional.add("source_gemm_runtime")
         if "source_projection_scope" in normalized:
-            if (normalized["source_projection_scope"] not in ("a800_tp1_target_representative_layers_v1", "a800_tp8_pp4_ep8_glm_source_v1", "vllm_0_30_glm_pcp_source_v1")
+            if (normalized["source_projection_scope"] not in ("a800_tp1_target_representative_layers_v1", "a800_tp8_pp4_ep8_glm_source_v1", "vllm_0_30_glm_pcp_source_v1", "vllm_0_30_portable_k3_source_v1", "vllm_0_30_portable_v4_source_v1")
                     or variant != "gemm" or compute_dtype != "bf16"
                     or "output_dtype" not in normalized or normalized["output_dtype"] != "fp32"):
                 raise ValueError("target structural GEMM scope requires plain BF16 A/B and FP32 C")
@@ -2335,7 +2339,7 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
                             or normalized["weight_group_size"] != 32 or normalized["has_bias"] is not False
                             or (expected_dtype == "fp8" and shape["k"] % 128)):
                         raise ValueError("MXFP4 mathematical GEMM requires declared BF16/FP8 A, BF16 C, group32 E2M1 weights/E8M0 scales and no bias")
-                elif (program != "block_fp8_fp32_scales_v1"
+                elif (program not in ("block_fp8_fp32_scales_v1", "block_fp8_weight_only_bf16_v1")
                         or compute_dtype != "bf16" or output_dtype not in (None, "bf16")
                         or shape["b"] != 1 or shape["k"] % 128):
                     raise ValueError("block-FP8 mathematical GEMM requires BF16 output and whole128 input groups")
@@ -4180,11 +4184,14 @@ def _normalize_compute_attributes(kind: KernelKind, variant: str,
                 if (compute_dtype != "bf16" or normalized["gather_factor"] != 1
                         or not normalized["materialized_output"] or normalized["index_bytes"] != 4):
                     raise ValueError("logical BF16 gather requires materialized rows with explicit INT32 indices")
-            elif normalized["mathematical_program"] == "materialized_fp32_copy_bytes_v1":
-                if (compute_dtype != "fp32" or normalized["gather_factor"] != 1
+            elif normalized["mathematical_program"] in (
+                    "materialized_fp32_copy_bytes_v1", "materialized_int32_copy_bytes_v1"):
+                expected_type = ("fp32" if normalized["mathematical_program"] == "materialized_fp32_copy_bytes_v1"
+                                 else "int32")
+                if (compute_dtype != expected_type or normalized["gather_factor"] != 1
                         or normalized["index_count"] != 0 or normalized["scattered"]
                         or not normalized["materialized_output"]):
-                    raise ValueError("logical FP32 copy requires an unindexed materialized one-to-one copy")
+                    raise ValueError("logical copy requires the declared dtype and an unindexed one-to-one copy")
             elif (normalized["mathematical_program"] not in (
                     "dense_fp16_source_flops_bytes_v1", "dense_bf16_source_flops_bytes_v1")
                     or compute_dtype != {"dense_fp16_source_flops_bytes_v1": "fp16",
@@ -6057,15 +6064,35 @@ class KernelSpec:
             raise TypeError("KernelSpec.shape must be a mapping")
         if not isinstance(self.attributes, Mapping):
             raise TypeError("KernelSpec.attributes must be a mapping")
+        from src.kernel.hardware_spec import HWSpec
+
         if ("mathematical_program" in self.attributes
                 and self.attributes["mathematical_program"] in (
                     "k3_tp_column_addmm_v1", "dense_bf16_source_flops_bytes_v1", "unquantized_bf16_flops_bytes_v1",
                     "unquantized_bf16_swiglu_v1", "unquantized_bf16_grouped_swiglu_v1",
                     "unquantized_bf16_legacy_grouped_swiglu_v1")
-                and (hardware_id != "nvidia_h200" or self.execution_support != "unsupported" or self.launch is not None)):
-            raise ValueError("BF16 source math requires an unbound H200 contract; native launch support is separate")
-        if self.attributes.get('mathematical_program') in ('k3_tp_sharded_marlin_v1','k3_tp_padded_marlin_v1') and hardware_id!='nvidia_h200':
-            raise ValueError('K3 TP mathematical program is H200-only')
+                and ((hardware_id != "nvidia_h200" and not (
+                    self.attributes["mathematical_program"] == "unquantized_bf16_grouped_swiglu_v1"
+                    and HWSpec.source_contract_supported("glm_bf16_portable_roofline", hardware_id)
+                    or self.attributes["mathematical_program"] in (
+                        "unquantized_bf16_swiglu_v1", "unquantized_bf16_grouped_swiglu_v1")
+                    and HWSpec.source_contract_supported("qwen3_moe_eager_source", hardware_id)
+                    or hardware_id == "ascend_910b"
+                    and self.attributes["mathematical_program"] == "dense_bf16_source_flops_bytes_v1"
+                    and (self.variant in ("rmsnorm", "add_rmsnorm")
+                         or self.variant == "elementwise" and self.attributes.get("operation") == "unary")
+                    or hardware_id == "nvidia_a800"
+                    and self.attributes["mathematical_program"] == "k3_tp_column_addmm_v1"
+                    or hardware_id in ("nvidia_a800", "metax_c500", "ascend_910b")
+                    and (self.attributes["mathematical_program"] == "dense_bf16_source_flops_bytes_v1"
+                        and (self.variant == "rmsnorm"
+                             or self.variant == "gather"
+                             or self.variant == "elementwise" and self.attributes.get("operation") == "add"))))
+                    or self.execution_support != "unsupported" or self.launch is not None)):
+            raise ValueError("BF16 source math requires a supported unbound mathematical contract")
+        if self.attributes.get("mathematical_program") in ("k3_tp_sharded_marlin_v1", "k3_tp_padded_marlin_v1"):
+            if hardware_id != "nvidia_h200" and not HWSpec.source_contract_supported("kimi_k3_portable_roofline", hardware_id):
+                raise ValueError("unsupported hardware for the K3 TP mathematical program")
         if (isinstance(self.anonymous_l2_dirty_bytes, bool)
                 or not isinstance(self.anonymous_l2_dirty_bytes, int)):
             raise TypeError(
@@ -6260,8 +6287,10 @@ class KernelSpec:
             if (kind is KernelKind.VECTOR and normalized_variant == "moe_topk"
                     and "source_program" in self.attributes
                     and self.attributes["source_program"] in ("vllm_0_11_bf16_sigmoid_bias_grouped_topk", "vllm_0_27_1_bf16_sigmoid_bias_grouped_topk")
-                    and self.hardware_id != "nvidia_h200"):
-                raise ValueError("DSV3 source grouped top-k requires its H200 mathematical contract")
+                    and self.hardware_id != "nvidia_h200"
+                    and not (self.attributes["source_program"] == "vllm_0_27_1_bf16_sigmoid_bias_grouped_topk"
+                        and self.hardware_id in ("nvidia_a800", "metax_c500", "ascend_910b"))):
+                raise ValueError("DSV3 source grouped top-k requires a supported mathematical contract")
             if (kind is KernelKind.VECTOR and normalized_variant == "moe_topk"
                     and "source_program" in self.attributes
                     and ((self.hardware_id != "nvidia_h200" and (
@@ -6325,8 +6354,10 @@ class KernelSpec:
                 raise ValueError("mathematical GEMM must not claim an actual launch")
             if (kind is KernelKind.GEMM and "mathematical_program" in self.attributes
                     and self.attributes["mathematical_program"] in ("block_fp8_quantized_input_fp32_scales_v1", "batched_fp8_quantized_input_fp32_scales_v1")
-                    and self.hardware_id not in ("hygon_bw1100", "nvidia_rtx_pro_5500")):
-                raise ValueError("prequantized block-FP8 program is scoped to the declared aggregate GPU design")
+                    and self.hardware_id not in ("hygon_bw1100", "nvidia_rtx_pro_5500")
+                    and not (normalized_variant == "batched_gemm"
+                             and self.hardware_id in ("nvidia_a800", "metax_c500", "ascend_910b"))):
+                raise ValueError("prequantized block-FP8 program requires a declared GPU projection")
             if (kind is KernelKind.GEMM and "mathematical_program" in self.attributes
                     and self.attributes["mathematical_program"] in ("mxfp4_bf16_flops_bytes_v1", "mxfp4_fp8_flops_bytes_v1")
                     and self.hardware_id != "intel_agmf039r47"):
@@ -6344,38 +6375,62 @@ class KernelSpec:
                 raise ValueError("SGLang0.5.19 mathematical experts require the declared H200 source contract")
             if (kind is KernelKind.FUSED_MOE and self.attributes.get("mathematical_program") == "glm_flashinfer_block128_deferred_ep_v1"
                     and self.hardware_id != "nvidia_h200"):
-                raise ValueError("GLM FlashInfer block128 source currently requires H200")
+                from src.kernel.hardware_spec import HWSpec
+                if not HWSpec.source_contract_supported("glm_fp8_weight_only_roofline", self.hardware_id):
+                    raise ValueError("unsupported hardware for GLM block128 expert math")
             if (kind is KernelKind.FUSED_MOE and "mathematical_program" in self.attributes
                     and self.attributes["mathematical_program"] == "block_fp8_replicated_ep_swiglu_v1"
                     and self.hardware_id != "nvidia_h200"):
                 raise ValueError("EP8 mathematical experts require their H200 source contract")
             if (kind is KernelKind.FUSED_MOE and "mathematical_program" in self.attributes
                     and self.attributes["mathematical_program"] == "kimi_ep_marlin_swiglu_v1"
-                    and self.hardware_id not in ("nvidia_a800", "nvidia_h200")):
-                raise ValueError("Kimi EP mathematical experts require an unbound NVIDIA source contract")
+                    and not HWSpec.source_contract_supported("kimi_ep_marlin_swiglu_math", self.hardware_id)):
+                raise ValueError("Kimi EP mathematical experts require an unbound source contract")
             if (kind is KernelKind.FUSED_MOE and "mathematical_program" in self.attributes
                     and self.attributes["mathematical_program"] == "kimi_ep_marlin_swiglu_v1"
-                    and normalized_shape["intermediate"] in (64, 128, 256, 512, 1024) and self.hardware_id != "nvidia_h200"):
-                raise ValueError("Kimi TP-sharded mathematical experts require the H200 source domain")
+                    and normalized_shape["intermediate"] in (64, 128, 256, 512, 1024)
+                    and self.hardware_id != "nvidia_h200"
+                    and not HWSpec.source_contract_supported("kimi_k2_portable_roofline", self.hardware_id)):
+                raise ValueError("Kimi TP-sharded mathematical experts require a matching source contract")
             if (kind is KernelKind.FUSED_MOE and self.attributes.get("mathematical_program") in ("v4_pro_tp16_padded_marlin_w4a16_v1", "v3_fp8_dispatched_ep_fused_quant_v1", "v3_fp8_ep8_fused_quant_v1", "v3_fp8_replicated_ep_fused_quant_v1", "v4_masked_marlin_ep_v1", "k3_masked_marlin_ep_v1", "v4_modelsp_masked_marlin_ep_v1")
                     and self.hardware_id != "nvidia_h200"):
-                raise ValueError("V4 masked EP mathematical source is currently H200-only")
+                from src.kernel.hardware_spec import HWSpec
+                program = self.attributes["mathematical_program"]
+                portable_v3_ep = (program in ("v3_fp8_dispatched_ep_fused_quant_v1", "v3_fp8_replicated_ep_fused_quant_v1")
+                    and HWSpec.source_contract_supported("deepseek_v3_expert_roofline", self.hardware_id))
+                portable_k3_ep = (program == "k3_masked_marlin_ep_v1"
+                    and HWSpec.source_contract_supported("kimi_k3_portable_roofline", self.hardware_id))
+                portable_v4 = (program in ("v4_pro_tp16_padded_marlin_w4a16_v1", "v4_masked_marlin_ep_v1",
+                    "v4_modelsp_masked_marlin_ep_v1")
+                    and HWSpec.source_contract_supported("deepseek_v4_portable_roofline", self.hardware_id))
+                if not (portable_v3_ep or portable_k3_ep or portable_v4):
+                    raise ValueError("unsupported hardware for the expert mathematical source")
             if (kind is KernelKind.FUSED_MOE and "mathematical_program" in self.attributes
                     and self.attributes["mathematical_program"] == "dsv4_mxfp4_w4a16_swiglu_v1"
                     and self.hardware_id not in ("hygon_bw1100", "nvidia_rtx_pro_5500")):
                 raise ValueError("V4 TP8 mathematical experts require their declared aggregate GPU source scope")
+            if (kind is KernelKind.FUSED_MOE
+                    and self.attributes.get("mathematical_program") == "dsv4_portable_mxfp4_w4a16_swiglu_v1"
+                    and not HWSpec.source_contract_supported("deepseek_v4_portable_roofline", self.hardware_id)):
+                raise ValueError("V4 portable expert math requires a declared hardware scope")
             if (kind is KernelKind.FUSED_MOE and "mathematical_program" in self.attributes
                     and (self.launch is not None or self.execution_support != "unsupported")):
                 raise ValueError("mathematical experts must not claim an actual launch")
             if (kind is KernelKind.FLASH_ATTN and normalized_variant == "kimi_k3_nope_context_attention"
-                    and (self.execution_support != "unsupported" or self.hardware_id != "nvidia_h200")):
-                raise ValueError("K3 context attention requires an unbound H200 source contract")
+                    and (self.execution_support != "unsupported" or not (
+                        self.hardware_id == "nvidia_h200"
+                        or HWSpec.source_contract_supported("kimi_k3_portable_roofline", self.hardware_id)))):
+                raise ValueError("K3 context attention requires an unbound source contract")
             if (kind is KernelKind.FUSED_MOE and normalized_variant == "kimi_k3_marlin_experts"
-                    and (self.execution_support != "unsupported" or self.hardware_id != "nvidia_h200")):
-                raise ValueError("K3 Marlin expert source requires an unbound H200 source contract")
+                    and (self.execution_support != "unsupported" or not (
+                        self.hardware_id == "nvidia_h200"
+                        or HWSpec.source_contract_supported("kimi_k3_portable_roofline", self.hardware_id)))):
+                raise ValueError("K3 Marlin expert source requires an unbound source contract")
             if (kind is KernelKind.VECTOR and normalized_variant in ("kimi_k3_attn_res", "kimi_k3_situ", "kimi_k3_kda_decode", "kimi_k3_kda_prefill", "kimi_k3_kda_mixed", "kimi_k3_kda_context_prefill", "kimi_k3_nope_prefill", "kimi_k3_nope_mixed", "kimi_k3_nope_context", "kimi_k3_moe_route")
-                    and (self.execution_support != "unsupported" or self.hardware_id != "nvidia_h200")):
-                raise ValueError("K3 source components require an unbound H200 source contract")
+                    and (self.execution_support != "unsupported" or not (
+                        self.hardware_id == "nvidia_h200"
+                        or HWSpec.source_contract_supported("kimi_k3_portable_roofline", self.hardware_id)))):
+                raise ValueError("K3 source components require an unbound source contract")
             if kind is KernelKind.VECTOR and normalized_variant == "dsv32_embed_norm" and self.hardware_id not in ("nvidia_a800", "nvidia_h200"):
                 raise ValueError("V32 target embedding norm requires a supported NVIDIA source contract")
             if (kind is KernelKind.VECTOR and normalized_variant in (
@@ -6461,9 +6516,9 @@ class KernelSpec:
                 if maca_cast and (self.hardware_id != "metax_c500"
                         or not _matches_maca_integer_cast_launch(self.launch, elements, self.attributes, normalized_variant)):
                     raise ValueError("integer cast requires its exact C500 source-selected Torch launch")
-                if logical_aten_cast and not (self.hardware_id in ("nvidia_h200", "metax_c500")
+                if logical_aten_cast and not (self.hardware_id in ("nvidia_a800", "nvidia_h200", "metax_c500", "ascend_910b")
                         and self.launch is None and self.execution_support == "unsupported"):
-                    raise ValueError("logical ATen integer cast requires an unbound H200 or C500 source")
+                    raise ValueError("logical ATen integer cast requires an unbound mathematical source")
                 if not logical_aten_cast and not maca_cast and not sm90_cast and (self.hardware_id != "nvidia_a800" or self.launch is None
                         or elements <= 0 or 8 * (elements - 1) > 2**31 - 1
                         or self.launch.algorithm != "pytorch_2_8_sm80_int32_to_int64"
@@ -6560,8 +6615,8 @@ class KernelSpec:
             if (kind is KernelKind.VECTOR and normalized_variant in ("vllm_logits_row_select", "vllm_logits_gather_reorder")
                     and "model_execution_version" in self.attributes
                     and self.attributes["model_execution_version"] == "vllm_0_27_1"
-                    and self.hardware_id != "nvidia_h200"):
-                raise ValueError("DSV3 logits boundary requires its declared H200 source contract")
+                    and self.hardware_id not in ("nvidia_a800", "nvidia_h200", "metax_c500", "ascend_910b")):
+                raise ValueError("DSV3 logits boundary requires a supported mathematical source")
             if (kind is KernelKind.VECTOR and normalized_variant == "vllm_logits_row_select"
                     and self.hardware_id not in ("nvidia_a800", "nvidia_h200", "metax_c500", "ascend_910b", "hygon_bw1100", "nvidia_rtx_pro_5500")):
                 raise ValueError("target logits row selection requires a supported source contract")
@@ -6598,21 +6653,39 @@ class KernelSpec:
                         or self.execution_support != "unsupported")):
                 raise ValueError("DSpark typed payload is an unbound H200 mathematical contract")
             if (kind is KernelKind.VECTOR and normalized_variant == "vocab_parallel_embedding"
-                    and (self.execution_support != "unsupported" or self.hardware_id not in ("nvidia_a800", "nvidia_h200", "hygon_bw1100", "nvidia_rtx_pro_5500"))):
-                raise ValueError("vocab embedding requires an unbound NVIDIA CUDA source contract")
+                    and (self.execution_support != "unsupported" or self.hardware_id not in (
+                        "nvidia_a800", "nvidia_h200", "metax_c500", "ascend_910b", "hygon_bw1100", "nvidia_rtx_pro_5500"))):
+                raise ValueError("vocab embedding requires an unbound mathematical source contract")
             if (kind is KernelKind.VECTOR and normalized_variant in ("dsv32_moe_route", "kimi_moe_route")
                     and (self.execution_support != "unsupported" or (self.hardware_id != "nvidia_h200"
                         and not (self.hardware_id == "nvidia_a800" and "source_projection_scope" in self.attributes
-                            and self.attributes["source_projection_scope"] in ("a800_tp1_target_representative_layers_v1", "a800_tp8_pp4_ep8_glm_source_v1", "a800_tp8_pp2_ep8_kimi_source_v1", "a800_kimi_parallel_source_v1", "a800_tp1_kimi_source_v1", "vllm_0_30_glm_pcp_source_v1"))))):
-                source_model = "GLM V32" if normalized_variant == "dsv32_moe_route" else "Kimi"
-                raise ValueError(f"{source_model} route requires an unbound H200 source contract")
+                            and self.attributes["source_projection_scope"] in ("a800_tp1_target_representative_layers_v1", "a800_tp8_pp4_ep8_glm_source_v1", "a800_tp8_pp2_ep8_kimi_source_v1", "a800_kimi_parallel_source_v1", "a800_tp1_kimi_source_v1", "vllm_0_30_glm_pcp_source_v1", "vllm_0_30_portable_k3_source_v1", "vllm_0_30_portable_v4_source_v1"))))):
+                portable_glm_route = (normalized_variant == "dsv32_moe_route"
+                    and self.attributes.get("source_projection_scope") == "vllm_0_30_glm_pcp_source_v1"
+                    and self.execution_support == "unsupported"
+                    and HWSpec.source_contract_supported("glm_fp8_weight_only_roofline", self.hardware_id))
+                portable_kimi_route = (normalized_variant == "kimi_moe_route"
+                    and self.attributes.get("source_projection_scope") == "vllm_0_30_portable_kimi_k2_source_v1"
+                    and self.execution_support == "unsupported"
+                    and HWSpec.source_contract_supported("kimi_k2_portable_roofline", self.hardware_id))
+                if not (portable_glm_route or portable_kimi_route):
+                    source_model = "GLM V32" if normalized_variant == "dsv32_moe_route" else "Kimi"
+                    raise ValueError(f"{source_model} route requires an unbound source contract")
             if (kind is KernelKind.VECTOR and normalized_variant in ("dsv32_moe_route", "kimi_moe_route")
                     and "source_projection_scope" in self.attributes
-                    and (self.hardware_id != "nvidia_a800" or self.launch is not None or self.execution_support != "unsupported")):
-                raise ValueError("A800 structural routing cannot claim an actual launch")
+                    and (self.launch is not None or self.execution_support != "unsupported"
+                         or self.hardware_id != "nvidia_a800" and not (
+                            normalized_variant == "kimi_moe_route"
+                            and self.attributes["source_projection_scope"] == "vllm_0_30_portable_kimi_k2_source_v1"
+                            and HWSpec.source_contract_supported("kimi_k2_portable_roofline", self.hardware_id)
+                            or normalized_variant == "dsv32_moe_route"
+                            and self.attributes["source_projection_scope"] == "vllm_0_30_glm_pcp_source_v1"
+                            and HWSpec.source_contract_supported("glm_fp8_weight_only_roofline", self.hardware_id)))):
+                raise ValueError("structural routing cannot claim an actual launch")
             if (kind is KernelKind.VECTOR and normalized_variant == "dsv4_moe_route"
                     and (self.hardware_id not in ("nvidia_h200", "hygon_bw1100", "nvidia_rtx_pro_5500")
-                         or (self.hardware_id in ("hygon_bw1100", "nvidia_rtx_pro_5500") and (self.launch is not None or self.execution_support != "unsupported"))
+                         and not HWSpec.source_contract_supported("deepseek_v4_portable_roofline", self.hardware_id)
+                         or (self.hardware_id != "nvidia_h200" and (self.launch is not None or self.execution_support != "unsupported"))
                          or (self.execution_support == "supported"
                              and ("routing_source" not in self.attributes
                                   or self.attributes["routing_source"] is None)))):
@@ -6794,6 +6867,15 @@ class KernelSpec:
                     and (self.hardware_id != "nvidia_h200" or self.launch is None
                          or self.launch.algorithm != "vllm_fa3_sm90_mla_prefill")):
                 raise ValueError("explicit MLA LSE output requires the H200 FA3 analytical source contract")
+            projection_scope = normalized_attributes.get("source_projection_scope")
+            portable_projection = (
+                projection_scope == "vllm_0_30_portable_k3_source_v1"
+                and HWSpec.source_contract_supported("kimi_k3_portable_roofline", self.hardware_id)
+                or projection_scope == "vllm_0_30_portable_v4_source_v1"
+                and HWSpec.source_contract_supported("deepseek_v4_portable_roofline", self.hardware_id)
+                or projection_scope == "vllm_0_30_glm_pcp_source_v1"
+                and HWSpec.source_contract_supported("glm_fp8_weight_only_roofline", self.hardware_id)
+            )
             if (kind is KernelKind.GEMM
                     and normalized_attributes["output_dtype"] is not None
                     and normalized_attributes["output_dtype"] != self.dtype
@@ -6803,15 +6885,15 @@ class KernelSpec:
                         and normalized_attributes["mathematical_program"] in ("mxfp4_fp8_flops_bytes_v1", "packed_fp4_source_v1"))
                     and not (self.hardware_id in ("hygon_bw1100", "nvidia_rtx_pro_5500") and self.launch is None
                         and self.execution_support == "unsupported")):
-                if (self.hardware_id != "nvidia_a800" or self.launch is not None
-                        or self.execution_support != "unsupported"
+                if ((self.hardware_id != "nvidia_a800" and not portable_projection)
+                        or self.launch is not None or self.execution_support != "unsupported"
                         or "source_projection_scope" not in normalized_attributes
-                        or normalized_attributes["source_projection_scope"] not in ("a800_tp1_target_representative_layers_v1", "a800_tp8_pp4_ep8_glm_source_v1", "vllm_0_30_glm_pcp_source_v1")):
-                    raise ValueError("mixed-output GEMM requires H200 or explicit unbound A800 structural scope")
-            if (kind is KernelKind.GEMM and "source_projection_scope" in normalized_attributes
-                    and (self.hardware_id != "nvidia_a800" or self.launch is not None
-                         or self.execution_support != "unsupported")):
-                raise ValueError("A800 target structural GEMM cannot claim an actual launch")
+                        or normalized_attributes["source_projection_scope"] not in ("a800_tp1_target_representative_layers_v1", "a800_tp8_pp4_ep8_glm_source_v1", "vllm_0_30_glm_pcp_source_v1", "vllm_0_30_portable_k3_source_v1", "vllm_0_30_portable_v4_source_v1")):
+                    raise ValueError("mixed-output GEMM requires a declared mathematical scope")
+            if kind is KernelKind.GEMM and "source_projection_scope" in normalized_attributes:
+                if ((self.hardware_id != "nvidia_a800" and not portable_projection)
+                        or self.launch is not None or self.execution_support != "unsupported"):
+                    raise ValueError("target structural GEMM cannot claim an actual launch")
             if (kind is KernelKind.VECTOR and normalized_variant == "fp8_group_quant"
                     and normalized_attributes["input_resource"] == "buffer"
                     and (self.hardware_id != "intel_agmf039r47" or self.launch is not None
@@ -6819,14 +6901,23 @@ class KernelSpec:
                 raise ValueError("FP8 A-buffer input requires unbound FPGA execution")
             if (kind is KernelKind.VECTOR and normalized_variant == "fp8_group_quant"
                     and normalized_attributes["source_program"] is not None):
-                if self.hardware_id != "nvidia_h200" or self.execution_support != "unsupported" or self.launch is not None:
-                    raise ValueError("conditional FP8 quantizer source requires unbound H200 execution")
+                from src.kernel.hardware_spec import HWSpec
+                portable = (normalized_attributes["source_program"] == "vllm_0_27_1_group_fp8_row_major"
+                    and HWSpec.source_contract_supported("deepseek_v3_expert_roofline", self.hardware_id))
+                if ((self.hardware_id != "nvidia_h200" and not portable)
+                        or self.execution_support != "unsupported" or self.launch is not None):
+                    raise ValueError("conditional FP8 quantizer requires a supported unbound source")
             if kind is KernelKind.VECTOR and normalized_variant == "dsv4_indexer_q_rope_quant":
-                if (self.hardware_id not in ("nvidia_h200", "hygon_bw1100", "nvidia_rtx_pro_5500") or self.execution_support != "unsupported" or self.launch is not None):
+                if (self.hardware_id not in ("nvidia_h200", "hygon_bw1100", "nvidia_rtx_pro_5500")
+                        and not HWSpec.source_contract_supported("deepseek_v4_portable_roofline", self.hardware_id)
+                        or self.execution_support != "unsupported" or self.launch is not None):
                     raise ValueError("V4 indexer Q source projection requires unbound H200 execution")
             if kind is KernelKind.VECTOR and normalized_variant == "dsv4_moe_route":
-                if normalized_attributes.get("mathematical_program")=="v4_modelsp_hash_top6_masked_v1" and (self.hardware_id!="nvidia_h200" or self.execution_support!="unsupported" or self.launch is not None):
-                    raise ValueError("V4 masked hash source is H200 partial math without native launch")
+                if (normalized_attributes.get("mathematical_program") == "v4_modelsp_hash_top6_masked_v1"
+                        and ((self.hardware_id != "nvidia_h200"
+                              and not HWSpec.source_contract_supported("deepseek_v4_portable_roofline", self.hardware_id))
+                             or self.execution_support != "unsupported" or self.launch is not None)):
+                    raise ValueError("V4 masked hash requires a declared mathematical scope")
                 source_bound = normalized_attributes["routing_source"] is not None
                 if source_bound != (self.execution_support == "supported"):
                     raise ValueError("unbound H200 route must remain unsupported; source routing requires a launch")

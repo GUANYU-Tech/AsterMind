@@ -281,9 +281,19 @@ def build_paged_kv_update(kernel, hardware, bindings, granularity, *, program_id
 
 
 def has_target_cache_source(kernel):
-    return (kernel.kind is KernelKind.KV_CACHE and kernel.execution_support == 'supported'
-        and (kernel.variant in ('mla_kv_cache','dsa_fp8_index_cache','dsv4_compressor_state_cache','dsv4_qnorm_rope_kv_insert')
-            or kernel.variant == 'dsv4_compressed_state_cache'))
+    if kernel.kind is not KernelKind.KV_CACHE:
+        return False
+    if kernel.execution_support == "supported":
+        return kernel.variant in ("mla_kv_cache", "dsa_fp8_index_cache", "dsv4_compressor_state_cache",
+                                  "dsv4_qnorm_rope_kv_insert", "dsv4_compressed_state_cache")
+    if kernel.launch is not None:
+        return False
+    from src.kernel.hardware_spec import HWSpec
+    return ((kernel.variant == "mla_kv_cache"
+             and HWSpec.source_contract_supported("deepseek_v3_portable_roofline", kernel.hardware_id))
+        or (kernel.variant in ("dsv4_qnorm_rope_kv_insert", "dsv4_compressor_state_cache",
+                              "dsv4_compressed_state_cache")
+            and HWSpec.source_contract_supported("deepseek_v4_portable_roofline", kernel.hardware_id)))
 
 
 def _target_cache_header(kernel):

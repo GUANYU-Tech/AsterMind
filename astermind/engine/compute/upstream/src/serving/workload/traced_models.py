@@ -2438,12 +2438,13 @@ class DeepseekV4DecoderLayer:
                  resolution, invocation_id, indexer_selection_source=None, workspace=None, source_max_batched_tokens=None,
                  profile_indexer_max_logits_mb=None, ffn=None, mhc_workspace_scope="source_launch", cache_tensors=None, slot_tensor=None,
                  expert_context=None, sequence_context=None, swa_request_phases=None,dummy_run=False):
-        self.pre = SymbolicMHC(trace, prefix + ":pre", pool, model, hardware,
+        mhc_hardware = None if mhc_workspace_scope == "logical_math_only" else hardware
+        self.pre = SymbolicMHC(trace, prefix + ":pre", pool, model, mhc_hardware,
             variant="mhc_pre", source_use_deep_gemm=source_use_deep_gemm, workspace_scope=mhc_workspace_scope)
         self.sequence, self.trace, self.pool, self.prefix = sequence_context, trace, pool, prefix
-        self.attn_pre = SymbolicMHC(trace, prefix + ":attn-post-pre", pool, model, hardware,
+        self.attn_pre = SymbolicMHC(trace, prefix + ":attn-post-pre", pool, model, mhc_hardware,
             variant="mhc_post_pre", source_use_deep_gemm=source_use_deep_gemm, workspace_scope=mhc_workspace_scope)
-        self.ffn_pre = SymbolicMHC(trace, prefix + ":ffn-post-pre", pool, model, hardware,
+        self.ffn_pre = SymbolicMHC(trace, prefix + ":ffn-post-pre", pool, model, mhc_hardware,
             variant="mhc_post_pre", source_use_deep_gemm=source_use_deep_gemm, workspace_scope=mhc_workspace_scope)
         if profile_indexer_max_logits_mb is None:
             self.attn = DeepseekV4Attention(trace, model, pool, prefix + ":attn", group, config, rotary_cache, topk_buffer,
@@ -2676,6 +2677,10 @@ class DeepseekV4Model:
         ropes = (dict(_source_state.ropes) if _source_state is not None else {kind: trace.tensor("model.rope-" + kind,
             (model.max_position_embeddings, model.qk_rope_head_dim), "fp32", persistent=True) for kind in rope_kinds})
         self.layers = []
+        mhc_math = hardware is not None and hardware.supports_source_contract("deepseek_v4_portable_roofline")
+        mhc_hardware = None if mhc_math else hardware
+        mhc_backend = None if mhc_math else source_use_deep_gemm
+        mhc_scope = "logical_math_only" if mhc_math else "source_launch"
         workspace = (_source_state.workspace if _source_state is not None else None if workspace_initial_capacity_bytes is None else
             ForwardWorkspace(trace, "worker.workspace", alignment_bytes=256,
                 initial_capacity_bytes=workspace_initial_capacity_bytes, locked=False))
@@ -2687,7 +2692,7 @@ class DeepseekV4Model:
                 rope, topk_buffer, layer_index=layer, q_lens=q_lens, kv_lens=kv_lens,
                 request_phases=request_phases, slot_mapping=slot_mapping, slot_tensor=slot_tensor, cache_capacity_tokens=cache_capacity_tokens,
                 source_max_model_len=source_max_model_len, linear_source_profile=linear_source_profile,
-                source_use_deep_gemm=source_use_deep_gemm, hardware=hardware,
+                source_use_deep_gemm=mhc_backend, hardware=hardware, mhc_workspace_scope=mhc_scope,
                 resolution=resolutions[layer], invocation_id=invocation_ids[layer],
                 indexer_selection_source=indexer_selection_source, workspace=workspace,
                 source_max_batched_tokens=max_batched_tokens, profile_indexer_max_logits_mb=profile_indexer_max_logits_mb,
@@ -2700,10 +2705,10 @@ class DeepseekV4Model:
         if not self.first_stage:
             self.layers[0].pre = SymbolicMHCPipelineInput(trace, f"layer-{start}:pre", pool, model,
                 source_use_deep_gemm=source_use_deep_gemm)
-        self.post = SymbolicMHC(trace, "final-mhc-post", pool, model, hardware,
-            variant="mhc_post", source_use_deep_gemm=source_use_deep_gemm)
-        self.head = (SymbolicMHC(trace, "hc-head", pool, model, hardware,
-            variant="hc_head", source_use_deep_gemm=source_use_deep_gemm) if self.last_stage else None)
+        self.post = SymbolicMHC(trace, "final-mhc-post", pool, model, mhc_hardware,
+            variant="mhc_post", source_use_deep_gemm=mhc_backend, workspace_scope=mhc_scope)
+        self.head = (SymbolicMHC(trace, "hc-head", pool, model, mhc_hardware,
+            variant="hc_head", source_use_deep_gemm=mhc_backend, workspace_scope=mhc_scope) if self.last_stage else None)
         self.norm = (SymbolicRMSNorm(trace, "final-norm", pool, model.hidden_size,
             model.target_semantics.rms_norm_eps) if self.last_stage else None)
 
@@ -2912,8 +2917,11 @@ def trace_deepseek_v4_forward(model, step, pool, hardware, expert_routing, *, in
             or len(workspace_initial_capacity_bytes) != config.worker_count
             or any(type(size) is not int or size < 0 for size in workspace_initial_capacity_bytes)):
         raise ValueError("V4 source workspace history needs one explicit nonnegative entry capacity per physical rank")
+    portable_v4 = (hardware.supports_source_contract("deepseek_v4_portable_roofline")
+        and config.data_parallel_size == 1
+        and not aux_hidden_state_layers and not _retain_source_state)
     if (model.model_type != "deepseek_v4" or model.compute_dtype != "bf16" or model.weight_dtype != "fp8"
-            or pool.hardware_id != "nvidia_h200" or hardware.hardware_id != pool.hardware_id
+            or not (pool.hardware_id == "nvidia_h200" or portable_v4) or hardware.hardware_id != pool.hardware_id
             or not is_deepseek_v4_parallel_model_scope(
                 model, config.tensor_parallel_size, config.pipeline_parallel_size,
                 expert_parallel=config.enable_expert_parallel or _replica_context is not None and _replica_context.expert_size > 1)
@@ -3354,7 +3362,9 @@ def trace_deepseek_v4_data_parallel_forward(model, step, pool, hardware, expert_
             or len(workspace_initial_capacity_bytes) != config.worker_count
             or any(type(size) is not int or size < 0 for size in workspace_initial_capacity_bytes)):
         raise ValueError("V4 DP workspace history needs one explicit nonnegative entry capacity per physical rank")
-    if (pool.hardware_id != "nvidia_h200" or hardware.hardware_id != pool.hardware_id
+    portable_v4 = (hardware.supports_source_contract("deepseek_v4_portable_roofline")
+        and config.enable_expert_parallel and not _retain_source_state and _prior_source is None)
+    if (not (pool.hardware_id == "nvidia_h200" or portable_v4) or hardware.hardware_id != pool.hardware_id
             or not is_deepseek_v4_data_parallel_model_scope(model, config) or len(pool.ranks) != config.worker_count):
         raise NotImplementedError("V4 DP source requires whole-block TP/DP and uniform global EP, nonempty PP, CP1")
     model_sp = config.enable_expert_parallel and tp > 1 and pp == 1
@@ -5791,7 +5801,8 @@ def trace_qwen3_moe_data_parallel_forward(model, step, pool, expert_routing, *, 
     from src.serving.deployment.validated_scope import is_qwen3_moe_dp_sp_source_scope
     if not is_qwen3_moe_dp_sp_source_scope(pool, model):
         raise NotImplementedError("coordinated Qwen3MoE source requires legal0.30 BF16 DP expert geometry")
-    if (source_profile != "cuda_eager_inplace" or type(sample_logits) is not bool
+    eager_source = "vllm_ascend_eager" if pool.hardware_id == "ascend_910b" else "cuda_eager_inplace"
+    if (source_profile != eager_source or type(sample_logits) is not bool
             or source_program_cache is not None and type(source_program_cache) is not SourceProgramCache):
         raise ValueError("Qwen DP source requires its explicit eager program and run-local source cache")
     if (not isinstance(input_ids, tuple) or len(input_ids) != step.token_count
@@ -5860,7 +5871,7 @@ def trace_qwen3_moe_data_parallel_forward(model, step, pool, expert_routing, *, 
                     token_ids=None if current_ids[replica] is None else (current_ids[replica],),
                     group=group, collective=pool.collective_for("all_reduce") if tp > 1 else None,
                     rope_program=vllm_rope_program(pool.hardware_id, model.rope_scaling_type), hardware_id=pool.hardware_id,
-                    model_execution_version="vllm_0_30_0", fused_embedding=True)
+                    model_execution_version="vllm_0_30_0", fused_embedding=pool.hardware_id not in ("ascend_910b", "metax_c500"))
                 ids = trace.tensor("input_ids", (1,), "int32", persistent=True) if network.first_stage else None
                 positions = trace.tensor("positions", (1,), "int64", persistent=True)
                 output = network(ids, positions, intermediate_tensors=incoming)
@@ -5896,7 +5907,7 @@ def trace_qwen3_moe_data_parallel_forward(model, step, pool, expert_routing, *, 
                     layer_range=ranges[stage], mlp_factories=stage_factories(trace, stage), token_ids=local_ids,
                     group=group, collective=pool.collective_for("all_reduce") if tp > 1 else None,
                     rope_program=vllm_rope_program(pool.hardware_id, model.rope_scaling_type), hardware_id=pool.hardware_id,
-                    model_execution_version="vllm_0_30_0", fused_embedding=True)
+                    model_execution_version="vllm_0_30_0", fused_embedding=pool.hardware_id not in ("ascend_910b", "metax_c500"))
                 ids = trace.tensor("input_ids", (logical_rows[replica],), "int32") if stage == 0 else None
                 positions = trace.tensor("positions", (logical_rows[replica],), "int64")
                 outputs = network(ids, positions, intermediate_tensors=incoming)
@@ -5929,7 +5940,7 @@ def trace_qwen3_moe_data_parallel_forward(model, step, pool, expert_routing, *, 
                     collective=pool.collective_for("all_reduce") if tp > 1 else None,
                     gather=pool.collective_for("all_gather") if tp > 1 else None,
                     mlp_factories=factories, sample_logits=sample_logits, cast_logits=False, hardware_id=pool.hardware_id,
-                    fused_embedding=True, rope_program=vllm_rope_program(pool.hardware_id, model.rope_scaling_type),
+                    fused_embedding=pool.hardware_id not in ("ascend_910b", "metax_c500"), rope_program=vllm_rope_program(pool.hardware_id, model.rope_scaling_type),
                     model_execution_version="vllm_0_30_0")
     joined.source_scope = {"model_execution_version": "vllm_0_30_0", "source_projection_only": True,
         "source_data_parallel_rows": logical_rows, "source_model_rows_including_dummy": work_rows,
@@ -6741,6 +6752,9 @@ def trace_kimi_k3_forward(model, step, pool, expert_routing, *, input_ids, posit
     from src.serving.parallelism.pp import pipeline_layer_ranges_for_plan
     from .model_config import is_kimi_k3_parallel_model_scope
 
+    from src.kernel.hardware_spec import HWSpec
+    from src.serving.deployment.validated_scope import is_portable_kimi_k3_pool
+
     config, source = pool.parallel_plan.config, model.kimi_k3_semantics
     if fa3_hardware is not None:
         if fa3_hardware.hardware_id != pool.hardware_id or prefill_output_source not in (None,"supports_out"):
@@ -6754,7 +6768,13 @@ def trace_kimi_k3_forward(model, step, pool, expert_routing, *, input_ids, posit
         raise ValueError("K3 dummy forward requires an actual idle replica without request coordinates")
     if kda_decode_backend not in ('triton','native') or _dummy_run and input_ids!=(0,):
         raise ValueError("K3 source requires its explicit KDA backend and V2 dummy input zeros")
-    if (model.model_type != "kimi_linear" or source is None or pool.hardware_id != "nvidia_h200"
+    portable_ep_replica = (_replica_context is not None and _replica_context.model_sequence_parallel
+        and _replica_context.expert_parallel_size == tp * len(_replica_context.rows)
+        and HWSpec.source_contract_supported("kimi_k3_portable_roofline", pool.hardware_id))
+    portable_source = ((is_portable_kimi_k3_pool(pool) or portable_ep_replica)
+        and fa3_hardware is None and kda_decode_backend == "triton")
+    if (model.model_type != "kimi_linear" or source is None
+            or not (pool.hardware_id == "nvidia_h200" or portable_source)
             or model.compute_dtype != "bf16" or not source.latent_moe_use_norm or not source.mla_use_output_gate
             or (model.qk_nope_head_dim, model.qk_rope_head_dim, model.kv_lora_rank, model.v_head_dim) != (128, 64, 512, 128)
             or source.kda_head_dim != 128 or source.short_conv_kernel_size != 4
@@ -7044,10 +7064,14 @@ def trace_kimi_k3_data_parallel_forward(model, step, pool, expert_routing, *, in
     from src.serving.parallelism.pp import pipeline_layer_ranges_for_plan
     from .model_config import is_kimi_k3_data_parallel_model_scope
     from .runtime_inputs import K3SourceInputs
+    from src.serving.deployment.validated_scope import is_portable_kimi_k3_pool
+
     config = pool.parallel_plan.config
     tp, pp, dp = config.tensor_parallel_size, config.pipeline_parallel_size, config.data_parallel_size
     model_sp = config.enable_expert_parallel and tp > 1 and pp == 1
-    if (pool.hardware_id != "nvidia_h200" or not is_kimi_k3_data_parallel_model_scope(model, config)
+    if (not (pool.hardware_id == "nvidia_h200" or is_portable_kimi_k3_pool(pool)
+                and fa3_hardware is None and kda_decode_backend == "triton")
+            or not is_kimi_k3_data_parallel_model_scope(model, config)
             or len(pool.ranks) != config.worker_count):
         raise NotImplementedError("K3 DP source requires whole-shard TP/nonempty PP, uniform global EP or EP-off and CP/SP1")
     if config.enable_expert_parallel and latent_tail_tier is not None:
@@ -7406,7 +7430,9 @@ def trace_kimi_k2_forward(model, step, pool, expert_routing, *, input_ids, posit
             or graph_token_shape is not None or source_program_cache is not None)):
         raise ValueError("Kimi dummy source requires its private one-row DP dummy without request/cache coordinates")
     config = pool.parallel_plan.config
-    a800_global_ep_replica = (pool.hardware_id == "nvidia_a800"
+    from src.kernel.hardware_spec import HWSpec
+    projected_global_ep_replica = ((pool.hardware_id == "nvidia_a800"
+        or HWSpec.source_contract_supported("kimi_k2_portable_roofline", pool.hardware_id))
         and isinstance(_replica_context, _KimiReplicaContext)
         and len(_replica_context.rows) > 1
         and _replica_context.expert_size == config.tensor_parallel_size * len(_replica_context.rows)
@@ -7414,17 +7440,17 @@ def trace_kimi_k2_forward(model, step, pool, expert_routing, *, input_ids, posit
         and config.data_parallel_size == config.context_parallel_size == config.sequence_parallel_size == 1
         and not config.enable_expert_parallel)
     pipeline_source = (_kimi_pipeline_source_scope(model, pool)
-        or a800_global_ep_replica and config.pipeline_parallel_size > 1)
+        or projected_global_ep_replica and config.pipeline_parallel_size > 1)
     single_rank = _kimi_single_rank_source_scope(model, pool)
     from src.serving.deployment.validated_scope import is_kimi_k2_rank_local_source_scope
     if type(include_lm_head) is not bool:
         raise TypeError("K2.6 include_lm_head must be boolean")
     if (source_profile != "vllm_0_30_k2_6_int4_sync_explicit_allreduce"
             or not _is_kimi_k2_text_source(model)
-            or not (single_rank or pipeline_source or a800_global_ep_replica or is_kimi_k2_rank_local_source_scope(pool, model))
+            or not (single_rank or pipeline_source or projected_global_ep_replica or is_kimi_k2_rank_local_source_scope(pool, model))
             or any(value != 1 for value in (config.sequence_parallel_size,
                 config.context_parallel_size, config.data_parallel_size))):
-        raise NotImplementedError("virtual K2 text requires legal eager H200 TP/PP with EP-off or stage-local EP, or its existing A800 source; SP/CP/DP1")
+        raise NotImplementedError("virtual K2 text requires a supported eager TP/PP placement with SP/CP/DP1")
     ordinary = bool(step.requests) and all(
         (r.phase == "prefill" and r.computed_tokens >= 0 and r.scheduled_tokens > 0)
         or (r.phase == "decode" and r.scheduled_tokens > 0 and r.computed_tokens > 0)
@@ -7617,9 +7643,13 @@ def trace_kimi_k2_data_parallel_forward(model, step, pool, expert_routing, *, in
         raise TypeError("Kimi DP source requires explicit canonical routing input")
     config = pool.parallel_plan.config
     tp, dp, pp = config.tensor_parallel_size, config.data_parallel_size, config.pipeline_parallel_size
-    if (source_profile != "vllm_0_30_k2_6_int4_sync_explicit_allreduce" or not (pool.hardware_id == "nvidia_h200" or pool.hardware_id == "nvidia_a800" and config.enable_expert_parallel)
+    from src.kernel.hardware_spec import HWSpec
+    if (source_profile != "vllm_0_30_k2_6_int4_sync_explicit_allreduce"
+            or not (pool.hardware_id == "nvidia_h200" or config.enable_expert_parallel
+                and (pool.hardware_id == "nvidia_a800"
+                    or HWSpec.source_contract_supported("kimi_k2_portable_roofline", pool.hardware_id)))
             or not is_kimi_k2_data_parallel_model_scope(model, config) or len(pool.ranks) != config.worker_count):
-        raise NotImplementedError("Kimi DP source requires0.30.0 H200 whole-group INT4 TP/DP or A800/H200 uniform global EP, CP1")
+        raise NotImplementedError("Kimi DP source requires vLLM 0.30, CP1, and a supported whole-group INT4 or uniform global EP placement")
     moe_sp = config.enable_expert_parallel and tp > 1
     if (not isinstance(input_ids, tuple) or len(input_ids) != step.token_count or not step.requests
             or step.pool_name != pool.name or len({request.request_id for request in step.requests}) != len(step.requests)
@@ -8303,6 +8333,10 @@ def trace_dense_pipeline_forward(model, step, pool, *, input_ids, positions, slo
                                  graph_token_shape=None, graph_eager_kinds=(), expert_routing=None):
     """Run the adapted Qwen/Llama forward over the plan's actual PP stages."""
     from src.serving.parallelism.tp import validate_gqa_parallelism
+    from src.serving.deployment.validated_scope import (
+        is_dense_parallel_source_scope, is_qwen3_moe_rank_local_source_scope,
+    )
+
     config = pool.parallel_plan.config
     if model_execution_version not in ("vllm_0_11_0", "vllm_0_18_0", "vllm_0_24_0", "vllm_0_30_0"):
         raise ValueError("virtual PP requires its supported declared model version")
@@ -8329,11 +8363,18 @@ def trace_dense_pipeline_forward(model, step, pool, *, input_ids, positions, slo
     c500_dense_pipeline = (pool.hardware_id == "metax_c500"
         and model_execution_version in ("vllm_0_24_0", "vllm_0_30_0")
         and source_profile == "cuda_eager_inplace" and not moe
-        and model.compute_dtype == model.weight_dtype == "bf16"
+        and model.compute_dtype == model.weight_dtype
+        and (model.compute_dtype == "bf16" or (model.compute_dtype == "fp16"
+            and model.model_type == "qwen3" and model_execution_version == "vllm_0_30_0"))
         and not config.enable_expert_parallel
         and config.data_parallel_size == config.sequence_parallel_size == config.context_parallel_size == 1
         and config.pipeline_parallel_size > 1 and graph_token_shape is None)
-    if (not model_scope or (pool.hardware_id not in ("nvidia_a800", "nvidia_h200") and not c500_dense_pipeline and not ascend018 and not vendor_ep2)
+    eager_scope = is_qwen3_moe_rank_local_source_scope if moe else is_dense_parallel_source_scope
+    ordinary030 = (model_execution_version == "vllm_0_30_0" and eager_scope(pool, model,
+        model_execution_version=model_execution_version, symbolic_forward_source=source_profile,
+        graph_enabled=graph_token_shape is not None))
+    if (not model_scope or not (pool.hardware_id in ("nvidia_a800", "nvidia_h200")
+            or c500_dense_pipeline or ascend018 or vendor_ep2 or ordinary030)
             or (model_execution_version == "vllm_0_18_0" and not ascend018 and not vendor_ep2)
             or (config.enable_expert_parallel and not moe) or not config.is_rank_local
             or len(pool.ranks) != config.worker_count):
@@ -8388,7 +8429,8 @@ def trace_dense_pipeline_forward(model, step, pool, *, input_ids, positions, slo
             group=group, collective=None if tp == 1 else pool.collective_for("all_reduce"),
             rope_program=vllm_rope_program(pool.hardware_id, model.rope_scaling_type), hardware_id=pool.hardware_id,
             model_execution_version=model_execution_version,
-            fused_embedding=(model_execution_version not in ("vllm_0_11_0", "vllm_0_18_0") and not c500_dense_pipeline and not vendor_ep2))
+            fused_embedding=(pool.hardware_id not in ("metax_c500", "ascend_910b")
+                and model_execution_version not in ("vllm_0_11_0", "vllm_0_18_0")))
         ids = trace.tensor("input_ids", (physical_rows,), "int32") if stage == 0 else None
         pos = trace.tensor("positions", (physical_rows,), "int64")
         if graph_token_shape is not None:
@@ -10615,12 +10657,18 @@ def _bind_ordinary_forward_source(model, deployment, runtime_inputs):
             is_glm_bf16_tensor_source_scope, is_glm_bf16_pipeline_source_scope)
         from src.serving.deployment.validated_scope import is_kimi_k2_data_parallel_source_scope
         from src.serving.deployment.validated_scope import is_kimi_k2_rank_local_source_scope
-        a800_kimi_tensor = (deployment.mode == "colocated" and len(deployment.worker_pools) == 1
+        from src.kernel.hardware_spec import HWSpec
+
+        def projected_kimi(pool):
+            return (pool.hardware_id == "nvidia_a800"
+                or HWSpec.source_contract_supported("kimi_k2_portable_roofline", pool.hardware_id))
+
+        kimi_tensor = (deployment.mode == "colocated" and len(deployment.worker_pools) == 1
             and not runtime_inputs.graph_execution.enabled
-            and all(pool.hardware_id == "nvidia_a800" and pool.parallel_plan.config.pipeline_parallel_size == 1
+            and all(projected_kimi(pool) and pool.parallel_plan.config.pipeline_parallel_size == 1
                 and pool.parallel_plan.config.tensor_parallel_size > 1 and is_kimi_k2_rank_local_source_scope(pool, model)
                 for pool in deployment.worker_pools.values()))
-        a800_kimi_dp_source = all(pool.hardware_id == "nvidia_a800"
+        kimi_dp_source = all(projected_kimi(pool)
             and is_kimi_k2_data_parallel_source_scope(pool, model,
                 model_execution_version=runtime_inputs.model_execution_version,
                 symbolic_forward_source="vllm_0_30_k2_6_int4_sync_explicit_allreduce",
@@ -10629,8 +10677,18 @@ def _bind_ordinary_forward_source(model, deployment, runtime_inputs):
         glm_bf16_source = all(is_glm_bf16_tensor_source_scope(pool, model) or is_glm_distributed_source_scope(pool, model)
             or is_glm_bf16_pipeline_source_scope(pool, model)
             for pool in deployment.worker_pools.values())
-        if (a800_glm_pipeline or a800_kimi_pipeline or a800_kimi_tensor or a800_kimi_dp_source
-                or glm_bf16_source
+        from src.serving.deployment.validated_scope import (
+            is_glm_fp8_rank_local_source_scope, is_glm53_rank_local_ep_source_scope,
+            is_glm_fp8_data_parallel_source_scope)
+        portable_glm_fp8 = all(
+            HWSpec.source_contract_supported("glm_fp8_weight_only_roofline", pool.hardware_id)
+            and (is_glm_fp8_rank_local_source_scope(pool, model)
+                 or is_glm53_rank_local_ep_source_scope(pool, model)
+                 or ((model.model_id == "zai-org/GLM-5.3" or pool.hardware_id == "nvidia_a800")
+                     and is_glm_fp8_data_parallel_source_scope(pool, model)))
+            for pool in deployment.worker_pools.values())
+        if (a800_glm_pipeline or a800_kimi_pipeline or kimi_tensor or kimi_dp_source
+                or glm_bf16_source or portable_glm_fp8
                 or all(_kimi_single_rank_source_scope(model, pool) for pool in deployment.worker_pools.values())
                 or all(pool.hardware_id == "nvidia_h200" for pool in deployment.worker_pools.values())):
             if model.model_type == "glm_moe_dsa" and model.weight_dtype in ("bf16", "fp8"):
@@ -10646,7 +10704,7 @@ def _bind_ordinary_forward_source(model, deployment, runtime_inputs):
                 # FP8 EP also owns a cold workspace per physical rank.
                 glm53_ep_cold = all(is_glm53_rank_local_ep_source_scope(pool, model)
                     for pool in deployment.worker_pools.values())
-                cold_glm_scope = (model.weight_dtype == "bf16" and glm_bf16_source
+                cold_glm_scope = (model.weight_dtype == "bf16" and glm_bf16_source or portable_glm_fp8
                     or model.weight_dtype == "fp8" and (glm53_rank_local_cold or glm53_ep_cold
                         or all(is_glm_fp8_data_parallel_source_scope(pool, model)
                             for pool in deployment.worker_pools.values())))
@@ -10781,24 +10839,19 @@ def _bind_ordinary_forward_source(model, deployment, runtime_inputs):
         return runtime_inputs
     pool, = deployment.worker_pools.values()
     parallel = pool.parallel_plan.config
-    # Reuse the existing ordinary0.30 DP forward; DP is not rank-local.
+    # Reuse the ordinary 0.30 DP forward with the target's embedding program.
+    eager_source = "vllm_ascend_eager" if pool.hardware_id == "ascend_910b" else "cuda_eager_inplace"
     from src.serving.deployment.validated_scope import is_qwen3_moe_dp_sp_source_scope
     if (runtime_inputs.model_execution_version == "vllm_0_30_0"
             and not runtime_inputs.graph_execution.enabled and pool.role == "colocated"
             and is_qwen3_moe_dp_sp_source_scope(pool, model)):
-        return replace(runtime_inputs, symbolic_forward_source="cuda_eager_inplace")
+        return replace(runtime_inputs, symbolic_forward_source=eager_source)
     general_dense = is_dense_parallel_source_scope(pool, model,
         model_execution_version=runtime_inputs.model_execution_version,
-        symbolic_forward_source="cuda_eager_inplace", graph_enabled=runtime_inputs.graph_execution.enabled)
-    # Bind the same Ascend0.18 eager source already admitted by the complete
-    # TP/PP forward. Keep the caller's version, sampler and execution mode.
-    ascend_dense = is_dense_parallel_source_scope(pool, model,
-        model_execution_version=runtime_inputs.model_execution_version,
-        symbolic_forward_source="vllm_ascend_eager", graph_enabled=runtime_inputs.graph_execution.enabled)
-    general_dense = general_dense or ascend_dense
+        symbolic_forward_source=eager_source, graph_enabled=runtime_inputs.graph_execution.enabled)
     general_moe = stage_ep2 or is_qwen3_moe_rank_local_source_scope(pool, model,
         model_execution_version=runtime_inputs.model_execution_version,
-        symbolic_forward_source="cuda_eager_inplace", graph_enabled=runtime_inputs.graph_execution.enabled)
+        symbolic_forward_source=eager_source, graph_enabled=runtime_inputs.graph_execution.enabled)
     pipeline = (dense and pool.hardware_id == "nvidia_a800" and not parallel.enable_expert_parallel
         and is_validated_qwen3_pipeline_model_scope(model, parallel.tensor_parallel_size, parallel.pipeline_parallel_size))
     hardware_ids = (("nvidia_a800", "nvidia_h200") if source011
@@ -10820,8 +10873,7 @@ def _bind_ordinary_forward_source(model, deployment, runtime_inputs):
         return runtime_inputs
     if moe and model.compute_dtype != "bf16":
         return runtime_inputs
-    return replace(runtime_inputs, symbolic_forward_source=(
-        "vllm_ascend_eager" if pool.hardware_id == "ascend_910b" else "cuda_eager_inplace"))
+    return replace(runtime_inputs, symbolic_forward_source=eager_source)
 
 
 def _dense_source_prefix(model, step, arguments):
@@ -11244,7 +11296,8 @@ def _trace_deepseek_distributed_runtime_source(model, step, pool, runtime_inputs
             source_max_model_len=runtime_inputs.symbolic_source_max_model_len,
             max_batched_tokens=runtime_inputs.symbolic_source_max_batched_tokens,
             source_profile=runtime_inputs.symbolic_forward_source, target_sampling_source=runtime_inputs.target_sampling_source,
-            fa3_hardware=None if hardware_by_id is None else hardware_by_id[pool.hardware_id])
+            fa3_hardware=(hardware_by_id[pool.hardware_id]
+                if hardware_by_id is not None and pool.hardware_id == "nvidia_h200" else None))
     if model.model_type == "kimi_k2":
         return trace_kimi_k2_data_parallel_forward(model, step, pool, runtime_inputs.expert_routing,
             input_ids=runtime_inputs.embedding_token_ids, slot_mapping_by_replica=slot_mapping,
@@ -11917,8 +11970,9 @@ def build_symbolic_workload(step, model, deployment, *, launch_policy, runtime_i
         return finish(_trace_deepseek_distributed_runtime_source(model, step, pool, runtime_inputs, hardware_by_id,
             kimi_input_history if pool.hardware_id == "nvidia_a800" else None))
     if is_qwen3_moe_dp_sp_source_scope(pool, model):
+        eager_source = "vllm_ascend_eager" if pool.hardware_id == "ascend_910b" else "cuda_eager_inplace"
         if (runtime_inputs.model_execution_version != "vllm_0_30_0"
-                or runtime_inputs.symbolic_forward_source != "cuda_eager_inplace"
+                or runtime_inputs.symbolic_forward_source != eager_source
                 or deployment.mode not in ("colocated", "pd_disagg")
                 or (deployment.mode == "colocated" and len(deployment.worker_pools) != 1)
                 or launch_policy != "analytical_launch" or runtime_inputs.graph_execution.enabled or host_transfers
@@ -12068,7 +12122,8 @@ def build_symbolic_workload(step, model, deployment, *, launch_policy, runtime_i
                 cache_capacity_tokens_by_replica=state.cache_capacity_tokens_by_replica,
                 state_pool_slots_by_replica=state.state_pool_slots_by_replica,
                 kda_decode_backend=runtime_inputs.k3_kda_decode_backend,
-                fa3_hardware=None if hardware_by_id is None else hardware_by_id[pool.hardware_id]))
+                fa3_hardware=(hardware_by_id[pool.hardware_id]
+                    if hardware_by_id is not None and pool.hardware_id == "nvidia_h200" else None)))
         if not isinstance(state, K3SourceInputs) or state.request_ids != tuple(request.request_id for request in step.requests):
             raise ValueError("K3 cache/state coordinates must match the original scheduled requests")
         positions = tuple(position for request in step.requests
@@ -12082,7 +12137,8 @@ def build_symbolic_workload(step, model, deployment, *, launch_policy, runtime_i
             prefill_output_source=state.prefill_output_source, latent_tail_tier=runtime_inputs.k3_latent_tail_tier,
             kda_decode_backend=runtime_inputs.k3_kda_decode_backend,
             fa3_hardware=(hardware_by_id[pool.hardware_id] if hardware_by_id is not None
-                and launch_policy=="analytical_launch" and not runtime_inputs.graph_execution.enabled else None)))
+                and pool.hardware_id == "nvidia_h200" and launch_policy == "analytical_launch"
+                and not runtime_inputs.graph_execution.enabled else None)))
     positions, slots, offset = [], [], 0
     source_prompt_lengths = runtime_inputs.symbolic_source_prompt_lengths
     prompt_lengths_by_request = runtime_inputs.symbolic_source_prompt_lengths_by_request

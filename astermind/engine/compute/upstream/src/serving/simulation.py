@@ -2217,8 +2217,9 @@ def validate_workload_emission_parallelism(
             for operation in operations:
                 pool.collective_for(operation)
             continue
+        eager_source = "vllm_ascend_eager" if pool.hardware_id == "ascend_910b" else "cuda_eager_inplace"
         if (runtime_inputs is not None and runtime_inputs.model_execution_version == "vllm_0_30_0"
-                and runtime_inputs.symbolic_forward_source == "cuda_eager_inplace"
+                and runtime_inputs.symbolic_forward_source == eager_source
                 and not runtime_inputs.graph_execution.enabled and is_qwen3_moe_dp_sp_source_scope(pool, model)
                 and deployment.mode == "colocated" and len(deployment.worker_pools) == 1):
             operations = (("all_reduce", "all_gather") if parallelism.tensor_parallel_size > 1 else ())

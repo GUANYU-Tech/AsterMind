@@ -3,9 +3,13 @@ from collections import defaultdict
 from contextvars import ContextVar
 from src.kernel.predictors.k3_tp_math import PROGRAM,PADDED_PROGRAM,validate as validate_math
 _PROOF=ContextVar('k3_tp_source_proof',default=None)
+from src.kernel.hardware_spec import HWSpec
+
+
 def applicable(pool):
  c=pool.parallel_plan.config
- return (pool.hardware_id=='nvidia_h200' and pool.parallel_plan.num_layers==93 and not c.enable_expert_parallel
+ return ((pool.hardware_id == "nvidia_h200" or HWSpec.source_contract_supported(
+            "kimi_k3_portable_roofline", pool.hardware_id)) and pool.parallel_plan.num_layers==93 and not c.enable_expert_parallel
   and c.tensor_parallel_size in (2,4,8,16,32) and c.data_parallel_size==c.context_parallel_size==c.sequence_parallel_size==1
   and 1<=c.pipeline_parallel_size<=93)
 def allowed_node(node,pool):

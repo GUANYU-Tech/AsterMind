@@ -90,7 +90,11 @@ def _vllm030_with_byte_budget(config, backend_config, requested, model, hardware
         is_deepseek_v4_data_parallel_model_scope, is_deepseek_v4_parallel_model_scope,
     )
     from src.serving.kv_cache.model_residency import dsv4_parallel_model_buffer_bytes
-    v4 = (config.hardware_id == "nvidia_h200" and model.model_type == "deepseek_v4"
+    from src.kernel.hardware_spec import HWSpec
+    portable_v4 = (config.compute_mode == "roofline"
+        and HWSpec.source_contract_supported("deepseek_v4_portable_roofline", config.hardware_id)
+        and (config.data_parallel_size == 1 or config.enable_expert_parallel))
+    v4 = ((config.hardware_id == "nvidia_h200" or portable_v4) and model.model_type == "deepseek_v4"
           and model.weight_dtype == "fp8" and model.compute_dtype == "bf16"
           and config.sequence_parallel_size == 1
           and (is_deepseek_v4_data_parallel_model_scope(model, parallelism)
@@ -98,11 +102,20 @@ def _vllm030_with_byte_budget(config, backend_config, requested, model, hardware
                is_deepseek_v4_parallel_model_scope(model, config.tensor_parallel_size,
                    config.pipeline_parallel_size, expert_parallel=config.enable_expert_parallel)))
     if v4 and config.kv_block_size_tokens != 256:
-        raise ValueError("H200 DeepSeek-V4 indexer requires a 256-token kernel KV block")
+        raise ValueError("DeepSeek-V4 indexer requires a 256-token kernel KV block")
     h200_text_source = config.hardware_id == "nvidia_h200" and config.sequence_parallel_size == 1
     a800_text_source = config.hardware_id == "nvidia_a800" and config.sequence_parallel_size == 1
-    qwen_wide_ep = ((h200_text_source or a800_text_source) and config.data_parallel_size > 1
-        and config.enable_expert_parallel and is_qwen3_moe_source_model_scope(model))
+    portable_v3 = (config.compute_mode == "roofline" and config.sequence_parallel_size == 1
+        and (HWSpec.source_contract_supported("deepseek_v3_expert_roofline", config.hardware_id)
+             if config.enable_expert_parallel else config.data_parallel_size == 1
+             and HWSpec.source_contract_supported("deepseek_v3_portable_roofline", config.hardware_id))
+        and (is_deepseek_v3_data_parallel_model_scope(model, parallelism) if config.data_parallel_size > 1
+             else is_deepseek_v3_parallel_model_scope(model, config.tensor_parallel_size,
+                 config.pipeline_parallel_size, expert_parallel=config.enable_expert_parallel)))
+    qwen_wide_ep = (config.sequence_parallel_size == 1 and config.data_parallel_size > 1
+        and config.enable_expert_parallel and is_qwen3_moe_source_model_scope(model)
+        and (h200_text_source or a800_text_source
+            or HWSpec.source_contract_supported("qwen3_moe_eager_source", config.hardware_id)))
     plain_mla = h200_text_source and (
         (is_kimi_k2_data_parallel_model_scope(model, parallelism)
          or is_deepseek_v3_data_parallel_model_scope(model, parallelism)) if config.data_parallel_size > 1 else
@@ -110,20 +123,37 @@ def _vllm030_with_byte_budget(config, backend_config, requested, model, hardware
             config.pipeline_parallel_size, expert_parallel=config.enable_expert_parallel)
          or is_deepseek_v3_parallel_model_scope(model, config.tensor_parallel_size,
             config.pipeline_parallel_size, expert_parallel=config.enable_expert_parallel)))
-    # Existing A800 INT4 K2 projection uses the same source KV geometry.
-    a800_kimi = a800_text_source and (
+    kimi_text_source = a800_text_source or (config.compute_mode == "roofline"
+        and config.sequence_parallel_size == 1
+        and HWSpec.source_contract_supported("kimi_k2_portable_roofline", config.hardware_id))
+    kimi = kimi_text_source and (
         config.enable_expert_parallel and is_kimi_k2_data_parallel_model_scope(model, parallelism)
         if config.data_parallel_size > 1 else is_kimi_k2_parallel_model_scope(
             model, config.tensor_parallel_size, config.pipeline_parallel_size,
             expert_parallel=config.enable_expert_parallel))
-    k3 = h200_text_source and (
+    portable_k3 = (config.compute_mode == "roofline"
+        and HWSpec.source_contract_supported("kimi_k3_portable_roofline", config.hardware_id)
+        and config.sequence_parallel_size == 1
+        and config.tensor_parallel_size in (1, 2, 4, 8, 16, 32)
+        and (config.tensor_parallel_size > 1 or config.pipeline_parallel_size > 1)
+        and (config.data_parallel_size == 1 or config.enable_expert_parallel))
+    k3 = (h200_text_source or portable_k3) and (
         is_kimi_k3_data_parallel_model_scope(model, parallelism) if config.data_parallel_size > 1 else
         is_kimi_k3_parallel_model_scope(model, config.tensor_parallel_size,
             config.pipeline_parallel_size, expert_parallel=config.enable_expert_parallel))
     glm_fp8 = h200_text_source and model.model_id == "zai-org/GLM-5.3" and (
         is_glm_fp8_data_parallel_model_scope(model, parallelism) if config.data_parallel_size > 1 else
         is_glm_fp8_tensor_model_scope(model, config.tensor_parallel_size))
-    if config.deployment != "colocated" or not (v4 or dense or plain_mla or a800_kimi or qwen_wide_ep or k3 or glm_fp8
+    portable_glm_fp8 = (config.compute_mode == "roofline" and config.sequence_parallel_size == 1
+        and HWSpec.source_contract_supported("glm_fp8_weight_only_roofline", config.hardware_id)
+        and (model.model_id == "zai-org/GLM-5.3" or config.hardware_id == "nvidia_a800"
+             or config.data_parallel_size == 1 and not config.enable_expert_parallel)
+        and (config.enable_expert_parallel and is_glm_fp8_data_parallel_model_scope(model, parallelism)
+             if config.data_parallel_size > 1 else
+             is_glm_fp8_tensor_model_scope(model, config.tensor_parallel_size)
+             and (not config.enable_expert_parallel or model.model_id == "zai-org/GLM-5.3")))
+    glm_fp8 = glm_fp8 or portable_glm_fp8
+    if config.deployment != "colocated" or not (v4 or dense or plain_mla or portable_v3 or kimi or qwen_wide_ep or k3 or glm_fp8
             or model.weight_dtype == "bf16" and (glm or qwen)):
         raise NotImplementedError("unsupported model or placement for the explicit 0.30 KV budget adapter")
     python = os.environ.get("ORBITServe_VLLM030_PYTHON")
@@ -138,10 +168,11 @@ def _vllm030_with_byte_budget(config, backend_config, requested, model, hardware
             pipeline_layer_partition=layers,
             v4_weight_storage_profile="sm90_deepgemm_marlin" if v4 else None,
         )
-    # Established profiles retain their original policy. V4 requires an
-    # explicitly supplied experimental memory projection.
+    # The portable V4 simulator reserves the padded packed-weight inventory
+    # (including FP32 scales) without claiming a resident CUDA layout.
+    # Keep the native H200 experiment's explicit memory policy.
     percentage, extra_reserve = 90, 2 * 1024**3
-    if v4:
+    if v4 and not portable_v4:
         policy_file = os.environ.get("ORBITServe_V4_EXPERIMENTAL_MEMORY_PROJECTION")
         if not policy_file:
             raise ValueError("explicit H200 V4 experimental memory projection is required")
@@ -157,7 +188,8 @@ def _vllm030_with_byte_budget(config, backend_config, requested, model, hardware
                 or type(extra_reserve) is not int or extra_reserve < 0):
             raise ValueError("invalid experimental memory projection parameters")
     hbm_budget = hardware.resource_by_role("dram").size_bytes * percentage // 100 - extra_reserve
-    budgets = (_project_glm53_kv_budgets(config, model, hardware, parallelism, layers) if glm_fp8
+    budgets = (_project_glm53_kv_budgets(config, model, hardware, parallelism, layers,
+                                      reserve=extra_reserve if portable_glm_fp8 else None) if glm_fp8
                else tuple(hbm_budget - rank.weight_resident_bytes for rank in residencies))
     if v4:
         budgets = tuple(budget - sum(dsv4_parallel_model_buffer_bytes(
@@ -180,25 +212,26 @@ def _vllm030_with_byte_budget(config, backend_config, requested, model, hardware
         pool_name=backend_config.pool_name, max_batched_tokens=config.max_batched_tokens,
         max_requests=config.max_requests, kv_block_size_tokens=config.kv_block_size_tokens,
         available_memory_by_rank=budgets,
-        supported_layouts_by_rank=(("LBHNC",) if glm else ("BLHNC",) if k3 else ("BLHNC", "BLNHC"),) * len(budgets),
+        supported_layouts_by_rank=(("LBHNC",) if glm or portable_glm_fp8 else ("BLHNC",) if k3 else ("BLHNC", "BLNHC"),) * len(budgets),
     )
 
 
-def _project_glm53_kv_budgets(config, model, hardware, parallelism, layers):
+def _project_glm53_kv_budgets(config, model, hardware, parallelism, layers, *, reserve=None):
     """Bound KV by source payloads and an explicit per-rank runtime reserve."""
     from src.serving.kv_cache.model_residency import (
         glm_block_fp8_constructor_buffer_bytes, glm_block_fp8_loader_payload_bytes,
     )
 
-    path = os.environ.get("ORBITServe_GLM53_MEMORY_PROJECTION")
-    if not path:
-        raise ValueError("explicit H200 GLM-5.3 memory projection is required")
-    policy = json.loads(Path(path).read_text(encoding="utf-8"))
-    if (policy.get("schema") != "h200-glm53-native-projection-v1"
-            or policy.get("model_config_sha256") != model.config_sha256
-            or policy.get("hardware") != config.hardware_id):
-        raise ValueError("H200 GLM-5.3 memory projection identity mismatch")
-    reserve = policy.get("additional_non_kv_reserve_bytes_per_rank")
+    if reserve is None:
+        path = os.environ.get("ORBITServe_GLM53_MEMORY_PROJECTION")
+        if not path:
+            raise ValueError("explicit H200 GLM-5.3 memory projection is required")
+        policy = json.loads(Path(path).read_text(encoding="utf-8"))
+        if (policy.get("schema") != "h200-glm53-native-projection-v1"
+                or policy.get("model_config_sha256") != model.config_sha256
+                or policy.get("hardware") != config.hardware_id):
+            raise ValueError("H200 GLM-5.3 memory projection identity mismatch")
+        reserve = policy.get("additional_non_kv_reserve_bytes_per_rank")
     if type(reserve) is not int or reserve <= 0:
         raise ValueError("GLM-5.3 requires a positive runtime workspace and non-KV reserve")
     budget = hardware.resource_by_role("dram").size_bytes * 90 // 100 - reserve
