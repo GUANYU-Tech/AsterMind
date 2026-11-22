@@ -167,7 +167,9 @@ class LatestControlPlane:
         if any(flags.values()) or self.pending is None or self.pending[0] != step:
             raise RuntimeError("invalid feedback or real model execution requested")
         ids = list(step.generated_tokens)
-        feedback=normalize_sampled_feedback(step,sampled_token_ids,self.scheduler.vllm_config.model_config.vocab_size)
+        model = self.scheduler.vllm_config.model_config
+        vocab_size = model.vocab_size if hasattr(model, "vocab_size") else model.get_vocab_size()
+        feedback=normalize_sampled_feedback(step,sampled_token_ids,vocab_size)
         output = ModelRunnerOutput(req_ids=ids, req_id_to_index={rid:i for i,rid in enumerate(ids)},
                                    sampled_token_ids=[feedback[rid] for rid in ids])
         result = self.scheduler.update_from_output(self.pending[1], output)

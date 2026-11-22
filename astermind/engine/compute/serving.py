@@ -20,7 +20,7 @@ class ServingScheduler:
                  on_output: Callable[[CellTokenOutput], None] | None = None,
                  on_failure: Callable[[dict], None] | None = None,
                  history_store=None, storage_enabled=False, batch_executor,
-                 hybrid_kv_capacity=None):
+                 hybrid_kv_capacity=None, compact_session_storage=False):
         if backend.config.scheduler_pipeline_depth != 1:
             raise NotImplementedError("requires a depth-one backend")
         if not callable(on_complete) or not cell_id:
@@ -45,13 +45,28 @@ class ServingScheduler:
             raise TypeError("failure callback must be callable")
         self._on_failure = on_failure
         self._kv_bytes = 0
-        self._hybrid_kv_capacity = hybrid_kv_capacity
+        self._kv_capacity = hybrid_kv_capacity
+        self._kv_event_scope = "representative_rank"
+        if getattr(batch_executor, "compute_mode", None) == "fast_mode":
+            model = getattr(execution, "model", None)
+            model_type = getattr(model, "model_type", None)
+            if getattr(model, "attention_layout", None) == "hybrid_kda_mla":
+                from .fast_mode.source_memory import native_kv_event_ceiling
+                self._kv_capacity = native_kv_event_ceiling(backend, hybrid=True)
+                self._kv_event_scope = "native_hybrid_group_page_events"
+            elif (getattr(backend, "data_parallel_size", 1) > 1
+                  and (model_type in ("deepseek_v3", "kimi_k2", "qwen3_moe")
+                       or model_type == "glm_moe_dsa" and model.weight_dtype == "fp8")):
+                from .fast_mode.source_memory import native_kv_event_ceiling
+                self._kv_capacity = native_kv_event_ceiling(backend, hybrid=False)
+                self._kv_event_scope = "native_dp_group_page_events"
         self._inflight = None
         self._dispatch_pending = False
         self._closed = False
         self._pool_failure = None
         self.history_store = history_store if history_store is not None else SessionHistoryStore()
         self.storage_enabled = storage_enabled
+        self._fast_session_storage = compact_session_storage
         self._migration_pause = None
         self._blocked = False
         self.state_records = ClockLog()
@@ -66,7 +81,8 @@ class ServingScheduler:
         backend = backends["main"]
         try:
             hybrid_kv_capacity = None
-            if config.scheduler_adapter == "vllm_0_30" and execution.model.attention_layout == "hybrid_kda_mla":
+            if (config.compute_mode != "fast_mode" and config.scheduler_adapter == "vllm_0_30"
+                    and execution.model.attention_layout == "hybrid_kda_mla"):
                 info = backend.runtime_info
                 replicas = info.get("replicas", (info,))
                 # The scheduler reports one representative KV arena per replica.
@@ -76,7 +92,8 @@ class ServingScheduler:
                        max_model_len=config.max_model_len, on_output=on_output,
                        on_failure=on_failure,
                        history_store=history_store, storage_enabled=storage_enabled,
-                       batch_executor=batch_executor, hybrid_kv_capacity=hybrid_kv_capacity)
+                       batch_executor=batch_executor, hybrid_kv_capacity=hybrid_kv_capacity,
+                       compact_session_storage=storage_enabled and config.scheduler_adapter == "vllm_0_30")
         except BaseException:
             backend.close()
             raise
@@ -158,11 +175,10 @@ class ServingScheduler:
             self._record_load()
             return
         self._blocked = False
-        plan = prepare_scheduled_step(
-            self.execution, step,
-            source_prompt_lengths=tuple(self._requests[row.request_id].input_tokens
-                                        for row in step.schedule.requests),
-        )
+        prompt_lengths = tuple(self._requests[row.request_id].input_tokens for row in step.schedule.requests)
+        prepare_batch = getattr(self.batch_executor, "prepare_batch", None)
+        plan = (prepare_batch(step, prompt_lengths) if prepare_batch is not None
+                else prepare_scheduled_step(self.execution, step, source_prompt_lengths=prompt_lengths))
         start = self.loop.now_s
         self._inflight = (step, start)
         for request_id in step.schedule.preempted_request_ids:
@@ -224,7 +240,8 @@ class ServingScheduler:
         if self.storage_enabled:
             # Shared blocks and retained caches cannot be accounted by summing
             # per-request ALLOCATE/RELEASE; the native pool is authoritative.
-            self._kv_bytes = self.storage_rpc("storage_snapshot")["referenced_bytes"]
+            args = (True,) if self._fast_session_storage else ()
+            self._kv_bytes = self.storage_rpc("storage_snapshot", *args)["referenced_bytes"]
             return
         for event in step.kv_cache_events:
             if event.action == KVCacheAction.ALLOCATE and not releasing:
@@ -237,7 +254,7 @@ class ServingScheduler:
                     self._kv_bytes -= event.bytes
             elif event.action in (KVCacheAction.LOAD, KVCacheAction.EVICT):
                 raise NotImplementedError("offload/migration is outside first cell scope")
-        capacity = self._hybrid_kv_capacity
+        capacity = self._kv_capacity
         if capacity is None:
             capacity = (self.backend.config.num_kv_blocks * self.backend.config.kv_block_size_tokens
                         * self.backend.config.kv_bytes_per_token)
@@ -304,9 +321,10 @@ class ServingScheduler:
         if not self._closed and not self._dispatch_pending and len(self._requests) > len(self._completed) + len(self._failed):
             self._dispatch()
 
-    def snapshot(self):
+    def snapshot(self, *, compact_storage=False):
         pool = self.execution.deployment.worker_pools[self.backend.config.pool_name]
-        storage = self.storage_rpc("storage_snapshot") if self.storage_enabled and not self._closed else None
+        args = (True,) if compact_storage else ()
+        storage = self.storage_rpc("storage_snapshot", *args) if self.storage_enabled and not self._closed else None
         if storage is not None:
             self._waiting = set(storage["waiting_request_ids"])
             self._kv_bytes = storage["referenced_bytes"]
@@ -333,7 +351,7 @@ class ServingScheduler:
                 "pipeline_parallel_size": pool.parallel_plan.config.pipeline_parallel_size,
                 "expert_parallel_size": pool.parallel_plan.config.expert_parallel_size,
                 "worker_count": len(pool.ranks),
-                "kv_allocated_bytes_scope": "representative_rank",
+                "kv_allocated_bytes_scope": self._kv_event_scope,
             },
             "host_timing": "native_launch_profile" if self.execution.host_launch_profiles else "device_only",
             "device_communication_timing": (
@@ -348,17 +366,17 @@ class ServingScheduler:
         from .provenance import contract
         return dict(native_contract=dict(model_id=self.execution.model.model_id,
                         model_config_sha256=self.execution.model.config_sha256,
-                        compute_mode=self.execution.prediction_method,
+                        compute_mode=getattr(self.batch_executor, "compute_mode", self.execution.prediction_method),
                         runtime_inputs=contract(self.execution.runtime_inputs)),steps=self.steps, load_history=self.load_history, final_load=self.snapshot(),
                     execution_performance=self.execution.performance_stats(),
                     scheduler_runtime=runtime if isinstance(runtime, dict) else asdict(runtime))
 
     def _record_load(self):
-        self.load_history.append(self.snapshot())
+        self.load_history.append(self.snapshot(compact_storage=self._fast_session_storage))
 
     def storage_rpc(self, name, *args):
         if not self.storage_enabled:
-            raise NotImplementedError("native storage RPC requires vLLM 0.31")
+            raise NotImplementedError("native storage RPC requires an enabled session storage adapter")
         # M-L offers a control-plane injection seam, but not these new RPCs.
         # Access is confined here; the original VLLMBackend is not modified.
         return self.backend._control_plane.rpc(name, *args)

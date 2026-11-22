@@ -14,7 +14,23 @@ from src.serving.kv_cache.kv_cache_events import KVCacheAction, KVCacheEvent
 
 class StorageControlPlane(LatestControlPlane):
     def __init__(self, config, requested, options):
-        self.scheduler = construct_scheduler(config, requested, options)
+        self._bind(construct_scheduler(config, requested, options), config, requested)
+
+    @classmethod
+    def from_native_030(cls, scheduler, config, requested, runtime_info):
+        if (len(scheduler.kv_cache_config.kv_cache_groups) != 1
+                or not scheduler.cache_config.enable_prefix_caching):
+            raise ValueError("Fast Mode session storage requires one native KV cache group and real prefix caching")
+        plane = cls.__new__(cls)
+        plane.scheduler_config = requested
+        plane.runtime_info = {**runtime_info, "requested_prefix_caching": True, "effective_prefix_caching": True,
+                              "session_storage": True, "prefix_oracle_mode": "symbolic_session_hashes"}
+        scheduler.orbitserve_capacity = dict(runtime_info["native_allocation"])
+        plane._bind(scheduler, config, replace(requested, enable_prefix_caching=True))
+        return plane
+
+    def _bind(self, scheduler, config, requested):
+        self.scheduler = scheduler
         self.config = replace(config, num_kv_blocks=self.scheduler.orbitserve_capacity["num_kv_blocks"])
         self.requested = requested
         self.specs, self.highwater, self.histories = {}, {}, {}
@@ -23,6 +39,9 @@ class StorageControlPlane(LatestControlPlane):
         self.exports, self.imports = {}, {}
         self.records = []
         self.version = 0
+
+    def close(self):
+        self.scheduler.shutdown()
 
     @property
     def pool(self):
@@ -176,7 +195,15 @@ class StorageControlPlane(LatestControlPlane):
         return {"resident_prefix_tokens": resident, "effective_prefix_hit_tokens": effective,
                 "block_ids": ids, "bytes": resident * self.config.kv_bytes_per_token, "state_version": self.version}
 
-    def storage_snapshot(self):
+    def storage_snapshot(self, compact=False):
+        if compact:
+            free = self.pool.get_num_free_blocks()
+            referenced = self.pool.num_gpu_blocks - 1 - free
+            return {"referenced_bytes": referenced * self.config.kv_block_size_tokens
+                    * self.config.kv_bytes_per_token,
+                    "free_or_reclaimable_blocks": free,
+                    "waiting_request_ids": [rid for rid, request in self.scheduler.requests.items()
+                                            if request.status.name != "RUNNING"]}
         blocks = [b for b in self.pool.blocks if not b.is_null]
         referenced = sum(b.ref_cnt > 0 for b in blocks)
         cached = sum(b.block_hash is not None and self.ready_hashes.get(b.block_id) == b.block_hash for b in blocks)

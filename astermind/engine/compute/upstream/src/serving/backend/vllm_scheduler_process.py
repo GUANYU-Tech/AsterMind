@@ -532,13 +532,15 @@ class VLLM030SchedulerProcess(VLLMSchedulerProcess):
                  source_root: Path, pool_name: str, max_batched_tokens: int,
                  max_requests: int, kv_block_size_tokens: int,
                  available_memory_by_rank: tuple[int, ...],
-                 supported_layouts_by_rank: tuple[tuple[str, ...], ...], role: str = "colocated") -> None:
+                 supported_layouts_by_rank: tuple[tuple[str, ...], ...], role: str = "colocated",
+                 session_storage: bool = False) -> None:
         from src.serving.backend.vllm import VLLMSchedulerConfig
         if (not isinstance(scheduler_config, VLLMSchedulerConfig)
                 or scheduler_config.scheduler_version != "0.30.0"):
             raise ValueError("isolated 0.30 process requires explicit 0.30 Scheduler config")
         if scheduler_config.context_parallel_size != 1 or scheduler_config.data_parallel_size != 1:
             raise NotImplementedError("native CPU0.30 process requires CP1; use VLLMBackend's explicit PCP cache projection")
+        self._session_storage = session_storage
         if (scheduler_config.max_model_len is None
                 or (scheduler_config.pipeline_parallel_size != 1 and role != "colocated")
                 or (scheduler_config.async_scheduling and (role != "colocated"
@@ -624,12 +626,16 @@ class VLLM030SchedulerProcess(VLLMSchedulerProcess):
         scheduler_config = replace(scheduler_config, model=str(model_root))
         parent, child = multiprocessing.get_context("spawn").Pipe(duplex=True)
         environment = dict(os.environ)
+        python_paths = [str(source_root), str(Path(__file__).resolve().parents[3])]
+        if session_storage:
+            import astermind
+
+            python_paths.append(str(Path(astermind.__file__).resolve().parents[1]))
         environment.update(
             CUDA_VISIBLE_DEVICES="", VLLM_TARGET_DEVICE="cpu", VLLM_PLUGINS="",
             HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", PYTHONDONTWRITEBYTECODE="1",
             VLLM_NO_USAGE_STATS="1", VLLM_CACHE_ROOT=str(model_root / "cache"),
-            PYTHONPATH=str(source_root) + os.pathsep + str(Path(__file__).resolve().parents[3])
-                       + os.pathsep + os.environ.get("PYTHONPATH", ""),
+            PYTHONPATH=os.pathsep.join((*python_paths, os.environ.get("PYTHONPATH", ""))),
         )
         if scheduler_config.dspark_draft_model is not None:
             environment["VLLM_USE_V2_MODEL_RUNNER"]="1"
@@ -657,9 +663,10 @@ class VLLM030SchedulerProcess(VLLMSchedulerProcess):
         self._finalizer = weakref.finalize(
             self, _finalize_worker, parent, self._process, temporary)
         try:
-            parent.send((scheduler_config, source_root, pool_name, max_batched_tokens,
+            startup = (scheduler_config, source_root, pool_name, max_batched_tokens,
                          max_requests, kv_block_size_tokens, available_memory_by_rank,
-                         supported_layouts_by_rank, role))
+                         supported_layouts_by_rank, role)
+            parent.send((*startup, True) if session_storage else startup)
             self.runtime_info = self._parse_ready(self._receive(_STARTUP_TIMEOUT_S))
             self._startup_request = startup_request
             self._startup_model_sha256 = startup_model
@@ -671,6 +678,11 @@ class VLLM030SchedulerProcess(VLLMSchedulerProcess):
     def _rpc(self, command):
         self._startup_available = False
         return super()._rpc(command)
+
+    def rpc(self, name, *args):
+        if not self._session_storage or name not in _SESSION_STORAGE_COMMANDS:
+            raise ValueError(f"unsupported vLLM 0.30 storage command {name!r}")
+        return self._rpc((name, *args))
 
     def claim_initial_state(self, scheduler_config, *, python_executable, source_root, pool_name,
             max_batched_tokens, max_requests, kv_block_size_tokens, available_memory_by_rank,
@@ -1426,15 +1438,19 @@ def _scheduler_worker(
         connection.close()
 
 
+_SESSION_STORAGE_COMMANDS = frozenset(("prepare_history", "storage_snapshot", "inspect_prefix", "abort_request"))
+
+
 def _vllm030_pipe_worker(fd: int) -> None:
     """Private SDK process entry; trusted local IPC, no model execution."""
     connection = Connection(fd)
     try:
         startup = connection.recv()
-        if not isinstance(startup, tuple) or len(startup) != 9:
+        if not isinstance(startup, tuple) or len(startup) not in (9, 10):
             raise ValueError("invalid isolated 0.30 startup packet")
         (requested, source_root, pool_name, max_batch, max_requests, block_size,
-         budgets, layouts, role) = startup
+         budgets, layouts, role) = startup[:9]
+        session_storage = len(startup) == 10 and startup[-1] is True
         if role not in ("colocated", "prefill", "decode") and worker_role_operator_group(role) != "attention":
             raise ValueError("invalid isolated 0.30 Scheduler role")
         identity = vllm030_source_identity(source_root)
@@ -1451,6 +1467,12 @@ def _vllm030_pipe_worker(fd: int) -> None:
         from vllm.v1.core.sched.scheduler import Scheduler
         from vllm.v1.structured_output import StructuredOutputManager
         model = load_model_config(requested.model)
+        if session_storage and (model.model_id != "zai-org/GLM-5.2"
+                or model.weight_dtype != "bf16" or role != "colocated"
+                or (requested.tensor_parallel_size, requested.pipeline_parallel_size) != (8, 4)
+                or requested.enable_expert_parallel or requested.async_scheduling
+                or requested.mtp_num_speculative_tokens or requested.simple_cpu_offload_bytes_per_rank):
+            raise ValueError("0.30 session storage is limited to synchronous GLM-5.2 TP8×PP4 DP1")
         target_model = ModelConfig(
                 model=requested.model, skip_tokenizer_init=True, enforce_eager=True,
                 dtype=requested.dtype, max_model_len=requested.max_model_len,
@@ -1547,10 +1569,12 @@ def _vllm030_pipe_worker(fd: int) -> None:
         control = backend._control_plane
         control.runtime_info.update(
             source_identity=identity, worker_pid=os.getpid(),
+            requested_chunked_prefill=requested.enable_chunked_prefill,
+            effective_chunked_prefill=native.scheduler_config.enable_chunked_prefill,
+            effective_max_num_batched_tokens=scheduler.max_num_scheduled_tokens,
             requested_async_scheduling=requested.async_scheduling,
             effective_async_scheduling=native.scheduler_config.async_scheduling,
             scheduler_class=type(scheduler).__name__,
-            requested_chunked_prefill=requested.enable_chunked_prefill,
             effective_long_prefill_token_threshold=native.scheduler_config.long_prefill_token_threshold,
             bootstrap="explicit SDK Python subprocess; guarded CpuPlatform",
             device_guard="CpuPlatform forced; CUDA availability hidden; CUDA/NVML APIs blocked",
@@ -1566,6 +1590,18 @@ def _vllm030_pipe_worker(fd: int) -> None:
             simple_cpu_offload_bytes_per_rank=simple_cpu_bytes,
             simple_cpu_offload_mode=(None if simple_cpu_bytes is None else "eager_cpu"),
         )
+        if session_storage:
+            from astermind.engine.compute.native_cell_storage import StorageControlPlane
+
+            # CpuPlatform disables prefix caching for MLA model execution.
+            # This worker executes only Scheduler and already verified the
+            # real allocator output before enabling its block hash cache.
+            info = control.runtime_info
+            control.close()
+            native.cache_config.enable_prefix_caching = True
+            scheduler = Scheduler(native, scheduler_cache, StructuredOutputManager(native),
+                                  block_size=scheduler_block_size)
+            control = StorageControlPlane.from_native_030(scheduler, effective, requested, info)
         _verify_no_accelerator_access(baseline)
         connection.send(("ready", effective, control.runtime_info))
         _serve_scheduler_commands(connection, control, baseline)
@@ -1653,6 +1689,8 @@ def _serve_scheduler_commands(connection: Connection, control_plane: Any,
                 result = control_plane.release_pd_kv(command[1])
             else:
                 result = control_plane.reserve_pd_destination(command[1])
+        elif name in _SESSION_STORAGE_COMMANDS and control_plane.runtime_info.get("session_storage") is True:
+            result = getattr(control_plane, name)(*command[1:])
         elif name == "has_work":
             if len(command) != 1:
                 raise ValueError("has_work command has invalid arity")
