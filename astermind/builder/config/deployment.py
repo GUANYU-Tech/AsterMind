@@ -1,7 +1,7 @@
 """Logical model placement and native Scheduler configuration."""
 from typing import Annotated, Literal
-from pydantic import Field, StrictBool, model_validator
-from astermind.common.contracts import Contract, Identifier, Nanoseconds
+from pydantic import AliasChoices, Field, StrictBool, model_validator
+from astermind.common.contracts import Contract, ComputeModeConfig, Identifier, Nanoseconds
 
 Positive = Annotated[int, Field(strict=True, gt=0)]
 
@@ -47,7 +47,9 @@ class ServingCell(Contract):
     num_kv_blocks: Positive = 64
     kv_block_size_tokens: Positive = 16
     scheduler_adapter: Literal["auto", "vllm_0_11", "vllm_0_30", "vllm_0_31"] = "auto"
-    enable_chunked_prefill: StrictBool | None = None
+    enable_chunked_prefill: StrictBool | None = Field(
+        default=None, validation_alias=AliasChoices("enable_chunked_prefill", "chunked_prefill"),
+    )
     long_prefill_token_threshold: Annotated[int, Field(strict=True, ge=0)] = 0
     prefix_caching: bool = False
     native_expert_parallel: bool = False
@@ -62,6 +64,7 @@ class ServingCell(Contract):
     external_terminals: tuple[Identifier, ...]
     execution_mode: Literal["accelerated", "fast", "reference"] = "accelerated"
     graph_backend: Literal["midlayer"] = "midlayer"
+    fast_glm_dsa_score: Literal["bf16_timing_proxy"] | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -103,20 +106,28 @@ class ServingCell(Contract):
         return self
 
 
-class SceneDeployment(Contract):
-    compute_mode: Literal["midlayer", "roofline"] = "midlayer"
+class SceneDeployment(ComputeModeConfig):
     model: str = "configs/model/qwen3-8b.json"
     hardware: str = "configs/hardware/nvidia_a800.yaml"
     hardware_id: str = "nvidia_a800"
     gpus_per_satellite: Annotated[int, Field(strict=True, ge=1, le=64)] = 1
     tp: Positive = 2
     pp: Positive = 2
+    dp: Positive = 1
     expert_parallel: bool = False
+    wide_ep_enabled: bool = False
+    fast_glm_dsa_score: Literal["bf16_timing_proxy"] | None = None
     expert_routing_seed: Annotated[int, Field(strict=True, ge=0)] | None = None
     max_requests: Annotated[int, Field(strict=True, ge=1, le=1024)] = 4
     max_model_len: Annotated[int, Field(strict=True, ge=2, le=131072)] = 128
     max_batched_tokens: Positive | None = None
     num_kv_blocks: Positive = 64
+    memory_policy_file: str | None = None
+    prefix_caching: bool = False
+    enable_chunked_prefill: StrictBool | None = Field(
+        default=None, validation_alias=AliasChoices("enable_chunked_prefill", "chunked_prefill"),
+    )
+    long_prefill_token_threshold: Annotated[int, Field(strict=True, ge=0)] = 0
     gpu_link_bandwidth_gbps: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 1600
     gpu_link_latency_ns: Annotated[int, Field(strict=True, ge=0)] = 200
     communication: dict = Field(default_factory=dict)
