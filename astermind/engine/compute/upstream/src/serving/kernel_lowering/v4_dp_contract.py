@@ -1,6 +1,8 @@
-"""V4 WideEP, PP>1: DP dispatch/combine followed by local TP tail."""
+"""V4 non-SP WideEP: DP dispatch/combine followed by the local TP tail."""
 from collections import defaultdict
 from contextvars import ContextVar
+
+from src.kernel.hardware_spec import HWSpec
 
 _validated_variables=ContextVar('v4_wideep_validated_variables',default=None)
 
@@ -15,16 +17,21 @@ def handles_hash_route(node):
 
 def applicable(pool):
     c=pool.parallel_plan.config
-    return (pool.hardware_id=='nvidia_h200' and pool.parallel_plan.num_layers in (43,61)
+    return ((pool.hardware_id == "nvidia_h200"
+        or HWSpec.source_contract_supported("deepseek_v4_portable_roofline", pool.hardware_id))
+            and pool.parallel_plan.num_layers in (43,61)
             and c.enable_expert_parallel and c.tensor_parallel_size in (1,2,4,8,16)
-            and c.data_parallel_size>1 and 1<c.pipeline_parallel_size<=pool.parallel_plan.num_layers
+            and c.data_parallel_size>1
+            # TP1 has no model sequence sharding even with one pipeline stage.
+            and (1<c.pipeline_parallel_size<=pool.parallel_plan.num_layers
+                 or c.tensor_parallel_size==c.pipeline_parallel_size==1)
             and c.expert_parallel_size==c.tensor_parallel_size*c.data_parallel_size
             and c.context_parallel_size==c.sequence_parallel_size==1)
 
 def validate(graph,pool,nodes,memory_context):
     _validated_variables.set(None)
     from .v4_ep_contract import expert_attributes
-    if not applicable(pool):raise NotImplementedError('V4 WideEP requires H200 DP, PP>1 non-SP, uniform TP*DP experts')
+    if not applicable(pool):raise NotImplementedError('V4 WideEP requires H200 DP, a non-SP TP1 or multi-stage pipeline, and uniform TP*DP experts')
     if memory_context is None:raise ValueError('V4 WideEP requires actual typed tensor ports')
     c=pool.parallel_plan.config;tp,dp,pp=c.tensor_parallel_size,c.data_parallel_size,c.pipeline_parallel_size
     memory=memory_context._by_node;out=defaultdict(list);succ=defaultdict(list);edges=set();byid={n.node_id:n for n in graph.nodes}

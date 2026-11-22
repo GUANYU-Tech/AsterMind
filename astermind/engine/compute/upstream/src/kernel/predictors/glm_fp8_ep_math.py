@@ -47,12 +47,15 @@ def logical_work(shape, a):
           "FP32_activation_then_BF16_materialization_before_second_internal_quantizer", "router_scale2.5_already_in_weights_not_reapplied"))
 
 def predict(k,hw):
-    if k.hardware_id!="nvidia_h200" or k.dtype!="bf16" or k.kind.value!="FUSED_MOE" or k.variant!="routed_experts" or k.launch is not None or k.execution_support!="unsupported":
-        raise ValueError("GLM deferred FP8 useful work requires unbound H200 BF16-output expert contract")
+    portable = hw.supports_source_contract("glm_fp8_weight_only_roofline")
+    if ((k.hardware_id != "nvidia_h200" and not portable) or k.dtype != "bf16" or k.kind.value != "FUSED_MOE"
+            or k.variant != "routed_experts" or k.launch is not None or k.execution_support != "unsupported"):
+        raise ValueError("GLM deferred FP8 requires supported unbound BF16-output expert math")
     from . import fused_moe as fm
+    from .v3_ep_math import stage_seconds
     from dataclasses import replace
-    w=logical_work(k.shape,k.attributes);fp8=float(hw.resource_by_role("compute_tensor_fp8").capacity)
-    times={s["stage"]:max(s["mathematical_fp8_flops"]/fp8,fm.roofline_ns(s["demand"],hw,s["logical_bytes"])*1e-9) for s in w["stages"]}
+    w=logical_work(k.shape,k.attributes)
+    times=stage_seconds(w["stages"], hw, dequantize_to_bf16=portable)
     return replace(fm.prediction_from_ns(sum(times.values())*1e9,"roofline"),t_per_group=times,
         diagnostics=fm.PredictionDiagnostics(compute_time_s={},memory=(),memory_access_classes=(),memory_arbitration=(),pipeline=None,
             critical_path=w["source_stage_order"],support_level="partial",limitations=w["limitations"]))

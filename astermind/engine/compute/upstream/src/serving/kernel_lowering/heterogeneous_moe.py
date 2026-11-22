@@ -134,13 +134,21 @@ def heterogeneous_moe_specs(node, hardware_id):
     if node.kind is WorkloadKind.MEMCPY:
         transfer = PhysicalTransferConfig(**{key: a[key] for key in ("algorithm", "bytes", "direction", "link")})
         return (KernelSpec(KernelKind.MEMCPY, hardware_id, transfer=transfer),)
+    return v4_logical_compute_specs(node, hardware_id)
+
+
+def v4_logical_compute_specs(node, hardware_id):
+    """Lower local V4 operations without requiring a native launch."""
+    a = node.attributes
+    portable = HWSpec.source_contract_supported("deepseek_v4_portable_roofline", hardware_id)
     variant, dtype, shape = node.variant, node.dtype, dict(node.shape)
     if node.kind is WorkloadKind.FUSED_MOE:
         names = ("tokens_per_expert", "local_tokens_per_expert", "expert_parallel_size", "expert_rank",
             "owned_experts", "routed_scaling_factor", "routed_weight_dtype", "weight_group_size", "swiglu_limit")
         return (KernelSpec(KernelKind.FUSED_MOE, hardware_id, shape=node.shape, dtype="bf16", variant="routed_experts",
             attributes={**{key: a[key] for key in names}, "expert_weight_tile_rows": None,
-                "mathematical_program": "dsv4_mxfp4_w4a16_swiglu_v1"},
+                "mathematical_program": ("dsv4_portable_mxfp4_w4a16_swiglu_v1" if portable
+                                         else "dsv4_mxfp4_w4a16_swiglu_v1")},
             execution_support="unsupported", unsupported_reason="launch_selector_unavailable"),)
     if variant == "vocab_parallel_embedding":
         return (_math_spec(KernelKind.VECTOR, hardware_id, node,
@@ -178,7 +186,10 @@ def heterogeneous_moe_specs(node, hardware_id):
         return (_math_spec(KernelKind.VECTOR, hardware_id, node, {"quant_group_size": a["quant_group_size"]}),)
     if node.kind in (WorkloadKind.LINEAR, WorkloadKind.LM_HEAD) and dtype == "bf16":
         if "output_dtype" in a and a["output_dtype"] == "fp32":
-            return (_math_spec(KernelKind.GEMM, hardware_id, node, {"output_dtype": "fp32"}),)
+            attributes = {"output_dtype": "fp32"}
+            if portable:
+                attributes["source_projection_scope"] = "vllm_0_30_portable_v4_source_v1"
+            return (_math_spec(KernelKind.GEMM, hardware_id, node, attributes),)
         if variant == "batched_gemm":
             attributes = {key: a[key] for key in (
                 "batch_layout", "a_batch_stride_elements", "b_batch_stride_elements", "c_batch_stride_elements",
@@ -187,6 +198,9 @@ def heterogeneous_moe_specs(node, hardware_id):
                 attributes["mathematical_program"] = "batched_fp8_quantized_input_fp32_scales_v1"
             return (_math_spec(KernelKind.GEMM, hardware_id, node, attributes),)
         if "weight_dtype" in a and a["weight_dtype"] == "fp8":
+            if portable:
+                return (_math_spec(KernelKind.GEMM, hardware_id, node,
+                    {"mathematical_program": "block_fp8_weight_only_bf16_v1"}),)
             m, k = shape["m"], shape["k"]
             quant = KernelSpec(KernelKind.VECTOR, hardware_id, dtype="bf16", variant="fp8_group_quant",
                 shape={"element_count": m * k, "rows": m, "columns": k}, attributes={"group_size": 128},
@@ -199,16 +213,22 @@ def heterogeneous_moe_specs(node, hardware_id):
                 "b_batch_stride_elements": k*n, "c_batch_stride_elements": m*n,
                 "weight_dtype": "bf16", "weight_group_size": 0}, execution_support="unsupported",
             unsupported_reason="launch_selector_unavailable"),)
-    if variant in ("mhc_post", "hc_head"):
+    if variant in ("mhc_post", "hc_head") or portable and variant in ("mhc_prenorm", "mhc_pre_norm"):
         return (_math_spec(KernelKind.VECTOR, hardware_id, node, {}),)
     if variant == "rmsnorm":
-        return (_math_spec(KernelKind.VECTOR, hardware_id, node, {"epsilon": a["epsilon"]}),)
+        attributes = {"epsilon": a["epsilon"]}
+        if portable:
+            attributes["mathematical_program"] = "dense_bf16_source_flops_bytes_v1"
+        return (_math_spec(KernelKind.VECTOR, hardware_id, node, attributes),)
     if variant == "vllm_embedding_id_widen":
         return (_math_spec(KernelKind.VECTOR, hardware_id, node, {"embedding_source": a["embedding_source"]}),)
     if variant == "embedding":
+        attributes = {key: a[key] for key in ("gather_factor", "index_count", "index_bytes", "scattered", "materialized_output")}
+        if portable and dtype == "bf16":
+            attributes["mathematical_program"] = ("dense_bf16_source_flops_bytes_v1"
+                if attributes["index_bytes"] == 8 else "materialized_bf16_gather_bytes_v1")
         return (KernelSpec(KernelKind.VECTOR, hardware_id, shape=shape, dtype=dtype, variant="gather",
-            attributes={key: a[key] for key in ("gather_factor", "index_count", "index_bytes", "scattered", "materialized_output")},
-            execution_support="unsupported", unsupported_reason="launch_selector_unavailable"),)
+            attributes=attributes, execution_support="unsupported", unsupported_reason="launch_selector_unavailable"),)
     if variant == "vllm_logits_row_select":
         return (_math_spec(KernelKind.VECTOR, hardware_id, node, {key: a[key] for key in (
             "model_execution_version", "index_source", "selected_indices")}),)
@@ -223,6 +243,8 @@ def heterogeneous_moe_specs(node, hardware_id):
         kind = KernelKind.GEMM
         if node.kind is WorkloadKind.ROUTER:
             attributes = {"output_dtype": "fp32", "weight_dtype": "bf16", "weight_group_size": 0}
+            if portable:
+                attributes["source_projection_scope"] = "vllm_0_30_portable_v4_source_v1"
         else:
             attributes = {key: a[key] for key in ("weight_dtype", "weight_group_size", "has_bias")}
             attributes.update(output_dtype="bf16", mathematical_program=(
@@ -238,15 +260,20 @@ def heterogeneous_moe_specs(node, hardware_id):
             attributes = {"swiglu_limit": a["swiglu_limit"]}
         elif variant == "gather":
             attributes = {key: a[key] for key in ("gather_factor", "index_count", "index_bytes", "scattered", "materialized_output")}
-            if HWSpec.source_contract_supported("aggregate_gpu_source_roofline", hardware_id) and dtype == "bf16":
-                attributes["mathematical_program"] = "materialized_bf16_gather_bytes_v1"
+            if portable and dtype == "int32" and attributes["index_count"] == 0:
+                attributes["mathematical_program"] = "materialized_int32_copy_bytes_v1"
+            if dtype == "bf16" and (portable or HWSpec.source_contract_supported("aggregate_gpu_source_roofline", hardware_id)):
+                attributes["mathematical_program"] = ("dense_bf16_source_flops_bytes_v1"
+                    if portable and attributes["index_bytes"] == 8 else "materialized_bf16_gather_bytes_v1")
         elif variant == "moe_sum":
             attributes = {"work_fraction": a["work_fraction"], "routed_weights_dtype": "fp32"}
         elif variant == "add":
             variant = "elementwise"
             attributes = {key: a[key] for key in ("operation", "reads", "writes")}
+            if portable:
+                attributes["mathematical_program"] = "dense_bf16_source_flops_bytes_v1"
         else:
-            raise NotImplementedError(f"heterogeneous MoE has no mathematical binding for {variant!r}")
+            raise NotImplementedError(f"V4 has no mathematical binding for {variant!r}")
     return (KernelSpec(kind, hardware_id, shape=shape, dtype=dtype, variant=variant,
         attributes=attributes, execution_support="unsupported", unsupported_reason="launch_selector_unavailable"),)
 

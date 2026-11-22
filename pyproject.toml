@@ -26,7 +26,7 @@ namespaces = false
 
 [tool.setuptools.package-data]
 "viz" = ["*.html", "*.css", "*.js"]
-"examples.native" = ["*.json"]
+"examples.native" = ["*.json", "offline_config/*.json", "offline_config/*.jsonl"]
 "workloads.main_composite_chat" = ["countries.csv", "gateways.json", "profiles/*.csv", "profiles/*.json"]
 "astermind.engine.compute" = ["SOURCE.json", "scheduler_runtime/*", "upstream/**/*", "upstream/.orbitserve_snapshot.json"]
 "astermind.engine.comm" = ["native_allocator.cc", "_vendor/**/*"]

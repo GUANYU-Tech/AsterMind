@@ -56,6 +56,14 @@ class SimulationConfig(Contract):
     def load(cls, path):
         path = Path(path)
         data = json.loads(path.read_text(encoding="utf-8"))
+        from .scenario_input import SCHEMA, lower_scenario
+
+        if data.get("schema_version") == SCHEMA:
+            from astermind.engine.policies.routing import get_routing_policy
+
+            config = cls.model_validate(lower_scenario(data, path.parent))
+            get_routing_policy(config.routing.policy)
+            return config
         for key in ("physical_dataset", "physical_network"):
             value = data.get(key)
             if isinstance(value, str) and not Path(value).is_absolute():

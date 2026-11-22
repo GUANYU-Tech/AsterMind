@@ -17360,7 +17360,7 @@ def dsv4_route_tensor_objects(kernel: KernelSpec):
         "scope": "declared source route objects and returned buffers, not checkpoint assignments, compiled spills or runtime dispatch"}
 
 
-def dsv4_route_source_work(kernel: KernelSpec):
+def dsv4_route_source_work(kernel: KernelSpec, *, routing_source=None):
     """Declared pure-text routing program; not a runtime provider receipt.
 
     CUDA hash visits six selected logits, using stable softplus. Ordinary
@@ -17373,7 +17373,7 @@ def dsv4_route_source_work(kernel: KernelSpec):
     if kernel.kind is not KernelKind.VECTOR or kernel.variant != "dsv4_moe_route":
         raise ValueError("V4 routing source work requires its vector contract")
     rows, experts, topk = (kernel.shape[name] for name in ("rows", "experts", "topk"))
-    source = kernel.attributes["routing_source"]
+    source = kernel.attributes["routing_source"] if routing_source is None else routing_source
     hashed = source == "vllm_0_30_cuda_hash_top6_pure_text"
     if source not in ("vllm_0_30_cuda_hash_top6_pure_text", "vllm_0_30_triton_top6_pure_text") or topk != 6:
         raise ValueError("routing source work requires the explicit pure-text top6 program")
@@ -21427,6 +21427,34 @@ def mhc_stage_logical_work(kernel: KernelSpec):
             "byte_scope": "unique global tensor roles; projection-tile/head-pass reloads and physical residency separate"}
 
 
+def _portable_v4_mhc_roofline(kernel: KernelSpec, hardware):
+    """Charge logical mHC work using the target card's FP32 rates."""
+    stages = (kernel,)
+    if kernel.variant in ("mhc_pre", "mhc_post_pre"):
+        broadcast = kernel.variant == "mhc_pre"
+        # One logical partial exposes the arithmetic dependency without
+        # selecting a hardware split, launch configuration, or provider.
+        shape = {name: kernel.shape[name] for name in (
+            "element_count", "hidden", "hc_mult", "dtype_bytes")}
+        shape["n_splits"] = 1
+        channels = shape["hc_mult"]
+        projection_shape = shape if broadcast else {**shape, "tile_n": channels * (channels + 2)}
+        stages = (
+            dataclasses.replace(kernel, variant="mhc_prenorm_broadcast" if broadcast else "mhc_post_prenorm",
+                shape=projection_shape, attributes={}),
+            dataclasses.replace(kernel, variant="mhc_pre_norm_broadcast" if broadcast else "mhc_pre_norm",
+                shape={**shape, "sinkhorn_iters": kernel.attributes["sinkhorn_iters"]}, attributes={}),
+        )
+    total_ns = 0.0
+    for stage in stages:
+        work = mhc_stage_logical_work(stage)
+        demand = dict.fromkeys(("compute_tensor", "compute_vector", "compute_reduction",
+            "compute_fma", "compute_sfu", "compute_alu"), 0)
+        demand.update(work["demand"])
+        total_ns += roofline_ns(demand, hardware, work["read_bytes"] + work["write_bytes"])
+    return prediction_from_ns(total_ns, "roofline")
+
+
 def _mhc_model(kernel: KernelSpec, hardware):
     if kernel.variant in ("mhc_prenorm", "mhc_prenorm_broadcast"):
         raise NotImplementedError("mHC DeepGEMM prenorm launch is unbound")
@@ -21925,10 +21953,38 @@ class VectorPredictor(KernelPredictor):
         return _model(kernel, hardware)
 
     def roofline_without_launch(self, kernel: KernelSpec, hardware):
+        if hardware.supports_source_contract("deepseek_v4_portable_roofline"):
+            if kernel.variant == "dsv4_short_context_topk":
+                work = dsv4_short_context_topk_source_work(kernel)
+                demand = dict.fromkeys(("compute_tensor", "compute_vector", "compute_reduction",
+                    "compute_fma", "compute_sfu", "compute_alu"), 0)
+                demand["compute_alu"] = sum(work["program"][key] for key in (
+                    "logical_position_adds", "logical_compression_divides",
+                    "logical_value_comparisons", "logical_value_selects"))
+                return prediction_from_ns(roofline_ns(demand, hardware,
+                    work["positions"]["read_bytes"] + work["output"]["write_bytes"]), "roofline")
+            if kernel.variant in ("mhc_pre", "mhc_post_pre", "mhc_post", "hc_head", "mhc_prenorm", "mhc_pre_norm"):
+                return _portable_v4_mhc_roofline(kernel, hardware)
+            if kernel.variant in ("dsv4_q_kv_rmsnorm", "dsv4_inv_rope_fp8_quant"):
+                work = (dsv4_qkv_rmsnorm_logical_work(kernel) if kernel.variant == "dsv4_q_kv_rmsnorm"
+                        else dsv4_inverse_rope_quant_logical_work(kernel))
+                return prediction_from_ns(roofline_ns(work["demand"], hardware,
+                    work["read_bytes"] + work["write_bytes"]), "roofline")
+            if (kernel.variant == "dsv4_moe_route"
+                    and kernel.attributes.get("mathematical_program") != "v4_modelsp_hash_top6_masked_v1"):
+                routing_source = ("vllm_0_30_cuda_hash_top6_pure_text"
+                    if kernel.attributes["expert_id_selection"] == "hash_table"
+                    else "vllm_0_30_triton_top6_pure_text")
+                work = dsv4_route_source_work(kernel, routing_source=routing_source)
+                return prediction_from_ns(roofline_ns({"compute_vector": 0, **work["demand"]},
+                    hardware, work["logical_bytes"]), "roofline")
         if kernel.attributes.get("mathematical_program")=="v4_modelsp_hash_top6_masked_v1":
             from .v4_modelsp_hash_math import logical_work
-            if kernel.hardware_id!=hardware.hardware_id or kernel.hardware_id!="nvidia_h200" or kernel.variant!="dsv4_moe_route" or kernel.launch is not None or kernel.execution_support!="unsupported":
-                raise ValueError("V4 masked hash requires its H200 partial source scope")
+            if (kernel.hardware_id != hardware.hardware_id or (kernel.hardware_id != "nvidia_h200"
+                    and not hardware.supports_source_contract("deepseek_v4_portable_roofline"))
+                    or kernel.variant != "dsv4_moe_route" or kernel.launch is not None
+                    or kernel.execution_support != "unsupported"):
+                raise ValueError("V4 masked hash requires a declared mathematical scope")
             work=logical_work(kernel.shape,kernel.attributes)
             return prediction_from_ns(roofline_ns(work["demand"],hardware,work["logical_bytes"]),"partial_v4_modelsp_masked_hash")
         if kernel.attributes.get('mathematical_program') == 'vllm_idle_replica_payload_v1':
@@ -21942,7 +21998,7 @@ class VectorPredictor(KernelPredictor):
             return prediction_from_ns(payload / hardware.resource_by_role('dram').capacity * 1e9,
                 'partial_vllm_idle_replica_payload')
         if kernel.attributes.get("mathematical_program")=="v4_modelsp_zero_fill_v1":
-            if kernel.hardware_id!=hardware.hardware_id or hardware.hardware_id!="nvidia_h200" or kernel.variant!="elementwise" or kernel.dtype not in ("bf16","int32") or kernel.launch is not None or kernel.execution_support!="unsupported" or (kernel.attributes["operation"],kernel.attributes["reads"],kernel.attributes["writes"])!=("fill",0,1):
+            if kernel.hardware_id!=hardware.hardware_id or (hardware.hardware_id!="nvidia_h200" and not hardware.supports_source_contract("deepseek_v4_portable_roofline")) or kernel.variant!="elementwise" or kernel.dtype not in ("bf16","int32") or kernel.launch is not None or kernel.execution_support!="unsupported" or (kernel.attributes["operation"],kernel.attributes["reads"],kernel.attributes["writes"])!=("fill",0,1):
                 raise ValueError("V4 model-SP zero fill requires unbound typed write source")
             from src.kernel.memory_access_builder import mathematical_prediction_memory_bytes
             payload=mathematical_prediction_memory_bytes(kernel,hardware)

@@ -33,10 +33,12 @@ from src.kernel.cache_traffic_sim import (
     simulate_cann_gemm_persistent_stateful_dual_accounted,
 )
 from src.kernel.predictors.gemm_block_fp8 import (
+    _block_fp8_matmul_payloads,
     block_fp8_linear_logical_work,
     is_block_fp8_gemm,
     predict_block_fp8_gemm,
     roofline_block_fp8_gemm,
+    weight_only_fp8_service_s,
 )
 from src.kernel.predictors.common import (
     _with_graph_regime,
@@ -1863,6 +1865,10 @@ def _cann_npu_gemm_analytical_envelope(
     persistent_program = _uses_cann_persistent_program(kernel)
     region_program = _uses_cann_region_program(kernel)
     if (not persistent_program and not region_program) or pipeline_depth != 2:
+        return None
+    # The alternative tile pipeline keeps the source memory traffic when
+    # the grouped-matmul recurrence cannot express a partial B step.
+    if program.a_l1_k_tiles % program.b_l1_k_tiles:
         return None
     if (region_program
             and ((tile_m, tile_n, tile_k) != (128, 256, 64)
@@ -8584,14 +8590,26 @@ class GEMMPredictor(KernelPredictor):
                 and kernel.attributes["mathematical_program"] == "batched_fp8_quantized_input_fp32_scales_v1"):
             b, m, n, k = (kernel.shape[key] for key in ("b", "m", "n", "k"))
             logical_bytes = b * (m * k + 4 * m * (k // 128) + k * n + 4 * (k // 128) * (n // 128) + 2 * m * n)
-            seconds = max(2 * b * m * n * k / hardware.resource_by_role("compute_tensor_fp8").capacity,
-                logical_bytes / hardware.resource_by_role("dram").capacity)
+            if hardware.supports_source_contract("deepseek_v4_portable_roofline"):
+                dequantized_elements = b * (m * k + k * n)
+                dequantize_s = (dequantized_elements / hardware.resource_by_role("compute_fma").capacity
+                    + 2 * dequantized_elements / hardware.resource_by_role("compute_alu").capacity)
+                seconds = max(2 * b * m * n * k / hardware.resource_by_role("compute_tensor").capacity,
+                    logical_bytes / hardware.resource_by_role("dram").capacity, dequantize_s)
+            else:
+                seconds = max(2 * b * m * n * k / hardware.resource_by_role("compute_tensor_fp8").capacity,
+                    logical_bytes / hardware.resource_by_role("dram").capacity)
             return prediction_from_ns(seconds * 1e9, "roofline")
         if (kernel.variant == "gemm"
                 and kernel.dtype == "bf16" and kernel.attributes["output_dtype"] == "fp32"):
             work = bf16_fp32_gemm_logical_work(kernel)
             return prediction_from_ns(roofline_ns(work["demand"], hardware, work["logical_bytes"]), "roofline")
         if kernel.variant == "gemm" and "mathematical_program" in kernel.attributes:
+            if kernel.attributes["mathematical_program"] == "block_fp8_weight_only_bf16_v1":
+                b, m, n, k = (kernel.shape[key] for key in ("b", "m", "n", "k"))
+                payload, scales = _block_fp8_matmul_payloads(b, m, n, k)
+                seconds = weight_only_fp8_service_s(hardware, 2 * b * m * n * k, payload | scales)
+                return prediction_from_ns(seconds * 1e9, "roofline")
             if kernel.attributes["mathematical_program"] == "block_fp8_quantized_input_fp32_scales_v1":
                 m, n, k = (kernel.shape[key] for key in ("m", "n", "k"))
                 logical_bytes = m * k + 4 * m * (k // 128) + k * n + 4 * (k // 128) * (n // 128) + 2 * m * n

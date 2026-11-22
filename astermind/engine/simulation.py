@@ -175,6 +175,8 @@ class Simulation:
             max_batched_tokens=cell.max_batched_tokens, max_requests=cell.max_requests,
             num_kv_blocks=cell.num_kv_blocks, kv_block_size_tokens=cell.kv_block_size_tokens,
             scheduler_adapter=cell.scheduler_adapter, enable_prefix_caching=cell.prefix_caching,
+            enable_chunked_prefill=cell.enable_chunked_prefill,
+            long_prefill_token_threshold=cell.long_prefill_token_threshold,
             enable_expert_parallel=cell.expert_parallel_enabled,
             expert_routing_seed=cell.expert_routing_seed, host_launch_profile_file=cell.host_launch_profile,
             memory_policy_file=cell.memory_policy_file, watermark=cell.watermark,

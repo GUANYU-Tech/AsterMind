@@ -348,7 +348,8 @@ class SparseAttentionIndexerPredictor(KernelPredictor):
         return self.roofline_without_launch(kernel, hardware)
 
     def roofline_without_launch(self, kernel: KernelSpec, hardware):
-        if HWSpec.source_contract_supported("multistage_attention_indexer_unbound_source_math", hardware.hardware_id) and kernel.variant in (
+        if (HWSpec.source_contract_supported("multistage_attention_indexer_unbound_source_math", hardware.hardware_id)
+                or HWSpec.source_contract_supported("deepseek_v4_portable_roofline", hardware.hardware_id)) and kernel.variant in (
                 "dsv4_indexer_prefill", "dsv4_indexer_decode"):
             work = dsv4_indexer_logical_work(kernel)
             ns = sum(roofline_ns(stage["demand"], hardware, sum(stage["read_write_bytes"].values()))

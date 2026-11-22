@@ -19,7 +19,8 @@ class ServingScheduler:
                  on_complete: Callable[[CellCompletion], None], *, max_model_len: int,
                  on_output: Callable[[CellTokenOutput], None] | None = None,
                  on_failure: Callable[[dict], None] | None = None,
-                 history_store=None, storage_enabled=False, batch_executor):
+                 history_store=None, storage_enabled=False, batch_executor,
+                 hybrid_kv_capacity=None):
         if backend.config.scheduler_pipeline_depth != 1:
             raise NotImplementedError("requires a depth-one backend")
         if not callable(on_complete) or not cell_id:
@@ -44,6 +45,7 @@ class ServingScheduler:
             raise TypeError("failure callback must be callable")
         self._on_failure = on_failure
         self._kv_bytes = 0
+        self._hybrid_kv_capacity = hybrid_kv_capacity
         self._inflight = None
         self._dispatch_pending = False
         self._closed = False
@@ -63,11 +65,18 @@ class ServingScheduler:
         backends, execution, storage_enabled = create_midlayer_runtime(config)
         backend = backends["main"]
         try:
+            hybrid_kv_capacity = None
+            if config.scheduler_adapter == "vllm_0_30" and execution.model.attention_layout == "hybrid_kda_mla":
+                info = backend.runtime_info
+                replicas = info.get("replicas", (info,))
+                # The scheduler reports one representative KV arena per replica.
+                hybrid_kv_capacity = sum(max(replica["shared_cache_arena_bytes_by_rank"])
+                                         for replica in replicas)
             return cls(cell_id, loop, backend, execution, on_complete,
                        max_model_len=config.max_model_len, on_output=on_output,
                        on_failure=on_failure,
                        history_store=history_store, storage_enabled=storage_enabled,
-                       batch_executor=batch_executor)
+                       batch_executor=batch_executor, hybrid_kv_capacity=hybrid_kv_capacity)
         except BaseException:
             backend.close()
             raise
@@ -228,8 +237,10 @@ class ServingScheduler:
                     self._kv_bytes -= event.bytes
             elif event.action in (KVCacheAction.LOAD, KVCacheAction.EVICT):
                 raise NotImplementedError("offload/migration is outside first cell scope")
-        capacity = (self.backend.config.num_kv_blocks * self.backend.config.kv_block_size_tokens
-                    * self.backend.config.kv_bytes_per_token)
+        capacity = self._hybrid_kv_capacity
+        if capacity is None:
+            capacity = (self.backend.config.num_kv_blocks * self.backend.config.kv_block_size_tokens
+                        * self.backend.config.kv_bytes_per_token)
         if not 0 <= self._kv_bytes <= capacity:
             raise RuntimeError("KV event accounting exceeds the configured capacity")
 

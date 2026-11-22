@@ -3197,13 +3197,16 @@ def vllm_0_30_source_model_inputs(step, *, embedding_token_ids, prompt_lengths, 
         "vllm_0_30_decode_prefix_model_input"), "decode_threshold": decode_threshold,
         "require_uniform": require_uniform,
         "initial_request_ids": [request.request_id for request in step.requests],
-        "request_permutation": order, "token_row_permutation": list(token_rows),
+        # Rank-local traces can all reference the same immutable batch rows.
+        "request_permutation": order, "token_row_permutation": token_rows,
         "model_request_ids": [request.request_id for request in packed_step.requests],
         "model_query_lengths": [request.scheduled_tokens for request in packed_step.requests],
         "model_attention_phases": attention_phases,
         "model_reorder_regions": [regions[index] for index in order],
         "initial_prompt_lengths": None if prompts is None else list(prompts),
-        "model_positions": [position for request in packed_step.requests for position in range(request.computed_tokens, request.computed_tokens + request.scheduled_tokens)],
+        "model_positions": tuple(position for request in packed_step.requests
+                                 for position in range(request.computed_tokens,
+                                                       request.computed_tokens + request.scheduled_tokens)),
         "initial_order_source": "explicit caller ScheduleStep order; not observed persistent InputBatch",
         "output_request_ids": [request.request_id for request in packed_step.requests],
         "extra_GPU_permutation_copy": False, "actual_runtime_bound": False}

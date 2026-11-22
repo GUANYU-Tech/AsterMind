@@ -66,7 +66,7 @@ class MidlayerCellConfig:
     hardware_file: str = "configs/hardware/nvidia_a800.yaml"
     hardware_id: str = "nvidia_a800"
     max_model_len: int = 128
-    max_batched_tokens: int = 32
+    max_batched_tokens: int | None = None
     max_requests: int = 4
     num_kv_blocks: int = 64
     kv_block_size_tokens: int = 16
@@ -84,6 +84,8 @@ class MidlayerCellConfig:
     deployment: Literal["colocated", "pd_disagg"] = "colocated"
     execution_mode: Literal["accelerated", "fast", "reference"] = "accelerated"
     compute_mode: Literal["midlayer", "roofline"] = "midlayer"
+    enable_chunked_prefill: bool | None = None
+    long_prefill_token_threshold: int = 0
 
 
 def _runtime_inputs(config, model):
@@ -102,7 +104,13 @@ def _runtime_inputs(config, model):
         return RuntimeInputs(routing, layout, "uniform")
 
     if model.attention_layout == "standard_gqa":
-        if config.scheduler_adapter == "vllm_0_30":
+        # The CPU scheduler version can differ from the modeled device forward.
+        vendor_ep2 = (config.hardware_id in ("metax_c500", "ascend_910b")
+            and model.model_type == "qwen3_moe" and config.data_parallel_size == 1
+            and config.tensor_parallel_size == 2 and config.enable_expert_parallel)
+        ascend_dense = config.hardware_id == "ascend_910b" and model.num_experts == 0
+        vendor_forward = model.compute_dtype == model.weight_dtype == "bf16" and (vendor_ep2 or ascend_dense)
+        if config.scheduler_adapter == "vllm_0_30" and not vendor_forward:
             return RuntimeInputs(routing, "paged_varlen", "uniform",
                 model_execution_version="vllm_0_30_0",
                 target_sampling_source=f"vllm_0_30_plain_greedy_{model.compute_dtype}")
@@ -132,9 +140,10 @@ def _runtime_inputs(config, model):
         target_sampling_source="vllm_0_30_plain_greedy_bf16",
         symbolic_source_max_model_len=config.max_model_len,
         symbolic_source_max_batched_tokens=config.max_batched_tokens)
-    if (config.hardware_id == "nvidia_a800" and model.model_type == "glm_moe_dsa"
-            and model.weight_dtype == "bf16" and config.data_parallel_size > 1
-            and config.pipeline_parallel_size == 1):
+    if (model.model_type == "glm_moe_dsa" and model.weight_dtype == "bf16"
+            and config.data_parallel_size > 1 and config.pipeline_parallel_size == 1
+            and (config.hardware_id == "nvidia_a800"
+                or HWSpec.source_contract_supported("glm_bf16_portable_roofline", config.hardware_id))):
         # The existing distributed BF16 forward requires sparse MQA during prefill.
         return replace(runtime, glm_prefill_attention_source="force_sparse_mqa")
     if (config.data_parallel_size > 1 and model.model_type == "glm_moe_dsa"
@@ -147,7 +156,7 @@ def _runtime_inputs(config, model):
     if (model.model_type == "glm_moe_dsa" and config.hardware_id == "nvidia_a800"
             and config.pipeline_parallel_size == 4):
         # Declare a cold source workspace for every rank in this new Cell.
-        ranks = config.tensor_parallel_size * config.pipeline_parallel_size
+        ranks = config.tensor_parallel_size * config.data_parallel_size * config.pipeline_parallel_size
         return replace(runtime, glm_indexer_selection_source="declared_causal_topk",
                        symbolic_workspace_initial_capacity_bytes=(0,) * ranks)
     return runtime
@@ -160,6 +169,22 @@ def create_midlayer_runtime(config: MidlayerCellConfig, *, with_scheduler: bool 
     if config.root.resolve() != loaded_root:
         raise ValueError("Cell root differs from the selected Mid-Layer source")
     model = load_model_config(config.root / config.model_file)
+    if (model.model_type == "glm_moe_dsa" and model.weight_dtype == "fp8"
+            and HWSpec.source_contract_supported("glm_fp8_weight_only_roofline", config.hardware_id)
+            and config.compute_mode != "roofline"):
+        raise NotImplementedError("the portable GLM FP8 projection requires Roofline")
+    if (model.model_type == "deepseek_v4"
+            and HWSpec.source_contract_supported("deepseek_v4_portable_roofline", config.hardware_id)
+            and config.compute_mode != "roofline"):
+        raise NotImplementedError("the portable DeepSeek-V4 projection requires Roofline")
+    if (model.model_type == "kimi_linear"
+            and HWSpec.source_contract_supported("kimi_k3_portable_roofline", config.hardware_id)
+            and config.compute_mode != "roofline"):
+        raise NotImplementedError("the portable Kimi K3 projection requires Roofline")
+    if (model.model_type == "deepseek_v3"
+            and HWSpec.source_contract_supported("deepseek_v3_portable_roofline", config.hardware_id)
+            and config.compute_mode != "roofline"):
+        raise NotImplementedError("the portable DeepSeek-V3 projection requires Roofline")
     if not _SOURCE_INPUTS and (config.deployment != "colocated" or config.scheduler_adapter in ("vllm_0_30", "vllm_0_31")
           or config.host_launch_profile_file is not None):
         raise NotImplementedError("the logical main uses colocated CPU scheduling and device timing")
@@ -170,6 +195,17 @@ def create_midlayer_runtime(config: MidlayerCellConfig, *, with_scheduler: bool 
         config = replace(config, scheduler_adapter=adapter)
     if config.scheduler_adapter not in ("vllm_0_31", "vllm_0_30", "vllm_0_11"):
         raise ValueError("unknown Scheduler adapter")
+    if config.max_batched_tokens is None:
+        chunked_prefill = config.enable_chunked_prefill
+        if chunked_prefill is None:
+            chunked_prefill = config.scheduler_adapter != "vllm_0_30"
+        if chunked_prefill:
+            config = replace(config, max_batched_tokens=32)
+        else:
+            # An explicit off setting prevents the CPU MLA fallback from
+            # replacing this inferred budget in the vLLM 0.30 worker.
+            config = replace(config, enable_chunked_prefill=False,
+                             max_batched_tokens=config.max_model_len * config.max_requests)
     if isinstance(config.watermark, bool) or not math.isfinite(config.watermark) or not 0 <= config.watermark < 1:
         raise ValueError("watermark must be in [0, 1)")
     storage_enabled = config.scheduler_adapter == "vllm_0_31"
@@ -243,7 +279,11 @@ def create_midlayer_runtime(config: MidlayerCellConfig, *, with_scheduler: bool 
     if not with_scheduler:
         return {}, execution, storage_enabled
 
-    if config.pipeline_parallel_size == 1:
+    if config.scheduler_adapter == "vllm_0_30" and model.attention_layout == "hybrid_kda_mla":
+        # The native allocator supplies hybrid per-group geometry. A single
+        # byte-per-token rate cannot describe recurrent state and MLA pages.
+        kv_bytes = 0
+    elif config.pipeline_parallel_size == 1:
         kv_bytes = math.ceil(model.kv_bytes_per_token_per_parallel_rank(config.tensor_parallel_size, 1))
     else:
         kv_bytes = math.ceil(max(model.kv_bytes_per_token_for_layer_range(config.tensor_parallel_size, start, end)

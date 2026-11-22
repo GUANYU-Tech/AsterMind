@@ -497,6 +497,10 @@ def select_gemm_launch(shape: Mapping[str, int], dtype: Optional[str],
     if policy == "analytical_launch":
         tile_m, tile_n, tile_k, depth = analytical_cublas_tiling(
             m_total, n, k)
+        if (execution_variant == "gemm" and dtype_name == "bf16"
+                and tile_k == 64 and k % 64 and k % 32 == 0):
+            # Reuse a complete 32-wide SM80 K tile for TP shards such as K=608.
+            tile_k = 32
         algorithm = f"cublas_analytical_{execution_variant}"
         split_k = 1
         partial_element_bytes = 0.0

@@ -1833,7 +1833,9 @@ def _target_moe_weight_bytes(
     tp_size = parallelism.tensor_parallel_size
     ep_size = parallelism.expert_parallel_size
     distributed_target = model.model_type in ("glm_moe_dsa", "kimi_k2") and (parallelism.context_parallel_size > 1 or parallelism.data_parallel_size > 1)
-    if parallelism.enable_expert_parallel and ep_size != tp_size and not distributed_target:
+    # The ordinary V3 DP scope validates an even source expert partition.
+    distributed_v3_ep = model.model_type == "deepseek_v3" and parallelism.data_parallel_size > 1
+    if parallelism.enable_expert_parallel and ep_size != tp_size and not (distributed_target or distributed_v3_ep):
         raise NotImplementedError(
             "target MoE residency requires the pinned vLLM EP=TP placement")
     local_experts = (len(linear_expert_partition(model.num_experts, ep_size, expert_rank)) if distributed_target
@@ -2197,9 +2199,14 @@ def model_rank_residencies(
         and parallelism.sequence_parallel_size in ((1, parallelism.tensor_parallel_size)
             if parallelism.enable_expert_parallel and parallelism.data_parallel_size > 1
                 and parallelism.tensor_parallel_size > 1 else (1,)))
-    from src.serving.workload.model_config import is_kimi_k2_data_parallel_model_scope
+    from src.serving.workload.model_config import (
+        is_deepseek_v3_data_parallel_model_scope, is_deepseek_v3_parallel_model_scope,
+        is_kimi_k2_data_parallel_model_scope,
+    )
     distributed_kimi = (model_execution_version == "vllm_0_30_0" and not include_mtp
         and worker_role in whole_model_roles and is_kimi_k2_data_parallel_model_scope(model, parallelism))
+    distributed_v3 = (model_execution_version == "vllm_0_30_0" and not include_mtp
+        and worker_role in whole_model_roles and is_deepseek_v3_data_parallel_model_scope(model, parallelism))
     if model_execution_version == "vllm_0_30_0":
         if model.model_type in ("qwen3", "llama"):
             # Qwen3Model inherits Qwen2Model's embedding/decoder/norm
@@ -2242,6 +2249,11 @@ def model_rank_residencies(
                     or not is_kimi_k2_parallel_model_scope(model, parallelism.tensor_parallel_size,
                         parallelism.pipeline_parallel_size, expert_parallel=parallelism.enable_expert_parallel)):
                 raise NotImplementedError("vLLM0.30 K2 text diagnostic residency requires legal TP/DP/PP, uniform EP or whole-group expert TP and MTP-off")
+        elif model.model_type == "deepseek_v3":
+            if (include_mtp or worker_role not in whole_model_roles or not (parallelism.is_rank_local or distributed_v3)
+                    or not is_deepseek_v3_parallel_model_scope(model, parallelism.tensor_parallel_size,
+                        parallelism.pipeline_parallel_size, expert_parallel=parallelism.enable_expert_parallel)):
+                raise NotImplementedError("vLLM0.30 V3 residency requires ordinary FP8 TP/DP/PP whole-model pools")
         elif (model.model_type != "glm_moe_dsa" or model.compute_dtype != "bf16"
                 or model.weight_dtype != "bf16" or model.tie_word_embeddings):
             raise NotImplementedError(
@@ -2250,7 +2262,7 @@ def model_rank_residencies(
         raise NotImplementedError(
             "analytical KV capacity requires a whole-model or AF Attention "
             f"scheduler pool, got worker role {worker_role!r}")
-    if not parallelism.is_rank_local and not (distributed_moe or distributed_glm or distributed_kimi):
+    if not parallelism.is_rank_local and not (distributed_moe or distributed_glm or distributed_kimi or distributed_v3):
         raise NotImplementedError(
             "analytical KV capacity currently supports DP=CP=SP=1")
     if model.compute_dtype not in ("bf16", "fp16"):

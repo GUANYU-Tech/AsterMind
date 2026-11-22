@@ -1,11 +1,14 @@
 """Strict V3 0.27.1 H200 TP8 DP1 PP1 EP8 caller contract."""
 from collections import defaultdict
+from src.kernel.hardware_spec import HWSpec
 from src.kernel.predictors.v3_ep_math import PROGRAM,logical_work
 PROFILE='vllm_0_27_1_deepseek_v3_sync_fp8'
 
 def applicable(pool):
     c=pool.parallel_plan.config
-    return (pool.hardware_id=='nvidia_h200' and c.enable_expert_parallel
+    return ((pool.hardware_id == 'nvidia_h200' or
+             HWSpec.source_contract_supported("deepseek_v3_expert_roofline", pool.hardware_id))
+        and c.enable_expert_parallel
         and c.tensor_parallel_size==c.expert_parallel_size and c.tensor_parallel_size in (2,4,8,16)
         and c.data_parallel_size==c.sequence_parallel_size==c.context_parallel_size==1
         and c.pipeline_parallel_size in (1,2,3,4,6,8)

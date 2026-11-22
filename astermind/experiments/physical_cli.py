@@ -28,7 +28,13 @@ def main(argv=None):
         value = json.loads(args.manifest.read_text(encoding="utf-8"))
         physical = value.get("physical_network", value)
         base = args.manifest.parent
-        if isinstance(physical, str):
+        from astermind.builder.config.scenario_input import SCHEMA, resolve_network_input, parse_time
+
+        if value.get("schema_version") == SCHEMA:
+            key, physical, _ = resolve_network_input(physical, base, parse_time(value["time"]))
+            if key != "physical_network":
+                parser.error("compute expects a Network configuration. Use export for a prepared dataset.")
+        elif isinstance(physical, str):
             path = base / physical
             physical = json.loads(path.read_text(encoding="utf-8"))
             base = path.parent

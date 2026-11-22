@@ -1355,6 +1355,11 @@ def select_gemm_launch(shape: Mapping[str, int], dtype: Optional[str],
         tile_m, tile_n, tile_k = _analytical_macro_tile(
             b * m, n, k, int(hardware.num_compute_units),
             int(hardware.resource_by_role("l1_cache").size_bytes))
+        if execution_variant == "gemm" and k % _CUBE_EXTENT == 0:
+            # Use a smaller legal Cube tile for aligned K shards that the
+            # default analytical tile cannot cover without a partial tile.
+            while k % tile_k:
+                tile_k //= 2
         m_tiles = math.ceil((b * m) / tile_m)
         n_tiles = math.ceil(n / tile_n)
         if (tile_m == _ASW_BASE_M and tile_k == _MAX_K_TILE

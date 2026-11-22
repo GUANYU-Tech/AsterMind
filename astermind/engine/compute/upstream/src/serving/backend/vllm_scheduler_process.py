@@ -1487,6 +1487,7 @@ def _vllm030_pipe_worker(fd: int) -> None:
                 max_model_len=requested.max_model_len, is_encoder_decoder=False,
                 max_num_batched_tokens=max_batch, max_num_seqs=max_requests,
                 enable_chunked_prefill=requested.enable_chunked_prefill,
+                long_prefill_token_threshold=requested.long_prefill_token_threshold,
                 async_scheduling=requested.async_scheduling),
             cache_config=cache_config,
             device_config=DeviceConfig(device="cpu"),
@@ -1505,6 +1506,11 @@ def _vllm030_pipe_worker(fd: int) -> None:
             # need it. This guarded process executes no model; restore the
             # target GPU Scheduler control-plane mode before construction.
             native.scheduler_config.async_scheduling = True
+        if requested.chunked_prefill_override is not None:
+            # CPU MLA can rewrite these fields for its runner. This process
+            # only schedules the simulated GPU model, so retain the Cell policy.
+            native.scheduler_config.enable_chunked_prefill = requested.chunked_prefill_override
+            native.scheduler_config.max_num_batched_tokens = max_batch
         workers, scheduler_cache = allocate_vllm030_model_cache(
             native, model, MidlayerParallel(tensor_parallel_size=requested.tensor_parallel_size,
                 pipeline_parallel_size=requested.pipeline_parallel_size,
@@ -1544,6 +1550,8 @@ def _vllm030_pipe_worker(fd: int) -> None:
             requested_async_scheduling=requested.async_scheduling,
             effective_async_scheduling=native.scheduler_config.async_scheduling,
             scheduler_class=type(scheduler).__name__,
+            requested_chunked_prefill=requested.enable_chunked_prefill,
+            effective_long_prefill_token_threshold=native.scheduler_config.long_prefill_token_threshold,
             bootstrap="explicit SDK Python subprocess; guarded CpuPlatform",
             device_guard="CpuPlatform forced; CUDA availability hidden; CUDA/NVML APIs blocked",
             requested_max_num_batched_tokens=max_batch, requested_cache_block_size=block_size,
