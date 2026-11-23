@@ -68,7 +68,7 @@ export function mappingDraft(config, {reset = false} = {}) {
   return rows;
 }
 
-export function matchParallelismToResources(config, {modelShape} = {}) {
+export function matchParallelismToResources(config, {modelShape, supportedChoices} = {}) {
   const {physical, pools} = deploymentCapacity(config);
   if (!pools.length || !positive(config.hardware.accelerators_per_satellite) || !positive(physical)) throw Error('请先配置有效的卫星和每星卡数');
   const ids = config.hardware.satellite_ids;
@@ -88,7 +88,13 @@ export function matchParallelismToResources(config, {modelShape} = {}) {
   }
   const pp = perPool / tp;
   let selected = {tp, pp};
-  if (modelShape?.num_hidden_layers && modelShape?.num_attention_heads) {
+  if (supportedChoices) {
+    const available = supportedChoices.filter(choice => choice.tp * choice.pp <= perPool);
+    available.sort((a,b) => b.tp*b.pp - a.tp*a.pp || Number(b.tp === currentTP) - Number(a.tp === currentTP));
+    if (!available.length) throw Error('当前模型与卡型的并行方案需要更多算力卡');
+    selected = available[0];
+    for (const pool of pools) pool.parallelism.enable_expert_parallel = selected.expert_parallel;
+  } else if (modelShape?.num_hidden_layers && modelShape?.num_attention_heads) {
     const shape = modelShape;
     const gqa = ['qwen3','qwen3_moe','llama'].includes(shape.model_type);
     const maxPP = gqa ? shape.num_hidden_layers : 1;

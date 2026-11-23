@@ -4,7 +4,7 @@ import {formatProgressLine,formatPhysicalSummary} from './progress_log.js';
 export const stateLabels={running:'正在运行',stopping:'正在停止',cancelled:'已手动停止',completed:'已完成',failed:'失败',interrupted:'已中断',paused:'已暂停',aborted:'已提前结束',terminated:'已终止',unknown:'状态暂不可用'};
 const validId=id=>typeof id==='string'&&/^[a-zA-Z0-9_-]+$/.test(id);
 function runDate(id){const m=id.match(/-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})(?:-(\d{6}))?$/);return m?{key:m.slice(1).join(''),text:`${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}:${m[6]}`}:{key:'',text:'创建时间未记录'}}
-function taskName(task){if(task.id.startsWith('native-scene-')&&(!task.title||task.title===task.id||['全部通信使用 FlowSim','卫星内通信使用 ProtoBridge','Cell 内通信使用 ProtoBridge'].includes(task.title)))return '完整场景仿真';if(task.title&&task.title!==task.id)return task.title.replaceAll(' · ',' / ');const grid=task.id.match(/^(?:starlink|comm)-([^-]+)-grid-(\d+)x(\d+)-/);return grid?`通信星座 ${grid[1]==='low'?'':grid[1]+' km '}（${grid[2]} 轨道 × ${grid[3]} 星）`:task.id.startsWith('qwen3-')?'计算 Cell 仿真':'仿真实验'}
+function taskName(task){if(task.id.startsWith('native-scene-')&&(!task.title||task.title===task.id||['全部通信使用 FlowSim','卫星内通信使用 ProtoBridge','Cell 内通信使用 ProtoBridge'].includes(task.title)))return '完整场景仿真';if(task.title&&task.title!==task.id)return task.title.replaceAll(' ',' / ');const grid=task.id.match(/^(?:starlink|comm)-([^-]+)-grid-(\d+)x(\d+)-/);return grid?`通信星座 ${grid[1]==='low'?'':grid[1]+' km '}（${grid[2]} 轨道 × ${grid[3]} 星）`:task.id.startsWith('qwen3-')?'计算 Cell 仿真':'仿真实验'}
 const deletedTaskIds=new Set();
 let taskRevision=0,dialogSerial=0;
 export function rememberTask(id){

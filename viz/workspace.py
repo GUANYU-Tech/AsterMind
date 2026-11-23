@@ -9,6 +9,18 @@ LINKS = (
 )
 
 
+_LANGUAGE_ASSETS = (b'<link rel="stylesheet" href="/assets/language.css">'
+                    b'<script src="/assets/language.js" defer></script>')
+
+
+def add_language_switch(content: bytes) -> bytes:
+    head_end = re.search(br'</head\s*>', content, re.I)
+    if head_end:
+        at = head_end.start()
+        return content[:at] + _LANGUAGE_ASSETS + content[at:]
+    return content + _LANGUAGE_ASSETS
+
+
 def decorate_document(content: bytes, path: str) -> bytes:
     if b'data-studio-rendered' in content:
         return content
@@ -34,7 +46,7 @@ def decorate_document(content: bytes, path: str) -> bytes:
         return (tag[:-1] + ' data-studio-rendered>').encode('utf-8')
 
     content = re.sub(br'<html\b[^>]*>', root, content, count=1, flags=re.I)
-    content = content.replace(b'OrbitServe', 'Astermind 星鉴'.encode())
+    content = content.replace(b'OrbitServe', 'AsterMind 星鉴'.encode())
     if path == '/':
         content = content.replace(b'class="studio-shell', b'class="studio-shell portal-shell', 1)
     current_path = ('/configuration' if path in {'/physical', '/scene'} else
@@ -44,9 +56,10 @@ def decorate_document(content: bytes, path: str) -> bytes:
     for index, (number, label, href) in enumerate(LINKS):
         current = ' aria-current="page"' if current_path == href.split('?')[0] else ''
         rows.append(f'<a href="{escape(href, quote=True)}"{current}><b aria-hidden="true">{number}</b>{label}</a>')
+    caption = '太空智算系统仿真平台' if path == '/' else '仿真任务工作台'
     shell = ('<header class="studio-topbar"><a class="studio-logo" href="/">'
-             '<span class="studio-mark" aria-hidden="true">✧</span>Astermind <em>星鉴</em></a>'
-             '<span>仿真任务工作台</span><a class="studio-local" href="/">'
+             '<span class="studio-mark" aria-hidden="true">✧</span>AsterMind <em>星鉴</em></a>'
+             f'<span>{caption}</span><a class="studio-local" href="/">'
              '切换仿真工作区 ↗</a></header>'
              '<aside class="studio-sidebar" aria-label="工作台导航">'
              '<div class="studio-nav-label">完整场景仿真</div>' + ''.join(rows) +
@@ -55,4 +68,4 @@ def decorate_document(content: bytes, path: str) -> bytes:
     body = re.search(br'<body\b[^>]*>', content, re.I)
     main = re.search(br'<main\b', content, re.I)
     at = body.end() if body else main.start() if main else len(content)
-    return content[:at] + shell + content[at:]
+    return add_language_switch(content[:at] + shell + content[at:])

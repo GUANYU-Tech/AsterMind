@@ -1,4 +1,4 @@
-function matchingShape(value, count) {
+export function matchingShape(value, count) {
   const match = String(value ?? '').match(/^\s*(\d+)\s*[xX×*]\s*(\d+)\s*$/);
   if (!match) return null;
   const columns = Number(match[1]), rows = Number(match[2]);
@@ -10,6 +10,10 @@ function suggestedShape(count) {
   let rows = Math.floor(Math.sqrt(count));
   while (count % rows !== 0) rows--;
   return `${count / rows}x${rows}`;
+}
+
+export function shapeForCount(shape,count) {
+  return matchingShape(shape,count) || suggestedShape(count);
 }
 
 // Update the model and both controls together, before notifying the JSON preview.
@@ -28,7 +32,7 @@ export function bindFormationSize(cluster, countInput, shapeInput, onChange, {sy
   function resize() {
     const count = cluster.satellites_per_cluster;
     if (synthetic && Number.isSafeInteger(count) && count > 0) {
-      cluster.grid_shape = matchingShape(cluster.grid_shape, count) || suggestedShape(count);
+      cluster.grid_shape = shapeForCount(cluster.grid_shape, count);
       shapeInput.value = cluster.grid_shape;
     }
     validateShape();

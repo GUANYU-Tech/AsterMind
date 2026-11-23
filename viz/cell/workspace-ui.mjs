@@ -1,5 +1,6 @@
 import { stages, stageNames, groups } from "./config-layout.mjs?v=compact-2";
 import { renderConfigForm } from "./config-form.mjs?v=validation-1";
+import {optionLabels} from "./config-labels.mjs?v=compact-2";
 import { editorChoices } from "./config-edit.mjs?v=validation-1";
 import { element } from "./results.mjs?v=compact-2";
 import { renderHardwareProfiles } from "./hardware-profile.mjs?v=profile-1";
@@ -35,12 +36,8 @@ export function buildWorkspace() {
       summary.append(capacity, note, modes, actions); scroll.append(summary);
     }
     for (const [index, [title]] of groups[name].entries()) {
-      const section = element("details", undefined, "editor-section"); section.dataset.group = `${name}-${index}`; section.open = index < 2 || title === "FlowSim";
+      const section = element("details", undefined, "editor-section"); section.dataset.group = `${name}-${index}`; section.open = index < 2;
       section.append(element("summary", title)); const fields = element("fieldset", undefined, "basic-fields"); fields.id = `form-${name}-${index}`; section.append(fields); scroll.append(section);
-      if (name === "network" && title === "FlowSim") {
-        const note = element("p", "当前 V1 使用 Runtime Comm。旧 FlowSim ACK 与 ECMP 固定种子不参与仿真；启用 ACK 或设置非零种子会被运行校验拒绝。", "unsupported-note");
-        section.insertBefore(note, fields);
-      }
       if (name === "formation" && index === 1) {
         const tle = element("div", undefined, "tle-input"); tle.id = "tle-input";
         const status = element("p", "", "upload-status"); status.id = "tle-upload-status";
@@ -48,8 +45,6 @@ export function buildWorkspace() {
       }
     }
     if (name === "formation") {
-      const note = element('p', '', 'resource-sync-note'); note.id='resource-sync-note'; note.setAttribute('role','status');
-      scroll.prepend(note);
       scroll.append(action('恢复默认配置','restore-defaults'));
       const details = element("details", undefined, "editor-section"); details.open = true; details.append(element("summary", "硬件档案")); const profile = element("div", undefined, "hardware-profile"); profile.id = "hardware-profile"; details.append(profile); scroll.append(details);
     }
@@ -60,16 +55,24 @@ export function buildWorkspace() {
       note.setAttribute("role", "status");
       scroll.append(links, note, preview);
     }
-    if (name === "workload") { scroll.append(upload("请求流 · CSV / JSONL / Parquet", "request-upload", ".csv,.jsonl,.parquet")); const status = element("p", "", "muted"); status.id = "request-upload-status"; scroll.append(status); }
+    if (name === "workload") {
+      const section = scroll.querySelector('[data-group="workload-1"]');
+      const modelCard = element("p", "", "upload-status"); modelCard.id="supported-models";
+      scroll.querySelector('[data-group="workload-0"] .basic-fields').before(modelCard);
+      const box = element("div"); box.id = "canonical-import"; box.hidden = true;
+      const status = element("p", "", "upload-status"); status.id = "request-upload-status";
+      box.append(upload("标准请求文件（CSV）", "request-upload", ".csv"), status);
+      section.append(box);
+    }
     if (name === "runtime") {
       const check = element('p','','configuration-check'); check.id='configuration-check'; check.setAttribute('role','status'); scroll.prepend(check);
-      scroll.append(action("为 MTP 假设绑定当前请求流", "bind-request-identity"));
-      const pool = element("select"); pool.id = "kv-replay-pool"; pool.className = "result-select"; pool.setAttribute("aria-label", "KV 回放目标 pool");
-      scroll.append(element("p", "KV 回放目标 pool", "fso-help"), pool, upload("KV 生命周期回放", "kv-replay-upload", ".json"));
-      const json = element("details", undefined, "editor-section"); json.open = false; json.append(element("summary", "完整配置 · 导入与导出"));
+      const json = element("details", undefined, "editor-section"); json.open = false; json.append(element("summary", "完整配置"));
       const area = element("textarea"); area.id = "advanced-config"; area.className = "config-json"; area.spellcheck = false; area.setAttribute("aria-label", "完整 AsterMindConfig");
-      json.append(area,
-        action("应用 JSON", "apply-json"), action("放弃 JSON 编辑", "discard-json"), action("导出配置", "export-config")); scroll.append(json);
+      const profile = element("div"); profile.id = "config-profile";
+      const editor = element("details"); editor.append(element("summary", "编辑 JSON"));
+      json.append(profile, editor, action("导出配置", "export-config"));
+      editor.append(area,
+        action("应用 JSON", "apply-json"), action("放弃 JSON 编辑", "discard-json")); scroll.append(json);
     }
     const footer = element("div", undefined, `panel-actions${i === 0 ? " panel-actions-single" : ""}`);
     if (i) { const back = action("← 上一步", null, "back-action"); back.dataset.stageTarget = stages[i - 1]; footer.append(back); }
@@ -91,21 +94,19 @@ export function renderWorkspaceForms(config, capabilities, changed, onEdit, onEr
     const present=new Set([...document.querySelectorAll('.basic-fields [data-config-path]')].map(n=>n.dataset.configPath));
     for(const path of validation.drafts.keys()) if(!present.has(path)) validation.drafts.delete(path);
   }
+  const cardId=config.hardware.default_hardware_id;
+  document.querySelector('#supported-models').textContent=(optionLabels[cardId]||cardId)+' 可用模型 '+document.querySelectorAll('#field-model option:not(:disabled)').length+' 个';
   const capacity = deploymentCapacity(config);
   const idle = Math.max(0,capacity.physical-capacity.required);
   const status = resourceSyncError(config) || (capacity.required > capacity.physical ? '资源不足，请启用自动适配资源。' : `已分配 ${capacity.required} 张卡，空闲 ${idle} 张。`);
   document.querySelector('#deployment-capacity').textContent = `${config.hardware.satellite_ids.length} 颗卫星 × 每星 ${config.hardware.accelerators_per_satellite} 张卡 = ${capacity.physical} 张物理卡；${status}`;
   document.querySelector('#automatic-deployment').setAttribute('aria-pressed',String(automaticDeployment(config)));
   document.querySelector('#manual-deployment').setAttribute('aria-pressed',String(!automaticDeployment(config)));
-  document.querySelector('#resource-sync-note').textContent = resourceSyncError(config) || (automaticDeployment(config) ? `自动适配已开启：ID、TP / PP、卡映射随资源更新。已分配 ${capacity.required} 张卡，空闲 ${idle} 张。` : '手动部署已开启：保留自定义 TP / PP 与有效卡映射。');
-  const optical = config.topology.inter_satellite.links.some(link => (link.mode || "islsim") === "islsim") || !config.topology.inter_satellite.links.length;
-  for (const i of [2, 3, 4]) document.querySelector(`[data-group="network-${i}"]`).hidden = !optical;
   const profile = document.querySelector("#hardware-profile");
   const models = new Set([config.hardware.default_hardware_id, ...(config.hardware.accelerator_overrides || []).map(x => x.hardware_id)]);
   renderHardwareProfiles(profile, models, capabilities.hardware_details);
-  const poolSelect = document.querySelector("#kv-replay-pool"), selected = poolSelect.value;
-  poolSelect.replaceChildren(...Object.keys(config.scheduler).map(name => { const option = element("option", name); option.value = name; return option; }));
-  if (Object.hasOwn(config.scheduler, selected)) poolSelect.value = selected;
+  document.querySelector("#canonical-import").hidden = config.requests.source !== "canonical";
+  document.querySelector("#request-upload-status").textContent = config.requests.file?.split("/").at(-1) || "";
   document.querySelector("#tle-input").hidden = config.topology.source !== "orbit";
   document.querySelector("#tle-upload-status").textContent = config.constellation?.tle_file ? config.constellation.tle_file.split("/").at(-1) : "";
 }

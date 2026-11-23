@@ -2,11 +2,16 @@
 export const stages = ["formation", "network", "workload", "deployment", "runtime", "analysis"];
 export const stageNames = ["星座资源", "通信网络", "模型负载", "并行部署", "调度运行", "仿真结果"];
 // Presentation policy only: these values remain in imported/exported configs.
-export const hiddenFields = ["hardware.accelerator_overrides", "constellation.earth_orientation_mode", "constellation.tle_file", "topology.file", "runtime_inputs.expert_routing"];
+export const hiddenFields = ["requests.file", "requests.production", "requests.closed_loop_client_count", "topology.inter_satellite.max_range_km", "topology.inter_satellite.drop_infeasible_links", "hardware.accelerator_overrides", "constellation.earth_orientation_mode", "constellation.tle_file", "topology.file", "runtime_inputs.expert_routing"];
 export function visibleField(path) {
   if (path[0] === "fso" && path.length > 1) {
     return path[1] === "tx" && (path.length === 2 ||
-      ["baud_rate_ghz", "baud_rate_options_ghz", "modulation_pool"].includes(path[2]));
+      ["baud_rate_ghz", "baud_rate_options_ghz"].includes(path[2]));
+  }
+  if (path[0] === "scheduler" && path.length > 2) {
+    const options = ["framework", "max_batched_tokens", "max_requests", "num_kv_blocks", "kv_block_size_tokens", "vllm"];
+    const vllmOptions = ["model", "max_model_len", "enable_prefix_caching"];
+    return path.length === 3 ? options.includes(path[2]) : path[2] === "vllm" && vllmOptions.includes(path[3]);
   }
   const name = path.join(".");
   return !hiddenFields.some(key => name === key || name.startsWith(key + "."));
@@ -30,9 +35,6 @@ export const groups = {
   ],
   runtime: [
     ["调度器", ["scheduler"]],
-    ["Attention 与 Graph", ["runtime_inputs.attention_kv_layout", "runtime_inputs.attention_kv_distribution", "runtime_inputs.graph_execution", "launch_policy"]],
-    ["KV 分层", ["deployment.worker_pools.*.kv_cache", "kv_offload"]],
-    ["主机与运行", ["deployment.router", "runtime"]],
   ],
 };
 
@@ -86,7 +88,7 @@ export function hardwareForPool(config, name) {
   if (!places.length) return "待配置映射";
   if (places.some(p => !hardware.satellite_ids.includes(p.satellite_id) || p.local_index < 0 || p.local_index >= hardware.accelerators_per_satellite)) return "映射超出资源清单";
   const ids = new Set(places.map(p => overrides.get(`${p.satellite_id}\0${p.local_index}`) || hardware.default_hardware_id));
-  return ids.size === 1 ? [...ids][0] : "型号混用 · 不支持";
+  return ids.size === 1 ? [...ids][0] : "型号混用 不支持";
 }
 
 export function importResourceHardware(config) {

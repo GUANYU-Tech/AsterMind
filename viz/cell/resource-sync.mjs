@@ -15,7 +15,7 @@ export function synchronizeResources(config, capabilities) {
   hardware.accelerator_overrides = (hardware.accelerator_overrides || []).filter(row => ids.includes(row.satellite_id) && row.local_index >= 0 && row.local_index < cards);
   state(config).error = '';
   try {
-    if (automaticDeployment(config)) matchParallelismToResources(config,{modelShape:capabilities.model_shapes?.[config.model]});
+    if (automaticDeployment(config)) matchParallelismToResources(config,{modelShape:capabilities.model_shapes?.[config.model], supportedChoices:capabilities.models_by_hardware?.[config.hardware.default_hardware_id]?.[config.model]});
     else config.deployment.placements = mappingDraft(config);
     if (capabilities.model_shapes?.[config.model]?.tie_word_embeddings
       && config.deployment.worker_pools.some(pool=>pool.parallelism.pipeline_parallel_size>1)) {

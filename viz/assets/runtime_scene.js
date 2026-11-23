@@ -51,9 +51,9 @@ window.setRuntimeGeometry=async(runtime,record)=>{
   if(bracket)snapshot=MotionState.pose(snapshot,bracket.left,bracket.right,runtime.time_s);
   if(own!==version)return;
   const nodes=environment.network.nodes,comm=nodes.filter(n=>n.role==='communication').length,compute=nodes.filter(n=>n.role==='compute').length,ground=nodes.filter(n=>n.role==='ground').length;
-  document.getElementById('constellationInfo').textContent=comm+' 颗通信卫星 + '+compute+' 颗计算卫星 = '+(comm+compute)+' 颗物理卫星 · '+ground+' 个地面站 · 仿真时长 '+environment.time.duration_s+' s · 当前 UP 链路 '+snapshot.links.filter(l=>l.state==='UP').length;
+  document.getElementById('constellationInfo').textContent=comm+' 颗通信卫星 + '+compute+' 颗计算卫星 = '+(comm+compute)+' 颗物理卫星 '+ground+' 个地面站 仿真时长 '+environment.time.duration_s+' s 当前 UP 链路 '+snapshot.links.filter(l=>l.state==='UP').length;
   presented={data:{...environment,network:{...environment.network,faults:logicalFaults}},snapshot,kind:'all',runtime,record};
-  status.textContent='播放 '+runtime.time_s.toFixed(6)+' s · 物理采样 '+(snapshot.physical_time_s??snapshot.time_s)+' s · '+(motion?'ITRS Hermite 位置插值 · 业务状态遵循实际事件':'位置保持（旧数据无运动帧）')+' · 缓存 '+cache.size()+' 拓扑 / '+(motion?.size()||0)+' 运动帧';
+  status.textContent='播放 '+runtime.time_s.toFixed(6)+' s 物理采样 '+(snapshot.physical_time_s??snapshot.time_s)+' s '+(motion?'ITRS Hermite 位置插值 业务状态遵循实际事件':'位置保持（旧数据无运动帧）')+' 缓存 '+cache.size()+' 拓扑 / '+(motion?.size()||0)+' 运动帧';
   // Preload the next two geometry frames; every subsecond hop shares this frame.
   for(const frame of frames.slice(frameIndex+1,frameIndex+2))cache.get(frame).catch(()=>{});
  }catch(error){if(own===version)status.textContent='3D 环境不可用：'+error.message}

@@ -7,7 +7,7 @@ export async function setupResultSelection({get,select,button,status,navigate}){
  for(const row of rows){
   if(!row.id)continue;ids.add(row.id);
   const option=document.createElement('option');option.value=row.id;
-  option.textContent=`${row.title&&row.title!==row.id?row.title+' · ':''}${row.id} · ${labels[row.state]||row.state}`;
+  option.textContent=`${row.title&&row.title!==row.id?row.title+' ':''}${row.id} ${labels[row.state]||row.state}`;
   select.append(option);
  }
  select.value='';select.disabled=!ids.size;

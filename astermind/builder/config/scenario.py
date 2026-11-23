@@ -18,6 +18,21 @@ class RoutingConfig(Contract):
     policy: str = Field(default="min_hops", pattern=r"^[a-z][a-z0-9_-]{0,127}$")
 
 
+CellMetric = Literal["load", "distance", "arrival"]
+
+
+class CellPriority(Contract):
+    """Rank reachable Cells by the user's ordered criteria, then by Cell ID."""
+    primary: CellMetric
+    secondary: CellMetric | None = None
+
+    @model_validator(mode="after")
+    def distinct_criteria(self):
+        if self.primary == self.secondary:
+            raise ValueError("Cell 选择的首选和次选条件必须不同")
+        return self
+
+
 class SimulationConfig(Contract):
     schema_version: Literal[1, "orbitserve.native_cells.v1"] = 1
     # Ground resources are explicit in the outer model. The current network
@@ -33,7 +48,7 @@ class SimulationConfig(Contract):
     compute_mode: Literal["midlayer", "roofline"] = "midlayer"
     communication: CommPolicy = Field(default_factory=CommPolicy)
     routing: RoutingConfig = Field(default_factory=RoutingConfig)
-    cell_selection: Literal['least_loaded', 'nearest', 'estimated_arrival'] = 'least_loaded'
+    cell_selection: Literal['least_loaded', 'nearest', 'estimated_arrival'] | CellPriority = 'least_loaded'
     horizon_ns: Positive = 1_000_000_000
     physical_dataset: str | None = None
     physical_network: dict | str | None = None

@@ -68,7 +68,7 @@ def start(root, preset=PRESET):
         inputs.mkdir(parents=True, exist_ok=False)
         write_json(inputs/'manifest.json', dict(schema_version='orbitserve.native_preset.v1',
                    native_preset=PRESET, deployment=DEPLOYMENT))
-        write_json(output/'run_metadata.json', dict(title='Qwen3-4B · 72×22 · TP2×PP2 · FlowSim'))
+        write_json(output/'run_metadata.json', dict(title='Qwen3-4B 72×22 TP2×PP2 FlowSim'))
         session = NativeSession(identity, output)
         session.payload.update(native_preset=PRESET, deployment=DEPLOYMENT,
                                message='正在加载 Qwen3-4B、72×22 星座与 FlowSim…')
@@ -101,7 +101,7 @@ def start(root, preset=PRESET):
 
             module.run_simulation = execute
             with (output/'execution.log').open('a', encoding='utf-8') as log:
-                log.write('Qwen3-4B · 72×22 · TP2×PP2 · 2 replicas · FlowSim\n')
+                log.write('Qwen3-4B 72×22 TP2×PP2 2 replicas FlowSim\n')
             with runtime_control(session):
                 data = module.run('multi', 'flowsim', 'tp_pp')
             write_json(output/'native_serving.json', data)

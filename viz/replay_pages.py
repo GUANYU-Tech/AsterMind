@@ -143,7 +143,7 @@ def ready_index(source):
 
 def catalog(source):
     with sqlite3.connect(ready_index(source)) as db:
-        return [dict(id=f'batch-{i}',title=f'{cell} · {step}',file=f'batch-{i}.json',paged=True)
+        return [dict(id=f'batch-{i}',title=f'{cell} {step}',file=f'batch-{i}.json',paged=True)
                 for i,cell,step in db.execute('SELECT id,cell,step FROM batches ORDER BY start,id')]
 
 
@@ -168,6 +168,6 @@ def batch(source, identity):
         steps=[unpacked(raw) for (raw,) in db.execute('SELECT data FROM steps WHERE cell=? AND step=?',(cell,step))]
         result.update(calls=calls,transfers=list(transfers.values()),hops=hops,steps=steps,
             events=[unpacked(raw) for (raw,) in db.execute('SELECT data FROM events WHERE time BETWEEN ? AND ? ORDER BY time',(start,end))],
-            title=cell+' · '+step,page_scope=dict(kind='batch',start=start,end=end),
+            title=cell+' '+step,page_scope=dict(kind='batch',start=start,end=end),
             end=end)
         return result

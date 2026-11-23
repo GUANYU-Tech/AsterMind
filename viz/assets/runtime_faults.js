@@ -60,14 +60,14 @@ export function attachFaults({THREE,scene,vector,camera,controls,toolbar,contain
   for(const [name,layer]of Object.entries(layers))for(const [kind,ids]of [['points','pointIds'],['tips','tipIds'],['lines','lineIds']]){
    const geometry=layer[kind].geometry;geometry.setAttribute('position',new THREE.Float32BufferAttribute(values[name][kind],3));geometry.computeBoundingSphere();layer[kind].userData.ids=values[name][ids];
   }
-  summary.textContent=`当前 ${state.runtime?.time_s??state.snapshot.time_s} s · 故障节点 ${rows.filter(r=>r.type==='node').length} · 故障链路 ${rows.filter(r=>r.type==='link').length}（含太阳避让）`;
+  summary.textContent=`当前 ${state.runtime?.time_s??state.snapshot.time_s} s 故障节点 ${rows.filter(r=>r.type==='node').length} 故障链路 ${rows.filter(r=>r.type==='link').length}（含太阳避让）`;
   const key=group.value+'|'+visible.map(r=>r.type+'|'+r.id+'|'+r.sources.join(',')).join(';');
   if(key===uiKey){if(pendingSource&&visible.length){pendingSource=null;focusSelected()}return}uiKey=key;
   hud.replaceChildren();
   for(const [key,{label,color}]of Object.entries(categories)){const own=counts(rows,key);badges[key].textContent=`⊗ ${label}：${own.nodes} 节点 / ${own.links} 链路`;if(own.nodes||own.links){const line=document.createElement('div');line.style.color=color;line.textContent=badges[key].textContent;hud.append(line)}}
-  if(!hud.children.length)hud.textContent='当前无有效故障 · 已恢复故障仅计入累计统计';
+  if(!hud.children.length)hud.textContent='当前无有效故障 已恢复故障仅计入累计统计';
   const prior=select.value,chosen=state.runtime?.event?.target_id||state.runtime?.event?.link_id;select.replaceChildren();
-  for(const row of visible){const option=document.createElement('option');option.value=row.type+'|'+row.id;option.textContent=row.sources.map(s=>categories[s].label).join(' + ')+' · '+(row.type==='node'?'节点 ':'链路 ')+row.id;select.append(option)}
+  for(const row of visible){const option=document.createElement('option');option.value=row.type+'|'+row.id;option.textContent=row.sources.map(s=>categories[s].label).join(' + ')+' '+(row.type==='node'?'节点 ':'链路 ')+row.id;select.append(option)}
   const choice=visible.find(r=>r.type+'|'+r.id===prior)||visible.find(r=>r.id===chosen)||visible[0];
   select.value=choice?choice.type+'|'+choice.id:'';
   focus.disabled=select.disabled=!visible.length;

@@ -22,7 +22,7 @@ function renderBaudRate(fields,tx){
   const fixedLabel=document.createElement('label');
   fixedLabel.textContent='固定波特率（GBaud，留空时自动选档）';
   const fixed=document.createElement('input');
-  fixed.type='number';fixed.min='0';fixed.step='any';
+  fixed.dataset.designControl='baud';fixed.type='number';fixed.min='0';fixed.step='any';
   fixed.value=tx.baud_rate_ghz??'';
   fixedLabel.append(fixed);
   const candidatesLabel=document.createElement('label');
@@ -62,27 +62,20 @@ function modulationMode(pool){
 
 function renderModulation(fields,profile){
   const tx=profile.islsim_config.tx,wrap=document.createElement('label');
-  wrap.textContent='ISLSim · 调制策略';
+  wrap.textContent='ISLSim 调制策略';
   const select=document.createElement('select');select.setAttribute('aria-label',wrap.textContent);
-  for(const[value,text]of [['auto','自动适配：16QAM → 8QAM → QPSK'],['4','固定 QPSK'],['8','固定 8QAM'],['16','固定 16QAM'],['64','固定 64QAM'],['custom','自定义候选集合与顺序']]){
+  for(const[value,text]of [['auto','自动适配：16QAM → 8QAM → QPSK'],['4','固定 QPSK'],['8','固定 8QAM'],['16','固定 16QAM'],['64','固定 64QAM']]){
     const option=document.createElement('option');option.value=value;option.textContent=text;select.append(option);
   }
+  if (modulationMode(tx.modulation_pool)==='custom') {
+    const imported=new Option('已载入的调制策略','custom'); imported.disabled=true; select.append(imported);
+  }
   select.value=modulationMode(tx.modulation_pool);
-  const details=document.createElement('details'),summary=document.createElement('summary');
-  summary.textContent='调制候选集合与顺序（高级）';details.append(summary);
-  const label=document.createElement('label');label.textContent='ISLSim · 调制池 JSON';
-  const pool=document.createElement('textarea');pool.setAttribute('aria-label',label.textContent);pool.value=JSON.stringify(tx.modulation_pool);
-  pool.oninput=()=>{try{
-    const value=JSON.parse(pool.value);
-    if(!Array.isArray(value)||!value.length||value.some(row=>!Array.isArray(row)||row.length!==2||!Number.isInteger(row[0])||row[0]<4||!Number.isInteger(Math.log2(row[0]))||typeof row[1]!=='string'||!row[1]))throw Error();
-    tx.modulation_pool=value;pool.setCustomValidity('');select.value=modulationMode(value);document.dispatchEvent(new Event('modelchange'));
-  }catch{pool.setCustomValidity('请输入非空的 [调制阶数, 标签] 数组；阶数须为不小于 4 的 2 的幂')}};
   select.onchange=()=>{
-    if(select.value==='custom'){details.open=true;return}
     tx.modulation_pool=(select.value==='auto'?[16,8,4]:[Number(select.value)]).map(order=>[order,(tx.dual_polarization?'DP-':'')+(order===4?'QPSK':order+'QAM')]);
-    pool.value=JSON.stringify(tx.modulation_pool);pool.setCustomValidity('');document.dispatchEvent(new Event('modelchange'));
+    document.dispatchEvent(new Event('modelchange'));
   };
-  wrap.append(select);fields.append(wrap);label.append(pool);details.append(label);fields.append(details);
+  wrap.append(select);fields.append(wrap);
   const note=document.createElement('p');note.textContent='OrbitServe 提供允许的调制集合；ISLSim 按候选顺序选择首个满足 BER 门限的方式。固定模式也必须满足 BER，否则链路不可用。';fields.append(note);
 }
 export function renderISLSim(fields,profile,changed){

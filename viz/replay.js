@@ -20,9 +20,9 @@ const exactDuration = (row) => {
   return ns<1000?`${Number(ns.toPrecision(9))} ns`:duration(ns);
 };
 const transportLabel = (data) => data.backend === "runtime_comm" ? "V1 Runtime Comm" : data.backend === "simgrid" ? "SimGrid" : data.backend === "ns3" ? "ns-3" : "FlowSim";
-const communicationLabel = (data) => data.backend === 'runtime_comm' ? 'V1 Runtime Comm · 整条路径共享资源' : ({
-  protobridge_cell: "Cell 内 ProtoBridge · Cell 外 FlowSim",
-  protobridge_satellite: "卫星内 ProtoBridge · 星间 FlowSim",
+const communicationLabel = (data) => data.backend === 'runtime_comm' ? 'V1 Runtime Comm 整条路径共享资源' : ({
+  protobridge_cell: "Cell 内 ProtoBridge Cell 外 FlowSim",
+  protobridge_satellite: "卫星内 ProtoBridge 星间 FlowSim",
 }[data.provenance?.communication_mode] || (data.backend === "ns3" ? "ns-3 包级" : "全部通信使用 FlowSim")).replaceAll('FlowSim',data.backend==='simgrid'?'SimGrid':'FlowSim');
 const bytes = (n) =>
   n >= 2 ** 20
@@ -157,9 +157,9 @@ function selectFlow(id) {
     $("selectedType").textContent = "独立物理传输";
     $("callDetails").innerHTML = `<div class="call-name">${esc(
       flow.operation
-    )} · ${esc(flow.id)}</div><div class="evidence">${esc(
+    )} ${esc(flow.id)}</div><div class="evidence">${esc(
       flow.evidence
-    )} · ${esc(flow.source)} → ${esc(flow.target)} · ${bytes(
+    )} ${esc(flow.source)} → ${esc(flow.target)} ${bytes(
       flow.size_bytes
     )}</div>`;
     $("dependencies").innerHTML = empty(
@@ -206,7 +206,7 @@ function eventLabel(event) {
         : event.state === "DOWN"
         ? "链路断开"
         : "正在建链"
-    } · ${event.link_id}`,
+    } ${event.link_id}`,
   };
   return labels[event.kind] || event.kind;
 }
@@ -221,19 +221,19 @@ function renderMetrics() {
     [
       String(completed).padStart(2, "0"),
       "最终完成请求",
-      `${Object.keys(d.requests).length} 请求 · ${Object.values(
+      `${Object.keys(d.requests).length} 请求 ${Object.values(
         d.requests
       ).reduce((s, r) => s + r.received_tokens, 0)} tokens`,
     ],
     [
       kernels.toLocaleString(),
       "计算 / 存储算子调用",
-      `${d.calls.length - kernels} 个通信操作 · ${d.page_scope ? '当前批次的 GPU 汇总' : '跨批次和 GPU 汇总'}`,
+      `${d.calls.length - kernels} 个通信操作 ${d.page_scope ? '当前批次的 GPU 汇总' : '跨批次和 GPU 汇总'}`,
     ],
     [
       d.transfers.length.toLocaleString(),
       "端到端消息记录",
-      `${d.transfers.filter(t => t.backend !== "protobridge").length} ${transportLabel(d)} / ${d.transfers.filter(t => t.backend === "protobridge").length} ProtoBridge · ${d.hops.length.toLocaleString()} 逐段服务记录`,
+      `${d.transfers.filter(t => t.backend !== "protobridge").length} ${transportLabel(d)} / ${d.transfers.filter(t => t.backend === "protobridge").length} ProtoBridge ${d.hops.length.toLocaleString()} 逐段服务记录`,
     ],
     [
       `${passed}/${d.audit.length}`,
@@ -307,7 +307,7 @@ function renderMoments() {
       (x) =>
         `<button type="button" data-time="${x.time}" class="${
           x.bad ? "danger" : ""
-        }">${esc(x.label)} · ${ms(x.time)}</button>`
+        }">${esc(x.label)} ${ms(x.time)}</button>`
     )
     .join("");
 }
@@ -428,11 +428,11 @@ function renderTopology() {
       const y = ground ? 333 : (a.y + b.y) / 2 - 12;
       const label =
         linkState === "DOWN"
-          ? "DOWN · 故障"
+          ? "DOWN 故障"
           : linkState === "SETTING_UP"
           ? "建链中"
           : serving.length
-          ? `${serving.length} 流 · 单流最高 ${rate(
+          ? `${serving.length} 流 单流最高 ${rate(
               Math.max(...serving.map((h) => h.rate))
             )}`
           : "UP";
@@ -482,7 +482,7 @@ function renderTopology() {
     }" text-anchor="middle">${esc(role)}</text></g>`;
   }
   $("topology").innerHTML = svg;
-  $("networkBadge").textContent = `${communicationLabel(d)} · 同一时间轴`;
+  $("networkBadge").textContent = `${communicationLabel(d)} 同一时间轴`;
 }
 function renderNow() {
   const d = state.data;
@@ -576,7 +576,7 @@ function renderNow() {
         frac * 100
       }%"></div></div><div class="request-times"><span>${
         input?.input_tokens ?? "?"
-      } prompt · 已交付 ${received} 输出块 / 最终 ${
+      } prompt 已交付 ${received} 输出块 / 最终 ${
         r.received_tokens
       } tokens</span><span>TTFT ${
         r.first_token_received_ns != null
@@ -671,7 +671,7 @@ function drawTimeline() {
     ctx.fillStyle = "#b4cce2";
     ctx.fillText(lane.device, 0, y + 7);
     ctx.fillStyle = "#627e9a";
-    ctx.fillText(`${lane.cell} · rank ${lane.rank}`, 0, y + 21);
+    ctx.fillText(`${lane.cell} rank ${lane.rank}`, 0, y + 21);
     ctx.fillStyle = "#0b1522";
     ctx.fillRect(left, y, plot, 38);
     const rows = d.calls
@@ -745,7 +745,7 @@ function drawTimeline() {
     ctx.lineTo(px, 28);
     ctx.fill();
   }
-  $("windowInfo").textContent = `视窗 ${ms(a)} — ${ms(b)} · ${
+  $("windowInfo").textContent = `视窗 ${ms(a)} — ${ms(b)} ${
     lanes.length
   } 个 GPU rank`;
 }
@@ -778,13 +778,13 @@ function renderCall() {
               })
             ),
           ].join(" ↔ ")
-        : `${c.device} · ${c.owner} · r${c.rank}`,
+        : `${c.device} ${c.owner} r${c.rank}`,
     ],
     ["仿真记录耗时", exactDuration(c)],
-    ["求解方法", c.comm ? (c.communication_backend === "protobridge" ? "ProtoBridge · 当前物理链路参数" : `${transportLabel(state.data)} · 逐流执行`) : "AsterMind GPU 计算模型"],
-    ["原生参考", duration(c.native_ns) + (c.comm ? " · 未额外计费" : "")],
+    ["求解方法", c.comm ? (c.communication_backend === "protobridge" ? "ProtoBridge 当前物理链路参数" : `${transportLabel(state.data)} 逐流执行`) : "AsterMind GPU 计算模型"],
+    ["原生参考", duration(c.native_ns) + (c.comm ? " 未额外计费" : "")],
     ["开始 → 结束", `${exactTime(c.start_ticks,c.start)} → ${exactTime(c.end_ticks,c.end)}`],
-    ["直接依赖", `${c.deps.length} 个 · launch gap ${duration(c.gap)}`],
+    ["直接依赖", `${c.deps.length} 个 launch gap ${duration(c.gap)}`],
     ["依赖就绪后的间隔", duration(Math.max(0, c.start - depEnd))],
   ]
     .map(
@@ -793,7 +793,7 @@ function renderCall() {
           b
         )}</strong></div>`
     )
-    .join("")}</div><div class="evidence">${esc(c.evidence)} · ${esc(
+    .join("")}</div><div class="evidence">${esc(c.evidence)} ${esc(
     c.cell + "/" + c.batch
   )}</div>`;
   const short = (call) =>
@@ -837,7 +837,7 @@ function renderFlows() {
       ? c.phases
       : [[state.flow]]
     ).entries()) {
-      content += `<p class="muted">阶段 ${phaseIndex + 1} · ${
+      content += `<p class="muted">阶段 ${phaseIndex + 1} ${
         phase.length
       } 条真实传输</p>`;
       for (const id of phase) {
@@ -847,7 +847,7 @@ function renderFlows() {
           state.flow === id ? "active" : ""
         }" role="button" tabindex="0" data-flow="${esc(
           id
-        )}"><div><div class="flow-name">${esc(t.operation)} · ${esc(
+        )}"><div><div class="flow-name">${esc(t.operation)} ${esc(
           id
         )}</div><div class="flow-route">${esc(
           t.path.join(" → ")
@@ -855,18 +855,18 @@ function renderFlows() {
           t.kind === "failed" ? "flow-failed" : ""
         }">${bytes(t.size_bytes)}<br><span class="muted">${
           t.start != null ? duration(t.end - t.start) : "未记录 ready"
-        } · ${t.kind === "completed" ? "交付" : "失败"}</span></div></div>`;
+        } ${t.kind === "completed" ? "交付" : "失败"}</span></div></div>`;
       }
     }
   }
   const t = transfers.get(state.flow);
   if (t) {
     const hops = flowHops.get(t.id) || [];
-    content += `<div class="evidence">${esc(t.evidence)} · ${
+    content += `<div class="evidence">${esc(t.evidence)} ${
       t.start == null ? "就绪时刻未记录" : `就绪 ${exactTime(t.start_ticks,t.start)}`
     } → 通知 ${exactTime(t.end_ticks,t.end)}<br>物理终态 ${
       t.physical_end != null ? ms(t.physical_end) : "未记录"
-    } · ${esc(t.reason || "依赖在实际交付后释放")}</div>`;
+    } ${esc(t.reason || "依赖在实际交付后释放")}</div>`;
     content += `<div class="scroll-table"><table class="hop-table"><thead><tr><th>服务资源 / 方向</th><th>区间 / ms</th><th>实际服务 / 容量</th><th>逻辑字节</th></tr></thead><tbody>${hops
       .map(
         (h) =>
@@ -903,9 +903,9 @@ function renderSteps() {
         )}</span></div><div class="step-body">${s.requests
           .map(
             (r) =>
-              `${esc(r.request_id)} · ${esc(r.phase)} · 调度 ${
+              `${esc(r.request_id)} ${esc(r.phase)} 调度 ${
                 r.input_tokens
-              } prefill / ${r.output_tokens} decode · 实际产出 ${
+              } prefill / ${r.output_tokens} decode 实际产出 ${
                 s.generated[r.request_id] ?? 0
               } token`
           )
@@ -914,7 +914,7 @@ function renderSteps() {
     .join("");
   $(
     "schedulerBadge"
-  ).textContent = `vLLM 0.31 · ${state.data.steps.length} 批次`;
+  ).textContent = `vLLM 0.31 ${state.data.steps.length} 批次`;
 }
 function renderStep() {
   const s = state.data.steps[state.step];
@@ -927,20 +927,20 @@ function renderStep() {
   )}</strong>${s.requests
     .map(
       (r) =>
-        `<p>${esc(r.request_id)} · ${esc(r.phase)}<br>已计算 ${
+        `<p>${esc(r.request_id)} ${esc(r.phase)}<br>已计算 ${
           r.computed_tokens
-        } · 本批 prefill ${r.input_tokens} / decode ${
+        } 本批 prefill ${r.input_tokens} / decode ${
           r.output_tokens
         }<br>实际产出 ${
           s.generated[r.request_id] ?? 0
         } 个 token<br>Scheduler 前缀命中 ${
           r.scheduler_prefix_hit_tokens ?? 0
-        } · 重计算 ${r.recomputed_tokens ?? 0}</p>`
+        } 重计算 ${r.recomputed_tokens ?? 0}</p>`
     )
     .join("")}<div>${s.kv
     .map(
       (e) =>
-        `<span class="kv-event">${esc(e.action)} · ${bytes(e.bytes)} · tokens ${
+        `<span class="kv-event">${esc(e.action)} ${bytes(e.bytes)} tokens ${
           e.token_start
         }–${e.token_end}</span>`
     )
@@ -995,9 +995,9 @@ function renderMigrations() {
             : "";
         return `<div class="migration"><div class="migration-head"><strong>${esc(
           m.id
-        )} · ${esc(m.source)} → ${esc(m.target)} · ${esc(
+        )} ${esc(m.source)} → ${esc(m.target)} ${esc(
           m.mode || ""
-        )} · ${bytes(m.bytes || 0)}</strong>${badge(
+        )} ${bytes(m.bytes || 0)}</strong>${badge(
           !begun
             ? "尚未开始"
             : !finished
@@ -1030,11 +1030,11 @@ function renderMigrations() {
             (p) =>
               `<div class="flow-row" role="button" tabindex="0" data-flow="${esc(
                 p.transfer_id
-              )}"><span class="flow-name">rank ${p.rank} · ${esc(
+              )}"><span class="flow-name">rank ${p.rank} ${esc(
                 p.source
               )} → ${esc(p.target)}</span><span class="flow-bytes">${bytes(
                 p.bytes
-              )} · ${
+              )} ${
                 state.now < (p.terminal_time_s ?? Infinity) * 1e9
                   ? "尚未终结"
                   : p.state === "completed"
@@ -1061,7 +1061,7 @@ function renderMemory() {
         c = storage.capacity;
       const analytical = c.source_mode !== "debug_explicit_block_count";
       const synthetic = JSON.stringify(c.policy || {}).includes("Synthetic");
-      return `<div class="memory-card"><h3>${esc(id)} · ${esc(
+      return `<div class="memory-card"><h3>${esc(id)} ${esc(
         cell.config.hardware_id
       )} ${badge(
         analytical
@@ -1072,7 +1072,7 @@ function renderMemory() {
         analytical ? "" : "wait"
       )}</h3><div class="memory-line"><span>模型 / 部署</span><strong>${esc(
         cell.config.model.split("/").pop()
-      )} · TP${cell.config.parallel.tp} / PP${
+      )} TP${cell.config.parallel.tp} / PP${
         cell.config.parallel.pp
       }</strong></div><div class="memory-line"><span>每 rank KV block / 逻辑池块数</span><strong>${bytes(
         c.kv_block_bytes
@@ -1204,7 +1204,7 @@ function updateCallOptions() {
         ({ c, i }) =>
           `<option value="${i}">${esc(
             c.device +
-              " · " +
+              " " +
               c.id +
               (c.occurrence >= 0 ? " / #" + c.occurrence : "")
           )}</option>`
@@ -1253,7 +1253,7 @@ async function loadCase(id) {
     );
     $("caseSelect").value = item.id;
     if($("batchSelect"))$("batchSelect").value=item.id;
-    $("caseSubtitle").textContent = `${d.title} · ${communicationLabel(d)}`;
+    $("caseSubtitle").textContent = `${d.title} ${communicationLabel(d)}`;
     $("cellFilter").innerHTML =
       '<option value="">全部 Cell</option>' +
       Object.keys(d.cells)
@@ -1294,7 +1294,7 @@ async function loadCase(id) {
     if(d.page_scope?.kind==='batch'){
       setView(d.page_scope.start, d.page_scope.end);
       setTime(d.page_scope.start);
-      $("caseSubtitle").textContent += ' · 当前批次算子与通信；校验与显存快照属于完整实验';
+      $("caseSubtitle").textContent += ' 当前批次算子与通信；校验与显存快照属于完整实验';
     }
     const caseUrl = new URL(location.href);
     caseUrl.searchParams.set("case", item.id);
@@ -1372,11 +1372,11 @@ function inspectTopology(e) {
     link = e.target.closest("[data-link]");
   if (device) {
     const n = state.data.devices.find((d) => d.id === device.dataset.device);
-    $("deviceDetail").textContent = `${n.id} · ${n.satellite} · ${n.kind}${
+    $("deviceDetail").textContent = `${n.id} ${n.satellite} ${n.kind}${
       n.capacity_gbps != null
-        ? " · 共享门容量 " + n.capacity_gbps + " Gb/s"
+        ? " 共享门容量 " + n.capacity_gbps + " Gb/s"
         : ""
-    }${n.kind === "gpu" ? " · GPU 输入/输出端口分离，不能用于转发" : ""}`;
+    }${n.kind === "gpu" ? " GPU 输入/输出端口分离，不能用于转发" : ""}`;
     if (n.kind === "gpu") {
       $("deviceFilter").value = n.id;
       updateCallOptions();
@@ -1392,9 +1392,9 @@ function inspectTopology(e) {
     const current = matching.filter((h) => active(h));
     const last =
       current[0] || matching.filter((h) => h.end <= state.now).at(-1);
-    $("deviceDetail").textContent = `${row.id} · ${row.source} ↔ ${
+    $("deviceDetail").textContent = `${row.id} ${row.source} ↔ ${
       row.target
-    } · 配置端口上限 ${row.bandwidth_gbps} Gb/s。${
+    } 配置端口上限 ${row.bandwidth_gbps} Gb/s。${
       last
         ? `${
             current.length
@@ -1441,9 +1441,9 @@ $("timeline").addEventListener("mousemove", (event) => {
   tip.hidden = !hit;
   if (hit) {
     const c = state.data.calls[hit.index];
-    tip.textContent = `${c.id}\n${c.device} / rank ${c.rank} · ${c.kind}\n${ms(
+    tip.textContent = `${c.id}\n${c.device} / rank ${c.rank} ${c.kind}\n${ms(
       c.start
-    )} → ${ms(c.end)} · ${duration(c.end - c.start)}`;
+    )} → ${ms(c.end)} ${duration(c.end - c.start)}`;
     tip.style.left = Math.max(0, Math.min(x + 12, rect.width - 380)) + "px";
     tip.style.top = Math.max(0, y - 70) + "px";
   }

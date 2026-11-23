@@ -14,7 +14,7 @@ export function quotaFields(parent,obj){
 }
 
 export function sourceFields(parent,card,obj,compute,render,sync){
-  const options=[['walker_delta','Walker 参数'],['dawn_dusk','Dawn-dusk · 晨昏太阳同步'],['tle','TLE · 实测轨道']];
+  const options=[['walker_delta','Walker 参数'],['dawn_dusk','晨昏太阳同步轨道'],['tle','TLE 实测轨道']];
   const source=field(parent,obj,'source.type','轨道来源','text',options);
   source.addEventListener('change',()=>{
     const s=obj.source;
@@ -24,9 +24,9 @@ export function sourceFields(parent,card,obj,compute,render,sync){
     render();
   });
   if(obj.source.type!=='tle'){
-    for(const [key,label]of [['altitude_km','高度 km'],['planes','轨道面数'],[compute?'clusters_per_plane':'satellites_per_plane',compute?'每面 cell 数':'每面卫星数'],['u0_deg','初始纬度幅角 °']])field(parent,obj,'source.'+key,label);
+    for(const [key,label]of [...(compute?[]:[['altitude_km','高度 km']]),['planes','轨道面数'],[compute?'clusters_per_plane':'satellites_per_plane',compute?'每面 cell 数':'每面卫星数'],['u0_deg','初始纬度幅角 °']])field(parent,obj,'source.'+key,label);
     if(obj.source.type==='walker_delta')for(const[key,label]of [['inclination_deg','倾角 °'],['walker_phase','Walker 相位'],['raan0_deg','初始 RAAN °']])field(parent,obj,'source.'+key,label);
-    else{field(parent,obj,'source.ltan_hours','中心轨道升交点地方时','number',[[6,'06:00 · 晨侧'],[18,'18:00 · 昏侧']]);field(parent,obj,'source.plane_spread_deg','轨道面 RAAN 展宽 °（0–30）');const note=document.createElement('p');note.textContent='一阶 J2 太阳同步初始设计；各星独立 SGP4 传播，不含轨道保持。多面可在晨昏线附近展宽，是否入影由实际几何计算。';card.append(note)}
+    else{field(parent,obj,'source.ltan_hours','中心轨道升交点地方时','number',[[6,'06:00 晨侧'],[18,'18:00 昏侧']]);field(parent,obj,'source.plane_spread_deg','轨道面 RAAN 展宽 °（0–30）');const note=document.createElement('p');note.textContent='一阶 J2 太阳同步初始设计；各星独立 SGP4 传播，不含轨道保持。多面可在晨昏线附近展宽，是否入影由实际几何计算。';card.append(note)}
     return;
   }
   if(!compute)for(const[key,label]of [['planes','标称轨道面数（含缺失面）'],['satellites_per_plane','每面标称槽位数（含空位）']])field(parent,obj,'source.'+key,label);

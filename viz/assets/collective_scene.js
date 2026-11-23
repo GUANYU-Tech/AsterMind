@@ -30,12 +30,12 @@ function update(){
  presented={data:{network:data.network,time:data.time,sun_positions:data.sun_positions},snapshot,kind:'all',record,
   runtime:{time_s:time,event:{time_s:time,kind:'collective_replay',event_order:time},globalMode:true,
     legs:active,activeTransfers:active,compute:'waiting',routePlans:[],recoveryEvents:[],lossEvents:[]}};
- $('clock').textContent=format(time)+' s · 物理快照 '+first.time_s+' s';$('time').value=time;
+ $('clock').textContent=format(time)+' s 物理快照 '+first.time_s+' s';$('time').value=time;
  const starts=data.collectives.filter(e=>e.kind==='collective_start'),done=new Map(data.collectives.filter(e=>e.kind==='collective_complete').map(e=>[e.id,e.time_s]));
- $('phases').innerHTML=starts.map(e=>{const end=done.get(e.id),state=time<e.time_s?'waiting':time<end?'active':'done';return `<div class="phase ${state}"><b>${names[e.operation]}</b> · ${format(e.time_s)}–${format(end)} s<br><small>${tensorNotes[e.operation]}</small><br><small>${state==='active'?'执行中':state==='done'?'完成':'等待前序任务'}</small></div>`}).join('');
+ $('phases').innerHTML=starts.map(e=>{const end=done.get(e.id),state=time<e.time_s?'waiting':time<end?'active':'done';return `<div class="phase ${state}"><b>${names[e.operation]}</b> ${format(e.time_s)}–${format(end)} s<br><small>${tensorNotes[e.operation]}</small><br><small>${state==='active'?'执行中':state==='done'?'完成':'等待前序任务'}</small></div>`}).join('');
  const prim=new Map(data.collectives.filter(e=>e.kind==='primitive_start').map(e=>[e.id,e]));
  $('transfers').innerHTML='<table><tr><th>发送 → 接收</th><th>阶段 / 轮次 / 分片</th><th>数据 / 进度 / 速率</th></tr>'+active.map(h=>{const p=prim.get(h.flow_id),fraction=MotionState.progress(h,time),segment=h.segments.find(s=>s.start_s<=time&&time<s.finish_s);return `<tr><td>${safe(h.source)} → ${safe(h.target)}</td><td>${p?safe(p.phase)+' / '+p.round+(p.shard_index!=null?' / #'+p.shard_index:''):safe(h.request_id)}</td><td>${format(h.bytes/1e6,2)} MB / ${format((fraction??0)*100,1)}%${segment?' / '+format(segment.bandwidth_bps/1e6,2)+' Mbps':''}</td></tr>`}).join('')+'</table>';
- $('arrivals').innerHTML=data.events.map(e=>`<p>${safe(e.request_id)} · ${e.time_s} s · ${time>=e.time_s?'已到达':'尚未到达'}</p>`).join('');
+ $('arrivals').innerHTML=data.events.map(e=>`<p>${safe(e.request_id)} ${e.time_s} s ${time>=e.time_s?'已到达':'尚未到达'}</p>`).join('');
  if(tracking&&window.orbitGlobe){const g=window.orbitGlobe,c=memberCenter();if(previousCenter){const delta=c.clone().sub(previousCenter);g.camera.position.add(delta);g.controls.target.add(delta);}previousCenter=c;}
 }
 function memberCenter(){const g=window.orbitGlobe,points=presented.snapshot.nodes.filter(n=>n.role!=='ground').map(n=>g.vector(n.position_itrs_km));return points.reduce((a,b)=>a.add(b),new g.THREE.Vector3()).multiplyScalar(1/points.length);}
@@ -55,9 +55,9 @@ try{
  $('description').textContent=($('scenario').value==='ring4'?'一个 cell 包含 sat-0、sat-1、sat-2、sat-3，物理链路为 0–1–2–3–0 的 ring。':'四个单星 cell 沿晨昏轨道独立运动，四个 rank 跨 cell 共同执行同一次训练通信任务。')+' LTAN 06:00，倾角 '+format(data.orbit.inclination_deg,2)+'°；10 s 物理采样，30 s 链路容量减半。';
  $('checks').textContent='原语 '+data.checks.primitive_count+' / 完成 '+data.checks.completed_count+'；依赖前序完成后才启动；业务完成 '+data.summary.completed_request_count+'/'+data.summary.total_request_count;
  const starts=data.collectives.filter(e=>e.kind==='collective_start');for(const e of starts){const b=document.createElement('button');b.textContent=names[e.operation];b.onclick=()=>{time=e.time_s+.1;update()};$('jumps').append(b)}
- for(const t of [12,18,30]){const b=document.createElement('button');b.textContent=t+' s · '+(t===30?'容量变化':'新请求');b.onclick=()=>{time=t;update()};$('jumps').append(b)}
+ for(const t of [12,18,30]){const b=document.createElement('button');b.textContent=t+' s '+(t===30?'容量变化':'新请求');b.onclick=()=>{time=t;update()};$('jumps').append(b)}
  update();await import('/assets/globe.js');document.getElementById('showLinks').checked=true;
- const g=window.orbitGlobe,labels=[];for(const id of ['sat-0','sat-1','sat-2','sat-3']){const label=document.createElement('div');label.style.cssText='position:absolute;pointer-events:none;background:#071522dd;border:1px solid #8dbbed;border-radius:5px;padding:5px 8px;color:#e2ecfa;font-size:12px';label.textContent=id+' · '+($('scenario').value==='ring4'?'rank '+id.slice(-1):'cell-'+id.slice(-1));g.container.append(label);labels.push({id,label})}
+ const g=window.orbitGlobe,labels=[];for(const id of ['sat-0','sat-1','sat-2','sat-3']){const label=document.createElement('div');label.style.cssText='position:absolute;pointer-events:none;background:#071522dd;border:1px solid #8dbbed;border-radius:5px;padding:5px 8px;color:#e2ecfa;font-size:12px';label.textContent=id+' '+($('scenario').value==='ring4'?'rank '+id.slice(-1):'cell-'+id.slice(-1));g.container.append(label);labels.push({id,label})}
  focus();loaded=true;$('status').textContent='已载入真实 '+data.backend+' 执行结果';let last=performance.now();
  function animate(now){const dt=Math.min(.1,(now-last)/1000);last=now;if(playing){time=Math.min(240,time+dt*Number($('speed').value));update();if(time===240)playing=false;}
   for(const {id,label} of labels){const node=presented.snapshot.nodes.find(n=>n.node_id===id),v=g.vector(node.position_itrs_km).project(g.camera);label.style.left=((v.x+1)*g.container.clientWidth/2+10)+'px';label.style.top=((1-v.y)*g.container.clientHeight/2+12)+'px';label.hidden=Math.abs(v.x)>1||Math.abs(v.y)>1||v.z>1;}requestAnimationFrame(animate)}requestAnimationFrame(animate);

@@ -30,7 +30,7 @@ export function createCellTopology(host,{edit,command,onSatellite}={}){
  function preset(panel,kind){if(isLive())return;const choices=kind==='cell'?[['ring','环形'],['chain','链式'],['fully_connected','全连接']]:[['switch','共享交换互联'],['ring','GPU 环形直连'],['chain','GPU 链式直连'],['fully_connected','GPU 全直连']];const row=element('div',null,{class:'topology-actions'});for(const[value,text]of choices){const b=button(text,()=>perform(()=>edit({action:kind==='cell'?'cell_topology':'gpu_topology',cell:cellId,satellite:owner,kind:value})));b.disabled=!editable();row.append(b)}panel.append(row)}
  function renderDetails(){details.replaceChildren();if(!config)return;
   if(!chosen){details.append(element('p',isLive()?'选择卫星查看 GPU，选择链路进行断开、重连或故障操作。':'点击卫星或链路编辑；灰色虚线表示已禁用。'));return}
-  if(chosen.kind==='device'){const ranks=config.cells.flatMap(c=>c.placements.filter(p=>p.device===chosen.id).map(p=>'rank '+p.rank));details.append(element('strong',chosen.id),element('p',ranks.join(' · ')||'物理连接设备'));return}
+  if(chosen.kind==='device'){const ranks=config.cells.flatMap(c=>c.placements.filter(p=>p.device===chosen.id).map(p=>'rank '+p.rank));details.append(element('strong',chosen.id),element('p',ranks.join(' ')||'物理连接设备'));return}
   const l=chosen;details.append(element('strong',short(l.source)+' ↔ '+short(l.target)),element('p',l.state==='DOWN'?'已断开 / 故障':l.state==='SETTING_UP'?'正在建链':'已连接'));
   const actions=element('div',null,{class:'topology-actions'});
   if(isLive()){

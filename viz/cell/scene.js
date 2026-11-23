@@ -1,3 +1,4 @@
+import {createEarth} from '../assets/earth-model.js';
 import * as THREE from "three";
 import { OrbitControls } from "./vendor/OrbitControls.js?v=compact-2";
 import { sceneData } from "./scene-data.mjs?v=compact-2";
@@ -119,34 +120,7 @@ const groundStationData = [
 
 const stageOrder = ["formation", "hardware", "terminal", "inference", "analysis"];
 const BLUE_LINK = 0x69c8ff;
-const RED_LINK = 0xc5e78b;
-
-function createFallbackEarthTexture() {
-  const canvas = document.createElement("canvas");
-  canvas.width = 1024;
-  canvas.height = 512;
-  const context = canvas.getContext("2d");
-  const ocean = context.createLinearGradient(0, 0, 0, 512);
-  ocean.addColorStop(0, "#193457");
-  ocean.addColorStop(0.48, "#0f2846");
-  ocean.addColorStop(1, "#07172a");
-  context.fillStyle = ocean;
-  context.fillRect(0, 0, 1024, 512);
-  context.globalAlpha = 0.7;
-  context.fillStyle = "#4b654f";
-  [
-    [630, 140, 120, 55],
-    [725, 215, 80, 105],
-    [550, 280, 72, 130],
-    [300, 165, 105, 80],
-    [230, 260, 65, 145],
-  ].forEach(([x, y, rx, ry]) => {
-    context.beginPath();
-    context.ellipse(x, y, rx, ry, 0.2, 0, TAU);
-    context.fill();
-  });
-  return new THREE.CanvasTexture(canvas);
-}
+const RED_LINK = 0xa0bcff;
 
 function latLonToVector3(lat, lon, radius) {
   const phi = (90 - lat) * DEG;
@@ -163,12 +137,12 @@ function createGroundStationBillboard() {
   canvas.width = 64;
   canvas.height = 64;
   const context = canvas.getContext("2d");
-  context.strokeStyle = "#d8fffb";
+  context.strokeStyle = "#d9e3ff";
   context.lineWidth = 6;
   context.beginPath();
   context.arc(32, 32, 18, 0, TAU);
   context.stroke();
-  context.fillStyle = "#79d7d0";
+  context.fillStyle = "#9baef3";
   context.beginPath();
   context.arc(32, 32, 5, 0, TAU);
   context.fill();
@@ -176,7 +150,7 @@ function createGroundStationBillboard() {
   texture.colorSpace = THREE.SRGBColorSpace;
   const material = new THREE.SpriteMaterial({
     map: texture,
-    color: 0x79d7d0,
+    color: 0x9baef3,
     transparent: true,
     depthTest: true,
     depthWrite: false,
@@ -294,7 +268,7 @@ function createLaserBeam(start, end, lift = 0.14, opacity = 0.72) {
   return new THREE.Mesh(
     new THREE.TubeGeometry(curve, 32, 0.006, 5, false),
     new THREE.MeshBasicMaterial({
-      color: 0xc5e78b,
+      color: 0xa0bcff,
       transparent: true,
       opacity,
       blending: THREE.AdditiveBlending,
@@ -345,45 +319,6 @@ function createNodeHalo(color) {
   return new THREE.Sprite(material);
 }
 
-function createAtmosphereMaterial(opacity = 0.42, power = 2.45) {
-  return new THREE.ShaderMaterial({
-    side: THREE.FrontSide,
-    transparent: true,
-    depthWrite: false,
-    blending: THREE.AdditiveBlending,
-    uniforms: {
-      uOpacity: { value: opacity },
-      uPower: { value: power },
-    },
-    vertexShader: `
-      varying vec3 vNormal;
-      varying vec3 vWorldPosition;
-      void main() {
-        vNormal = normalize(mat3(modelMatrix) * normal);
-        vec4 worldPosition = modelMatrix * vec4(position, 1.0);
-        vWorldPosition = worldPosition.xyz;
-        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-      }
-    `,
-    fragmentShader: `
-      varying vec3 vNormal;
-      varying vec3 vWorldPosition;
-      uniform float uOpacity;
-      uniform float uPower;
-      void main() {
-        vec3 viewDirection = normalize(cameraPosition - vWorldPosition);
-        float fresnel = pow(clamp(1.0 - dot(vNormal, viewDirection), 0.0, 1.0), uPower);
-        float veil = smoothstep(0.08, 0.92, fresnel);
-        float polarShift = clamp(vNormal.y * 0.5 + 0.5, 0.0, 1.0);
-        vec3 cyan = vec3(0.16, 0.70, 0.68);
-        vec3 violet = vec3(0.36, 0.42, 0.84);
-        vec3 color = mix(cyan, violet, polarShift * 0.42 + fresnel * 0.22);
-        gl_FragColor = vec4(color, veil * uOpacity);
-      }
-    `,
-  });
-}
-
 function makeConceptSatellite(index) {
   const group = new THREE.Group();
   const visual = new THREE.Group();
@@ -395,14 +330,14 @@ function makeConceptSatellite(index) {
     emissiveIntensity: 0.18,
   });
   const panelMaterial = new THREE.MeshStandardMaterial({
-    color: 0x2d9995,
+    color: 0x496ab6,
     roughness: 0.45,
     metalness: 0.38,
-    emissive: 0x0d4f4d,
+    emissive: 0x283e76,
     emissiveIntensity: 0.72,
   });
   const edgeMaterial = new THREE.LineBasicMaterial({
-    color: 0xaef0e7,
+    color: 0xd0dcff,
     transparent: true,
     opacity: 0.48,
   });
@@ -419,9 +354,9 @@ function makeConceptSatellite(index) {
   visual.add(bus, busEdges, leftWing, rightWing);
   visual.rotation.set(0.14 * Math.sin(index), 0.32 + index * 0.4, index * 0.18);
 
-  const halo = createNodeHalo(0x49bcb4);
+  const halo = createNodeHalo(0x769af2);
   halo.scale.set(0.32, 0.32, 1);
-  halo.material.uniforms.uColor.value.set(0x3ba59f);
+  halo.material.uniforms.uColor.value.set(0x738ad9);
   const hitArea = new THREE.Mesh(
     new THREE.SphereGeometry(0.32, 12, 8),
     new THREE.MeshBasicMaterial({
@@ -574,7 +509,7 @@ function makeSatellite(index) {
 }
 
 export class AsterMindScene {
-  constructor(canvas, callbacks) {
+  constructor(canvas, callbacks = null) {
     this.canvas = canvas;
     this.callbacks = callbacks;
     this.clock = new THREE.Clock();
@@ -604,6 +539,7 @@ export class AsterMindScene {
     this.controls.maxDistance = 9.4;
     this.controls.rotateSpeed = 0.34;
     this.controls.target.copy(HOME_CAMERA_TARGET);
+    this.controls.update();
 
     this.raycaster = new THREE.Raycaster();
     this.pointer = new THREE.Vector2();
@@ -642,7 +578,10 @@ export class AsterMindScene {
     this.buildPlanet();
     this.buildOrbitalNodes();
     this.buildConfigScene();
-    this.bindEvents();
+    if (callbacks) this.bindEvents();
+    else this.controls.enabled = false;
+    this.resizeObserver = new ResizeObserver(() => this.resize());
+    this.resizeObserver.observe(this.canvas);
     this.resize();
 
     this.renderer.setAnimationLoop(() => this.animate());
@@ -684,63 +623,8 @@ export class AsterMindScene {
   }
 
   buildPlanet() {
-    this.earthTilt = new THREE.Group();
-    this.earthTilt.rotation.z = -23.4 * DEG;
-    this.earthSpin = new THREE.Group();
-    this.earthTilt.add(this.earthSpin);
+    Object.assign(this, createEarth(THREE, this.renderer));
     this.scene.add(this.earthTilt);
-
-    const geometry = new THREE.SphereGeometry(2, 96, 64);
-    const fallbackTexture = createFallbackEarthTexture();
-    const earthMaterial = new THREE.MeshStandardMaterial({
-      map: fallbackTexture,
-      roughness: 0.68,
-      metalness: 0,
-      emissive: new THREE.Color(0x071726),
-      emissiveIntensity: 0.28,
-    });
-    this.earthMaterial = earthMaterial;
-    this.earth = new THREE.Mesh(geometry, earthMaterial);
-    this.earthBaseRotation = 2.75;
-    this.earthSpin.rotation.y = this.earthBaseRotation;
-    this.earthSpin.add(this.earth);
-
-    const textureLoader = new THREE.TextureLoader();
-    textureLoader.load(
-      "./assets/earth-blue-marble.jpg",
-      (texture) => {
-        texture.colorSpace = THREE.SRGBColorSpace;
-        texture.anisotropy = Math.min(8, this.renderer.capabilities.getMaxAnisotropy());
-        earthMaterial.map?.dispose();
-        earthMaterial.map = texture;
-        earthMaterial.needsUpdate = true;
-      },
-      undefined,
-      () => {},
-    );
-
-    const atmosphere = new THREE.Mesh(
-      new THREE.SphereGeometry(2.035, 96, 64),
-      createAtmosphereMaterial(0.62, 4.4),
-    );
-    this.earthTilt.add(atmosphere);
-
-    const outerAtmosphere = new THREE.Mesh(
-      new THREE.SphereGeometry(2.13, 96, 64),
-      createAtmosphereMaterial(0.11, 2.2),
-    );
-    this.earthTilt.add(outerAtmosphere);
-
-    const latitudeMaterial = new THREE.MeshBasicMaterial({
-      color: 0x76aeb6,
-      transparent: true,
-      opacity: 0.038,
-      wireframe: true,
-      depthWrite: false,
-      blending: THREE.AdditiveBlending,
-    });
-    const latitudeShell = new THREE.Mesh(new THREE.SphereGeometry(2.025, 48, 24), latitudeMaterial);
-    this.earthSpin.add(latitudeShell);
 
     groundStationData.forEach((station) => {
       const group = new THREE.Group();
@@ -753,7 +637,7 @@ export class AsterMindScene {
       const mast = new THREE.Mesh(
         new THREE.ConeGeometry(0.018, 0.07, 10),
         new THREE.MeshBasicMaterial({
-          color: 0x79d7d0,
+          color: 0x9baef3,
           depthTest: true,
           depthWrite: false,
         }),
@@ -812,7 +696,7 @@ export class AsterMindScene {
       }
       const orbitGeometry = new THREE.BufferGeometry().setFromPoints(orbitPoints);
       const orbitMaterial = new THREE.LineDashedMaterial({
-        color: 0x59b8b4,
+        color: 0x819aea,
         transparent: true,
         opacity: 0.22,
         dashSize: 0.055,
@@ -893,7 +777,7 @@ export class AsterMindScene {
     this.configRoot.add(this.satelliteRoot, this.localLinksRoot);
     this.configRoot.visible = false;
     this.altitudeGuide = new THREE.Line(new THREE.BufferGeometry(),
-      new THREE.LineBasicMaterial({color: 0xc5e78b, transparent: true, opacity: .48}));
+      new THREE.LineBasicMaterial({color: 0xa0bcff, transparent: true, opacity: .48}));
     this.altitudeGuide.visible = false;
     this.scene.add(this.altitudeGuide);
     this.rebuildFormation();
@@ -1046,7 +930,7 @@ export class AsterMindScene {
 
   updateStrategyVisual() {
     this.satellites.forEach((satellite) => {
-      const color = new THREE.Color(0x2d9995);
+      const color = new THREE.Color(0x496ab6);
       const material = satellite.userData.panelMaterial || satellite.userData.payloadMaterial;
       material.color.copy(color);
       material.emissive.copy(color).multiplyScalar(0.32);
@@ -1191,23 +1075,22 @@ export class AsterMindScene {
       }
     });
 
-    this.resizeObserver = new ResizeObserver(() => this.resize());
-    this.resizeObserver.observe(this.canvas);
+
   }
 
   setNodeHover(node, active) {
     const group = node.parent;
     group.userData.halo.scale.setScalar(active ? 0.44 : 0.32);
-    group.userData.panelMaterial.emissive.set(active ? 0x486437 : 0x0d4f4d);
-    group.userData.panelMaterial.color.set(active ? 0xc5e78b : 0x2d9995);
+    group.userData.panelMaterial.emissive.set(active ? 0x485882 : 0x283e76);
+    group.userData.panelMaterial.color.set(active ? 0xa0bcff : 0x496ab6);
     group.userData.shellMaterial.emissiveIntensity = active ? 0.52 : 0.18;
   }
 
   setStationHover(node, active) {
     const group = node.parent;
     group.scale.setScalar(active ? 1.45 : 1);
-    group.userData.mastMaterial.color.set(active ? 0xffffff : 0x79d7d0);
-    group.userData.markerMaterial.color.set(active ? 0xffffff : 0x79d7d0);
+    group.userData.mastMaterial.color.set(active ? 0xffffff : 0x9baef3);
+    group.userData.markerMaterial.color.set(active ? 0xffffff : 0x9baef3);
   }
 
   setLinkHover(hitMesh, active) {
@@ -1297,7 +1180,7 @@ export class AsterMindScene {
         || (this.stage === "terminal" && satelliteIndex === sceneState.linkBuildStart);
       satellite.userData.halo.scale.setScalar(active ? 0.42 : 0.32);
       satellite.userData.halo.material.uniforms.uColor.value.set(
-        active && this.stage === "terminal" ? 0x79d7d0 : active ? 0xff9a86 : 0x3ba59f,
+        active && this.stage === "terminal" ? 0x9baef3 : active ? 0xff9a86 : 0x738ad9,
       );
     });
   }

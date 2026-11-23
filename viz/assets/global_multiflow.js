@@ -9,15 +9,15 @@ async function initialize(){
  if(data.metadata?.mode!=='global_multiflow_manual_faults')return;
  const audit=data.audit,host=document.getElementById('recoveryDemo');if(!host)return;
  host.hidden=false;host.replaceChildren();
- host.append(element('h2','全球六地区 · 多流综合评分与人工故障恢复'));
- host.append(element('p',`600 s / 10 s 物理采样 · 1584 颗通信星 / 4 个 cell · ${audit.request_count} 个请求，完成 ${audit.completed}，失败 ${audit.failed.length} · ${audit.manual_fault_count} 轮人工断链与恢复 · 随机故障关闭`));
+ host.append(element('h2','全球六地区 多流综合评分与人工故障恢复'));
+ host.append(element('p',`600 s / 10 s 物理采样 1584 颗通信星 / 4 个 cell ${audit.request_count} 个请求，完成 ${audit.completed}，失败 ${audit.failed.length} ${audit.manual_fault_count} 轮人工断链与恢复 随机故障关闭`));
  const note=element('p','上传量为演示而放大。四项权重均为 0.25；可行候选中总分最高者获选。回放来自实际日志，下面的评分是请求到达时的决策记录。');host.append(note);
  for(const failure of audit.late_failure_explanations||[]){
   const explanation=element('p',`${failure.request_id} 在 ${failure.time_s.toFixed(6)} s 到达，剩余 ${failure.remaining_horizon_s.toFixed(6)} s；即使按配置的星地容量上限，上传也至少需要 ${failure.minimum_upload_s_at_configured_ceiling.toFixed(6)} s，因此无法在本次 600 s 窗口内完成。`);explanation.style.color='#ffc665';host.append(explanation);
  }
  const controls=element('div');controls.className='controls';
  for(let i=0;i<audit.fault_cases.length;i++){
-  const c=audit.fault_cases[i],button=element('button',`故障 ${i+1} · ${c.start_s.toFixed(3)} s`);
+  const c=audit.fault_cases[i],button=element('button',`故障 ${i+1} ${c.start_s.toFixed(3)} s`);
   button.onclick=()=>seek(c.start_s+.15).catch(error=>document.getElementById('status').textContent=error.message);controls.append(button);
  }
  host.append(controls);

@@ -47,7 +47,7 @@ export function attachOverlay({THREE,scene,camera,controls,container,toolbar,vec
    if(planned.checked){for(const leg of original?.path||[]){const a=positions.get(leg.source_node_id),b=positions.get(leg.target_node_id);if(a&&b)dashed(a,b,0x528dff,.022)}for(const leg of replacement?.path||[]){const a=positions.get(leg.source_node_id),b=positions.get(leg.target_node_id);if(a&&b)line(a,b,0x35e4ef,.85,.026)}}
    const selectedId=state.record.request.request_id;
    const perRequest=new Map();for(const leg of concurrent)perRequest.set(leg.request_id||selectedId,(perRequest.get(leg.request_id||selectedId)||0)+1);
-   hud.textContent='事件 '+runtime.time_s.toFixed(9)+' s · 物理快照 '+(state.snapshot.physical_time_s??state.snapshot.time_s)+' s\n'+(runtime.globalMode?'全系统':'本请求')+'并发 '+concurrent.length+' 跳 · '+Array.from(perRequest,([id,count])=>id+': '+count+' 跳').slice(0,8).join(' / ')+(perRequest.size>8?' / …':'');
+   hud.textContent='事件 '+runtime.time_s.toFixed(9)+' s 物理快照 '+(state.snapshot.physical_time_s??state.snapshot.time_s)+' s\n'+(runtime.globalMode?'全系统':'本请求')+'并发 '+concurrent.length+' 跳 '+Array.from(perRequest,([id,count])=>id+': '+count+' 跳').slice(0,8).join(' / ')+(perRequest.size>8?' / …':'');
    const historyLegs=history.checked?runtime.legs.filter(l=>['delivered','cancelled','dropped'].includes(l.status)):[];
    for(const leg of historyLegs) {
     const a=positions.get(leg.source_node_id),b=positions.get(leg.target_node_id);if(a&&b)line(a,b,palette[leg.status],.85,.026);
@@ -60,7 +60,7 @@ export function attachOverlay({THREE,scene,camera,controls,container,toolbar,vec
    }
    const relevant=new Set([...(original?.path||[]),...(replacement?.path||[])].map(l=>l.link_id));
    for(const fault of state.data.network.faults||[]){if(!(fault.start_s<=runtime.time_s&&runtime.time_s<fault.end_s))continue;for(const edge of state.snapshot.links){if(!relevant.has(edge.link_id)||(fault.target_type==='link'?fault.target_id!==edge.link_id:![edge.endpoint_a,edge.endpoint_b].includes(fault.target_id)))continue;const a=positions.get(edge.endpoint_a),b=positions.get(edge.endpoint_b);if(a&&b){line(a,b,0xff354f,1,.065,false)}}}
-   const lastLoss=(runtime.lossEvents||[]).at(-1);if(lastLoss&&runtime.time_s>=lastLoss.time_s&&(!lastRecovery||lastRecovery.time_s<lastLoss.time_s)){const node=lastLoss.resume_node_id||lastLoss.source_node_id,p=positions.get(node);if(p){mark(p,0xffdf83,.1);label(p,'数据保留于 '+node+' · 等待 Runtime 执行恢复选路','#ffdf83')}}
+   const lastLoss=(runtime.lossEvents||[]).at(-1);if(lastLoss&&runtime.time_s>=lastLoss.time_s&&(!lastRecovery||lastRecovery.time_s<lastLoss.time_s)){const node=lastLoss.resume_node_id||lastLoss.source_node_id,p=positions.get(node);if(p){mark(p,0xffdf83,.1);label(p,'数据保留于 '+node+' 等待 Runtime 执行恢复选路','#ffdf83')}}
    if(lastRecovery&&runtime.compute==='waiting'){const done=runtime.legs.filter(l=>l.stage==='input'&&l.status==='delivered').at(-1),node=done?.target_node_id||lastRecovery.source_node_id,p=positions.get(node);if(p){mark(p,0x35e4ef,.09);label(p,'当前缓存节点 '+node,'#62f4ff')}}
    if(active&&active.status==='delivered'){
     const a=positions.get(active.source_node_id),b=positions.get(active.target_node_id);if(a&&b)line(a,b,palette.delivered,1,auto.checked?.012:.03);
@@ -85,7 +85,7 @@ export function attachOverlay({THREE,scene,camera,controls,container,toolbar,vec
     const point=positions.get(computeNode);mark(point,0xd99cff,.065);label(point,(event.kind==='surrogate_complete'?'ProtoBridge 通信完成：':'计算：')+computeNode,'#d99cff');
     if(auto.checked&&focusKey!==computeNode){focusKey=computeNode;controls.target.copy(point);camera.position.copy(point).add(point.clone().normalize().multiplyScalar(9.0));controls.minDistance=.15}
    }
-   document.getElementById('hopInfo').textContent=(runtime.globalMode?'全系统并发 '+concurrent.length+' 跳 · 当前请求 '+selectedId+' · ':'当前请求 '+selectedId+' · ')+(active?active.source_node_id+' → '+active.target_node_id+' · '+({queued:'等待链路服务',transmitting:'序列化发送中',propagating:'光速传播中',delivered:'本跳已到达',cancelled:'传输中止',dropped:'传输丢弃'}[active.status]||active.status):'当前事件没有正在执行的物理跳');
+   document.getElementById('hopInfo').textContent=(runtime.globalMode?'全系统并发 '+concurrent.length+' 跳 当前请求 '+selectedId+' ':'当前请求 '+selectedId+' ')+(active?active.source_node_id+' → '+active.target_node_id+' '+({queued:'等待链路服务',transmitting:'序列化发送中',propagating:'光速传播中',delivered:'本跳已到达',cancelled:'传输中止',dropped:'传输丢弃'}[active.status]||active.status):'当前事件没有正在执行的物理跳');
   }
   const bounds=container.getBoundingClientRect();
   for(const p of pulses){const fraction=MotionState.progress(p.leg,runtime.time_s);p.mesh.visible=fraction!==null;if(fraction!==null)p.mesh.position.copy(p.a).lerp(p.b,fraction)}

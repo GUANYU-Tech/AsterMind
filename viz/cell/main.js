@@ -2,7 +2,7 @@ import { AsterMindScene, sceneState, syncSceneConfiguration } from "./scene.js?v
 import { parseConfiguration } from "./config-form.mjs?v=validation-1";
 import { buildWorkspace, renderWorkspaceForms } from "./workspace-ui.mjs?v=profile-1";
 import { stages, stageNames, importResourceHardware, validationTarget } from "./config-layout.mjs?v=compact-2";
-import { editDependencies, bindRequestIdentity, newWebConfiguration, networkInputs } from "./config-edit.mjs?v=validation-1";
+import { editDependencies, newWebConfiguration, networkInputs } from "./config-edit.mjs?v=validation-1";
 import {mappingDraft, matchParallelismToResources} from './deployment-mapping.mjs';
 import {linkMode, setLinkMode, rememberEmptyLinkMode, newInterSatelliteLink, applyOpticalDefaults} from './link-mode.mjs';
 import {automaticDeployment,setAutomaticDeployment,synchronizeResources,clearDependentDrafts} from './resource-sync.mjs';
@@ -11,6 +11,8 @@ import { appUrl, appStorageKey } from "./app-path.mjs?v=compact-2";
 import { sceneData } from "./scene-data.mjs?v=compact-2";
 import { configurationErrors, validationError } from "./config-validation.mjs?v=validation-1";
 
+import {renderConfigProfile} from "../assets/config-profile.js";
+import {labels} from "./config-labels.mjs?v=compact-2";
 const $ = selector => document.querySelector(selector);
 buildWorkspace();
 const statuses = { queued: "排队", running: "运行中", success: "成功", failed: "失败", interrupted: "已中断", cancelled: "已取消", rejected: "校验失败" };
@@ -23,7 +25,7 @@ const drafts = new Map();
 function draftChanged() {
   if(drafts.size) {
     ++previewVersion; previewKey=''; clearTimeout(previewTimer); previewAbort?.abort();
-    $('#scene-links').textContent='请修正输入 · 预览未更新';
+    $('#scene-links').textContent='请修正输入 预览未更新';
   } else if(config) { message(''); scheduleNetworkPreview(); }
   if(config) scheduleConfigurationPreflight();
 }
@@ -59,7 +61,7 @@ function scheduleConfigurationPreflight() {
 function scheduleNetworkPreview() {
   if(drafts.size || ['formation','network'].some(name=>configurationErrors(config,capabilities.schema,name).length)) {
     ++previewVersion; previewKey=''; clearTimeout(previewTimer); previewAbort?.abort();
-    $('#scene-links').textContent='请修正输入 · 预览未更新'; return;
+    $('#scene-links').textContent='请修正输入 预览未更新'; return;
   }
   const payload = networkInputs(config), key = JSON.stringify(payload);
   if (key === previewKey) return;
@@ -80,7 +82,7 @@ function scheduleNetworkPreview() {
       for (let pass=0;pass<config.hardware.satellite_ids.length;pass++) for (const [a,b] of edges) {
         if (reached.has(a)) reached.add(b); if (reached.has(b)) reached.add(a);
       }
-      $("#scene-links").textContent = `${edges.length} 条链路 · ${reached.size === config.hardware.satellite_ids.length ? "全部接入" : "存在未接入卫星"}`;
+      $("#scene-links").textContent = `${edges.length} 条链路 ${reached.size === config.hardware.satellite_ids.length ? "全部接入" : "存在未接入卫星"}`;
       if (scene) syncSceneConfiguration(scene, config, result);
       $("#preview-note").textContent = "";
       renderNetworkPreview($("#topology-preview"), result);
@@ -158,7 +160,7 @@ function lockFields() {
   document.querySelectorAll('[data-action=start-config]').forEach(control => { control.disabled = !config; });
   document.querySelectorAll('.chapter-rail button, .cell-overview, #show-history, .orbit-node-action').forEach(control => { control.disabled = !config; });
   document.querySelectorAll(".basic-fields").forEach(field => { field.disabled = dirty || busy; });
-  document.querySelectorAll("input[type=file], #run-simulation, #export-config, #bind-request-identity").forEach(control => { control.disabled = dirty || busy || !config; });
+  document.querySelectorAll("input[type=file], #run-simulation, #export-config").forEach(control => { control.disabled = dirty || busy || !config; });
   $('#run-simulation').disabled = dirty || busy || !config || drafts.size>0 || preflightStatus!=='valid';
   $("#advanced-config").disabled = busy;
   $("#apply-json").disabled = $("#discard-json").disabled = busy;
@@ -167,8 +169,12 @@ function lockFields() {
 function changed(path) {
   scheduleNetworkPreview();
   const layout = config.topology.source === "orbit" ? "轨道快照" : config.constellation?.formation?.layout === "chain" ? "链式编队" : "环形编队";
-  $("#scene-summary").textContent = `${layout} · ${config.hardware.satellite_ids.length} 颗卫星`;
+  $("#scene-summary").textContent = `${layout} ${config.hardware.satellite_ids.length} 颗卫星`;
   $("#advanced-config").value = JSON.stringify(config, null, 2);
+  renderConfigProfile($("#config-profile"), config, labels, [
+    ['模型',config.model],['算力卡',config.hardware.default_hardware_id.replaceAll('_',' ').toUpperCase()],
+    ['算力卫星',config.hardware.satellite_ids.length+' 颗'],['每星算力卡',config.hardware.accelerators_per_satellite+' 张'],
+  ]);
   save("astermind-config", config);
   save('astermind-automatic-deployment',automaticDeployment(config));
   if (linkMode(config)) save('astermind-link-mode', linkMode(config));
@@ -282,6 +288,7 @@ function remember(id) {
 function historyReplace(id) { window.history.replaceState(null, "", `#job=${encodeURIComponent(id)}`); }
 
 async function watch(id, open = false) {
+  $('#artifact-shortcut').hidden=true;
   const version = ++pollVersion; jobId = id; remember(id);
   if (open) stage("analysis");
   $("#job-status").hidden = false;
@@ -289,7 +296,7 @@ async function watch(id, open = false) {
     try {
       const status = await api(`/api/simulations/${id}`);
       if (version !== pollVersion) return;
-      $("#job-progress").textContent = `${statuses[status.status] || status.status} · ${phases[status.phase] || status.phase || ""} · ${status.progress ?? 0}%`;
+      $("#job-progress").textContent = `${statuses[status.status] || status.status} ${phases[status.phase] || status.phase || ""} ${status.progress ?? 0}%`;
       if (status.status === "success") {
         const result = await api(`/api/simulations/${id}/result`);
         if (version !== pollVersion) return;
@@ -343,7 +350,7 @@ $("#export-config").onclick = () => { try { validateFormInputs(); const link = d
 $('#match-parallelism').onclick = () => {
   try {
     if (dirty || busy || drafts.size) throw Error('请先应用或放弃 JSON 编辑，并修正未完成的输入');
-    const {tp, pp} = matchParallelismToResources(config,{modelShape:capabilities.model_shapes?.[config.model]});
+    const {tp, pp} = matchParallelismToResources(config,{modelShape:capabilities.model_shapes?.[config.model], supportedChoices:capabilities.models_by_hardware?.[config.hardware.default_hardware_id]?.[config.model]});
     clearDependentDrafts(drafts);
     renderForms(); changed(); message(`已按资源设置各 pool：TP ${tp} × PP ${pp}，并生成卡映射`);
   } catch (error) { showError(error); }
@@ -371,11 +378,6 @@ $('#generate-mapping').onclick = () => {
     renderForms(); changed(); message('已按当前 TP / PP、卫星顺序和星内卡号重新生成映射');
   } catch (error) { showError(error); }
 };
-$("#bind-request-identity").onclick = () => guarded(async () => {
-  const identity = await post("/api/requests/identity", config.requests);
-  const count = bindRequestIdentity(config, identity);
-  renderForms(); changed(); message(count ? `已绑定 ${count} 个 MTP 假设；后续修改请求流后需要重新绑定。` : "请先在调度器中设置 MTP 接受假设。");
-}, true);
 $("#run-simulation").onclick = () => guarded(async () => {
   message("正在校验并提交…"); await post("/api/config/validate", config);
   const job = await post("/api/simulations", config); $("#history-list").replaceChildren(); watch(job.id, true);
@@ -393,6 +395,5 @@ bindUpload("#request-upload", "requests", resource => {
   if (config.requests.source === "synthetic") { config.requests.source = "canonical"; config.requests.production = null; }
   $("#request-upload-status").textContent = resource.path.split("/").at(-1);
 });
-bindUpload("#kv-replay-upload", "kv_replay", resource => { const pool = $("#kv-replay-pool").value; if (!pool) throw new Error("请先配置 Scheduler pool"); config.kv_offload.enabled = true; config.kv_offload.replay_files[pool] = resource.path; });
 window.addEventListener("beforeunload", event => { if (dirty || drafts.size) { event.preventDefault(); event.returnValue = ""; } });
 initialize().catch(error => message(`初始化失败，请刷新重试：${error.message}`, true));

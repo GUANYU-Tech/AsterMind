@@ -70,7 +70,7 @@ async function seek(value){
  presented={data:{network:source.network,time:source.time,sun_positions:source.sun_positions},snapshot,kind:'all',record:r,
   runtime:{time_s:time,event:{time_s:time,kind:'parallel_inference',event_order:time},globalMode:true,legs:active,activeTransfers:active,
    compute:'waiting',routePlans:[{reason:'initial',path:r.routing.selected_path.filter(h=>h.stage==='input')}],recoveryEvents:[],lossEvents:[]}};
- $('clock').textContent=format(time,6)+' s · 快照 '+left.time_s+' s';$('time').value=time;
+ $('clock').textContent=format(time,6)+' s 快照 '+left.time_s+' s';$('time').value=time;
  $('active').innerHTML='<table><tr><th>实际传输</th><th>'+ (backend==='ns3'?'区间有效速率':'分配带宽')+'</th></tr>'+active.slice(0,12).map(h=>{const s=h.segments.find(s=>s.start_s<=time&&time<s.finish_s);return `<tr><td>${safe(h.source)} → ${safe(h.target)}<br><small>${safe(h.flow_id?.includes('pp-')?'PP activation':h.flow_id?.includes('ep-output')?'EP output all-reduce':h.flow_id?.includes('tp-all-reduce')?'TP all-reduce':h.stage)}</small></td><td>${s?format(s.bandwidth_bps/1e6,2)+' Mbps':'传播中'}</td></tr>`}).join('')+'</table>';
  const id=r.request.request_id,ev=data.events.filter(e=>e.request_id===id);
  const times=[ev.find(e=>e.kind==='request_arrival')?.time_s,ev.find(e=>e.kind==='input_done')?.time_s,ev.find(e=>e.kind==='astermind_first_token')?.time_s,ev.find(e=>e.kind==='astermind_compute_complete')?.time_s,ev.find(e=>e.kind==='request_complete')?.time_s];
@@ -98,7 +98,7 @@ try{
  $('status').textContent='读取完整壳层与推理结果…';[source,data]=await Promise.all([read('/serving/physical?parallel='+parallel),read('/serving/data?'+args)]);
  $('summary').textContent='1584 颗通信卫星（72×22） → '+(parallel==='tp_pp'?'8':'4')+' 颗晨昏计算卫星 / 2 个模型副本；已完成 '+data.summary.completed_request_count+'/'+data.summary.total_request_count+' 请求，'+Object.values(data.kernels).reduce((a,b)=>a+b,0)+' 个 Midlayer kernel 时延事件。';
  $('deployment').textContent=parallel==='tp_pp'?'Qwen3-4B：每副本 PP=2、每阶段 TP=2，共 4 颗计算卫星。两个独立副本按未完成请求量分流。':'Qwen3-30B-A3B：每副本 TP=EP=2，MoE 专家分布在两颗计算卫星。两个独立副本按未完成请求量分流。';
- $('renderLegend').textContent=backend==='flowsim'?'连续流带 · 宽度表示带宽份额':'离散方块 · 实际正在发送的数据包';
+ $('renderLegend').textContent=backend==='flowsim'?'连续流带 宽度表示带宽份额':'离散方块 实际正在发送的数据包';
  data.records.forEach((r,i)=>{const o=document.createElement('option');o.value=i;o.textContent=r.request.request_id+' → '+r.decision.serving_compute_node_id;$('request').append(o);});
  timeline();await seek(record().request.arrival_time_s);await import('/assets/globe.js');document.getElementById('showLinks').checked=false;focusGlobal();
  const comparison=await read('/serving/compare?'+args);$('compare').innerHTML='<table><tr><th>同输入结果</th><th>FlowSim</th><th>ns-3</th></tr>'+[['平均 E2E / s','mean_e2e_s'],['平均 TTFT / s','mean_ttft_s'],['逐跳有效字节','payload_hop_bytes']].map(([label,k])=>`<tr><td>${label}</td>${['flowsim','ns3'].map(mode=>`<td>${comparison[mode]?format(comparison[mode][k],k.includes('bytes')?0:6):'未运行'}</td>`).join('')}</tr>`).join('')+`<tr><td>实际发送包数</td><td>无包模型</td><td>${comparison.ns3?.native_counters?.packets_started??'未记录'}</td></tr><tr><td>实际线速字节</td><td>有效字节连续流</td><td>${comparison.ns3?.native_counters?.wire_bytes_started??'未记录'}</td></tr></table>`;
@@ -107,5 +107,5 @@ try{
  const hopMap=new Map(data.hops.map(h=>[h.transfer_id,h]));const packets=data.packets||[];
  let last=performance.now();function animate(now){const dt=Math.min(.1,(now-last)/1000);last=now;if(playing){seek(Math.min(60,time+dt*Number($('speed').value)));if(time>=60)playing=false;}
   if(backend==='ns3'&&presented){const positions=new Map(presented.snapshot.nodes.map(n=>[n.node_id,g.vector(n.position_itrs_km)]));cubes.forEach(m=>m.visible=false);let index=0;for(const p of packets){if(p.start_s<=time&&time<p.finish_s&&index<cubes.length){const h=hopMap.get(p.transfer_id),m=cubes[index++];m.position.copy(positions.get(h.source)).lerp(positions.get(h.target),(p.offset_bytes+p.payload_bytes/2)/h.bytes);m.scale.setScalar(tracking?.12:1);m.visible=true;}}}
-  requestAnimationFrame(animate);}requestAnimationFrame(animate);$('status').textContent='真实推理运行已载入 · '+backend;
+  requestAnimationFrame(animate);}requestAnimationFrame(animate);$('status').textContent='真实推理运行已载入 '+backend;
 }catch(e){$('status').textContent=e.message;}
