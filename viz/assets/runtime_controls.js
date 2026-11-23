@@ -9,9 +9,9 @@ function render(state,record){
  $('trafficHint').textContent=flows.length?'逐事件播放；可使用“下一次开始发送”查看每一跳。':state.completed?'此处请求已完成；点击“跳到传输过程”或“播放事件”重新观看。':'此事件没有在途传输。';
  for(const flow of flows){
   const card=document.createElement('div');card.className='card '+flow.status;
-  const title=document.createElement('strong');title.style.fontSize='15px';title.textContent='请求 '+(flow.request_id||record.request.request_id)+' · '+(stages[flow.stage]||flow.stage||'')+' · '+names[flow.status];card.append(title);
+  const title=document.createElement('strong');title.style.fontSize='15px';title.textContent='请求 '+(flow.request_id||record.request.request_id)+' '+(stages[flow.stage]||flow.stage||'')+' '+names[flow.status];card.append(title);
   const path=document.createElement('p');path.style.cssText='color:inherit;overflow-wrap:anywhere';path.textContent=flow.source_node_id+' → '+flow.target_node_id;card.append(path);
-  const detail=document.createElement('span');detail.textContent=(flow.payload_bytes==null?'':flow.payload_bytes+' B')+(flow.allocated_bandwidth_bps==null?'':' · 最近已记录区间 '+(flow.allocated_bandwidth_bps/1e9).toFixed(6)+' Gbit/s');card.append(detail);
+  const detail=document.createElement('span');detail.textContent=(flow.payload_bytes==null?'':flow.payload_bytes+' B')+(flow.allocated_bandwidth_bps==null?'':' 最近已记录区间 '+(flow.allocated_bandwidth_bps/1e9).toFixed(6)+' Gbit/s');card.append(detail);
   $('currentTraffic').append(card);
  }
 }

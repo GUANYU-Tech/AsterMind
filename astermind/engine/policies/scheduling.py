@@ -3,6 +3,14 @@
 def select_cell(self, request):
     candidates = []
     policy = getattr(self.config, 'cell_selection', 'least_loaded')
+    if isinstance(policy, str):
+        order = {
+            "least_loaded": ("load", "distance"),
+            "nearest": ("distance", "load"),
+            "estimated_arrival": ("load", "arrival"),
+        }[policy]
+    else:
+        order = tuple(metric for metric in (policy.primary, policy.secondary) if metric)
     context = None
     for c in self.config.cells:
         if request.cell is not None and request.cell != c.id:
@@ -17,7 +25,7 @@ def select_cell(self, request):
             continue
         try:
             path = self.network.route(request.user_device, c.ingress_device)
-            if policy == 'estimated_arrival':
+            if 'arrival' in order:
                 if context is None:
                     context = self.network.estimation_context()
                 path = self.network.estimate_transfer(
@@ -41,15 +49,10 @@ def select_cell(self, request):
         )
         # Explicit deterministic first policy. Reservation/load stays at
         # whole requests; native vLLM decides actual admission and KV.
-        distance = path['routing_distance_km']
-        if policy == 'nearest':
-            score = (distance, assigned, c.id)
-        elif policy == 'estimated_arrival':
-            score = (assigned, path['estimated_transfer_ns'], c.id)
-        else:
-            score = (assigned, distance, c.id)
-        candidates.append(score)
+        metrics = {"distance": path["routing_distance_km"], "load": assigned,
+                   "arrival": path.get("estimated_transfer_ns")}
+        candidates.append((tuple(metrics[key] for key in order), c.id))
     if not candidates:
         raise RuntimeError(f"No reachable Cell for {request.id}")
-    return self._cell_configs[min(candidates)[2]]
+    return self._cell_configs[min(candidates)[1]]
 

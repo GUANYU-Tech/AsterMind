@@ -17,7 +17,11 @@ function table(columns, rows) {
   const node = element("table"); const head = element("thead"); const tr = element("tr");
   columns.forEach(column => tr.append(element("th", column))); head.append(tr); node.append(head);
   const body = element("tbody");
-  rows.forEach(row => { const tr = element("tr"); row.forEach(value => tr.append(element("td", value))); body.append(tr); });
+  rows.forEach(row => { const tr = element("tr"); row.forEach((value, index) => {
+    const cell = element("td", value);
+    if (/^(request(_id)?|id)$/i.test(columns[index])) cell.className = "identifier";
+    tr.append(cell);
+  }); body.append(tr); });
   node.append(body); frame.append(node); return frame;
 }
 
@@ -58,8 +62,8 @@ export async function renderArtifacts(container, jobId, api) {
         if (data.items) {
           const columns = [...new Set(data.items.flatMap(item => Object.keys(item)))];
           page.replaceChildren(table(columns, data.items.map(item => columns.map(key => typeof item[key] === "object" && item[key] !== null ? JSON.stringify(item[key]) : item[key] ?? "不可用"))));
-          status.textContent = `从第 ${offset + 1} 条起 · 本页 ${data.items.length} 条${data.preview_only ? ' · 嵌套长数据为预览，完整内容请下载' : ''}`;
-        } else { page.replaceChildren(element("pre", JSON.stringify(data.value, null, 2))); status.textContent = data.preview_only ? "JSON 预览 · 完整内容请下载" : "完整 JSON"; }
+          status.textContent = `从第 ${offset + 1} 条起 本页 ${data.items.length} 条${data.preview_only ? ' 嵌套长数据为预览，完整内容请下载' : ''}`;
+        } else { page.replaceChildren(element("pre", JSON.stringify(data.value, null, 2))); status.textContent = data.preview_only ? "JSON 预览 完整内容请下载" : "完整 JSON"; }
         previous.disabled = offset === 0; next.disabled = !data.has_more;
       } catch (error) { if (requestVersion === version) page.textContent = error.message; }
     }

@@ -14,7 +14,7 @@ LABELS = {
 }
 
 def execution_label(config):
-    return 'V1.0 Runtime Comm · ' + config.compute_mode
+    return 'V1.0 Runtime Comm ' + config.compute_mode
 
 
 class PhysicalCommandView:
@@ -184,7 +184,7 @@ def start(root, value, *, automatic=False):
                     label=f"初始化计算 Cell {stage['index']}/{stage['total']}：计算模型、调度器与 KV 状态"
                 if stage['phase']=='cells':
                     mode='并行初始化' if stage['workers']>1 else '初始化'
-                    label=f"{mode}计算 Cell · 已就绪 {stage['completed']}/{stage['total']} · 同时最多 {stage['workers']} 个"
+                    label=f"{mode}计算 Cell 已就绪 {stage['completed']}/{stage['total']} 同时最多 {stage['workers']} 个"
                 if stage['phase']=='physics' and config.physical_dataset is None:
                     label='准备物理拓扑' if config.physical_network is not None else '建立设备拓扑'
                 with session.condition:

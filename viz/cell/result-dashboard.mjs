@@ -90,7 +90,7 @@ function chart(series,{label='',xFormat=time,yFormat=fmt,step=false}={}) {
     if(series.length===1) image.append(svg('path',{d:`${d}L${x(samples.at(-1)[0])},188L${x(samples[0][0])},188Z`,fill:color,opacity:.08}));
     image.append(svg('path',{d,fill:'none',stroke:color,'stroke-width':2,'stroke-linejoin':'round'}));
     const markerSamples=samples.length<=160?samples:samples.filter((_,i)=>i%Math.ceil(samples.length/160)===0);
-    markerSamples.forEach(point=>{const marker=svg('circle',{cx:x(point[0]),cy:y(point[1]),r:samples.length<12?4:2.5,fill:color,tabindex:0,class:'report-chart-point','aria-label':`${item.label} ${xFormat(point[0])}：${yFormat(point[1])}`}); marker.append(svg('title',{},`${point[2]||xFormat(point[0])} · ${item.label} ${yFormat(point[1])}`)); image.append(marker);});
+    markerSamples.forEach(point=>{const marker=svg('circle',{cx:x(point[0]),cy:y(point[1]),r:samples.length<12?4:2.5,fill:color,tabindex:0,class:'report-chart-point','aria-label':`${item.label} ${xFormat(point[0])}：${yFormat(point[1])}`}); marker.append(svg('title',{},`${point[2]||xFormat(point[0])} ${item.label} ${yFormat(point[1])}`)); image.append(marker);});
   });
   frame.append(image); const legend=el('div',undefined,'report-legend');
   series.forEach(item=>{const key=el('span'), dot=el('i'); dot.style.background=item.color||colors.compute; key.append(dot,document.createTextNode(item.label)); legend.append(key);}); frame.append(legend); return frame;
@@ -134,8 +134,8 @@ function overview(data,jumpRank,jumpOperators) {
 }
 function requestPage(data) {
   const page=el('div'), requests=data.request_rows;
-  page.append(stats([['平均首 Token 延迟',time(average(requests,'ttft_ns')),'TTFT · 有效请求均值','time'],['平均 Token 间隔',time(average(requests,'tpot_ns')),'TPOT · 有效请求均值','time'],['平均端到端延迟',time(average(requests,'latency_ns')),'E2E · 有效请求均值','chart'],['请求吞吐',`${fmt(data.throughput_rps)} req/s`,'完成请求数 ÷ 首次到达至最终完成','request']]));
-  const box=block('请求延迟对比',`以请求序号排列 · ${requests.length>200?'图中显示前 200 个请求':'悬停或聚焦节点查看数值'}`), samples=requests.slice(0,200);
+  page.append(stats([['平均首 Token 延迟',time(average(requests,'ttft_ns')),'TTFT 有效请求均值','time'],['平均 Token 间隔',time(average(requests,'tpot_ns')),'TPOT 有效请求均值','time'],['平均端到端延迟',time(average(requests,'latency_ns')),'E2E 有效请求均值','chart'],['请求吞吐',`${fmt(data.throughput_rps)} req/s`,'完成请求数 ÷ 首次到达至最终完成','request']]));
+  const box=block('请求延迟对比',`以请求序号排列 ${requests.length>200?'图中显示前 200 个请求':'悬停或聚焦节点查看数值'}`), samples=requests.slice(0,200);
   box.append(chart([{label:'端到端延迟',points:samples.map((r,i)=>[i+1,r.latency_ns,r.id]),color:colors.compute},{label:'首 Token 延迟',points:samples.map((r,i)=>[i+1,r.ttft_ns,r.id]),color:colors.memory}],{label:'请求端到端与首 Token 延迟曲线',xFormat:value=>Number.isInteger(value)?fmt(value):'',yFormat:time}));
   const rows=el('div'), footer=el('div',undefined,'report-pagination'); let offset=0;
   const previous=action('上一页',()=>{offset-=25;render();}), next=action('下一页',()=>{offset+=25;render();}), status=el('span');
@@ -150,7 +150,7 @@ function rankPage(data,load) {
   tools.append(title,previous,next); timeline.append(chartArea,tools);
   function render() {
     rows.replaceChildren(table(['Rank / 算力星','执行跨度','计算 / KV','通信','重叠','调用数','权重驻留'],data.ranks.map(row=>{
-      const button=action('',()=>{},'report-rank-button'); button.append(label(`RANK ${row.rank}`,`${row.satellite} · 卡 ${row.local_index??'—'}`)); button.setAttribute('aria-pressed',String(selected===row.id));
+      const button=action('',()=>{},'report-rank-button'); button.append(label(`RANK ${row.rank}`,`${row.satellite} 卡 ${row.local_index??'—'}`)); button.setAttribute('aria-pressed',String(selected===row.id));
       return [button,time(row.wall_ns),time(row.compute_ns),time(row.communication_ns),time(row.overlap_ns),fmt(row.calls),bytes(row.weight_bytes)];
     }),{click:index=>{selected=data.ranks[index].id;offset=0;render();draw();},selected:data.ranks.findIndex(row=>row.id===selected)}));
   }
@@ -160,20 +160,20 @@ function rankPage(data,load) {
       const image=svg('svg',{viewBox:'0 0 900 208',role:'img','aria-label':`${selected} 执行时间线`}), max=Math.max(1,result.end_ns-result.start_ns), x=value=>100+(value-result.start_ns)/max*770;
       [['compute','计算',colors.compute],['memory','KV 访问',colors.memory],['communication','通信',colors.communication]].forEach(([key,name,color],index)=>{
         const y=34+index*48; image.append(svg('text',{x:12,y:y+19,class:'report-axis-label'},name),svg('line',{x1:100,x2:870,y1:y+13,y2:y+13,class:'report-grid-line'}));
-        for(const [start,end] of result.lanes[key].items) {const bar=svg('rect',{x:x(start),y,width:Math.max(.8,x(end)-x(start)),height:25,rx:2,fill:color,tabindex:0,'aria-label':`${name} ${time(start)} 至 ${time(end)}`}); bar.append(svg('title',{},`${name} · ${time(start)} → ${time(end)} · 时长 ${time(end-start)}`)); image.append(bar);}
+        for(const [start,end] of result.lanes[key].items) {const bar=svg('rect',{x:x(start),y,width:Math.max(.8,x(end)-x(start)),height:25,rx:2,fill:color,tabindex:0,'aria-label':`${name} ${time(start)} 至 ${time(end)}`}); bar.append(svg('title',{},`${name} ${time(start)} → ${time(end)} 时长 ${time(end-start)}`)); image.append(bar);}
       });
       for(let i=0;i<=4;i++) image.append(svg('text',{x:100+i/4*770,y:196,'text-anchor':i===0?'start':i===4?'end':'middle',class:'report-axis-label'},time(result.start_ns+max*i/4)));
-      chartArea.replaceChildren(image); title.textContent=`RANK ${selected.split('/').at(-1)} · ${offset?`从第 ${offset+1} 段起`:'完整执行范围'}${result.has_more?' · 本页每类最多 500 段':''}`; previous.disabled=offset===0; next.disabled=!result.has_more;
+      chartArea.replaceChildren(image); title.textContent=`RANK ${selected.split('/').at(-1)} ${offset?`从第 ${offset+1} 段起`:'完整执行范围'}${result.has_more?' 本页每类最多 500 段':''}`; previous.disabled=offset===0; next.disabled=!result.has_more;
     } catch(error) {if(current===version) chartArea.replaceChildren(empty('时间线读取失败',error.message));}
   }
   page.append(rows,timeline,definition('时间线口径','同类相邻或重叠区间合并显示。通信按原始 call 的 Rank 归属展示；同一次集合通信不复制到未记录该 call 的 Rank。区间空隙不视为 CPU 实测。')); render(); draw(); return page;
 }
 function operatorPage(data,load) {
-  const page=el('div'), top=block('算子类型分布','累计调用时长 · 并行或重叠区间会分别计入，不等同于任务总时间');
+  const page=el('div'), top=block('算子类型分布','累计调用时长 并行或重叠区间会分别计入，不等同于任务总时间');
   top.append(barList(data.operator_types.map(row=>({label:kindNames[row.kind]||row.kind,value:row.duration_ns,color:row.kind==='COMMUNICATION'?colors.communication:row.kind==='KV_CACHE'?colors.memory:colors.compute})),time));
   const controls=el('div',undefined,'report-filters'), rows=el('div'), footer=el('div',undefined,'report-pagination'); let offset=0,kind='',rank='',search='',version=0,timer;
   const types=selector('算子类型',[['','全部类型'],...data.operator_types.map(row=>[row.kind,kindNames[row.kind]||row.kind])],value=>{kind=value;offset=0;render();});
-  const ranks=selector('算子 Rank',[['','全部 Rank'],...data.ranks.map(row=>[row.id,`RANK ${row.rank} · ${row.satellite}`])],value=>{rank=value;offset=0;render();});
+  const ranks=selector('算子 Rank',[['','全部 Rank'],...data.ranks.map(row=>[row.id,`RANK ${row.rank} ${row.satellite}`])],value=>{rank=value;offset=0;render();});
   const input=el('input'); input.type='search';input.placeholder='搜索算子名称';input.setAttribute('aria-label','搜索算子名称'); input.oninput=()=>{clearTimeout(timer);timer=setTimeout(()=>{search=input.value;offset=0;render();},250);};
   controls.append(types.wrap,ranks.wrap,input);
   const previous=action('上一页',()=>{offset-=25;render();}),next=action('下一页',()=>{offset+=25;render();}),status=el('span'); footer.append(status,previous,next);
@@ -188,7 +188,7 @@ function operatorPage(data,load) {
 function networkPage(data) {
   const page=el('div'), network=data.network;
   page.append(stats([['路径传输尝试',fmt(network.attempts),'Runtime Comm 准入记录','network'],['路径传输量',bytes(network.application_bytes),'服务记录中的应用字节','network'],['峰值并发流',fmt(network.peak_active),'运行时统计','chart'],['重试次数',fmt(network.retries),'运行时统计','network']]));
-  const grid=el('div',undefined,'report-equal-grid'), concurrency=block('路径传输并发','按准入与完成时刻绘制'), bandwidth=block('端点间平均服务速率','应用字节 ÷ 服务区间累计时长 · Gbps');
+  const grid=el('div',undefined,'report-equal-grid'), concurrency=block('路径传输并发','按准入与完成时刻绘制'), bandwidth=block('端点间平均服务速率','应用字节 ÷ 服务区间累计时长 Gbps');
   if(network.attempts) {concurrency.append(chart([{label:'活跃传输',points:network.concurrency,color:colors.communication}],{label:'路径传输并发时间线',step:true,yFormat:value=>Number.isInteger(value)?fmt(value):''}));bandwidth.append(barList(network.paths.slice(0,6).map(row=>({label:`${row.source} → ${row.target}`,value:row.service_gbps,color:colors.communication})),value=>finite(value)?`${fmt(value)} Gbps`:'—'));}
   else {concurrency.append(empty('没有路径传输记录',network.intra_mode==='IntraSatelliteRoofline'?'本次通信在星内完成，采用 Roofline 模型。':'本次运行未记录路径传输。'));bandwidth.append(empty('没有可绘制的服务速率','星内 Roofline 通信不产生对应的路径服务记录。'));}
   grid.append(concurrency,bandwidth);page.append(grid);
@@ -200,7 +200,7 @@ function memoryPage(data) {
   const box=block('KV 缓存占用曲线','按调度步骤结束时的 HBM 分配 / 释放事件重建');
   box.append(memory.length?chart(memory.map((item,index)=>({label:item.cell,points:item.samples,color:index?colors.memory:colors.compute})),{label:'KV 缓存占用时间线',step:true,yFormat:bytes}):empty('没有 KV 事件记录','此任务没有可重建的 KV 缓存占用曲线。'));
   page.append(stats([['KV 事件峰值',memory.length?bytes(Math.max(...memory.map(item=>item.peak_kv_bytes))):'—','按单 Cell HBM 事件累计','memory'],['分配事件',fmt(memory.reduce((sum,item)=>sum+item.allocation_events,0)),'HBM allocate','memory'],['释放事件',fmt(memory.reduce((sum,item)=>sum+item.release_events,0)),'HBM release','memory'],['已记录 Rank',fmt(rankMemory.length),'提供权重驻留数据的 Rank','chip']]),box);
-  const residency=block('Rank 内存配置','权重驻留与预留 KV 池 · 不是实测 HBM 峰值');
+  const residency=block('Rank 内存配置','权重驻留与预留 KV 池 不是实测 HBM 峰值');
   residency.append(rankMemory.length?table(['Rank / 算力星','权重驻留','预留 KV 池'],rankMemory.map(row=>[label(`RANK ${row.rank}`,row.satellite),bytes(row.weight_bytes),bytes(row.reserved_kv_bytes)])):empty('没有内存配置记录','当前报告未提供 Rank 级驻留信息。'));
   page.append(residency,definition('与原版 Tensor 展示的差异','当前 V1 报告不包含完整临时 Tensor 生命周期和全量 HBM 峰值，不能恢复为实测 Tensor 热图。这里使用真实 KV 事件和权重驻留记录；KV 曲线只显示步骤末状态，事件峰值另行统计。显式配置的 KV 池容量不代表硬件自动探测容量。'));return page;
 }
@@ -213,10 +213,10 @@ export async function renderDashboard(container,jobId,result,api,renderArtifacts
   catch(error) {if(renders.get(container)!==render||context.parentNode!==container)return;container.append(empty('图表数据暂未载入',error.message),action('重新载入图表',()=>renderDashboard(container,jobId,result,api,renderArtifacts))); await renderArtifacts(container,jobId,api);return;}
   if(renders.get(container)!==render||context.parentNode!==container)return;
   const model=el('span',data.model||'模型未记录','report-model');context.insertBefore(model,context.lastChild);
-  const parallel=data.parallelism[0], info=el('span',`${data.satellite_count??'—'} 颗卫星 · ${data.ranks.length} 个 Rank${parallel?` · TP ${parallel.tensor_parallel_size} / PP ${parallel.pipeline_parallel_size}`:''}`);context.insertBefore(info,context.lastChild);
+  const parallel=data.parallelism[0], info=el('span',`${data.satellite_count??'—'} 颗卫星 ${data.ranks.length} 个 Rank${parallel?` TP ${parallel.tensor_parallel_size} / PP ${parallel.pipeline_parallel_size}`:''}`);context.insertBefore(info,context.lastChild);
   const hero=el('div',undefined,'report-hero'), lead=el('div',undefined,'report-lead');
-  lead.append(el('span','任务完成用时'),el('strong',time(data.completion_ns)),el('small',`首次请求到达 → 最终完成 · 仿真时间窗 ${time(data.simulation_ns)}`));
-  hero.append(lead,stat('完成请求',`${data.completed} / ${data.requests}`,`${data.failed} 个请求失败`,'request'),stat('平均首 Token 延迟',time(average(data.request_rows,'ttft_ns')),'TTFT · 有效请求均值','time'),stat('算子调用',fmt(data.kernel_calls),`${fmt(data.scheduler_steps)} 个调度步骤`,'chip'));container.append(hero);
+  lead.append(el('span','任务完成用时'),el('strong',time(data.completion_ns)),el('small',`首次请求到达 → 最终完成 仿真时间窗 ${time(data.simulation_ns)}`));
+  hero.append(lead,stat('完成请求',`${data.completed} / ${data.requests}`,`${data.failed} 个请求失败`,'request'),stat('平均首 Token 延迟',time(average(data.request_rows,'ttft_ns')),'TTFT 有效请求均值','time'),stat('算子调用',fmt(data.kernel_calls),`${fmt(data.scheduler_steps)} 个调度步骤`,'chip'));container.append(hero);
   const addTab=addTabs(container), system=addTab('System 总览','chart');
   const requests=addTab('请求性能','request');requests.append(requestPage(data));
   const rank=addTab('Rank / 算力星','chip');rank.append(rankPage(data,load));
@@ -225,6 +225,11 @@ export async function renderDashboard(container,jobId,result,api,renderArtifacts
   const network=addTab('通信','network');network.append(networkPage(data));
   const memory=addTab('内存与 KV','memory');memory.append(memoryPage(data));
   const artifacts=addTab('产物与明细','request');
+  const shortcut=document.querySelector('#artifact-shortcut');
+  if(shortcut){
+    shortcut.hidden=false;
+    shortcut.onclick=()=>{artifacts.open();artifacts.scrollIntoView({block:'nearest'});};
+  }
   if(result.warnings?.length) artifacts.append(definition('报告说明',result.warnings.join('\n')));
   const raw=definition('版本与原始参数',JSON.stringify({status:result.status,simulator:result.simulator,network_backend:result.network_backend,versions:result.versions},null,2));raw.classList.add('report-raw');artifacts.append(raw);
   await renderArtifacts(artifacts,jobId,api);

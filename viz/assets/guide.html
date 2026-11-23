@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Astermind · 技术文档</title>
+  <title>AsterMind 技术文档</title>
   <link rel="stylesheet" href="/assets/mission.css">
   <style>
     main { max-width: 880px; margin: 60px auto; padding: 20px 30px; }
@@ -46,6 +46,10 @@
       <p>要把星地接入过程纳入实验，请使用完整场景工作区。</p>
     </section>
 
+    <section>
+      <h2>链路中断与重试</h2>
+      <p>完整场景使用通信运行时处理链路中断。传输需要重新寻路时，运行时检查可用路径。超过场景设置的重试次数后，运行时将任务记为失败。在实验场景的“故障与恢复”中填写最多再试几次。填写 0 次会在需要重试时结束传输。</p>
+    </section>
     <section>
       <h2>三维预览</h2>
       <p>拖动旋转，滚轮缩放。点击「重置视角」可将画面重新对准当前编队。预览会放大卫星图标和静态编队间距，实际数值请在配置中查看。</p>

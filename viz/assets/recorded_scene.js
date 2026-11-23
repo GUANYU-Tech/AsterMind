@@ -18,7 +18,7 @@ main.innerHTML=`<div class="recorded-controls" aria-label="场景回放控制">
  <details class="recorded-log"><summary>通信记录</summary><table><thead><tr><th>时间 / s</th><th>通信状态</th><th>请求 / 对象</th><th>链路</th></tr></thead><tbody id="recordEvents"></tbody></table></details>`;
 const style=document.createElement('link');style.rel='stylesheet';style.href='/assets/recorded_scene.css';document.head.append(style);
 if(main.tagName==='MAIN'){
- document.title='场景回放 · 已保存记录';
+ document.title='场景回放 已保存记录';
  const heading=document.createElement('h1');heading.textContent='场景回放';main.prepend(heading);
 }
 window.runtimeGlobeMode=true;window.runtimeLiveMode=true;window.runtimeRecordedMode=true;
@@ -30,7 +30,7 @@ const recent=new Map();
 const allPaths=()=>[...new Map([...pagePaths,...searchedPaths].map(path=>[path.id,path])).values()];
 window.networkReplayState=()=>presented;
 function pause(){running=false;clearTimeout(timer);epoch++;seekVersion++;const end=selectedClock?selectedClock.toSimulation(selectedClock.end):catalog?.end_s;$('recordPlay').textContent=time>=end?'重新播放':'播放回放';if(presented)presented.playback.playing=false}
-function inspect(){const node=presented?.snapshot.nodes.find(n=>n.node_id===selected.nodeId),link=presented?.snapshot.links.find(l=>l.link_id===selected.linkId);$('recordSelection').textContent=node?node.node_id+' · '+node.state:link?link.endpoint_a+' ↔ '+link.endpoint_b+' · '+link.state:''}
+function inspect(){const node=presented?.snapshot.nodes.find(n=>n.node_id===selected.nodeId),link=presented?.snapshot.links.find(l=>l.link_id===selected.linkId);$('recordSelection').textContent=node?node.node_id+' '+node.state:link?link.endpoint_a+' ↔ '+link.endpoint_b+' '+link.state:''}
 window.inspectNetworkNode=id=>{selected={nodeId:id};window.selectGlobeObject?.(selected);inspect()};
 window.inspectNetworkLink=id=>{selected={linkId:id};window.selectGlobeObject?.(selected);inspect()};
 window.openComputeTopology=id=>{const node=presented?.snapshot.nodes.find(n=>n.cell_id===id);if(node)window.inspectNetworkNode(node.node_id);return true};
@@ -92,7 +92,7 @@ async function seekTime(at,animate=false){
  current=catalog.pages[pageIndex].offset+visible;time=at;exactTime=target;pagePaths=page.paths||[];presented={snapshot,data:model,runtime,recentTransfers:[...recent.values()],route:{path:runtime.activeTransfers},record:{request:{request_id:runtime.request_id}},pathContext:{paths:allPaths()},kind:'all',revision:++revision,playback:{playing:running,rate:Number($('recordRate').value)}};
  const completed=target?.time_ticks&&catalog.completion_ticks?countAt(catalog.completion_ticks,target):catalog.completion_times?countAt(catalog.completion_times,at):(catalog.pages[pageIndex].completed_before||0)+page.events.slice(0,cut+1).filter(e=>e.kind==='external_flow_done').length;
  const failed=target?.time_ticks&&catalog.failure_ticks?countAt(catalog.failure_ticks,target):countAt(catalog.failure_times||[],at);
- $('recordSeek').value=at;$('recordClock').textContent=($('recordMode').value==='inspect'?formatTime(target??at):at.toFixed(6))+' s';$('recordClock').title=formatTime(target??at)+' s'+(catalog.clock?' · 统一时钟 · 1 as':' · 旧时钟记录');$('recordPosition').textContent=catalog.transfer_count?(catalog.unit?'完成'+catalog.unit+' ':'完成传输 ')+completed.toLocaleString()+' / '+catalog.transfer_count.toLocaleString()+(failed?' · 失败 '+failed.toLocaleString():''):'通信回放';
+ $('recordSeek').value=at;$('recordClock').textContent=($('recordMode').value==='inspect'?formatTime(target??at):at.toFixed(6))+' s';$('recordClock').title=formatTime(target??at)+' s'+(catalog.clock?' 统一时钟 1 as':' 旧时钟记录');$('recordPosition').textContent=catalog.transfer_count?(catalog.unit?'完成'+catalog.unit+' ':'完成传输 ')+completed.toLocaleString()+' / '+catalog.transfer_count.toLocaleString()+(failed?' 失败 '+failed.toLocaleString():''):'通信回放';
  $('recordStatus').textContent=event.event_label||event.kind;$('recordPrevious').disabled=current<=0;$('recordNext').disabled=current>=catalog.event_count-1;
  if(!running)$('recordPlay').textContent=at>=catalog.end_s?'重新播放':'播放回放';
  renderEventRows($('recordEvents'),page.events.slice(0,cut+1).filter(isTransmissionEvent).slice(-50));inspect();

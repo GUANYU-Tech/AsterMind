@@ -13,7 +13,7 @@ def configuration(root,payload):
     # The old example used 400 bit/s to force a visible slow transfer. Native
     # device links require >= 1000 bit/s; this V1 example declares 400 Mbit/s.
     physical['network']['link_profiles']['sgl']['bandwidth_bps']=400_000_000
-    model=save(root,'physical',dict(name='V1 在线示例 · 400 Mbps 星地接入',physical_network=physical))
+    model=save(root,'physical',dict(name='V1 在线示例 400 Mbps 星地接入',physical_network=physical))
     job=console.prepare_physical(model['id'])
     deadline=time.monotonic()+120
     while True:

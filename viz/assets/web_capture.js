@@ -48,7 +48,7 @@ if (sessionStorage.getItem('orbitserve.webCapture') === '1') {
   cursor.innerHTML = '<svg viewBox="0 0 30 38"><path d="M3 2 L3 29 L10 23 L16 35 L21 32 L15 21 L25 20 Z" fill="#f2fff8" stroke="#0d2920" stroke-width="2"/><path d="M5 5 L5 24 L10 19 L17 21 Z" fill="#7cd8c0"/></svg>';
   const badge = document.createElement('span');
   badge.className = 'web-capture-badge';
-  badge.textContent = '网页交互录制 · 等待点击';
+  badge.textContent = '网页交互录制 等待点击';
   const log = document.createElement('script');
   log.id = 'web-capture-events';
   log.type = 'application/json';
@@ -71,7 +71,7 @@ if (sessionStorage.getItem('orbitserve.webCapture') === '1') {
     log.textContent = JSON.stringify(events);
     sessionStorage.setItem('orbitserve.webCaptureEvents', log.textContent);
     sessionStorage.setItem('orbitserve.webCapturePosition', JSON.stringify(position));
-    badge.textContent = `网页交互录制 · ${event.type === 'change' ? '选择' : '点击'} ${name.slice(0, 24)}`;
+    badge.textContent = `网页交互录制 ${event.type === 'change' ? '选择' : '点击'} ${name.slice(0, 24)}`;
   }
   document.addEventListener('pointermove', move, {passive:true,capture:true});
   document.addEventListener('pointerdown', event => {

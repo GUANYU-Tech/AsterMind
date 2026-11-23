@@ -55,7 +55,7 @@
       "communication_isl": {
         "capacity_model": "islsim",
         "bandwidth_bps": 200000000000.0,
-        "setup_time_s": 3,
+        "setup_time_s": 2,
         "wavelength_m": 1.55e-06,
         "transmit_power_w": 0.2,
         "transmit_aperture_m": 0.05,
@@ -81,7 +81,7 @@
       "cell_isl": {
         "capacity_model": "islsim",
         "bandwidth_bps": 200000000000.0,
-        "setup_time_s": 1,
+        "setup_time_s": 2,
         "wavelength_m": 1.55e-06,
         "transmit_power_w": 0.2,
         "transmit_aperture_m": 0.05,
@@ -107,7 +107,7 @@
       "cross_layer": {
         "capacity_model": "islsim",
         "bandwidth_bps": 200000000000.0,
-        "setup_time_s": 5,
+        "setup_time_s": 2,
         "wavelength_m": 1.55e-06,
         "transmit_power_w": 0.2,
         "transmit_aperture_m": 0.05,
@@ -133,7 +133,7 @@
       "sgl": {
         "capacity_model": "free_space_shannon",
         "bandwidth_bps": 100000000000.0,
-        "setup_time_s": 2,
+        "setup_time_s": 0.1,
         "max_distance_km": 2500,
         "frequency_hz": 83500000000.0,
         "channel_bandwidth_hz": 5000000000.0,

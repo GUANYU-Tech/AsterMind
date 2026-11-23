@@ -1,8 +1,8 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>OrbitServe · 运行进度</title><link rel="stylesheet" href="/assets/pages.css"><main>
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>OrbitServe 运行进度</title><link rel="stylesheet" href="/assets/pages.css"><main>
 <nav><a href="/experiments?state=running">正在运行的任务</a><a href="/experiments">任务管理</a><a href="/">← 实验配置</a><a href="/experiments">历史实验</a></nav>
 <div class="steps">① 配置 <strong>② 运行</strong> ③ 结果</div><h1 id="heading">实验运行中</h1><p id="runId"></p>
 <section class="card" aria-live="polite"><h2 id="state">正在读取运行状态…</h2><p id="phase">完成后自动进入结果页。可以离开此页，稍后通过此地址继续查看。</p><p id="error" class="error"></p><div class="actions"><a id="result" class="button primary" hidden>查看结果</a><button id="refresh">刷新状态</button></div></section>
-<h2>执行日志</h2><pre id="log">等待日志…</pre><p>日志中的时间范围表示仿真时间；并行进程数为该阶段实际使用的数量。当前阶段和进度来自后端实际记录。</p><section class="card"><h2>手动管理</h2><div id="taskActions"></div></section></main>
+<h2>执行日志</h2><pre id="log">等待日志…</pre><section class="card"><h2>手动管理</h2><div id="taskActions"></div></section></main>
 <script type="module">
 import {formatProgressLog,formatPhysicalSummary} from '/assets/progress_log.js';
 import {completedDestination} from '/assets/experiment_flow.js';

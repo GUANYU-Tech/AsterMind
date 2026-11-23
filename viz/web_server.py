@@ -11,6 +11,7 @@ from runtime_environment import activate,identity
 activate()
 from paths import VIZ,RUNTIME,WORKSPACE
 from console import Handler as SceneHandler
+from workspace import add_language_switch
 
 
 class Handler(SceneHandler):
@@ -36,10 +37,12 @@ class Handler(SceneHandler):
                 target=(VIZ/'cell'/relative).resolve()
                 if not target.is_relative_to(VIZ/'cell') or not target.is_file() or target.suffix not in ('.html','.js','.mjs','.css','.png','.jpg','.svg','.woff','.woff2','.otf','.ico'):
                     return self.respond({'detail':'资源不存在'},code=404)
-                return self.raw(target.read_bytes(),mimetypes.guess_type(str(target))[0] or 'application/octet-stream')
+                content=target.read_bytes()
+                if target.suffix=='.html':return self.raw(add_language_switch(content),'text/html; charset=utf-8')
+                return self.raw(content,mimetypes.guess_type(str(target))[0] or 'application/octet-stream')
             if path.startswith('/assets/') and path.endswith('.html'):
                 target=(VIZ/path.lstrip('/')).resolve()
-                if target.parent==VIZ/'assets': return self.raw(target.read_bytes(),'text/html; charset=utf-8')
+                if target.parent==VIZ/'assets': return self.raw(add_language_switch(target.read_bytes()),'text/html; charset=utf-8')
             if path=='/favicon.ico':
                 self.send_response(204);self.send_header('Content-Length','0');self.end_headers();return
             return super().do_GET()
@@ -83,11 +86,14 @@ class Handler(SceneHandler):
             if path.startswith('/cell/api/uploads/'):
                 kind=path.rsplit('/',1)[-1]
                 if kind not in ('tle','requests','kv_replay'): raise ValueError('未知资源类型')
-                value={'path':str(RUNTIME/'uploads'/(uuid.uuid4().hex+('.tle' if kind=='tle' else '.json')))}
+                value={'path':str(RUNTIME/'uploads'/(uuid.uuid4().hex+{'tle': '.tle', 'requests': '.csv', 'kv_replay': '.json'}[kind]))}
                 if kind=='tle':
                     from astermind.builder.orbit import tle_elements
                     bundle=tle_elements(raw.decode(),name='cell-upload')
                     value['satellite_ids']=[s.satellite_id for s in bundle.satellites]
+                elif kind=='requests':
+                    from src.serving.request_gen.canonical_requests import parse_canonical_requests_bytes
+                    parse_canonical_requests_bytes(raw, source_path=value['path'])
                 elif kind=='kv_replay':json.loads(raw)
                 target=Path(value['path']);target.parent.mkdir(exist_ok=True);target.write_bytes(raw)
                 return self.respond(value)

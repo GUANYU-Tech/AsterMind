@@ -30,7 +30,12 @@ document.querySelector('main').classList.toggle('awaiting-live',!identity);
 const labels={request_arrival:'请求到达',route_plan:'路线规划',route_recovery:'恢复选路',route_wait:'等待可行路线',fault_injected:'故障生效',fault_restored:'故障恢复',topology_command:'拓扑操作',transfer_queued:'本跳入队',transmit_start:'开始发送',transmit_complete:'发送完成',hop_arrival:'到达下一跳',transfer_cancelled:'传输中断',bandwidth_update:'带宽分配',link_state:'链路状态',compute_start:'计算开始',prefill_complete:'Prefill 完成',compute_complete:'计算完成',request_complete:'请求完成',request_failed:'请求失败',first_delivered:'首 token 交付',output_delivered:'输出交付',retry_transfer:'执行重试'};
 const stateLabels={preparing:'准备场景',paused:'当前时刻已暂停',advancing:'正在执行',completed:'已完成',failed:'执行失败',cancelled:'已结束',finalizing:'保存执行日志'};
 function trafficStatus(flows,label){const host=$('trafficState');host.replaceChildren();for(const [status,text]of [['transmitting','正在传输'],['queued','排队'],['propagating','传播']]){const item=document.createElement('span'),name=document.createElement('span'),value=document.createElement('strong');item.className='traffic-stat';name.textContent=text;value.textContent=flows.filter(f=>f.status===status).length;item.append(name,value);host.append(item)}const event=document.createElement('span');event.className='traffic-event';event.textContent=label;host.append(event)}
-function notice(message,type=''){const host=$('notice'),classes='notice '+type;if(host.textContent!==message)host.textContent=message;if(host.className!==classes)host.className=classes}
+let noticeMessage=$('notice').textContent;
+function notice(message,type=''){
+ const host=$('notice'),classes='notice '+type;
+ if(noticeMessage!==message){noticeMessage=message;host.textContent=message}
+ if(host.className!==classes)host.className=classes;
+}
 function controlText(id,text){if($(id).textContent!==text)$(id).textContent=text}
 function displayClock(){
  const seconds=value=>Number(value).toFixed(6).replace(/\.?0+$/,''),view=window.networkReplayState?.()?.runtime,time=view?.time_s??state?.time_s??0;
@@ -191,7 +196,7 @@ async function playbackTick(){
    notice(liveWatchError()||'正在播放通信，数据就绪后会自动继续。',liveWatchError()?'error':'');
   }else if(playback.waiting||playback.feedback){
    notice(liveWatchError()||(state?.state==='failed'?state.message:playback.feedback?.title+'，'+playback.feedback?.detail),liveWatchError()||state?.state==='failed'?'error':'working');
-  }else if($('notice').className==='notice working'||state?.nodes&&$('notice').textContent==='等待任务运行。'){
+  }else if($('notice').className==='notice working'||state?.nodes&&noticeMessage==='等待任务运行。'){
    notice(playing?'正在播放通信传输':'已暂停观看，可检查下一时刻');
   }
  }catch(error){notice(error.message,'error')}

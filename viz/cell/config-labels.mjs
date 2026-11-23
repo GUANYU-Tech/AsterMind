@@ -1,6 +1,6 @@
 export const labels = {
   model:"模型", source:"输入来源", synthetic:"合成请求", production:"生产 Trace", requests:"请求流",
-  num_requests:"请求数量", request_rate:"到达率 / req·s⁻¹", input_lengths:"输入 Token 长度", output_lengths:"输出 Token 长度",
+  num_requests:"请求数量", request_rate:"每秒到达请求数", input_lengths:"输入 Token 长度", output_lengths:"输出 Token 长度",
   arrival_distribution:"到达分布", seed:"随机种子", arrival_rate_scale:"到达率缩放", closed_loop_client_count:"闭环客户端数",
   prefix_hit_fraction:"前缀命中比例", file:"已导入文件", source_format:"文件格式", input_time_unit:"时间单位",
   arrival_time_field:"到达时间列", input_tokens_field:"输入 Token 列", output_tokens_field:"输出 Token 列",
@@ -45,7 +45,7 @@ export const labels = {
   host_evidence_directory:"Host 证据目录（服务端管理）", dispatch_service_time_s:"Router 派发耗时 / s",
 };
 export const optionLabels = {
-  nvidia_a800:"NVIDIA A800", metax_c500:"MetaX C500", ascend_910b:"Ascend 910B", formation:"静态编队", orbit:"TLE 轨道", file:"拓扑文件",
+  nvidia_h200:"NVIDIA H200", nvidia_a800:"NVIDIA A800", metax_c500:"MetaX C500", ascend_910b:"Ascend 910B", formation:"静态编队", orbit:"TLE 轨道", file:"拓扑文件",
   synthetic:"合成请求", canonical:"标准请求文件", production:"生产 Trace", switch:"Switch", fully_connected:"Fully Connected", ring:"Ring", chain:"链式",
   device_only:"仅设备执行", device_plus_launch:"设备 + 主机启动", device_plus_launch_plus_scheduler:"设备 + 启动 + 调度",
   colocated:"同池部署", pd_disagg:"Prefill / Decode 分离", af_disagg:"Attention / FFN 分离", pd_af_disagg:"PD + AF 分离",

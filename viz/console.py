@@ -506,7 +506,7 @@ class Handler(BaseHTTPRequestHandler):
                 if "/" in name or "\\" in name or name.startswith("."):
                     return self.respond({"error":"not found"},code=404)
                 asset=Path(__file__).with_name("assets")/name
-                kind="image/jpeg" if name.endswith(".jpg") else 'text/css' if name.endswith('.css') else "text/javascript"
+                kind="text/plain" if name.endswith(".tle") else "image/jpeg" if name.endswith(".jpg") else 'text/css' if name.endswith('.css') else "text/javascript"
                 return self.respond(asset.read_bytes(),kind)
             if path=="/run-catalog":
                 rows=[]
@@ -515,13 +515,13 @@ class Handler(BaseHTTPRequestHandler):
                     metadata=output/"run_metadata.json"
                     title=json.loads(metadata.read_text()).get("title") if metadata.is_file() else None
                     if not title and result_index(output).stat().st_size>10_000_000:
-                        title="旧版内嵌大文件结果（请重跑） · "+output.name
+                        title="旧版内嵌大文件结果（请重跑） "+output.name
                     if not title:
                         replay=json.loads(result_index(output).read_text())
                         ns=replay.get("network",{})
                         shells=ns.get("communication_shells",[])
-                        name=" / ".join(str(s["shell_id"])+" · "+s["topology"] for s in shells) or ns.get("communication_topology","物理网络")
-                        title=name+" · "+str(replay.get("time",{}).get("duration_s","?"))+" s · 间隔 "+str(replay.get("time",{}).get("step_s","?"))+" s"
+                        name=" / ".join(str(s["shell_id"])+" "+s["topology"] for s in shells) or ns.get("communication_topology","物理网络")
+                        title=name+" "+str(replay.get("time",{}).get("duration_s","?"))+" s 间隔 "+str(replay.get("time",{}).get("step_s","?"))+" s"
                     rows.append({"id":output.name,"title":title})
                 return self.respond(rows)
             if path == '/task-catalog':

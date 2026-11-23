@@ -16,7 +16,7 @@ if(data.motion_frames?.length){
   if(key!==stateKey){const edges=new Map(base.links.map(e=>[e.link_id,e]));for(const e of events.slice(0,end+1))if(e.time_s>=base.time_s&&edges.has(e.link_id))edges.set(e.link_id,{...edges.get(e.link_id),state:e.state,reason:e.reason});links=[...edges.values()];stateKey=key}
   window.motionPhysicalFrame=MotionState.pose({...base,links},left,right,target);time=target;
   $('clock').textContent=`${target.toFixed(3)} s / ${data.time.end_s} s`;
-  $('status').textContent=`ITRS Hermite 位置插值 · 拓扑按物理状态变化切换 · 运动缓存 ${motion.size()}/6 帧`;
+  $('status').textContent=`ITRS Hermite 位置插值 拓扑按物理状态变化切换 运动缓存 ${motion.size()}/6 帧`;
  }
  const player=createTimeClock({render,onStop:()=>$('play').textContent='连续播放',onError:error=>$('status').textContent=error.message});
  $('play').textContent='连续播放';$('play').onclick=()=>{if(player.running){player.stop();return}player.start(time>=data.time.end_s?0:time,data.time.end_s,Number(speed.value));$('play').textContent='暂停连续播放'};

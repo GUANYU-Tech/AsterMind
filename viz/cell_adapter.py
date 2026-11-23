@@ -24,6 +24,10 @@ def capabilities():
     value = json.loads((VIZ / 'cell/presentation.json').read_text())
     value.update(models=[Path(m['id']).stem for m in catalog['models'] if m['available']],
                  hardware=[h['id'] for h in catalog['hardware']], backend=identity())
+    value['models_by_hardware'] = {
+        h['id']: {Path(m['id']).stem: m['choices'][h['id']] for m in catalog['models'] if m['choices'].get(h['id'])}
+        for h in catalog['hardware']
+    }
     value['hardware_details']={h['id']:yaml.safe_load((upstream/h['file']).read_text()) for h in catalog['hardware']}
     config = value['default_configuration']
     scheduler = config['scheduler']['main']
@@ -39,6 +43,7 @@ def capabilities():
         for collective in pool['collectives']:
             collective['backend'] = 'runtime_comm'
     definitions = value['schema']['$defs']
+    definitions['HardwareConfig']['properties']['default_hardware_id']['enum'] = value['hardware']
     definitions['SchedulerConfig']['properties']['framework']['enum'] = ['vllm']
     definitions['CollectiveConfig']['properties']['backend']['enum'] = ['runtime_comm']
     value['compatibility'] = {'unsupported': ['sglang', 'af_disagg', 'pd_af_disagg',

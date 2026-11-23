@@ -9,7 +9,7 @@ if(sessionStorage.getItem('orbitserve.demoPointer')==='1'){
   document.head.append(style);
   const cursor=document.createElement('div');cursor.className='demo-pointer';cursor.setAttribute('aria-hidden','true');
   cursor.innerHTML='<svg viewBox="0 0 30 38"><path d="M3 2 L3 29 L10 23 L16 35 L21 32 L15 21 L25 20 Z" fill="#f2fff8" stroke="#0d2920" stroke-width="2"/><path d="M5 5 L5 24 L10 19 L17 21 Z" fill="#7cd8c0"/></svg>';
-  const label=document.createElement('span');label.className='demo-pointer-label';label.textContent='交互演示 · 网页模拟指针';
+  const label=document.createElement('span');label.className='demo-pointer-label';label.textContent='交互演示 网页模拟指针';
   document.body.append(cursor,label);cursor.style.transform='translate(260px,140px)';
   function move(event){cursor.style.transform=`translate(${event.clientX}px,${event.clientY}px)`;}
   document.addEventListener('pointermove',move,{passive:true,capture:true});

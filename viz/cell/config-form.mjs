@@ -99,11 +99,11 @@ export function renderConfigForm(container, root, keys, schema, onChange, choice
     let spec = resolveSchema(raw, defs);
     let value = path.reduce((v, k) => v?.[k], root);
     if (linkField && key === "mode" && value == null) value = "islsim";
-    let title = labels[key] || String(key);
+    let title = choices.labels?.[key] || labels[key] || String(key);
     if (key === "source" && path.includes("links")) title = "源卫星";
     if (linkField && key === "mode") title = "链路模式";
     if (linkField && key === "bandwidth_gbps") title = "链路带宽 / Gbps";
-    if (key === "kv_cache") title = `${root.deployment.worker_pools[path[2]]?.name || "pool"} · KV 分层`;
+    if (key === "kv_cache") title = `${root.deployment.worker_pools[path[2]]?.name || "pool"} KV 分层`;
     const nullable = spec.anyOf?.some(s => s.type === "null");
     const scalarTypes = spec.anyOf?.map(s => s.type).filter(t => ["string", "integer", "number", "boolean"].includes(t));
     if (spec.anyOf) spec = resolveSchema(spec.anyOf.find(s => s.type === (typeof value === "number" ? "integer" : typeof value)) || spec.anyOf.find(s => s.type !== "null"), defs);
@@ -179,7 +179,7 @@ export function renderConfigForm(container, root, keys, schema, onChange, choice
         }));
         }
       }
-      if (nullable && !["constellation", "constellation.formation"].includes(full)) group.append(button("设为未启用", () => { setAt(root, path, null); rerender(); }));
+      if (nullable && !["requests", "scheduler"].includes(path[0]) && !["constellation", "constellation.formation"].includes(full)) group.append(button("设为未启用", () => { setAt(root, path, null); rerender(); }));
       wrap.append(group); return wrap;
     }
     if (Array.isArray(value)) {
@@ -199,10 +199,10 @@ export function renderConfigForm(container, root, keys, schema, onChange, choice
       }
       wrap.className += " field-container";
       if (full === "topology.inter_satellite.links") wrap.classList.add("link-collection");
-      wrap.append(el("div", `${title} · ${value.length}`, "field-title"));
+      wrap.append(el("div", `${title} ${value.length}`, "field-title"));
       value.forEach((item, index) => {
         const row = el("details", undefined, "repeat-item"); row.open = true; row.dataset.detailPath = JSON.stringify([...path, index]);
-        const desc = item?.name || item?.operation || (item?.worker_pool ? `${item.worker_pool} · PP${item.parallel_coordinate.pp} / TP${item.parallel_coordinate.tp}` : item?.satellite_id ? `${item.satellite_id} / 卡 ${item.local_index}` : item?.source ? `${item.source} → ${item.target}` : `第 ${index + 1} 项`);
+        const desc = item?.name || item?.operation || (item?.worker_pool ? `${item.worker_pool} PP${item.parallel_coordinate.pp} / TP${item.parallel_coordinate.tp}` : item?.satellite_id ? `${item.satellite_id} / 卡 ${item.local_index}` : item?.source ? `${item.source} → ${item.target}` : `第 ${index + 1} 项`);
         row.append(el("summary", desc));
         const rendered = field(spec.prefixItems?.[index] || spec.items || {}, [...path, index], depth + 1); if (rendered) row.append(rendered);
         if (!spec.prefixItems && full !== "deployment.placements") {
@@ -236,8 +236,9 @@ export function renderConfigForm(container, root, keys, schema, onChange, choice
     input.id = `field-${path.map(x => encodeURIComponent(x)).join("-")}`; input.dataset.configPath = JSON.stringify(path);
     const label = el("label", title); label.htmlFor = input.id; wrap.append(label);
     if (options) {
-      const values = full === "topology.source" ? options : [...new Set([...options, value])];
-      if (full === "topology.source" && !values.includes(value)) { const old = el("option", "已载入的外部配置"); old.value = value; old.disabled = true; input.append(old); }
+      const strict = ["topology.source", "model", "requests.source", "requests.synthetic.arrival_distribution"].includes(full);
+      const values = strict ? options : [...new Set([...options, value])];
+      if (strict && !values.includes(value)) { const old = el("option", "已载入的外部配置"); old.value = value; old.disabled = true; input.append(old); }
       for (const option of values) { const n = el("option", optionLabels[option] || String(option)); n.value = option; input.append(n); }
       input.value = value;
     } else if (typeof value === "boolean") { input.type = "checkbox"; input.checked = value; }
@@ -278,10 +279,10 @@ export function renderConfigForm(container, root, keys, schema, onChange, choice
       label.textContent = key === "spacing_km" ? "编队距离" : "轨道高度";
       const line = el("div", undefined, "field-line"), amount = el("div", undefined, "range-value");
       amount.append(input, el("span", "km")); line.append(label, amount);
-      const slider = el("input"); slider.type = "range"; slider.className = "range"; slider.min = spec.minimum; slider.max = spec.maximum; slider.step = key === "spacing_km" ? ".1" : "1"; slider.value = value; slider.setAttribute("aria-label", title);
+      const slider = el("input"); slider.type = "range"; slider.className = "range"; slider.min = spec.minimum ?? 0.001; slider.max = spec.maximum ?? Math.max(value, key === "spacing_km" ? 10 : 1200); slider.step = key === "spacing_km" ? ".1" : "1"; slider.value = value; slider.setAttribute("aria-label", title);
       const updateRange = () => slider.style.setProperty("--range-progress", `${Math.max(0, Math.min(100, (Number(slider.value) - Number(slider.min)) / (Number(slider.max) - Number(slider.min)) * 100))}%`);
       updateRange();
-      const endpoints = el("div", undefined, "range-labels"); endpoints.append(el("span", key === "spacing_km" ? "100 m" : "350 km"), el("span", key === "spacing_km" ? "10 km" : "1200 km"));
+      const endpoints = el("div", undefined, "range-labels"); endpoints.append(el("span", Number(slider.min) < 1 ? Number(slider.min)*1000 + " m" : slider.min + " km"), el("span", slider.max + " km"));
       slider.addEventListener("input", () => { updateRange(); input.value = slider.value; commit(); });
       input.addEventListener("input", () => { if(input.checkValidity()) { slider.value = input.value; updateRange(); } });
       wrap.replaceChildren(line, slider, endpoints, state.note);

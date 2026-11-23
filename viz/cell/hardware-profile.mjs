@@ -42,7 +42,7 @@ function componentTree(components) {
     if (component.size_bytes != null) metrics.push(bytes(component.size_bytes));
     if (component.throughput_per_clk != null) metrics.push(`吞吐 ${number(component.throughput_per_clk)} / 周期`);
     for (const variant of component.variants || []) metrics.push(`${variant.name.toUpperCase()} ${number(variant.throughput_per_clk)} / 周期`);
-    if (metrics.length) row.append(element('small', metrics.join(' · ')));
+    if (metrics.length) row.append(element('small', metrics.join(' ')));
     if (component.children?.length) row.append(componentTree(component.children));
     list.append(row);
   }
@@ -69,9 +69,9 @@ export function renderHardwareProfiles(container, ids, details = {}) {
     ], 'hardware-metrics'));
     card.append(definitionList([
       ['显存频率', unit(clocks[memory?.clock_domain || 'dram'], 'GHz', 1e9)],
-      ['卡间互联 · 单向', unit(links.nvlink_unidir_bw_GB_s, 'GB/s')],
+      ['卡间单向互联带宽', unit(links.nvlink_unidir_bw_GB_s, 'GB/s')],
       ['PCIe 带宽', unit(links.pcie_bw_GB_s, 'GB/s')],
-      ['InfiniBand · 单向', unit(links.infiniband_unidir_bw_GB_s, 'GB/s')],
+      ['InfiniBand 单向带宽', unit(links.infiniband_unidir_bw_GB_s, 'GB/s')],
     ], 'hardware-specs'));
     const architecture = element('details', undefined, 'hardware-architecture');
     architecture.dataset.hardwareId = id; architecture.open = opened.has(id);

@@ -75,6 +75,9 @@ export function editorChoices(config, capabilities) {
     options(path) {
       if (capabilities.compatibility) {
         const full=path.join('.');
+        if(full==='model') return Object.keys(capabilities.models_by_hardware[config.hardware.default_hardware_id] || {});
+        if(full==='requests.source') return ['synthetic','canonical'];
+        if(full==='requests.synthetic.arrival_distribution') return ['poisson','constant'];
         if(full==='deployment.mode') return ['colocated','pd_disagg'];
         if(path[0]==='scheduler' && path.at(-1)==='framework') return ['vllm'];
         if(full==='runtime_inputs.graph_execution.configured_mode') return ['NONE'];
@@ -139,8 +142,15 @@ export function editDependencies(config, path, value, capabilities, previous) {
     syncFormationLinks(config);
   }
   if (full === "hardware.satellite_ids") config.hardware.satellite_count = config.hardware.satellite_ids.length;
-  if (["hardware.satellite_count", "hardware.satellite_ids", "hardware.accelerators_per_satellite"].includes(full)) synchronizeResources(config, capabilities);
+  if (["hardware.satellite_count", "hardware.satellite_ids", "hardware.accelerators_per_satellite", "hardware.default_hardware_id"].includes(full)) synchronizeResources(config, capabilities);
   if (["constellation.formation.layout", "hardware.satellite_ids"].includes(full)) syncFormationLinks(config);
+  if (full === "hardware.default_hardware_id" && capabilities.models_by_hardware) {
+    const supported = Object.keys(capabilities.models_by_hardware[value] || {});
+    if (supported.length && !supported.includes(config.model)) {
+      config.model = supported.includes(capabilities.default_configuration.model) ? capabilities.default_configuration.model : supported[0];
+      editDependencies(config, ["model"], config.model, capabilities);
+    }
+  }
   if (full === "model") {
     for (const settings of Object.values(config.scheduler)) if (settings.vllm) settings.vllm.model = value;
     config.runtime_inputs.expert_routing = defaultModelRouting(value, capabilities.default_configuration.runtime_inputs.expert_routing);

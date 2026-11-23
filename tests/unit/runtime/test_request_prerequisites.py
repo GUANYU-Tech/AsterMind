@@ -239,6 +239,19 @@ class CellSelectionTests(unittest.TestCase):
             self.assertIs(call.kwargs['context'], context)
             self.assertEqual(call.args[2], request.input_bytes)
 
+    def test_user_priority_changes_winner_and_skips_unneeded_estimates(self):
+        from astermind.builder.config.scenario import CellPriority
+        runtime, _, choose = self.runtime(CellPriority(primary='distance', secondary='load'))
+        runtime.state['busy'] = dict(cell='near', status='input')
+        self.assertEqual(choose(), 'near')
+        runtime.config.cell_selection = CellPriority(primary='load', secondary='distance')
+        self.assertEqual(choose(), 'far')
+        runtime.network.estimate_transfer.assert_not_called()
+        runtime.config.cell_selection = CellPriority(primary='arrival')
+        self.assertEqual(choose(), 'far')
+        with self.assertRaises(ValueError):
+            CellPriority(primary='distance', secondary='distance')
+
     def test_explicit_cell_and_session_affinity_are_retained(self):
         runtime, request, choose = self.runtime()
         request.cell = 'far'

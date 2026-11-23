@@ -88,7 +88,7 @@ async function loadRecords() {
     }
     const filtered = $("#search").value.trim() || $("#status-filter").value;
     $("#message").textContent = result.total
-      ? `按提交时间倒序排列${result.skipped ? ` · ${result.skipped} 个记录文件无法读取，已跳过` : ""}`
+      ? `按提交时间倒序排列${result.skipped ? ` ${result.skipped} 个记录文件无法读取，已跳过` : ""}`
       : `${filtered ? "没有符合条件的记录，请调整筛选条件。" : "还没有使用记录。返回仿真页面提交一次任务后，点击刷新即可查看。"}${result.skipped ? ` ${result.skipped} 个文件无法读取。` : ""}`;
     $("#count").textContent = result.total
       ? `第 ${state.offset + 1}–${state.offset + result.items.length} 条，共 ${result.total} 条`
@@ -152,17 +152,17 @@ async function showDetail(id) {
     if (record.error) content.append(node("p", record.error, "run-error"));
     if (!record.effective_configuration) content.append(node("p", "此提交未生成有效仿真配置，下方保留了原始提交及错误信息。", "muted"));
     content.append(
-      section("提交硬件配置 · 物理清单 / 星内互联", config.hardware, true),
-      section("V1 生效部署 · 物理设备 / Cell", {physical:effective.physical,cells:effective.cells}),
-      section("卫星配置 · 编队 / 卫星 ID / 部署映射", {
+      section("提交硬件配置 物理清单 / 星内互联", config.hardware, true),
+      section("V1 生效部署 物理设备 / Cell", {physical:effective.physical,cells:effective.cells}),
+      section("卫星配置 编队 / 卫星 ID / 部署映射", {
         constellation: config.constellation,
         deployment: config.deployment,
       }),
-      section("模型与负载 · 模型 / 并行维度 / Prompt / Decode", {
+      section("模型与负载 模型 / 并行维度 / Prompt / Decode", {
         model: config.model ?? submitted.model, requests: config.requests,
         scheduler: config.scheduler, runtime_inputs: config.runtime_inputs,
       }),
-      section("提交链路配置 · 拓扑 / FSO / 传输", {
+      section("提交链路配置 拓扑 / FSO / 传输", {
         topology: config.topology ?? submitted.links, fso: config.fso ?? submitted.fso,
         network: config.network, flowsim: config.flowsim,
       }),
@@ -170,13 +170,13 @@ async function showDetail(id) {
     for (const [key, source] of Object.entries(record.configuration_sources || {})) {
       let contents = source.content;
       try { contents = JSON.parse(contents); } catch { /* TLE stays plain text. */ }
-      content.append(section(`配置快照 · ${{ model: "完整模型结构", tle: "TLE 轨道数据", components: "组件版本" }[key] || key}`, contents));
+      content.append(section(`配置快照 ${{ model: "完整模型结构", tle: "TLE 轨道数据", components: "组件版本" }[key] || key}`, contents));
     }
     content.append(
-      section("原始提交 · 完整配置", record.submitted_configuration),
-      section("后端实际配置 · 完整配置", record.effective_configuration),
+      section("原始提交 完整配置", record.submitted_configuration),
+      section("后端实际配置 完整配置", record.effective_configuration),
       section("客户端与运行产物", { client: record.client, artifacts: record.artifacts, warnings: record.warnings }),
-      section("完整记录 · JSON", record),
+      section("完整记录 JSON", record),
     );
     $("#download").disabled = false;
   } catch (error) {

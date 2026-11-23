@@ -524,7 +524,7 @@ def replay_data(result, *, source_name="report.json", source_sha256=None):
             if any(
                 m["state"] == "failed" for m in result.get("migrations", {}).values()
             )
-            else f"KV {config.migrations[0].mode.title() if config.migrations else '迁移'} · {config.backend}"
+            else f"KV {config.migrations[0].mode.title() if config.migrations else '迁移'} {config.backend}"
             if result.get("migrations")
             else "MoE TP2 / EP2"
             if any(c.native_expert_parallel for c in config.cells)
@@ -562,7 +562,7 @@ def replay_data(result, *, source_name="report.json", source_sha256=None):
         "physical_identity": result["network"].get("physical_dataset_identity"),
         "transport": result["network"].get("transport"),
         "clock": result['network'].get('clock'),
-        "clock_note": "SimGrid 全局事件时钟" if config.timeline_mode=='simgrid' else "统一时钟 · 1 as" if result['network'].get('clock') else "旧时钟记录 · 重新运行后使用统一时钟",
+        "clock_note": "SimGrid 全局事件时钟" if config.timeline_mode=='simgrid' else "统一时钟 1 as" if result['network'].get('clock') else "旧时钟记录 重新运行后使用统一时钟",
     }
 
 
