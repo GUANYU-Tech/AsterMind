@@ -1,0 +1,7 @@
+{
+  "model": "deepseek-v4-pro",
+  "deployment": "tp8-pp4",
+  "topology": "ring",
+  "bandwidth_gbps": 400,
+  "distance_km": 1
+}

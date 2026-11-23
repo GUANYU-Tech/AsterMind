@@ -58,8 +58,10 @@ def construct_scheduler(config, requested, storage_options=None):
     scheduler_config = SchedulerConfig(
         max_model_len=requested.max_model_len, is_encoder_decoder=False,
         max_num_batched_tokens=config.max_batched_tokens, max_num_seqs=config.max_requests,
-        enable_chunked_prefill=True, async_scheduling=False, policy="fcfs",
-        long_prefill_token_threshold=0, watermark=(storage_options or {}).get("watermark", 0.0),
+        enable_chunked_prefill=getattr(requested, "chunked_prefill_override", None) is not False,
+        async_scheduling=False, policy="fcfs",
+        long_prefill_token_threshold=getattr(requested, "long_prefill_token_threshold", 0),
+        watermark=(storage_options or {}).get("watermark", 0.0),
         # Keep the new version's native default; record this difference.
         scheduler_reserve_full_isl=True,
     )
@@ -165,7 +167,9 @@ class LatestControlPlane:
         if any(flags.values()) or self.pending is None or self.pending[0] != step:
             raise RuntimeError("invalid feedback or real model execution requested")
         ids = list(step.generated_tokens)
-        feedback=normalize_sampled_feedback(step,sampled_token_ids,self.scheduler.vllm_config.model_config.vocab_size)
+        model = self.scheduler.vllm_config.model_config
+        vocab_size = model.vocab_size if hasattr(model, "vocab_size") else model.get_vocab_size()
+        feedback=normalize_sampled_feedback(step,sampled_token_ids,vocab_size)
         output = ModelRunnerOutput(req_ids=ids, req_id_to_index={rid:i for i,rid in enumerate(ids)},
                                    sampled_token_ids=[feedback[rid] for rid in ids])
         result = self.scheduler.update_from_output(self.pending[1], output)

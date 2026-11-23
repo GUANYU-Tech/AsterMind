@@ -704,7 +704,7 @@ def _analytical_launch(
     tile = {
         "m": 32 if m_total <= 32 else (64 if m_total <= 64 else 128),
         "n": 64 if n <= 64 else 128,
-        "k": 32 if k <= 32 else 64,
+        "k": 32 if k <= 32 or (k % 64 and k % 32 == 0) else 64,
     }
     return LaunchConfig(
         algorithm="mcblas_analytical_gemm",

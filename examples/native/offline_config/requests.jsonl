@@ -1,0 +1,2 @@
+{"id": "context0", "arrival_s": 0.0, "gateway_id": "ground", "region_id": "demo", "slo_class": "interactive", "session_id": "session", "turn": 1, "new_input_tokens": 32, "history_tokens": 0, "output_tokens": 2}
+{"id": "context1", "arrival_s": 4.0, "gateway_id": "ground", "region_id": "demo", "slo_class": "interactive", "session_id": "session", "turn": 2, "new_input_tokens": 14, "history_tokens": 34, "output_tokens": 2}

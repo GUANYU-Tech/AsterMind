@@ -99,9 +99,14 @@ class Simulation:
             for p in c.placements
         )
         from astermind.engine.compute.batch_executor import RuntimeBatchExecutor
+        if config.compute_mode == "fast_mode":
+            from astermind.engine.compute.fast_mode import FastModeExecutor
+            executor_type = FastModeExecutor
+        else:
+            executor_type = RuntimeBatchExecutor
         self.executor = CellTransferExecutor(self.loop, self.network)
         self.executors = {
-            cell.id: RuntimeBatchExecutor(cell.id, self.loop, self.network.communication_policy,
+            cell.id: executor_type(cell.id, self.loop, self.network.communication_policy,
                 tuple(p for p in placements if p.cell_id == cell.id),
                 on_batch_boundary=self.executor.notify_batch_boundary)
             for cell in config.cells
@@ -175,13 +180,15 @@ class Simulation:
             max_batched_tokens=cell.max_batched_tokens, max_requests=cell.max_requests,
             num_kv_blocks=cell.num_kv_blocks, kv_block_size_tokens=cell.kv_block_size_tokens,
             scheduler_adapter=cell.scheduler_adapter, enable_prefix_caching=cell.prefix_caching,
+            enable_chunked_prefill=cell.enable_chunked_prefill,
+            long_prefill_token_threshold=cell.long_prefill_token_threshold,
             enable_expert_parallel=cell.expert_parallel_enabled,
             expert_routing_seed=cell.expert_routing_seed, host_launch_profile_file=cell.host_launch_profile,
             memory_policy_file=cell.memory_policy_file, watermark=cell.watermark,
             tensor_parallel_size=p.tp, pipeline_parallel_size=p.pp,
             data_parallel_size=p.dp, sequence_parallel_size=p.sp,
             deployment=cell.deployment, execution_mode=cell.execution_mode,
-            compute_mode=self.config.compute_mode)
+            compute_mode=self.config.executor_compute_mode, fast_glm_dsa_score=cell.fast_glm_dsa_score)
         executor = self.executors[cell.id]
         if cell.deployment == "pd_disagg":
             created = PrefillDecodeCell(cell.id, self.loop, config, executor,
@@ -193,6 +200,8 @@ class Simulation:
                 batch_executor=executor, history_store=self.history)
         try:
             validate_cell_deployment(cell, created.execution, executor.placements.values())
+            if self.config.compute_mode == "fast_mode":
+                executor.configure(created.execution, config)
         except BaseException:
             created.close()
             raise
@@ -452,7 +461,7 @@ class Simulation:
                 "midlayer_root": str(self.root),
                 "communication": "runtime_comm",
                 "compute_mode": self.config.compute_mode,
-                "compute_modes": {c.id: self.config.compute_mode for c in self.config.cells},
+                "compute_modes": {c.id: self.config.executor_compute_mode for c in self.config.cells},
                 "native_inputs": self.native_inputs,
                 "source_commit": "9c08c9cad81df5a4fee5e606114753df8dab6c2d",
                 "timeline_mode": "orbitserve",

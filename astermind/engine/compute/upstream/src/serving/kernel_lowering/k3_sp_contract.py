@@ -2,6 +2,8 @@
 from collections import defaultdict
 from contextvars import ContextVar
 
+from src.kernel.hardware_spec import HWSpec
+
 _validated_variables=ContextVar('k3_wideep_validated_variables',default=None)
 
 def handles_collective(node,pool,graph):
@@ -11,7 +13,8 @@ def handles_collective(node,pool,graph):
 
 def applicable(pool):
     c=pool.parallel_plan.config
-    return (pool.hardware_id=='nvidia_h200' and pool.parallel_plan.num_layers==93
+    return ((pool.hardware_id == "nvidia_h200" or HWSpec.source_contract_supported(
+                "kimi_k3_portable_roofline", pool.hardware_id)) and pool.parallel_plan.num_layers==93
             and c.enable_expert_parallel and c.tensor_parallel_size in (2,4,8,16,32)
             and c.data_parallel_size>1 and c.pipeline_parallel_size==1
             and c.expert_parallel_size==c.tensor_parallel_size*c.data_parallel_size

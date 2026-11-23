@@ -1,0 +1,8 @@
+{
+  "schema": "h200-v4-native-projection-v1",
+  "hardware": "nvidia_h200",
+  "model_file": "configs/model/deepseek-v4-pro.json",
+  "weight_storage_profile": "sm90_deepgemm_marlin",
+  "hbm_utilization_percent": 90,
+  "additional_non_kv_reserve_bytes_per_rank": 2147483648
+}

@@ -1,0 +1,23 @@
+{
+  "requests": {
+    "context0": {
+      "cell": "cellA"
+    },
+    "context1": {
+      "cell": "cellB",
+      "history_upload_tokens": 2
+    }
+  },
+  "migrations": [
+    {
+      "id": "copy0",
+      "after_request": "context0",
+      "source_cell": "cellA",
+      "target_cell": "cellB",
+      "session_id": "session",
+      "context_id": "context0",
+      "mode": "copy",
+      "before_request": "context1"
+    }
+  ]
+}

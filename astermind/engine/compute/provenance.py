@@ -32,6 +32,8 @@ def inputs(root,cells):
             placements=[placement.model_dump() for placement in cell.placements],
             deployment=cell.deployment,execution_mode=cell.execution_mode,
             scheduler_adapter=cell.scheduler_adapter,expert_routing_seed=cell.expert_routing_seed)
+        if cell.fast_glm_dsa_score is not None:
+            identities[cell.id]["fast_glm_dsa_score"]=cell.fast_glm_dsa_score
     return dict(snapshot_manifest_sha256=hashlib.sha256(snapshot.read_bytes()).hexdigest(),
         native_source_commit=manifest['source_commit'],native_source_config_tree_sha256=manifest['source_config_tree_sha256'],
         cells=identities,assumptions=[

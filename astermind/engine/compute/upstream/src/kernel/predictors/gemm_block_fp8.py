@@ -332,6 +332,19 @@ def _block_fp8_matmul_payloads(b, m, n, k):
              "weight_scales": 4 * b * _ceil_div(n, _BLOCK_K) * kblocks})
 
 
+def weight_only_fp8_service_s(hardware, flops, fp8_payload):
+    """Roofline for packed FP8 weights converted to BF16 inside a tile."""
+    weights = fp8_payload["weight_payload"]
+    # BF16 activations arrive directly. Weight expansion stays on chip.
+    hbm_bytes = (2 * fp8_payload["matmul_input"] + weights
+        + fp8_payload["output"] + fp8_payload["weight_scales"])
+    tensor_s = flops / hardware.resource_by_role("compute_tensor").capacity
+    scale_s = weights / hardware.resource_by_role("compute_fma").capacity
+    convert_s = 2 * weights / hardware.resource_by_role("compute_alu").capacity
+    return max(hbm_bytes / hardware.resource_by_role("dram").capacity,
+               tensor_s, scale_s + convert_s)
+
+
 def block_fp8_linear_logical_work(kernel: KernelSpec):
     """Ideal FP8 A/B, BF16 C and FP32 group-scale payload, without launch.
 

@@ -2,6 +2,8 @@
 from collections import defaultdict
 from contextvars import ContextVar
 
+from src.kernel.hardware_spec import HWSpec
+
 _validated_variables=ContextVar('v4_modelsp_validated_variables',default=None)
 
 def handles_collective(node,pool,graph):
@@ -21,7 +23,9 @@ def handles_hash_route(node):
 
 def applicable(pool):
     c=pool.parallel_plan.config
-    return (pool.hardware_id=='nvidia_h200' and pool.parallel_plan.num_layers in (43,61)
+    return ((pool.hardware_id == "nvidia_h200"
+             or HWSpec.source_contract_supported("deepseek_v4_portable_roofline", pool.hardware_id))
+            and pool.parallel_plan.num_layers in (43,61)
             and c.enable_expert_parallel and c.tensor_parallel_size in (2,4,8,16)
             and (c.data_parallel_size in (2,4,8) or (pool.parallel_plan.num_layers==61 and pool.parallel_plan.num_experts==384 and c.tensor_parallel_size==8 and c.data_parallel_size==48)) and c.pipeline_parallel_size==1
             and c.expert_parallel_size==c.tensor_parallel_size*c.data_parallel_size
@@ -154,7 +158,7 @@ def validate(graph,pool,nodes,memory_context):
     variable_ids.update(tensor_ids)
     _validated_variables.set((graph,pool,frozenset(variable_ids),frozenset(fill_ids),frozenset(hash_ids),frozenset(n.node_id for n in nodes)))
 
-def validate_lowered(graph,plan):
+def validate_lowered(graph, plan, deployment):
     """Check the actual returned plan, including ordinary no-launch-input calls."""
     proof = _validated_variables.get()
     if proof is not None and proof[0] is graph:
@@ -193,7 +197,8 @@ def validate_lowered(graph,plan):
             kind,variant=KernelKind.FUSED_MOE,'routed_experts'
             expected=expert_attributes(node);shape={**node.shape,'dtype_bytes':2}
             if expected['mathematical_program']=='v4_modelsp_masked_marlin_ep_v1':shape['tokens']=valid_tokens(node)
-        canonical=KernelSpec(kind=kind,hardware_id='nvidia_h200',shape=shape,dtype=node.dtype,variant=variant,attributes=expected,launch=None,execution_support='unsupported',unsupported_reason='launch_selector_unavailable')
+        hardware_id = deployment.worker_pools[node.pool_name].hardware_id
+        canonical=KernelSpec(kind=kind,hardware_id=hardware_id,shape=shape,dtype=node.dtype,variant=variant,attributes=expected,launch=None,execution_support='unsupported',unsupported_reason='launch_selector_unavailable')
         actual=(k.kind,k.variant,dict(k.attributes),dict(k.shape),k.dtype,k.hardware_id,k.launch,k.execution_support)
         required=(canonical.kind,canonical.variant,dict(canonical.attributes),dict(canonical.shape),canonical.dtype,canonical.hardware_id,canonical.launch,canonical.execution_support)
         if actual!=required:

@@ -19,6 +19,7 @@ and does not claim native0.27 equivalence.
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 
+from src.kernel.hardware_spec import HWSpec
 from .traced_forward import ForwardCollectiveGroup, ForwardPipelineGroup, ForwardTrace
 from .model_config import is_deepseek_v3_parallel_model_scope
 from .traced_models import (
@@ -802,13 +803,17 @@ def trace_deepseek_v3_decode(model, step, pool, expert_routing, *, input_ids, po
         and model.num_hidden_layers == 32 and config.tensor_parallel_size == 4)
     source_version = "vllm_0_11_0" if source011 else "vllm_0_27_1"
     sampler = "vllm_0_11_plain_greedy_bf16" if source011 else "vllm_0_27_1_plain_greedy_bf16"
+    portable = (not source011 and
+        (HWSpec.source_contract_supported("deepseek_v3_expert_roofline", pool.hardware_id)
+         if config.enable_expert_parallel or _replica_context is not None
+         else HWSpec.source_contract_supported("deepseek_v3_portable_roofline", pool.hardware_id)))
     if source011 and (config.tensor_parallel_size != 1 or config.pipeline_parallel_size != 1
             or model.num_hidden_layers != 61 or config.enable_expert_parallel or _replica_context is not None):
         raise NotImplementedError("native0.11 MLA source currently requires TP1")
     if (source_profile not in (SOURCE_PROFILE, SOURCE_PROFILE_011) or model.model_id != "deepseek-ai/DeepSeek-V3"
             or model.model_type != "deepseek_v3"
             or model.compute_dtype != "bf16" or model.weight_dtype != "fp8"
-            or pool.hardware_id != "nvidia_h200"
+            or (pool.hardware_id != "nvidia_h200" and not portable)
             or not is_deepseek_v3_parallel_model_scope(model, config.tensor_parallel_size, config.pipeline_parallel_size,
                 expert_parallel=config.enable_expert_parallel or _replica_context is not None and _replica_context.expert_size > 1)
             or len(pool.ranks) != config.worker_count
@@ -1002,7 +1007,9 @@ def trace_deepseek_v3_data_parallel_forward(model, step, pool, expert_routing, *
         raise TypeError("V3 DP source requires explicit canonical routing input")
     config = pool.parallel_plan.config
     tp, dp, pp = config.tensor_parallel_size, config.data_parallel_size, config.pipeline_parallel_size
-    if (source_profile != SOURCE_PROFILE or pool.hardware_id != "nvidia_h200"
+    portable = (config.enable_expert_parallel
+        and HWSpec.source_contract_supported("deepseek_v3_expert_roofline", pool.hardware_id))
+    if (source_profile != SOURCE_PROFILE or (pool.hardware_id != "nvidia_h200" and not portable)
             or not is_deepseek_v3_data_parallel_model_scope(model, config) or len(pool.ranks) != config.worker_count):
         raise NotImplementedError("V3 DP source requires0.27.1 H200 whole-block FP8 TP/DP or uniform global EP, CP1")
     moe_sp = config.enable_expert_parallel and tp > 1

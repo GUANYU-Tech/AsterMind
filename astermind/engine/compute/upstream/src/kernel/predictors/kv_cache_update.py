@@ -569,6 +569,18 @@ class KVCacheUpdatePredictor(KernelPredictor):
         return PerformanceFormula(hardware).predict_kernel(inp)
 
     def roofline_without_launch(self, kernel: KernelSpec, hardware):
+        if (kernel.variant == "mla_kv_cache"
+                and hardware.supports_source_contract("deepseek_v3_portable_roofline")):
+            from src.kernel.memory_access_builder import target_cache_memory_access_program
+            from src.kernel.memory_cache_update import target_cache_source_demands
+            work = target_cache_logical_work(kernel)
+            traffic = target_cache_source_demands(
+                target_cache_memory_access_program(kernel, hardware), expected_kernel=kernel)
+            demand = dict.fromkeys(("compute_tensor", "compute_vector", "compute_reduction",
+                "compute_fma", "compute_sfu", "compute_alu"), 0)
+            demand.update(work["demand"])
+            return prediction_from_ns(roofline_ns(demand, hardware,
+                traffic["read_bytes"] + traffic["write_bytes"]), "roofline")
         if (kernel.variant == "dsv4_qnorm_rope_kv_insert" and "mathematical_program" in kernel.attributes
                 and kernel.attributes["mathematical_program"] in ("vllm_0_30_dspark_partial_context_insert_v1", "v4_idle_swa_insert_v1")):
             work = target_cache_logical_work(kernel)
@@ -581,7 +593,8 @@ class KVCacheUpdatePredictor(KernelPredictor):
         if stage_kernels is not None:
             return prediction_from_ns(1e9 * sum(self.roofline_without_launch(
                 stage_kernel, hardware).t_total_s for _, stage_kernel in stage_kernels), "roofline")
-        if HWSpec.source_contract_supported("aggregate_gpu_source_roofline", hardware.hardware_id) and kernel.variant in (
+        if (hardware.supports_source_contract("aggregate_gpu_source_roofline")
+                or hardware.supports_source_contract("deepseek_v4_portable_roofline")) and kernel.variant in (
                 "dsv4_qnorm_rope_kv_insert", "dsv4_compressor_state_cache", "dsv4_compressed_state_cache"):
             work = target_cache_logical_work(kernel)
             if hardware.gpu_vector_memory_only:
@@ -594,8 +607,15 @@ class KVCacheUpdatePredictor(KernelPredictor):
             demand = {role: 0 for role in ("compute_tensor", "compute_vector", "compute_reduction",
                 "compute_fma", "compute_sfu", "compute_alu")}
             demand.update(work["demand"])
-            return prediction_from_ns(roofline_ns(demand, hardware,
-                work["read_bytes"] + work["write_bytes"]), "roofline")
+            bytes_total = work["read_bytes"] + work["write_bytes"]
+            if hardware.supports_source_contract("deepseek_v4_portable_roofline"):
+                from src.kernel.memory_access_builder import target_cache_memory_access_program
+                from src.kernel.memory_cache_update import target_cache_source_demands
+
+                traffic = target_cache_source_demands(
+                    target_cache_memory_access_program(kernel, hardware), expected_kernel=kernel)
+                bytes_total = traffic["read_bytes"] + traffic["write_bytes"]
+            return prediction_from_ns(roofline_ns(demand, hardware, bytes_total), "roofline")
         if ("mathematical_program" in kernel.attributes
                 and kernel.attributes["mathematical_program"] in ("dense_fp16_source_flops_bytes_v1", "dense_bf16_source_flops_bytes_v1")):
             work = {"fp16": dense_fp16_source_logical_work, "bf16": dense_bf16_source_logical_work}[kernel.dtype](kernel)
