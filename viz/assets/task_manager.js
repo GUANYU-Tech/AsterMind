@@ -3,8 +3,21 @@ import {formatProgressLine,formatPhysicalSummary} from './progress_log.js';
 
 export const stateLabels={running:'正在运行',stopping:'正在停止',cancelled:'已手动停止',completed:'已完成',failed:'失败',interrupted:'已中断',paused:'已暂停',aborted:'已提前结束',terminated:'已终止',unknown:'状态暂不可用'};
 const validId=id=>typeof id==='string'&&/^[a-zA-Z0-9_-]+$/.test(id);
-function runDate(id){const m=id.match(/-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})(?:-(\d{6}))?$/);return m?{key:m.slice(1).join(''),text:`${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}:${m[6]}`}:{key:'',text:'创建时间未记录'}}
-function taskName(task){if(task.id.startsWith('native-scene-')&&(!task.title||task.title===task.id||['全部通信使用 FlowSim','卫星内通信使用 ProtoBridge','Cell 内通信使用 ProtoBridge'].includes(task.title)))return '完整场景仿真';if(task.title&&task.title!==task.id)return task.title.replaceAll(' ',' / ');const grid=task.id.match(/^(?:starlink|comm)-([^-]+)-grid-(\d+)x(\d+)-/);return grid?`通信星座 ${grid[1]==='low'?'':grid[1]+' km '}（${grid[2]} 轨道 × ${grid[3]} 星）`:task.id.startsWith('qwen3-')?'计算 Cell 仿真':'仿真实验'}
+function runDate(id){
+  // Physical runs end in a random hex suffix; native runs use microseconds.
+  const match=id.match(/-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})(?:-[0-9a-f]{6})?$/i);
+  if(!match)return {key:'',text:'创建时间未记录'};
+  const [year,month,day,hour,minute,second]=match.slice(1);
+  return {key:match.slice(1).join(''),text:`${year}-${month}-${day} ${hour}:${minute}:${second}`};
+}
+function taskName(task){
+  if(task.id.startsWith('native-scene-')&&(!task.title||task.title===task.id||['全部通信使用 FlowSim','卫星内通信使用 ProtoBridge','Cell 内通信使用 ProtoBridge'].includes(task.title)))return '完整场景仿真';
+  if(task.title&&task.title!==task.id)return task.title.replaceAll(' ',' / ');
+  if(task.id.startsWith('physical-'))return '物理数据生成';
+  const grid=task.id.match(/^(?:starlink|comm)-([^-]+)-grid-(\d+)x(\d+)-/);
+  if(grid)return `通信星座 ${grid[1]==='low'?'':grid[1]+' km '}（${grid[2]} 轨道 × ${grid[3]} 星）`;
+  return task.id.startsWith('qwen3-')?'计算 Cell 仿真':'仿真实验';
+}
 const deletedTaskIds=new Set();
 let taskRevision=0,dialogSerial=0;
 export function rememberTask(id){
@@ -73,7 +86,9 @@ export function renderTask(container,task){
   const heading=document.createElement('h3'),badge=document.createElement('span');
   badge.className='task-badge task-'+task.state;badge.textContent=stateLabels[task.state]||task.state;
   heading.append(badge,document.createTextNode(' '+taskName(task)));
-  const id=document.createElement('small');id.textContent='创建时间 '+runDate(task.id).text;id.title='记录编号：'+task.id;
+  const id=document.createElement('small'),created=runDate(task.id);
+  id.textContent=created.key?'创建时间 '+created.text:created.text;
+  id.title='记录编号：'+task.id;
   const actions=document.createElement('div');actions.className='actions';
   const link=(label,suffix)=>{const a=document.createElement('a');a.className='button';a.href='/runs/'+encodeURIComponent(task.id)+'/'+suffix;a.textContent=label;actions.append(a)};
   link(task.state==='running'?'查看进度与日志':'查看状态与日志','progress?stay=1');
