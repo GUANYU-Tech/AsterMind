@@ -2,19 +2,27 @@ import { defaultValue, resolveSchema } from "./config-form.mjs?v=validation-1";
 import { mappingDraft } from "./config-layout.mjs?v=compact-2";
 import {newInterSatelliteLink} from './link-mode.mjs';
 import {synchronizeResources,setAutomaticDeployment} from './resource-sync.mjs';
+import {fastMode, modelOptions, normalizeComputeSettings} from './compute-config.mjs';
 
 export const networkInputs = config => Object.fromEntries(["hardware", "topology", "constellation", "fso"].map(key => [key, config[key]]));
+
+export function formationPairs(ids, layout) {
+  const pairs = layout === "fully_connected"
+    ? ids.flatMap((source, i) => ids.slice(i + 1).map(target => [source, target]))
+    : ids.slice(1).map((id,index) => [ids[index],id]);
+  if (layout === "ring" && ids.length > 2) pairs.push([ids.at(-1),ids[0]]);
+  return pairs;
+}
 
 export function syncFormationLinks(config) {
   if (config.topology?.source !== "formation" || !config.constellation?.formation) return;
   const ids = config.hardware.satellite_ids;
+  const formation = config.constellation.formation;
   const links = config.topology.inter_satellite.links;
   const key = (a,b) => JSON.stringify([a,b].sort());
   const existing = new Map(links.map(link => [key(link.source,link.target),link]));
   const template = links[0] || newInterSatelliteLink(config, '', '');
-  const pairs = ids.slice(1).map((id,index) => [ids[index],id]);
-  if (config.constellation.formation.layout === "ring" && ids.length > 2) pairs.push([ids.at(-1),ids[0]]);
-  config.topology.inter_satellite.links = pairs.map(([source,target]) => ({
+  config.topology.inter_satellite.links = formationPairs(ids, formation.layout).map(([source,target]) => ({
     ...structuredClone(existing.get(key(source,target)) || template), source, target,
   }));
 }
@@ -47,14 +55,14 @@ export function syncDeployment(config, capabilities, path, previous) {
 }
 
 export const moeModels = new Set(["glm-5.2", "glm-5.2-fp8", "kimi-k2.6", "qwen3-30b-a3b"]);
-export function defaultModelRouting(model, denseRouting) {
-  if (!moeModels.has(model)) return structuredClone(denseRouting);
+export function defaultModelRouting(model, denseRouting, details) {
+  if (!(details ? details.experts : moeModels.has(model))) return structuredClone(denseRouting);
   return {source_kind:"explicit_assumption", source_id:"astermind-web-uniform-topk-seed-0", algorithm:"sha256_weighted_rejection_topk_without_replacement_model_step_v2", root_seed:0, distribution:"maximum_entropy_uniform_topk_v1", hot_expert_count:null, hot_expert_weight:null, replay:null, profile:null, request_stream_sha256:null, vllm_runtime_binding_sha256:null};
 }
 export function newWebConfiguration(capabilities) {
-  const config = structuredClone(capabilities.default_configuration);
+  const config = normalizeComputeSettings(structuredClone(capabilities.default_configuration), capabilities);
   if (config.constellation) config.constellation.earth_orientation_mode = "stk11_compat";
-  config.runtime_inputs.expert_routing = defaultModelRouting(config.model, capabilities.default_configuration.runtime_inputs.expert_routing);
+  config.runtime_inputs.expert_routing = defaultModelRouting(config.model, capabilities.default_configuration.runtime_inputs.expert_routing, capabilities.model_details?.[config.model]);
   syncFormationLinks(config);
   config.deployment.placements = mappingDraft(config);
   return config;
@@ -72,13 +80,32 @@ export function editorChoices(config, capabilities) {
     operation: ["all_reduce", "all_gather", "all_to_all"],
     configured_mode: ["NONE", "FULL", "PIECEWISE", "FULL_DECODE_ONLY", "FULL_AND_PIECEWISE"],
     source_kind: ["not_applicable", "explicit_assumption", "profile_observation", "replay_observation"],
+    modelContext: capabilities.model_details?.[config.model]?.max_context,
+    visible(path) {
+      return !['expert_routing_seed','enable_expert_parallel','data_parallel_size'].includes(path.at(-1))
+        || !!capabilities.model_details?.[config.model]?.experts;
+    },
+    optionLabels: {
+      ...Object.fromEntries((capabilities.compute_modes || []).map(mode => [mode.id, mode.name])),
+      ...Object.fromEntries(Object.entries(capabilities.model_details || {}).map(([id, model]) => [id, model.name])),
+      bf16_timing_proxy: "BF16 计时代理",
+    },
     options(path) {
       if (capabilities.compatibility) {
         const full=path.join('.');
-        if(full==='model') return Object.keys(capabilities.models_by_hardware[config.hardware.default_hardware_id] || {});
+        if(full==='model') return modelOptions(config, capabilities);
+        if(full==='memory_policy_file') return ['', ...capabilities.memory_policies.map(policy=>policy.id)];
+        if(full==='detail_prediction_method') return ['auto', ...capabilities.detail_prediction_methods];
+        if(path[0]==='collective_policies' && path.length===3) {
+          const row=config.collective_policies[path[1]];
+          const scopes=capabilities.collective_algorithms;
+          if(path[2]==='scope') return Object.keys(scopes);
+          if(path[2]==='operation') return Object.keys(scopes[row.scope] || {});
+          if(path[2]==='algorithm') return scopes[row.scope]?.[row.operation]?.choices;
+        }
         if(full==='requests.source') return ['synthetic','canonical'];
         if(full==='requests.synthetic.arrival_distribution') return ['poisson','constant'];
-        if(full==='deployment.mode') return ['colocated','pd_disagg'];
+        if(full==='deployment.mode') return fastMode(config)?['colocated']:['colocated','pd_disagg'];
         if(path[0]==='scheduler' && path.at(-1)==='framework') return ['vllm'];
         if(full==='runtime_inputs.graph_execution.configured_mode') return ['NONE'];
         if(full==='runtime.timing_mode') return ['device_only'];
@@ -92,6 +119,20 @@ export function editorChoices(config, capabilities) {
     onObservation(path, data) { bindObservation(config, path, data); },
     seed(path, raw) {
       const parent = path.at(-2);
+      if (parent === 'collective_policies') {
+        for (const [scope, operations] of Object.entries(capabilities.collective_algorithms)) {
+          for (const [operation, rule] of Object.entries(operations)) {
+            if (!config.collective_policies.some(row => row.scope===scope && row.operation===operation)) {
+              return {scope,operation,algorithm:rule.default};
+            }
+          }
+        }
+        throw Error('全部通信范围和操作均已配置');
+      }
+      if (path.at(-1)==='max_model_len') return 128;
+      if (path.at(-1)==='kv_block_size_tokens') return 16;
+      if (path.at(-1)==='num_kv_blocks') return 64;
+      if (path.at(-1)==='max_batched_tokens') return 256;
       if (parent === "worker_pools") {
         const pool = structuredClone(defaults.deployment.worker_pools[0]);
         let i = config.deployment.worker_pools.length + 1;
@@ -111,6 +152,28 @@ export function editorChoices(config, capabilities) {
 
 export function editDependencies(config, path, value, capabilities, previous) {
   const key = path.at(-1), full = path.join(".");
+  function ensureSupportedModel() {
+    const supported = modelOptions(config, capabilities);
+    if (!supported.length || supported.includes(config.model)) return;
+    const preferred = capabilities.default_configuration.model;
+    config.model = supported.includes(preferred) ? preferred : supported[0];
+    editDependencies(config, ['model'], config.model, capabilities);
+  }
+  if (full === 'compute_mode') {
+    const fast = fastMode(config);
+    config.detail_prediction_method = fast ? null : 'auto';
+    if (fast && config.deployment.mode !== 'colocated') {
+      config.deployment.mode = 'colocated';
+      editDependencies(config, ['deployment','mode'], 'colocated', capabilities);
+    }
+    if (!fast) {
+      config.memory_policy_file = '';
+      config.fast_glm_dsa_score = '';
+    }
+    ensureSupportedModel();
+    synchronizeResources(config, capabilities);
+    return true;
+  }
   if (full === 'deployment.mode' && ['colocated','pd_disagg'].includes(value)) {
     const roles=value==='colocated'?['colocated']:['prefill','decode'];
     const existing=config.deployment.worker_pools;
@@ -121,9 +184,26 @@ export function editDependencies(config, path, value, capabilities, previous) {
       pool.name=role==='colocated'?'main':role; pool.role=role; return pool;
     });
     config.deployment.routes=[];
-    syncDeployment(config,capabilities,path,previous); synchronizeResources(config,capabilities); return true;
+    syncDeployment(config,capabilities,path,previous);
+    ensureSupportedModel();
+    synchronizeResources(config,capabilities); return true;
   }
   if (full === 'topology.inter_satellite.links') return true;
+  if (full === 'topology.intra_satellite.type') {
+    if (value !== 'profile_su') config.hardware.su_group_sizes = [];
+    return true;
+  }
+  if (full === 'hardware.su_group_sizes') return true;
+  if (path[0] === 'collective_policies' && ['scope','operation'].includes(key)) {
+    const row=config.collective_policies[path[1]];
+    const options=capabilities.collective_algorithms[row.scope];
+    if (!options[row.operation]) row.operation=Object.keys(options)[0];
+    const rule=options[row.operation];
+    if (!rule.choices.includes(row.algorithm)) row.algorithm=rule.default;
+    return true;
+  }
+  if (full === 'hardware.accelerators_per_satellite' && config.hardware.su_group_sizes?.length &&
+      config.hardware.su_group_sizes.reduce((sum,n) => sum+n,0) !== value) config.hardware.su_group_sizes=[];
   if (path[0] === "deployment" && path[1] === "worker_pools" && (path.length === 2 || (path.length === 4 && ["name", "role"].includes(key)) || path[3] === "parallelism")) {
     if (path[3] === 'parallelism') setAutomaticDeployment(config, false);
     syncDeployment(config, capabilities, path, previous);
@@ -144,16 +224,30 @@ export function editDependencies(config, path, value, capabilities, previous) {
   if (full === "hardware.satellite_ids") config.hardware.satellite_count = config.hardware.satellite_ids.length;
   if (["hardware.satellite_count", "hardware.satellite_ids", "hardware.accelerators_per_satellite", "hardware.default_hardware_id"].includes(full)) synchronizeResources(config, capabilities);
   if (["constellation.formation.layout", "hardware.satellite_ids"].includes(full)) syncFormationLinks(config);
-  if (full === "hardware.default_hardware_id" && capabilities.models_by_hardware) {
-    const supported = Object.keys(capabilities.models_by_hardware[value] || {});
-    if (supported.length && !supported.includes(config.model)) {
-      config.model = supported.includes(capabilities.default_configuration.model) ? capabilities.default_configuration.model : supported[0];
-      editDependencies(config, ["model"], config.model, capabilities);
-    }
+  if (full === "hardware.default_hardware_id") {
+    const limit = capabilities.su_profiles?.[value]?.fast_gpu_limit_per_satellite;
+    if (config.hardware.su_group_sizes?.some(size => size > limit)) config.hardware.su_group_sizes = [];
+    config.memory_policy_file = '';
+    config.fast_glm_dsa_score = '';
+    ensureSupportedModel();
   }
   if (full === "model") {
-    for (const settings of Object.values(config.scheduler)) if (settings.vllm) settings.vllm.model = value;
-    config.runtime_inputs.expert_routing = defaultModelRouting(value, capabilities.default_configuration.runtime_inputs.expert_routing);
+    const model = capabilities.model_details?.[value];
+    for (const settings of Object.values(config.scheduler)) {
+      if (!settings.vllm) continue;
+      settings.vllm.model = value;
+      settings.vllm.dtype = model?.dtype || 'bfloat16';
+      settings.vllm.max_model_len = null;
+      settings.num_kv_blocks = null;
+      settings.kv_block_size_tokens = null;
+    }
+    if (model && !model.experts) for (const pool of config.deployment.worker_pools) {
+      pool.parallelism.enable_expert_parallel = false;
+      pool.parallelism.data_parallel_size = 1;
+    }
+    config.memory_policy_file = '';
+    config.fast_glm_dsa_score = '';
+    config.runtime_inputs.expert_routing = defaultModelRouting(value, capabilities.default_configuration.runtime_inputs.expert_routing, model);
     synchronizeResources(config, capabilities);
   }
   if (full === "topology.source") {
@@ -186,6 +280,10 @@ export function editDependencies(config, path, value, capabilities, previous) {
       decode_admission_contract_sha256:null, closed_loop_admission_contract_sha256:null,
     } : null;
     settings.sglang = value === "sglang" ? structuredClone(Object.values(capabilities.default_configuration.scheduler)[0].sglang) : null;
+  }
+  if (path[0] === 'scheduler' && key === 'enable_chunked_prefill') {
+    if (!value) config.scheduler[path[1]].vllm.long_prefill_token_threshold = 0;
+    return true;
   }
   if (path.includes("collectives") && ["algorithm", "operation"].includes(key)) {
     const collective = path.slice(0, -1).reduce((v, k) => v[k], config);

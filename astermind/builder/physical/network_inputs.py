@@ -4,6 +4,7 @@ from copy import deepcopy
 from pathlib import Path
 import math
 
+from astermind.builder.physical.formation_geometry import static_formation_offsets
 from astermind.builder.orbit import walker_delta_elements, tle_elements, dawn_dusk_elements
 
 
@@ -55,6 +56,68 @@ def snapshot_network_input(manifest, base_dir=".", *, bind_islsim=False):
     return result
 
 
+
+def _formation_geometry(cluster, count, motion):
+    shape = (f"{count}x1" if motion == "static_formation" else cluster.get("grid_shape", f"{count}x1")).lower().split("x")
+    if (
+        len(shape) != 2
+        or any(not x.isdigit() or int(x) < 1 for x in shape)
+        or math.prod(map(int, shape)) != count
+    ):
+        raise ValueError(
+            "grid_shape dimensions must multiply to satellites_per_cluster"
+        )
+    columns, rows = map(int, shape)
+    pitch = float(cluster.get("formation_pitch_m", 500.0))
+    keepout = float(cluster.get("d_keepout_m", 0.0))
+    if (
+        not math.isfinite(pitch)
+        or pitch <= 0
+        or not math.isfinite(keepout)
+        or keepout < 0
+        or (count > 1 and pitch <= keepout)
+    ):
+        raise ValueError(
+            "formation pitch must be positive and greater than keepout"
+        )
+    if cluster.get("formation_frame", "lvlh") != "lvlh":
+        raise ValueError("formation_frame must be lvlh")
+    offsets = cluster.get('member_offsets_m')
+    if motion == 'reference_fixed_lvlh':
+        if offsets is None:
+            raise ValueError('reference_fixed_lvlh requires member_offsets_m')
+        if not isinstance(offsets, list) or len(offsets) != count:
+            raise ValueError('member_offsets_m must contain one vector per member in ID order')
+        if any(not isinstance(v, (list, tuple)) or len(v) != 3 or
+               any(isinstance(x, bool) or not isinstance(x, (float, int)) or not math.isfinite(x) for x in v)
+               for v in offsets):
+            raise ValueError('member_offsets_m requires finite three-component vectors in metres')
+        if type(cluster.get('reference_member', 0)) is not int or cluster.get('reference_member', 0) != 0 or any(offsets[0]):
+            raise ValueError('reference member must be member 0 with zero offset')
+        for i, a in enumerate(offsets):
+            for b in offsets[i+1:]:
+                if math.dist(a, b) <= keepout:
+                    raise ValueError('member offsets must be distinct and exceed keepout')
+    elif offsets is not None:
+        raise ValueError('member_offsets_m requires reference_fixed_lvlh')
+    return columns, rows, pitch, keepout, offsets
+
+
+def _cell_geometry_overrides(formation, cell_ids, *, observed=False):
+    overrides = formation.get('cell_overrides', {})
+    if not isinstance(overrides, dict) or set(overrides) - set(cell_ids):
+        raise ValueError('cell_overrides must reference members of the physical formation')
+    allowed = {'topology'} if observed else {
+        'topology', 'satellites_per_cluster', 'grid_shape', 'formation_pitch_m', 'altitude_km', 'motion_model',
+    }
+    for cell, options in overrides.items():
+        if not isinstance(options, dict) or set(options) - allowed:
+            raise ValueError(f'Cell {cell} has invalid physical overrides')
+        if 'motion_model' in options and options['motion_model'] != 'static_formation':
+            raise ValueError(f'Cell {cell} has an unsupported motion override')
+    return overrides
+
+
 def materialize_network_input(manifest, base_dir="."):
     result = snapshot_network_input(manifest, base_dir)
     result.setdefault("time", {}).setdefault("step_s", 1.0)
@@ -92,7 +155,7 @@ def materialize_network_input(manifest, base_dir="."):
     sources = []
     epoch = result["time"]["epoch_utc"]
 
-    def source_rows(source, name, compute=False, topology='grid'):
+    def source_rows(source, name, compute=False, topology='grid', *, record=True):
         kind = source["type"]
         if kind in {"walker_delta", "dawn_dusk"}:
             params = {
@@ -131,16 +194,17 @@ def materialize_network_input(manifest, base_dir="."):
                 rows, layout, indexing = sparse_tle_layout(bundle, source, epoch)
         else:
             raise ValueError("source.type must be walker_delta, dawn_dusk, or tle")
-        sources.append(
-            dict(
-                name=name,
-                type=kind,
-                observationally_fitted=kind == "tle",
-                indexing="plane_slot"
-                if kind in {'walker_delta', 'dawn_dusk'}
-                else indexing,
+        if record:
+            sources.append(
+                dict(
+                    name=name,
+                    type=kind,
+                    observationally_fitted=kind == "tle",
+                    indexing="plane_slot"
+                    if kind in {'walker_delta', 'dawn_dusk'}
+                    else indexing,
+                )
             )
-        )
         return rows, layout
 
     for shell in config.get("communication_shells", ()):
@@ -235,13 +299,14 @@ def materialize_network_input(manifest, base_dir="."):
             groups = formation['source'].get('cell_members')
             if not isinstance(groups, dict) or not groups:
                 raise ValueError('compute TLE requires source.cell_members: cell ID -> ordered catalog numbers')
+            overrides = _cell_geometry_overrides(formation, (f'{name}-{key}' for key in groups), observed=True)
             membership = []
             for cell_name, catalog in groups.items():
                 if (not isinstance(cell_name, str) or not cell_name or not isinstance(catalog, (list, tuple))
                     or len(catalog) != count or any(str(k) not in by_catalog for k in catalog)):
                     raise ValueError('compute TLE cell_members must match satellites_per_cluster and known catalog numbers')
                 cell = f'{name}-{cell_name}'
-                cell_topologies[cell] = formation.get('topology', 'ring')
+                cell_topologies[cell] = overrides.get(cell, {}).get('topology', formation.get('topology', 'ring'))
                 cell_egress_policies[cell] = egress
                 for member, number in enumerate(catalog):
                     membership.append(str(number))
@@ -261,66 +326,52 @@ def materialize_network_input(manifest, base_dir="."):
             continue
         hubs, layout = source_rows(formation["source"], name, True)
         motion = cluster.get('motion_model', 'free_sgp4')
-        if motion not in {'free_sgp4', 'reference_fixed_lvlh'}:
-            raise ValueError('motion_model must be free_sgp4 or reference_fixed_lvlh')
-        shape = cluster.get("grid_shape", f"{count}x1").lower().split("x")
-        if (
-            len(shape) != 2
-            or any(not x.isdigit() or int(x) < 1 for x in shape)
-            or math.prod(map(int, shape)) != count
-        ):
-            raise ValueError(
-                "grid_shape dimensions must multiply to satellites_per_cluster"
-            )
-        columns, rows = map(int, shape)
-        pitch = float(cluster.get("formation_pitch_m", 500.0))
-        keepout = float(cluster.get("d_keepout_m", 0.0))
-        if (
-            not math.isfinite(pitch)
-            or pitch <= 0
-            or not math.isfinite(keepout)
-            or keepout < 0
-            or (count > 1 and pitch <= keepout)
-        ):
-            raise ValueError(
-                "formation pitch must be positive and greater than keepout"
-            )
-        if cluster.get("formation_frame", "lvlh") != "lvlh":
-            raise ValueError("formation_frame must be lvlh")
-        offsets = cluster.get('member_offsets_m')
-        if motion == 'reference_fixed_lvlh':
-            if offsets is None:
-                raise ValueError('reference_fixed_lvlh requires member_offsets_m')
-            if not isinstance(offsets, list) or len(offsets) != count:
-                raise ValueError('member_offsets_m must contain one vector per member in ID order')
-            if any(not isinstance(v, (list, tuple)) or len(v) != 3 or
-                   any(isinstance(x, bool) or not isinstance(x, (float, int)) or not math.isfinite(x) for x in v)
-                   for v in offsets):
-                raise ValueError('member_offsets_m requires finite three-component vectors in metres')
-            if type(cluster.get('reference_member', 0)) is not int or cluster.get('reference_member', 0) != 0 or any(offsets[0]):
-                raise ValueError('reference member must be member 0 with zero offset')
-            for i, a in enumerate(offsets):
-                for b in offsets[i+1:]:
-                    if math.dist(a, b) <= keepout:
-                        raise ValueError('member offsets must be distinct and exceed keepout')
-        elif offsets is not None:
-            raise ValueError('member_offsets_m requires reference_fixed_lvlh')
+        if motion not in {'free_sgp4', 'reference_fixed_lvlh', 'static_formation'}:
+            raise ValueError('unknown formation motion_model')
+        default_geometry = _formation_geometry(cluster, count, motion)
+        overrides = _cell_geometry_overrides(formation, (hub['satellite_id'] for hub in hubs))
+        altitude_hubs = {}
         for hub, (plane, slot) in zip(hubs, layout):
             cell = hub["satellite_id"]
-            cell_topologies[cell] = formation.get("topology", "ring")
+            override = overrides.get(cell, {})
+            cell_count = override.get('satellites_per_cluster', count)
+            if type(cell_count) is not int or cell_count < 1:
+                raise ValueError(f'Cell {cell} satellite count must be positive')
+            cell_cluster = {**cluster, **{key: override[key] for key in ('grid_shape', 'formation_pitch_m') if key in override}}
+            cell_motion = override.get('motion_model', motion)
+            geometry = _formation_geometry(cell_cluster, cell_count, cell_motion) if override else default_geometry
+            columns, rows, pitch, keepout, offsets = geometry
+            cell_ingresses = list(range(cell_count)) if egress == 'free' else ingress_members
+            if any(index >= cell_count for index in cell_ingresses):
+                raise ValueError(f'Cell {cell} has an ingress index outside its physical members')
+            if 'altitude_km' in override:
+                altitude = override['altitude_km']
+                if type(altitude) not in (int, float) or not math.isfinite(altitude) or altitude <= 0:
+                    raise ValueError(f'Cell {cell} altitude must be positive and finite')
+                if altitude not in altitude_hubs:
+                    alternative, _ = source_rows({**formation['source'], 'altitude_km': altitude}, name, True, record=False)
+                    altitude_hubs[altitude] = {row['satellite_id']: row for row in alternative}
+                hub = altitude_hubs[altitude][cell]
+            cell_topologies[cell] = override.get('topology', formation.get("topology", "ring"))
             cell_egress_policies[cell] = egress
             n = hub["mean_motion_rev_per_day"] * 2 * math.pi / 86400
             radius = (398600.8 / n**2) ** (1 / 3)
             inclination = math.radians(hub["inclination_deg"])
             u = math.radians(hub["mean_anomaly_deg"] + hub["argument_of_perigee_deg"])
-            for member in range(count):
+            static_offsets = None
+            if cell_motion == 'static_formation':
+                altitude = override.get('altitude_km', formation['source']['altitude_km'])
+                static_offsets = static_formation_offsets(cell_count, cell_topologies[cell], pitch / 1000, altitude)
+            for member in range(cell_count):
                 row = deepcopy(hub)
-                along = ((member % columns) - (columns - 1) / 2) * pitch / 1000
-                across = ((member // columns) - (rows - 1) / 2) * pitch / 1000
-                if motion == 'reference_fixed_lvlh':
-                    row['satellite_id'] = f'{cell}-m{member:03d}'
+                row['satellite_id'] = f'{cell}-m{member:03d}'
+                if static_offsets is not None:
+                    row['fixed_lvlh_offset_km'] = list(static_offsets[member])
+                elif cell_motion == 'reference_fixed_lvlh':
                     row['fixed_lvlh_offset_km'] = [float(x) / 1000 for x in offsets[member]]
                 else:
+                    along = ((member % columns) - (columns - 1) / 2) * pitch / 1000
+                    across = ((member // columns) - (rows - 1) / 2) * pitch / 1000
                     if abs(math.sin(inclination)) < 1e-8 and abs(across) > 0:
                         raise ValueError(
                             "equatorial cross-track formation requires explicit member elements"
@@ -336,7 +387,6 @@ def materialize_network_input(manifest, base_dir="."):
                     # Compensate the eccentricity-induced along-track offset so
                     # the requested initial along/cross grid is preserved.
                     du = (along - 2 * across) / radius - math.cos(inclination) * draan
-                    row["satellite_id"] = f"{cell}-m{member:03d}"
                     row["raan_deg"] = _wrap_degrees(hub["raan_deg"] + math.degrees(draan))
                     row["inclination_deg"] = hub["inclination_deg"] + math.degrees(di)
                     omega = math.radians(hub['argument_of_perigee_deg'])
@@ -355,10 +405,10 @@ def materialize_network_input(manifest, base_dir="."):
                 elements.append(row)
                 if (
                     any(
-                        type(i) is not int or not 0 <= i < count
-                        for i in ingress_members
+                        type(i) is not int or not 0 <= i < cell_count
+                        for i in cell_ingresses
                     )
-                    or not ingress_members
+                    or not cell_ingresses
                 ):
                     raise ValueError(
                         "ingress_members must identify physical cell members"
@@ -369,7 +419,7 @@ def materialize_network_input(manifest, base_dir="."):
                         role="compute",
                         shell_id=name,
                         cell_id=cell,
-                        cell_ingress=member in ingress_members,
+                        cell_ingress=member in cell_ingresses,
                         compute_target=member == 0,
                         isl_terminals=formation.get("isl_terminals", 4),
                         sgl_terminals=formation.get("sgl_terminals", 1 if actual_scenario == 'compute_only' else 0),
@@ -385,6 +435,7 @@ def materialize_network_input(manifest, base_dir="."):
                 "formation uncertainty parameters must be finite and nonnegative"
             )
         uncertainty = math.hypot(*sigmas)
+        _, _, pitch, keepout, _ = default_geometry
         sources[-1].update(
             formation_motion="free_sgp4_ei_separated_mean_element_offsets_v2",
             separation_design="parallel_relative_eccentricity_and_inclination_vectors",
@@ -393,6 +444,14 @@ def materialize_network_input(manifest, base_dir="."):
             keepout_m=keepout + 3 * uncertainty,
             uncertainty_model="three_sigma_clearance_margin_no_stochastic_displacement",
         )
+        if overrides:
+            sources[-1]['cell_overrides'] = deepcopy(overrides)
+        if motion == 'static_formation':
+            sources[-1].update(formation_motion='reference_sgp4_static_formation',
+                separation_design='prescribed_equal_altitude_chord_spacing', separation_reference=None)
+        elif any(row.get('motion_model') == 'static_formation' for row in overrides.values()):
+            sources[-1]['default_formation_motion'] = sources[-1]['formation_motion']
+            sources[-1]['formation_motion'] = 'per_cell_motion_overrides'
         if motion == 'reference_fixed_lvlh':
             sources[-1].update(formation_motion='reference_sgp4_fixed_lvlh',
                 separation_design='prescribed_rigid_offsets_not_free_member_orbits',

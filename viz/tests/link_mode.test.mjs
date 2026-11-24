@@ -80,3 +80,17 @@ test('ISLSim keeps imported optical parameters and defaults to automatic baud se
   assert.equal(visibleField(['fso','tx','baud_rate_options_ghz']),true);
   assert.equal(visibleField(['fso','tx','beam_waist_m']),false);
 });
+
+test('resizing a fully connected formation retains the preset and every satellite pair', () => {
+  const config = fixture();
+  setLinkMode(config, 'fixed');
+  config.constellation.formation.layout = 'fully_connected';
+  for (const count of [4,5,10,35,2]) {
+    const ids = Array.from({length:count}, (_,index)=>'sat-'+index);
+    Object.assign(config.hardware,{satellite_count:count,satellite_ids:ids});
+    syncFormationLinks(config);
+    assert.equal(config.constellation.formation.layout,'fully_connected');
+    assert.deepEqual(config.topology.inter_satellite.links.map(({source,target})=>[source,target]),
+      ids.flatMap((source,index)=>ids.slice(index+1).map(target=>[source,target])));
+  }
+});

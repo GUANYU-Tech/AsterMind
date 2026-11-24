@@ -73,6 +73,24 @@ test('PD pools receive the same parallel shape and disjoint physical cards', () 
   assertCoverage(config);
 });
 
+test('Fast Mode maps every replica and retains manual assignments by DP coordinate', () => {
+  const config = fixture(2, 4, 2, 2);
+  config.compute_mode = 'fast_mode';
+  const pool = config.deployment.worker_pools[0];
+  Object.assign(pool.parallelism, {data_parallel_size:2, enable_expert_parallel:true});
+  config.deployment.placements = [{
+    worker_pool:pool.name, parallel_coordinate:{dp:1, pp:0, cp:0, tp:0},
+    satellite_id:'sat-0', local_index:0,
+  }];
+  config.deployment.placements = mappingDraft(config);
+  assertCoverage(config);
+  assert.equal(deploymentCapacity(config).required,8);
+  assert.deepEqual(config.deployment.placements.map(({parallel_coordinate:p})=>[p.dp,p.pp,p.tp]), [
+    [0,0,0],[0,0,1],[0,1,0],[0,1,1],[1,0,0],[1,0,1],[1,1,0],[1,1,1],
+  ]);
+  assert.equal(locations(config.deployment.placements)[4],'sat-0/0');
+});
+
 test('odd inventory leaves spare cards idle; unsupported parallelism still fails explicitly', () => {
   const config = fixture(3,1,1,1);
   const second = structuredClone(config.deployment.worker_pools[0]); second.name = 'decode';

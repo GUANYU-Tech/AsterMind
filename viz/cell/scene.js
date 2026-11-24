@@ -3,7 +3,7 @@ import * as THREE from "three";
 import { OrbitControls } from "./vendor/OrbitControls.js?v=compact-2";
 import { sceneData } from "./scene-data.mjs?v=compact-2";
 
-import { formationDisplay, orbitDisplay, focusedViewDistance } from "./scene-geometry.mjs?v=scale-3";
+import { formationDisplay, orbitDisplay, focusedViewDistance, placeMemberLabel } from "./scene-geometry.mjs?v=scale-3";
 
 const TAU = Math.PI * 2;
 const DEG = Math.PI / 180;
@@ -800,10 +800,15 @@ export class AsterMindScene {
     this.orientSatelliteVisuals();
   }
 
+  usesStaticFormationView() {
+    return sceneState.geometrySource === "formation" && !sceneState.physicalPositions;
+  }
+
   orientSatelliteVisuals() {
     // Choose a readable initial spacecraft attitude independently of the Cell's
     // location. Keep it fixed during editing and subsequent manual camera moves.
-    const view = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0,0,1), this.configViewRadial);
+    const direction = this.usesStaticFormationView() ? this.configRadial : this.configViewRadial;
+    const view = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0,0,1), direction);
     const localView = this.configRoot.quaternion.clone().invert().multiply(view);
     this.satellites.forEach((satellite, index) => {
       const attitude = new THREE.Quaternion().setFromEuler(new THREE.Euler(.95, .15 + (index % 4) * .04, .25));
@@ -815,7 +820,9 @@ export class AsterMindScene {
     if (sceneState.geometrySource === "orbit" && sceneState.orbitPositions) {
       return {positions:sceneState.orbitPositions, orbitRadius:0, satelliteScale:.3};
     }
-    return formationDisplay(sceneState.nodeCount, sceneState.layout, sceneState.spacingKm, sceneState.altitudeKm);
+    const model = formationDisplay(sceneState.nodeCount, sceneState.layout, sceneState.spacingKm, sceneState.altitudeKm);
+    if (sceneState.physicalPositions) model.positions = sceneState.physicalPositions.map(point => point.map(v => v * model.displayRadius));
+    return model;
   }
 
   applyFormationFrame() {
@@ -922,7 +929,16 @@ export class AsterMindScene {
       host.replaceChildren();
       this.nodeLabels = this.satellites.map((satellite, index) => {
         const label = document.createElement("span");
-        label.className = "node-label"; label.textContent = sceneState.nodeIds?.[index] || `sat-${index}`;
+        label.className = "node-label";
+        if (this.callbacks?.memberLabel) {
+          label.tabIndex = 0;
+          label.setAttribute("role", "img");
+          label.onfocus = label.onmouseenter = () => this.callbacks.onMemberHover(index);
+          label.onblur = label.onmouseleave = () => {
+            if (document.activeElement !== label) this.callbacks.onMemberHover(null);
+          };
+        }
+        this.updateMemberLabel(label,index);
         host.append(label); return {satellite,label};
       });
     }
@@ -1001,9 +1017,10 @@ export class AsterMindScene {
         : null;
       const nextFormationNode = this.stage === "formation"
         || this.stage === "hardware"
-        || this.stage === "terminal"
+        || this.stage === "terminal" || this.callbacks?.onMemberHover
         ? this.raycaster.intersectObjects(this.localSatelliteMeshes, false)[0]?.object || null
         : null;
+      this.callbacks?.onMemberHover?.(nextFormationNode?.userData.formationNodeIndex ?? null);
       if (nextLink !== this.hoveredLink) {
         if (this.hoveredLink) this.setLinkHover(this.hoveredLink, false);
         this.hoveredLink = nextLink;
@@ -1058,6 +1075,8 @@ export class AsterMindScene {
         }
       }
     });
+
+    this.canvas.addEventListener("pointerleave", () => this.callbacks?.onMemberHover?.(null));
 
     this.canvas.addEventListener("dblclick", (event) => {
       if (this.stage !== "hardware" && this.stage !== "terminal") return;
@@ -1185,6 +1204,17 @@ export class AsterMindScene {
     });
   }
 
+  updateMemberLabel(label, index) {
+    const id = sceneState.nodeIds?.[index] || `sat-${index}`;
+    label.textContent = this.callbacks?.memberLabel?.(id, index) ?? id;
+    if (this.callbacks?.memberLabel) {
+      label.title = id;
+      label.setAttribute("aria-label", id);
+      label.style.width = (14 + label.textContent.length * 7) + "px";
+      label.style.height = "20px";
+    }
+  }
+
   updateConfig() {
     const model = this.displayModel();
     const signature = JSON.stringify([model.positions, model.orbitRadius, sceneState.geometrySource, sceneState.explicitEdges]);
@@ -1194,7 +1224,7 @@ export class AsterMindScene {
     }
     // Names/card inventory/link prediction do not own the camera or orientation.
     (this.nodeLabels || []).forEach(({label}, index) => {
-      label.textContent = sceneState.nodeIds?.[index] || "";
+      this.updateMemberLabel(label, index);
     });
   }
 
@@ -1204,12 +1234,16 @@ export class AsterMindScene {
     this.currentViewOffset = 0;
     this.camera.clearViewOffset();
     this.configRoot.updateMatrixWorld(true);
-    const direction = preserveDirection ? this.camera.position.clone().sub(this.controls.target).normalize() : this.configViewRadial;
+    // The synthetic formation lies in the local tangent plane. View it face-on
+    // on entry and reset so an equal-radius ring also projects to a circle.
+    const staticLayout = this.usesStaticFormationView();
+    const defaultDirection = staticLayout ? this.configRadial : this.configViewRadial;
+    const direction = preserveDirection ? this.camera.position.clone().sub(this.controls.target).normalize() : defaultDirection;
     const inverse = new THREE.Quaternion().setFromUnitVectors(direction, new THREE.Vector3(0,0,1));
     const world = this.satellites.map(satellite => satellite.getWorldPosition(new THREE.Vector3()));
     const target = world.reduce((center,point)=>center.add(point), new THREE.Vector3()).divideScalar(world.length || 1);
     const points = world.map(point=>point.clone().sub(target).applyQuaternion(inverse).toArray());
-    const distance = focusedViewDistance(points, this.camera.aspect, this.camera.fov);
+    const distance = focusedViewDistance(points, this.camera.aspect, this.camera.fov, staticLayout ? .9 : 2.4);
     this.camera.far = Math.max(80, distance * 6);
     this.camera.position.copy(target).addScaledVector(direction,distance);
     this.controls.target.copy(target);
@@ -1446,15 +1480,30 @@ export class AsterMindScene {
       action.style.left = `${rect.left + (point.x+1)*rect.width/2}px`;
       action.style.top = `${rect.top + (1-point.y)*rect.height/2}px`;
     }
+    const occupied = [];
     for (const {satellite,label} of this.nodeLabels || []) {
-      const point = satellite.getWorldPosition(new THREE.Vector3()).project(this.camera);
       const world = satellite.getWorldPosition(new THREE.Vector3());
+      const point = world.clone().project(this.camera);
       const sightline = world.clone().sub(this.camera.position);
       const fraction = THREE.MathUtils.clamp(-this.camera.position.dot(sightline) / sightline.lengthSq(), 0, 1);
       const occluded = this.camera.position.clone().addScaledVector(sightline, fraction).length() < 2.03;
-      label.hidden = occluded || !this.configRoot.visible || Math.abs(point.x) > .98 || Math.abs(point.y) > .98 || point.z < -1 || point.z > 1;
-      label.style.left = `${rect.left + (point.x+1)*rect.width/2 + 12}px`;
-      label.style.top = `${rect.top + (1-point.y)*rect.height/2 + 18}px`;
+      if (occluded || !this.configRoot.visible || Math.abs(point.x) > .98 || Math.abs(point.y) > .98 || point.z < -1 || point.z > 1) {
+        label.hidden = true;
+        continue;
+      }
+      const x = rect.left + (point.x + 1) * rect.width / 2;
+      const y = rect.top + (1 - point.y) * rect.height / 2;
+      let left = x + 12, top = y + 18;
+      if (this.callbacks?.memberLabel) {
+        const box = placeMemberLabel(x, y, parseFloat(label.style.width), parseFloat(label.style.height), rect, occupied);
+        if (!box) { label.hidden = true; continue; }
+        occupied.push(box);
+        left = box.left;
+        top = box.top;
+      }
+      label.hidden = false;
+      label.style.left = `${left}px`;
+      label.style.top = `${top}px`;
     }
     this.renderer.render(this.scene, this.camera);
   }
@@ -1492,7 +1541,8 @@ export class AsterMindScene {
   }
 }
 
-export function syncSceneConfiguration(scene, config, preview = null) {
+export function syncSceneConfiguration(scene, config, preview = null, memberPositions = null) {
+  sceneState.physicalPositions = memberPositions;
   const ids = config.hardware?.satellite_ids || [];
   sceneState.nodeCount = ids.length;
   sceneState.nodeIds = ids;

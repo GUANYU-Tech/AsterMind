@@ -1,4 +1,9 @@
+export const formationNames = {ring:"环形编队", chain:"链式编队", fully_connected:"全连接编队"};
+
 export const labels = {
+  su_group_sizes:"每星 SU 分组", ep_strategy:"专家并行通信", collective_policies:"集合通信规则", scope:"通信范围",
+  compute_mode:"计算模式", detail_prediction_method:"详细预测方法", memory_policy_file:"显存策略",
+  fast_glm_dsa_score:"GLM DSA 计时", expert_routing_seed:"专家路由种子", long_prefill_token_threshold:"长 Prefill 阈值 / token",
   model:"模型", source:"输入来源", synthetic:"合成请求", production:"生产 Trace", requests:"请求流",
   num_requests:"请求数量", request_rate:"每秒到达请求数", input_lengths:"输入 Token 长度", output_lengths:"输出 Token 长度",
   arrival_distribution:"到达分布", seed:"随机种子", arrival_rate_scale:"到达率缩放", closed_loop_client_count:"闭环客户端数",
@@ -8,7 +13,7 @@ export const labels = {
   field_name:"字段名称", accepted_value:"匹配值", provenance:"来源说明",
   satellite_count:"算力卫星", accelerators_per_satellite:"每星算力卡", satellite_ids:"卫星 ID 列表",
   default_hardware_id:"统一卡型号", accelerator_overrides:"逐卡型号覆盖", hardware_id:"卡型号",
-  satellite_id:"卫星 ID", local_index:"星内卡 ID", intra_satellite_bandwidth_gbps:"星内带宽 / Gbps", intra_satellite_latency_ns:"星内时延 / ns",
+  satellite_id:"卫星 ID", local_index:"星内卡 ID", intra_satellite_bandwidth_gbps:"星内互联带宽 / Gbps", intra_satellite_latency_ns:"星内互联时延 / ns",
   formation:"编队构型", layout:"构型", spacing_km:"编队间距 / km", altitude_km:"轨道高度 / km",
   timestamp:"冻结时刻 / 含时区", earth_orientation_mode:"地球定向模式", tle_file:"已导入 TLE",
   type:"拓扑类型", gateway_local_index:"网关卡 ID", max_range_km:"最大距离 / km", drop_infeasible_links:"剔除不可行光链路",
@@ -41,12 +46,15 @@ export const labels = {
   uniform_decode_query_len:"统一 Decode query 长度", launch_policy:"Kernel launch 策略",
   kv_cache:"KV 分层", tiers:"存储层级", capacity_bytes:"容量 / B", block_size_tokens:"每 block Token 数", bytes_per_token:"每 Token 字节数",
   offload_policy:"换出策略", replay_files:"各 pool 的 KV 回放", pcie_latency:"各型号 PCIe 时延", latency_ns:"时延 / ns",
-  timing_mode:"耗时建模范围", timeout_seconds:"运行超时 / s", output_directory:"结果目录（服务端管理）",
+  timing_mode:"耗时建模范围", output_directory:"结果目录（服务端管理）",
   host_evidence_directory:"Host 证据目录（服务端管理）", dispatch_service_time_s:"Router 派发耗时 / s",
 };
 export const optionLabels = {
+  auto:"自动", profile_su:"SU 分域互联（按卡型）", single_su:"同一 SU 域", intra_cross_su:"同星跨 SU 域", inter_satellite:"跨卫星",
+  allgather:"AllGather / ReduceScatter", direct:"Direct",
+  midlayer:"Midlayer", roofline:"Roofline",
   nvidia_h200:"NVIDIA H200", nvidia_a800:"NVIDIA A800", metax_c500:"MetaX C500", ascend_910b:"Ascend 910B", formation:"静态编队", orbit:"TLE 轨道", file:"拓扑文件",
-  synthetic:"合成请求", canonical:"标准请求文件", production:"生产 Trace", switch:"Switch", fully_connected:"Fully Connected", ring:"Ring", chain:"链式",
+  synthetic:"合成请求", canonical:"标准请求文件", production:"生产 Trace", switch:"共享交换互联", fully_connected:"全连接", ring:"环形", chain:"链式",
   device_only:"仅设备执行", device_plus_launch:"设备 + 主机启动", device_plus_launch_plus_scheduler:"设备 + 启动 + 调度",
   colocated:"同池部署", pd_disagg:"Prefill / Decode 分离", af_disagg:"Attention / FFN 分离", pd_af_disagg:"PD + AF 分离",
 };

@@ -8,7 +8,7 @@ export function formationDisplay(count, layout, spacingKm, altitudeKm) {
   const spacing = Math.max(0, Number(spacingKm) || 0);
   const altitude = Math.max(0, Number(altitudeKm) || 0);
   const orbitRadius = EARTH_RADIUS * (1 + ALTITUDE_GAIN * altitude / EARTH_RADIUS_KM);
-  const physicalRadius = count < 2 ? 0 : layout === 'ring'
+  const physicalRadius = count < 2 ? 0 : (layout === 'ring' || layout === 'fully_connected')
     ? spacing / (2 * Math.sin(Math.PI / count)) : spacing * (count - 1) / 2;
   // A compact enlargement with a hard asymptotic bound, shared by both layouts.
   // Increasing distance never changes orientation or camera framing.
@@ -42,9 +42,30 @@ export function orbitDisplay(config, preview) {
   return selected.map(({ecef_position_km:[x,y,z]}) => [x,z,-y].map(v=>v*EARTH_RADIUS/EARTH_RADIUS_KM));
 }
 
-export function focusedViewDistance(points, aspect, fov = 42) {
+export function focusedViewDistance(points, aspect, fov = 42, minimum = 2.4) {
   const vertical = Math.tan(fov * Math.PI / 360);
   const horizontal = vertical * Math.max(.1, aspect);
-  return Math.max(2.4, ...points.map(([x,y,z]) =>
+  return Math.max(minimum, ...points.map(([x,y,z]) =>
     z + Math.max((Math.abs(x)+.18)/horizontal, (Math.abs(y)+.18)/vertical))) * 1.08;
+}
+
+// Try nearby positions in a stable order as the camera moves. Bounds are in CSS pixels.
+export function placeMemberLabel(x, y, width, height, viewport, occupied) {
+  const gap = 5;
+  const rightSide = x + gap, leftSide = x - gap - width;
+  const above = y - gap - height, below = y + gap, middle = x - width / 2;
+  const centeredY = y - height / 2;
+  const candidates = [
+    [rightSide,below], [leftSide,below], [rightSide,above], [leftSide,above],
+    [middle,above], [middle,below], [rightSide,centeredY], [leftSide,centeredY],
+  ];
+  for (const [candidateX, candidateY] of candidates) {
+    const left = Math.round(candidateX), top = Math.round(candidateY);
+    const box = {left,top,right:left + width,bottom:top + height};
+    if (left < viewport.left || box.right > viewport.right || top < viewport.top || box.bottom > viewport.bottom) continue;
+    if (occupied.some(other => left < other.right + 2 && box.right + 2 > other.left &&
+      top < other.bottom + 2 && box.bottom + 2 > other.top)) continue;
+    return box;
+  }
+  return null;
 }

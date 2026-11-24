@@ -1,6 +1,11 @@
 const positive = value => Number.isSafeInteger(value) && value > 0;
-const supported = pool => ['data_parallel_size', 'context_parallel_size', 'sequence_parallel_size']
-  .every(key => (pool.parallelism?.[key] ?? 1) === 1);
+import {fastMode} from './compute-config.mjs';
+
+const replicas = pool => pool.parallelism.data_parallel_size ?? 1;
+const requiredCards = pool => pool.parallelism.tensor_parallel_size * pool.parallelism.pipeline_parallel_size * replicas(pool);
+const supported = (config, pool) => ['context_parallel_size', 'sequence_parallel_size']
+  .every(key => (pool.parallelism?.[key] ?? 1) === 1)
+  && (replicas(pool) === 1 || (fastMode(config) || config.compute_mode === 'detail_mode') && positive(replicas(pool)));
 
 function executableShape(config, shape, tp, pp) {
   const pools=config.deployment.worker_pools;
@@ -20,36 +25,38 @@ function executableShape(config, shape, tp, pp) {
 export function deploymentCapacity(config) {
   const hardware = config.hardware, pools = config.deployment.worker_pools;
   const physical = hardware.satellite_ids.length * hardware.accelerators_per_satellite;
-  const required = pools.reduce((sum, pool) => sum + pool.parallelism.tensor_parallel_size * pool.parallelism.pipeline_parallel_size, 0);
+  const required = pools.reduce((sum, pool) => sum + requiredCards(pool), 0);
   return {physical, required, pools};
 }
 
 export function mappingDraft(config, {reset = false} = {}) {
   const {hardware, deployment} = config;
   const pools = deployment.worker_pools;
-  if (!positive(hardware.accelerators_per_satellite) || pools.some(pool => !supported(pool)
+  if (!positive(hardware.accelerators_per_satellite) || pools.some(pool => !supported(config, pool)
     || !positive(pool.parallelism.tensor_parallel_size) || !positive(pool.parallelism.pipeline_parallel_size)
     || pool.parallelism.tensor_parallel_size > 1024 || pool.parallelism.pipeline_parallel_size > 1024
-    || pool.parallelism.tensor_parallel_size * pool.parallelism.pipeline_parallel_size > 4096)) return deployment.placements;
+    || requiredCards(pool) > 4096)) return deployment.placements;
   const ids = hardware.satellite_ids;
   if (new Set(ids).size !== ids.length || ids.some(id => typeof id !== 'string' || !id.trim())) return deployment.placements;
   const old = new Map();
-  const rankKey = row => JSON.stringify([row.worker_pool, row.parallel_coordinate.pp, row.parallel_coordinate.tp]);
+  const rankKey = row => JSON.stringify([row.worker_pool, row.parallel_coordinate.dp ?? 0, row.parallel_coordinate.pp, row.parallel_coordinate.tp]);
   for (const row of reset ? [] : deployment.placements) {
-    if (row.parallel_coordinate && (row.parallel_coordinate.dp || 0) === 0 && (row.parallel_coordinate.cp || 0) === 0) old.set(rankKey(row), row);
+    if (row.parallel_coordinate && (row.parallel_coordinate.cp || 0) === 0) old.set(rankKey(row), row);
   }
   const rows = [];
   const occupied = new Set();
   const location = row => JSON.stringify([row.satellite_id, row.local_index]);
   for (const pool of pools) {
-    for (let pp = 0; pp < pool.parallelism.pipeline_parallel_size; pp++) for (let tp = 0; tp < pool.parallelism.tensor_parallel_size; tp++) {
-      const row = {worker_pool:pool.name, parallel_coordinate:{dp:0, pp, cp:0, tp}, satellite_id:'', local_index:null};
-      const existing = old.get(rankKey(row));
-      if (existing && ids.includes(existing.satellite_id) && Number.isSafeInteger(existing.local_index)
-        && existing.local_index >= 0 && existing.local_index < hardware.accelerators_per_satellite && !occupied.has(location(existing))) {
-        Object.assign(row, structuredClone(existing)); occupied.add(location(row));
+    for (let dp = 0; dp < replicas(pool); dp++) {
+      for (let pp = 0; pp < pool.parallelism.pipeline_parallel_size; pp++) for (let tp = 0; tp < pool.parallelism.tensor_parallel_size; tp++) {
+        const row = {worker_pool:pool.name, parallel_coordinate:{dp, pp, cp:0, tp}, satellite_id:'', local_index:null};
+        const existing = old.get(rankKey(row));
+        if (existing && ids.includes(existing.satellite_id) && Number.isSafeInteger(existing.local_index)
+          && existing.local_index >= 0 && existing.local_index < hardware.accelerators_per_satellite && !occupied.has(location(existing))) {
+          Object.assign(row, structuredClone(existing)); occupied.add(location(row));
+        }
+        rows.push(row);
       }
-      rows.push(row);
     }
   }
   // Reserve every valid manual assignment before filling gaps, so a new rank
@@ -75,7 +82,7 @@ export function matchParallelismToResources(config, {modelShape, supportedChoice
   if (ids.length !== config.hardware.satellite_count || new Set(ids).size !== ids.length || ids.some(id => typeof id !== 'string' || !id.trim())) throw Error('请先修正卫星 ID 清单，数量须与卫星数一致且不能重复');
   const names = pools.map(pool => pool.name);
   if (names.some(name => typeof name !== 'string' || !name.trim()) || new Set(names).size !== names.length) throw Error('请先修正重复或空的 Worker pool 名称');
-  if (pools.some(pool => !supported(pool))) throw Error('当前自动方案支持 DP / CP / SP 为 1，请先调整对应并行参数');
+  if (fastMode(config) || pools.some(pool => !supported(config, pool))) throw Error('自动匹配适用于 Detail Mode 的 DP / CP / SP 为 1 的方案');
   const perPool = Math.floor(physical / pools.length);
   if (!perPool) throw Error(`${physical} 张物理卡不足以为 ${pools.length} 个 pool 分配资源`);
   const currentTP = pools[0].parallelism.tensor_parallel_size;

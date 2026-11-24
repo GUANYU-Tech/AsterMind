@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from astermind.common.topology import pairs_for
 from astermind.engine.setup.network_spec import NetworkSpec
 
 
@@ -49,6 +50,7 @@ def candidate_links(spec: NetworkSpec) -> tuple[dict, ...]:
                 cross_plane_offset=shell.get("cross_plane_offset", 0),
                 explicit_pairs=tuple(tuple(p) for p in shell.get('explicit_pairs', ())),
                 cell_topologies={},
+                cell_link_overrides={},
                 cell_egress_policies={},
                 faults=(),
                 communication_grid_shape=shell.get('grid_shape'),
@@ -118,18 +120,25 @@ def candidate_links(spec: NetworkSpec) -> tuple[dict, ...]:
     compute = sorted(
         (n for n in spec.nodes if n.role == "compute"), key=lambda n: n.node_id
     )
-    cells = sorted({n.cell_id for n in compute if n.cell_id})
-    for cell in cells:
-        members = [n.node_id for n in compute if n.cell_id == cell]
-        for i, a in enumerate(members):
-            for j in range(i + 1, len(members)):
-                if (
-                    spec.cell_topologies.get(cell, spec.cell_topology)
-                    == "fully_connected"
-                    or j == i + 1
-                    or (i == 0 and j == len(members) - 1)
-                ):
-                    add(a, members[j], "cell_isl")
+    cell_members: dict[str, list[str]] = {}
+    for node in spec.nodes:
+        if node.role == "compute" and node.cell_id:
+            cell_members.setdefault(node.cell_id, []).append(node.node_id)
+    cell_profiles = {}
+    for cell, members in cell_members.items():
+        if cell in spec.cell_link_overrides:
+            for link in spec.cell_link_overrides[cell]:
+                a, b = link['source'], link['target']
+                add(a, b, 'cell_isl')
+                cell_profiles[tuple(sorted((a, b)))] = link['profile_id']
+            continue
+        topology = spec.cell_topologies.get(cell, spec.cell_topology)
+        # Chains follow the declared member order, including ordered TLE groups.
+        # Existing rings retain their historical ID ordering.
+        if topology == "ring":
+            members.sort()
+        for a, b in pairs_for(members, topology):
+            add(a, b, "cell_isl")
     ingress = [n for n in compute if spec.external_member(n)]
     for n in ingress:
         for relay in comm:
@@ -157,6 +166,8 @@ def candidate_links(spec: NetworkSpec) -> tuple[dict, ...]:
     shell_configs = {row["shell_id"]: row for row in spec.communication_shells}
 
     def profile_id(a, b, kind):
+        if kind == 'cell_isl' and (a, b) in cell_profiles:
+            return cell_profiles[a, b]
         shell = nodes[a].shell_id
         profile = (
             shell_configs.get(shell, {}).get("isl_profile", kind)

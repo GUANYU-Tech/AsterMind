@@ -47,7 +47,7 @@ def decorate_document(content: bytes, path: str) -> bytes:
 
     content = re.sub(br'<html\b[^>]*>', root, content, count=1, flags=re.I)
     content = content.replace(b'OrbitServe', 'AsterMind 星鉴'.encode())
-    if path == '/':
+    if path == '/platform':
         content = content.replace(b'class="studio-shell', b'class="studio-shell portal-shell', 1)
     current_path = ('/configuration' if path in {'/physical', '/scene'} else
                     '/results' if re.match(r'/runs/[^/]+/(result|scene-replay|native-replay|runtime)', path) else
@@ -56,10 +56,12 @@ def decorate_document(content: bytes, path: str) -> bytes:
     for index, (number, label, href) in enumerate(LINKS):
         current = ' aria-current="page"' if current_path == href.split('?')[0] else ''
         rows.append(f'<a href="{escape(href, quote=True)}"{current}><b aria-hidden="true">{number}</b>{label}</a>')
-    caption = '太空智算系统仿真平台' if path == '/' else '仿真任务工作台'
-    shell = ('<header class="studio-topbar"><a class="studio-logo" href="/">'
+    caption = '太空智算系统仿真平台' if path == '/platform' else '仿真任务工作台'
+    parent = {'/platform': '/', '/workspace': '/platform'}.get(path, '/workspace')
+    home = ' data-project-home' if path == '/platform' else ''
+    shell = (f'<header class="studio-topbar"><a class="studio-logo" href="{parent}"{home}>'
              '<span class="studio-mark" aria-hidden="true">✧</span>AsterMind <em>星鉴</em></a>'
-             f'<span>{caption}</span><a class="studio-local" href="/">'
+             f'<span>{caption}</span><a class="studio-local" href="/platform">'
              '切换仿真工作区 ↗</a></header>'
              '<aside class="studio-sidebar" aria-label="工作台导航">'
              '<div class="studio-nav-label">完整场景仿真</div>' + ''.join(rows) +

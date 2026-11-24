@@ -1,5 +1,5 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>OrbitServe 运行记录</title><link rel="stylesheet" href="/assets/pages.css"><main>
-<nav><a href="/">← 实验工作台</a><a href="/experiments?state=running">正在运行的任务</a><button id="refresh">刷新任务</button></nav><h1>运行记录</h1><p>查看历史实验、物理数据与执行日志。</p>
+<nav><a href="/workspace">← 实验工作台</a><a href="/experiments?state=running">正在运行的任务</a><button id="refresh">刷新任务</button></nav><h1>运行记录</h1><p>查看历史实验、物理数据与执行日志。</p>
 <label>筛选状态<select id="filter" aria-label="筛选任务状态"><option value="all">全部任务（含历史实验）</option><option value="running">正在运行</option><option value="completed">已完成</option><option value="cancelled">已停止</option><option value="failed">失败</option><option value="interrupted">已中断</option><option value="unknown">状态暂不可用</option></select></label><p id="status" role="status">正在读取任务…</p><div id="list"></div>
 <details><summary>通过任务 ID 找回任务</summary><form id="recover"><label>任务 ID<input id="taskId" required pattern="[a-zA-Z0-9_-]+" aria-label="任务 ID"></label><button>打开任务</button></form><p id="recoverError" class="error"></p></details>
 </main><script type="module">

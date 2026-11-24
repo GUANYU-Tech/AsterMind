@@ -1,8 +1,6 @@
 """Persistent frontend jobs and usage records; every output lives under viz."""
 from datetime import datetime, timezone
 import json
-import os
-import signal
 from pathlib import Path
 import re
 import subprocess
@@ -49,6 +47,9 @@ def start(config, client):
         satellite_count=config.get('hardware',{}).get('satellite_count'),ip=client,backend=identity())
     try:
         effective,_ = convert(config)
+        if effective['compute_mode'] == 'fast_mode':
+            from compute_options import require_fast_scheduler
+            require_fast_scheduler()
     except Exception as error:
         write(destination/'status.json',{**record,'status':'rejected','phase':'validation','error':str(error)})
         raise
@@ -59,14 +60,7 @@ def start(config, client):
             with (destination/'execution.log').open('w') as log:
                 process=subprocess.Popen([sys.executable,'-B',str(VIZ/'cell_worker.py'),job],
                     cwd=VIZ,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
-                try:
-                    process.wait(timeout=config['runtime']['timeout_seconds'])
-                except subprocess.TimeoutExpired:
-                    os.killpg(process.pid,signal.SIGTERM)
-                    try: process.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        os.killpg(process.pid,signal.SIGKILL); process.wait()
-                    raise TimeoutError('任务超过配置的实际运行超时；详见执行日志')
+                process.wait()
             if process.returncode and status(job)['status'] not in ('failed','cancelled'):
                 raise RuntimeError(f'V1 worker 退出码 {process.returncode}；详见执行日志')
         except Exception as error:

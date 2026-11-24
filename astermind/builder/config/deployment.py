@@ -65,6 +65,7 @@ class ServingCell(Contract):
     execution_mode: Literal["accelerated", "fast", "reference"] = "accelerated"
     graph_backend: Literal["midlayer"] = "midlayer"
     fast_glm_dsa_score: Literal["bf16_timing_proxy"] | None = None
+    detail_prediction_method: Literal["midlayer", "roofline"] | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -122,6 +123,8 @@ class SceneDeployment(ComputeModeConfig):
     max_model_len: Annotated[int, Field(strict=True, ge=2, le=131072)] = 128
     max_batched_tokens: Positive | None = None
     num_kv_blocks: Positive = 64
+    kv_block_size_tokens: Positive = 16
+    scheduler_adapter: Literal["auto", "vllm_0_11", "vllm_0_30", "vllm_0_31"] = "auto"
     memory_policy_file: str | None = None
     prefix_caching: bool = False
     enable_chunked_prefill: StrictBool | None = Field(

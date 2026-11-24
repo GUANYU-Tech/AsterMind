@@ -3,14 +3,23 @@ export const stages = ["formation", "network", "workload", "deployment", "runtim
 export const stageNames = ["星座资源", "通信网络", "模型负载", "并行部署", "调度运行", "仿真结果"];
 // Presentation policy only: these values remain in imported/exported configs.
 export const hiddenFields = ["requests.file", "requests.production", "requests.closed_loop_client_count", "topology.inter_satellite.max_range_km", "topology.inter_satellite.drop_infeasible_links", "hardware.accelerator_overrides", "constellation.earth_orientation_mode", "constellation.tle_file", "topology.file", "runtime_inputs.expert_routing"];
-export function visibleField(path) {
+export function visibleField(path, config) {
+  const fast = config?.compute_mode === 'fast_mode';
+  const key = path.at(-1);
+  if (key === 'detail_prediction_method' && fast) return false;
+  if (key === 'memory_policy_file' && !fast) return false;
+  if (key === 'fast_glm_dsa_score' && (!fast || config.model !== 'glm-5.2' || config.hardware.default_hardware_id === 'nvidia_h200')) return false;
+  if (path[0] === 'deployment' && path[1] === 'worker_pools' &&
+      ['name','role','collectives','pipeline_p2p','sequence_parallel_size','context_parallel_size','expert_communication_backend','enable_eplb'].includes(key)) return false;
+  if (key === 'su_group_sizes' && config?.topology?.intra_satellite?.type !== 'profile_su') return false;
   if (path[0] === "fso" && path.length > 1) {
     return path[1] === "tx" && (path.length === 2 ||
-      ["baud_rate_ghz", "baud_rate_options_ghz"].includes(path[2]));
+      ["baud_rate_ghz", "baud_rate_options_ghz", "modulation_pool"].includes(path[2]));
   }
   if (path[0] === "scheduler" && path.length > 2) {
-    const options = ["framework", "max_batched_tokens", "max_requests", "num_kv_blocks", "kv_block_size_tokens", "vllm"];
-    const vllmOptions = ["model", "max_model_len", "enable_prefix_caching"];
+    const options = ["framework", "max_batched_tokens", "max_requests", "vllm", "num_kv_blocks", "kv_block_size_tokens"];
+    const vllmOptions = ["max_model_len", "enable_prefix_caching", "enable_chunked_prefill"];
+    if (config?.scheduler[path[1]]?.vllm?.enable_chunked_prefill) vllmOptions.push("long_prefill_token_threshold");
     return path.length === 3 ? options.includes(path[2]) : path[2] === "vllm" && vllmOptions.includes(path[3]);
   }
   const name = path.join(".");
@@ -22,23 +31,28 @@ export const groups = {
     ["星座几何", ["topology.source", "topology.file", "constellation"]],
   ],
   network: [
-    ["星内网络", ["topology.intra_satellite", "hardware.intra_satellite_bandwidth_gbps", "hardware.intra_satellite_latency_ns"]],
+    ["星内网络", ["topology.intra_satellite", "hardware.su_group_sizes", "hardware.intra_satellite_bandwidth_gbps", "hardware.intra_satellite_latency_ns"]],
     ["星间连接", ["topology.inter_satellite"]],
     ["ISLSim 光学链路", ["fso"]],
+    ["集合通信", ["ep_strategy", "collective_policies"]],
   ],
   workload: [
-    ["模型", ["model"]], ["请求流", ["requests"]],
+    ["模型", ["compute_mode", "model"]], ["请求流", ["requests"]],
   ],
   deployment: [
     ["部署模式", ["deployment.mode"]], ["Worker pools", ["deployment.worker_pools"]],
     ["卡映射（自动生成，可手动调整）", ["deployment.placements"]], ["跨 pool 通信", ["deployment.routes"]],
   ],
   runtime: [
-    ["调度器", ["scheduler"]],
+    ["调度器", ["scheduler.*.vllm.max_model_len", "scheduler.*.max_requests", "scheduler.*.max_batched_tokens",
+      "scheduler.*.vllm.enable_chunked_prefill", "scheduler.*.vllm.long_prefill_token_threshold"]],
+    ["KV 缓存（高级）", ["scheduler.*.vllm.enable_prefix_caching", "scheduler.*.kv_block_size_tokens", "scheduler.*.num_kv_blocks",
+      "memory_policy_file", "fast_glm_dsa_score", "detail_prediction_method", "expert_routing_seed"]],
   ],
 };
 
 export function fieldStage(path) {
+  if (path[0] === 'scheduler') return 'runtime';
   const normalized = path.map(k => typeof k === "number" ? "*" : k).join(".");
   if (normalized === "runtime_inputs.expert_routing" || normalized.startsWith("runtime_inputs.expert_routing.")) return "workload";
   if (/^deployment\.worker_pools\.[^.]+\.kv_cache(?:\.|$)/.test(normalized)) return "runtime";

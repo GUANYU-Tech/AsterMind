@@ -4,20 +4,23 @@ import {normalizeRandomFaults,renderRandomFaults} from '/assets/random_faults.js
 import {createCellTopology} from '/assets/cell_topology.js';
 import {createRequestBatch} from '/assets/request_batch.js';
 import {startBatchExperiment} from '/assets/experiment_flow.js';
+import {deploymentFromPhysical,removeLegacyCellWorkload} from './physical-cells.js';
+import {layoutFromExperiment, preserveOtherCellTopologies, sceneCellDraft, sceneCellLayout} from './scene-cell-parameters.js';
 const $=id=>document.getElementById(id);
 let experiment=null,modelId=null,physicalTime={},runtime={},busy=false,needsBuild=true,ready=false;
 let validatedSignature='';
 let capabilities=null;
-let minCellMembers=Infinity;
+let membersByCell={}, cellParameters={}, effectiveRequestKey='';
+let physicalOptions=null;
+const restoreKey='orbitserve-scene-geometry-';
 let requestPage=0;
 const requestPageSize=25;
 let initialTopologyOwner=new URLSearchParams(location.search).get('satellite');
 const signature=()=>JSON.stringify(payload());
-const deploymentFields=['model','hardware','gpus','parallel','concurrency','context','gpuBandwidth','gpuLatency','batchTokens','kvBlocks','expertSeed'];
 const number=id=>Number($(id).value);
 const topologySection=document.createElement('section');topologySection.className='card topology-panel';topologySection.hidden=true;
 const topologyHeading=document.createElement('h2');topologyHeading.textContent='计算节点拓扑';const topologyHost=document.createElement('div');topologySection.append(topologyHeading,topologyHost);$('requests').closest('section').before(topologySection);
-const topologyEditor=createCellTopology(topologyHost,{edit:op=>perform(async()=>{if(needsBuild)throw Error('请先生成当前 GPU 部署');syncRuntime();const value=await post('/edit-scene-topology',{experiment,edit:op});experiment=value;validatedSignature='';reflectConfig();$('jsonStatus').textContent='拓扑已修改，启动前将重新校验。';return value},true)});
+const topologyEditor=createCellTopology(topologyHost);
 const requestBatch=createRequestBatch({getExperiment:()=>experiment,apply:requests=>{experiment.requests=requests;requestPage=0;validatedSignature='';renderRequests();writeJson();state();$('status').textContent=`已应用 ${requests.length.toLocaleString()} 条业务请求`}});
 for(const [id,kind]of [['importRequests','import'],['generateRequests','generate']])$(id).onclick=()=>{try{requestBatch.open(kind)}catch(error){$('status').textContent=error.message}};
 function state(){
@@ -25,6 +28,8 @@ function state(){
  $('dataset').disabled=busy; $('name').disabled=busy;
  for(const id of ['save','run','liveRun'])$(id).disabled=busy||!experiment||needsBuild;
  $('buildStatus').textContent=needsBuild?'部署参数待生成':'';
+ $('build').hidden=!needsBuild;
+
  for(const id of ['addRequest','importRequests','generateRequests'])$(id).disabled=!experiment||needsBuild||busy;
 }
 const resourceKeys=['physical','physical_link_bindings','ground_owners','satellite_roles','physical_dataset','physical_network'];
@@ -36,38 +41,54 @@ function writeJson(){
  ]:[]);
  if(validatedSignature&&validatedSignature!==signature())$('jsonStatus').textContent='配置已修改，启动前将重新校验。';
 }
-function payload(){return{name:$('name').value.trim(),physical_model_id:modelId,experiment}}
-const selectedModel=()=>capabilities?.models.find(row=>row.id===$('model').value);
-const choices=()=>selectedModel()?.choices[$('hardware').value]||[];
-const fitsCell=row=>row.tp*row.pp<=minCellMembers*number('gpus');
-function hardwareDefaults(){const row=capabilities.hardware.find(item=>item.id===$('hardware').value);if(row?.gpu_link_bandwidth_gbps!=null)$('gpuBandwidth').value=row.gpu_link_bandwidth_gbps;$('gpuLatency').value=(row?.gpu_link_latency_ns??0)/1000}
-function deploymentValidity(){const row=choices().find(row=>`${row.tp},${row.pp}`===$('parallel').value);$('parallel').setCustomValidity(!row?'当前模型、硬件与并行部署组合不受支持':!fitsCell(row)?'并行部署所需计算卡超过当前 Cell 容量':'')}
-function refreshChoices(preferred=$('parallel').value,restore=false){
- const requested=$('model').value;
- const availableModels=capabilities.models.filter(row=>row.choices[$('hardware').value]?.length);
- $('model').replaceChildren(...availableModels.map(row=>option(row.id,row.name)));
- if(availableModels.some(row=>row.id===requested))$('model').value=requested;
- else if(restore && requested){
-   const old=option(requested,requested.split('/').pop()+'（当前卡型不支持）');old.disabled=true;
-   $('model').append(old);$('model').value=requested;
- }else if(availableModels.some(row=>row.id===capabilities.defaults.model))$('model').value=capabilities.defaults.model;
- const model=selectedModel();
- const rows=choices(),available=rows.filter(fitsCell);$('parallel').replaceChildren(...rows.map(row=>{const item=option(`${row.tp},${row.pp}`,row.expert_parallel?`TP ${row.tp} × EP ${row.tp}`:`TP ${row.tp} × PP ${row.pp}`);item.disabled=!fitsCell(row);if(item.disabled)item.textContent+=`（需 ${row.tp*row.pp} 卡）`;return item}));
- if(available.some(row=>`${row.tp},${row.pp}`===preferred))$('parallel').value=preferred;
- else if(restore){if(![...$('parallel').options].some(item=>item.value===preferred))$('parallel').append(option(preferred,preferred.replace(',',' × ')));$('parallel').value=preferred}
- else if(available.some(row=>row.tp===capabilities.defaults.tp&&row.pp===capabilities.defaults.pp))$('parallel').value=`${capabilities.defaults.tp},${capabilities.defaults.pp}`;
- else if(available.length)$('parallel').value=`${available[0].tp},${available[0].pp}`;
- $('expertSeedField').hidden=!model?.experts;$('expertSeed').disabled=!model?.experts;
- $('context').max=String(model?.max_context||131072);deploymentValidity();
+function payload(){return{name:$('name').value.trim(),physical_model_id:modelId,experiment,cell_parameters:cellParameters}}
+function validFields(){
+ for(const input of document.querySelectorAll('input,select')){
+  if(input.closest('dialog')||input.disabled||input.checkValidity())continue;
+  input.reportValidity();throw Error(input.validationMessage||'请修正无效的表单参数');
+ }
+ if(!$('name').value.trim())throw Error('请填写场景名称');
 }
 function initializeCatalog(value){
  capabilities=value;
- $('model').replaceChildren(...value.models.map(model=>{const item=option(model.id,model.name+(model.available?' / BF16':' / 未接入'));item.disabled=!model.available;item.title=model.reason;return item}));
- $('hardware').replaceChildren(...value.hardware.map(row=>option(row.id,row.name)));
- $('model').value=value.defaults.model;$('hardware').value=value.defaults.hardware;refreshChoices(`${value.defaults.tp},${value.defaults.pp}`);hardwareDefaults();
+ $('computeMode').replaceChildren(...value.compute_modes.map(row=>option(row.id,row.name)));
 }
-function validFields(){deploymentValidity();for(const input of document.querySelectorAll('input,select'))if(!input.closest('dialog')&&!input.disabled&&!input.checkValidity()){input.reportValidity();throw Error(input.validationMessage||'请修正无效的表单参数')}if(!$('name').value.trim())throw Error('请填写场景名称')}
-function deployment(){const [tp,pp]=$('parallel').value.split(',').map(Number),hardwareId=$('hardware').value,hardware=capabilities.hardware.find(row=>row.id===hardwareId)?.file,choice=choices().find(row=>row.tp===tp&&row.pp===pp);return{model:$('model').value,hardware,hardware_id:hardwareId,gpus_per_satellite:number('gpus'),tp,pp,expert_parallel:!!choice?.expert_parallel,expert_routing_seed:choice?.expert_parallel?number('expertSeed'):null,max_requests:number('concurrency'),max_model_len:number('context'),max_batched_tokens:number('batchTokens'),num_kv_blocks:number('kvBlocks'),gpu_link_bandwidth_gbps:number('gpuBandwidth'),gpu_link_latency_ns:Math.round(number('gpuLatency')*1000),compute_mode:'midlayer',communication:{retry_limit:number('retryCount'),intra_mode:'IntraSatelliteRoofline'}}}
+function renderCellList(){
+ const root=$('cellDeploymentList');const table=document.createElement('table');
+ const head=table.createTHead().insertRow();
+ for(const text of ['Cell','成员','GPU 部署']){const cell=document.createElement('th');cell.textContent=text;head.append(cell)}
+ const body=table.createTBody();
+ for(const [id,members] of Object.entries(membersByCell)){
+  const row=body.insertRow();
+  row.insertCell().textContent=id;
+  row.insertCell().textContent=members.length+' 颗卫星';
+  const cell=experiment?.cells.find(row=>row.id===id), options=cellParameters[id]?.deployment;
+  const model=options?.model||cell?.model;
+  const hardware=options?.hardware_id||cell?.hardware_id;
+  row.insertCell().textContent=model?[
+   capabilities.su_profiles[hardware]?.name||hardware, (options?.gpus_per_satellite??1)+' 卡/星',model.split('/').at(-1).replace(/\.json$/,''),
+   cell?'TP '+cell.parallel.tp+' / PP '+cell.parallel.pp+' / DP '+cell.parallel.dp:'',
+  ].filter(Boolean).join(' · '):'待生成默认部署';
+ }
+ root.replaceChildren(table);
+}
+$('physicalLink').onclick=event=>{
+ if(!modelId)return;
+ event.preventDefault();
+ const returnId=crypto.randomUUID();
+ try{
+  sessionStorage.setItem(restoreKey+returnId,JSON.stringify({name:$('name').value,experiment,
+   physical_model_id:modelId,cell_parameters:cellParameters,mode:$('computeMode').value,
+   ep_strategy:$('epStrategy').value}));
+ }catch(error){
+  $('status').textContent='浏览器草稿空间不足，请先保存场景后从物理模型页编辑。';
+  return;
+ }
+ const target=new URL($('physicalLink').href);
+ target.searchParams.set('scene_draft',returnId);
+ target.hash='cells';
+ location.assign(target.href);
+};
 const metricNames={load:'正在处理的请求最少',distance:'传输路径最短',arrival:'预计数据最早到达'};
 $('cellPrimary').replaceChildren(...Object.entries(metricNames).map(([id,name])=>option(id,name)));
 function updateSecondary(preferred){
@@ -107,7 +128,7 @@ function renderRequests(){
   for(const key of ['id','user_device','cell','arrival_ns','input_tokens','output_tokens']){
    const td=document.createElement('td'),select=['user_device','cell'].includes(key),input=document.createElement(select?'select':'input');
    input.setAttribute('aria-label',`${request.id} ${key}`);
-   if(select){if(key==='cell'){input.append(option('','自动选择'));for(const c of experiment.cells)input.append(option(c.id,c.id))}else for(const d of endpoints)input.append(option(d.id,d.satellite));input.value=request[key]||''}
+   if(select){if(key==='cell'){input.append(option('','自动选择'));for(const id of Object.keys(membersByCell))input.append(option(id,id))}else for(const d of endpoints)input.append(option(d.id,d.satellite));input.value=request[key]||''}
    else{input.type=key==='id'?'text':'number';input.required=true;if(key!=='id'){input.min=key==='arrival_ns'?'0':'1';input.step=key==='arrival_ns'?'any':'1';if(key==='arrival_ns')input.max=String(experiment.horizon_ns/1e9-1e-9)}input.value=key==='arrival_ns'?request[key]/1e9:request[key]}
    input.oninput=()=>{request[key]=key==='id'?input.value:key==='cell'?input.value||null:key==='user_device'?input.value:key==='arrival_ns'?Math.round(Number(input.value)*1e9):Number(input.value);writeJson()};td.append(input);row.append(td);
   }
@@ -118,33 +139,62 @@ function changeRequestPage(delta){for(const input of $('requests').querySelector
 $('previousRequestPage').onclick=()=>changeRequestPage(-1);$('nextRequestPage').onclick=()=>changeRequestPage(1);
 function reflectConfig(){
  reflectRouting();
- const c=experiment.cells[0];$('deploymentSummary').textContent=`${experiment.cells.length} 个 Cell ${experiment.physical.devices.filter(d=>d.kind==='gpu').length} 个 GPU`;
- $('concurrency').value=c.max_requests;$('context').value=c.max_model_len;$('batchTokens').value=c.max_batched_tokens;$('kvBlocks').value=c.num_kv_blocks;$('expertSeed').value=c.expert_routing_seed??0;
- for(const [id,value]of [['model',c.model],['hardware',c.hardware_id]]){if(![...$(id).options].some(o=>o.value===value))$(id).append(option(value,value));$(id).value=value}
- const gpus=experiment.physical.devices.filter(d=>d.kind==='gpu'),owner=gpus[0]?.satellite;$('gpus').value=gpus.filter(d=>d.satellite===owner).length||1;
- refreshChoices(`${c.parallel.tp},${c.parallel.pp}`,true);
- const port=experiment.physical.links?.find(l=>l.source===gpus[0]?.id);if(port){$('gpuBandwidth').value=port.bandwidth_gbps;$('gpuLatency').value=(port.latency_ns||0)/1000}
- runtime=experiment.runtime_network||{};renderRuntime();renderRequests();writeJson();needsBuild=false;state();
+ $('deploymentSummary').textContent=experiment.cells.length+' 个 Cell · '+experiment.physical.devices.filter(d=>d.kind==='gpu').length+' 张 GPU';
+ runtime=experiment.runtime_network||{};renderRuntime();renderRequests();writeJson();renderCellList();state();
  topologySection.hidden=false;topologyEditor.update(experiment,null,initialTopologyOwner);initialTopologyOwner=null;
 }
-async function loadDataset(id){
+async function loadDataset(id,usePhysical=true){
  ready=false;state();$('physicalLink').href='/physical?id='+encodeURIComponent(id);
  const data=await get('/physical-data/'+encodeURIComponent(id));if(!data.ready)throw Error(data.reason||'物理数据尚未就绪，请先完成物理模型生成');
- const [doc,catalog]=await Promise.all([get('/documents/physical/'+id),get('/native-scene-catalog?physical_model_id='+encodeURIComponent(id))]);physicalTime=doc.physical_network.time;minCellMembers=Math.min(...Object.values(catalog.cell_members));refreshChoices();modelId=id;$('dataset').value=id;$('physicalLink').href='/physical?id='+id;
- $('datasetStatus').textContent=`物理拓扑已就绪 / ${physicalTime.duration_s} s`;ready=true;renderRuntime();state();
+ const [doc,catalog]=await Promise.all([get('/documents/physical/'+encodeURIComponent(id)),get('/native-scene-catalog?physical_model_id='+encodeURIComponent(id))]);
+ physicalTime=doc.physical_network.time;membersByCell=catalog.cell_satellites;
+ physicalOptions=doc.compute_configuration;
+ if(usePhysical){
+  cellParameters=deploymentFromPhysical(doc,membersByCell);
+  $('computeMode').value=physicalOptions?.mode||'detail_mode';$('epStrategy').value=physicalOptions?.ep_strategy||'auto';
+ }
+ modelId=id;$('dataset').value=id;
+ $('datasetStatus').textContent='物理拓扑已就绪 / '+physicalTime.duration_s+' s';ready=true;renderCellList();renderRuntime();state();
 }
-async function build(){
+function requestSchedulingKey(){
+ return JSON.stringify(experiment?.requests.map(row=>[row.cell,row.input_tokens,row.output_tokens])||[]);
+}
+async function build(updated=cellParameters, changed=new Set(Object.keys(membersByCell))){
  validFields();syncRuntime();
- const value=await post('/native-scene-config',{physical_model_id:modelId,deployment:deployment(),requests:experiment?.requests||[],migrations:experiment?.migrations||[],runtime_network:runtime,routing:routingConfig(),cell_selection:selectionPolicy()});
- experiment=value;reflectConfig();$('legacyNotice').hidden=true;$('build').textContent='重新生成 GPU 部署';$('status').textContent='GPU 部署已生成，可添加业务请求。';
+ const mode=$('computeMode').value;
+ const submitted=Object.fromEntries(Object.entries(membersByCell).map(([id,members])=>{
+  const saved=updated[id];
+  const sameMembers=saved&&members.length===Object.keys(saved.satellite_gpus).length&&members.every(sat=>Object.hasOwn(saved.satellite_gpus,sat));
+  if(sameMembers && (!saved.configuration || saved.configuration.compute_mode===mode)){
+   const row=structuredClone(saved);
+   if(mode!=='fast_mode'){
+    row.deployment.memory_policy_file=null;row.deployment.fast_glm_dsa_score=null;
+   }
+   return [id,row];
+  }
+  const draft=sceneCellDraft(capabilities,members,mode,saved);
+  return [id,{...saved,...sceneCellLayout(draft,capabilities,members)}];
+ }));
+ const communication={...experiment?.communication,retry_limit:number('retryCount')};
+ delete communication.cell_policies;
+ if($('epStrategy').value==='auto')delete communication.ep_strategy;
+ else communication.ep_strategy=$('epStrategy').value;
+ const value=await post('/native-scene-config',{physical_model_id:modelId,deployment:{compute_mode:mode,communication},
+  cell_deployments:submitted,requests:experiment?.requests||[],migrations:experiment?.migrations||[],
+  runtime_network:runtime,routing:routingConfig(),cell_selection:selectionPolicy()});
+ experiment=experiment?preserveOtherCellTopologies(experiment,value,changed):value;
+ cellParameters=submitted;needsBuild=false;effectiveRequestKey=requestSchedulingKey();validatedSignature='';
+ reflectConfig();$('legacyNotice').hidden=true;$('build').textContent='重新生成 GPU 部署';$('status').textContent='GPU 部署已生成，可添加业务请求。';
 }
-$('build').onclick=()=>perform(build);
-for(const id of deploymentFields)$(id).oninput=()=>{if(['model','hardware','gpus'].includes(id))refreshChoices();if(id==='hardware')hardwareDefaults();deploymentValidity();needsBuild=true;validatedSignature='';state()};
+$('build').onclick=()=>perform(()=>build());
+for(const id of ['computeMode','epStrategy'])$(id).onchange=()=>{needsBuild=true;validatedSignature='';state()};
 $('addRequest').onclick=()=>{const owners=new Set(experiment.ground_owners),device=experiment.physical.devices.find(d=>owners.has(d.satellite));let i=1;while(experiment.requests.some(r=>r.id==='request-'+i))i++;experiment.requests.push({id:'request-'+i,arrival_ns:0,user_device:device.id,input_tokens:32,output_tokens:4,input_bytes:128,output_bytes_per_token:4,cell:null});requestPage=Math.floor((experiment.requests.length-1)/requestPageSize);renderRequests();writeJson()};
 $('retryCount').oninput=()=>{try{syncRuntime();writeJson();$('status').textContent=''}catch(e){$('status').textContent='重试配置：'+e.message}};
 document.addEventListener('modelchange',()=>{if(experiment){experiment.runtime_network=runtime;writeJson()}});
 async function validate(){
- if(needsBuild)throw Error('部署参数已修改，请先生成 GPU 部署配置');validFields();syncRuntime();writeJson();
+ if(needsBuild)throw Error('部署参数已修改，请先生成 GPU 部署配置');validFields();syncRuntime();
+ if(Object.keys(cellParameters).length&&effectiveRequestKey!==requestSchedulingKey())await build(cellParameters,new Set());
+ writeJson();
  if(validatedSignature===signature())return experiment;
  $('jsonStatus').textContent='正在校验通信与部署…';
  const response=await post('/validate-scene',payload());
@@ -166,13 +216,53 @@ async function save(kind){
  }
 }
 $('save').onclick=()=>perform(()=>save());$('run').onclick=()=>perform(()=>save('batch'));$('liveRun').onclick=()=>perform(()=>save('live'));
-$('dataset').onchange=()=>perform(async()=>{experiment=null;needsBuild=true;runtime={};writeJson();topologySection.hidden=true;topologyEditor.clear();renderRequests();const id=$('dataset').value;if(!id){ready=false;return}await loadDataset(id)});
+$('dataset').onchange=()=>perform(async()=>{experiment=null;needsBuild=true;runtime={};cellParameters={};membersByCell={};writeJson();topologySection.hidden=true;topologyEditor.clear();renderRequests();const id=$('dataset').value;if(!id){ready=false;return}await loadDataset(id);await build()});
 (async()=>{
- const [datasets,catalog]=await Promise.all([get('/physical-datasets'),get('/native-scene-catalog')]);initializeCatalog(catalog);for(const d of datasets)$('dataset').append(option(d.id,d.name));
- const q=new URLSearchParams(location.search);let doc=null;if(q.has('id'))doc=await get('/documents/scenes/'+q.get('id'));else if(q.has('run'))doc={experiment:await get('/runs/'+q.get('run')+'/input'),name:'复用场景'};
- if(doc){$('name').value=doc.name;modelId=doc.physical_model_id||q.get('model');if(!modelId&&doc.experiment.physical_dataset){for(const d of datasets){const info=await get('/physical-data/'+d.id);if(info.physical_dataset===doc.experiment.physical_dataset){modelId=d.id;break}}}
-  if([1,'orbitserve.native_cells.v1'].includes(doc.experiment.schema_version))experiment=doc.experiment;
-  else{$('legacyNotice').hidden=false;$('legacyDownload').href=URL.createObjectURL(new Blob([JSON.stringify(doc,null,2)],{type:'application/json'}));runtime=structuredClone(doc.experiment.physical_network?.network||{});for(const key of Object.keys(runtime))if(!['faults','random_faults','fault_timing','failure_policy','max_transfer_retries'].includes(key))delete runtime[key]}}
- modelId??=q.get('model');if(modelId)await loadDataset(modelId);else $('datasetStatus').textContent=datasets.length?'选择物理数据后配置实验。':'暂无完整物理数据，请先生成物理模型。';
- if(experiment){reflectConfig();if(q.has('satellite'))topologySection.scrollIntoView({block:'start'})}state();
+ const [datasets,catalog]=await Promise.all([get('/physical-datasets'),get('/cell/api/capabilities')]);
+ initializeCatalog(catalog);for(const d of datasets)$('dataset').append(option(d.id,d.name));
+ const q=new URLSearchParams(location.search);let doc=null;
+ const draftId=q.get('scene_draft');
+ const restored=draftId&&sessionStorage.getItem(restoreKey+draftId);
+ if(restored)doc=JSON.parse(restored);
+ else if(q.has('id'))doc=await get('/documents/scenes/'+encodeURIComponent(q.get('id')));
+ else if(q.has('run'))doc={experiment:await get('/runs/'+encodeURIComponent(q.get('run'))+'/input'),name:'复用场景'};
+ if(doc){
+  $('name').value=doc.name;
+  modelId=q.get('model')||doc.physical_model_id;
+  if(!modelId&&doc.experiment?.physical_dataset)for(const d of datasets){
+   const info=await get('/physical-data/'+encodeURIComponent(d.id));if(info.physical_dataset===doc.experiment.physical_dataset){modelId=d.id;break}
+  }
+  if([1,'orbitserve.native_cells.v1'].includes(doc.experiment?.schema_version))experiment=doc.experiment;
+  else if(doc.experiment){
+   $('legacyNotice').hidden=false;
+   $('legacyDownload').href=URL.createObjectURL(new Blob([JSON.stringify(doc,null,2)],{type:'application/json'}));
+   runtime=structuredClone(doc.experiment.physical_network?.network||{});
+   for(const key of Object.keys(runtime))if(!['faults','random_faults','fault_timing','failure_policy','max_transfer_retries'].includes(key))delete runtime[key];
+  }
+  cellParameters=doc.cell_parameters||{};
+  Object.values(cellParameters).forEach(removeLegacyCellWorkload);
+ }
+ modelId??=q.get('model');
+ const revised=!!restored && doc.physical_model_id!==modelId;
+ if(modelId)await loadDataset(modelId,!doc || revised);else $('datasetStatus').textContent=datasets.length?'选择物理数据后配置实验。':'暂无完整物理数据，请先生成物理模型。';
+ const mode=(revised||!doc)?physicalOptions?.mode:doc?.mode||experiment?.compute_mode;
+ $('computeMode').value=['fast_mode','batch_roofline'].includes(mode)?'fast_mode':'detail_mode';
+ $('epStrategy').value=((revised||!doc)?physicalOptions?.ep_strategy:doc?.ep_strategy||experiment?.communication?.ep_strategy)||'auto';
+ if(experiment){
+  const sameTopology=!restored||doc.physical_model_id===modelId;
+  if(sameTopology&&!Object.keys(cellParameters).length)for(const cell of experiment.cells){
+   if(membersByCell[cell.id])cellParameters[cell.id]=layoutFromExperiment(experiment,cell,membersByCell[cell.id]);
+  }
+  // Previously saved scenes carry effective fields. Only form-owned fields are posted on future builds.
+  if(!revised && !doc?.cell_parameters)for(const [id,layout] of Object.entries(cellParameters)){
+   const draft=sceneCellDraft(capabilities,membersByCell[id],$('computeMode').value,layout);
+   cellParameters[id]=sceneCellLayout(draft,capabilities,membersByCell[id]);
+  }
+  cellParameters=Object.fromEntries(Object.entries(cellParameters).filter(([id])=>membersByCell[id]));
+  needsBuild=!sameTopology;effectiveRequestKey=requestSchedulingKey();
+  reflectConfig();if(q.has('satellite'))topologySection.scrollIntoView({block:'start'});
+ }
+ if(ready && (!experiment||revised))await perform(()=>build(),true);
+ if(restored)sessionStorage.removeItem(restoreKey+draftId);
+ state();
 })().catch(e=>{$('status').textContent=e.message;state()});

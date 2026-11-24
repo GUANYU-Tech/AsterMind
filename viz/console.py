@@ -33,6 +33,18 @@ LAUNCH_LOCK = threading.Lock()
 COMPARISONS = {}
 PHYSICAL_LOCK = threading.Lock()
 
+HOMEPAGE = Path(__file__).parent / 'homepage' / 'dist'
+HOMEPAGE_FILES = {
+    '/': ('index.html', 'text/html'),
+    '/index.html': ('index.html', 'text/html'),
+    '/en/': ('en/index.html', 'text/html'),
+    '/en/index.html': ('en/index.html', 'text/html'),
+    '/style.css': ('style.css', 'text/css'),
+    '/language.js': ('language.js', 'text/javascript'),
+    '/app.js': ('app.js', 'text/javascript'),
+    '/assets/guanyu-logo.png': ('assets/guanyu-logo.png', 'image/png'),
+}
+
 
 def prepare_physical(identity):
     from studio import key, physical_data, physical_input
@@ -323,7 +335,7 @@ class Handler(BaseHTTPRequestHandler):
         """Send large immutable artifacts without allocating their entire contents."""
         with Path(path).open('rb') as stream:
             self.send_response(200)
-            self.send_header('Content-Type',kind+'; charset=utf-8')
+            self.send_header('Content-Type', kind if kind == 'image/png' else kind + '; charset=utf-8')
             self.send_header('Content-Length',str(Path(path).stat().st_size))
             self.send_header('X-Content-Type-Options','nosniff')
             self.send_header('Cache-Control','no-store')
@@ -385,7 +397,20 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond({"error": "Host not allowed"}, code=403)
         path = urlparse(self.path).path
         try:
-            if path == "/":
+            if path in HOMEPAGE_FILES:
+                name, kind = HOMEPAGE_FILES[path]
+                return self.respond_file(HOMEPAGE / name, kind)
+            if path in {'/zh', '/zh/', '/zh/index.html', '/en', '/platform/'}:
+                canonical = {'/en': '/en/', '/platform/': '/platform'}.get(path, '/')
+                query = urlparse(self.path).query
+                if path.startswith('/zh'):
+                    query = (query + '&' if query else '') + 'lang=zh-CN'
+                self.send_response(302)
+                self.send_header('Location', canonical + ('?' + query if query else ''))
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+                return
+            if path == "/platform":
                 return self.respond(Path(__file__).with_name("index.html").read_bytes(), "text/html")
             if path in {'/workspace', '/configuration', '/results'}:
                 page = 'workbench' if path == '/workspace' else path[1:]
@@ -478,15 +503,17 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(rows)
             if path == '/native-scene-catalog':
                 from native_environment import enable_device_native
-                from astermind.builder.catalog import scene_catalog, cell_member_counts
-                result = scene_catalog(enable_device_native())
+                from astermind.builder.catalog import cell_members
+                from compute_options import compute_catalog
+                result = compute_catalog(enable_device_native())
                 identity = parse_qs(urlparse(self.path).query).get('physical_model_id', [None])[0]
                 if identity:
                     from studio import physical_data
                     data = physical_data(ROOT, identity)
                     if not data['ready']:
                         raise ValueError('物理数据尚未就绪')
-                    result['cell_members'] = cell_member_counts(data['physical_dataset'])
+                    result['cell_satellites'] = cell_members(data['physical_dataset'])
+                    result['cell_members'] = {identity: len(members) for identity, members in result['cell_satellites'].items()}
                 return self.respond(result)
             if path.startswith('/physical-data/'):
                 from studio import physical_data

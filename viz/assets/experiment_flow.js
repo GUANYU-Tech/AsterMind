@@ -10,7 +10,9 @@ export async function startBatchExperiment(post, sceneId, navigate) {
 export function completedDestination(job, search) {
   const query = new URLSearchParams(search);
   if (query.get('next') === 'scene' && job.physical_model_id) {
-    return '/scene?model=' + encodeURIComponent(query.get('model') || job.physical_model_id);
+    const model = encodeURIComponent(query.get('model') || job.physical_model_id);
+    const draft = query.get('scene_draft');
+    return '/scene?model=' + model + (draft ? '&scene_draft=' + encodeURIComponent(draft) : '');
   }
   if (query.get('next') === 'replay' || job.automatic) {
     return '/results?run=' + encodeURIComponent(job.id) + '&view=scene';
