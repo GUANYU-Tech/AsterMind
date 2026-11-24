@@ -1,13 +1,13 @@
 <!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AsterMind 星鉴 实验配置</title><link rel="stylesheet" href="/assets/pages.css"></head>
 <body><main class="configuration-page" id="main-content">
-  <h1>实验配置</h1><p class="configuration-lead">先新建或编辑物理模型，再配置业务与部署</p>
+  <h1>实验配置</h1><p class="configuration-lead">先在物理场景中配置星座与算力编队，再设置业务请求</p>
   <div class="configuration-grid" data-phase="physical">
-    <section class="card config-step"><h2><span>01</span> 物理场景</h2><p>星座、地面站与物理链路</p>
+    <section class="card config-step"><h2><span>01</span> 物理场景</h2><p>通信星座、算力编队、地面站与物理链路</p>
       <label for="models">已有物理模型</label><div class="saved-selection"><select id="models" disabled><option value="">正在读取…</option></select><button id="editModel" disabled>编辑所选模型</button></div>
       <a class="button primary create-action" href="/physical">新建物理模型</a>
     </section>
-    <section class="card config-step"><h2><span>02</span> 业务与部署</h2><p>请求负载、模型部署与运行策略</p>
+    <section class="card config-step"><h2><span>02</span> 业务与运行</h2><p>业务请求、路由调度与运行策略</p>
       <label for="scenes">已有完整场景</label><div class="saved-selection"><select id="scenes" disabled><option value="">正在读取…</option></select><button id="editScene" disabled>编辑所选场景</button></div>
       <a id="createScene" class="button primary create-action" href="/scene" hidden>新建完整场景</a><a id="configurePhysical" class="config-prerequisite" href="/physical">← 去配置物理场景</a>
     </section>

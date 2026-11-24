@@ -362,6 +362,14 @@ class DynamicNetworkTests(unittest.TestCase):
             ),
             6,
         )
+        ordered = (members[3], members[0], members[2], members[1], comm)
+        for options in ({"cell_topology": "chain"}, {"cell_topologies": {"cell": "chain"}}):
+            with self.subTest(options=options):
+                chain = replace(ring, nodes=ordered, **options)
+                self.assertEqual(
+                    {(e["endpoint_a"], e["endpoint_b"]) for e in candidate_links(chain) if e["kind"] == "cell_isl"},
+                    {("m-0", "m-3"), ("m-0", "m-2"), ("m-1", "m-2")},
+                )
         with self.assertRaisesRegex(ValueError, "exactly one"):
             replace(
                 ring, nodes=tuple(replace(n, compute_target=True) for n in ring.nodes)

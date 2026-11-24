@@ -1,6 +1,7 @@
 import { fieldStage } from './config-layout.mjs?v=compact-2';
 import {linkMode} from './link-mode.mjs';
 import {resourceSyncError} from './resource-sync.mjs';
+import {deploymentCapacity} from './deployment-mapping.mjs';
 
 const resolve = (spec, defs) => spec?.$ref ? defs[spec.$ref.split('/').at(-1)] || {} : spec || {};
 export function schemaAt(schema, path) {
@@ -67,6 +68,9 @@ export function valueError(value, raw, defs = {}) {
 export function fieldError(value, path, root, spec = {}, defs = {}) {
   const error = valueError(value, spec, defs); if (error) return error;
   const name=path.join('.'), key=path.at(-1), hardware=root.hardware, ids=hardware?.satellite_ids || [];
+  if (name === 'hardware.su_group_sizes' && value.length && value.reduce((sum,n)=>sum+n,0)!==hardware.accelerators_per_satellite) {
+    return 'SU 分组卡数之和必须等于每星 GPU 数';
+  }
   // Dataclass-backed inputs have semantic bounds that JSON Schema does not
   // expose; mirror their native validators here, without changing engine rules.
   if(path[0]==='requests' && path[1]==='synthetic') {
@@ -170,10 +174,14 @@ export function configurationErrors(root, schema, stage = null) {
   if (root.topology?.inter_satellite && linkMode(root) === null) add(['topology','inter_satellite'],'请在星间连接中选择一个全局模式，统一所有链路');
   if(root.deployment?.placements && root.hardware) {
     const rows=root.deployment.placements, pools=root.deployment.worker_pools || [];
-    const expected=pools.reduce((n,p)=>n+p.parallelism.tensor_parallel_size*p.parallelism.pipeline_parallel_size,0);
-    const physical=root.hardware.satellite_count*root.hardware.accelerators_per_satellite;
-    if(expected>physical) add(['deployment','worker_pools'],`当前只有 ${physical} 张物理卡，并行部署需要 ${expected} 张卡。请启用自动适配资源，或减少 TP / PP。`);
+    const {physical, required:expected}=deploymentCapacity(root);
+    if(expected>physical) add(['deployment','worker_pools'],`当前只有 ${physical} 张物理卡，并行部署需要 ${expected} 张卡。请增加 GPU 或减少 TP / PP / DP。`);
     if(rows.length!==expected) add(['deployment','placements'],'部署映射数量与并行规模不一致');
+    for (const [index, pool] of pools.entries()) {
+      if (pool.parallelism.data_parallel_size > 1 && !pool.parallelism.enable_expert_parallel) {
+        add(['deployment','worker_pools',index,'parallelism','data_parallel_size'],'DP 大于 1 需要开启专家并行（WideEP）');
+      }
+    }
     const locations=new Set(), ranks=new Set();
     for(const [i,row] of rows.entries()) {
       const location=JSON.stringify([row.satellite_id,row.local_index]);

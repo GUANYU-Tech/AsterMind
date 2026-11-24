@@ -188,7 +188,8 @@ class Simulation:
             tensor_parallel_size=p.tp, pipeline_parallel_size=p.pp,
             data_parallel_size=p.dp, sequence_parallel_size=p.sp,
             deployment=cell.deployment, execution_mode=cell.execution_mode,
-            compute_mode=self.config.executor_compute_mode, fast_glm_dsa_score=cell.fast_glm_dsa_score)
+            compute_mode=cell.detail_prediction_method or self.config.executor_compute_mode,
+            fast_glm_dsa_score=cell.fast_glm_dsa_score)
         executor = self.executors[cell.id]
         if cell.deployment == "pd_disagg":
             created = PrefillDecodeCell(cell.id, self.loop, config, executor,
@@ -461,7 +462,8 @@ class Simulation:
                 "midlayer_root": str(self.root),
                 "communication": "runtime_comm",
                 "compute_mode": self.config.compute_mode,
-                "compute_modes": {c.id: self.config.executor_compute_mode for c in self.config.cells},
+                "compute_modes": {c.id: c.detail_prediction_method or self.config.executor_compute_mode
+                                  for c in self.config.cells},
                 "native_inputs": self.native_inputs,
                 "source_commit": "9c08c9cad81df5a4fee5e606114753df8dab6c2d",
                 "timeline_mode": "orbitserve",

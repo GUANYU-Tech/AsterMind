@@ -1,4 +1,5 @@
 import {mappingDraft, matchParallelismToResources, deploymentCapacity} from './deployment-mapping.mjs';
+import {detailChoices, fastMode} from './compute-config.mjs';
 const states = new WeakMap();
 function state(config) {
   if (!states.has(config)) states.set(config,{automatic:true,error:''});
@@ -15,9 +16,9 @@ export function synchronizeResources(config, capabilities) {
   hardware.accelerator_overrides = (hardware.accelerator_overrides || []).filter(row => ids.includes(row.satellite_id) && row.local_index >= 0 && row.local_index < cards);
   state(config).error = '';
   try {
-    if (automaticDeployment(config)) matchParallelismToResources(config,{modelShape:capabilities.model_shapes?.[config.model], supportedChoices:capabilities.models_by_hardware?.[config.hardware.default_hardware_id]?.[config.model]});
+    if (automaticDeployment(config) && !fastMode(config)) matchParallelismToResources(config,{modelShape:capabilities.model_shapes?.[config.model], supportedChoices:detailChoices(config, capabilities)});
     else config.deployment.placements = mappingDraft(config);
-    if (capabilities.model_shapes?.[config.model]?.tie_word_embeddings
+    if (!fastMode(config) && capabilities.model_shapes?.[config.model]?.tie_word_embeddings
       && config.deployment.worker_pools.some(pool=>pool.parallelism.pipeline_parallel_size>1)) {
       throw Error('当前模型共享输入与输出权重，执行器暂不支持 PP 大于 1。请启用自动适配资源，或将 PP 设为 1。');
     }

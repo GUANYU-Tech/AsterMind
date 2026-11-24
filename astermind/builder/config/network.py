@@ -230,6 +230,7 @@ class NetworkSpec:
     ground_access_policy: str = "nearest_distance"
     communication_shells: tuple[dict, ...] = ()
     cell_topologies: dict[str, str] = field(default_factory=dict)
+    cell_link_overrides: dict[str, list[dict]] = field(default_factory=dict)
     transport_model: str = "runtime_comm"
     # Unexpected outages: revealed only at start_s to online Runtime routing.
     faults: tuple[dict, ...] = ()
@@ -291,6 +292,19 @@ class NetworkSpec:
         }
         object.__setattr__(self, "nodes", nodes)
         object.__setattr__(self, "link_profiles", profiles)
+        owners = {node.node_id: node.cell_id for node in nodes if node.role == 'compute'}
+        if not set(self.cell_link_overrides) <= set(owners.values()):
+            raise ValueError('cell_link_overrides references an unknown Cell')
+        for cell, rows in self.cell_link_overrides.items():
+            pairs = set()
+            for edge in rows:
+                if set(edge) != {'source', 'target', 'profile_id'} or edge['profile_id'] not in profiles:
+                    raise ValueError('Cell links require source, target and a registered profile')
+                a, b = edge['source'], edge['target']
+                pair = frozenset((a, b))
+                if a == b or owners.get(a) != cell or owners.get(b) != cell or pair in pairs:
+                    raise ValueError(f'Cell {cell} has invalid or repeated link endpoints')
+                pairs.add(pair)
         for node in nodes:
             for name in node.sgl_profiles.values():
                 if name not in profiles or profiles[name].uplink_profile or profiles[name].downlink_profile:
@@ -332,9 +346,8 @@ class NetworkSpec:
                 raise ValueError(
                     "communication nodes must belong to exactly one configured shell"
                 )
-        if any(
-            v not in {"ring", "fully_connected"} for v in self.cell_topologies.values()
-        ):
+        cell_topologies = {"ring", "chain", "fully_connected"}
+        if any(v not in cell_topologies for v in self.cell_topologies.values()):
             raise ValueError("unsupported per-cell topology")
         if self.communication_topology not in {"grid", "honeycomb", "explicit"}:
             raise ValueError(
@@ -344,8 +357,8 @@ class NetworkSpec:
             raise ValueError(
                 "unsupported ground_access_policy"
             )
-        if self.cell_topology not in {"ring", "fully_connected"}:
-            raise ValueError("physical cell_topology must be ring or fully_connected")
+        if self.cell_topology not in cell_topologies:
+            raise ValueError("physical cell_topology must be ring, chain, or fully_connected")
         for key in (
             "wrap_planes",
             "wrap_slots",

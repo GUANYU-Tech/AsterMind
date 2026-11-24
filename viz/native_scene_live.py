@@ -136,6 +136,9 @@ def start(root, value, *, automatic=False):
     _, value = validate_document(root, dict(name='运行配置', experiment=value))
     from astermind.builder.config import SimulationConfig
     config = SimulationConfig.model_validate(value)
+    if config.compute_mode == 'fast_mode':
+        from compute_options import require_fast_scheduler
+        require_fast_scheduler()
     if not config.physical_dataset and not config.physical_network:
         raise ValueError('三维场景需要物理数据包；静态设备计算请使用计算 Cell 工作区')
     root = Path(root)

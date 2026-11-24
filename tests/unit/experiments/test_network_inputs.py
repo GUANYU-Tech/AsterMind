@@ -1,4 +1,5 @@
 import json
+import math
 import unittest
 from copy import deepcopy
 from pathlib import Path
@@ -106,3 +107,64 @@ class NetworkInputTests(unittest.TestCase):
             self.assertRaisesRegex(ValueError, "fields"),
         ):
             run_network_experiment(value, out)
+
+    def test_physical_override_only_changes_the_selected_cell(self):
+        value = json.loads((ROOT / 'tests/fixtures/network/multi_shell.json').read_text())
+        original = materialize_network_input(value)
+        cells = sorted({row['cell_id'] for row in original['network']['nodes'] if row['role'] == 'compute'})
+        formation = value['constellations']['compute_formations'][0]
+        formation['cell_overrides'] = {cells[0]: {
+            'satellites_per_cluster': 3, 'grid_shape': '3x1',
+            'formation_pitch_m': 1000, 'altitude_km': 650, 'topology': 'fully_connected',
+        }}
+        rebuilt = materialize_network_input(value)
+        members = [row for row in rebuilt['network']['nodes'] if row.get('cell_id') == cells[0]]
+        self.assertEqual(len(members), 3)
+        previous_sibling = [row for row in original['elements']['satellites'] if row['satellite_id'].startswith(cells[1] + '-')]
+        rebuilt_sibling = [row for row in rebuilt['elements']['satellites'] if row['satellite_id'].startswith(cells[1] + '-')]
+        # Synthetic catalog numbers are assigned across the rebuilt dataset.
+        def without_catalog_number(rows):
+            return [{key: value for key, value in row.items() if key != 'satnum'} for row in rows]
+        self.assertEqual(without_catalog_number(rebuilt_sibling), without_catalog_number(previous_sibling))
+        self.assertEqual(rebuilt['network']['cell_topologies'][cells[0]], 'fully_connected')
+
+    def test_static_ring_and_chain_geometry_survive_orbit_propagation(self):
+        from astermind.builder.orbit import load_sgp4_element_bundle, propagate_sgp4_teme
+
+        manifest = json.loads((ROOT / 'tests/fixtures/network/multi_shell.json').read_text())
+        formation = manifest['constellations']['compute_formations'][0]
+        formation['cluster'].update(motion_model='static_formation', satellites_per_cluster=10,
+                                    formation_pitch_m=500., grid_shape='5x2')
+        formation['topology'] = 'ring'
+        name = formation['name']
+        first, second = [f'{name}-p000-s{i:04d}' for i in range(2)]
+        formation['source'].update(planes=1, clusters_per_plane=2, walker_phase=0)
+        formation['cell_overrides'] = {second:{'topology':'chain','satellites_per_cluster':4}}
+        raw = materialize_network_input(manifest)
+        bundle = load_sgp4_element_bundle(raw['elements'])
+        samples = propagate_sgp4_teme(bundle, simulation_epoch_utc=manifest['time']['epoch_utc'],
+                                      sample_times_s=(0., 600.)).samples
+        for time in (0., 600.):
+            frame = {s.satellite_id:s.position_teme_km for s in samples if s.time_s == time}
+            ring = [frame[f'{first}-m{i:03d}'] for i in range(10)]
+            center = tuple(sum(axis)/10 for axis in zip(*ring))
+            for i, point in enumerate(ring):
+                self.assertAlmostEqual(math.dist(point, center), .5/(2*math.sin(math.pi/10)), places=7)
+                self.assertAlmostEqual(math.dist(point, ring[(i+1)%10]), .5, places=7)
+            chain = [frame[f'{second}-m{i:03d}'] for i in range(4)]
+            for a,b in zip(chain,chain[1:]):
+                self.assertAlmostEqual(math.dist(a,b), .5, places=7)
+            self.assertGreater(math.dist(chain[0],chain[-1]), 1.49)
+
+    def test_static_cell_override_preserves_other_free_propagating_members(self):
+        manifest = json.loads((ROOT / 'tests/fixtures/network/multi_shell.json').read_text())
+        f = manifest['constellations']['compute_formations'][0]
+        target = f['name']+'-p000-s0000'
+        original = materialize_network_input(manifest)
+        f['cell_overrides'] = {target:{'motion_model':'static_formation','topology':'fully_connected'}}
+        updated = materialize_network_input(manifest)
+        for before, after in zip(original['elements']['satellites'],updated['elements']['satellites'],strict=True):
+            if before['satellite_id'].startswith(target+'-'):
+                self.assertIn('fixed_lvlh_offset_km',after)
+            else:
+                self.assertEqual(before,after)

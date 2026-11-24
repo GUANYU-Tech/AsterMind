@@ -4,6 +4,8 @@ import { buildWorkspace, renderWorkspaceForms } from "./workspace-ui.mjs?v=profi
 import { stages, stageNames, importResourceHardware, validationTarget } from "./config-layout.mjs?v=compact-2";
 import { editDependencies, newWebConfiguration, networkInputs } from "./config-edit.mjs?v=validation-1";
 import {mappingDraft, matchParallelismToResources} from './deployment-mapping.mjs';
+import {detailChoices, normalizeComputeSettings} from './compute-config.mjs';
+import {renderSchedulingReadout} from './parameter-panel.mjs';
 import {linkMode, setLinkMode, rememberEmptyLinkMode, newInterSatelliteLink, applyOpticalDefaults} from './link-mode.mjs';
 import {automaticDeployment,setAutomaticDeployment,synchronizeResources,clearDependentDrafts} from './resource-sync.mjs';
 import { renderResults, renderArtifacts, renderNetworkPreview, element } from "./results.mjs?v=compact-2";
@@ -12,14 +14,14 @@ import { sceneData } from "./scene-data.mjs?v=compact-2";
 import { configurationErrors, validationError } from "./config-validation.mjs?v=validation-1";
 
 import {renderConfigProfile} from "../assets/config-profile.js";
-import {labels} from "./config-labels.mjs?v=compact-2";
+import {labels,formationNames} from "./config-labels.mjs?v=compact-2";
 const $ = selector => document.querySelector(selector);
 buildWorkspace();
 const statuses = { queued: "排队", running: "运行中", success: "成功", failed: "失败", interrupted: "已中断", cancelled: "已取消", rejected: "校验失败" };
 const phases = { queued: "等待执行", preparing_environment:"准备运行环境", configuration: "解析配置", topology: "构建网络", serving: "请求调度与计算 / 通信仿真", completed: "完成" };
 let config, capabilities, scene, dirty = false, busy = false, jobId = null, pollVersion = 0, previewVersion = 0, refreshForms = false;
 let previewTimer, previewAbort, previewKey = "", networkPreview = null;
-let preflightTimer, preflightVersion = 0, preflightKey = '', preflightStatus = 'pending';
+let preflightTimer, preflightVersion = 0, preflightKey = '', preflightStatus = 'pending', effectiveCell;
 const drafts = new Map();
 
 function draftChanged() {
@@ -37,19 +39,26 @@ function scheduleConfigurationPreflight() {
   const issues = configurationErrors(config,capabilities.schema);
   if (dirty || drafts.size || issues.length) {
     preflightStatus='invalid'; preflightKey='';
+    renderSchedulingReadout(document,null);
     output.textContent=dirty ? '请先应用或放弃 JSON 编辑。' : drafts.size ? '请修正输入框下方的提示。' : issues[0].msg;
     lockFields(); return;
   }
   const key=JSON.stringify(config);
-  if (preflightStatus==='valid' && preflightKey===key) { lockFields(); return; }
+  if (['valid','blocked'].includes(preflightStatus) && preflightKey===key) {
+    renderSchedulingReadout(document,effectiveCell);lockFields();return;
+  }
+  renderSchedulingReadout(document,null);
   preflightStatus='pending'; output.textContent='进入调度运行后自动检查配置。'; lockFields();
   if (document.body.dataset.stage!=='runtime') return;
   output.textContent='正在进行后端预检…';
   preflightTimer=setTimeout(async()=>{
     try {
-      await post('/api/config/validate',config);
+      const result=await post('/api/config/validate',config);
       if (version!==preflightVersion) return;
-      preflightStatus='valid'; preflightKey=key; output.textContent='配置预检通过，可以发布任务。';
+      effectiveCell=result.effective_configuration.cells[0];
+      renderSchedulingReadout(document,effectiveCell);
+      preflightStatus=result.launch_blocker?'blocked':'valid'; preflightKey=key;
+      output.textContent=result.launch_blocker||'配置预检通过，可以发布任务。';
     } catch(error) {
       if (version!==preflightVersion) return;
       preflightStatus='invalid'; preflightKey=''; output.textContent=`配置需调整：${error.message}`;
@@ -168,7 +177,7 @@ function lockFields() {
 
 function changed(path) {
   scheduleNetworkPreview();
-  const layout = config.topology.source === "orbit" ? "轨道快照" : config.constellation?.formation?.layout === "chain" ? "链式编队" : "环形编队";
+  const layout = config.topology.source === "orbit" ? "轨道快照" : formationNames[config.constellation?.formation?.layout] || "环形编队";
   $("#scene-summary").textContent = `${layout} ${config.hardware.satellite_ids.length} 颗卫星`;
   $("#advanced-config").value = JSON.stringify(config, null, 2);
   renderConfigProfile($("#config-profile"), config, labels, [
@@ -185,7 +194,7 @@ function changed(path) {
 
 function renderForms() {
   renderWorkspaceForms(config, capabilities, changed, (path, value, previous) => {
-    if (path[0]==='hardware' || path[0]==='model' || path[0]==='deployment' && ['worker_pools','mode'].includes(path[1])) clearDependentDrafts(drafts);
+    if (['hardware','model','compute_mode'].includes(path[0]) || path[0]==='deployment' && ['worker_pools','mode'].includes(path[1])) clearDependentDrafts(drafts);
     refreshForms = editDependencies(config, path, value, capabilities, previous);
     if (path[0]==='deployment' && path[1]==='placements') { setAutomaticDeployment(config,false); refreshForms=true; }
   }, text => message(text, true), {drafts,onDraftChange:draftChanged});
@@ -211,6 +220,7 @@ function stage(name, anchor = null, revealError = false) {
   if (scene && !["home", "analysis"].includes(sceneStage) && ["home", "analysis"].includes(sceneState.stage)) scene.prepareConfigAnchor(anchor);
   sceneState.stage = sceneStage; sceneState.linkBuildStart = null;
   document.body.dataset.stage = name; scene?.setStage(sceneStage);
+  $('.studio-logo').href = name === 'home' ? '/platform' : appUrl('');
   if (name !== "analysis") $("#job-status").hidden = true;
   document.querySelectorAll(".config-panel").forEach(panel => { panel.hidden = panel.dataset.panel !== name; panel.classList.toggle("is-active", !panel.hidden); });
   $("#analysis-shell").hidden = name !== "analysis";
@@ -320,7 +330,9 @@ async function historyView() {
     const row = element("div", undefined, "history-row"); const open = element("button", id); open.onclick = () => watch(id, true);
     const reuse = element("button", "载入配置"); reuse.onclick = () => guarded(async () => {
       if (dirty) throw new Error("请先应用或放弃高级 JSON 编辑");
-      config = prepareOpticalSettings(importResourceHardware(await api(`/api/simulations/${id}/configuration`))); config.deployment.placements = mappingDraft(config); renderForms(); changed(); stage("formation");
+      config = prepareOpticalSettings(importResourceHardware(await api(`/api/simulations/${id}/configuration`)));
+      normalizeComputeSettings(config, capabilities);
+      config.deployment.placements = mappingDraft(config); renderForms(); changed(); stage("formation");
     });
     row.append(open, reuse); list.append(row);
   }
@@ -331,6 +343,7 @@ async function initialize() {
   bindScene(); stage("home"); lockFields();
   capabilities = await api("/api/capabilities");
   config = prepareOpticalSettings(importResourceHardware(stored("astermind-config", null) || newWebConfiguration(capabilities)));
+  normalizeComputeSettings(config, capabilities);
   config.deployment.placements = mappingDraft(config);
   renderForms(); changed();
   const current = new URLSearchParams(location.hash.slice(1)).get("job") || stored("astermind-active-job", null);
@@ -338,19 +351,29 @@ async function initialize() {
 }
 
 document.querySelectorAll("[data-stage-target]").forEach(node => node.addEventListener("click", () => stage(node.dataset.stageTarget)));
-document.querySelectorAll("[data-action=home]").forEach(node => node.addEventListener("click", () => { window.history.replaceState(null,"",location.pathname + location.search); stage("home"); }));
+function returnToCellOverview() {
+  history.replaceState(null, "", location.pathname + location.search);
+  stage("home");
+}
+document.querySelectorAll("[data-action=home]").forEach(node => node.addEventListener("click", returnToCellOverview));
+$('.studio-logo').addEventListener('click', event => {
+  if (document.body.dataset.stage === 'home' || event.button !== 0 ||
+      event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+  event.preventDefault();
+  returnToCellOverview();
+});
 document.querySelectorAll("[data-action=start-config]").forEach(node => { node.onclick = () => stage("formation"); });
 $("#show-history").onclick = historyView;
 $("#reset-view").onclick = () => scene?.resetConfigView();
 $("#open-job").onclick = () => { if (jobId) stage("analysis"); };
 $("#advanced-config").oninput = () => { dirty = true; ++previewVersion; previewKey = ""; clearTimeout(previewTimer); previewAbort?.abort(); lockFields(); };
-$("#apply-json").onclick = () => { try { const next = importResourceHardware(parseConfiguration($("#advanced-config").value)); for (const key of ["hardware", "deployment", "scheduler", "requests", "topology", "runtime_inputs", "runtime"]) if (!next[key]) throw new Error(`缺少配置段：${key}`); prepareOpticalSettings(next); const error=validationError(configurationErrors(next,capabilities.schema)); if(error) throw error; config = next; drafts.clear(); dirty = false; renderForms(); changed(); message("JSON 已应用"); } catch (error) { message(`JSON 未应用：${error.message}`, true); } };
+$("#apply-json").onclick = () => { try { const next = importResourceHardware(parseConfiguration($("#advanced-config").value)); for (const key of ["hardware", "deployment", "scheduler", "requests", "topology", "runtime_inputs", "runtime"]) if (!next[key]) throw new Error(`缺少配置段：${key}`); prepareOpticalSettings(next); normalizeComputeSettings(next, capabilities); const error=validationError(configurationErrors(next,capabilities.schema)); if(error) throw error; config = next; drafts.clear(); dirty = false; renderForms(); changed(); message("JSON 已应用"); } catch (error) { message(`JSON 未应用：${error.message}`, true); } };
 $("#discard-json").onclick = () => { dirty = false; renderForms(); changed(); message(''); };
 $("#export-config").onclick = () => { try { validateFormInputs(); const link = document.createElement("a"); link.href = URL.createObjectURL(new Blob([JSON.stringify(config, null, 2)], {type:"application/json"})); link.download = "astermind-config.json"; link.click(); setTimeout(() => URL.revokeObjectURL(link.href), 1000); } catch(error) { showError(error); } };
 $('#match-parallelism').onclick = () => {
   try {
     if (dirty || busy || drafts.size) throw Error('请先应用或放弃 JSON 编辑，并修正未完成的输入');
-    const {tp, pp} = matchParallelismToResources(config,{modelShape:capabilities.model_shapes?.[config.model], supportedChoices:capabilities.models_by_hardware?.[config.hardware.default_hardware_id]?.[config.model]});
+    const {tp, pp} = matchParallelismToResources(config,{modelShape:capabilities.model_shapes?.[config.model], supportedChoices:detailChoices(config, capabilities)});
     clearDependentDrafts(drafts);
     renderForms(); changed(); message(`已按资源设置各 pool：TP ${tp} × PP ${pp}，并生成卡映射`);
   } catch (error) { showError(error); }

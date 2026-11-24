@@ -100,10 +100,27 @@ class Handler(SceneHandler):
             from scene_validation import strict_json
             config=strict_json(raw)
             from cell_adapter import topology,convert,request_stream
+            if path=='/cell/api/scene/validate':
+                from cell_adapter import capabilities
+                from scene_cell_config import editor_layout
+                from astermind.builder.config.deployment import SceneDeployment
+                row, identity_key = config['layout'], config['id']
+                draft = row['configuration']
+                base = SceneDeployment(compute_mode=draft['compute_mode'], communication={'ep_strategy':draft['ep_strategy']})
+                layout = editor_layout(identity_key,draft['hardware']['satellite_ids'],row,base,(),capabilities())
+                return self.respond({'cell':layout.serving_cell.model_dump(mode='json')})
             if path=='/cell/api/topology/preview':return self.respond(topology(config)[1])
             if path=='/cell/api/config/validate':
                 effective,_=convert(config)
-                return self.respond({'valid':True,'effective_configuration':effective,'backend':identity()})
+                blocker = None
+                if effective['compute_mode'] == 'fast_mode':
+                    from compute_options import require_fast_scheduler
+                    try:
+                        require_fast_scheduler()
+                    except ValueError as error:
+                        blocker = str(error)
+                return self.respond({'valid':True,'effective_configuration':effective,
+                                     'launch_blocker':blocker,'backend':identity()})
             if path=='/cell/api/requests/identity':
                 stream=request_stream(config)
                 from src.serving.request_gen.request_stream import request_stream_sha256

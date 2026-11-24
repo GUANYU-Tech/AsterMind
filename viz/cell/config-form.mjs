@@ -76,14 +76,15 @@ export function renderConfigForm(container, root, keys, schema, onChange, choice
     const [key, ...rest] = parts;
     if (key !== "*") return expand(rest, [...path, key]);
     const value = path.reduce((v, k) => v?.[k], root);
-    return Array.isArray(value) ? value.flatMap((_, i) => expand(rest, [...path, i])) : [];
+    if (Array.isArray(value)) return value.flatMap((_, i) => expand(rest, [...path, i]));
+    return value && typeof value === 'object' ? Object.keys(value).flatMap(name => expand(rest, [...path, name])) : [];
   }
   function field(raw, path, depth = 0) {
     const key = path.at(-1), full = path.join(".");
     const linkField = path[0] === "topology" && path.includes("links");
     if (linkField && key === 'mode') return null;
     if (linkField && key === "bandwidth_gbps" && root.topology.inter_satellite.links[path[3]].mode !== "fixed") return null;
-    if (!visibleField(path)) return null;
+    if (!visibleField(path, root) || choices.visible?.(path) === false) return null;
     if (path[0] === 'fso' && linkMode(root) === 'fixed') return null;
     if (full === 'fso.tx.baud_rate_options_ghz' && root.fso.tx?.baud_rate_ghz != null) return null;
     if (choices.stage && fieldStage(path) !== choices.stage) return null;
@@ -97,6 +98,9 @@ export function renderConfigForm(container, root, keys, schema, onChange, choice
     if (full === "requests.file" && root.requests.source === "synthetic") return null;
     if (["vllm", "sglang"].includes(key) && path[0] === "scheduler" && root.scheduler[path[1]].framework !== key) return null;
     let spec = resolveSchema(raw, defs);
+    if (key === 'max_model_len' && choices.modelContext) {
+      spec = {...spec, anyOf:spec.anyOf?.map(option=>option.type==='integer'?{...option, maximum:choices.modelContext}:option)};
+    }
     let value = path.reduce((v, k) => v?.[k], root);
     if (linkField && key === "mode" && value == null) value = "islsim";
     let title = choices.labels?.[key] || labels[key] || String(key);
@@ -109,6 +113,13 @@ export function renderConfigForm(container, root, keys, schema, onChange, choice
     if (spec.anyOf) spec = resolveSchema(spec.anyOf.find(s => s.type === (typeof value === "number" ? "integer" : typeof value)) || spec.anyOf.find(s => s.type !== "null"), defs);
     const wrap = el("div", undefined, "config-field");
     wrap.dataset.fieldPath = JSON.stringify(path);
+    if (path[0]==='scheduler' && root.compute_mode==='fast_mode' && ['num_kv_blocks','kv_block_size_tokens'].includes(key)) {
+      const output=el('output','自动 · 等待后端预检');
+      output.dataset.schedulerValue=key;
+      wrap.className+=' read-only-field';
+      wrap.append(el('span',title,'field-title'),output);
+      return wrap;
+    }
     if (scalarTypes?.length > 1) {
       const typeSelect = el("select"); typeSelect.setAttribute("aria-label", `${title} 值类型`);
       for (const type of scalarTypes) { const option = el("option", {string:"文本",integer:"整数",number:"数值",boolean:"布尔值"}[type]); option.value = type; typeSelect.append(option); }
@@ -116,10 +127,13 @@ export function renderConfigForm(container, root, keys, schema, onChange, choice
       typeSelect.addEventListener("change", () => { setAt(root, path, {string:"",integer:0,number:0,boolean:false}[typeSelect.value]); rerender(); });
       wrap.append(typeSelect);
     }
-    const readonly = fixed.has(key) || managed.has(key) || String(key).endsWith("sha256") || (key === "model" && path[0] === "scheduler") || (key === "topology" && path[0] === "deployment") || spec.readOnly;
+    const readonly = fixed.has(key) && !(key === "data_parallel_size" && ['fast_mode','detail_mode'].includes(root.compute_mode))
+      || managed.has(key) || String(key).endsWith("sha256") || (["model","dtype"].includes(key) && path[0] === "scheduler")
+      || (key === "topology" && path[0] === "deployment") || spec.readOnly;
     if (readonly) {
       wrap.className += " read-only-field";
-      wrap.append(el("span", title, "field-title"), el("output", value == null ? "自动 / 未启用" : String(value)));
+      const display = key === "topology" ? optionLabels[value] ?? value : value;
+      wrap.append(el("span", title, "field-title"), el("output", display == null ? "自动 / 未启用" : String(display)));
       return wrap;
     }
     if (blobs.has(key)) {
@@ -138,8 +152,12 @@ export function renderConfigForm(container, root, keys, schema, onChange, choice
     const unsetCard = key === "local_index" && path.includes("placements") && value == null;
     const fixedBaudRate = full === 'fso.tx.baud_rate_ghz';
     if ((value === null || value === undefined) && !unsetCard) {
-      wrap.append(el("span", title, "field-title"), el("small", fixedBaudRate ? "根据候选波特率自动选档" : "未设置 / 未启用"), button(fixedBaudRate ? "设为固定波特率" : "设置", () => {
-        setAt(root, path, choices.seed?.(path, spec) ?? defaultValue(spec, defs)); rerender();
+      const automatic = ['max_model_len','max_batched_tokens','num_kv_blocks','kv_block_size_tokens'].includes(key);
+      const note = fixedBaudRate ? "根据候选波特率自动选档" : automatic ? "自动 · 等待后端预检" : "未设置 / 未启用";
+      const status = el("small", note);
+      if (automatic) status.dataset.schedulerValue = key;
+      wrap.append(el("span", title, "field-title"), status, button(fixedBaudRate ? "设为固定波特率" : "设置", () => {
+        setAt(root, path, choices.seed?.(path, spec) ?? defaultValue(spec, defs)); rerender(path);
       })); return wrap;
     }
     if (spec.type === "object" || (value !== null && typeof value === "object" && !Array.isArray(value))) {
@@ -186,10 +204,14 @@ export function renderConfigForm(container, root, keys, schema, onChange, choice
       const itemSpec = resolveSchema(spec.items, defs);
       if (!spec.prefixItems && ["string", "integer", "number"].includes(itemSpec.type)) {
         if (key === "satellite_ids") wrap.className += " field-wide";
-        const input = el("input"); input.type = "text"; input.value = value.join(", "); input.setAttribute("aria-label", title);
+        const isSu = full === 'hardware.su_group_sizes';
+        const input = el("input"); input.type = "text"; input.value = value.join(isSu ? " + " : ", "); input.setAttribute("aria-label", title);
         input.dataset.configPath = JSON.stringify(path);
-        input.placeholder = "逗号分隔"; wrap.append(el("label", title), input);
-        const read=()=>input.value.trim()==='' ? [] : input.value.split(/[,，\n]/).map(x=>x.trim()).map(x=>itemSpec.type==='string' ? x : x==='' ? NaN : Number(x));
+        input.placeholder = isSu ? choices.autoSuGroups ?? '' : "逗号分隔";
+        input.id = `field-${path.join('-')}`;
+        const label = el("label", title); label.htmlFor = input.id; wrap.append(label, input);
+        const read=()=>input.value.trim()==='' ? [] : input.value.split(isSu ? /[+＋,，\n]/ : /[,，\n]/).map(x=>x.trim()).map(x=>itemSpec.type==='string' ? x : x==='' ? NaN : Number(x));
+        if (isSu && choices.suLimit) spec = {...spec, items:{...itemSpec, maximum:choices.suLimit}};
         const state=validation(input,wrap,path,spec,read);
         input.addEventListener('input',()=>state.check());
         input.addEventListener("change", () => {
@@ -202,7 +224,7 @@ export function renderConfigForm(container, root, keys, schema, onChange, choice
       wrap.append(el("div", `${title} ${value.length}`, "field-title"));
       value.forEach((item, index) => {
         const row = el("details", undefined, "repeat-item"); row.open = true; row.dataset.detailPath = JSON.stringify([...path, index]);
-        const desc = item?.name || item?.operation || (item?.worker_pool ? `${item.worker_pool} PP${item.parallel_coordinate.pp} / TP${item.parallel_coordinate.tp}` : item?.satellite_id ? `${item.satellite_id} / 卡 ${item.local_index}` : item?.source ? `${item.source} → ${item.target}` : `第 ${index + 1} 项`);
+        const desc = item?.name || item?.operation || (item?.worker_pool ? `${item.worker_pool} DP${item.parallel_coordinate.dp} / PP${item.parallel_coordinate.pp} / TP${item.parallel_coordinate.tp}` : item?.satellite_id ? `${item.satellite_id} / 卡 ${item.local_index}` : item?.source ? `${item.source} → ${item.target}` : `第 ${index + 1} 项`);
         row.append(el("summary", desc));
         const rendered = field(spec.prefixItems?.[index] || spec.items || {}, [...path, index], depth + 1); if (rendered) row.append(rendered);
         if (!spec.prefixItems && full !== "deployment.placements") {
@@ -238,8 +260,14 @@ export function renderConfigForm(container, root, keys, schema, onChange, choice
     if (options) {
       const strict = ["topology.source", "model", "requests.source", "requests.synthetic.arrival_distribution"].includes(full);
       const values = strict ? options : [...new Set([...options, value])];
-      if (strict && !values.includes(value)) { const old = el("option", "已载入的外部配置"); old.value = value; old.disabled = true; input.append(old); }
-      for (const option of values) { const n = el("option", optionLabels[option] || String(option)); n.value = option; input.append(n); }
+      if (strict && !values.includes(value)) {
+        const label = full === "model" ? `${choices.optionLabels?.[value] || value}（当前模式或卡型不支持）` : "已载入的外部配置";
+        const old = el("option", label); old.value = value; old.disabled = true; input.append(old);
+      }
+      for (const option of values) {
+        if (option === null) continue;
+        const n = el("option", choices.optionLabels?.[option] || optionLabels[option] || (option === "" ? "默认" : String(option))); n.value = option; input.append(n);
+      }
       input.value = value;
     } else if (typeof value === "boolean") { input.type = "checkbox"; input.checked = value; }
     else { input.type = ["integer","number"].includes(spec.type) || typeof value === "number" || unsetCard ? "number" : "text"; input.value = unsetCard ? "" : value;
@@ -288,7 +316,6 @@ export function renderConfigForm(container, root, keys, schema, onChange, choice
       wrap.replaceChildren(line, slider, endpoints, state.note);
     } else if (key === "layout") {
       wrap.className += " field-wide formation-field"; label.textContent = "编队构型";
-      for (const option of input.options) option.textContent = option.value === "chain" ? "链式编队" : option.value === "ring" ? "环形编队" : option.textContent;
       wrap.append(input);
     } else if (input.type === "checkbox") {
       const modes = el("div", undefined, "boolean-modes");
@@ -308,7 +335,10 @@ export function renderConfigForm(container, root, keys, schema, onChange, choice
       else wrap.append(input);
       if (["timestamp", "default_hardware_id", "resource_id", "source_id", "provenance", "max_total_num_tokens_source"].includes(key)) wrap.className += " field-wide";
     }
-    if (nullable) wrap.append(button(fixedBaudRate ? "改为自动选档" : "清空", () => { setAt(root, path, null); rerender(); }));
+    if (nullable && !['detail_prediction_method','memory_policy_file'].includes(key)) {
+      const caption = fixedBaudRate ? "改为自动选档" : key === "max_batched_tokens" ? "改为自动" : "清空";
+      wrap.append(button(caption, () => { setAt(root, path, null); rerender(); }));
+    }
     return wrap;
   }
   container.replaceChildren(...keys.flatMap(key => expand(String(key).split("."))).map(path => field(schemaAt(path), path)).filter(Boolean));

@@ -64,6 +64,10 @@ def create_scheduler(config, backend_config, model, hardware, *, export_embeddin
         if config.enable_chunked_prefill is False or config.long_prefill_token_threshold:
             raise NotImplementedError(
                 "the vLLM 0.11 adapter keeps chunked prefill enabled without a per-request cap")
+        python = os.environ.get("ORBITServe_VLLM011_PYTHON")
+        if python:
+            from .isolated_vllm011 import create_backend
+            return create_backend(python, backend_config, requested)
         return VLLMBackend.from_model(backend_config, requested)
     if config.scheduler_adapter == "vllm_0_30":
         if config.compute_mode == "fast_mode":

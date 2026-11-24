@@ -25,7 +25,8 @@ include = ["astermind*", "viz", "workloads*", "examples", "examples.native"]
 namespaces = false
 
 [tool.setuptools.package-data]
-"viz" = ["*.html", "*.css", "*.js"]
+"viz" = ["*.html", "*.css", "*.js", "homepage/dist/*.html", "homepage/dist/*.css",
+         "homepage/dist/*.js", "homepage/dist/en/*.html", "homepage/dist/assets/*.png"]
 "examples.native" = ["*.json", "offline_config/*.json", "offline_config/*.jsonl"]
 "workloads.main_composite_chat" = ["countries.csv", "gateways.json", "profiles/*.csv", "profiles/*.json"]
 "astermind.engine.compute" = ["SOURCE.json", "scheduler_runtime/*", "upstream/**/*", "upstream/.orbitserve_snapshot.json"]

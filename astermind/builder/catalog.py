@@ -29,6 +29,10 @@ FAST_EDITOR_GPU_LIMITS = {"nvidia_h200": 8, "nvidia_a800": 8, "ascend_910b": 8, 
 
 
 def cell_member_counts(dataset):
+    return {identity: len(members) for identity, members in cell_members(dataset).items()}
+
+
+def cell_members(dataset):
     value = json.loads(
         (Path(dataset) / "materialized_input.json").read_text(encoding="utf-8")
     )
@@ -36,10 +40,10 @@ def cell_member_counts(dataset):
     for node in value["network"]["nodes"]:
         if node["role"] == "compute":
             identity = node.get("cell_id") or node["node_id"]
-            groups[identity] = groups.get(identity, 0) + 1
+            groups.setdefault(identity, []).append(node["node_id"])
     if not groups:
         raise ValueError("所选物理数据没有计算 Cell")
-    return groups
+    return {identity: sorted(members) for identity, members in groups.items()}
 
 
 def parallel_choices(model, hardware_id):

@@ -50,8 +50,9 @@ The two shipped CPU lockfiles and vLLM identities are in
 `engine/compute/scheduler_runtime/`; they are Scheduler test environments, not a
 complete GPU/HTTP serving dependency stack. Native 0.30 requires the exact source
 checkout and `ORBITServe_VLLM030_SOURCE` / `ORBITServe_VLLM030_PYTHON`. Version 0.11
-and 0.31 workers inherit their launching Python environment. Use separate runs
-where those package versions differ, as upstream does.
+and 0.31 workers inherit their launching Python environment by default. Set
+`ORBITServe_VLLM011_PYTHON` to the Python executable of the locked 0.11 environment
+to run 0.11 worker pools alongside 0.31 Cells in the same scene.
 
 ## Configuration
 

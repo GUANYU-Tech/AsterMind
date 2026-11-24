@@ -128,6 +128,8 @@ class SimulationConfig(ComputeModeConfig):
                 raise ValueError("fast_mode does not support KV migrations")
             portable_scene = any(cell.hardware_id in PORTABLE_BATCH_HARDWARE for cell in self.cells)
             for cell in self.cells:
+                if cell.detail_prediction_method is not None:
+                    raise ValueError("per-Cell detail prediction requires Detail Mode")
                 if cell.hardware_id not in FAST_MODE_HARDWARE:
                     raise ValueError(f"fast_mode has no hardware profile for {cell.hardware_id}")
                 if cell.deployment != "colocated" or cell.parallel.sp != 1:

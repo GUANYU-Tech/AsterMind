@@ -407,7 +407,7 @@ class NetworkOptions(unittest.TestCase):
             self.assertTrue(any(edge["kind"] == "sgl" for edge in candidate_links(spec)))
 
         for formation, direct, cross, handover in product(
-            ("ring", "fully_connected"), (False, True),
+            ("ring", "chain", "fully_connected"), (False, True),
             ("nearest_distance", "highest_capacity", "longest_available"),
             ("retain_valid", "quality_first"),
         ):
@@ -420,7 +420,7 @@ class NetworkOptions(unittest.TestCase):
             edges = candidate_links(spec)
             self.assertEqual(set(spec.cell_topologies.values()), {formation})
             self.assertEqual(sum(edge["kind"] == "cell_isl" for edge in edges),
-                             8 if formation == "ring" else 12)
+                             {"chain": 6, "ring": 8, "fully_connected": 12}[formation])
             self.assertEqual(any(edge["kind"] == "inter_cell" for edge in edges), direct)
             self.assertEqual((spec.cross_layer_access_policy, spec.handover_policy), (cross, handover))
 

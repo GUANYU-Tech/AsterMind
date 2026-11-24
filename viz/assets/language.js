@@ -1,6 +1,6 @@
 /* Localize presentation without reloading forms, tasks or the WebGL scene. */
 (() => {
-  const STORAGE_KEY = 'astermind.ui.language';
+  const STORAGE_KEY = 'astermind.language';
   const attrs = ['aria-label', 'aria-description', 'title', 'placeholder', 'alt'];
   const excluded = 'script,style,template,[translate="no"],[data-raw]';
   const skip = excluded + ',textarea,code';
@@ -126,6 +126,9 @@
     switcher.removeAttribute('aria-busy');
     language = locale;
     document.documentElement.lang = locale;
+    for (const link of document.querySelectorAll('[data-project-home]')) {
+      link.href = locale === 'en' ? '/en/' : '/';
+    }
     switcher.setAttribute('aria-label',locale === 'en' ? 'Interface language' : '界面语言');
     for (const [id,button] of buttons) button.setAttribute('aria-pressed',String(locale === id));
     if (persist) {
@@ -147,7 +150,7 @@
     }
   }
   const savedLanguage = () => {
-    try { return localStorage.getItem(STORAGE_KEY) === 'en' ? 'en' : 'zh-CN'; }
+    try { return (localStorage.getItem(STORAGE_KEY) ?? localStorage.getItem('astermind.ui.language')) === 'en' ? 'en' : 'zh-CN'; }
     catch { return 'zh-CN'; }
   };
   window.addEventListener('storage', event => {
