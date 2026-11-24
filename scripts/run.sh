@@ -12,4 +12,8 @@ fi
 export ORBITSERVE_ISLSIM_ROOT="${ORBITSERVE_ISLSIM_ROOT:-$repo/astermind/builder/islsim}"
 export ORBITServe_VLLM030_PYTHON="${ORBITServe_VLLM030_PYTHON:-$python}"
 export ORBITServe_VLLM030_SOURCE="${ORBITServe_VLLM030_SOURCE:-$repo/.venv/source}"
+if [[ ${1:-} == --deepseek-v4-example ]]; then
+    export ORBITServe_V4_EXPERIMENTAL_MEMORY_PROJECTION="$repo/tests/L2/deepseek-v4-h200-memory.json"
+    shift
+fi
 exec "$python" -B -m viz "$@"

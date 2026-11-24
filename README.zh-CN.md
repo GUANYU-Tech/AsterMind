@@ -1,8 +1,4 @@
-# AsterMind
-
-<p align="center">
-  <img src="assets/astermind-logo.png" alt="AsterMind 标志" width="144">
-</p>
+# <img src="assets/astermind-logo.png" alt="" width="44" align="middle"> AsterMind
 
 [English](README.md) · 简体中文
 
@@ -29,11 +25,9 @@ AsterMind 模拟低轨卫星如何为地面用户提供大语言模型推理服�
 
 ## 构建与安装
 
-以下命令适用于可联网且具备 `sudo` 权限的 x86-64 Ubuntu 24.04。
+**运行前提。** x86-64 Ubuntu 24.04、支持 `venv` 的 Python 3.12、Git、C/C++ 工具链、Node.js 与 npm，以及 `libnuma.so.1`。样例在 CPU 上运行，无需模型权重或 GPU。
 
 ```bash
-sudo apt-get update
-sudo apt-get install -y git ca-certificates
 git clone --branch version/AsterMind-V1.0 https://github.com/GUANYU-Tech/OrbitServe.git AsterMind
 cd AsterMind
 
@@ -43,8 +37,6 @@ source .venv/bin/activate
 python -m pip install -r requirements.txt
 bash scripts/build.sh
 ```
-
-构建脚本会编译 C 和 C++ 组件、准备 vLLM 源码并安装前端资源。仿真在主机 CPU 上运行，无需模型权重。
 
 ## 快速上手
 
@@ -59,13 +51,13 @@ viz/                             L2 和 L3 仿真的本地前端
 
 ### 启动前端
 
-启动本地服务。三维预览需要支持 WebGL 2 的浏览器。
+加载 DeepSeek-V4-Pro 样例配置并启动本地服务。三维预览需要支持 WebGL 2 的浏览器。
 
 ```bash
-bash scripts/run.sh
+bash scripts/run.sh --deepseek-v4-example
 ```
 
-打开[中文首页](http://localhost:8766/)或[英文首页](http://localhost:8766/en/)，点击「进入仿真平台」。可通过[健康检查](http://localhost:8766/health)确认服务返回 `ok`。
+打开[中文首页](http://localhost:8766/)，点击「进入仿真平台」。
 
 | 仿真范围 | 前端入口 | 样例 |
 | --- | --- | --- |
@@ -74,14 +66,14 @@ bash scripts/run.sh
 
 ### L2 · DeepSeek-V4-Pro 仿真样例
 
-本例使用 vLLM 0.30 CPU 调度器，在网页中用 **TP8 × PP4** 模拟 **DeepSeek-V4-Pro**。四颗卫星各模拟八张 H200 GPU。L2 仿真覆盖 Cell 内的推理和通信，请求接入与完成通过零字节的占位客户端记录。
+本例在 **Detail Mode** 下用 **TP8 × PP4** 模拟 **DeepSeek-V4-Pro**，四颗卫星各配八张模拟 H200 GPU。
 
 1. 打开[计算 Cell 仿真](http://localhost:8766/cell/)，点击「新建任务」。
 2. 在「星座资源」选择 **NVIDIA H200**，设置 **4 颗卫星、每星 8 张 GPU**。静态编队选环形，间距设为 **1 km**。
 3. 在「通信网络」中，每星使用 **一组 8 卡 SU**，星间链路选「默认模式」，带宽设为 **400 Gbps**。
-4. 在「模型负载」选择 **deepseek-v4-pro** 和 **Fast Mode**。设置两条合成请求，每条 **16 个输入 Token、2 个输出 Token**。
+4. 在「模型负载」选择 **deepseek-v4-pro** 和 **Detail Mode**。设置两条合成请求，到达率为 **16 请求/秒**，每条 **16 个输入 Token、2 个输出 Token**。
 5. 在「并行部署」保持「同池部署」，选择「手动配置」，设置 **TP 8、PP 4、DP 1**，关闭 EP。确认每个流水线阶段映射到一颗独立卫星。
-6. 在「调度运行」将「模型长度上限」设为 **1152 Token**，在「显存策略」选择 **deepseek-v4-h200-memory.json**，关闭「分块 Prefill」，然后点击「发布任务」。在「仿真结果」查看两条请求的状态以及计算和通信时间线。
+6. 在「调度运行」将「模型长度上限」设为 **1152 Token**，关闭「分块 Prefill」，然后点击「发布任务」。在「仿真结果」查看两条请求及其计算和通信时间线。
 
 ### L3 · 完整场景仿真样例
 
