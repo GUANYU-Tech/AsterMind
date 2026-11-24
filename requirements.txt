@@ -1,0 +1,4 @@
+-e .
+jsonschema>=4.18,<5
+PyYAML>=6,<7
+-r astermind/engine/compute/scheduler_runtime/requirements-vllm-0.30.txt

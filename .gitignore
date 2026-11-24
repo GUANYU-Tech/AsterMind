@@ -21,6 +21,7 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
+.venv-vllm030/
 .pytest_cache/
 .ruff_cache/
 # Personal network console and visual diagnostics (not distributed).
