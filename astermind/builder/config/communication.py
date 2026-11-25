@@ -1,6 +1,6 @@
 """Communication configuration; task resolution and execution stay in Engine."""
 from typing import Annotated, Literal
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 from astermind.engine.comm._vendor.inter_mean.settings import InterMeanSettings
 from .intra_topology import IntraHierarchy
 from .intra_profile import IntraProfile
@@ -47,7 +47,7 @@ class CellCommPolicy(BaseModel):
 
 class CommPolicy(BaseModel):
     model_config=ConfigDict(extra="forbid", frozen=True)
-    ep_strategy: Literal["allgather", "direct"]="allgather"
+    ep_strategy: Literal["direct"]="direct"
     mode: Literal["surrogate"]="surrogate"
     execution: Literal["runtime"]="runtime"
     routing_policy: Literal["min_hops", "min_propagation", "earliest_arrival"]="min_propagation"
@@ -90,6 +90,12 @@ class CommPolicy(BaseModel):
     task_timeout_s: float | None=Field(default=None,gt=0,allow_inf_nan=False)
     trace_service: bool=True
     resource_profiles: dict[str, dict]=Field(default_factory=dict)
+
+    @field_validator('ep_strategy', mode='before')
+    @classmethod
+    def normalize_expert_strategy(cls, value):
+        # Keep archived scenario files readable under the Direct-only model.
+        return 'direct' if value in ('auto', 'allgather') else value
 
     @model_validator(mode='before')
     @classmethod

@@ -44,7 +44,7 @@ source .venv/bin/activate
 如果使用 Conda，将环境建到同一个项目路径并激活。
 
 ```bash
-conda create --prefix "$PWD/.venv" --override-channels -c conda-forge python=3.12 pip nodejs=22
+conda create --prefix "$PWD/.venv" --override-channels -c conda-forge python=3.12 pip nodejs=22 'libstdcxx>=14'
 conda activate "$PWD/.venv"
 ```
 

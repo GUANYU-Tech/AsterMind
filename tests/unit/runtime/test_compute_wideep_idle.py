@@ -17,6 +17,7 @@ def test_single_real_request_with_an_idle_replica(model, tp, pp):
     from astermind.common.bootstrap import activate
 
     root = activate()
+    from astermind.engine.compute.ep_routing import direct_ep_matrices
     from astermind.engine.compute.runtime import (
         MidlayerCellConfig, create_midlayer_runtime, prepare_scheduled_step,
     )
@@ -56,6 +57,14 @@ def test_single_real_request_with_an_idle_replica(model, tp, pp):
         specs = tuple(call.kernel_spec for call in plan.calls)
         assert any(spec.transfer is not None and spec.transfer.operation == 'all_gatherv'
                    and len(spec.transfer.participants) >= 2 for spec in specs)
+        calls = {call.call_id: call for call in plan.calls}
+        matrices = direct_ep_matrices(calls, execution, 'main', schedule.step_id,
+                                      replica_tokens=(schedule.token_count, 0))
+        assert matrices
+        for name, matrix in matrices.items():
+            transfer = calls[name].kernel_spec.transfer
+            if transfer.operation == 'all_gatherv':
+                assert all(not any(row) for row in matrix[tp:])
         if model == 'deepseek-v4-flash':
             assert any(spec.attributes.get('mathematical_program') == 'v4_idle_swa_insert_v1'
                        and spec.attributes.get('valid_token_count') == 0 for spec in specs)

@@ -225,15 +225,18 @@ class KernelPlan:
     calls: Tuple[KernelCall, ...]
     block_repeats: Tuple[KernelBlockRepeat, ...]
     memory_context: TraceMemoryContext | None = None
+    wide_ep_source_nodes: Mapping | None = field(default=None, repr=False, compare=False)
     _topological_calls: Tuple[KernelCall, ...] = field(
         init=False, repr=False, compare=False)
 
     def __init__(self, calls: Iterable[KernelCall],
                  block_repeats: Iterable[KernelBlockRepeat] = (), *,
-                 memory_context: TraceMemoryContext | None = None):
+                 memory_context: TraceMemoryContext | None = None,
+                 wide_ep_source_nodes: Mapping | None = None):
         if memory_context is not None and type(memory_context) is not TraceMemoryContext:
             raise TypeError("kernel plan memory context must be a trace receipt")
         object.__setattr__(self, "memory_context", memory_context)
+        object.__setattr__(self, "wide_ep_source_nodes", wide_ep_source_nodes)
         call_tuple = tuple(calls)
         block_repeat_tuple = tuple(block_repeats)
         if not call_tuple:

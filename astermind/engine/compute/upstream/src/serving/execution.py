@@ -1222,6 +1222,18 @@ class ServingExecutionContext:
         self._phase_wall_time_s["kernel_lowering"] += (
             time.perf_counter() - started)
         if _plan_only:
+            if source_memory_context is None and any(
+                    pool.parallel_plan.config.enable_expert_parallel
+                    and pool.parallel_plan.config.data_parallel_size > 1
+                    for pool in deployment.worker_pools.values()):
+                # Fast execution has no memory receipts. Preserve just the
+                # source nodes required to route runtime expert transfers.
+                nodes = {node.node_id: node for node in workload.nodes
+                         if node.kind is WorkloadKind.FUSED_MOE or (
+                             node.kind is WorkloadKind.COLLECTIVE
+                             and node.attributes["operation"] in ("all_gatherv", "reduce_scatterv"))}
+                return KernelPlan(kernel_plan.calls, kernel_plan.block_repeats,
+                                  wide_ep_source_nodes=nodes)
             return kernel_plan
         predictions = self._predict_plan(kernel_plan)
         started_order = time.perf_counter()

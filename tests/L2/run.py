@@ -77,8 +77,6 @@ def scenario(case, *, smoke=False, prefill_chunk_tokens=None):
     )
     if model == "deepseek-v4-pro":
         cell["kv_block_size_tokens"] = 256
-        if wideep:
-            communication["ep_strategy"] = "direct"
 
     count, prompt, output = (4, 96, 2) if smoke else (128, 1000, 100)
     return dict(

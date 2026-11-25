@@ -405,14 +405,9 @@ def compile_serving_cell(value, physical, longest_request, *, cell_id='cell', sc
         }
     if fast:
         validate_fast_su_placement(hardware, by_rank.values(), physical.get('intra_hierarchies', {}))
-    strategy = value.get('ep_strategy', 'auto')
-    if strategy == 'auto':
-        strategy = 'direct' if dp > 1 else 'allgather'
-    if fast and dp > 1 and strategy != 'direct':
-        raise ValueError('Fast Mode 的 WideEP 需要 Direct 专家通信')
     communication = {
-        'intra_mode': 'surrogate' if physical.get('intra_hierarchies') else 'IntraSatelliteRoofline',
-        'default_hardware_id': hardware, 'ep_strategy': strategy,
+        'intra_mode': 'surrogate' if dp > 1 or physical.get('intra_hierarchies') else 'IntraSatelliteRoofline',
+        'default_hardware_id': hardware,
         'cell_policies': {cell_id: {'algorithms': scoped_algorithms, 'hardware_id':hardware}},
     }
     terminal = '/terminal' if scene else '.exit'

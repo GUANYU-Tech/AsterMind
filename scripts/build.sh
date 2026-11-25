@@ -9,6 +9,9 @@ if [[ ! -x "$python" ]]; then
     exit 1
 fi
 
+source "$repo/scripts/conda-runtime.sh"
+astermind_use_conda_cxx_runtime "$repo/.venv"
+
 if ! "$python" -c 'import ctypes; ctypes.CDLL("libnuma.so.1")' >/dev/null 2>&1; then
     echo 'The vLLM CPU wheel requires libnuma.so.1. On Ubuntu, it is provided by libnuma1.' >&2
     exit 1

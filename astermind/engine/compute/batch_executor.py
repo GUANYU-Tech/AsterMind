@@ -95,7 +95,7 @@ class RuntimeBatchExecutor(NetworkBatchExecutor):
             if deliveries:self.input_distributions.append(dict(cell_id=cell_id,pool_name=pool_name,step_id=step_id,
                 ready_ns=origin,ready_ticks=origin_ticks,completed_ticks=str(self.loop.now_s.ticks),
                 completed_ns=nanoseconds(self.loop.now_s),replicas=deliveries))
-            try:self._run_plan(step_id,components,predictions,execution,pool_name,on_complete,on_next_batch,state)
+            try:self._run_plan(step_id,components,predictions,execution,pool_name,on_complete,on_next_batch,state,counts)
             except Exception as error:
                 if not state['alive']:raise
                 self._abort_batch(state,error)
@@ -113,16 +113,18 @@ class RuntimeBatchExecutor(NetworkBatchExecutor):
             self._submit_batch_task(state,operator,lambda estimate,r=replica:delivered(r,estimate),
                                     f"{cell_id}/{pool_name}/{step_id}/input/{replica}")
 
-    def _run_plan(self,step_id,plan,predictions,execution,pool_name,on_complete,on_next_batch,state):
+    def _run_plan(self,step_id,plan,predictions,execution,pool_name,on_complete,on_next_batch,state,replica_tokens):
         start_time=self.loop.now_s
         start_ns=nanoseconds(start_time)
         inputs=_plan_schedule_inputs(plan);calls=inputs[1]
         logical=tuple(_logical_schedule(plan,*inputs))
         policy = getattr(self.comm, "policy", None)
-        routed = (direct_ep_matrices(calls, execution, pool_name, step_id)
-                  if getattr(policy, "ep_strategy", "allgather") == "direct" else {})
+        routed = direct_ep_matrices(
+            calls, execution, pool_name, step_id,
+            replica_tokens=replica_tokens, source_nodes=plan.wide_ep_source_nodes,
+        )
         if routed and native_enabled(policy, self.cell_id):
-            raise NotImplementedError("Direct DeepSeek V4 EP requires surrogate communication")
+            raise NotImplementedError("Direct WideEP requires surrogate communication")
         host_end={};gaps=None
         if execution.host_launch_profiles:
             from src.serving.kernel_lowering.execution_timeline import _DeviceLaunchGapTracker,eager_host_ready_times

@@ -9,6 +9,9 @@ if [[ ! -x "$python" ]]; then
     exit 1
 fi
 
+source "$repo/scripts/conda-runtime.sh"
+astermind_use_conda_cxx_runtime "$repo/.venv"
+
 export ORBITSERVE_ISLSIM_ROOT="${ORBITSERVE_ISLSIM_ROOT:-$repo/astermind/builder/islsim}"
 export ORBITServe_VLLM030_PYTHON="${ORBITServe_VLLM030_PYTHON:-$python}"
 export ORBITServe_VLLM030_SOURCE="${ORBITServe_VLLM030_SOURCE:-$repo/.venv/source}"

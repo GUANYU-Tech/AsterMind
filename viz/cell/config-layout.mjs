@@ -34,7 +34,7 @@ export const groups = {
     ["星内网络", ["topology.intra_satellite", "hardware.su_group_sizes", "hardware.intra_satellite_bandwidth_gbps", "hardware.intra_satellite_latency_ns"]],
     ["星间连接", ["topology.inter_satellite"]],
     ["ISLSim 光学链路", ["fso"]],
-    ["集合通信", ["ep_strategy", "collective_policies"]],
+    ["集合通信", ["collective_policies"]],
   ],
   workload: [
     ["模型", ["compute_mode", "model"]], ["请求流", ["requests"]],

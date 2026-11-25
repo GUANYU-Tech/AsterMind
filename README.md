@@ -44,7 +44,7 @@ source .venv/bin/activate
 If you use Conda, create and activate the environment at the same path.
 
 ```bash
-conda create --prefix "$PWD/.venv" --override-channels -c conda-forge python=3.12 pip nodejs=22
+conda create --prefix "$PWD/.venv" --override-channels -c conda-forge python=3.12 pip nodejs=22 'libstdcxx>=14'
 conda activate "$PWD/.venv"
 ```
 
