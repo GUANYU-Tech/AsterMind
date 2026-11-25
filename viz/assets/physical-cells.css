@@ -1,4 +1,22 @@
-.physical-page #addCell {width:auto;padding:7px 14px;border:1px solid var(--border);border-radius:6px;font:inherit}
+.physical-page :is(#addShell,#addCell,#addGround) {width:auto;padding:7px 14px;border:1px solid var(--border);border-radius:6px;font:inherit}
+.ground-import-row{display:flex;flex-wrap:wrap;gap:12px;align-items:end;margin-top:14px}
+.ground-import-row label{max-width:100%}
+#addCommunication {width:min(560px,calc(100vw - 32px));max-height:calc(100dvh - 32px);overflow:auto}
+#addCommunication h2 {margin:0 0 18px}
+#addCommunication fieldset {border:0;min-width:0;margin:0;padding:0}
+#addCommunication #shellMethods {display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+#shellMethods legend {margin:0 0 8px}
+#shellMethods label {flex-direction:row;align-items:center;gap:8px;padding:10px;border:1px solid var(--border);border-radius:6px;cursor:pointer}
+#shellMethods label:has(:checked) {border-color:currentColor}
+#addCommunication input[type=radio] {width:auto;height:auto;min-height:0;align-self:center;accent-color:var(--ink)}
+#addCommunication .fields {grid-template-columns:repeat(2,minmax(0,1fr));gap:12px 16px;margin-top:18px}
+#addCommunication .fields input {width:100%}
+#addCommunication #tleOptions {display:grid;gap:12px;margin-top:16px}
+#addCommunication p {font-size:.9em;line-height:1.5}
+#addCommunication :is(#tleOptions p,#tleStatus:empty) {margin:0}
+#addCommunication .actions {justify-content:flex-end;margin:18px 0 0}
+.physical-page #shells > .card {scroll-margin-top:78px}
+@media(max-width:520px){#addCommunication :is(#shellMethods,.fields){grid-template-columns:1fr}}
 .formation-cell-list{margin:16px 0 22px}
 .formation-cell-list h4{margin:0 0 10px}
 .formation-cell-row{display:grid;grid-template-columns:minmax(140px,.8fr) minmax(180px,1.4fr) auto;align-items:center;gap:18px;padding:12px 0;border-top:1px solid var(--border)}
@@ -12,7 +30,10 @@
 .cell-workspace-dialog footer span{flex:1;color:#eed6ab}
 .cell-workspace-dialog iframe{flex:1;min-height:0;border:0;width:100%}
 #addFormation label{margin:14px 0}
-#jumpCells{margin-bottom:16px}
+.physical-page > .fields.model-header{grid-template-columns:minmax(0,1fr) minmax(0,1.5fr)}
+.model-picker{min-width:0;display:grid;gap:10px}
+.model-source-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px}
+@media(max-width:700px){.physical-page > .fields.model-header{grid-template-columns:minmax(0,1fr)}}
 @media(max-width:650px){.formation-cell-row{grid-template-columns:1fr auto;gap:8px}.formation-cell-row span{grid-row:2;grid-column:1/-1}.formation-cell-row button{grid-column:2;grid-row:1}.cell-workspace-dialog footer{padding:6px;gap:6px}.cell-workspace-dialog footer span:empty{display:none}.cell-workspace-dialog footer button{font-size:12px;padding:8px}}
 
 .physical-page .physical-section-heading:has(#addCell){scroll-margin-top:24px}

@@ -1,7 +1,7 @@
 /* Localize presentation without reloading forms, tasks or the WebGL scene. */
 (() => {
   const STORAGE_KEY = 'astermind.language';
-  const attrs = ['aria-label', 'aria-description', 'title', 'placeholder', 'alt'];
+  const attrs = ['aria-label', 'aria-description', 'title', 'placeholder', 'alt', 'label'];
   const excluded = 'script,style,template,[translate="no"],[data-raw]';
   const skip = excluded + ',textarea,code';
   const hasChinese = /\p{Script=Han}/u;
