@@ -1,4 +1,4 @@
-# <img src="assets/astermind-logo.png" alt="" width="44" align="middle"> AsterMind
+# <img src="assets/astermind-logo.png" alt="" width="36" align="absmiddle"> AsterMind
 
 [English](README.md) · 简体中文
 
@@ -25,7 +25,7 @@ AsterMind 模拟低轨卫星如何为地面用户提供大语言模型推理服�
 
 ## 构建与安装
 
-**运行前提。** x86-64 Ubuntu 24.04、支持 `venv` 的 Python 3.12、Git、C/C++ 工具链、Node.js 与 npm，以及 `libnuma.so.1`。样例在 CPU 上运行，无需模型权重或 GPU。
+**运行前提。** x86-64 Linux，glibc 版本至少为 2.39（例如 Ubuntu 24.04）。还需要支持 `venv` 的 Python 3.12、Git、C/C++ 工具链、Node.js 与 npm，以及 `libnuma.so.1`。样例在 CPU 上运行，无需模型权重或 GPU。
 
 ```bash
 git clone --branch version/AsterMind-V1.0 https://github.com/GUANYU-Tech/OrbitServe.git AsterMind
@@ -51,13 +51,13 @@ viz/                             L2 和 L3 仿真的本地前端
 
 ### 启动前端
 
-加载 DeepSeek-V4-Pro 样例配置并启动本地服务。三维预览需要支持 WebGL 2 的浏览器。
+启动本地服务。三维预览需要支持 WebGL 2 的浏览器。
 
 ```bash
-bash scripts/run.sh --deepseek-v4-example
+bash scripts/run.sh
 ```
 
-打开[中文首页](http://localhost:8766/)，点击「进入仿真平台」。
+打开[首页](http://localhost:8766/)。
 
 | 仿真范围 | 前端入口 | 样例 |
 | --- | --- | --- |

@@ -1,5 +1,6 @@
 """Subprocess entry point for a V1 Cell run."""
 import json
+import os
 import sys
 import traceback
 from datetime import datetime,timezone
@@ -17,6 +18,12 @@ def main():
         from astermind.engine.simulation import Simulation
         from astermind.__main__ import json_default
         config=SimulationConfig.load(output/'effective_configuration.json')
+        cell = config.cells[0]
+        if (config.compute_mode == 'detail_mode' and cell.hardware_id == 'nvidia_h200'
+                and cell.model == 'configs/model/deepseek-v4-pro.json'):
+            from compute_options import DEEPSEEK_V4_H200_MEMORY_POLICY
+            os.environ.setdefault('ORBITServe_V4_EXPERIMENTAL_MEMORY_PROJECTION',
+                                  str(DEEPSEEK_V4_H200_MEMORY_POLICY))
         update(status='running',phase='configuration',progress=5,started_at=datetime.now(timezone.utc).isoformat())
         with Simulation(config,physical_output_dir=output/'physical',startup_progress=lambda stage:
                         update(phase=stage['phase'],progress=20,startup_stage=stage)) as simulation:
@@ -27,7 +34,7 @@ def main():
         write(output/'result.json',project(result))
         write(output/'requests.json',[dict(id=k,**v) for k,v in result['requests'].items()])
         write(output/'communication_events.json',result.get('communication_events',[]))
-        write(output/'placement.json',config.cells[0].model_dump(mode='json')['placements'])
+        write(output/'placement.json',cell.model_dump(mode='json')['placements'])
         write(output/'batches.json',result.get('batches',[]))
         update(status='success',phase='completed',progress=100,simulation_status=result['status'],finished_at=datetime.now(timezone.utc).isoformat())
     except Exception as error:

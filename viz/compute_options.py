@@ -7,6 +7,8 @@ from pathlib import Path
 
 from paths import REPOSITORY, RUNTIME
 
+DEEPSEEK_V4_H200_MEMORY_POLICY = REPOSITORY / 'tests/L2/deepseek-v4-h200-memory.json'
+
 
 def memory_policies():
     """Return named files the operator has made available to the web service."""
@@ -16,7 +18,7 @@ def memory_policies():
         for file in sorted(directory.glob('*.json'))
         if file.is_file() and file.resolve().is_relative_to(directory)
     }
-    example = REPOSITORY / 'tests/L2/deepseek-v4-h200-memory.json'
+    example = DEEPSEEK_V4_H200_MEMORY_POLICY
     if example.is_file():
         policies.setdefault('deepseek-v4-h200-memory.json', example.resolve())
     return policies

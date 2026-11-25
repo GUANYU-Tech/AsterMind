@@ -1,4 +1,4 @@
-# <img src="assets/astermind-logo.png" alt="" width="44" align="middle"> AsterMind
+# <img src="assets/astermind-logo.png" alt="" width="36" align="absmiddle"> AsterMind
 
 English · [简体中文](README.zh-CN.md)
 
@@ -25,7 +25,7 @@ AsterMind simulates how satellites serve inference requests from users on Earth.
 
 ## Build and Install
 
-**Prerequisites.** x86-64 Ubuntu 24.04, Python 3.12 with `venv`, Git, a C/C++ toolchain, Node.js with npm, and `libnuma.so.1`. The examples run on the CPU without model weights or a GPU.
+**Prerequisites.** x86-64 Linux with glibc 2.39 or newer (for example, Ubuntu 24.04), Python 3.12 with `venv`, Git, a C/C++ toolchain, Node.js with npm, and `libnuma.so.1`. The examples run on the CPU without model weights or a GPU.
 
 ```bash
 git clone --branch version/AsterMind-V1.0 https://github.com/GUANYU-Tech/OrbitServe.git AsterMind
@@ -51,13 +51,13 @@ viz/                             Local frontend for L2 and L3
 
 ### Open the Frontend
 
-Start the local service with the DeepSeek-V4-Pro example preset. The 3D previews require a browser with WebGL 2.
+Start the local service. The 3D previews require a browser with WebGL 2.
 
 ```bash
-bash scripts/run.sh --deepseek-v4-example
+bash scripts/run.sh
 ```
 
-Open the [English homepage](http://localhost:8766/en/) and enter the simulation platform.
+Open the [homepage](http://localhost:8766/en/).
 
 | Simulation scope | Frontend | Example |
 | --- | --- | --- |
