@@ -15,13 +15,17 @@ if [[ ! $glibc =~ ^glibc\ ([0-9]+)\.([0-9]+)$ ]] ||
 fi
 
 missing=()
-for program in git "${CC:-gcc}" "${CC:-cc}" "${CXX:-g++}"; do
+for program in git "${CC:-gcc}" "${CC:-cc}" "${CXX:-g++}" python3.12 node npm; do
     if ! command -v "$program" >/dev/null; then
         missing+=("$program")
     fi
 done
 if (( ${#missing[@]} )); then
     printf 'Missing required command: %s\n' "${missing[@]}" >&2
+    failed=true
+fi
+if command -v python3.12 >/dev/null && ! python3.12 -m ensurepip --version >/dev/null 2>&1; then
+    echo 'Python 3.12 must include venv and ensurepip.' >&2
     failed=true
 fi
 if [[ $failed == true ]]; then
