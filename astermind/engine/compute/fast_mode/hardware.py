@@ -1,6 +1,6 @@
 """Bind Roofline inputs to the selected Cell hardware profile."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import isfinite
 
 
@@ -44,6 +44,16 @@ class Hardware:
             raise ValueError(f"{spec.hardware_id} does not declare an FP16 tensor peak")
         return cls(bf16_flops=bf16, fp8_flops=tensor_peak("fp8"), fp16_flops=fp16,
                    hbm_bytes=read_bandwidth, widen_fp8_to_bf16=widen_fp8_to_bf16)
+
+    def nominal_hbm_bytes(self, hardware_id):
+        # H200 SXM is rated at 4.8 TB/s. Other profiles use their declared read bandwidth.
+        return 4.8e12 if hardware_id == "nvidia_h200" else self.hbm_bytes
+
+    def with_roofline(self, hardware_id, settings):
+        if settings is None:
+            return self
+        return replace(self, hbm_bytes=self.nominal_hbm_bytes(hardware_id),
+                       tensor_efficiency=settings.tensor_percent / 100, hbm_efficiency=settings.hbm_percent / 100)
 
     def roofline(self, flops, memory, *, fp8=False):
         if fp8:

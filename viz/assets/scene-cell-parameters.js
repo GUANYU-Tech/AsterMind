@@ -10,7 +10,7 @@ export function sceneCellDraft(capabilities, members, mode, layout) {
   const draft = normalizeComputeSettings(structuredClone(layout?.configuration ?? capabilities.default_configuration), capabilities);
   delete draft.requests;
   if (layout?.configuration) {
-    setAutomaticDeployment(draft,layout.automatic_deployment ?? false);
+    setAutomaticDeployment(draft,false);
     if (draft.compute_mode !== mode) {
       draft.compute_mode = mode;
       editDependencies(draft,['compute_mode'],mode,capabilities);
@@ -22,6 +22,7 @@ export function sceneCellDraft(capabilities, members, mode, layout) {
   const scheduler = draft.scheduler[base.name];
   const fast = mode === 'fast_mode';
   Object.assign(draft, {
+    ...(options.fast_roofline?{fast_roofline:structuredClone(options.fast_roofline)}:{}),
     compute_mode: mode, model: options.model ? modelId(options.model) : draft.model,
     detail_prediction_method: fast ? null : options.detail_prediction_method || 'auto',
     memory_policy_file: fast ? options.memory_policy_file || '' : '',
@@ -92,6 +93,7 @@ export function sceneCellLayout(draft, capabilities, members, {remap=false}={}) 
   if (new Set(ranks).size!==ranks.length) throw Error('Rank 需要映射到不同的 GPU');
   return {
     deployment:{
+      ...(draft.compute_mode==='fast_mode' && draft.fast_roofline?{fast_roofline:structuredClone(draft.fast_roofline)}:{}),
       model:model.id,hardware_id:profile.id,gpus_per_satellite:cards,tp,pp,dp,expert_parallel:ep,
       expert_routing_seed:model.experts?draft.expert_routing_seed:null,
       detail_prediction_method:draft.detail_prediction_method,memory_policy_file:draft.memory_policy_file||null,

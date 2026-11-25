@@ -3,9 +3,9 @@ import {renderParameterGroup} from './parameter-panel.mjs';
 import {optionLabels} from "./config-labels.mjs?v=compact-2";
 import { editorChoices } from "./config-edit.mjs?v=validation-1";
 import { element } from "./results.mjs?v=compact-2";
-import { renderHardwareProfiles } from "./hardware-profile.mjs?v=profile-1";
+import { renderHardwareProfiles, rooflinePanel } from "./hardware-profile.mjs?v=profile-1";
 import {deploymentCapacity} from './deployment-mapping.mjs';
-import {automaticDeployment, resourceSyncError} from './resource-sync.mjs';
+import {resourceSyncError} from './resource-sync.mjs';
 import {fastMode} from './compute-config.mjs';
 
 function action(text, id, cls = "small-action") { const b = element("button", text, cls); b.type = "button"; if (id) b.id = id; return b; }
@@ -30,16 +30,13 @@ export function buildWorkspace({sceneCell=false}={}) {
     if (name === 'deployment') {
       const summary = element('section', undefined, 'deployment-assistant');
       const capacity = element('p'); capacity.id = 'deployment-capacity'; capacity.setAttribute('role', 'status');
-      const note = element('p', '', 'muted'); note.id='deployment-assistant-note';
-      const modes = element('div', undefined, 'boolean-modes'); modes.setAttribute('role','group'); modes.setAttribute('aria-label','部署配置方式');
-      modes.append(action('自动适配资源','automatic-deployment','boolean-mode'),action('手动配置','manual-deployment','boolean-mode'));
       const actions = element('div', undefined, 'deployment-tools');
       actions.append(action('按资源匹配 TP / PP', 'match-parallelism'), action('重新生成卡映射', 'generate-mapping'));
-      summary.append(capacity, note, modes, actions); scroll.append(summary);
+      summary.append(capacity, actions); scroll.append(summary);
     }
     for (const [index, [title,paths]] of groups[name].entries()) {
       if(sceneCell && paths.includes('requests'))continue;
-      const section = element("details", undefined, "editor-section"); section.dataset.group = `${name}-${index}`; section.open = index < 2;
+      const section = element("details", undefined, "editor-section"); section.dataset.group = `${name}-${index}`; section.open = index < 2 || paths.includes('deployment.worker_pools');
       section.append(element("summary", title)); const fields = element("fieldset", undefined, "basic-fields"); fields.id = `form-${name}-${index}`; section.append(fields); scroll.append(section);
       if (name === "formation" && index === 1) {
         const tle = element("div", undefined, "tle-input"); tle.id = "tle-input";
@@ -95,35 +92,33 @@ export function renderWorkspaceForms(config, capabilities, changed, onEdit, onEr
     if (paths.includes('fso')) container.parentElement.hidden = !container.childElementCount;
     for (const d of container.querySelectorAll("details[data-detail-path]")) if (opened.has(d.dataset.detailPath)) d.open = opened.get(d.dataset.detailPath);
   });
+  renderComputeSummary(config,capabilities,changed,choices);
   if(validation.drafts) {
     const present=new Set([...document.querySelectorAll('.basic-fields [data-config-path]')].map(n=>n.dataset.configPath));
     for(const path of validation.drafts.keys()) if(!present.has(path)) validation.drafts.delete(path);
   }
-  renderComputeSummary(config,capabilities);
   document.querySelector("#canonical-import").hidden = config.requests.source !== "canonical";
   document.querySelector("#request-upload-status").textContent = config.requests.file?.split("/").at(-1) || "";
   document.querySelector("#tle-input").hidden = config.topology.source !== "orbit";
   document.querySelector("#tle-upload-status").textContent = config.constellation?.tle_file ? config.constellation.tle_file.split("/").at(-1) : "";
 }
 
-export function renderComputeSummary(config,capabilities) {
+export function renderComputeSummary(config,capabilities,changed,choices) {
   const cardId=config.hardware.default_hardware_id;
   const fast=fastMode(config);
   const selected=capabilities.model_details?.[config.model];
   const count=document.querySelectorAll('#field-model option:not(:disabled)').length;
   document.querySelector('#supported-models').textContent=[optionLabels[cardId]||cardId,fast?'Fast Mode · vLLM 0.30':'Detail Mode',
     `${fast?'候选模型':'可用模型'} ${count} 个`,selected?.dtype,selected?.quantization].filter(Boolean).join(' · ');
-  document.querySelector('#deployment-assistant-note').textContent=fast
-    ? '设置 TP / PP / DP 后生成卡映射，启动前由后端校验。'
-    : '默认自动适配资源与模型，生成 TP / PP 和卡映射。不能参与当前并行方案的卡保持空闲；可切换手动配置。';
   document.querySelector('#match-parallelism').hidden=fast;
   const capacity = deploymentCapacity(config);
   const idle = Math.max(0,capacity.physical-capacity.required);
-  const status = resourceSyncError(config) || (capacity.required > capacity.physical ? '资源不足，请启用自动适配资源。' : `已分配 ${capacity.required} 张卡，空闲 ${idle} 张。`);
+  const status = resourceSyncError(config) || (capacity.required > capacity.physical ? '资源不足，请调整并行规模或增加算力卡。' : `已分配 ${capacity.required} 张卡，空闲 ${idle} 张。`);
   document.querySelector('#deployment-capacity').textContent = `${config.hardware.satellite_ids.length} 颗卫星 × 每星 ${config.hardware.accelerators_per_satellite} 张卡 = ${capacity.physical} 张物理卡；${status}`;
-  document.querySelector('#automatic-deployment').setAttribute('aria-pressed',String(automaticDeployment(config)));
-  document.querySelector('#manual-deployment').setAttribute('aria-pressed',String(!automaticDeployment(config)));
   const profile = document.querySelector("#hardware-profile");
   const models = new Set([config.hardware.default_hardware_id, ...(config.hardware.accelerator_overrides || []).map(x => x.hardware_id)]);
   renderHardwareProfiles(profile, models, capabilities.hardware_details);
+  if (fast && config.fast_roofline) {
+    document.querySelector('#form-workload-0').append(rooflinePanel(config, capabilities, changed, choices));
+  }
 }

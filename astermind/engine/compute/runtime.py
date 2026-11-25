@@ -17,6 +17,7 @@ from src.serving.parallelism.parallel_config import ParallelConfig
 from src.serving.parallelism.pp import pipeline_layer_ranges_for_model
 from src.serving.backend.vllm import BackendConfig, VLLMSchedulerConfig
 from src.serving.simulation import validate_workload_emission_parallelism
+from astermind.builder.config.deployment import FastRoofline
 from astermind.common.hardware_capabilities import PORTABLE_BATCH_HARDWARE
 from src.serving.workload.model_config import load_model_config
 from src.serving.workload.runtime_inputs import ExpertRoutingInput, RuntimeInputs
@@ -92,6 +93,8 @@ class MidlayerCellConfig:
     enable_chunked_prefill: bool | None = None
     long_prefill_token_threshold: int = 0
     fast_glm_dsa_score: Literal["bf16_timing_proxy"] | None = None
+    fast_roofline: FastRoofline | None = None
+    fast_link_contention: bool = False
 
 
 def _runtime_inputs(config, model, *, portable_fp8=False):

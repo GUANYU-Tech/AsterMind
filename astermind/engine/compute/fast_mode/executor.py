@@ -29,6 +29,7 @@ class FastModeExecutor(RuntimeBatchExecutor):
     compute_mode = "fast_mode"
     compute_timing_reference = None
     portable_hardware = False
+    link_contention = False
 
     def configure(self, execution, config):
 
@@ -47,7 +48,8 @@ class FastModeExecutor(RuntimeBatchExecutor):
         hardware = Hardware.from_hardware_spec(
             execution.hardware_by_id[pool.hardware_id], compute_dtype=execution.model.compute_dtype,
             widen_fp8_to_bf16=widened_fp8,
-        )
+        ).with_roofline(pool.hardware_id, config.fast_roofline)
+        self.link_contention = config.fast_link_contention
         self.compute_timing_reference = "fp8_widened_bf16_reference_roofline" if widened_fp8 else None
         predictor = Predictor(model_name, model, parallel.tensor_parallel_size, parallel.data_parallel_size,
                               parallel.expert_parallel_size, ranges, hardware=hardware,
@@ -114,17 +116,20 @@ class FastModeExecutor(RuntimeBatchExecutor):
         start = self.loop.now_s
         crossing = None
         fallback = None
-        try:
-            communication_s, frame_end, pricing = self._price(components)
-        except NoRouteError:
-            communication_s, end = 0., None
-            fallback = "initial_route_unavailable"
+        if self.link_contention:
+            communication_s, end, pricing = 0., None, "runtime"
         else:
-            end = start + Time(compute_s + communication_s)
-            if frame_end is not None and end >= frame_end:
-                fallback = self._crossing_reason(components, frame_end, end)
-                if fallback is None:
-                    crossing = "certified"
+            try:
+                communication_s, frame_end, pricing = self._price(components)
+            except NoRouteError:
+                communication_s, end = 0., None
+                fallback = "initial_route_unavailable"
+            else:
+                end = start + Time(compute_s + communication_s)
+                if frame_end is not None and end >= frame_end:
+                    fallback = self._crossing_reason(components, frame_end, end)
+                    if fallback is None:
+                        crossing = "certified"
         if fallback is not None:
             pricing, crossing = "runtime", "runtime"
         self._active.add(pool_name)
@@ -136,6 +141,8 @@ class FastModeExecutor(RuntimeBatchExecutor):
         if self.compute_timing_reference is not None:
             record["compute_timing_reference"] = self.compute_timing_reference
         state["record"] = record
+        if self.link_contention:
+            record["runtime_reason"] = "link_bandwidth_contention"
         if crossing is not None:
             record["cross_frame"] = crossing
         if fallback is not None:
@@ -155,7 +162,7 @@ class FastModeExecutor(RuntimeBatchExecutor):
             if on_next_batch:
                 on_next_batch()
 
-        if fallback is None:
+        if pricing != "runtime":
             self.loop.schedule(end, 1, "cell:fast-mode-complete", complete, owner_id=cell_id)
         else:
             self._run_runtime_phases(components, state, complete)

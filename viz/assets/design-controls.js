@@ -26,7 +26,7 @@ function fieldContainer(input, caption) {
 
 export function enhancePhysicalFields(root) {
   enhanceSelects(root);
-  for (const input of root.querySelectorAll('input[type=checkbox]:not([data-design-control])')) {
+  for (const input of root.querySelectorAll('input[type=checkbox]:not([data-design-control]):not(#linkContention)')) {
     const caption = captionFor(input), container = fieldContainer(input, caption);
     if (!container) continue;
     const {wrap, title} = container; input.dataset.designControl = 'toggle';

@@ -11,7 +11,8 @@ let experiment=null,modelId=null,physicalTime={},runtime={},busy=false,needsBuil
 let validatedSignature='';
 let capabilities=null;
 let membersByCell={}, cellParameters={}, effectiveRequestKey='';
-let physicalOptions=null;
+let physicalOptions=null, cellNames={};
+const cellCaption=id=>cellNames[id]?cellNames[id]+' · '+id:id;
 const restoreKey='orbitserve-scene-geometry-';
 let requestPage=0;
 const requestPageSize=25;
@@ -60,7 +61,7 @@ function renderCellList(){
  const body=table.createTBody();
  for(const [id,members] of Object.entries(membersByCell)){
   const row=body.insertRow();
-  row.insertCell().textContent=id;
+  row.insertCell().textContent=cellCaption(id);
   row.insertCell().textContent=members.length+' 颗卫星';
   const cell=experiment?.cells.find(row=>row.id===id), options=cellParameters[id]?.deployment;
   const model=options?.model||cell?.model;
@@ -128,7 +129,7 @@ function renderRequests(){
   for(const key of ['id','user_device','cell','arrival_ns','input_tokens','output_tokens']){
    const td=document.createElement('td'),select=['user_device','cell'].includes(key),input=document.createElement(select?'select':'input');
    input.setAttribute('aria-label',`${request.id} ${key}`);
-   if(select){if(key==='cell'){input.append(option('','自动选择'));for(const id of Object.keys(membersByCell))input.append(option(id,id))}else for(const d of endpoints)input.append(option(d.id,d.satellite));input.value=request[key]||''}
+   if(select){if(key==='cell'){input.append(option('','自动选择'));for(const id of Object.keys(membersByCell))input.append(option(id,cellCaption(id)))}else for(const d of endpoints)input.append(option(d.id,d.satellite));input.value=request[key]||''}
    else{input.type=key==='id'?'text':'number';input.required=true;if(key!=='id'){input.min=key==='arrival_ns'?'0':'1';input.step=key==='arrival_ns'?'any':'1';if(key==='arrival_ns')input.max=String(experiment.horizon_ns/1e9-1e-9)}input.value=key==='arrival_ns'?request[key]/1e9:request[key]}
    input.oninput=()=>{request[key]=key==='id'?input.value:key==='cell'?input.value||null:key==='user_device'?input.value:key==='arrival_ns'?Math.round(Number(input.value)*1e9):Number(input.value);writeJson()};td.append(input);row.append(td);
   }
@@ -149,6 +150,8 @@ async function loadDataset(id,usePhysical=true){
  const [doc,catalog]=await Promise.all([get('/documents/physical/'+encodeURIComponent(id)),get('/native-scene-catalog?physical_model_id='+encodeURIComponent(id))]);
  physicalTime=doc.physical_network.time;membersByCell=catalog.cell_satellites;
  physicalOptions=doc.compute_configuration;
+ cellNames=Object.fromEntries(Object.entries(physicalOptions?.formations||{}).flatMap(([name,settings])=>
+   Object.entries(settings.cell_names||{}).map(([key,caption])=>[name+'-'+key,caption])));
  if(usePhysical){
   cellParameters=deploymentFromPhysical(doc,membersByCell);
   $('computeMode').value=physicalOptions?.mode||'detail_mode';$('epStrategy').value=physicalOptions?.ep_strategy||'auto';
@@ -179,7 +182,7 @@ async function build(updated=cellParameters, changed=new Set(Object.keys(members
  delete communication.cell_policies;
  if($('epStrategy').value==='auto')delete communication.ep_strategy;
  else communication.ep_strategy=$('epStrategy').value;
- const value=await post('/native-scene-config',{physical_model_id:modelId,deployment:{compute_mode:mode,communication},
+ const value=await post('/native-scene-config',{physical_model_id:modelId,deployment:{compute_mode:mode,communication,fast_link_contention:mode==='fast_mode' && !!physicalOptions?.fast_link_contention},
   cell_deployments:submitted,requests:experiment?.requests||[],migrations:experiment?.migrations||[],
   runtime_network:runtime,routing:routingConfig(),cell_selection:selectionPolicy()});
  experiment=experiment?preserveOtherCellTopologies(experiment,value,changed):value;

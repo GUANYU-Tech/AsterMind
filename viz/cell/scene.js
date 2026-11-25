@@ -800,15 +800,10 @@ export class AsterMindScene {
     this.orientSatelliteVisuals();
   }
 
-  usesStaticFormationView() {
-    return sceneState.geometrySource === "formation" && !sceneState.physicalPositions;
-  }
-
   orientSatelliteVisuals() {
     // Choose a readable initial spacecraft attitude independently of the Cell's
     // location. Keep it fixed during editing and subsequent manual camera moves.
-    const direction = this.usesStaticFormationView() ? this.configRadial : this.configViewRadial;
-    const view = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0,0,1), direction);
+    const view = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0,0,1), this.configViewRadial);
     const localView = this.configRoot.quaternion.clone().invert().multiply(view);
     this.satellites.forEach((satellite, index) => {
       const attitude = new THREE.Quaternion().setFromEuler(new THREE.Euler(.95, .15 + (index % 4) * .04, .25));
@@ -1231,19 +1226,20 @@ export class AsterMindScene {
   resetConfigView(preserveDirection = false) {
     if (["home", "analysis"].includes(this.stage)) return;
     this.cameraTransition = null;
+    if (!preserveDirection) {
+      // Consume any pending drag inertia before setting the default pose.
+      this.controls.enableDamping = false;
+      this.controls.update();
+    }
     this.currentViewOffset = 0;
     this.camera.clearViewOffset();
     this.configRoot.updateMatrixWorld(true);
-    // The synthetic formation lies in the local tangent plane. View it face-on
-    // on entry and reset so an equal-radius ring also projects to a circle.
-    const staticLayout = this.usesStaticFormationView();
-    const defaultDirection = staticLayout ? this.configRadial : this.configViewRadial;
-    const direction = preserveDirection ? this.camera.position.clone().sub(this.controls.target).normalize() : defaultDirection;
+    const direction = preserveDirection ? this.camera.position.clone().sub(this.controls.target).normalize() : this.configViewRadial;
     const inverse = new THREE.Quaternion().setFromUnitVectors(direction, new THREE.Vector3(0,0,1));
     const world = this.satellites.map(satellite => satellite.getWorldPosition(new THREE.Vector3()));
     const target = world.reduce((center,point)=>center.add(point), new THREE.Vector3()).divideScalar(world.length || 1);
     const points = world.map(point=>point.clone().sub(target).applyQuaternion(inverse).toArray());
-    const distance = focusedViewDistance(points, this.camera.aspect, this.camera.fov, staticLayout ? .9 : 2.4);
+    const distance = focusedViewDistance(points, this.camera.aspect, this.camera.fov);
     this.camera.far = Math.max(80, distance * 6);
     this.camera.position.copy(target).addScaledVector(direction,distance);
     this.controls.target.copy(target);

@@ -32,6 +32,7 @@ def editor_layout(identity, members, row, base, requests, catalog):
                                      for a, b in zip(stops, stops[1:])]} for sat in ids}
     longest = max((r['input_tokens'] + r['output_tokens'] for r in requests
                    if r.get('cell') in (None, identity)), default=0)
+    value['fast_link_contention'] = base.fast_link_contention
     value['ep_strategy'] = base.communication.get('ep_strategy', 'auto')
     cell, comm, method = compile_serving_cell(value, {'intra_hierarchies': hierarchy}, longest,
                                               cell_id=identity, scene=True, catalog=catalog)

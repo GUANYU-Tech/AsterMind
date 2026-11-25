@@ -51,7 +51,7 @@ test('editing one Cell preserves imported link overrides when restoring the scen
   const [a,b]=cellKeys(f);
   const geometry=cellGeometry(f,a),members=memberIds(f,a,geometry);
   const sourceEdge={source:members[0],target:members[1],mode:'fixed',bandwidth_gbps:123};
-  const row={...layout(members),custom_links:true,configuration:{hardware:{},deployment:{placements:[]},
+  const row={...layout(members),custom_links:true,configuration:{compute_mode:'detail_mode',hardware:{},deployment:{placements:[]},
     topology:{inter_satellite:{links:[sourceEdge]}}}};
   applyCell(f,a,geometry,row,false);
   const [source,target]=memberIds(f,b,cellGeometry(f,b));

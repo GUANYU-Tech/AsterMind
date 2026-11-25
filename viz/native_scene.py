@@ -107,7 +107,7 @@ def build_cell_deployments(dataset, payload, upstream, arguments):
             profile = hardware.get(options.get('hardware_id'))
             if model is None or profile is None:
                 raise ValueError('请选择后端目录中的模型和 GPU 卡型')
-            options.update(hardware=profile['file'], compute_mode=base.compute_mode)
+            options.update(hardware=profile['file'], compute_mode=base.compute_mode, fast_link_contention=base.fast_link_contention)
             ep = options.get('expert_parallel', False)
             dp = options.get('dp', 1)
             if type(dp) is not int or dp < 1 or (dp > 1 and not ep) or (ep and not model['experts']):

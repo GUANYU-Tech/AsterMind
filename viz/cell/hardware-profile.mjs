@@ -1,4 +1,5 @@
 import { element } from './results.mjs?v=compact-2';
+import {renderConfigForm} from './config-form.mjs';
 import { optionLabels } from './config-labels.mjs?v=compact-2';
 
 const number = value => typeof value === 'number' && Number.isFinite(value)
@@ -47,6 +48,30 @@ function componentTree(components) {
     list.append(row);
   }
   return list;
+}
+
+export function rooflinePanel(config, capabilities, changed, choices) {
+  const peaks = capabilities.su_profiles[config.hardware.default_hardware_id].roofline_peaks;
+  const box=element('fieldset',undefined,'basic-fields roofline-settings');
+  box.append(element('legend','Roofline 参数配置'));
+  for(const [key,caption,peak,unit] of [
+    ['tensor_percent','有效算力（BF16）',peaks.bf16_tflops,'TFLOP/s'],
+    ['hbm_percent','有效 HBM 带宽',peaks.hbm_tb_s,'TB/s'],
+  ]){
+    const row=element('div',undefined,'roofline-row'), form=element('div');
+    const label=element('span',caption), output=element('output');
+    renderConfigForm(form,config,['fast_roofline.'+key],capabilities.schema,changed,choices);
+    const input = form.querySelector('input');
+    output.htmlFor.add(input.id);
+    const update = () => {
+      output.textContent = input.validity.valid ? number(peak * input.valueAsNumber / 100) + ' ' + unit : '—';
+    };
+    input.addEventListener('input', update);
+    update();
+    const result=element('div',undefined,'roofline-effective');result.append(label,output);
+    row.append(form,result);box.append(row);
+  }
+  return box;
 }
 
 export function renderHardwareProfiles(container, ids, details = {}) {

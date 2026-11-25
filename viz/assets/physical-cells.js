@@ -1,3 +1,5 @@
+import {sceneCellDraft,sceneCellLayout} from './scene-cell-parameters.js';
+
 const pad = (number, width) => String(number).padStart(width, '0');
 
 export function cellCount({source}) {
@@ -134,7 +136,7 @@ export function cellLayout(formation,key,members) {
   return bindLayout(settings?.cells?.[key] || settings?.template,members);
 }
 
-export function physicalPayload(network, mode, epStrategy) {
+export function physicalPayload(network, mode, epStrategy, capabilities, linkContention=false) {
   const physical_network=structuredClone(network);
   const formations={};
   const spec = physical_network.network;
@@ -145,6 +147,17 @@ export function physicalPayload(network, mode, epStrategy) {
     if (formation.compute_parameters) {
       const settings=formation.compute_parameters;
       settings.cells=Object.fromEntries(Object.entries(settings.cells||{}).filter(([key])=>cellIndex(formation,key)>=0));
+      for (const layout of [settings.template,...Object.values(settings.cells)]) {
+        if (!layout?.configuration) continue;
+        if (mode==='fast_mode' || Object.hasOwn(layout.configuration,'fast_link_contention')) {
+          layout.configuration.fast_link_contention=mode==='fast_mode' && linkContention;
+        }
+        if (layout.configuration.compute_mode===mode) continue;
+        const members=layout.configuration.hardware.satellite_ids;
+        const draft=sceneCellDraft(capabilities,members,mode,layout);
+        Object.assign(layout,sceneCellLayout(draft,capabilities,members),{configuration:draft});
+      }
+      if(settings.cell_names)settings.cell_names=Object.fromEntries(Object.entries(settings.cell_names).filter(([key])=>cellIndex(formation,key)>=0));
       formations[formation.name]=settings;
       for (const key of cellKeys(formation)) {
         const saved = settings.cells[key] || settings.template;
@@ -173,7 +186,7 @@ export function physicalPayload(network, mode, epStrategy) {
       delete formation.compute_parameters;
     }
   }
-  return {physical_network,compute_configuration:{mode,ep_strategy:epStrategy,formations}};
+  return {physical_network,compute_configuration:{mode,ep_strategy:epStrategy,fast_link_contention:mode==='fast_mode' && linkContention,formations}};
 }
 
 export function loadPhysicalCompute(doc) {

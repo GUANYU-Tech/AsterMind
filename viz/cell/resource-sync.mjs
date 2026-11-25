@@ -20,7 +20,7 @@ export function synchronizeResources(config, capabilities) {
     else config.deployment.placements = mappingDraft(config);
     if (!fastMode(config) && capabilities.model_shapes?.[config.model]?.tie_word_embeddings
       && config.deployment.worker_pools.some(pool=>pool.parallelism.pipeline_parallel_size>1)) {
-      throw Error('当前模型共享输入与输出权重，执行器暂不支持 PP 大于 1。请启用自动适配资源，或将 PP 设为 1。');
+      throw Error('当前模型共享输入与输出权重，执行器暂不支持 PP 大于 1。请将 PP 设为 1。');
     }
   } catch (error) { state(config).error = error.message; }
   const {physical,required} = deploymentCapacity(config);

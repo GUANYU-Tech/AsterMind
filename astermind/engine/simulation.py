@@ -189,7 +189,8 @@ class Simulation:
             data_parallel_size=p.dp, sequence_parallel_size=p.sp,
             deployment=cell.deployment, execution_mode=cell.execution_mode,
             compute_mode=cell.detail_prediction_method or self.config.executor_compute_mode,
-            fast_glm_dsa_score=cell.fast_glm_dsa_score)
+            fast_glm_dsa_score=cell.fast_glm_dsa_score, fast_roofline=cell.fast_roofline,
+            fast_link_contention=cell.fast_link_contention)
         executor = self.executors[cell.id]
         if cell.deployment == "pd_disagg":
             created = PrefillDecodeCell(cell.id, self.loop, config, executor,

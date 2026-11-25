@@ -18,8 +18,9 @@
   </div>
 </div><p id="count"></p>
 
-<div class="tabs" role="tablist"><button data-tab="geometry" role="tab" aria-selected="true" disabled>星座与时间</button><button data-tab="compute" role="tab" disabled>计算星座与编队</button><button data-tab="ground" role="tab" disabled>地面站</button><button data-tab="links" role="tab" disabled>连接与链路预算</button></div>
-<section data-panel="geometry"><div id="time" class="fields"></div><h2>通信星座</h2><div id="shells"></div><button id="addShell" type="button" aria-haspopup="dialog" disabled>＋ 添加通信星座</button></section>
+<div id="time" class="fields"></div>
+<div class="tabs" role="tablist"><button data-tab="geometry" role="tab" aria-selected="true" disabled>通信星座</button><button data-tab="compute" role="tab" disabled>计算星座与编队</button><button data-tab="ground" role="tab" disabled>地面站</button><button data-tab="links" role="tab" disabled>连接与链路预算</button></div>
+<section data-panel="geometry"><h2>通信星座</h2><div id="shells"></div><button id="addShell" type="button" aria-haspopup="dialog" disabled>＋ 添加通信星座</button></section>
 <dialog id="addCommunication" class="formation-dialog" aria-labelledby="communicationTitle">
   <form>
     <h2 id="communicationTitle">添加通信星座</h2>
@@ -37,8 +38,9 @@
     <div class="actions"><button type="button" id="cancelCommunication">取消</button><button type="submit" id="confirmCommunication" class="primary" disabled>添加星座</button></div>
   </form>
 </dialog>
-<section data-panel="compute" hidden><h2>计算星座</h2><div id="cells"></div><button id="addCell" disabled>＋ 添加计算星座</button>
-<div class="fields"><label>全场景计算模式<select id="computeMode"></select></label><label>专家并行通信<select id="epStrategy"><option value="auto">自动</option><option value="allgather">AllGather / ReduceScatter</option><option value="direct">Direct</option></select></label></div></section>
+<section data-panel="compute" hidden>
+<div class="fields"><label>全场景计算模式<select id="computeMode"></select></label><label id="contentionField" hidden>链路带宽资源竞争<input id="linkContention" type="checkbox"></label></div>
+<h2>计算星座</h2><div id="cells"></div><button id="addCell" disabled>＋ 添加计算星座</button></section>
 <section data-panel="ground" hidden>
   <div class="physical-section-heading"><h2>地面站与接入</h2><button id="addGround" disabled>＋ 添加地面站</button></div>
   <p>请求负载须使用相同的地面站 ID 与坐标。</p>
@@ -52,7 +54,7 @@
   </details>
   <div id="grounds"></div><div id="access" class="fields"></div>
 </section>
-<section data-panel="links" hidden><h2>计算卫星—通信卫星建链规则</h2><p>设置跨层接入；切换策略在“地面站”中配置。</p><div id="connections" class="fields"></div><h2>按每个方向计算的物理链路预算</h2><p>通用链路预算。壳层专属预算可在“星座与时间”中修改。</p><div id="budgets"></div></section>
+<section data-panel="links" hidden><h2>计算卫星—通信卫星建链规则</h2><p>设置跨层接入；切换策略在“地面站”中配置。</p><div id="connections" class="fields"></div><h2>按每个方向计算的物理链路预算</h2><p>通用链路预算。壳层专属预算可在“通信星座”中修改。</p><div id="budgets"></div></section>
 <details><summary>完整物理模型 JSON</summary><div id="json"></div></details><p id="status" role="status"></p><p id="scenarioNote" role="status" hidden></p><div class="actions sticky"><button id="save">保存配置草稿</button><button id="preview">生成并预览</button><button id="next" class="primary">生成数据并继续 →</button></div><dialog id="addFormation" class="formation-dialog" aria-labelledby="addFormationTitle"><form><h2 id="addFormationTitle">添加计算星座</h2>
 <label>星座 ID<input name="formationName" required></label><label>Cell 数量<input name="cellCount" type="number" min="1" step="1" required value="2"></label>
 <p>新星座从一个轨道面开始，可在星座参数中调整轨道面和每面 Cell 数。</p><div class="actions"><button type="button" id="cancelFormation">取消</button><button type="submit" class="primary">添加星座</button></div></form></dialog></main><script type="module" src="/assets/physical_editor.js"></script></html>

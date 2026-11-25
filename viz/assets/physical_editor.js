@@ -1,5 +1,6 @@
 import {newPhysicalPreset,cellKeys,satelliteCount,cellGeometry,cellLayout,memberIds,physicalPayload,loadPhysicalCompute} from './physical-cells.js';
 import {sceneCellDraft,sceneCellLayout} from './scene-cell-parameters.js';
+import {renderIngressFields} from './ingress-fields.js';
 import {showCellList} from './physical-cell-list.js';
 import {renderConfigProfile} from './config-profile.js';
 import {renderRadio} from '/assets/radio_editor.js';
@@ -13,7 +14,9 @@ import {ensureInterCellProfile,interCellProfileNote,missingInterCellProfile} fro
 const $=id=>document.getElementById(id);let config,defaultShell,defaultCell,radioProfiles;tabs('data-tab');
 const sceneQuery=new URLSearchParams(location.search);
 const sceneDraft=sceneQuery.get('scene_draft');
-let capabilities;
+let capabilities, epStrategy='auto';
+const updateContention=()=>{$('contentionField').hidden=$('computeMode').value!=='fast_mode'};
+$('computeMode').addEventListener('change',updateContention);
 const selectedCell=sceneQuery.get('cell');
 const selectedFormation=()=>[...config.constellations.compute_formations].sort((a,b)=>b.name.length-a.name.length)
  .find(formation=>selectedCell?.startsWith(formation.name+'-'));
@@ -92,8 +95,7 @@ identity.addEventListener('change',()=>{
 });
 sourceFields(fields,advanced,cell,true,render,()=>{render()});
 const refreshList=()=>showCellList(list,cell,capabilities,()=>({
- mode:$('computeMode').value, epStrategy:$('epStrategy').value, linkProfile:config.network.link_profiles.cell_isl,
- applyShared:draft=>{$('computeMode').value=draft.compute_mode;$('epStrategy').value=draft.ep_strategy},
+ mode:$('computeMode').value, linkContention:$('linkContention').checked, epStrategy, linkProfile:config.network.link_profiles.cell_isl,
 }),render,selectedCell);
 refreshList();
 for(const label of ['轨道面数','每面 cell 数']){
@@ -101,9 +103,10 @@ for(const label of ['轨道面数','每面 cell 数']){
  if(input){input.min='1';input.step='1';input.required=true;input.addEventListener('change',refreshList)}
 }
 for(const[k,label]of [['d_keepout_m','安全间距 m'],['sigma_navigation_m','导航误差 σ m'],['sigma_control_m','控制误差 σ m']])field(fields,cell,'cluster.'+k,label);
-field(fields,cell,'isl_terminals','每成员 ISL 终端数');field(fields,cell,'sgl_terminals','每成员地面关联总上限');quotaFields(fields,cell);
-cell.egress_policy??=cell.ingress_members?.length===1?'single':'multi';const mode=field(fields,cell,'egress_policy','cell 对外出口模式','text',[['single','单星出口 指定一个成员'],['multi','多星出口 指定成员集合'],['free','自由连接 全体成员可对外']]);mode.addEventListener('change',()=>{if(cell.egress_policy==='single')cell.ingress_members=[cell.ingress_members?.[0]??0];render()});
-const label=document.createElement('label');label.textContent='对外接入成员编号（从 0 开始，逗号分隔）';const input=document.createElement('input');input.value=(cell.ingress_members||[0]).join(',');input.disabled=cell.egress_policy==='free';input.onchange=()=>{cell.ingress_members=input.value.split(',').map(s=>s.trim()===''?NaN:Number(s));sync()};label.append(input);fields.append(label);removeButton(card,()=>config.constellations.compute_formations.splice(i,1))});
+field(fields,cell,'sgl_terminals','每成员地面关联总上限');quotaFields(fields,cell);
+cell.egress_policy??=cell.ingress_members?.length===1?'single':'multi';const mode=field(fields,cell,'egress_policy','cell 对外出口模式','text',[['single','单星出口 指定一个成员'],['multi','多星出口 指定成员集合'],['free','自由连接 全体成员可对外']]);mode.addEventListener('change',()=>{if(cell.egress_policy==='single')cell.ingress_members=[cell.ingress_members?.[0]??0];delete cell.ingress_isl_terminals;render()});
+renderIngressFields(fields,cell,sync);
+removeButton(card,()=>config.constellations.compute_formations.splice(i,1))});
 config.ground_ingresses.forEach((ground,i)=>{const{card,fields}=group($('grounds'),'地面站 '+(i+1));for(const[k,label,type]of [['ingress_id','地面站 ID','text'],['lat_deg','纬度 °','number'],['lon_deg','经度 °','number'],['altitude_km','高度 km','number'],['min_elevation_deg','最小仰角 °','number'],['terminal_count','终端数','number']])field(fields,ground,k,label,type);ground.ground_kind??='gateway';field(fields,ground,'ground_kind','地面节点用途','text',[['gateway','RF 网关回传'],['user','用户接入']]);removeButton(card,()=>config.ground_ingresses.splice(i,1))});
 config.network.handover_policy??='retain_valid';config.network.cross_layer_access_policy??='nearest_distance';
 field($('access'),config,'network.handover_policy','动态链路切换策略','text',[['retain_valid','尽量使用原链路 失效后才切换'],['quality_first','按质量重新选择 允许切换有效链路']]);
@@ -162,7 +165,7 @@ addForm.onsubmit=event=>{
 const computeTab=document.querySelector('[data-tab="compute"]');
 function showComputeTab(){
  computeTab.click();
- $('cells').previousElementSibling.scrollIntoView({block:'start'});
+ document.querySelector('[data-panel="compute"]').scrollIntoView({block:'start'});
 }
 $('addGround').onclick=()=>{config.ground_ingresses.push({ingress_id:'ground-'+Date.now(),lat_deg:0,lon_deg:0,...groundDefaults});render()};
 async function save(next){
@@ -179,13 +182,13 @@ async function save(next){
       }
     }
     saving=true;updateActions();
-    const doc=await post('/save-physical',{name:$('name').value,...physicalPayload(config,$('computeMode').value,$('epStrategy').value)});
+    const doc=await post('/save-physical',{name:$('name').value,...physicalPayload(config,$('computeMode').value,epStrategy,capabilities,$('linkContention').checked)});
     selectLoadedSource(addSavedModel(doc,true));
     history.replaceState(null,'','/physical?id='+doc.id+(sceneDraft?'&scene_draft='+encodeURIComponent(sceneDraft):'')+location.hash);
     $('status').textContent='物理模型已保存到本地：'+doc.name;
     if(next){
       $('status').textContent='正在生成完整物理数据：全时域位置、链路与双向预算…';
-      const job=await post('/prepare-physical',{id:doc.id});
+      const job=await post('/prepare-physical',{id:doc.id,independent:true});
       location.href='/runs/'+job.id+'/progress'+(next===true?'?next=scene&model='+encodeURIComponent(doc.id)
         +(sceneDraft?'&scene_draft='+encodeURIComponent(sceneDraft):''):'');
     }
@@ -206,11 +209,11 @@ $('save').onclick=()=>save(false);$('next').onclick=()=>save(true);$('preview').
  const id=sceneQuery.get('id');
  if(id){const doc=await get('/documents/physical/'+encodeURIComponent(id));loadPhysicalCompute(doc);config=doc.physical_network;$('name').value=doc.name;
  selectLoadedSource(models.some(model=>model.id===id)?'?id='+encodeURIComponent(id):addSavedModel(doc,true));
- $('computeMode').value=doc.compute_configuration?.mode||'detail_mode';$('epStrategy').value=doc.compute_configuration?.ep_strategy||'auto';
+ $('computeMode').value=doc.compute_configuration?.mode||'detail_mode';epStrategy=doc.compute_configuration?.ep_strategy||'auto';$('linkContention').checked=doc.compute_configuration?.fast_link_contention===true;
  const saved=sceneDraft && sessionStorage.getItem('orbitserve-scene-geometry-'+sceneDraft);
  const draft=saved && JSON.parse(saved);
  if(draft && draft.physical_model_id===doc.id){
-  $('computeMode').value=draft.mode;$('epStrategy').value=draft.ep_strategy;
+  $('computeMode').value=draft.mode;epStrategy=draft.ep_strategy;
   for(const formation of config.constellations?.compute_formations||[]) for(const key of cellKeys(formation)){
    const layout=draft.cell_parameters?.[formation.name+'-'+key];
    if(layout){
@@ -228,7 +231,7 @@ $('save').onclick=()=>save(false);$('next').onclick=()=>save(true);$('preview').
    config=example==='starlink_550'?initial:newPhysicalPreset(await get('/templates/'+example));
    selectLoadedSource(option.value);$('name').value=option.textContent;
  }
- render();modelSource.disabled=$('addCell').disabled=false;
+ updateContention();render();modelSource.disabled=$('addCell').disabled=false;
  initCommunicationDialog(()=>config,defaultShell,render);
  initGroundImport(text=>{
    const rows=parseGroundCsv(text,config.ground_ingresses);

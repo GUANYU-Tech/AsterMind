@@ -7,13 +7,13 @@ import {mappingDraft, matchParallelismToResources} from './deployment-mapping.mj
 import {detailChoices, normalizeComputeSettings} from './compute-config.mjs';
 import {renderSchedulingReadout} from './parameter-panel.mjs';
 import {linkMode, setLinkMode, rememberEmptyLinkMode, newInterSatelliteLink, applyOpticalDefaults} from './link-mode.mjs';
-import {automaticDeployment,setAutomaticDeployment,synchronizeResources,clearDependentDrafts} from './resource-sync.mjs';
+import {setAutomaticDeployment,synchronizeResources,clearDependentDrafts} from './resource-sync.mjs';
 import { renderResults, renderArtifacts, renderNetworkPreview, element } from "./results.mjs?v=compact-2";
 import { appUrl, appStorageKey } from "./app-path.mjs?v=compact-2";
 import { sceneData } from "./scene-data.mjs?v=compact-2";
 import { configurationErrors, validationError } from "./config-validation.mjs?v=validation-1";
 
-import {renderConfigProfile} from "../assets/config-profile.js";
+import {renderCellConfigProfile} from "../assets/config-profile.js";
 import {labels,formationNames} from "./config-labels.mjs?v=compact-2";
 const $ = selector => document.querySelector(selector);
 buildWorkspace();
@@ -137,7 +137,7 @@ function prepareOpticalSettings(value) {
   applyOpticalDefaults(value, capabilities.default_configuration.fso);
   rememberEmptyLinkMode(value, stored('astermind-link-mode', null));
   const mode = linkMode(value); if (mode) setLinkMode(value, mode);
-  setAutomaticDeployment(value,stored('astermind-automatic-deployment',true));
+  setAutomaticDeployment(value,false);
   synchronizeResources(value,capabilities);
   return value;
 }
@@ -180,12 +180,8 @@ function changed(path) {
   const layout = config.topology.source === "orbit" ? "轨道快照" : formationNames[config.constellation?.formation?.layout] || "环形编队";
   $("#scene-summary").textContent = `${layout} ${config.hardware.satellite_ids.length} 颗卫星`;
   $("#advanced-config").value = JSON.stringify(config, null, 2);
-  renderConfigProfile($("#config-profile"), config, labels, [
-    ['模型',config.model],['算力卡',config.hardware.default_hardware_id.replaceAll('_',' ').toUpperCase()],
-    ['算力卫星',config.hardware.satellite_ids.length+' 颗'],['每星算力卡',config.hardware.accelerators_per_satellite+' 张'],
-  ]);
+  renderCellConfigProfile($("#config-profile"), config, labels);
   save("astermind-config", config);
-  save('astermind-automatic-deployment',automaticDeployment(config));
   if (linkMode(config)) save('astermind-link-mode', linkMode(config));
   if (scene) syncSceneConfiguration(scene, config, networkPreview);
   if (refreshForms) { refreshForms = false; renderForms(); }
@@ -378,18 +374,10 @@ $('#match-parallelism').onclick = () => {
     renderForms(); changed(); message(`已按资源设置各 pool：TP ${tp} × PP ${pp}，并生成卡映射`);
   } catch (error) { showError(error); }
 };
-$('#automatic-deployment').onclick = () => {
-  if(dirty || busy) return;
-  setAutomaticDeployment(config,true); clearDependentDrafts(drafts); synchronizeResources(config,capabilities); renderForms(); changed();
-};
-$('#manual-deployment').onclick = () => {
-  if(dirty || busy) return;
-  setAutomaticDeployment(config,false); renderForms(); changed();
-};
 $('#restore-defaults').onclick = () => {
   if(busy) return;
   save('astermind-before-defaults',config);
-  config=newWebConfiguration(capabilities); setAutomaticDeployment(config,true); synchronizeResources(config,capabilities);
+  config=newWebConfiguration(capabilities); setAutomaticDeployment(config,false); synchronizeResources(config,capabilities);
   dirty=false; drafts.clear(); renderForms(); changed(); stage('formation'); message('已恢复可运行的默认配置');
 };
 $('#generate-mapping').onclick = () => {

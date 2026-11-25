@@ -34,24 +34,24 @@ export const groups = {
     ["星内网络", ["topology.intra_satellite", "hardware.su_group_sizes", "hardware.intra_satellite_bandwidth_gbps", "hardware.intra_satellite_latency_ns"]],
     ["星间连接", ["topology.inter_satellite"]],
     ["ISLSim 光学链路", ["fso"]],
-    ["集合通信", ["ep_strategy", "collective_policies"]],
+    ["集合通信", ["collective_policies"]],
   ],
   workload: [
     ["模型", ["compute_mode", "model"]], ["请求流", ["requests"]],
   ],
   deployment: [
-    ["部署模式", ["deployment.mode"]], ["Worker pools", ["deployment.worker_pools"]],
-    ["卡映射（自动生成，可手动调整）", ["deployment.placements"]], ["跨 pool 通信", ["deployment.routes"]],
+    ["部署模式", ["deployment.mode"]], ["跨 pool 通信", ["deployment.routes"]],
+    ["计算池", ["deployment.worker_pools"]], ["卡映射（自动生成，可手动调整）", ["deployment.placements"]],
   ],
   runtime: [
-    ["调度器", ["scheduler.*.vllm.max_model_len", "scheduler.*.max_requests", "scheduler.*.max_batched_tokens",
+    ["调度器", ["scheduler.*.max_requests", "scheduler.*.max_batched_tokens",
       "scheduler.*.vllm.enable_chunked_prefill", "scheduler.*.vllm.long_prefill_token_threshold"]],
-    ["KV 缓存（高级）", ["scheduler.*.vllm.enable_prefix_caching", "scheduler.*.kv_block_size_tokens", "scheduler.*.num_kv_blocks",
-      "memory_policy_file", "fast_glm_dsa_score", "detail_prediction_method", "expert_routing_seed"]],
+    ["KV 缓存（高级）", ["scheduler.*.vllm.enable_prefix_caching", "scheduler.*.kv_block_size_tokens", "scheduler.*.num_kv_blocks"]],
   ],
 };
 
 export function fieldStage(path) {
+  if (path[0] === 'fast_roofline') return 'workload';
   if (path[0] === 'scheduler') return 'runtime';
   const normalized = path.map(k => typeof k === "number" ? "*" : k).join(".");
   if (normalized === "runtime_inputs.expert_routing" || normalized.startsWith("runtime_inputs.expert_routing.")) return "workload";

@@ -212,7 +212,7 @@ def validate_fast_layout(deployment, root):
         hardware_id=deployment.hardware_id, scheduler_adapter="vllm_0_30", compute_mode="fast_mode",
         tensor_parallel_size=deployment.tp, pipeline_parallel_size=deployment.pp, data_parallel_size=deployment.dp,
         enable_expert_parallel=deployment.expert_parallel, expert_routing_seed=deployment.expert_routing_seed,
-        fast_glm_dsa_score=deployment.fast_glm_dsa_score,
+        fast_glm_dsa_score=deployment.fast_glm_dsa_score, fast_roofline=deployment.fast_roofline,
         max_model_len=deployment.max_model_len, max_batched_tokens=deployment.max_batched_tokens,
         max_requests=deployment.max_requests, kv_block_size_tokens=fast_kv_block_size(deployment),
         enable_prefix_caching=deployment.prefix_caching,
@@ -229,7 +229,7 @@ def validate_fast_layout(deployment, root):
     profile = Hardware.from_hardware_spec(
         hardware, compute_dtype=model.compute_dtype,
         widen_fp8_to_bf16=supports_portable_fp8_reference(config, model, parallel),
-    )
+    ).with_roofline(config.hardware_id, config.fast_roofline)
     raw = json.loads((config.root / config.model_file).read_text(encoding="utf-8-sig"))
     Predictor(Path(config.model_file).stem, raw, deployment.tp, deployment.dp,
               parallel.expert_parallel_size, ranges, hardware=profile,

@@ -312,6 +312,13 @@ class NetworkState:
             result.observe_fault(index, fault, time_s, restored=restored)
         return result
 
+    def _terminal_pool(self, node_id, kind):
+        if kind == 'sgl':
+            return 'sgl'
+        if kind in ('cross_layer', 'inter_cell') and self.nodes[node_id].external_isl_terminals is not None:
+            return 'external_isl'
+        return 'isl'
+
     def _compile(self, from_s=None) -> None:
         """Store only per-link changes; never copy the whole graph per event."""
         compile_start = self.start_s if from_s is None else from_s
@@ -424,8 +431,8 @@ class NetworkState:
             used = {}
             for link_id in states:
                 edge = latest[link_id]
-                pool = "sgl" if edge["kind"] == "sgl" else "isl"
                 for node in (edge["endpoint_a"], edge["endpoint_b"]):
+                    pool = self._terminal_pool(node, edge["kind"])
                     used[node, pool] = used.get((node, pool), 0) + 1
 
             for edge in sorted(eligible.values(), key=lambda edge: connection_priority(self, edge, t)):
@@ -434,12 +441,11 @@ class NetworkState:
                     continue
                 if edge['kind'] == 'sgl' and link_id not in selected_sgl:
                     continue
-                pool = "sgl" if edge["kind"] == "sgl" else "isl"
-                endpoints = edge["endpoint_a"], edge["endpoint_b"]
+                endpoints = [(n, self._terminal_pool(n, edge["kind"])) for n in (edge["endpoint_a"], edge["endpoint_b"])]
                 if any(
                     used.get((n, pool), 0)
                     >= getattr(self.nodes[n], pool + "_terminals")
-                    for n in endpoints
+                    for n, pool in endpoints
                 ):
                     if (
                         not self.link_frames[link_id]
@@ -457,7 +463,7 @@ class NetworkState:
                     changed.add(link_id)
                     if t < states[link_id]["ready_s"] < self.end_s:
                         heapq.heappush(queue, (states[link_id]['ready_s'], 1, link_id, None))
-                for n in endpoints:
+                for n, pool in endpoints:
                     key = n, pool
                     used[key] = used.get(key, 0) + 1
                     if used[key] > getattr(self.nodes[n], pool + "_terminals"):

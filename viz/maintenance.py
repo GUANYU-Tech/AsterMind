@@ -153,7 +153,7 @@ def reconcile(root, *, apply=False, thorough=False):
     with LOCK:
         from tasks import processes
         from live import SESSIONS
-        if any(s.payload['state'] in {'preparing','paused','advancing','finalizing'} for s in SESSIONS.values()):
+        if any(s.payload['state'] in {'preparing','paused','advancing','finalizing','stopping'} for s in list(SESSIONS.values())):
             raise ValueError('有在线仿真正在使用数据，清理延后到实验结束')
         outputs = list((root/'local/results/network').glob('*'))
         if any(p.is_dir() and processes(root,p.name) for p in outputs):

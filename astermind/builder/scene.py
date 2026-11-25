@@ -189,7 +189,8 @@ def build_scene(
                 detail_prediction_method=None if batch else options.detail_prediction_method,
                 native_expert_parallel=options.expert_parallel,
                 wide_ep_enabled=options.wide_ep_enabled,
-                fast_glm_dsa_score=options.fast_glm_dsa_score,
+                fast_glm_dsa_score=options.fast_glm_dsa_score, fast_roofline=options.fast_roofline,
+                fast_link_contention=options.fast_link_contention,
                 expert_routing_seed=options.expert_routing_seed,
                 placements=[
                     dict(rank=rank, device=gpu)
