@@ -25,27 +25,15 @@ AsterMind simulates how satellites serve inference requests from users on Earth.
 
 ## Build and Install
 
-**Prerequisites.** x86-64 Linux with glibc 2.39 or newer (for example, Ubuntu 24.04), Git, a C/C++ toolchain, and `libnuma.so.1`. The examples run on the CPU without model weights or a GPU.
+**Prerequisites.** x86-64 Linux with glibc 2.39 or newer (for example, Ubuntu 24.04), Git, a C/C++ toolchain, and `libnuma.so.1`. The virtual environment uses Python 3.12. The setup script can download Python 3.12 or Node.js with npm when needed and uses `curl` to fetch tools. The examples run on the CPU without model weights or a GPU.
 
 ```bash
 git clone --branch version/AsterMind-V1.0 https://github.com/GUANYU-Tech/OrbitServe.git AsterMind
 cd AsterMind
 
 bash scripts/install-ubuntu-deps.sh
-```
-
-Create and activate the virtual environment. The script uses `curl` to fetch Python 3.12 or Node.js with npm when needed.
-
-```bash
 bash scripts/create-venv.sh
 source .venv/bin/activate
-```
-
-If you use Conda, create and activate the environment at the same path.
-
-```bash
-conda create --prefix "$PWD/.venv" --override-channels -c conda-forge python=3.12 pip nodejs=22 'libstdcxx>=14'
-conda activate "$PWD/.venv"
 ```
 
 Install the Python dependencies and build AsterMind.

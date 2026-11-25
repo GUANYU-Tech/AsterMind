@@ -25,27 +25,15 @@ AsterMind 模拟低轨卫星如何为地面用户提供大语言模型推理服�
 
 ## 构建与安装
 
-**运行前提。** x86-64 Linux，glibc 版本至少为 2.39（例如 Ubuntu 24.04），并提供 Git、C/C++ 工具链和 `libnuma.so.1`。样例在 CPU 上运行，无需模型权重或 GPU。
+**运行前提。** x86-64 Linux，glibc 版本至少为 2.39（例如 Ubuntu 24.04），并提供 Git、C/C++ 工具链和 `libnuma.so.1`。虚拟环境使用 Python 3.12。环境脚本会按需下载 Python 3.12 或 Node.js（含 npm），下载工具时使用 `curl`。样例在 CPU 上运行，无需模型权重或 GPU。
 
 ```bash
 git clone --branch version/AsterMind-V1.0 https://github.com/GUANYU-Tech/OrbitServe.git AsterMind
 cd AsterMind
 
 bash scripts/install-ubuntu-deps.sh
-```
-
-创建并激活虚拟环境。脚本会在需要时用 `curl` 下载 Python 3.12 或 Node.js 与 npm。
-
-```bash
 bash scripts/create-venv.sh
 source .venv/bin/activate
-```
-
-如果使用 Conda，将环境建到同一个项目路径并激活。
-
-```bash
-conda create --prefix "$PWD/.venv" --override-channels -c conda-forge python=3.12 pip nodejs=22 'libstdcxx>=14'
-conda activate "$PWD/.venv"
 ```
 
 安装 Python 依赖并构建 AsterMind。
