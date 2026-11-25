@@ -1,50 +1,37 @@
 import {post} from '/assets/studio_common.js';
 
-export function importedShell(template,analysis,id){
+export function importedShell(template,analysis){
   const shell=structuredClone(template);
-  shell.shell_id=id;shell.source=structuredClone(analysis.suggested_source);
+  shell.shell_id='tle-'+Date.now();shell.source=structuredClone(analysis.suggested_source);
   for(const key of ['radio_profile','hardware_link_profiles','radio_capacity_bps','capacity_assumptions','optical_terminal_bandwidth_bps','terminal_assumptions'])delete shell[key];
-  shell.isl_terminals=3;shell.sgl_terminals=8;shell.topology=analysis.inferred_grid_shape?'honeycomb':'explicit';shell.topology_repair='none';
-  shell.wrap_planes=analysis.inferred_grid_shape?.[0]%2===0;
-  shell.wrap_slots=analysis.inferred_grid_shape?.[1]%2===0;
+  shell.isl_terminals=3;shell.sgl_terminals=8;shell.topology='honeycomb';shell.topology_repair='none';
+  shell.wrap_planes=analysis.inferred_grid_shape[0]%2===0;
+  shell.wrap_slots=analysis.inferred_grid_shape[1]%2===0;
   return shell;
 }
 
-export async function inspectTleShells(file,config,template){
-  const data=await post('/inspect-tle',{tle_text:await file.text()});
-  const {communication_shells,compute_formations}=config.constellations;
-  const used=new Set(communication_shells.map(shell=>shell.shell_id));
-  const catalogs=new Set();
-  for(const shell of [...communication_shells,...compute_formations]){
-    if(shell.source.type!=='tle')continue;
-    for(const line of (shell.source.tle_text||'').split('\n'))if(line.startsWith('1 '))catalogs.add(line.slice(2,7).trim());
-  }
-  let index=1;
-  const analyses=data.shells??[data];
-  const additions=analyses.map(analysis=>{
-    for(const line of analysis.suggested_source.tle_text.split('\n')){
-      if(line.startsWith('1 ') && catalogs.has(line.slice(2,7).trim()))throw Error('目录号已存在。请在对应壳层中更新 TLE。');
-    }
-    while(used.has('tle-'+index))index++;
-    return importedShell(template,analysis,'tle-'+index++);
-  });
-  return {additions,analyses,satelliteCount:data.satellite_count};
-}
-
-export function showTleResult(card,result){
-  const {additions,analyses,satelliteCount}=result;
-  const status=document.createElement('p');
-  status.setAttribute('role','status');
-  status.textContent='已追加 '+additions.length+' 个通信壳层，共 '+satelliteCount+' 颗卫星。';
-  if(analyses.some(a=>!a.inferred_grid_shape))status.textContent+=' 部分壳层未识别到规则网格，请检查星间拓扑。';
-  card.querySelector('h3').after(status);
-  const details=document.createElement('details');
-  const caption=document.createElement('summary');caption.textContent='TLE 壳层分组详情';details.append(caption);
-  analyses.forEach((analysis,i)=>{
-    if(!analysis.inferred_grid_shape)return;
-    const row=document.createElement('p');
-    row.textContent=additions[i].shell_id+'：推断网格 '+analysis.inferred_grid_shape.join('×')+'，已匹配 '+analysis.grid_placed_count+' 颗，未匹配 '+analysis.grid_unplaced_count+' 颗。';
-    details.append(row);
-  });
-  if(details.childElementCount>1)status.after(details);
+export function initTleImporter({readConfig,replaceConfig,readShell,render}){
+  const $=id=>document.getElementById(id);
+  const status=message=>$('tleStatus').textContent=message;
+  $('tleFile').onchange=()=>{
+    const file=$('tleFile').files[0];$('importTle').disabled=!file;
+    status(file?'已选择 '+file.name+'，点击“导入文件并生成通信星座”。':'请选择单壳层 .tle 或 .txt 文件。');
+  };
+  $('importTle').onclick=async()=>{
+    const file=$('tleFile').files[0];if(!file)return;
+    try{
+      $('importTle').disabled=true;status('正在校验 TLE 并分析共同历元的轨道面和槽位…');
+      const analysis=await post('/inspect-tle',{tle_text:await file.text()});
+      const value=structuredClone(readConfig());
+      value.constellations.communication_shells=[importedShell(readShell(),analysis)];
+      value.time.epoch_utc=analysis.simulation_epoch_utc;
+      value.network.faults=[];value.network.explicit_pairs=[];value.route_probes=[];
+      delete value.network.nodes;delete value.network.communication_shells;
+      value.network.ground_roles=value.network.ground_roles?.includes('compute')?['communication','compute']:['communication'];
+      replaceConfig(value);render();
+      status('已从 '+file.name+' 生成 '+analysis.satellite_count+' 颗通信卫星的配置；推断网格 '+analysis.inferred_grid_shape.join('×')+'，匹配 '+analysis.grid_placed_count+' 颗、未匹配 '+analysis.grid_unplaced_count+' 颗、空位 '+analysis.nominal_grid_empty_positions+'。可在“通信星座”中查看并配置硬件。');
+    }catch(e){status('导入失败：'+e.message)}finally{$('importTle').disabled=false}
+  };
+  const configured=readConfig().constellations.communication_shells.filter(s=>s.source.type==='tle');
+  if(configured.length){const count=configured.reduce((n,s)=>n+(s.source.tle_text||'').split('\n').filter(l=>l.startsWith('1 ')).length,0);status('当前模型已保存 '+configured.length+' 个 TLE 通信壳层，共 '+count+' 颗。轨道数据已保存在模型内，无需重复选择文件；也可从这里替换。')}
 }
