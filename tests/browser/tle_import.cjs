@@ -100,7 +100,8 @@ function catalog() {
     assert.deepEqual(cfg.ground_ingresses.map(g=>g.ingress_id),model.ground_ingresses.map(g=>g.ingress_id));
     assert.deepEqual(cfg.constellations.compute_formations.map(g=>g.name),model.constellations.compute_formations.map(g=>g.name));
     assert.deepEqual(cfg.route_probes,model.route_probes);
-    await page.goto('/physical?id='+doc.id);
+    await page.waitForURL(url=>url.pathname==='/physical' && url.searchParams.get('id')===doc.id);
+    await page.reload();
     await regular.waitFor();
     await checkTime();
     assert.equal(await page.getByLabel('每面标称槽位数（含空位）',{exact:true}).first().inputValue(),'110');
