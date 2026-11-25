@@ -13,38 +13,20 @@ export function quotaFields(parent,obj){
   nullableInteger(parent,obj,'max_gateway_links','每星同时连接信关站上限');
 }
 
-export function sourceFields(parent,card,obj,compute,render,sync,parametersOnly=false){
-  const options=[['walker_delta','Walker 参数'],['dawn_dusk','晨昏太阳同步轨道']];
-  if(!parametersOnly)options.push(['tle','TLE 实测轨道']);
-  const source=field(parent,obj,'source.type',parametersOnly?'轨道模型':'轨道来源','text',options);
+export function sourceFields(parent,card,obj,compute,render,sync){
+  const options=[['walker_delta','Walker 参数'],['dawn_dusk','晨昏太阳同步轨道'],['tle','TLE 实测轨道']];
+  const source=field(parent,obj,'source.type','轨道来源','text',options);
   source.addEventListener('change',()=>{
     const s=obj.source;
-    if(!compute && s.type==='tle'){s.satellites_per_plane??=1;s.planes??=1}
-    if(s.type!=='tle'){
-      s.altitude_km??=550;s.planes??=1;
-      if(!compute){s.satellites_per_plane??=1;if(obj.topology==='explicit')obj.topology='grid'}
-    }
     if(s.type==='dawn_dusk'){s.planes=1;s.ltan_hours??=6;s.plane_spread_deg??=0;s.u0_deg??=0}
     if(s.type==='tle'){s.tle_text??='';delete s.raan0_deg;delete s.u0_deg}
     if(s.type==='walker_delta'){s.inclination_deg??=53;s.walker_phase=0;s.raan0_deg??=0;s.u0_deg??=0}
     render();
   });
   if(obj.source.type!=='tle'){
-    const orbitField=(key,label,limits={})=>{
-      const input=field(parent,obj,'source.'+key,label);
-      if(parametersOnly)Object.assign(input,{required:true,...limits});
-      return input;
-    };
-    if(!compute)orbitField('altitude_km','高度 km',{min:Number.MIN_VALUE});
-    const planes=orbitField('planes','轨道面数',{min:1,step:1});
-    orbitField(compute?'clusters_per_plane':'satellites_per_plane',compute?'每面 cell 数':'每面卫星数',{min:1,step:1});
-    orbitField('u0_deg','初始纬度幅角 °');
-    if(obj.source.type==='walker_delta'){
-      orbitField('inclination_deg','倾角 °',{min:0,max:180});
-      const phase=orbitField('walker_phase','Walker 相位',{min:0,max:obj.source.planes-1,step:1});
-      if(parametersOnly)planes.addEventListener('input',()=>{phase.max=planes.valueAsNumber-1});
-      orbitField('raan0_deg','初始 RAAN °');
-    }else{field(parent,obj,'source.ltan_hours','中心轨道升交点地方时','number',[[6,'06:00 晨侧'],[18,'18:00 昏侧']]);orbitField('plane_spread_deg','轨道面 RAAN 展宽 °（0–30）',{min:0,max:30});const note=document.createElement('p');note.textContent='一阶 J2 太阳同步初始设计；各星独立 SGP4 传播，不含轨道保持。多面可在晨昏线附近展宽，是否入影由实际几何计算。';card.append(note)}
+    for(const [key,label]of [...(compute?[]:[['altitude_km','高度 km']]),['planes','轨道面数'],[compute?'clusters_per_plane':'satellites_per_plane',compute?'每面 cell 数':'每面卫星数'],['u0_deg','初始纬度幅角 °']])field(parent,obj,'source.'+key,label);
+    if(obj.source.type==='walker_delta')for(const[key,label]of [['inclination_deg','倾角 °'],['walker_phase','Walker 相位'],['raan0_deg','初始 RAAN °']])field(parent,obj,'source.'+key,label);
+    else{field(parent,obj,'source.ltan_hours','中心轨道升交点地方时','number',[[6,'06:00 晨侧'],[18,'18:00 昏侧']]);field(parent,obj,'source.plane_spread_deg','轨道面 RAAN 展宽 °（0–30）');const note=document.createElement('p');note.textContent='一阶 J2 太阳同步初始设计；各星独立 SGP4 传播，不含轨道保持。多面可在晨昏线附近展宽，是否入影由实际几何计算。';card.append(note)}
     return;
   }
   if(!compute)for(const[key,label]of [['planes','标称轨道面数（含缺失面）'],['satellites_per_plane','每面标称槽位数（含空位）']])field(parent,obj,'source.'+key,label);
@@ -63,8 +45,16 @@ export function sourceFields(parent,card,obj,compute,render,sync,parametersOnly=
   const note=document.createElement('p');note.textContent='默认在共同历元按标称均匀网格拟合，偏差超过槽距 20% 的节点不参与 ISL 网格。已知槽位时请提供 catalog 编号→[面,槽]；省略编号保留为未分配，绝不补造卫星。该拟合不等同于 Ronchetti 的自动壳层/间距恢复。';card.append(note);
 }
 
-export function inferredScenario(config){
-  const {communication_shells,compute_formations}=config.constellations;
-  if(!communication_shells.length)return compute_formations.length?'compute_only':null;
-  return compute_formations.length?'mixed':'communication_only';
+export function inferredScenario(config){const c=!!config.constellations.communication_shells.length,p=!!config.constellations.compute_formations.length;return c&&p?'mixed':p?'compute_only':'communication_only'}
+
+export function applyScenario(config,mode,cache){
+  const c=config.constellations;
+  if(c.communication_shells.length)cache.shells=structuredClone(c.communication_shells);
+  if(c.compute_formations.length)cache.cells=structuredClone(c.compute_formations);
+  c.communication_shells=mode==='compute_only'?[]:c.communication_shells.length?c.communication_shells:structuredClone(cache.shells||[]);
+  c.compute_formations=mode==='communication_only'?[]:c.compute_formations.length?c.compute_formations:structuredClone(cache.cells||[]);
+  config.scenario_type=mode;
+  if(mode==='compute_only'){config.network.ground_roles=['compute'];for(const f of c.compute_formations)if(!f.sgl_terminals)f.sgl_terminals=1}
+  else config.network.ground_roles=['communication'];
+  if(mode==='communication_only')config.route_probes=[];
 }
