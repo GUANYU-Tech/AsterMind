@@ -260,7 +260,7 @@ async function save(kind){
  $('status').textContent='场景已保存';
  if(kind==='batch'){
   $('status').textContent='正在启动后台实验，随后进入运行进度…';
-  await startBatchExperiment(post,doc.id,url=>location.assign(url));
+  await startBatchExperiment(post,doc.id,url=>location.assign(url),$('skipReplay').checked);
  }else if(kind==='live'){
   const job=await post('/live/start',{scene_id:doc.id});
   location.assign(job.url+'?autostart=1');

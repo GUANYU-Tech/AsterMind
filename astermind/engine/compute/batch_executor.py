@@ -59,11 +59,12 @@ class RuntimeBatchExecutor(NetworkBatchExecutor):
         state['failure'](failure)
         if self._on_batch_boundary:self._on_batch_boundary()
 
-    def _submit_batch_task(self,state,operator,callback,identity):
+    def _submit_batch_task(self,state,operator,callback,identity,**transport_options):
         if not state['alive']:return
         state['tasks'].add(identity)
         try:
-            self.comm.submit(operator,callback,lambda error:self._abort_batch(state,error),task_id=identity)
+            self.comm.submit(operator,callback,lambda error:self._abort_batch(state,error),task_id=identity,
+                             **transport_options)
         except Exception as error:
             if not state['alive']:raise
             self._abort_batch(state,error)

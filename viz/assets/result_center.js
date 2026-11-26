@@ -34,6 +34,7 @@ function charts(){const key=$('chartMetric').value,rows=data.requests.filter(r=>
 }
 $('chartMetric').onchange=charts;
 function tool(kind){const host=$(kind==='scene'?'sceneTool':kind==='operators'?'operatorTool':'kvTool');if(frames.has(kind))return;
+ if(replayState==='skipped'){host.replaceChildren(el('p','本次实验已跳过回放整理。','card'));return}
  if(replayState==='preparing'){host.replaceChildren(el('p','计算结果已保存，正在整理回放。可先查看请求结果，整理完成后这里会自动加载。','card'));return}
  if(replayState==='failed'){host.replaceChildren(el('p','计算结果已保存；回放整理失败：'+replayError,'card'));return}
  let src;

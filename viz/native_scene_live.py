@@ -149,7 +149,7 @@ class DeviceLiveSession(LiveSession):
         return ready
 
 
-def start(root, value, *, automatic=False, scene_id=None):
+def start(root, value, *, automatic=False, scene_id=None, skip_replay=False):
     import console
     from native_environment import enable_device_native
     from native_scene import validate_document
@@ -192,7 +192,8 @@ def start(root, value, *, automatic=False, scene_id=None):
     (output / 'run_metadata.json').write_text(json.dumps(dict(
         title=title, timeline_mode=config.timeline_mode)), encoding='utf-8')
     job = dict(id=identity, interactive=True, automatic=automatic, native_scene=True,
-               input=str(manifest.relative_to(root)), output=str(output), runtime_url=f'/live/{identity}')
+               input=str(manifest.relative_to(root)), output=str(output), runtime_url=f'/live/{identity}',
+               skip_replay=skip_replay)
     if scene_id:
         job['scene_id'] = scene_id
     with LOCK:
@@ -212,6 +213,7 @@ def run_session(session, job):
     from tasks import write_status
     config, identity, output = session.config, session.id, session.output
     results_ready = False
+    skip_replay = job.get('skip_replay', False)
     try:
         from astermind.engine import runtime_control
         from astermind.engine.simulation import Simulation
@@ -222,6 +224,8 @@ def run_session(session, job):
         def ready():
             nonlocal results_ready
             results_ready = True
+            if skip_replay:
+                return
             write_status(job,'completed',phase='计算结果已就绪，正在整理回放',
                            replay_state='preparing',result_url=f'/runs/{identity}/result')
             if session.automatic:
@@ -254,11 +258,14 @@ def run_session(session, job):
             save_audited_result(output/'native_result.json', result,
                                 auditor=audit, default=json_default,progress=phase)
             from scene_outputs import export
-            export(output,result,config,simulation.physical,progress=phase,on_ready=ready)
-        write_status(job, 'completed',phase='结果与回放已就绪',replay_state='ready',result_url=f'/runs/{identity}/result')
+            export(output,result,config,simulation.physical,progress=phase,on_ready=ready,
+                   skip_replay=skip_replay)
+        completion = '请求结果已就绪，已跳过回放整理' if skip_replay else '结果与回放已就绪'
+        write_status(job, 'completed', phase=completion, replay_state='skipped' if skip_replay else 'ready',
+                     result_url=f'/runs/{identity}/result')
         with session.condition:
             session.version += 1
-            session.payload.update(state='completed', version=session.version, message='仿真完成，算子与通信记录已保存')
+            session.payload.update(state='completed', version=session.version, message=completion)
             (output/'live_state.json').write_text(json.dumps(session.payload, ensure_ascii=False), encoding='utf-8')
             session.engine = None
             session.condition.notify_all()
@@ -271,7 +278,10 @@ def run_session(session, job):
             with (output/'execution.log').open('a',encoding='utf-8') as stream:
                 stream.write('\nPath index publication failed:\n'+traceback.format_exc())
         state = 'completed' if results_ready else 'cancelled' if isinstance(error, SessionStopped) else 'failed'
-        if results_ready:
+        if results_ready and skip_replay:
+            write_status(job,state,replay_state='skipped',phase='请求结果已保存，运行收尾失败',
+                         error=str(error),result_url=f'/runs/{identity}/result')
+        elif results_ready:
             write_status(job,state,replay_state='failed',replay_error=str(error),phase='计算结果已保存，回放整理失败')
         else:
             write_status(job, state, error=str(error))

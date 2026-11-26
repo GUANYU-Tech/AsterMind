@@ -830,10 +830,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(edit_topology(payload['experiment'],payload['edit']))
             if self.path=='/launch-scene':
                 from studio import scene_input
+                skip_replay = payload.get('skip_replay', False)
+                if not isinstance(skip_replay, bool):
+                    raise ValueError('跳过回放整理需要布尔值')
                 value = scene_input(ROOT,payload['id'])
                 if value.get('schema_version') in (1, 'orbitserve.native_cells.v1'):
                     from native_scene_live import start as start_native_scene
-                    return self.respond(start_native_scene(ROOT, value, automatic=True, scene_id=payload['id']), code=202)
+                    return self.respond(start_native_scene(ROOT, value, automatic=True, scene_id=payload['id'],
+                                                           skip_replay=skip_replay), code=202)
+                if skip_replay:
+                    raise ValueError('仅原生场景的后台实验支持跳过回放整理')
                 job=start(value)
                 status(job,job['state'],scene_id=payload['id'],runtime_url=f"/runs/{job['id']}/runtime")
                 from current_experiment import select

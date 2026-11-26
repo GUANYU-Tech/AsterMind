@@ -181,10 +181,10 @@ class NetworkState:
         write_physical_state(self, path, workers=workers, progress=progress)
 
     @staticmethod
-    def open_physical_attributes(path):
+    def open_physical_attributes(path, *, lazy_blocks=False):
         """Open immutable attributes for offline snapshots without a full trace."""
         from astermind.engine.state.physical_dataset import PhysicalAttributes
-        return PhysicalAttributes(path)
+        return PhysicalAttributes(path, lazy_blocks=lazy_blocks)
 
     def position(self, node_id: str, time_s: float) -> tuple[float, ...]:
         if not self.start_s <= time_s <= self.end_s:

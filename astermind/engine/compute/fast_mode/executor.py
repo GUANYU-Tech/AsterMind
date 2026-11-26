@@ -23,6 +23,7 @@ from .frame_forecast import forecast_routes
 from .hardware import Hardware
 from .predictor import Predictor, Row
 from .quote import BatchCommunication, mixed_runtime_waves
+from .static_cell import static_rank_path_window
 from .v4_small_gemm import SmallFp8Gemm
 
 
@@ -33,6 +34,8 @@ class FastModeExecutor(RuntimeBatchExecutor):
     compute_timing_reference = None
     portable_hardware = False
     link_contention = False
+    runtime_transport_options = {}
+    static_rank_paths = None
 
     def configure(self, execution, config):
 
@@ -91,6 +94,26 @@ class FastModeExecutor(RuntimeBatchExecutor):
         )
         self.prepared_frame = None
         self.bound_available = False
+        from astermind.engine.comm.event_runtime import RuntimeCommunication
+        from astermind.engine.comm.target_network import TargetNetworkFrames
+        self.runtime_transport_options = {}
+        if type(self.comm) is RuntimeCommunication and type(self.comm.network) is TargetNetworkFrames:
+            from astermind.engine.comm.intra_hierarchy import ScaleUpPairIndex
+            topology = self.comm.network.network.topology
+            index = getattr(self.comm, '_fast_scale_up_index', None)
+            if index is None:
+                index = self.comm._fast_scale_up_index = ScaleUpPairIndex(topology)
+            self.runtime_transport_options = {'fast_scale_up_index': index}
+            if not (self.link_contention or self.comm.shared_bandwidth):
+                self.static_rank_paths = static_rank_path_window(self.comm.network, devices, program)
+
+    def _has_static_rank_paths(self, start, end):
+        if self.static_rank_paths is None:
+            return False
+        ready, horizon, revision = self.static_rank_paths
+        net = self.comm.network.host.net
+        return (ready <= start <= end <= horizon and revision == net.revision
+                and not (net.disabled_device_links or net.failed_device_links or net.active_faults))
 
     def _validate_portable_placement(self, devices):
         frame = self.comm.network.frame_at(self.loop.now_s)
@@ -156,9 +179,12 @@ class FastModeExecutor(RuntimeBatchExecutor):
             else:
                 end = start + Time(compute_s + communication_s)
                 if frame_end is not None and end >= frame_end:
-                    fallback = self._crossing_reason(components, frame_end, end)
-                    if fallback is None:
-                        crossing = "certified"
+                    if self._has_static_rank_paths(start, end):
+                        crossing = "static_cell"
+                    else:
+                        fallback = self._crossing_reason(components, frame_end, end)
+                        if fallback is None:
+                            crossing = "certified"
         if fallback is not None:
             pricing, crossing = "runtime", "runtime"
         quote_wall_s = perf_counter() - quote_started
@@ -294,7 +320,7 @@ class FastModeExecutor(RuntimeBatchExecutor):
     def _submit_runtime_operator(self, state, operator, done, identity):
         waves = mixed_runtime_waves(self.comm, operator) if self.portable_hardware else None
         if waves is None:
-            self._submit_batch_task(state, operator, done, identity)
+            self._submit_batch_task(state, operator, done, identity, **self.runtime_transport_options)
             return
 
         pending_waves = iter(enumerate(wave for wave in waves if wave))
@@ -337,8 +363,10 @@ class FastModeExecutor(RuntimeBatchExecutor):
                         self.comm.submit_transfer(
                             task_id, source, target, message.bytes, lambda key=task_id: arrived(key),
                             lambda error: self._abort_batch(state, error),
+                            **self.runtime_transport_options,
                         )
                         continue
-                self._submit_batch_task(state, message, lambda _, key=task_id: arrived(key), task_id)
+                self._submit_batch_task(state, message, lambda _, key=task_id: arrived(key), task_id,
+                                        **self.runtime_transport_options)
 
         next_wave()

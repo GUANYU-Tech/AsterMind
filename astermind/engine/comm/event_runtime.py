@@ -193,9 +193,13 @@ class RuntimeCommunication(CommunicationRouting):
             details={}
             shared=False
             if all(routes.topology.devices[n].kind=='gpu' for n in (f['source'],f['target'])):
-                from astermind.engine.comm.intra_hierarchy import classify_participants
-                scope, hierarchy, _, _ = classify_participants(routes.frame, (f['source'], f['target']))
                 task_state = self.tasks[f['task']]
+                index = task_state.get('fast_scale_up_index')
+                if index is None:
+                    from astermind.engine.comm.intra_hierarchy import classify_participants
+                    scope, hierarchy, _, _ = classify_participants(routes.frame, (f['source'], f['target']))
+                else:
+                    scope, hierarchy = index.classify(f['source'], f['target'])
                 if not task_state.get('local_runtime'):
                     duration = legacy_p2p_ns(routes, route, f['size'], hierarchy)
                 else:
@@ -336,13 +340,15 @@ class RuntimeCommunication(CommunicationRouting):
                                    plan.selection['hardware_by_gpu'], self.capacities)
         return current, local_routes, limits
 
-    def submit(self,operator,on_complete,on_failure=None,*,task_id=None,deadline_s=None):
+    def submit(self,operator,on_complete,on_failure=None,*,task_id=None,deadline_s=None,fast_scale_up_index=None):
         self.serial+=1;identity=task_id or f'communication-{self.serial}'
         self._register(identity,on_failure,deadline_s)
         try:
             self._settle();routes=self._refresh()
             plan=plan_communication(self.network,self.policy,operator,self.loop.now_s,routes=routes)
             task = self.tasks[identity]
+            if fast_scale_up_index is not None:
+                task['fast_scale_up_index'] = fast_scale_up_index
             task['policy'] = plan.policy
             if plan.local_runtime:
                 task.update(local_runtime=True, hardware_by_gpu=plan.selection['hardware_by_gpu'],
@@ -398,7 +404,7 @@ class RuntimeCommunication(CommunicationRouting):
         return identity
 
     def submit_transfer(self,identity,source,target,size,on_complete,on_failure=None,*,deadline_s=None,
-                        first_hop=None):
+                        first_hop=None,fast_scale_up_index=None):
         if type(size) is not int or size<0:raise ValueError('payload must be nonnegative integer bytes')
         if first_hop is not None:
             if first_hop==source:raise ValueError('first hop must differ from source')
@@ -409,6 +415,8 @@ class RuntimeCommunication(CommunicationRouting):
                 raise NoRouteError(f'first hop {first_hop} is not an established neighbor of {source}')
         self._register(identity,on_failure,deadline_s)
         self.tasks[identity]['first_hop']=first_hop
+        if fast_scale_up_index is not None:
+            self.tasks[identity]['fast_scale_up_index'] = fast_scale_up_index
         try:
             self._settle();self._refresh()
             def complete():

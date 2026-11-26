@@ -263,7 +263,7 @@ def write_physical_state(network, path, *, workers=1, progress=None):
 class PhysicalAttributes:
     """Bounded cache over an immutable, indexed dataset shared by network forks."""
 
-    def __init__(self, path, *, _metadata=None):
+    def __init__(self, path, *, _metadata=None, lazy_blocks=False):
         self.path = Path(path).resolve()
         self._read_connection = None
         self.link_store = None
@@ -275,16 +275,17 @@ class PhysicalAttributes:
             if _metadata is None and (self.metadata.get("indexed_timeline") or self.metadata.get("chunked_fields")):
                 self._load_timeline(db)
             self.block_times = {}
-            # Scan small immutable datasets once as compressed bytes. Avoid
-            # repeated filesystem connection/lock roundtrips in route searches.
-            packed_bytes = db.execute('SELECT COALESCE(SUM(length(value)),0) FROM attributes').fetchone()[0]
-            self._packed = {} if packed_bytes <= COMPRESSED_READ_CACHE_BYTES else None
-            columns = 'link,time,value' if self._packed is not None else 'link,time'
-            for row in db.execute(f'SELECT {columns} FROM attributes ORDER BY link,time'):
-                link, time_s = row[:2]
-                self.block_times.setdefault(link, []).append(time_s)
-                if self._packed is not None:
-                    self._packed[link,time_s] = row[2]
+            self._packed = None
+            if not lazy_blocks:
+                # Small datasets can avoid repeated filesystem roundtrips.
+                packed_bytes = db.execute('SELECT COALESCE(SUM(length(value)),0) FROM attributes').fetchone()[0]
+                self._packed = {} if packed_bytes <= COMPRESSED_READ_CACHE_BYTES else None
+                columns = 'link,time,value' if self._packed is not None else 'link,time'
+                for row in db.execute(f'SELECT {columns} FROM attributes ORDER BY link,time'):
+                    link, time_s = row[:2]
+                    self.block_times.setdefault(link, []).append(time_s)
+                    if self._packed is not None:
+                        self._packed[link,time_s] = row[2]
         if self.metadata.get("schema_version") not in {SCHEMA, LEGACY_SCHEMA}:
             raise ValueError("unsupported physical state; regenerate in step one")
         self._blocks = OrderedDict()
@@ -292,6 +293,8 @@ class PhysicalAttributes:
         self.decoded_bytes = self.peak_decoded_bytes = 0
         self.read_decode_s = 0.
         self.block_loads = 0
+        self._starts = (lru_cache(maxsize=32768)(self._read_block_starts)
+                        if lazy_blocks else self.block_times.get)
         self._cached_at = lru_cache(maxsize=4096)(self._at)
 
         def read(link, time_s):
@@ -362,10 +365,17 @@ class PhysicalAttributes:
             self._read_connection.close()
             self._read_connection = None
 
+    def _read_block_starts(self, link):
+        query = 'SELECT time FROM attributes WHERE link=? ORDER BY time'
+        if self._read_connection is not None:
+            return tuple(row[0] for row in self._read_connection.execute(query, (link,)))
+        with closing(self.connect()) as db:
+            return tuple(row[0] for row in db.execute(query, (link,)))
+
     def _locate(self, link, time_s):
         if not math.isfinite(time_s) or time_s < 0:
             raise ValueError('physical query time must be finite and nonnegative')
-        starts = self.block_times.get(link, ())
+        starts = self._starts(link) or ()
         index = bisect.bisect_right(starts, time_s) - 1
         if index < 0:
             raise ValueError('physical dataset does not cover link/time')

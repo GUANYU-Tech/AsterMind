@@ -67,7 +67,7 @@ class SnapshotSource(NetworkState):
         if value.get("schema_version") != SCHEMA:
             raise ValueError("unsupported snapshot store")
         self.physical_attributes = NetworkState.open_physical_attributes(
-            self.root / "physical_state.sqlite"
+            self.root / "physical_state.sqlite", lazy_blocks=initial_spec is not None
         )
         if value["trace_id"] != self.physical_attributes.metadata["trace_id"]:
             raise ValueError("snapshot store trace mismatch")

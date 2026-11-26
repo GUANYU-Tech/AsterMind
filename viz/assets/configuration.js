@@ -31,7 +31,7 @@ $('runExperiment').onclick = async () => {
   updateSelection();
   $('status').textContent = '正在提交实验，随后进入运行进度…';
   try {
-    await startBatchExperiment(post, $('scenes').value, url => location.assign(url));
+    await startBatchExperiment(post, $('scenes').value, url => location.assign(url), $('skipReplay').checked);
   } catch (error) {
     $('status').textContent = '启动失败：' + error.message;
   } finally {

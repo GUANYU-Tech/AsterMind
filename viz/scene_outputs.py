@@ -35,7 +35,7 @@ def reuse_physical_frames(output, physics, horizon_s):
     return True
 
 
-def export(output,result,config,physics,*,progress=None,on_ready=None):
+def export(output,result,config,physics,*,progress=None,on_ready=None,skip_replay=False):
     from result_analysis import native_analysis
     from native_live import physical_export
     from viz.export import export_reports
@@ -44,7 +44,7 @@ def export(output,result,config,physics,*,progress=None,on_ready=None):
     if progress:progress('生成请求结果与分析摘要')
     analysis = native_analysis(result, identity)
     fast = config.compute_mode == "fast_mode"
-    if fast:
+    if fast or skip_replay:
         analysis["operator_replay"] = False
     (output/'analysis.json').write_text(json.dumps(analysis, ensure_ascii=False))
     summary=dict(id=identity,communication_mode='runtime_comm',communication_label='V1.0 Runtime Comm',
@@ -53,6 +53,8 @@ def export(output,result,config,physics,*,progress=None,on_ready=None):
         flows=sum(e['kind']=='admit' for e in result.get('communication_events',[])),surrogate_operations=None)
     (output/'native_summary.json').write_text(json.dumps(summary,ensure_ascii=False))
     if on_ready:on_ready()
+    if skip_replay:
+        return summary
     if physics is not None:
         if progress:progress('整理场景几何快照')
         horizon = config.horizon_ns / 1e9

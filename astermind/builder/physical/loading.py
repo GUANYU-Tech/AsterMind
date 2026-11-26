@@ -52,7 +52,11 @@ def prepare_physics(config, output_dir=None):
                 "transport_model": "runtime_comm",
             }
         )
-        trace = load_orbit_trace(root / "orbit_trace/trace_manifest.json")
+        # The indexed Runtime reads positions and links from SnapshotSource.
+        # Its dataset checks above still verify the archived inputs.
+        trace = None
+        if config.fast_orbital_route_frames is None:
+            trace = load_orbit_trace(root / "orbit_trace/trace_manifest.json")
         return (root, metadata, concrete, spec, trace), lifetime
     except BaseException:
         if lifetime is not None:
