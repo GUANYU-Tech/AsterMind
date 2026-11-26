@@ -40,11 +40,12 @@ The export contains both languages, the brand images and a copy of the
 The integrated homepage continues to open the simulator at `/platform`.
 The report opens inline at `#pdf` and loads on first use.
 
-For a dedicated GitHub Pages repository, put the **contents** of the export
-at the root of its publishing branch, including `.nojekyll`. Select the
-approved branch and `/(root)` under **Settings → Pages → Deploy from a branch**.
-The published project URL supports both `/<repository>/` and
-`/<repository>/en/#pdf`. See the [GitHub Pages setup guide](https://docs.github.com/en/pages/getting-started-with-github-pages/creating-a-github-pages-site).
+The [Pages workflow](../../.github/workflows/pages.yml) builds both languages
+on pull requests and deploys the static export when homepage or report changes
+reach `main`. A maintainer selects **Settings → Pages → Build and deployment →
+Source → GitHub Actions** once. After a successful deployment, the
+[project homepage](https://guanyu-tech.github.io/AsterMind/) is available in
+Chinese and [English](https://guanyu-tech.github.io/AsterMind/en/).
 
 ## Brand assets and typography
 
