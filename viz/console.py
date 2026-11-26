@@ -42,7 +42,9 @@ HOMEPAGE_FILES = {
     '/style.css': ('style.css', 'text/css'),
     '/language.js': ('language.js', 'text/javascript'),
     '/app.js': ('app.js', 'text/javascript'),
+    '/assets/astermind-mark.png': ('assets/astermind-mark.png', 'image/png'),
     '/assets/guanyu-logo.png': ('assets/guanyu-logo.png', 'image/png'),
+    '/assets/AsterMind-V1-Tech-Report.pdf': ('assets/AsterMind-V1-Tech-Report.pdf', 'application/pdf'),
 }
 
 
@@ -335,7 +337,7 @@ class Handler(BaseHTTPRequestHandler):
         """Send large immutable artifacts without allocating their entire contents."""
         with Path(path).open('rb') as stream:
             self.send_response(200)
-            self.send_header('Content-Type', kind if kind == 'image/png' else kind + '; charset=utf-8')
+            self.send_header('Content-Type', kind if kind in ('image/png', 'application/pdf') else kind + '; charset=utf-8')
             self.send_header('Content-Length',str(Path(path).stat().st_size))
             self.send_header('X-Content-Type-Options','nosniff')
             self.send_header('Cache-Control','no-store')
