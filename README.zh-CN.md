@@ -89,6 +89,11 @@ bash scripts/run.sh
 
 示范数据和运行步骤待补充。
 
+## 贡献指南
+
+欢迎为 AsterMind 作出贡献。提交 PR 前，请阅读 [贡献指南](CONTRIBUTING.md)，感谢所有为项目作出贡献的开发者。
+
+
 ## 致谢
 
 感谢清华大学及无问芯穹研发团队的开源仿真工具[Uni3Sim](https://github.com/thu-nics/uni3sim)。AsterMind V1.0的计算仿真模块和卡间互联通信仿真模块参考了Uni3Sim的仿真方法。
