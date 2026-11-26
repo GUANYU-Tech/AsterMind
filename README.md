@@ -35,13 +35,17 @@ The **state-coupled runtime engine** replays requests at their recorded arrival 
 
 ## Build and Install
 
-### Windows x64
+### Windows (64-bit)
 
-[Download the AsterMind v1.0 Windows x64 installer](https://github.com/GUANYU-Tech/AsterMind/releases/download/v1.0.0-preview.7/AsterMind-v1.0-Windows-x64-Setup.exe) (prerelease `1.0.0-preview.7`).
+[Download the AsterMind v1.0 Windows x64 installer](https://github.com/GUANYU-Tech/AsterMind/releases/download/v1.0.0-preview.7/AsterMind-v1.0-Windows-x64-Setup.exe).
+
+### macOS (Apple Silicon)
+
+The Apple Silicon installer is in preparation, with macOS 13 or later as the compatibility target.
 
 ### Linux source installation
 
-**Prerequisites.** x86-64 Linux with glibc 2.39 or newer, Git, a C/C++ toolchain, and `libnuma.so.1`. Python 3.12 is required. The examples run on the CPU without model weights or a GPU.
+**Prerequisites.** x86-64 Linux with glibc 2.39 or newer, Git, a C/C++ toolchain, and `libnuma.so.1`. Python 3.12 is required.
 
 ```bash
 git clone https://github.com/GUANYU-Tech/AsterMind.git
@@ -61,7 +65,7 @@ bash scripts/build.sh
 
 ## Quick Start
 
-### Open the Frontend
+### Open AsterMind Frontend
 
 Start the local service. The 3D previews require a browser with WebGL 2.
 
@@ -69,33 +73,28 @@ Start the local service. The 3D previews require a browser with WebGL 2.
 bash scripts/run.sh
 ```
 
-Open the [local simulation homepage](http://localhost:8766/en/).
+Then open the AsterMind frontend [http://localhost:8766/](http://localhost:8766/en/).
 
-| Simulation scope | Frontend | Example |
-| --- | --- | --- |
-| **L2 · Single Cell** | [Compute Formation Simulation](http://localhost:8766/cell/) | [DeepSeek-V4-Pro](#l2--deepseek-v4-pro-example) |
-| **L3 · Constellation** | [End-to-End Simulation](http://localhost:8766/workspace) | Example pending. |
+### Compute Formation Simulation
 
-### L2 · DeepSeek-V4-Pro Example
+In **Detail Mode**, this example simulates distributed inference for **DeepSeek-V4-Pro** using a **TP8 × PP4** parallel configuration across four satellites, each equipped with eight NVIDIA H200 GPUs.
 
-Run **DeepSeek-V4-Pro** in **Detail Mode** with **TP8 × PP4** across four satellites with eight simulated H200 GPUs each.
-
-1. Open [Compute Formation Simulation](http://localhost:8766/cell/), switch to **EN**, and select **New Task**.
-2. In **Constellation Resources**, select **NVIDIA H200**, **four satellites**, and **eight GPUs per satellite**. Set the formation to **Ring** with **1 km** spacing.
-3. In **Communication Network**, use one **eight-GPU SU group per satellite** and set the inter-satellite links to **Fixed-Bandwidth Mode** at **400 Gbps**.
-4. In **Model and Workload**, select **deepseek-v4-pro** and **Detail Mode**. Set two synthetic requests at **16 requests/s**, each with **16 input tokens** and **2 output tokens**.
-5. In **Parallel Deployment**, select **Colocated** and **Manual Configuration**. Set **TP 8, PP 4, DP 1** with EP off. Map each pipeline stage to a separate satellite.
-6. In **Scheduling and Execution**, set **Maximum Model Context Length** to **1152 tokens** and turn off **Chunked Prefill**. Select **Submit Task**. Open **Simulation Results** to view both requests and their compute and communication timelines.
+1. Enter **[Compute Formation Simulation]**, select **New Task**.
+2. In **[Constellation Resources]**, select **NVIDIA H200**, **four satellites**, and **eight GPUs per satellite**. Set the formation to **Ring** with **1 km** spacing.
+3. In **[Communication Network]**, use one **eight-GPU SU group per satellite** and set the inter-satellite links to **Fixed-Bandwidth Mode** at **400 Gbps**.
+4. In **[Model and Workload]**, select **deepseek-v4-pro** and **Detail Mode**. Set two synthetic requests at **16 requests/s**, each with **16 input tokens** and **2 output tokens**.
+5. In **[Parallel Deployment]**, select **Colocated** and **Manual Configuration**. Set **TP 8, PP 4, DP 1** with EP off. Map each pipeline stage to a separate satellite.
+6. In **[Scheduling and Execution]**, set **Maximum Model Context Length** to **1152 tokens** and turn off **Chunked Prefill**. Select **Submit Task**. Open **Simulation Results** to view both requests and their compute and communication timelines.
 
 ### L3 · Constellation Simulation Example
 
 Sample dataset and run instructions pending.
 
-## Contributing
+## Acknowledgements
 
-Bug reports, fixes, and runnable scenarios are welcome. For an issue, include your AsterMind commit, scenario or minimal input, run command, and expected and observed behavior. For a pull request, describe the change and include the checks you ran.
+We thank the teams at Tsinghua University and Infinigence AI for open-sourcing [Uni3Sim](https://github.com/thu-nics/uni3sim). AsterMind V1.0 draws on Uni3Sim’s simulation methods in its compute and inter-accelerator communication modules.
 
 ## Contact
 
-- **Lidong Guo** · [guolidong@guanyu.cn](mailto:guolidong@guanyu.cn)
-- **Zhenhua Zhu** · [zhuzhenhua@mail.tsinghua.edu.cn](mailto:zhuzhenhua@mail.tsinghua.edu.cn)
+- **Lidong Guo** : [guolidong@guanyu.cn](mailto:guolidong@guanyu.cn)
+- **Zhenhua Zhu** : [zhuzhenhua@mail.tsinghua.edu.cn](mailto:zhuzhenhua@mail.tsinghua.edu.cn)

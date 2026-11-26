@@ -35,14 +35,17 @@ AsterMind 是一个可扩展的星座级太空智算系统仿真平台，为在�
 
 ## 构建与安装
 
-### Windows x64
+### Windows（64位）
 
-[下载 AsterMind v1.0 Windows x64 安装包](https://github.com/GUANYU-Tech/AsterMind/releases/download/v1.0.0-preview.7/AsterMind-v1.0-Windows-x64-Setup.exe)（预发布版 `1.0.0-preview.7`）。
+[下载 AsterMind v1.0 Windows x64 安装包](https://github.com/GUANYU-Tech/AsterMind/releases/download/v1.0.0-preview.7/AsterMind-v1.0-Windows-x64-Setup.exe)。
+
+### macOS（Apple 芯片）
+
+Apple 芯片版安装包准备中，目标支持 macOS 13 或更高版本。
 
 ### Linux 源码安装
 
-**运行前提。** x86-64 Linux，glibc 版本至少为 2.39，并提供 Git、C/C++ 工具链和 `libnuma.so.1`。需要 Python 3.12。样例在 CPU 上运行，无需模型权重或 GPU。
-
+**环境依赖：** x86-64 Linux，glibc 版本至少为 2.39，并提供 Git、C/C++ 工具链和 `libnuma.so.1`。需要 Python 3.12。
 ```bash
 git clone https://github.com/GUANYU-Tech/AsterMind.git
 cd AsterMind
@@ -61,29 +64,24 @@ bash scripts/build.sh
 
 ## 快速上手
 
-### 启动前端
+### 打开 AsterMind 前端
 
-启动本地服务。三维预览需要支持 WebGL 2 的浏览器。
+启动本地服务。
 
 ```bash
 bash scripts/run.sh
 ```
 
-打开[本地仿真首页](http://localhost:8766/)。
+打开本地仿真前端界面 [http://localhost:8766/](http://localhost:8766/)。
 
-| 仿真范围 | 前端入口 | 样例 |
-| --- | --- | --- |
-| **L2 · 单编队** | [计算 Cell 仿真](http://localhost:8766/cell/) | [DeepSeek-V4-Pro 网页样例](#l2--deepseek-v4-pro-仿真样例)。 |
-| **L3 · 星座级** | [完整场景仿真](http://localhost:8766/workspace) | 样例待补充。 |
+### 计算编队仿真
 
-### L2 · DeepSeek-V4-Pro 仿真样例
+本例在 **Detail Mode** 下，采用 **TP8 × PP4** 并行配制模拟 **DeepSeek-V4-Pro** 的分布式推理过程，仿真场景中的四颗卫星各配八张 NVIDIA H200 GPU。
 
-本例在 **Detail Mode** 下用 **TP8 × PP4** 模拟 **DeepSeek-V4-Pro**，四颗卫星各配八张模拟 H200 GPU。
-
-1. 打开[计算 Cell 仿真](http://localhost:8766/cell/)，点击「新建任务」。
+1. 进入「算力编队仿真」界面，点击「新建任务」。
 2. 在「星座资源」选择 **NVIDIA H200**，设置 **4 颗卫星、每星 8 张 GPU**。静态编队选环形，间距设为 **1 km**。
 3. 在「通信网络」中，每星使用 **一组 8 卡 SU**，星间链路选「默认模式」，带宽设为 **400 Gbps**。
-4. 在「模型负载」选择 **deepseek-v4-pro** 和 **Detail Mode**。设置两条合成请求，到达率为 **16 请求/秒**，每条 **16 个输入 Token、2 个输出 Token**。
+4. 在「模型负载」选择 **deepseek-v4-pro** 和 **Detail Mode**。设置两条合成请求，到达率为 **16 请求/秒**，每条 **1024 个输入 Token、128 个输出 Token**。
 5. 在「并行部署」保持「同池部署」，选择「手动配置」，设置 **TP 8、PP 4、DP 1**，关闭 EP。确认每个流水线阶段映射到一颗独立卫星。
 6. 在「调度运行」将「模型长度上限」设为 **1152 Token**，关闭「分块 Prefill」，然后点击「发布任务」。在「仿真结果」查看两条请求及其计算和通信时间线。
 
@@ -91,11 +89,11 @@ bash scripts/run.sh
 
 示范数据和运行步骤待补充。
 
-## 参与贡献
+## 致谢
 
-欢迎反馈问题、提交修复和贡献可运行的场景。提交 Issue 时请附上 AsterMind 的提交版本、场景配置或最小输入、运行命令、预期结果和实际结果。发起 Pull Request 时请说明改动，并附上运行过的验证。
+感谢清华大学及无问芯穹研发团队的开源仿真工具[Uni3Sim](https://github.com/thu-nics/uni3sim)。AsterMind V1.0的计算仿真模块和卡间互联通信仿真模块参考了Uni3Sim的仿真方法。
 
 ## 联系方式
 
-- **郭立栋** · [guolidong@guanyu.cn](mailto:guolidong@guanyu.cn)
-- **朱振华** · [zhuzhenhua@mail.tsinghua.edu.cn](mailto:zhuzhenhua@mail.tsinghua.edu.cn)
+- **郭立栋** : [guolidong@guanyu.cn](mailto:guolidong@guanyu.cn)
+- **朱振华** : [zhuzhenhua@mail.tsinghua.edu.cn](mailto:zhuzhenhua@mail.tsinghua.edu.cn)
