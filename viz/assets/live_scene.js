@@ -1,6 +1,7 @@
 import '/assets/visual_state.js';
 import '/assets/runtime_state.js';
 import '/assets/constellation_layout.js';
+import {createOrbitSampleLoader} from './orbit_planes.js';
 import {createLiveEventCursor,isPlaybackEvent} from '/assets/live_event_cursor.js';
 import {eventsForPath} from '/assets/live_traffic_model.js';
 import {LiveCommunicationWatch} from '/assets/live_watch.js';
@@ -57,7 +58,7 @@ function renderWatch(view){
   if(row.kind==='topology_command'&&links.has(row.target_id)){if(row.action==='disconnect')links.get(row.target_id).state='DOWN';if(row.action==='connect'&&row.link_state)Object.assign(links.get(row.target_id),row.link_state)}
  }
  const paths={...pathContext,paths:[...new Map([...(pathContext?.paths||[]),...searchedPaths,...(pathReplay?.path?[pathReplay.path]:[])].map(p=>[p.id,p])).values()]};
- presented={snapshot:RuntimeVisual.applyFaults({...frame,links:[...links.values()],time_s:view.time},runtime.faults),data:{sun_positions:latest.sun_positions||[],network:{nodes:latest.nodes,faults:runtime.faults,inter_cell_links:latest.inter_cell_links},time:{step_s:latest.step_s,duration_s:latest.end_s}},runtime,pathContext:paths,record:{request:{request_id:runtime.request_id}},route:{path:runtime.activeTransfers},recentTransfers:[...recentTransfers.values()],kind:'all',revision:'watch-'+(++watchRevision)};
+ presented={orbitSnapshot:frame,loadOrbitSample,snapshot:RuntimeVisual.applyFaults({...frame,links:[...links.values()],time_s:view.time},runtime.faults),data:{sun_positions:latest.sun_positions||[],network:{nodes:latest.nodes,faults:runtime.faults,inter_cell_links:latest.inter_cell_links},time:{step_s:latest.step_s,duration_s:latest.end_s}},runtime,pathContext:paths,record:{request:{request_id:runtime.request_id}},route:{path:runtime.activeTransfers},recentTransfers:[...recentTransfers.values()],kind:'all',revision:'watch-'+(++watchRevision)};
  syncPlayback();callbacks.onPresent?.(runtime);callbacks.onMode?.();
  $('visualTime').textContent=formatTime(watchPlayer.exact??{time_s:view.time})+' s';
  $('geometryStatus').textContent=runtime.event.event_label||callbacks.label?.[runtime.event.kind]||'在线通信';
@@ -85,9 +86,27 @@ export async function advanceLiveWatch(now,rate=1,inspect=false){
  }finally{watchBusy=false}
 }
 let pathRequest=0;
-let physicalSource=null,physicalIndex=null;
+let physicalSource=null,physicalIndex=null,orbitLoader=null;
 const physicalFrames=new Map();
-export function setLivePhysicalSource(path){const id=String(path||'').replaceAll('\\','/').split('/').filter(Boolean).at(-1);if(id&&/^[a-zA-Z0-9_-]+$/.test(id))physicalSource=id}
+export function setLivePhysicalSource(path){
+ const id=String(path||'').replaceAll('\\','/').split('/').filter(Boolean).at(-1);
+ if(id && id!==physicalSource && /^[a-zA-Z0-9_-]+$/.test(id)){
+  physicalSource=id;physicalIndex=null;orbitLoader=null;physicalFrames.clear();
+ }
+}
+async function loadOrbitSample(time){
+ if(physicalSource){
+  const source=physicalSource,base='/runs/'+encodeURIComponent(source)+'/';
+  if(!orbitLoader){
+   const model=physicalIndex || await loadReplayJson(base+'environment-index');
+   if(source!==physicalSource)return null;
+   physicalIndex=model;orbitLoader=createOrbitSampleLoader(base,model);
+  }
+  return orbitLoader(time);
+ }
+ const frames=replayData().frames || [];
+ return frames.filter(f=>f.time_s!==time).sort((a,b)=>Math.abs(a.time_s-time)-Math.abs(b.time_s-time))[0];
+}
 const replayData=()=>pathReplay||latest?.replay||{events:latest?.events||[],initial:{},frames:latest?[latest]:[]};
 const displayEvent=e=>isPlaybackEvent(e)||!!pathReplay&&e.kind==='cell_transfer_terminal';
 let pathContext=null,pathPollAt=0,pathLoading=false;
@@ -159,7 +178,7 @@ function render(){
  // for environment-index exports, which may only become available on finish.
  const snapshot=history||liveCursor.pending?{...held,time_s:time}: {time_s:time,physical_time_s:latest.geometry_sample_s,nodes:latest.nodes,links:latest.links};
  const combinedPaths={...pathContext,paths:[...new Map([...(pathContext?.paths||[]),...searchedPaths,...(pathReplay?.path?[pathReplay.path]:[])].map(p=>[p.id,p])).values()]};
- presented={snapshot,data:{sun_positions:latest.sun_positions||[],network:{nodes:latest.nodes,faults:runtime.faults,inter_cell_links:latest.inter_cell_links},time:{step_s:latest.step_s,duration_s:latest.end_s}},
+ presented={snapshot,orbitSnapshot:history||liveCursor.pending?held:snapshot,loadOrbitSample,data:{sun_positions:latest.sun_positions||[],network:{nodes:latest.nodes,faults:runtime.faults,inter_cell_links:latest.inter_cell_links},time:{step_s:latest.step_s,duration_s:latest.end_s}},
   runtime,pathContext:combinedPaths,record:{request:{request_id:runtime.request_id}},route:{path:runtime.activeTransfers},kind:'all',revision:latest.version+'|'+cursor+'|'+history+'|'+(pathContext?.through_event_count||0)+'|'+pathSearchRevision};
  syncPlayback();
  const label=displayEvent(runtime.event)?runtime.event.event_label||callbacks.label?.[runtime.event.kind]||runtime.event.kind:terminal?'仿真已结束':'等待下一事件';

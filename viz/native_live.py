@@ -1,5 +1,5 @@
 """Run the existing Qwen TP/PP preset through the shared live controller."""
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from datetime import datetime
 from dataclasses import replace
 import gzip
@@ -37,8 +37,15 @@ def physical_export(output, engine, source, *, horizon_s=None):
         # Keep the first sample at or after the end for the viewer's last
         # interval. A longer offline topology may serve several shorter runs.
         times = times[:bisect_left(times, horizon_s) + 1]
+    events = engine.net.events
+    # Link acquisition and release can occur between two geometry samples.
+    # Use the same (sample, next sample] contract as the physical dataset exporter.
     for i, time in enumerate(times):
         snapshot = engine.net.snapshot(time)
+        next_time = times[min(i + 1, len(times) - 1)]
+        start = bisect_right(events, time, key=lambda event: event['time_s'])
+        end = bisect_right(events, next_time, lo=start, key=lambda event: event['time_s'])
+        snapshot['events_until_next_boundary'] = events[start:end]
         name = f'frames/frame-{i:06d}.json.gz'
         with gzip.open(output/name, 'wt', encoding='utf-8') as stream:
             json.dump(snapshot, stream, ensure_ascii=False, allow_nan=False)

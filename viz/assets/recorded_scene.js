@@ -1,5 +1,7 @@
+import {createOrbitSampleLoader} from './orbit_planes.js';
 import {get} from '/assets/studio_common.js';
 import {loadReplayJson} from '/assets/replay_page_loader.js';
+import {createRecordedFrameLoader,recordedLinksAt} from './replay_link_states.js';
 import {isTransmissionEvent,watchTimeline,communicationPositionAt,countAt,compareTime,formatTime} from '/assets/communication_clock.js';
 import {renderEventRows} from '/assets/event_view.js';
 import '/assets/visual_state.js';
@@ -22,10 +24,11 @@ if(main.tagName==='MAIN'){
  const heading=document.createElement('h1');heading.textContent='场景回放';main.prepend(heading);
 }
 window.runtimeGlobeMode=true;window.runtimeLiveMode=true;window.runtimeRecordedMode=true;
-let catalog,model,presented,current=0,time=0,running=false,timer=null,revision=0,seekVersion=0,epoch=0,ready=false,globeReady=false,pagePaths=[],globalClock,selectedClock=null;
+let catalog,model,loadOrbitSample,presented,current=0,time=0,running=false,timer=null,revision=0,seekVersion=0,epoch=0,ready=false,globeReady=false,pagePaths=[],globalClock,selectedClock=null;
 let exactTime=null;
 let selected={},searchedPaths=[],searchRevision=0;
-const pages=new Map(),frames=new Map();
+const pages=new Map();
+let physical;
 const recent=new Map();
 const allPaths=()=>[...new Map([...pagePaths,...searchedPaths].map(path=>[path.id,path])).values()];
 window.networkReplayState=()=>presented;
@@ -53,11 +56,6 @@ async function loadPage(index){
  }
  return pages.get(index);
 }
-async function physical(at){
- const descriptors=model.artifacts.frames,index=Math.max(0,descriptors.findLastIndex(f=>f.time_s<=at)),descriptor=descriptors[index];
- if(!frames.has(descriptor.artifact)){frames.set(descriptor.artifact,await loadReplayJson(base+descriptor.artifact));while(frames.size>3)frames.delete(frames.keys().next().value)}
- return frames.get(descriptor.artifact);
-}
 async function pageAt(at){
  return communicationPositionAt(catalog.pages,loadPage,at);
 }
@@ -82,18 +80,15 @@ async function seekTime(at,animate=false){
  for(const [id,row]of recent)if(now-row.shownAt>500)recent.delete(id);
  for(const event of arriving)recent.set(event.transfer_id,{...event,shownAt:now});
  while(recent.size>16384)recent.delete(recent.keys().next().value);
- const links=new Map(held.links.map(link=>[link.link_id,{...link}]));
- const apply=e=>{
-  if(e.kind==='link_state'&&e.time_s>=held.time_s&&links.has(e.link_id))Object.assign(links.get(e.link_id),{state:e.state,reason:e.reason});
-  if(e.kind==='topology_command'&&links.has(e.target_id)){const link=links.get(e.target_id);if(e.action==='disconnect')Object.assign(link,{state:'DOWN',manual_disconnected:true});if(e.action==='connect')Object.assign(link,{manual_disconnected:false,...e.link_state})}
- };
- (page.link_states||[]).forEach(apply);(page.commands||[]).forEach(apply);page.events.slice(0,cut+1).forEach(apply);
- const snapshot=RuntimeVisual.applyFaults({...held,time_s:at,links:[...links.values()]},runtime.faults);
- current=catalog.pages[pageIndex].offset+visible;time=at;exactTime=target;pagePaths=page.paths||[];presented={snapshot,data:model,runtime,recentTransfers:[...recent.values()],route:{path:runtime.activeTransfers},record:{request:{request_id:runtime.request_id}},pathContext:{paths:allPaths()},kind:'all',revision:++revision,playback:{playing:running,rate:Number($('recordRate').value)}};
+ const snapshot=RuntimeVisual.applyFaults({...held,time_s:at,links:recordedLinksAt(held,at,page,cut)},runtime.faults);
+ current=catalog.pages[pageIndex].offset+visible;time=at;exactTime=target;pagePaths=page.paths||[];presented={snapshot,orbitSnapshot:held,loadOrbitSample,data:model,runtime,recentTransfers:[...recent.values()],route:{path:runtime.activeTransfers},record:{request:{request_id:runtime.request_id}},pathContext:{paths:allPaths()},kind:'all',revision:++revision,playback:{playing:running,rate:Number($('recordRate').value)}};
  const completed=target?.time_ticks&&catalog.completion_ticks?countAt(catalog.completion_ticks,target):catalog.completion_times?countAt(catalog.completion_times,at):(catalog.pages[pageIndex].completed_before||0)+page.events.slice(0,cut+1).filter(e=>e.kind==='external_flow_done').length;
  const failed=target?.time_ticks&&catalog.failure_ticks?countAt(catalog.failure_ticks,target):countAt(catalog.failure_times||[],at);
  $('recordSeek').value=at;$('recordClock').textContent=($('recordMode').value==='inspect'?formatTime(target??at):at.toFixed(6))+' s';$('recordClock').title=formatTime(target??at)+' s'+(catalog.clock?' 统一时钟 1 as':' 旧时钟记录');$('recordPosition').textContent=catalog.transfer_count?(catalog.unit?'完成'+catalog.unit+' ':'完成传输 ')+completed.toLocaleString()+' / '+catalog.transfer_count.toLocaleString()+(failed?' 失败 '+failed.toLocaleString():''):'通信回放';
- $('recordStatus').textContent=event.event_label||event.kind;$('recordPrevious').disabled=current<=0;$('recordNext').disabled=current>=catalog.event_count-1;
+ $('recordStatus').textContent=event.event_label||event.kind;
+ if(at>held.time_s && !Array.isArray(held.events_until_next_boundary ?? held.state_events))
+  $('recordStatus').append(document.createTextNode('　此时段缺少物理链路事件，按快照及运行记录显示。'));
+ $('recordPrevious').disabled=current<=0;$('recordNext').disabled=current>=catalog.event_count-1;
  if(!running)$('recordPlay').textContent=at>=catalog.end_s?'重新播放':'播放回放';
  renderEventRows($('recordEvents'),page.events.slice(0,cut+1).filter(isTransmissionEvent).slice(-50));inspect();
  if(!globeReady){
@@ -132,6 +127,8 @@ window.addEventListener('message',event=>{if(event.origin===location.origin&&eve
 main.addEventListener('analysis-visibility',event=>{if(!event.detail.visible)pause()});
 try{
  model=await get(base+'environment-index');
+ physical=createRecordedFrameLoader(base,model,loadReplayJson);
+ loadOrbitSample=createOrbitSampleLoader(base,model);
  const response=await fetch(base+'native-replay/transmission-recording.json');
  if(response.ok)catalog=await response.json();
  else{

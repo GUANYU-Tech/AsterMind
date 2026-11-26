@@ -14,7 +14,9 @@
 <div class="scene-caption" id="scene-caption"><span class="eyebrow">EARTH / CONSTELLATION</span><strong id="scene-summary">卫星编队预览</strong><span id="scene-links" role="status"></span><span>拖动旋转，滚轮缩放</span><button id="reset-view" type="button">重置视角</button></div><div id="node-labels" aria-hidden="true"></div>
 <aside class="cluster-peek" id="cluster-peek" aria-live="polite"><div id="peek-index"></div><strong id="peek-name"></strong><span id="peek-altitude"></span><span id="peek-status"></span></aside>
 <main class="config-shell" id="config-shell"></main><div id="web-message" role="status" aria-live="polite"></div><div id="job-status" hidden><span id="job-progress"></span><button id="open-job" type="button">查看任务 →</button></div>
-<section class="analysis-shell" id="analysis-shell" hidden><header class="analysis-header"><div class="analysis-title"><span class="eyebrow">COMPUTE / RESULTS</span><h1>仿真结果</h1></div><button class="secondary-action" type="button" data-stage-target="runtime">返回任务配置</button></header><div id="analysis-content"><div id="history-list"></div><div id="simulation-results"><p class="muted">运行任务后，在这里查看结果。</p></div></div></section>
+<section class="analysis-shell" id="analysis-shell" hidden><header class="analysis-header"><div class="analysis-title"><span class="eyebrow">COMPUTE / RESULTS</span><h1>仿真结果</h1></div><button class="secondary-action" type="button" data-stage-target="runtime">返回任务配置</button></header><div id="analysis-content"><div id="history-list"></div>
+<details id="cell-task-log" hidden open><summary>执行日志</summary><pre id="cell-log-lines"></pre></details>
+<div id="simulation-results"><p class="muted">运行任务后，在这里查看结果。</p></div></div></section>
 </div><script type="module">
 if (new URLSearchParams(location.search).get('context') === 'physical' && window.frameElement?.formationSession) {
   import('./physical-workspace.mjs').catch(error=>window.frameElement.formationSession.status('编队编辑器加载失败：'+error.message));

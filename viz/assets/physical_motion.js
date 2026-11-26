@@ -23,5 +23,6 @@ if(data.motion_frames?.length){
  speed.onchange=()=>player.stop();
  for(const id of ['prev','next','time'])$(id).addEventListener(id==='time'?'input':'click',()=>{version++;player.stop();baseIndex=-1;setTimeout(()=>{time=window.physicalSnapshot().time_s},0)});
  document.querySelector('footer').textContent=`地固坐标系保持不变。物理采样 ${data.time.step_s} s；相邻位置和速度作 Hermite 插值，太阳方向平滑变化。箭头按钮逐采样核查；连续播放只加载邻近运动帧，不改变物理与业务结果。`;
- await render(time);
+ try { await render(time); }
+ catch(error) { $('status').textContent=error.message; }
 }

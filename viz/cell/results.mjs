@@ -47,7 +47,10 @@ export async function renderArtifacts(container, jobId, api) {
   try {
     const manifest = await api(`/api/simulations/${jobId}/artifacts`);
     const select = element("select", undefined, "result-select"); select.setAttribute("aria-label", "选择结果产物");
-    for (const item of manifest.items) { const option = element("option", item.key); option.value = item.key; select.append(option); }
+    for (const item of manifest.items) {
+      const option=element("option", item.key==='execution.log' ? '原始诊断日志（execution.log）' : item.key);
+      option.value=item.key; select.append(option);
+    }
     if (!manifest.items.length) { details.append(element("p", "此历史任务没有可下载的产物清单")); return; }
     const download = element("a", "下载当前文件", "small-action");
     const previous = element("button", "上一页"); const next = element("button", "下一页"); const page = element("div"); const status = element("p", "", "muted"); let offset = 0; let version = 0;
@@ -63,6 +66,11 @@ export async function renderArtifacts(container, jobId, api) {
           const columns = [...new Set(data.items.flatMap(item => Object.keys(item)))];
           page.replaceChildren(table(columns, data.items.map(item => columns.map(key => typeof item[key] === "object" && item[key] !== null ? JSON.stringify(item[key]) : item[key] ?? "不可用"))));
           status.textContent = `从第 ${offset + 1} 条起 本页 ${data.items.length} 条${data.preview_only ? ' 嵌套长数据为预览，完整内容请下载' : ''}`;
+        } else if (select.value.endsWith(".log") && typeof data.value === "string") {
+          const raw = element("pre", data.value);
+          raw.dataset.raw = "";
+          page.replaceChildren(raw);
+          status.textContent = "原始诊断日志预览，完整内容请下载。";
         } else { page.replaceChildren(element("pre", JSON.stringify(data.value, null, 2))); status.textContent = data.preview_only ? "JSON 预览 完整内容请下载" : "完整 JSON"; }
         previous.disabled = offset === 0; next.disabled = !data.has_more;
       } catch (error) { if (requestVersion === version) page.textContent = error.message; }

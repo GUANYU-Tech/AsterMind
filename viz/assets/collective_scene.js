@@ -27,7 +27,7 @@ function update(){
   position_itrs_km:n.position_itrs_km.map((v,i)=>v+(other.get(n.node_id).position_itrs_km[i]-v)*u)}))};
  const path=data.hops.map(leg),active=path.filter(h=>h.start_s<=time&&time<h.arrival_s);
  const record={request:{request_id:'training-step-0'},routing:{selected_path:path}};
- presented={data:{network:data.network,time:data.time,sun_positions:data.sun_positions},snapshot,kind:'all',record,
+ presented={orbitSnapshot:first,loadOrbitSample:()=>data.frames[index+1] || data.frames[index-1],data:{network:data.network,time:data.time,sun_positions:data.sun_positions},snapshot,kind:'all',record,
   runtime:{time_s:time,event:{time_s:time,kind:'collective_replay',event_order:time},globalMode:true,
     legs:active,activeTransfers:active,compute:'waiting',routePlans:[],recoveryEvents:[],lossEvents:[]}};
  $('clock').textContent=format(time)+' s 物理快照 '+first.time_s+' s';$('time').value=time;

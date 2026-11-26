@@ -48,7 +48,7 @@ class SceneProcess:
                     if self.cancelled:
                         write_status(status, 'cancelled')
                     else:
-                        write_status(status, 'failed', error=f'仿真进程意外退出 ({code})，请查看执行日志')
+                        write_status(status, 'failed', error=f'仿真进程退出码 {code}')
                 elif status.get('replay_state') == 'preparing':
                     write_status(status, 'completed', replay_state='failed', replay_error=f'回放进程退出 ({code})')
         finally:
