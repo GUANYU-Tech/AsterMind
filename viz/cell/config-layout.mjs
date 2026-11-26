@@ -24,6 +24,8 @@ export function visibleField(path, config) {
     return path.length === 3 ? options.includes(path[2]) : path[2] === "vllm" && vllmOptions.includes(path[3]);
   }
   const name = path.join(".");
+  if (config?.requests?.source === 'synthetic' && config.requests.synthetic?.arrival_distribution === 'simultaneous'
+      && ['requests.synthetic.request_rate', 'requests.arrival_rate_scale'].includes(name)) return false;
   return !hiddenFields.some(key => name === key || name.startsWith(key + "."));
 }
 export const groups = {

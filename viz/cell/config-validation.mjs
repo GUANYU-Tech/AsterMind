@@ -74,10 +74,10 @@ export function fieldError(value, path, root, spec = {}, defs = {}) {
   // Dataclass-backed inputs have semantic bounds that JSON Schema does not
   // expose; mirror their native validators here, without changing engine rules.
   if(path[0]==='requests' && path[1]==='synthetic') {
-    if(['num_requests','request_rate'].includes(key) && value<=0) return '必须大于 0';
+    if ((key === 'num_requests' || key === 'request_rate' && root.requests.synthetic.arrival_distribution !== 'simultaneous')
+        && value <= 0) return '必须大于 0';
     if(['input_lengths','output_lengths'].includes(key) && (!value.length || value.some(v=>!Number.isSafeInteger(v) || v<(key==='input_lengths'?1:0)))) return key==='input_lengths' ? '请输入正整数 Token 长度列表' : '请输入非负整数 Token 长度列表';
     if(key==='prefix_hit_fraction' && (value<0 || value>1)) return '比例范围为 0–1';
-    if(key==='arrival_distribution' && !['poisson','constant'].includes(value)) return '请选择 poisson 或 constant';
   }
   if(path.includes('parallelism') && key.endsWith('_size') && value<1) return '并行规模必须为正整数';
   if(path[0]==='scheduler' && path.includes('vllm')) {
@@ -150,6 +150,9 @@ export function configurationErrors(root, schema, stage = null) {
     if(spec.anyOf) { if(value===null && spec.anyOf.some(s=>s.type==='null')) return; spec=resolve(spec.anyOf.find(s=>s.type!== 'null'),schema.$defs); }
     if(spec.type==='object' && value && typeof value==='object' && !Array.isArray(value)) {
       for(const key of spec.required || []) if(value[key]===undefined) add([...path,key],'请填写此项');
+      if (path.join('.') === 'requests.synthetic' && value.arrival_distribution !== 'simultaneous' && value.request_rate === undefined) {
+        add([...path, 'request_rate'], '请填写此项');
+      }
       for(const [key,child] of Object.entries(value)) {
         const childSpec=spec.properties?.[key] || spec.additionalProperties;
         if(typeof childSpec==='object') walk(child,childSpec,[...path,key]);

@@ -4,7 +4,7 @@ No historical engine is imported. Unsupported semantics fail before submission.
 The submitted and effective configurations are both retained for inspection.
 """
 from copy import deepcopy
-from dataclasses import asdict
+from dataclasses import replace
 import json
 import math
 from pathlib import Path
@@ -243,11 +243,17 @@ def topology(config):
 def request_stream(config):
     activate()
     from src.serving.request_gen.synthetic_requests import SyntheticRequestConfig, generate_synthetic_requests
-    from src.serving.request_gen.request_stream import RequestSpec, RequestStream
+    from src.serving.request_gen.request_stream import RequestStream
     if config.get('closed_loop_client_count') is not None:
         raise ValueError('V1 输入契约没有旧前端的 closed-loop admission，不能等价转换')
     if config['source'] == 'synthetic':
-        stream = generate_synthetic_requests(SyntheticRequestConfig(**config['synthetic']))
+        synthetic = config['synthetic']
+        if synthetic.get('arrival_distribution') == 'simultaneous':
+            # Reuse the pinned generator for request IDs, lengths and prefix hits.
+            source = SyntheticRequestConfig(**{**synthetic, 'arrival_distribution': 'constant', 'request_rate': 1.0})
+            return RequestStream(replace(request, arrival_time_s=0.0)
+                                 for request in generate_synthetic_requests(source))
+        stream = generate_synthetic_requests(SyntheticRequestConfig(**synthetic))
     elif config['source'] == 'canonical':
         from src.serving.request_gen.canonical_requests import load_canonical_requests
         stream=load_canonical_requests(owned(config['file']))
@@ -261,7 +267,8 @@ def request_stream(config):
     scale = config.get('arrival_rate_scale', 1)
     if scale <= 0:
         raise ValueError('arrival_rate_scale 必须为正')
-    return RequestStream(RequestSpec(**{**asdict(r),'arrival_time_s':r.arrival_time_s/scale}) for r in stream.requests)
+    return RequestStream(replace(request, arrival_time_s=request.arrival_time_s / scale)
+                         for request in stream.requests)
 
 
 def compile_serving_cell(value, physical, longest_request, *, cell_id='cell', scene=False, catalog=None):
