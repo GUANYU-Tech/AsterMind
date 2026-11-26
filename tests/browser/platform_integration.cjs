@@ -152,7 +152,7 @@ async function main() {
     await page.locator('.portal-card[href="/workspace"]').click();
     await page.locator('main a[href="/configuration"]').click();
     await page.locator('main a[href="/physical"]').first().click();
-    await page.getByRole('tab',{name:'计算星座与编队'}).click();
+    await page.locator('#jumpCells').click();
     const formation = page.locator('#cells [data-formation-name]').first();
     await formation.locator('.formation-cell-row button').first().click();
     const dialog = page.locator('dialog.cell-workspace-dialog');

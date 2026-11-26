@@ -50,7 +50,7 @@ async function main() {
     assert.equal(await editor.locator('#field-deployment-mode option[value=pd_disagg]').count(),1);
     if(pd){
       await editor.locator('#field-deployment-mode').selectOption('pd_disagg');
-      await editor.locator('#match-parallelism').click();
+      await editor.locator('#automatic-deployment').click();
     }
     await stage('runtime');
     assert.equal(await editor.locator('[id*=timeout_seconds],#run-simulation').count(),0);

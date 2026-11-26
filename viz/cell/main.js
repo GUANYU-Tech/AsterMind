@@ -7,7 +7,7 @@ import {mappingDraft} from './deployment-mapping.mjs';
 import {normalizeComputeSettings} from './compute-config.mjs';
 import {renderSchedulingReadout} from './parameter-panel.mjs';
 import {linkMode, setLinkMode, rememberEmptyLinkMode, newInterSatelliteLink, applyOpticalDefaults} from './link-mode.mjs';
-import {synchronizeResources,clearDependentDrafts} from './resource-sync.mjs';
+import {synchronizeManualResources as synchronizeResources,clearDependentDrafts} from './resource-sync.mjs';
 import { renderResults, renderArtifacts, renderNetworkPreview, element } from "./results.mjs?v=compact-2";
 import { appUrl, appStorageKey } from "./app-path.mjs?v=compact-2";
 import { sceneData } from "./scene-data.mjs?v=compact-2";

@@ -1,7 +1,7 @@
 import { defaultValue, resolveSchema } from "./config-form.mjs?v=validation-1";
 import { mappingDraft } from "./config-layout.mjs?v=compact-2";
 import {newInterSatelliteLink} from './link-mode.mjs';
-import {synchronizeResources} from './resource-sync.mjs';
+import {synchronizeManualResources as synchronizeResources} from './resource-sync.mjs';
 import {fastMode, modelOptions, normalizeComputeSettings} from './compute-config.mjs';
 
 export const networkInputs = config => Object.fromEntries(["hardware", "topology", "constellation", "fso"].map(key => [key, config[key]]));

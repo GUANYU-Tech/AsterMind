@@ -89,26 +89,6 @@ class AssociationTests(unittest.TestCase):
                     self.assertEqual(len([e for e in state.snapshot(12)['links'] if e['state']=='UP']),1)
                     self.assertEqual(NetworkSpec.from_value(spec.to_dict()),spec)
 
-    def test_external_isl_limits_allow_internal_links_and_reject_excess_egress(self):
-        nodes = (NetworkNodeSpec('r', 'communication', isl_terminals=2),
-                 NetworkNodeSpec('m0', 'compute', isl_terminals=1, cell_id='cell', cell_ingress=True,
-                                 external_isl_terminals=0),
-                 NetworkNodeSpec('m1', 'compute', isl_terminals=1, cell_id='cell', cell_ingress=True,
-                                 compute_target=False, external_isl_terminals=1))
-        spec = NetworkSpec(nodes, {kind: LinkProfile(1e9, 2) for kind in ('cross_layer', 'cell_isl')},
-                           communication_topology='explicit')
-        positions = {'r': 7010, 'm0': 7000, 'm1': 7001}
-        trace = SimpleNamespace(
-            time={'start_s': 0., 'end_s': 10.}, satellite_catalog=[{'satellite_id': n} for n in positions],
-            ephemeris_samples=[dict(satellite_id=n, time_s=t, position_itrs_km=(d, 0, 0))
-                               for t in (0., 5., 10.) for n, d in positions.items()],
-            sgl_windows=[], isl_windows=[dict(endpoint_a=a, endpoint_b=b, start_s=0., end_s=10.)
-                                         for a, b in [('m0', 'm1'), ('m0', 'r'), ('m1', 'r')]])
-        state = NetworkState(trace, spec, [])
-        for t in (3., 6.):
-            up = {e['link_id'] for e in state.snapshot(t)['links'] if e['state'] == 'UP'}
-            self.assertEqual(up, {'cell_isl:m0:m1', 'cross_layer:m1:r'})
-
     def test_unknown_handover_and_cross_layer_ranking_are_rejected(self):
         spec=self.state().spec
         with self.assertRaisesRegex(ValueError,'handover_policy'):

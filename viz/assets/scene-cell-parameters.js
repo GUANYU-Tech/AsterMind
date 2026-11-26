@@ -131,6 +131,27 @@ export function layoutFromExperiment(experiment, cell, members) {
   };
 }
 
+function kvPoolInputs(cell) {
+  const {tp,pp,dp,ep}=cell.parallel;
+  return [cell.model,cell.hardware_id,tp,pp,dp,ep,cell.native_expert_parallel,
+    cell.max_model_len,cell.max_batched_tokens,cell.max_requests,cell.kv_block_size_tokens,
+    cell.enable_chunked_prefill];
+}
+
+export function preserveFixedKvPools(previous, rebuilt) {
+  if(previous.compute_mode!=='fast_mode'||rebuilt.compute_mode!=='fast_mode'||
+     previous.physical_dataset!==rebuilt.physical_dataset)return;
+  const byId=new Map(previous.cells.filter(cell=>cell.fast_kv_pool_blocks!=null).map(cell=>[cell.id,cell]));
+  for(const cell of rebuilt.cells){
+    const old=byId.get(cell.id);
+    if(!old)continue;
+    const inputs=kvPoolInputs(old);
+    if(kvPoolInputs(cell).every((value,index)=>value===inputs[index])){
+      cell.fast_kv_pool_blocks=old.fast_kv_pool_blocks;
+    }
+  }
+}
+
 export function preserveOtherCellTopologies(previous, rebuilt, changedCells) {
  if(previous.physical_dataset!==rebuilt.physical_dataset)return rebuilt;
  const retained = new Set(previous.cells.filter(cell=>!changedCells.has(cell.id)).map(cell=>cell.id));

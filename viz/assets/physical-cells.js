@@ -150,7 +150,7 @@ export function physicalPayload(network, mode, epStrategy, capabilities, linkBan
       for (const layout of [settings.template,...Object.values(settings.cells)]) {
         if (!layout?.configuration) continue;
         delete layout.configuration.fast_link_contention;
-        if (layout.configuration.compute_mode===mode) continue;
+        if (!capabilities||layout.configuration.compute_mode===mode) continue;
         const members=layout.configuration.hardware.satellite_ids;
         const draft=sceneCellDraft(capabilities,members,mode,layout);
         Object.assign(layout,sceneCellLayout(draft,capabilities,members),{configuration:draft});

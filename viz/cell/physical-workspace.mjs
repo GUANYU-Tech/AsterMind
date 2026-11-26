@@ -8,7 +8,7 @@ import {configurationErrors} from './config-validation.mjs';
 import {renderCellConfigProfile} from '../assets/config-profile.js';
 import {mappingDraft} from './deployment-mapping.mjs';
 import {modelOptions} from './compute-config.mjs';
-import {synchronizeResources,clearDependentDrafts} from './resource-sync.mjs';
+import {synchronizeManualResources as synchronizeResources,clearDependentDrafts} from './resource-sync.mjs';
 import {AsterMindScene,sceneState,syncSceneConfiguration} from './scene.js?v=profile-1';
 import {sceneCellDraft,sceneCellLayout} from '../assets/scene-cell-parameters.js';
 import {memberIds} from '../assets/physical-cells.js';

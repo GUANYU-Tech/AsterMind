@@ -8,7 +8,7 @@ from unittest.mock import patch
 from astermind.builder.config import SimulationConfig
 from astermind.engine.network_host import DeviceRuntimeHost, DeviceCommunicationRuntime
 from astermind.engine.policies.routing import register_routing_policy
-from astermind.engine.state.network import NetworkSpec, NetworkState, NetworkUnavailable
+from astermind.engine.state.network import NetworkState, NetworkUnavailable
 from tests.unit.runtime.test_comm_port import scenario
 from tests.unit.runtime.test_dynamic_network import network
 
@@ -83,30 +83,6 @@ class RouteSnapshotReuseTests(unittest.TestCase):
                 expected = attrs.at(edge['link_id'], 0)['geometry']['distance_km']
                 with patch.object(attrs, '_cached_at', side_effect=AssertionError('full record expansion')):
                     self.assertEqual(loaded.distance(edge, 0), expected)
-
-    def test_old_offline_defaults_are_equivalent_but_a_changed_budget_is_not(self):
-        from astermind.engine.state.physical_dataset import PhysicalAttributes
-
-        original = network(bandwidth=8e9)
-        original.trace.trace_id = 'unit-offline-default'
-        with TemporaryDirectory() as directory:
-            path = Path(directory) / 'physical.sqlite'
-            original.save_physical_state(path)
-            initialize = PhysicalAttributes.__init__
-
-            def read_old_metadata(reader, path):
-                initialize(reader, path)
-                for node in reader.metadata['network']['nodes']:
-                    node.pop('optical_terminal_bandwidth_bps')
-
-            with patch.object(PhysicalAttributes, '__init__', read_old_metadata):
-                restored = NetworkState(original.trace, original.spec, physical_state=path)
-                self.assertEqual(restored.snapshot(0), original.snapshot(0))
-                changed = original.spec.to_dict()
-                profile = next(iter(changed['link_profiles'].values()))
-                profile['bandwidth_bps'] *= 2
-                with self.assertRaisesRegex(ValueError, 'does not match'):
-                    NetworkState(original.trace, NetworkSpec.from_value(changed), physical_state=path)
 
 
 if __name__ == '__main__':

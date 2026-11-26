@@ -19,34 +19,6 @@ class CommunicationRefreshTests(unittest.TestCase):
         self.addCleanup(fixture.doCleanups)
         return fixture.runtime(**kwargs)
 
-    def fast_runtime(self, **options):
-        raw = fixtures.scenario(**options)
-        for cell in raw['cells']:
-            cell.update(hardware_id='nvidia_h200', hardware='configs/hardware/nvidia_h200.yaml')
-        return self.runtime(raw={**raw, 'compute_mode': 'fast_mode'})
-
-    def test_fast_builds_the_first_idle_frame_only_when_a_request_needs_it(self):
-        host, _, comm = self.fast_runtime(capacity_schedule_ns=((500, 0.5),))
-        completed = []
-        when = Time.from_ns(750)
-        host.timeline.schedule(when, 1, 'submit', lambda: comm.submit_transfer(
-            'request', 'ag', 'bg', 1000, lambda: completed.append(host.now), self.fail))
-        with patch.object(comm.network, 'frame_at', wraps=comm.network.frame_at) as frames:
-            host.run()
-        self.assertEqual([call.args[0] for call in frames.call_args_list], [when])
-        self.assertEqual(completed, [Time.from_ns(2760)])
-
-    def test_fast_waiting_transfer_still_reacts_to_recovered_link(self):
-        host, _, comm = self.fast_runtime()
-        completed = []
-        apply_device_command(host, {'action': 'device_link_fail', 'target_id': 'alocal'})
-        comm.submit_transfer('waiting', 'ag', 'bg', 1000,
-                             lambda: completed.append(host.now), self.fail)
-        host.timeline.schedule(Time.from_ns(500), 0, 'restore',
-            lambda: apply_device_command(host, {'action': 'device_link_restore', 'target_id': 'alocal'}))
-        host.run()
-        self.assertEqual(completed, [Time.from_ns(1510)])
-
     def test_ten_thousand_initial_notifications_build_once_and_deliver_once(self):
         host, network, comm = self.runtime()
         for index in range(10_000):

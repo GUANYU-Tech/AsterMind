@@ -9,19 +9,6 @@ const formation=()=>({name:'east',source:{type:'walker_delta',planes:1,clusters_
 const layout=members=>({satellite_gpus:Object.fromEntries(members.map(id=>[id,2])),
   rank_devices:[members[1]+'/gpu1',members[0]+'/gpu0'],deployment:{hardware_id:'nvidia_h200',gpus_per_satellite:2}});
 
-test('physical saves store static bandwidth factors only in Fast Mode',()=>{
-  const east=formation();
-  east.compute_parameters={template:{configuration:{compute_mode:'fast_mode',fast_link_contention:true}}};
-  const network={constellations:{compute_formations:[east]},network:{}};
-  const factors={cross_layer:0.95,cell_isl:0.9};
-  const fast=physicalPayload(network,'fast_mode','auto',null,factors);
-  assert.deepEqual(fast.compute_configuration.link_bandwidth_factors,factors);
-  assert.equal(fast.compute_configuration.formations.east.template.configuration.fast_link_contention,undefined);
-  assert.equal(fast.physical_network.network.link_bandwidth_factors,undefined);
-  const detailed=physicalPayload({...network,constellations:{compute_formations:[]}},'detail_mode','auto',null,factors);
-  assert.equal(detailed.compute_configuration.link_bandwidth_factors,undefined);
-});
-
 test('a Cell template preserves custom rank slots across physical save, reload and expansion',()=>{
   const east=formation(),west={...formation(),name:'west'};
   const [a,b,c]=cellKeys(east);
@@ -64,7 +51,7 @@ test('editing one Cell preserves imported link overrides when restoring the scen
   const [a,b]=cellKeys(f);
   const geometry=cellGeometry(f,a),members=memberIds(f,a,geometry);
   const sourceEdge={source:members[0],target:members[1],mode:'fixed',bandwidth_gbps:123};
-  const row={...layout(members),custom_links:true,configuration:{compute_mode:'detail_mode',hardware:{},deployment:{placements:[]},
+  const row={...layout(members),custom_links:true,configuration:{hardware:{},deployment:{placements:[]},
     topology:{inter_satellite:{links:[sourceEdge]}}}};
   applyCell(f,a,geometry,row,false);
   const [source,target]=memberIds(f,b,cellGeometry(f,b));

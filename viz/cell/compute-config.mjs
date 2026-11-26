@@ -14,6 +14,14 @@ export function modelOptions(config, capabilities) {
     : Object.keys(capabilities.models_by_hardware?.[hardware] || {});
 }
 
+export function detailChoices(config, capabilities) {
+  if (config.deployment.mode === 'pd_disagg') {
+    return config.hardware.default_hardware_id === 'nvidia_h200' && config.model === 'kimi-k2.6'
+      ? [{tp:8, pp:1, expert_parallel:true}] : [];
+  }
+  return capabilities.models_by_hardware?.[config.hardware.default_hardware_id]?.[config.model];
+}
+
 export function normalizeComputeSettings(config, capabilities) {
   if (config.runtime) delete config.runtime.timeout_seconds;
   if (['midlayer', 'roofline'].includes(config.compute_mode)) {

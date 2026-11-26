@@ -49,7 +49,9 @@ experiment under `viz/.runtime/`. To register just the inputs, run
    eight H200 GPUs per satellite, TP8 within a satellite, and PP4 across
    four satellites per Cell. Its compute and HBM efficiency settings are
    70% and 96.25%, the batch token budget is 16,384, and each Cell has
-   193,904 KV blocks of 16 tokens.
+   193,904 KV blocks of 16 tokens. Editing the workload or rebuilding the
+   same deployment keeps this capacity. New Fast deployments derive capacity
+   from the GPU memory budget.
 3. Keep the supplied **Nearest** setting for the initial run. Default
    route selection uses the physical data and deployed ranks.
 4. Click **Start experiment and view results** (「开始实验并查看结果」).
