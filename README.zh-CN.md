@@ -45,8 +45,7 @@ Apple 芯片版安装包准备中，目标支持 macOS 13 或更高版本。
 
 ### Linux 源码安装
 
-**环境依赖：** x86-64 Linux，glibc 版本至少为 2.39，并提供 Git、C/C++ 工具链和 `libnuma.so.1`。需要 Python 3.12。样例在 CPU 上运行，无需模型权重或 GPU。
-
+**环境依赖：** x86-64 Linux，glibc 版本至少为 2.39，并提供 Git、C/C++ 工具链和 `libnuma.so.1`。需要 Python 3.12。
 ```bash
 git clone https://github.com/GUANYU-Tech/AsterMind.git
 cd AsterMind

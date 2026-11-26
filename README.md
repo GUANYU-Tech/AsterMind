@@ -45,7 +45,7 @@ The Apple Silicon installer is in preparation, with macOS 13 or later as the com
 
 ### Linux source installation
 
-**Prerequisites.** x86-64 Linux with glibc 2.39 or newer, Git, a C/C++ toolchain, and `libnuma.so.1`. Python 3.12 is required. The examples run on the CPU without model weights or a GPU.
+**Prerequisites.** x86-64 Linux with glibc 2.39 or newer, Git, a C/C++ toolchain, and `libnuma.so.1`. Python 3.12 is required.
 
 ```bash
 git clone https://github.com/GUANYU-Tech/AsterMind.git
@@ -79,12 +79,12 @@ Then open the AsterMind frontend [http://localhost:8766/](http://localhost:8766/
 
 In **Detail Mode**, this example simulates distributed inference for **DeepSeek-V4-Pro** using a **TP8 × PP4** parallel configuration across four satellites, each equipped with eight NVIDIA H200 GPUs.
 
-1. Enter **Compute Formation Simulation**, select **New Task**.
-2. In **Constellation Resources**, select **NVIDIA H200**, **four satellites**, and **eight GPUs per satellite**. Set the formation to **Ring** with **1 km** spacing.
-3. In **Communication Network**, use one **eight-GPU SU group per satellite** and set the inter-satellite links to **Fixed-Bandwidth Mode** at **400 Gbps**.
-4. In **Model and Workload**, select **deepseek-v4-pro** and **Detail Mode**. Set two synthetic requests at **16 requests/s**, each with **16 input tokens** and **2 output tokens**.
-5. In **Parallel Deployment**, select **Colocated** and **Manual Configuration**. Set **TP 8, PP 4, DP 1** with EP off. Map each pipeline stage to a separate satellite.
-6. In **Scheduling and Execution**, set **Maximum Model Context Length** to **1152 tokens** and turn off **Chunked Prefill**. Select **Submit Task**. Open **Simulation Results** to view both requests and their compute and communication timelines.
+1. Enter **[Compute Formation Simulation]**, select **New Task**.
+2. In **[Constellation Resources]**, select **NVIDIA H200**, **four satellites**, and **eight GPUs per satellite**. Set the formation to **Ring** with **1 km** spacing.
+3. In **[Communication Network]**, use one **eight-GPU SU group per satellite** and set the inter-satellite links to **Fixed-Bandwidth Mode** at **400 Gbps**.
+4. In **[Model and Workload]**, select **deepseek-v4-pro** and **Detail Mode**. Set two synthetic requests at **16 requests/s**, each with **16 input tokens** and **2 output tokens**.
+5. In **[Parallel Deployment]**, select **Colocated** and **Manual Configuration**. Set **TP 8, PP 4, DP 1** with EP off. Map each pipeline stage to a separate satellite.
+6. In **[Scheduling and Execution]**, set **Maximum Model Context Length** to **1152 tokens** and turn off **Chunked Prefill**. Select **Submit Task**. Open **Simulation Results** to view both requests and their compute and communication timelines.
 
 ### L3 · Constellation Simulation Example
 
