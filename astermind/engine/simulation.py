@@ -24,6 +24,7 @@ class Simulation:
         network_factory=None,
         physical_output_dir=None,
         startup_progress=None,
+        on_batch_complete=None,
         cell_init_workers=None,
     ):
         self.cells = {}
@@ -36,6 +37,7 @@ class Simulation:
                 network_factory=network_factory,
                 physical_output_dir=physical_output_dir,
                 startup_progress=startup_progress,
+                on_batch_complete=on_batch_complete,
                 cell_init_workers=cell_init_workers,
             )
         except BaseException:
@@ -51,6 +53,7 @@ class Simulation:
         network_factory=None,
         physical_output_dir=None,
         startup_progress=None,
+        on_batch_complete=None,
         cell_init_workers=None,
     ):
         from astermind.engine.startup_resources import startup_policy
@@ -110,7 +113,8 @@ class Simulation:
         self.executors = {
             cell.id: executor_type(cell.id, self.loop, self.network.communication_policy,
                 tuple(p for p in placements if p.cell_id == cell.id),
-                on_batch_boundary=self.executor.notify_batch_boundary)
+                on_batch_boundary=self.executor.notify_batch_boundary,
+                on_batch_complete=on_batch_complete)
             for cell in config.cells
         }
         from astermind.engine.record_store import CompressedRecords

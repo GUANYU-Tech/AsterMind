@@ -297,11 +297,26 @@ async function watch(id, open = false) {
   const version = ++pollVersion; jobId = id; remember(id);
   if (open) stage("analysis");
   $("#job-status").hidden = false;
+  $("#job-batches").hidden = true;
   while (version === pollVersion) {
     try {
       const status = await api(`/api/simulations/${id}`);
       if (version !== pollVersion) return;
-      $("#job-progress").textContent = `${statuses[status.status] || status.status} ${phases[status.phase] || status.phase || ""} ${status.progress ?? 0}%`;
+      const hasBatchProgress = Number.isInteger(status.batches_completed);
+      const stageProgress = status.phase === "serving" && hasBatchProgress ? "" : ` ${status.progress ?? 0}%`;
+      $("#job-progress").textContent = `${statuses[status.status] || status.status} ${phases[status.phase] || status.phase || ""}${stageProgress}`;
+      const batches = $("#job-batches");
+      batches.hidden = !hasBatchProgress;
+      if (hasBatchProgress) {
+        const count = status.batches_completed;
+        const label = status.last_batch_id
+          ? `已完成 ${count} 个批次 · 最近批次 ${status.last_batch_id}`
+          : `已完成 ${count} 个批次`;
+        if (batches.dataset.progressLabel !== label) {
+          batches.dataset.progressLabel = label;
+          batches.textContent = label;
+        }
+      }
       if (status.status === "success") {
         const result = await api(`/api/simulations/${id}/result`);
         if (version !== pollVersion) return;
