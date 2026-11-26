@@ -10,6 +10,14 @@ def main():
     from cell_jobs import folder,status,write,project
     job=sys.argv[1]; output=folder(job)
     def update(**kw): write(output/'status.json',{**status(job),**kw})
+
+    batches_completed = 0
+
+    def batch_completed(record):
+        nonlocal batches_completed
+        batches_completed += 1
+        update(batches_completed=batches_completed, last_batch_id=record['step_id'])
+
     try:
         update(status='running',phase='preparing_environment',progress=2,started_at=datetime.now(timezone.utc).isoformat())
         from runtime_environment import activate
@@ -25,9 +33,13 @@ def main():
             os.environ.setdefault('ORBITServe_V4_EXPERIMENTAL_MEMORY_PROJECTION',
                                   str(DEEPSEEK_V4_H200_MEMORY_POLICY))
         update(status='running',phase='configuration',progress=5,started_at=datetime.now(timezone.utc).isoformat())
-        with Simulation(config,physical_output_dir=output/'physical',startup_progress=lambda stage:
-                        update(phase=stage['phase'],progress=20,startup_stage=stage)) as simulation:
-            update(phase='serving',progress=40)
+        with Simulation(
+            config,
+            physical_output_dir=output/'physical',
+            startup_progress=lambda stage: update(phase=stage['phase'],progress=20,startup_stage=stage),
+            on_batch_complete=batch_completed,
+        ) as simulation:
+            update(phase='serving',progress=40,batches_completed=0)
             result=simulation.run()
         result=json.loads(json.dumps(result,default=json_default))
         write(output/'native_result.json',result)

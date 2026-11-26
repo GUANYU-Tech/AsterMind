@@ -28,7 +28,7 @@ AsterMind simulates how satellites serve inference requests from users on Earth.
 **Prerequisites.** x86-64 Linux with glibc 2.39 or newer, Git, a C/C++ toolchain, and `libnuma.so.1`. Python 3.12 is required. The examples run on the CPU without model weights or a GPU.
 
 ```bash
-git clone --branch version/AsterMind-V1.0 https://github.com/GUANYU-Tech/OrbitServe.git AsterMind
+git clone https://github.com/GUANYU-Tech/AsterMind.git
 cd AsterMind
 
 bash scripts/install-ubuntu-deps.sh

@@ -28,7 +28,7 @@ AsterMind 模拟低轨卫星如何为地面用户提供大语言模型推理服�
 **运行前提。** x86-64 Linux，glibc 版本至少为 2.39，并提供 Git、C/C++ 工具链和 `libnuma.so.1`。需要 Python 3.12。样例在 CPU 上运行，无需模型权重或 GPU。
 
 ```bash
-git clone --branch version/AsterMind-V1.0 https://github.com/GUANYU-Tech/OrbitServe.git AsterMind
+git clone https://github.com/GUANYU-Tech/AsterMind.git
 cd AsterMind
 
 bash scripts/install-ubuntu-deps.sh
