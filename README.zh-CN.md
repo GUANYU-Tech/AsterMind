@@ -74,6 +74,15 @@ bash scripts/run.sh
 
 打开本地仿真前端界面 [http://localhost:8766/](http://localhost:8766/)。
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/astermind-frontend-cn.jpg">
+    <img src="assets/astermind-frontend-cn.jpg" alt="AsterMind">
+  </picture>
+</p>
+<h1 align="center"></h1>
+
+
 ### 计算编队仿真
 
 本例在 **Detail Mode** 下，采用 **TP8 × PP4** 并行配制模拟 **DeepSeek-V4-Pro** 的分布式推理过程，仿真场景中的四颗卫星各配八张 NVIDIA H200 GPU。

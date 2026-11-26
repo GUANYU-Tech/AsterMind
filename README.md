@@ -75,6 +75,14 @@ bash scripts/run.sh
 
 Then open the AsterMind frontend [http://localhost:8766/](http://localhost:8766/en/).
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/astermind-frontend-en.jpg">
+    <img src="assets/astermind-frontend-en.jpg" alt="AsterMind">
+  </picture>
+</p>
+<h1 align="center"></h1>
+
 ### Compute Formation Simulation
 
 In **Detail Mode**, this example simulates distributed inference for **DeepSeek-V4-Pro** using a **TP8 × PP4** parallel configuration across four satellites, each equipped with eight NVIDIA H200 GPUs.
