@@ -30,6 +30,7 @@ document.addEventListener('keydown', event => {
 });
 const journey = document.querySelector('.journey');
 const tabs = [...journey.querySelectorAll('[data-step]')];
+const nodes = [...journey.querySelectorAll('[data-node]')];
 const panel = document.querySelector('#journey-panel');
 const playButton = document.querySelector('#play-stages');
 const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
@@ -58,8 +59,9 @@ function selectStage(index) {
   ['#stage-kicker', '#stage-title', '#stage-body'].forEach((selector, i) => {
     panel.querySelector(selector).textContent = copy.stages[index][i];
   });
-  journey.querySelectorAll('[data-node]').forEach(node => {
-    node.classList.toggle('active', Number(node.dataset.node) === index);
+  nodes.forEach((node, i) => {
+    node.classList.toggle('active', i === index);
+    node.setAttribute('aria-pressed', String(i === index));
   });
   progress = tabs[index].querySelector('.stage-track i').animate(
     [{ transform: 'scaleX(0)' }, { transform: 'scaleX(1)' }],
@@ -70,10 +72,12 @@ function selectStage(index) {
 }
 
 tabs.forEach((tab, index) => {
-  tab.addEventListener('click', () => {
+  function chooseStage() {
     playing = false;
     selectStage(index);
-  });
+  }
+  nodes[index].addEventListener('click', chooseStage);
+  tab.addEventListener('click', chooseStage);
   tab.addEventListener('keydown', event => {
     let next;
     if (event.key === 'ArrowRight') next = (index + 1) % tabs.length;
