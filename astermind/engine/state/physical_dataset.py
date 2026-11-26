@@ -54,6 +54,24 @@ def physical_spec(spec):
     return physical_network_settings(spec.to_dict())
 
 
+def validate_stored_link_budgets(network, edges=()):
+    profiles = network.get("link_profiles", {})
+    if any(profile.get("capacity_model") == "islsim"
+           and "terminal_cap_gbps" in profile.get("islsim_config", {}).get("rx", {})
+           for profile in profiles.values()):
+        raise ValueError("物理数据包含旧版光终端限速，请使用链路容量重新生成物理数据")
+    caps = {node["node_id"]: node["optical_terminal_bandwidth_bps"]
+            for node in network.get("nodes", ()) if node.get("optical_terminal_bandwidth_bps") is not None}
+    if caps and any(
+        edge["kind"] != "sgl" and any(
+            endpoint in caps and caps[endpoint] < profiles[edge.get("profile_id", edge["kind"])]["bandwidth_bps"]
+            for endpoint in (edge["endpoint_a"], edge["endpoint_b"])
+        )
+        for edge in edges
+    ):
+        raise ValueError("物理数据中的链路可能受旧版光终端限速影响，请重新生成物理数据")
+
+
 def _edge_blocks(network, edge, *, encoded=True):
     from astermind.engine.setup.radio_capacity import directional_profile
 
@@ -248,11 +266,14 @@ class PhysicalAttributes:
     def __init__(self, path, *, _metadata=None):
         self.path = Path(path).resolve()
         self._read_connection = None
+        self.link_store = None
         # Connections are short-lived so forks and concurrent preview requests
         # never share thread-affine handles or leak descriptors.
         with closing(self.connect()) as db:
             self.metadata = (_metadata if _metadata is not None else json.loads(
                 db.execute("SELECT value FROM metadata").fetchone()[0]))
+            if _metadata is None and (self.metadata.get("indexed_timeline") or self.metadata.get("chunked_fields")):
+                self._load_timeline(db)
             self.block_times = {}
             # Scan small immutable datasets once as compressed bytes. Avoid
             # repeated filesystem connection/lock roundtrips in route searches.
@@ -279,6 +300,40 @@ class PhysicalAttributes:
         read.cache_info = self._cached_at.cache_info
         read.cache_clear = self._cached_at.cache_clear
         self.at = read
+
+    def _load_timeline(self, db):
+        from .link_state_store import INDEX_DIRECTORY, WindowedLinkStates
+
+        index = self.path.parent / INDEX_DIRECTORY
+        fields = self.metadata.pop("chunked_fields", ())
+        if self.metadata.get("indexed_timeline"):
+            if not index.is_dir():
+                raise ValueError("physical dataset is missing its offline link-state index")
+            frames = self.metadata["frames"]
+            self.link_store = WindowedLinkStates(index, self.path, self.metadata["trace_id"],
+                                                 frames[0]["time_s"], frames[-1]["end_s"])
+            self.metadata["link_frames"] = self.link_store.frames
+        for field in fields:
+            if field == "link_frames" and self.link_store is not None:
+                continue
+            if field not in {"link_frames", "events"}:
+                raise ValueError(f"unsupported physical metadata field {field!r}")
+            data = {} if field == "link_frames" else []
+            for packed, in db.execute(
+                "SELECT value FROM metadata_parts WHERE field=? ORDER BY sequence", (field,)
+            ):
+                values = json.loads(zlib.decompress(packed))
+                if field == "link_frames":
+                    data.update(values)
+                else:
+                    data.extend(values)
+            self.metadata[field] = data
+
+    def close(self):
+        self.close_read_session()
+        if self.link_store is not None:
+            self.link_store.close()
+            self.link_store = None
 
     def connect(self, *, immutable=False):
         options = '?mode=ro&immutable=1' if immutable else '?mode=ro'

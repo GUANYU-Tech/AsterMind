@@ -42,10 +42,10 @@ export function orbitDisplay(config, preview) {
   return selected.map(({ecef_position_km:[x,y,z]}) => [x,z,-y].map(v=>v*EARTH_RADIUS/EARTH_RADIUS_KM));
 }
 
-export function focusedViewDistance(points, aspect, fov = 42, minimum = 2.4) {
+export function focusedViewDistance(points, aspect, fov = 42) {
   const vertical = Math.tan(fov * Math.PI / 360);
   const horizontal = vertical * Math.max(.1, aspect);
-  return Math.max(minimum, ...points.map(([x,y,z]) =>
+  return Math.max(2.4, ...points.map(([x,y,z]) =>
     z + Math.max((Math.abs(x)+.18)/horizontal, (Math.abs(y)+.18)/vertical))) * 1.08;
 }
 

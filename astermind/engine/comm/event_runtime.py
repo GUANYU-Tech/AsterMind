@@ -5,6 +5,7 @@ intra-only traffic retains surrogate timing. GlobalTimeline owns all events.
 """
 from dataclasses import asdict,dataclass
 from math import isfinite
+from types import SimpleNamespace
 from astermind.engine.clock import Time
 from astermind.engine.timeline import nanoseconds
 from time import perf_counter
@@ -35,9 +36,11 @@ class TickTrace(list):
 
 
 class RuntimeCommunication(CommunicationRouting):
-    def __init__(self,network,loop,policy,allocator=None):
+    def __init__(self,network,loop,policy,allocator=None,*,shared_bandwidth=True):
         self.network,self.loop,self.policy=network,loop,policy
-        self.allocator=allocator or FlowAllocator()
+        self.shared_bandwidth = shared_bandwidth
+        self.allocator = allocator or (FlowAllocator() if shared_bandwidth else
+                                      SimpleNamespace(provenance='independent_path_quote'))
         self.tasks={};self.flows={};self.active={};self.capacities={};self.rates={}
         self._trace_capacity_source=None;self._trace_capacities=None
         self.last_time=self.loop.now_s;self.last_ns=self.now_ns;self.serial=0;self.generation=0;self.trace=TickTrace(loop)
@@ -51,6 +54,9 @@ class RuntimeCommunication(CommunicationRouting):
             cell_estimate_context_calls=0,cell_estimate_context_wall_s=0.,
             network_notifications=0,coalesced_network_notifications=0,network_frame_builds=0,
             network_frame_wall_s=0.)
+        if not shared_bandwidth:
+            self.stats['idle_network_notifications'] = 0
+            self.fast_lane_templates = {}
 
     @property
     def now_ns(self):return self.loop.now_s.ticks/10**9
@@ -131,9 +137,16 @@ class RuntimeCommunication(CommunicationRouting):
         self.generation+=1;generation=self.generation
         demands={i:dict(f['budget']['demand']) for i,f in self.active.items()}
         capacities=dict(self.capacities)
-        started=perf_counter();self.rates=self.allocator.rates(demands,capacities)
-        self.stats['allocation_wall_s']+=perf_counter()-started;self.stats['rate_allocations']+=1
-        if self.policy.trace_service:
+        if self.shared_bandwidth:
+            started=perf_counter();self.rates=self.allocator.rates(demands,capacities)
+            self.stats['allocation_wall_s']+=perf_counter()-started;self.stats['rate_allocations']+=1
+        else:
+            # Use the resource limit of each path in isolation. The original
+            # transfer lifecycle still handles outages and records paths.
+            self.rates = {identity: min(capacities[key] / coefficient
+                                       for key, coefficient in demand.items())
+                          for identity, demand in demands.items()}
+        if self.shared_bandwidth and self.policy.trace_service:
             # Physical refresh replaces the capacity mapping. Between those
             # boundaries only flow rates change; share the immutable evidence
             # table instead of rebuilding every pool's label per allocation.
@@ -229,11 +242,21 @@ class RuntimeCommunication(CommunicationRouting):
         if observed is not None and observed==self._observed_network_state:
             self.stats['coalesced_network_notifications']+=1
             return
+        host = getattr(self.network, 'host', None)
+        cache = getattr(host.net, '_path_route_cache', None) if host is not None else None
+        if not self.shared_bandwidth and observed is not None and not (self.tasks or self.flows):
+            # Keep path invalidation at every observed transition. Materialize
+            # the Comm resource view only when a later quote or transfer uses it.
+            if cache is not None and cache.entries:
+                cache.synchronize(host.net, host.now)
+            if observed != (self._frame_ticks, self._frame_version):
+                self.routes = None
+            self._observed_network_state = observed
+            self.stats['idle_network_notifications'] += 1
+            return
         self._settle();routes=self._refresh(force=True)
         # Updating path validity never rewrites an in-flight attempt. Only
         # actual lost resources below trigger retry; capacity changes rebalance.
-        host = getattr(self.network, 'host', None)
-        cache = getattr(host.net, '_path_route_cache', None) if host is not None else None
         if cache is not None:
             cache.synchronize(host.net, host.now)
         for f in tuple(self.flows.values()):

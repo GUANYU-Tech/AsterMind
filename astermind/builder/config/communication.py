@@ -6,6 +6,7 @@ from .intra_topology import IntraHierarchy
 from .intra_profile import IntraProfile
 
 Scope = Literal['single_su', 'intra_cross_su', 'inter_satellite']
+PhysicalLinkKind = Literal['cross_layer', 'communication_isl', 'cell_isl', 'inter_cell', 'sgl']
 LAYERED_COLLECTIVES = frozenset(('all_reduce', 'all_gather', 'all_gatherv',
                                  'reduce_scatter', 'reduce_scatterv'))
 LAYER_ALGORITHMS = frozenset(('ring', 'tree', 'fullmesh', 'fc2', 'mesh', 'direct', 'pairwise'))
@@ -89,6 +90,7 @@ class CommPolicy(BaseModel):
     retry_limit: int=Field(default=8,ge=0)
     task_timeout_s: float | None=Field(default=None,gt=0,allow_inf_nan=False)
     trace_service: bool=True
+    link_bandwidth_factors: dict[PhysicalLinkKind, Annotated[float, Field(gt=0, le=1)]] = Field(default_factory=dict)
     resource_profiles: dict[str, dict]=Field(default_factory=dict)
 
     @field_validator('ep_strategy', mode='before')

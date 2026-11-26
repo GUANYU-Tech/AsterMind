@@ -33,8 +33,12 @@ class NetworkNodeSpec:
     # Concurrent ground-node associations, independent of aggregate RF rates.
     max_user_links: int | None = None
     max_gateway_links: int | None = None
+    external_isl_terminals: int | None = None
 
     def __post_init__(self) -> None:
+        if self.external_isl_terminals is not None and (
+                self.role != 'compute' or type(self.external_isl_terminals) is not int or self.external_isl_terminals < 0):
+            raise ValueError('external_isl_terminals requires a nonnegative integer on a compute satellite')
         for key in ('max_user_links', 'max_gateway_links'):
             value = getattr(self, key)
             if value is not None and (type(value) is not int or value < 0):

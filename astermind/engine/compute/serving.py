@@ -67,6 +67,10 @@ class ServingScheduler:
         self.history_store = history_store if history_store is not None else SessionHistoryStore()
         self.storage_enabled = storage_enabled
         self._fast_session_storage = compact_session_storage
+        model = getattr(execution, "model", None)
+        self._native_only_prefix = compact_session_storage and (
+            getattr(model, "attention_layout", None) == "hybrid_kda_mla"
+            or getattr(model, "model_type", None) == "deepseek_v4")
         self._migration_pause = None
         self._blocked = False
         self.state_records = ClockLog()
@@ -93,7 +97,8 @@ class ServingScheduler:
                        on_failure=on_failure,
                        history_store=history_store, storage_enabled=storage_enabled,
                        batch_executor=batch_executor, hybrid_kv_capacity=hybrid_kv_capacity,
-                       compact_session_storage=storage_enabled and config.scheduler_adapter == "vllm_0_30")
+                       compact_session_storage=storage_enabled and (
+                           config.compute_mode == "fast_mode" or config.scheduler_adapter == "vllm_0_30"))
         except BaseException:
             backend.close()
             raise
@@ -112,6 +117,8 @@ class ServingScheduler:
             raise ValueError("request exceeds configured context")
         if request.prefix_hit_tokens and not self.storage_enabled:
             raise NotImplementedError("prefix reuse requires the storage adapter")
+        if request.prefix_hit_tokens and self._native_only_prefix:
+            raise ValueError("hybrid prefix hits are discovered by the native scheduler; omit the prefix hint")
         history = self.history_store.prepare(request)
         if history is not None:
             if not self.storage_enabled:

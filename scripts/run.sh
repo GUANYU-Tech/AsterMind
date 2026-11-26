@@ -19,4 +19,9 @@ if [[ ${1:-} == --deepseek-v4-example ]]; then
     export ORBITServe_V4_EXPERIMENTAL_MEMORY_PROJECTION="$repo/tests/L2/deepseek-v4-h200-memory.json"
     shift
 fi
+if [[ -f "$repo/examples/case-study-iii/inputs.tar.gz" ]]; then
+    if ! "$python" -B "$repo/scripts/install-case-study-iii.py" --ensure; then
+        echo 'Case Study III inputs could not be registered.' >&2
+    fi
+fi
 exec "$python" -B -m viz "$@"

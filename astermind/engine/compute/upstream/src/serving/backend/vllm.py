@@ -401,8 +401,11 @@ class VLLMSchedulerConfig:
     # Optional Cell policy for scheduler-only projections. None retains the adapter defaults.
     chunked_prefill_override: bool | None = None
     long_prefill_token_threshold: int = 0
+    kv_pool_blocks: int | None = None
 
     def __post_init__(self) -> None:
+        if self.kv_pool_blocks is not None and (type(self.kv_pool_blocks) is not int or self.kv_pool_blocks < 2):
+            raise ValueError("kv_pool_blocks must include the reserved block and at least one usable block")
         if self.chunked_prefill_override is not None and type(self.chunked_prefill_override) is not bool:
             raise TypeError("chunked_prefill_override must be boolean or None")
         if type(self.long_prefill_token_threshold) is not int or self.long_prefill_token_threshold < 0:
@@ -1585,6 +1588,8 @@ class VLLMBackend:
         source_root: Path, pool_name: str, max_batched_tokens: int, max_requests: int,
         kv_block_size_tokens: int, available_memory_by_rank: tuple[int, ...],
         supported_layouts_by_rank: tuple[tuple[str, ...], ...], role: str = "colocated",
+        session_storage: bool = False,
+        export_k3_session_state: bool = False,
     ) -> "VLLMBackend":
         """Start isolated 0.30 control-plane simulation on declared KV budgets.
 
@@ -1634,11 +1639,18 @@ class VLLMBackend:
                         python_executable=python_executable, source_root=source_root, pool_name=f"{pool_name}:dp{replica}",
                         max_batched_tokens=max_batched_tokens, max_requests=max_requests, kv_block_size_tokens=kv_block_size_tokens,
                         available_memory_by_rank=available_memory_by_rank[start:end],
-                        supported_layouts_by_rank=supported_layouts_by_rank[start:end], role=role)
+                        supported_layouts_by_rank=supported_layouts_by_rank[start:end], role=role,
+                        session_storage=session_storage, export_k3_session_state=session_storage and k3_target)
                     children.append(child)
                     if qwen_moe or scheduler_config.mtp_num_speculative_tokens or deepseek_target or k3_target or fp8_target:
                         _bind_vllm030_source_cache_projection(child, local_settings,
                             available_memory_by_rank[start:end], supported_layouts_by_rank[start:end])
+                if session_storage:
+                    from astermind.engine.compute.fast_mode.dp_session import SessionDataParallel
+
+                    control = SessionDataParallel(tuple(children), pool_name=pool_name,
+                                                  source_scheduler_config=scheduler_config)
+                    return cls(control.backend_config, control)
                 return cls.from_data_parallel_replicas(tuple(children), pool_name=pool_name,
                     source_scheduler_config=scheduler_config)
             except BaseException as primary_error:
@@ -1688,6 +1700,7 @@ class VLLMBackend:
             backend = cls.from_vllm030_byte_budget(projected, python_executable=python_executable,
                 source_root=source_root, pool_name=pool_name, max_batched_tokens=max_batched_tokens,
                 max_requests=max_requests, kv_block_size_tokens=kv_block_size_tokens, role=role,
+                session_storage=session_storage, export_k3_session_state=export_k3_session_state,
                 available_memory_by_rank=tuple(min(available_memory_by_rank[(stage * cp + c) * tp + lane] for c in range(cp))
                     for stage in range(pp) for lane in range(tp)), supported_layouts_by_rank=supported_layouts_by_rank[:tp * pp])
             try:
@@ -1700,13 +1713,16 @@ class VLLMBackend:
                     raise primary_error from cleanup_error
                 raise
             return backend
+        storage_options = {"session_storage": True} if session_storage else {}
+        if export_k3_session_state:
+            storage_options["export_k3_session_state"] = True
         control = VLLM030SchedulerProcess(
             scheduler_config, python_executable=python_executable, source_root=source_root,
             pool_name=pool_name, max_batched_tokens=max_batched_tokens,
             role=role,
             max_requests=max_requests, kv_block_size_tokens=kv_block_size_tokens,
             available_memory_by_rank=available_memory_by_rank,
-            supported_layouts_by_rank=supported_layouts_by_rank)
+            supported_layouts_by_rank=supported_layouts_by_rank, **storage_options)
         backend = cls(control.backend_config, control)
         try:
             from src.serving.workload.model_config import load_model_config

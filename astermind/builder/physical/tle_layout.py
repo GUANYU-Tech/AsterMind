@@ -5,13 +5,27 @@ multimodal shell/spacing recovery. An explicit catalog-to-slot map is preferred
 when orbital planes are irregular or their nominal positions are known.
 """
 import math
+from bisect import bisect_right
+from itertools import accumulate
 
 from astermind.builder.orbit import propagate_sgp4_teme
 
 
 def _phase(values, spacing):
-    candidates = [v % spacing for v in values]
-    return min(candidates, key=lambda p: (sum(min((v-p) % spacing, (p-v) % spacing) for v in values), p)) if candidates else 0.
+    # Circular L1 median among observed phases, using prefix sums over one turn.
+    phases = sorted(v % spacing for v in values)
+    if not phases:
+        return 0.
+    n = len(phases)
+    doubled = phases + [p + spacing for p in phases]
+    sums = list(accumulate(doubled, initial=0.))
+    def distance(i):
+        p = phases[i]
+        mid = bisect_right(doubled, p + spacing / 2, i, i + n)
+        near = sums[mid] - sums[i] - (mid - i) * p
+        far = (i + n - mid) * (p + spacing) - (sums[i+n] - sums[mid])
+        return near + far
+    return phases[min(range(n), key=distance)]
 
 
 def sparse_tle_layout(bundle, source, epoch):
@@ -58,7 +72,7 @@ def sparse_tle_layout(bundle, source, epoch):
         angles[sample.satellite_id] = (math.degrees(math.atan2(node[1], node[0])) % 360,
             math.degrees(math.atan2(sum(x*y for x,y in zip(r,b)), sum(x*y for x,y in zip(r,a)))) % 360)
     dp, ds = 360 / planes, 360 / slots
-    raan0 = source.get('raan0_deg', _phase([a for a,b in angles.values()], dp))
+    raan0 = source['raan0_deg'] if 'raan0_deg' in source else _phase([a for a,b in angles.values()], dp)
     if not math.isfinite(raan0):
         raise ValueError('raan0_deg must be finite')
     groups = {}
@@ -70,7 +84,7 @@ def sparse_tle_layout(bundle, source, epoch):
         if residual <= tolerance * dp:
             groups.setdefault(p, []).append((i, u))
     for p, members in groups.items():
-        phase = source.get('u0_deg', _phase([u for _,u in members], ds))
+        phase = source['u0_deg'] if 'u0_deg' in source else _phase([u for _,u in members], ds)
         if not math.isfinite(phase):
             raise ValueError('u0_deg must be finite')
         claimed = {}

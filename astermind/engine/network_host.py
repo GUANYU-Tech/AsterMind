@@ -24,7 +24,15 @@ class DeviceRuntimeHost(_EventEngine):
             physical=physical,
             bindings=config.physical_link_bindings,
             ground_owners=getattr(config, "ground_owners", ()),
+            prune_terminal_checks=getattr(config, "compute_mode", None) == "fast_mode",
+            indexed_fast_routes=getattr(config, "fast_orbital_route_frames", None) is not None,
         )
+        self.orbital_frames = getattr(config, "fast_orbital_route_frames", None)
+        self.fast_mode = getattr(config, "compute_mode", None) == "fast_mode"
+        if (device_frames := getattr(config, "fast_device_route_frames", None)) is not None:
+            from astermind.engine.state.prepared_route_frames import PreparedRouteFrames
+
+            network.prepared_route_frames = PreparedRouteFrames(device_frames, network)
         network.timeline_mode = timeline_mode
         spec = SimpleNamespace(
             network=network.spec,
@@ -68,7 +76,17 @@ class DeviceCommunicationRuntime(RuntimeCellNetwork):
         self.topology = topology
         from astermind.engine.comm.target_network import TargetNetworkFrames
         from astermind.engine.comm.event_runtime import RuntimeCommunication
-        self.communication_policy = RuntimeCommunication(TargetNetworkFrames(self), host.timeline, host.comm_policy)
+        frames = TargetNetworkFrames(self)
+        if host.orbital_frames is not None:
+            from astermind.engine.comm.legacy_orbital_routes import OrbitalRequestRouting
+            from astermind.engine.comm.static_runtime import StaticCommunication
+
+            self.communication_policy = StaticCommunication(frames, host.timeline, host.comm_policy)
+            self.communication_policy.request_routes = OrbitalRequestRouting(host, topology)
+        else:
+            self.communication_policy = RuntimeCommunication(
+                frames, host.timeline, host.comm_policy,
+                shared_bandwidth=not getattr(host, "fast_mode", False))
         host.communication_policy = self.communication_policy
         self.pending = {}
 
@@ -101,6 +119,13 @@ class DeviceCommunicationRuntime(RuntimeCellNetwork):
 
         def begin():
             if request.id not in self.pending:
+                return
+            if self.host.orbital_frames is not None:
+                self.communication_policy.submit_transfer(request.id, request.source, request.target,
+                    request.size_bytes, finish, finish,
+                    stage=request.operation if request.operation in
+                    ("request_input", "request_output", "request_relay") else None,
+                    correlation_id=request.correlation_id)
                 return
             self.communication_policy.submit_transfer(request.id, request.source, request.target,
                 request.size_bytes, finish, finish)
@@ -176,6 +201,10 @@ class DeviceCommunicationRuntime(RuntimeCellNetwork):
         from astermind.engine.comm.path_budget import isolated_path_ns, path_budget
 
         runtime = self.communication_policy
+        if self.host.orbital_frames is not None:
+            end, path, selected = runtime.request_routes.quote(source, target, size_bytes)
+            return dict(path=path, routing_distance_km=selected.distance_km,
+                        estimated_transfer_ns=nanoseconds(end - self.host.now))
         route = runtime.route(source, target, size_bytes)
         routes = runtime.routes
         started = perf_counter()
@@ -205,9 +234,11 @@ class DeviceCommunicationRuntime(RuntimeCellNetwork):
             "clock_s": self.host.now, "clock_ticks": str(self.host.now.ticks), "clock": CLOCK,
             "routing": {"policy": self.host.spec.routing_policy,
                         "refresh": "physical_samples_and_observed_topology_events",
-                        **self.host.net.path_route_cache_info()},
+                        **(self.host.net.physical if self.host.orbital_frames is not None
+                           else self.host.net).path_route_cache_info()},
             "transport": {"allocator": self.communication_policy.allocator.provenance,
-                          "semantics": "whole_path_external_resources",
+                          "semantics": ("static_per_hop" if self.host.orbital_frames is not None
+                                        else "whole_path_external_resources"),
                           "intra_competition": False},
             "flows": list(self.events),
             "device_topology": self.topology.view("devices"),

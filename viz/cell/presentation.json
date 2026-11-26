@@ -1453,7 +1453,7 @@
             "type": "integer"
           },
           "long_prefill_token_threshold": {
-            "title": "Long Prefill Token Threshold",
+            "title": "Prefill Chunk Limit",
             "type": "integer"
           }
         },

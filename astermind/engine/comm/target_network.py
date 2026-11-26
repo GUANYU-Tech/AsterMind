@@ -34,6 +34,9 @@ class TargetNetworkFrames:
         snapshot = net.path_route_snapshot(time_s)
         nodes = {}
         pools = dict(net.pool_capacities)
+        policy = getattr(host, "comm_policy", None)
+        factors = {kind: scale for kind, scale in getattr(policy, "link_bandwidth_factors", {}).items()
+                   if scale != 1.0}
         for identity, device in topology.devices.items():
             attrs = dict(device_kind=device.kind, capacity_gbps=device.capacity_gbps)
             hierarchy = getattr(topology, 'intra_hierarchies', {}).get(device.satellite)
@@ -42,7 +45,7 @@ class TargetNetworkFrames:
             nodes[identity] = SimpleNamespace(satellite_id=device.satellite,
                 role='ground' if device.satellite in net.ground_owners else 'compute',
                 attributes=attrs)
-            if device.kind == 'terminal' and device.capacity_gbps is not None:
+            if device.kind == 'terminal' and device.capacity_gbps is not None and not net.indexed_fast_routes:
                 pools[f'device:{identity}'] = device.capacity_gbps * 1e9
         established = []
         for edge in net.edges:
@@ -58,12 +61,16 @@ class TargetNetworkFrames:
                 if attrs['bandwidth_bps'] <= 0:
                     continue
                 src, dst = topology.node_device[source], topology.node_device[target]
+                factor = 1.
+                if factors and (link := metadata.get('physical_link_id')):
+                    kind = net.physical.edge_by_id[link]['kind']
+                    factor = factors.get(kind, 1.)
                 shared = list(net.pools_for_hop(source, target))
                 if topology.devices[src].satellite != topology.devices[dst].satellite:
                     shared += [f'device:{n}' for n in (src, dst) if f'device:{n}' in pools]
                 established.append(SimpleNamespace(link_id=edge['link_id'],
                     source_node_id=src, target_node_id=dst,
-                    bandwidth_bps=attrs['bandwidth_bps'],
+                    bandwidth_bps=attrs['bandwidth_bps'] * factor,
                     propagation_delay_s=state['propagation_delay_s'],
                     shared_capacity_pools=tuple(dict.fromkeys(shared)),
                     attributes={**attrs, 'bidirectional': False,

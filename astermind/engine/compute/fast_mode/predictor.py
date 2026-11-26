@@ -90,7 +90,7 @@ class Predictor:
     """Share identical layer formulas within each batch, preserving layer types."""
 
     def __init__(self, name, model, tp, dp, ep, ranges, *, hardware=Hardware(), force_sparse_glm=None,
-                 glm_dsa_bf16_timing=False):
+                 glm_dsa_bf16_timing=False, small_fp8_gemm=None, grouped_glm_ffn=False):
         self.name = name
         self.family = MODEL_FAMILIES.get(name)
         if self.family is None:
@@ -98,7 +98,11 @@ class Predictor:
         self.model = model.get("text_config", model)
         self.tp, self.dp, self.ep = tp, dp, ep
         self.hardware = hardware
+        self.small_fp8_gemm = small_fp8_gemm
         self.glm_dsa_bf16_timing = glm_dsa_bf16_timing
+        if grouped_glm_ffn and (name != "glm-5.2" or dp != 1 or ep != 1):
+            raise ValueError("grouped GLM FFN timing requires GLM-5.2 with DP1 and EP1")
+        self.grouped_glm_ffn = grouped_glm_ffn
         # Use the sparse-prefill timing policy for both pinned GLM models.
         self.force_sparse_glm = self.family == "glm" if force_sparse_glm is None else force_sparse_glm
         self.extra_layout = None
@@ -182,6 +186,19 @@ class Predictor:
                                         len(self.stage_kinds), self.hardware, n, total, dense, self.dp1_peak,
                                         split=split)
         m, h = self.model, self.hidden
+        if self.grouped_glm_ffn:
+            if dense:
+                estimate = self._linear(3 * h * m["intermediate_size"] // self.tp, n)
+                return (estimate, 0., 0.) if split else estimate
+            # The archived Case Study III prices shared and routed GEMMs as
+            # one Roofline group, using the expected distinct routed weights.
+            gate = self._linear(h * self.routed, n)
+            expert = 3 * h * m["moe_intermediate_size"] // self.tp
+            shared = m["n_shared_experts"]
+            active = expected_active(n, self.routed, self.top_k)
+            estimate = gate + self._linear(expert * (shared + active), n,
+                                           active=expert * (shared + self.top_k))
+            return (estimate, gate, 0.) if split else estimate
         model_sequence_sharded = self.dp > 1 and self.tp > 1 and len(self.stage_kinds) == 1
         if dense:
             local_n = ceil(n / self.tp) if model_sequence_sharded else n
@@ -213,7 +230,13 @@ class Predictor:
         local_n = ceil(n / self.tp) if sequence_sharded else n
         shared_tp = 1 if sequence_sharded else self.tp
         gate = self._linear(h * self.routed, local_n, dtype=BF16, operands=local_n * self.routed * 4)
-        shared_time = self._linear(3 * h * intermediate * shared // shared_tp, local_n)
+        if self.small_fp8_gemm is None:
+            shared_time = self._linear(3 * h * intermediate * shared // shared_tp, local_n)
+        else:
+            # The provider shards only complete FP8 scale blocks.
+            columns = ceil(intermediate * shared / (128 * shared_tp)) * 128
+            shared_time = (self.small_fp8_gemm(local_n, 2 * columns, h)
+                           + self.small_fp8_gemm(local_n, h, columns))
         latent = self._linear(2 * h * width, local_n, dtype=BF16) if width != h else 0.
         estimate = routed + gate + shared_time + latent
         return (estimate, gate + latent / 2, latent / 2) if split else estimate
@@ -251,8 +274,17 @@ class Predictor:
         m, h, heads = self.model, self.hidden, self.local_heads
         d, qrank, orank = m["head_dim"], m["q_lora_rank"], m["o_lora_rank"]
         groups = m["o_groups"] // self.tp
-        projection = self._linear(h * (qrank + d) + qrank * heads * d + heads * d * orank
-                                  + groups * orank * h, n, operands=4 * m["hc_mult"] * n * h * BF16)
+        mhc_bytes = 4 * m["hc_mult"] * n * h * BF16
+        use_small_gemm = self.small_fp8_gemm is not None
+        if use_small_gemm:
+            projection = (self.small_fp8_gemm(n, qrank + d, h)
+                          + self.small_fp8_gemm(n, heads * d, qrank)
+                          + self.small_fp8_gemm(n, orank, heads * d // groups, groups=groups, prequantized=True)
+                          + self.small_fp8_gemm(n, h, groups * orank)
+                          + self.hardware.roofline(0, mhc_bytes))
+        else:
+            projection = self._linear(h * (qrank + d) + qrank * heads * d + heads * d * orank
+                                      + groups * orank * h, n, operands=mhc_bytes)
         window = m["sliding_window"]
         prefill = tuple(r for r in rows if r.phase == "prefill")
         decode = tuple(r for r in rows if r.phase == "decode")
@@ -266,7 +298,8 @@ class Predictor:
                 index_time = self._linear(h * (ih + 4 * d_index), n, dtype=BF16)
                 if any((r.history + r.query) // interval > cap for r in rows):
                     scan = sum(compressed_pairs(r.query, r.history, interval) for r in rows)
-                    index_time += self._linear(qrank * ih * d_index, n)
+                    index_time += (self.small_fp8_gemm(n, ih * d_index, qrank) if use_small_gemm
+                                   else self._linear(qrank * ih * d_index, n))
                     index_time += self.hardware.roofline(2 * scan * ih * d_index, scan * 132, fp8=True)
         else:
             cap = None

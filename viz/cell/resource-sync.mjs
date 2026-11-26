@@ -9,6 +9,12 @@ export const automaticDeployment = config => state(config).automatic;
 export function setAutomaticDeployment(config, value) { state(config).automatic = !!value; }
 export const resourceSyncError = config => state(config).error;
 export function synchronizeResources(config, capabilities) {
+  return synchronize(config, capabilities, automaticDeployment(config));
+}
+export function synchronizeManualResources(config, capabilities) {
+  return synchronize(config, capabilities, false);
+}
+function synchronize(config, capabilities, automatic) {
   const hardware = config.hardware, ids = hardware.satellite_ids;
   const cards = hardware.accelerators_per_satellite;
   const gateway = config.topology?.intra_satellite;
@@ -16,11 +22,12 @@ export function synchronizeResources(config, capabilities) {
   hardware.accelerator_overrides = (hardware.accelerator_overrides || []).filter(row => ids.includes(row.satellite_id) && row.local_index >= 0 && row.local_index < cards);
   state(config).error = '';
   try {
-    if (automaticDeployment(config) && !fastMode(config)) matchParallelismToResources(config,{modelShape:capabilities.model_shapes?.[config.model], supportedChoices:detailChoices(config, capabilities)});
-    else config.deployment.placements = mappingDraft(config);
+    if (automatic && !fastMode(config)) {
+      matchParallelismToResources(config,{modelShape:capabilities.model_shapes?.[config.model],supportedChoices:detailChoices(config,capabilities)});
+    } else config.deployment.placements = mappingDraft(config);
     if (!fastMode(config) && capabilities.model_shapes?.[config.model]?.tie_word_embeddings
       && config.deployment.worker_pools.some(pool=>pool.parallelism.pipeline_parallel_size>1)) {
-      throw Error('当前模型共享输入与输出权重，执行器暂不支持 PP 大于 1。请启用自动适配资源，或将 PP 设为 1。');
+      throw Error('当前模型共享输入与输出权重，执行器暂不支持 PP 大于 1。请将 PP 设为 1。');
     }
   } catch (error) { state(config).error = error.message; }
   const {physical,required} = deploymentCapacity(config);

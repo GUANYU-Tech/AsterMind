@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 import re
 
-from astermind.builder.physical.tle_inspection import inspect_tle_constellation
+from astermind.builder.physical.tle_inspection import inspect_tle_catalog
 
 
 def sample_paths(root, identity):
@@ -31,6 +31,6 @@ def sample(root, identity):
 
 
 def inspect(text):
-    if not isinstance(text,str) or len(text.encode('utf-8'))>1_500_000:
-        raise ValueError('TLE text is missing or too large; select one shell')
-    return inspect_tle_constellation(text)
+    if not isinstance(text, str):
+        raise ValueError('TLE text is required')
+    return inspect_tle_catalog(text)

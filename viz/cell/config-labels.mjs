@@ -2,8 +2,9 @@ export const formationNames = {ring:"环形编队", chain:"链式编队", fully_
 
 export const labels = {
   su_group_sizes:"每星 SU 分组", ep_strategy:"专家并行通信", collective_policies:"集合通信规则", scope:"通信范围",
-  compute_mode:"计算模式", detail_prediction_method:"详细预测方法", memory_policy_file:"显存策略",
-  fast_glm_dsa_score:"GLM DSA 计时", expert_routing_seed:"专家路由种子", long_prefill_token_threshold:"长 Prefill 阈值 / token",
+  fast_link_contention:"链路带宽资源竞争", tensor_percent:"算力效率 / %", hbm_percent:"HBM 带宽效率 / %",
+  compute_mode:"计算模式", detail_prediction_method:"详细预测方法", memory_policy_file:"显存策略（可选，留空自动）",
+  fast_glm_dsa_score:"GLM DSA 计时", expert_routing_seed:"专家路由种子", long_prefill_token_threshold:"Prefill 分块上限 / token",
   model:"模型", source:"输入来源", synthetic:"合成请求", production:"生产 Trace", requests:"请求流",
   num_requests:"请求数量", request_rate:"每秒到达请求数", input_lengths:"输入 Token 长度", output_lengths:"输出 Token 长度",
   arrival_distribution:"到达分布", seed:"随机种子", arrival_rate_scale:"到达率缩放", closed_loop_client_count:"闭环客户端数",
@@ -24,7 +25,7 @@ export const labels = {
   link_margin_db:"链路余量 / dB", optical_efficiency:"光学效率", wdm_loss_db:"WDM 损耗 / dB", pointing_error_rad:"指向误差 / rad",
   routing_seed:"ECMP 固定种子", acknowledgement:"ACK 设置", enabled:"启用", packet_payload_bytes:"报文净荷 / B",
   ack_interval_packets:"ACK 间隔 / 包", ack_size_bytes:"ACK 大小 / B",
-  mode:"模式", worker_pools:"Worker pools", name:"名称", role:"角色", parallelism:"并行策略",
+  mode:"模式", worker_pools:"计算池", name:"名称", role:"角色", parallelism:"并行策略",
   tensor_parallel_size:"TP", pipeline_parallel_size:"PP", data_parallel_size:"DP", sequence_parallel_size:"SP", context_parallel_size:"CP",
   enable_expert_parallel:"启用 EP", expert_communication_backend:"EP 通信语义", enable_eplb:"EPLB",
   collectives:"Collective", operation:"通信操作", algorithm:"执行算法", link:"通信类型标记", topology:"逻辑通信拓扑",
@@ -32,6 +33,7 @@ export const labels = {
   source_pool:"源 pool", destination_pool:"目标 pool", payload:"传输内容", placements:"显式部署映射", worker_pool:"Worker pool",
   parallel_coordinate:"并行坐标", dp:"DP 坐标", pp:"PP 坐标", cp:"CP 坐标", tp:"TP 坐标",
   framework:"调度框架", max_batched_tokens:"每批 Token 上限", max_requests:"每批请求上限", num_kv_blocks:"KV block 数",
+  fast_kv_pool_blocks:"固定 KV 池大小 / 块",
   kv_block_size_tokens:"每 block Token 数", scheduler_pipeline_depth:"调度流水深度", vllm:"vLLM 选项", sglang:"SGLang 选项",
   dtype:"数据精度", max_model_len:"模型长度上限", gpu_memory_utilization:"显存利用比例", trust_remote_code:"远程模型代码",
   enable_chunked_prefill:"分块 Prefill", enable_prefix_caching:"前缀缓存", async_scheduling:"异步调度", dummy_token_id:"模拟 Token ID",

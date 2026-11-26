@@ -8,6 +8,7 @@ export function visibleField(path, config) {
   const key = path.at(-1);
   if (key === 'detail_prediction_method' && fast) return false;
   if (key === 'memory_policy_file' && !fast) return false;
+  if (key === 'fast_kv_pool_blocks' && !fast) return false;
   if (key === 'fast_glm_dsa_score' && (!fast || config.model !== 'glm-5.2' || config.hardware.default_hardware_id === 'nvidia_h200')) return false;
   if (path[0] === 'deployment' && path[1] === 'worker_pools' &&
       ['name','role','collectives','pipeline_p2p','sequence_parallel_size','context_parallel_size','expert_communication_backend','enable_eplb'].includes(key)) return false;
@@ -40,18 +41,18 @@ export const groups = {
     ["模型", ["compute_mode", "model"]], ["请求流", ["requests"]],
   ],
   deployment: [
-    ["部署模式", ["deployment.mode"]], ["Worker pools", ["deployment.worker_pools"]],
-    ["卡映射（自动生成，可手动调整）", ["deployment.placements"]], ["跨 pool 通信", ["deployment.routes"]],
+    ["部署模式", ["deployment.mode"]], ["跨 pool 通信", ["deployment.routes"]],
+    ["计算池", ["deployment.worker_pools"]], ["卡映射（自动生成，可手动调整）", ["deployment.placements"]],
   ],
   runtime: [
-    ["调度器", ["scheduler.*.vllm.max_model_len", "scheduler.*.max_requests", "scheduler.*.max_batched_tokens",
+    ["调度器", ["scheduler.*.max_requests", "scheduler.*.max_batched_tokens",
       "scheduler.*.vllm.enable_chunked_prefill", "scheduler.*.vllm.long_prefill_token_threshold"]],
-    ["KV 缓存（高级）", ["scheduler.*.vllm.enable_prefix_caching", "scheduler.*.kv_block_size_tokens", "scheduler.*.num_kv_blocks",
-      "memory_policy_file", "fast_glm_dsa_score", "detail_prediction_method", "expert_routing_seed"]],
+    ["KV 缓存（高级）", ["scheduler.*.vllm.enable_prefix_caching", "scheduler.*.kv_block_size_tokens", "scheduler.*.num_kv_blocks", "fast_kv_pool_blocks"]],
   ],
 };
 
 export function fieldStage(path) {
+  if (path[0] === 'fast_roofline') return 'workload';
   if (path[0] === 'scheduler') return 'runtime';
   const normalized = path.map(k => typeof k === "number" ? "*" : k).join(".");
   if (normalized === "runtime_inputs.expert_routing" || normalized.startsWith("runtime_inputs.expert_routing.")) return "workload";

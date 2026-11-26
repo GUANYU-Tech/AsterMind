@@ -106,7 +106,9 @@ class Handler(SceneHandler):
                 from astermind.builder.config.deployment import SceneDeployment
                 row, identity_key = config['layout'], config['id']
                 draft = row['configuration']
-                base = SceneDeployment(compute_mode=draft['compute_mode'], communication={'ep_strategy':draft['ep_strategy']})
+                base = SceneDeployment(compute_mode=config.get('compute_mode', draft['compute_mode']),
+                                       fast_link_contention=config.get('fast_link_contention',False),
+                                       communication={'ep_strategy':draft['ep_strategy']})
                 layout = editor_layout(identity_key,draft['hardware']['satellite_ids'],row,base,(),capabilities())
                 return self.respond({'cell':layout.serving_cell.model_dump(mode='json')})
             if path=='/cell/api/topology/preview':return self.respond(topology(config)[1])

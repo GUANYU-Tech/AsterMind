@@ -168,7 +168,7 @@ def prepare_deployment(options, upstream, *, largest_su=None, native_detail=Fals
     else:
         hardware = validate_deployment_choice(deployment, upstream)
     if deployment.long_prefill_token_threshold and deployment.enable_chunked_prefill is not True:
-        raise ValueError('长 Prefill 阈值需要开启分块 Prefill')
+        raise ValueError('Prefill 分块上限需要开启分块 Prefill')
     if deployment.compute_mode == 'fast_mode':
         # The cache key includes the policy content. Server operators can replace
         # a policy between validation and submission without reusing a stale check.

@@ -1,49 +1,48 @@
 """Bind Roofline inputs to the selected Cell hardware profile."""
 
-from dataclasses import dataclass
-from math import isfinite
+from dataclasses import dataclass, replace
+import json
+from pathlib import Path
+
+
+_PROFILES = json.loads(Path(__file__).with_name("hardware_profiles.json").read_text(encoding="utf-8"))
+_H200 = _PROFILES["nvidia_h200"]
+KV_HBM_UTILIZATION_PERCENT = 90
+KV_RUNTIME_RESERVE_BYTES = 2 * 2**30
+
+
+def fast_hbm_capacity_bytes(hardware_id):
+    return _PROFILES[hardware_id]["hbm_capacity_gib"] * 2**30
 
 
 @dataclass(frozen=True, slots=True)
 class Hardware:
-    bf16_flops: float = 989.4e12
-    fp8_flops: float | None = 1978.8e12
-    # The pinned H200 read rate for standalone formula probes. The CLI binds
-    # the actual Cell hardware profile at startup.
-    hbm_bytes: float = 1478.7609855270666 * 3.125e9
+    bf16_flops: float = _H200["bf16_flops"]
+    fp8_flops: float | None = _H200["fp8_flops"]
+    # Peak bytes/s and efficiency are independent of HBM capacity in bytes.
+    hbm_bytes: float = _H200["hbm_bytes_per_s"]
     tensor_efficiency: float = .70
-    hbm_efficiency: float = 1.
+    hbm_efficiency: float = .96
     fp16_flops: float | None = None
     widen_fp8_to_bf16: bool = False
 
     @classmethod
     def from_hardware_spec(cls, spec, *, compute_dtype="bf16", widen_fp8_to_bf16=False):
-        read_bandwidth = spec.dram_capacity_for_access(
-            "read", active_units=1, sm_freq_hz=spec.nominal_sm_freq_hz,
-            dram_freq_hz=spec.nominal_dram_freq_hz,
-        )
-        if spec.hardware_id == "nvidia_h200":
-            return cls(hbm_bytes=read_bandwidth)
+        profile = _PROFILES[spec.hardware_id]
+        default_hbm = .96 if spec.hardware_id == "nvidia_h200" else 1.
+        return cls(bf16_flops=profile["bf16_flops"], fp8_flops=profile["fp8_flops"],
+                   fp16_flops=profile["fp16_flops"] if compute_dtype == "fp16" else None,
+                   hbm_bytes=profile["hbm_bytes_per_s"], widen_fp8_to_bf16=widen_fp8_to_bf16,
+                   hbm_efficiency=default_hbm)
 
-        def tensor_peak(dtype):
-            try:
-                resource = spec.resource_by_role(f"compute_tensor_{dtype}")
-            except KeyError:
-                resource = spec.resource_by_role("compute_tensor")
-                if not resource.name.endswith(f"_{dtype}"):
-                    return None
-            if not isfinite(resource.capacity) or resource.capacity <= 0:
-                raise ValueError(f"{spec.hardware_id} has an invalid {dtype} tensor peak")
-            return resource.capacity
+    def nominal_hbm_bytes(self, hardware_id):
+        return _PROFILES[hardware_id]["hbm_bytes_per_s"]
 
-        bf16 = tensor_peak("bf16")
-        if bf16 is None:
-            raise ValueError(f"{spec.hardware_id} does not declare a BF16 tensor peak")
-        fp16 = tensor_peak("fp16") if compute_dtype == "fp16" else None
-        if compute_dtype == "fp16" and fp16 is None:
-            raise ValueError(f"{spec.hardware_id} does not declare an FP16 tensor peak")
-        return cls(bf16_flops=bf16, fp8_flops=tensor_peak("fp8"), fp16_flops=fp16,
-                   hbm_bytes=read_bandwidth, widen_fp8_to_bf16=widen_fp8_to_bf16)
+    def with_roofline(self, hardware_id, settings):
+        if settings is None:
+            return self
+        return replace(self, hbm_bytes=self.nominal_hbm_bytes(hardware_id),
+                       tensor_efficiency=settings.tensor_percent / 100, hbm_efficiency=settings.hbm_percent / 100)
 
     def roofline(self, flops, memory, *, fp8=False):
         if fp8:

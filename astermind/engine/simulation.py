@@ -1,9 +1,11 @@
 """Shared physical network around the existing native Scheduler/Cell seam."""
 
 import time
+from collections import Counter
 from dataclasses import asdict
 
 from astermind.engine.cell_bridge import CellTransferExecutor
+from astermind.engine.cell_events import CellTokenOutput
 from astermind.engine.cell_migration import NetworkKVMigration
 from astermind.engine.timeline import nanoseconds
 
@@ -143,6 +145,12 @@ class Simulation:
             {c.id: {p.rank: p.device for p in c.placements} for c in config.cells},
         )
         self._session_cells = {}
+        self._legacy_cell_local_history = (
+            config.fast_orbital_route_frames is not None
+            and config.cell_selection == "least_loaded_per_turn"
+        )
+        if config.compute_mode == "fast_mode" and config.cell_selection == "least_loaded_per_turn":
+            self._case_study_load = Counter()
         self.cell_init_workers = self.cell_startup_policy["workers"]
         if cell_factory is None:
             # Resolve the native module graph on the owning thread first.
@@ -189,7 +197,10 @@ class Simulation:
             data_parallel_size=p.dp, sequence_parallel_size=p.sp,
             deployment=cell.deployment, execution_mode=cell.execution_mode,
             compute_mode=cell.detail_prediction_method or self.config.executor_compute_mode,
-            fast_glm_dsa_score=cell.fast_glm_dsa_score)
+            fast_glm_dsa_score=cell.fast_glm_dsa_score, fast_roofline=cell.fast_roofline,
+            fast_kv_pool_blocks=(cell.fast_kv_pool_blocks
+                                 if self.config.executor_compute_mode == "fast_mode" else None),
+            fast_link_contention=cell.fast_link_contention)
         executor = self.executors[cell.id]
         if cell.deployment == "pd_disagg":
             created = PrefillDecodeCell(cell.id, self.loop, config, executor,
@@ -198,7 +209,8 @@ class Simulation:
         else:
             created = ServingScheduler.create(cell.id, self.loop, config, self._completed,
                 on_output=self._output, on_failure=self._cell_failure,
-                batch_executor=executor, history_store=self.history)
+                batch_executor=executor,
+                history_store=None if self._legacy_cell_local_history else self.history)
         try:
             validate_cell_deployment(cell, created.execution, executor.placements.values())
             if self.config.compute_mode == "fast_mode":
@@ -268,7 +280,15 @@ class Simulation:
         # Communication 9c08c9c state trace, retaining the authoritative tick.
         state = self.state[request_id]
         previous = state["status"]
+        loads = getattr(self, "_case_study_load", None)
+        previous_cell = state.get("cell")
+        if (loads is not None and previous_cell and previous in ("input", "computing")
+                and "compute_complete_ns" not in state):
+            loads[previous_cell] -= 1
         state.update(changes)
+        if (loads is not None and state.get("cell") and state["status"] in ("input", "computing")
+                and "compute_complete_ns" not in state):
+            loads[state["cell"]] += 1
         event = self.loop.current_event
         self.request_state_events.append(dict(
             request_id=request_id, reason=reason,
@@ -293,6 +313,16 @@ class Simulation:
             return
         self.outputs.append(asdict(output))
         request = self.requests[output.request_id]
+        if self.config.output_delivery == "first_then_rest":
+            if output.token_start == 0:
+                self._send_output(request, CellTokenOutput(
+                    output.cell_id, request.id, 0, 1, output.produced_time_s,
+                    request.output_tokens == 1,
+                ))
+            return
+        self._send_output(request, output)
+
+    def _send_output(self, request, output):
         c = self._cell_configs[output.cell_id]
 
         def received():
@@ -314,10 +344,17 @@ class Simulation:
                 self._record_request("output_delivered", request.id)
             self._finish(request.id)
 
+        size = output.token_count * request.output_bytes_per_token
+        if self.config.fast_orbital_route_frames is not None and c.output_device != c.ingress_device:
+            def relay_finished():
+                self._submit(c.ingress_device, request.user_device, size, "request_output", request.id, received)
+
+            self._submit(c.output_device, c.ingress_device, size, "request_relay", request.id, relay_finished)
+            return
         self._submit(
             c.output_device,
             request.user_device,
-            output.token_count * request.output_bytes_per_token,
+            size,
             "request_output",
             request.id,
             received,
@@ -332,6 +369,12 @@ class Simulation:
             compute_complete_ns=nanoseconds(completion.completion_time_s),
             compute_complete_ticks=str(completion.completion_time_s.ticks))
         self._record_request("compute_complete", completion.request_id)
+        request = self.requests[completion.request_id]
+        if self.config.output_delivery == "first_then_rest" and request.output_tokens > 1:
+            self._send_output(request, CellTokenOutput(
+                completion.cell_id, request.id, 1, request.output_tokens - 1,
+                completion.completion_time_s, True,
+            ))
         self._finish(completion.request_id)
         for callback in self._parent_waiters.pop(completion.request_id, ()):
             callback()
@@ -480,6 +523,8 @@ class Simulation:
         with ExitStack() as cleanup:
             if self._physics_lifetime is not None:
                 cleanup.callback(self._physics_lifetime.cleanup)
+            if getattr(self, "physical", None) is not None and self.config.fast_orbital_route_frames is not None:
+                cleanup.callback(self.physical.close)
             if self.host is not None:
                 cleanup.callback(self.host.close)
             for cell in self.cells.values():

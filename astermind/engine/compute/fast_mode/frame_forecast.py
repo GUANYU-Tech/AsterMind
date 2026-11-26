@@ -15,7 +15,8 @@ def forecast_routes(frames, at):
     host = frames.host
     state = host.net
     physical = state.physical
-    if (not host.now < at < frames.horizon or host.controller is not None
+    if (not host.now < at < frames.horizon
+            or host.controller is not None and not getattr(host.controller, 'read_only_topology', False)
             or state.active_faults or physical is not None and physical.spec.faults
             or host.spec.routing_policy not in ("min_hops", "min_propagation")):
         return None
@@ -28,7 +29,8 @@ def forecast_routes(frames, at):
     scratch._path_route_cache = cache.fork() if cache is not None else None
     network = frames.network
     view = SimpleNamespace(
-        host=SimpleNamespace(now=at, net=scratch, spec=host.spec, end=host.end),
+        host=SimpleNamespace(now=at, net=scratch, spec=host.spec, end=host.end,
+                             comm_policy=getattr(host, 'comm_policy', None)),
         topology=network.topology,
         resolve_pair=network.resolve_pair,
     )

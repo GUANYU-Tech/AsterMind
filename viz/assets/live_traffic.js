@@ -100,7 +100,7 @@ export function attachOverlay({THREE,scene,camera,controls,container,vector}){
   const sequence=tracked?.time_semantics==='whole_path_shared_resources'?'V1 整条路径共享资源':tracked?.stage==='request_input'?'地面站 → 通信星座 → 计算 Cell':tracked?.stage==='request_output'?'计算 Cell → 通信星座 → 地面站':'跨 Cell 通信';
   const user=tracked?.request_id?.match(/^user-(\d+)-request-/)?.[1];
   caption.textContent=tracked?`${user?'用户 '+user:'传输 #'+tracked.id.replace('serving-','')} / ${sequence} / ${done?(tracked.terminal==='failed'?'传输失败':'传输已完成'):tracked.time_semantics==='whole_path_shared_resources'?'路径传输中':`已走 ${delivered} 跳`}`:search?'未找到匹配的已执行传输':'选择传输后显示已走路径与当前一跳';
-  caption.title=(tracked?.time_semantics==='whole_path_shared_resources'?'整条路径同时占用共享资源；方块仅示意方向。':'绿色保留已走路径；方块标出当前一跳。')+(tracked?.request_id||'');
+  caption.title=[tracked?.time_semantics==='whole_path_shared_resources'?'整条路径同时占用共享资源；方块仅示意方向。':'绿色保留已走路径；方块标出当前一跳。',tracked?.request_id].filter(Boolean).join(' ');
   if(routeDraws.length>capacity)caption.textContent+=` / 路径显示前 ${capacity} 跳`;
   routeDraws=routeDraws.slice(0,capacity);
   draws=[];let unmapped=0,internal=0;

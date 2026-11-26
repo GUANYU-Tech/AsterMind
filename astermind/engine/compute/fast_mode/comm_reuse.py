@@ -1,4 +1,4 @@
-"""Parameterize COMM_Backend quotes on the fixed, uncontended H200 test formation."""
+"""Bind eligible Fast communication paths before pricing the current batch."""
 
 from collections import Counter
 from itertools import permutations
@@ -8,6 +8,7 @@ from astermind.engine.clock import Time
 from astermind.engine.comm import registered_profiles as profiles
 from astermind.engine.comm._vendor.inter_mean.mean import mean_frame_budget
 from astermind.engine.comm.frame_surrogate import NoRouteError
+from astermind.engine.comm.intra_hierarchy import classify_participants
 from astermind.engine.comm.path_budget import _capacity_contract, path_budget
 from astermind.engine.comm.planner import plan_communication
 from .quote import BatchCommunication
@@ -18,15 +19,17 @@ class UnsupportedFormation(ValueError):
 
 
 class LocalLane:
-    """Bind the native H200 P2P rule, including its byte-dependent protocol."""
+    """Bind one homogeneous SU lane, including its byte-dependent protocol."""
 
-    def __init__(self, route, policy):
+    def __init__(self, route, policy, card, port):
+        self.bandwidth_gbps = route['bandwidth_gbps']
+        self.latency_ns = route['latency_ns']
         self.bandwidth = route['bandwidth_gbps'] * 125
         self.latency = route['latency_ns'] / 1000
         self.policy = policy
-        self.cards = ('nvidia_h200',) * 2
-        self.port = profiles.nominal_gpu_bandwidth(self.cards[0])
-        self.select = profiles.registered(self.cards[0], 'send_recv', 'send_recv', 'nvlink').protocol_policy.select
+        self.cards = (card, card)
+        self.port = port
+        self.select = profiles.registered(card, 'send_recv', 'send_recv', profiles.LINKS[card]).protocol_policy.select
         self.protocols = {}
 
     def _entry(self, size):
@@ -105,6 +108,7 @@ class BoundCommunicationPlan:
         self.direct_factory = direct_factory
         self.runtime = pricing.runtime
         self.policy = self.runtime.policy.model_dump_json()
+        self.templates = getattr(self.runtime, 'fast_lane_templates', {})
         self.stats = Counter()
         self.local = {}
         self.inter = {}
@@ -116,28 +120,48 @@ class BoundCommunicationPlan:
         self.capacities = None
         self.prepare_ms = 0.
 
+    def _template(self, key, create):
+        # Scope immutable formulas to the simulation. Do not retain prior
+        # batch durations or routes, and bound independent timing profiles.
+        key = self.policy, key
+        template = self.templates.get(key)
+        if template is None:
+            template = create()
+            if len(self.templates) < 512:
+                self.templates[key] = template
+        return template
+
     def _initialize(self, quote):
         runtime = self.runtime
         from astermind.engine.comm.target_network import TargetRoutes
         from astermind.engine.state.device_network import DeviceNetworkState
 
         net = getattr(getattr(runtime.network, 'host', None), 'net', None)
-        fixed_network = (type(quote.routes) is TargetRoutes and type(net) is DeviceNetworkState
-                and quote.routes.routing_policy in ('min_hops', 'min_propagation')
+        target_routes = (type(quote.routes) is TargetRoutes and type(net) is DeviceNetworkState
+                         and quote.routes.routing_policy in ('min_hops', 'min_propagation'))
+        fixed_network = (target_routes
                 and net.physical is None and len(net.environment_times) == 2
                 and not (net.calendars or net.disabled_device_links or net.failed_device_links or net.active_faults))
-        frame_bound = (getattr(quote.routes, "frame_bound_paths", False) and
+        frame_bound = ((target_routes or getattr(quote.routes, "frame_bound_paths", False)) and
                        quote.routes.frame.valid_until_s is not None and
                        quote.time < quote.routes.frame.valid_until_s)
         if not (fixed_network or frame_bound):
             raise UnsupportedFormation('timing reuse requires a fixed network or frame-bound paths')
         policy = runtime.policy
-        expected = type(policy)(ep_strategy=policy.ep_strategy, default_hardware_id='nvidia_h200')
+        expected = type(policy)(ep_strategy=policy.ep_strategy, default_hardware_id=policy.default_hardware_id,
+                                cell_policies=policy.cell_policies, gpu_hardware=policy.gpu_hardware,
+                                gpu_port_gbps=policy.gpu_port_gbps, link_bandwidth_factors=policy.link_bandwidth_factors)
         # ISL processing is a scenario coefficient in each bound directed lane.
         expected = expected.model_copy(update={'inter_parameters': expected.inter_parameters.model_copy(
             update={'hop_processing_us': policy.inter_parameters.hop_processing_us})})
         if policy != expected or policy.runtime_protocol != 'inter_reference':
-            raise UnsupportedFormation('ineligible fixed H200 communication timing environment')
+            raise UnsupportedFormation('communication policy requires the general estimator')
+        cell_policy = policy.cell_policies.get(self.pricing.cell_id)
+        if cell_policy and cell_policy.algorithms.get('inter_satellite'):
+            raise UnsupportedFormation('custom inter-satellite algorithms require the general estimator')
+        self.default_card = ((cell_policy.hardware_id if cell_policy else None)
+                             or policy.default_hardware_id)
+        self.static_direct_network = fixed_network or getattr(quote.routes, 'frame_bound_paths', False)
         self.routes = quote.routes
         # Runtime replaces the entire mapping when it replaces the Frame.
         self.capacities = quote.capacities
@@ -146,6 +170,7 @@ class BoundCommunicationPlan:
         self.hierarchical_owners = frozenset(
             node.satellite_id for node in quote.routes.frame.node_states.values()
             if node.attributes.get('intra_hierarchy'))
+        self.cell_owners = {quote.routes.topology.devices[rank].satellite for rank in self.pricing.devices}
         self.local.clear()
         self.inter.clear()
         self.pairs.clear()
@@ -161,18 +186,33 @@ class BoundCommunicationPlan:
         devices = quote.routes.topology.devices
         path = route['path']
         if len({devices[node].satellite for node in path}) == 1:
+            policy = quote.runtime.policy
+            cards = {policy.gpu_hardware.get(rank, self.default_card) for rank in (source, target)}
+            if len(cards) != 1:
+                raise UnsupportedFormation('heterogeneous GPU links require the general estimator')
+            card, = cards
+            edges = tuple(quote.routes.route_resources(route))
             if (len(path) not in (2, 3)
                     or (len(path) == 3 and devices[path[1]].kind != 'switch')
                     or any(devices[node].kind != 'gpu' for node in (source, target))
-                    or devices[source].satellite in self.hierarchical_owners
-                    or any(edge['shared_pools'] for edge in quote.routes.route_resources(route))):
-                raise UnsupportedFormation('requires one homogeneous H200 scale-up fabric without shared pools')
-            key = route['bandwidth_gbps'], route['latency_ns']
+                    or card not in profiles.LINKS
+                    or any(edge['shared_pools'] or
+                           edge['attributes'].get('comm_technology') not in (None, profiles.LINKS[card])
+                           for edge in edges)
+                    or (devices[source].satellite in self.hierarchical_owners
+                        and classify_participants(quote.routes.frame, (source, target))[0] != 'single_su')):
+                raise UnsupportedFormation('requires one homogeneous scale-up fabric without shared pools')
+            port = min(profiles.gpu_port_bandwidth(rank, card, policy) for rank in (source, target))
+            key = card, route['bandwidth_gbps'], route['latency_ns'], port
             if key not in self.local:
-                self.local[key] = LocalLane(route, quote.runtime.policy)
+                self.local[key] = self._template(('local', *key),
+                    lambda: LocalLane(route, policy, card, port))
             price = self.local[key], False
         else:
+            if any(devices[node].satellite not in self.cell_owners for node in path):
+                raise UnsupportedFormation('path leaves the deployed Cell')
             lane = InterLane(quote, route)
+            lane = self._template(('inter', lane.signature), lambda: lane)
             price = self.inter.setdefault(lane.signature, lane), True
         self.pairs[pair] = price
         return price
@@ -195,19 +235,35 @@ class BoundCommunicationPlan:
         if op == 'send_recv' and size == 2:
             lane, cross = self.lanes(quote, *ranks)
             program = lambda n, frames: lane.ticks(n, frames if cross else True)
-        elif op in ('broadcast', 'all_reduce', 'all_gather', 'reduce_scatterv') and size in (4, 8):
+        elif op in ('broadcast', 'all_reduce', 'all_gather', 'reduce_scatterv') and size in (2, 4, 8):
             lane = self._local_group(quote, ranks)
             descriptor = op, size, lane
             if descriptor not in self.local_classes:
-                prototype = self.pricing._operator(op, transfer.ranks, size)
+                registered_ring = op in ('all_reduce', 'all_gather')
+                # A collective can move from explicit waves to the registered
+                # profile as its payload grows. Only bind the registered rule;
+                # byte sizes it does not accept keep the ordinary quote.
+                probe_bytes = 65536 if registered_ring else size
+                prototype = self.pricing._operator(op, transfer.ranks, probe_bytes)
                 plan = plan_communication(self.runtime.network, self.runtime.policy, prototype, quote.time, quote.routes)
+                if (registered_ring and not plan.waves and
+                        plan.estimate.mode == 'intra_ring' and plan.selection['scope'] == 'single_su'
+                        and plan.selection['algorithm'] == 'ring'):
+                    program = self._template(('whole_ring', *descriptor),
+                        lambda: profiles.bind_registered_ring(prototype, plan.policy, lane.cards[0],
+                                                              lane.bandwidth_gbps, lane.latency_ns, lane.port))
+                    self.local_classes[descriptor] = self.programs[key] = program
+                    return program
+                if registered_ring:
+                    raise UnsupportedFormation('collective uses payload-dependent planning')
                 divisor = size if op in ('all_reduce', 'reduce_scatterv') else 1
                 expected = {'broadcast': 1, 'all_reduce': 2 * (size - 1),
                             'all_gather': size - 1, 'reduce_scatterv': size - 1}[op]
                 if (not plan.local_runtime or len(plan.waves) != expected
                         or plan.selection['scope'] != 'single_su'
+                        or plan.selection['algorithm'] != ('direct' if op == 'broadcast' else 'ring')
                         or any(not wave or any(amount != size // divisor for _, amount in wave) for wave in plan.waves)):
-                    raise UnsupportedFormation('unrecognized H200 native collective waves')
+                    raise UnsupportedFormation('unrecognized local collective waves')
 
                 def uniform(n, frames):
                     if n % divisor:
@@ -237,7 +293,10 @@ class BoundCommunicationPlan:
         self.boundaries = tuple(tuple(tuple(map(bind, phase)) for phase in boundary)
                                 for boundary in self.pricing.program.boundaries)
         self.direct = None
-        if self.direct_factory is not None:
+        policy = self.runtime.policy
+        if (self.direct_factory is not None and self.static_direct_network and self.default_card == 'nvidia_h200'
+                and not (policy.cell_policies or policy.gpu_hardware or policy.gpu_port_gbps
+                         or self.cell_owners & self.hierarchical_owners)):
             try:
                 self.direct = self.direct_factory(self, quote)
             except (UnsupportedFormation, NoRouteError):

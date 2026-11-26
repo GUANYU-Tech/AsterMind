@@ -5,7 +5,7 @@ const commonLabels = {
   disabled_physical_links:'停用链路', max_requests:'并发请求上限', max_model_len:'上下文上限',
   arrival_ns:'到达时间', retry_limit:'最多重试次数', primary:'首先比较', secondary:'条件相同时再比较',
 };
-const displayValues={least_loaded:'负载优先',nearest:'距离优先',estimated_arrival:'先比较负载，再比较到达时间',midlayer:'原生计算模型',load:'请求最少',distance:'路径最短',arrival:'最早到达'};
+const displayValues={detail_mode:'Detail Mode',fast_mode:'Fast Mode',least_loaded:'负载优先',nearest:'距离优先',estimated_arrival:'先比较负载，再比较到达时间',midlayer:'原生计算模型',load:'请求最少',distance:'路径最短',arrival:'最早到达'};
 
 function node(tag, content, className) {
   const result=document.createElement(tag);
@@ -14,7 +14,15 @@ function node(tag, content, className) {
   return result;
 }
 
-export function renderConfigProfile(container, config, labels={}, metrics=[]) {
+export function renderCellConfigProfile(container, config, labels) {
+  const {model,compute_mode,hardware,topology,constellation,fso,deployment,scheduler}=config;
+  const groups={model,compute_mode,hardware,topology,constellation,fso,deployment,scheduler,
+    collective_policies:config.collective_policies,requests:config.requests};
+  if(compute_mode==='fast_mode')groups.fast_roofline=config.fast_roofline;
+  renderConfigProfile(container,groups,{...labels,fso:'光学链路',fast_roofline:'Roofline 参数配置'},[],true);
+}
+
+export function renderConfigProfile(container, config, labels={}, metrics=[], omitEmpty=false) {
   const previous=container.querySelector('select')?.value;
   container.replaceChildren();
   if(!config)return;
@@ -28,7 +36,7 @@ export function renderConfigProfile(container, config, labels={}, metrics=[]) {
     card.append(list);
   }
   const scalar=value=>value===null || typeof value!=='object';
-  const keys=Object.keys(config).filter(key=>!scalar(config[key]) && Object.keys(config[key]).length);
+  const keys=Object.keys(config).filter(key=>config[key]!=null && !scalar(config[key]) && Object.keys(config[key]).length);
   const base=Object.fromEntries(Object.entries(config).filter(([,value])=>scalar(value) && value!=null));
   const select=node('select');select.setAttribute('aria-label','查看配置分组');
   if(Object.keys(base).length) select.add(new Option('基本参数',''));
@@ -38,6 +46,7 @@ export function renderConfigProfile(container, config, labels={}, metrics=[]) {
   const pages=node('div',null,'actions');
   function *rows(value, path=[]) {
     for(const [key,item] of Object.entries(value)){
+      if(omitEmpty && (item==null || item==='' || (typeof item==='object'&&!Object.keys(item).length)))continue;
       const label=Array.isArray(value)?'第 '+(Number(key)+1)+' 项':caption(key);
       const name=[...path,typeof item==='number' && key.endsWith('_ns') ? label.replace(/(?:_ns|\s*\/\s*ns)$/i,'') : label];
       if(!scalar(item) && Object.keys(item).length){yield* rows(item,name);continue}

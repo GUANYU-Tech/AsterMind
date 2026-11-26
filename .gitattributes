@@ -12,6 +12,11 @@ examples/workloads/trace_examples/** text eol=lf
 # Pinned Orbit reference data hashes require canonical LF bytes on every host.
 src/orbitserve/orbit/data/iers/** -text
 src/orbitserve/orbit/data/stk_validation/*.json text eol=lf
+astermind/builder/orbit/data/iers/** -text
+astermind/builder/orbit/data/stk_validation/*.json text eol=lf
+
+# These entry points run under Linux, including from Windows checkouts in WSL.
+scripts/*.sh text eol=lf
 
 # Preserve whitespace markers in the colleague's recorded upstream patch.
 network_sim/docs/vendor_changes.patch -whitespace

@@ -30,6 +30,7 @@ export function normalizeComputeSettings(config, capabilities) {
   }
   if (config.compute_mode === 'batch_roofline') config.compute_mode = 'fast_mode';
   config.compute_mode ??= 'detail_mode';
+  if (capabilities.fast_roofline_defaults) config.fast_roofline ??= structuredClone(capabilities.fast_roofline_defaults);
   if (config.compute_mode === 'detail_mode') config.detail_prediction_method ??= 'auto';
   const policy = capabilities.memory_policies?.find(row => row.file === config.memory_policy_file);
   config.memory_policy_file = policy?.id ?? config.memory_policy_file ?? '';

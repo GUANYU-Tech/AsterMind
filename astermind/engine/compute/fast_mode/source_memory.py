@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 
 from .v3_residency import weight_bytes_by_rank
+from .hardware import KV_HBM_UTILIZATION_PERCENT, KV_RUNTIME_RESERVE_BYTES, fast_hbm_capacity_bytes
 
 from src.serving.kv_cache.model_residency import (
     glm_block_fp8_constructor_buffer_bytes,
@@ -19,7 +20,7 @@ K3_PORTABLE_MEMORY_PROFILE = "kimi-k3-mxfp4-bf16-hybrid-reference"
 FP8_REFERENCE_MEMORY_PROFILE = "fp8-widened-bf16-reference"
 
 
-def projected_budgets(config, model, hardware, parallel, layers, profile):
+def _projection_limits(config, model, hardware, parallel, profile):
     # K2 reuses grouped INT4 checkpoint storage only. Vendor workspaces and
     # allocator overhead are accounted for by each target's explicit reserve.
     portable_boards = {"nvidia_a800": "a800", "ascend_910b": "910b", "metax_c500": "c500"}
@@ -52,7 +53,21 @@ def projected_budgets(config, model, hardware, parallel, layers, profile):
     if (type(percentage) is not int or not 0 < percentage <= 100
             or type(reserve) is not int or reserve <= 0):
         raise ValueError(f"{profile} memory projection requires a positive explicit reserve")
-    base = hardware.resource_by_role("dram").size_bytes * percentage // 100 - reserve
+    return percentage, reserve
+
+
+def projected_budgets(config, model, hardware, parallel, layers, profile):
+    if config.compute_mode == "fast_mode":
+        if config.memory_policy_file:
+            _projection_limits(config, model, hardware, parallel, profile)
+        percentage, reserve = KV_HBM_UTILIZATION_PERCENT, KV_RUNTIME_RESERVE_BYTES
+        capacity = fast_hbm_capacity_bytes(hardware.hardware_id)
+    else:
+        percentage, reserve = _projection_limits(config, model, hardware, parallel, profile)
+        capacity = hardware.resource_by_role("dram").size_bytes
+    portable_k3 = profile == K3_PORTABLE_MEMORY_PROFILE
+    portable_fp8 = profile == FP8_REFERENCE_MEMORY_PROFILE
+    base = capacity * percentage // 100 - reserve
     options = dict(max_batched_tokens=config.max_batched_tokens, max_requests=config.max_requests,
                    pipeline_layer_partition=layers)
     if portable_fp8 and model.model_type == "deepseek_v4":
@@ -121,7 +136,9 @@ def native_kv_event_ceiling(backend, *, hybrid):
             raise ValueError("native Scheduler returned invalid KV group geometry")
         if hybrid:
             capacities = replica.get("k3_source_capacities", ())
-            if (allocation["kv_spec_type"] != "UniformTypeKVCacheSpecs" or len(capacities) != 2
+            supported = (("UniformTypeKVCacheSpecs", "MambaSpec", "MLAAttentionSpec")
+                         if replica.get("session_storage") else ("UniformTypeKVCacheSpecs",))
+            if (allocation["kv_spec_type"] not in supported or len(capacities) != 2
                     or capacities[1] != blocks or type(capacities[0]) is not int or capacities[0] < blocks):
                 raise ValueError("K3 native Scheduler returned invalid hybrid KV capacities")
         page_bytes = sum(page for _, page in groups)

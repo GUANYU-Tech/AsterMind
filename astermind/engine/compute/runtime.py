@@ -17,14 +17,15 @@ from src.serving.parallelism.parallel_config import ParallelConfig
 from src.serving.parallelism.pp import pipeline_layer_ranges_for_model
 from src.serving.backend.vllm import BackendConfig, VLLMSchedulerConfig
 from src.serving.simulation import validate_workload_emission_parallelism
+from astermind.builder.config.deployment import FastRoofline
 from astermind.common.hardware_capabilities import PORTABLE_BATCH_HARDWARE
 from src.serving.workload.model_config import load_model_config
 from src.serving.workload.runtime_inputs import ExpertRoutingInput, RuntimeInputs
 
 from .factory import create_scheduler, resolve_batch_token_budget
 from .fast_mode.admission import (
-    KIMI_VENDOR_PROJECTION_HARDWARE, supports_fast_session_storage, supports_portable_batch_k3,
-    supports_portable_batch_kimi, supports_portable_fp8_reference,
+    KIMI_VENDOR_PROJECTION_HARDWARE, supports_portable_batch_k3, supports_portable_batch_kimi,
+    supports_portable_fp8_reference, validate_fast_session_storage,
 )
 
 
@@ -92,6 +93,9 @@ class MidlayerCellConfig:
     enable_chunked_prefill: bool | None = None
     long_prefill_token_threshold: int = 0
     fast_glm_dsa_score: Literal["bf16_timing_proxy"] | None = None
+    fast_roofline: FastRoofline | None = None
+    fast_kv_pool_blocks: int | None = None
+    fast_link_contention: bool = False
 
 
 def _runtime_inputs(config, model, *, portable_fp8=False):
@@ -231,14 +235,24 @@ def create_midlayer_runtime(config: MidlayerCellConfig, *, with_scheduler: bool 
                 and HWSpec.source_contract_supported("deepseek_v3_portable_roofline", config.hardware_id)
                 and config.compute_mode != "roofline"):
             raise NotImplementedError("the portable DeepSeek-V3 projection requires Roofline")
-    if not _SOURCE_INPUTS and (config.deployment != "colocated" or config.scheduler_adapter in ("vllm_0_30", "vllm_0_31")
-          or config.host_launch_profile_file is not None):
+    fast_mode = config.compute_mode == "fast_mode"
+    if not fast_mode and not _SOURCE_INPUTS and (
+        config.deployment != "colocated" or config.scheduler_adapter in ("vllm_0_30", "vllm_0_31")
+        or config.host_launch_profile_file is not None
+    ):
         raise NotImplementedError("the logical main uses colocated CPU scheduling and device timing")
+    if fast_mode and config.scheduler_adapter not in ("auto", "vllm_0_30"):
+        raise ValueError(f"Fast Mode: migrate scheduler_adapter {config.scheduler_adapter} "
+                         "to vllm_0_30 and revalidate batching and KV")
     if config.scheduler_adapter == "auto":
-        adapter = ("vllm_0_30" if config.data_parallel_size>1 and model.model_type=="glm_moe_dsa"
+        if fast_mode and config.data_parallel_size == 1 and config.enable_chunked_prefill is None:
+            config = replace(config, enable_chunked_prefill=True)
+        adapter = ("vllm_0_30" if fast_mode or config.data_parallel_size > 1 and model.model_type == "glm_moe_dsa"
                    else "vllm_0_31" if _SOURCE_INPUTS and model.attention_layout == "standard_gqa"
                    else "vllm_0_11")
         config = replace(config, scheduler_adapter=adapter)
+    if fast_mode and not _SOURCE_INPUTS:
+        raise NotImplementedError("the logical main uses colocated CPU scheduling and device timing")
     if config.scheduler_adapter not in ("vllm_0_31", "vllm_0_30", "vllm_0_11"):
         raise ValueError("unknown Scheduler adapter")
     config = resolve_batch_token_budget(config)
@@ -260,11 +274,10 @@ def create_midlayer_runtime(config: MidlayerCellConfig, *, with_scheduler: bool 
                              and config.scheduler_adapter == "vllm_0_30"
                              and (model.model_type in ("deepseek_v3", "deepseek_v4", "kimi_k2", "kimi_linear")
                                   or model.model_type == "glm_moe_dsa" and model.weight_dtype == "fp8"))
-    fast_session = (config.compute_mode == "fast_mode" and config.scheduler_adapter == "vllm_0_30"
+    fast_session = (fast_mode and config.scheduler_adapter == "vllm_0_30"
                     and config.enable_prefix_caching)
-    if fast_session and not supports_fast_session_storage(config, model):
-        raise NotImplementedError(
-            "Fast Mode session storage requires vLLM 0.30, H200 GLM-5.2 TP8xPP4, DP1, EP off")
+    if fast_session:
+        validate_fast_session_storage(config, model)
     storage_enabled = config.scheduler_adapter == "vllm_0_31" or fast_session
     if not storage_enabled and (config.enable_prefix_caching or config.watermark
                                 or config.memory_policy_file and not (vendor_kimi or portable_k3
@@ -414,14 +427,10 @@ def _validate_batch_hardware(config, model, parallel):
     if model.model_type == "kimi_linear":
         if not supports_portable_batch_k3(config, model, parallel):
             raise ValueError("portable Kimi-K3 requires the exact BF16/MXFP4 model and legal hybrid TP/PP and EP geometry")
-        if not config.memory_policy_file:
-            raise ValueError("portable Kimi-K3 Fast Mode requires an explicit per-Cell memory_policy_file for the BF16/W4A16 reference")
         return
     if model.model_type == "kimi_k2":
         if not supports_portable_batch_kimi(config, model, parallel):
             raise ValueError("portable Kimi-K2 requires legal group-32 INT4 sharding and explicit uniform EP for DP > 1")
-        if config.hardware_id in KIMI_VENDOR_PROJECTION_HARDWARE and not config.memory_policy_file:
-            raise ValueError("910B/C500 Kimi-K2 Fast Mode requires an explicit per-Cell memory_policy_file")
         return
     if model.model_type == "deepseek_v4":
         raise NotImplementedError(

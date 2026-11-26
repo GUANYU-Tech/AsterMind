@@ -39,6 +39,27 @@ def catalog(root, kind):
     return rows
 
 
+def physical_catalog(root):
+    rows = catalog(root, 'physical')
+    inputs = Path(root) / 'local/inputs'
+    registration = inputs / 'examples/case-study-iii.json'
+    if not registration.is_file():
+        return rows
+    try:
+        example = json.loads(registration.read_text(encoding='utf-8'))
+        scene_id = key(example['scene_id'])
+        model_id = key(example['physical_model_id'])
+    except (OSError, ValueError, KeyError, TypeError):
+        return rows
+    if (inputs / 'scenes' / (scene_id + '.json')).is_file() and (
+            inputs / 'physical-data' / (model_id + '.json')).is_file():
+        for row in rows:
+            if row['id'] == model_id:
+                row['case_study_iii_scene_id'] = scene_id
+                break
+    return rows
+
+
 def physical_data(root, identity):
     """Persist dataset ownership separately from immutable configuration revisions."""
     identity = key(identity)
@@ -171,6 +192,13 @@ def save(root, kind, payload):
         physical = value['physical_network']
         physical['network'] = physical_network_settings(physical['network'])
         value.pop('random_faults', None)
+        compute = value.get('compute_configuration', {})
+        if 'link_bandwidth_factors' in compute:
+            from astermind.builder.config.communication import CommPolicy
+            if compute.get('mode') not in ('fast_mode', 'batch_roofline'):
+                raise ValueError('有效可用带宽比例仅适用于 Fast Mode')
+            compute['link_bandwidth_factors'] = CommPolicy(
+                link_bandwidth_factors=compute['link_bandwidth_factors']).link_bandwidth_factors
         validate_model(physical, root)
     elif kind == 'scenes':
         from scene_validation import validate_scene

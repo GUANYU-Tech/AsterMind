@@ -4,6 +4,8 @@ import bisect
 import json
 from collections import OrderedDict
 from pathlib import Path
+from threading import RLock
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -56,7 +58,7 @@ def write_store(network, root, regular_times, *, chunk_samples=32):
 class SnapshotSource(NetworkState):
     """Each worker opens shared read-only arrays; no full trace/model is pickled."""
 
-    def __init__(self, root, *, _share_static=False):
+    def __init__(self, root, *, _share_static=False, initial_spec=None):
         self.root = Path(root)
         self._share_snapshot_metadata = _share_static
         self.manual_disabled_links = set()
@@ -84,14 +86,52 @@ class SnapshotSource(NetworkState):
         self.position_shards = value["position_shards"]
         self.shard_offsets = [s["offset"] for s in self.position_shards]
         self._positions = OrderedDict()
-        timeline = json.loads(
-            (self.root / "state/timeline.json").read_text(encoding="utf-8")
-        )
+        self._position_lock = RLock()
+        if initial_spec is None:
+            timeline = json.loads(
+                (self.root / "state/timeline.json").read_text(encoding="utf-8")
+            )
+        else:
+            from astermind.engine.state.physical_dataset import validate_stored_link_budgets
+            from astermind.engine.setup.faults import physical_network_settings
+
+            metadata = self.physical_attributes.metadata
+            validate_stored_link_budgets(metadata["network"], self.edges)
+            stored_spec = NetworkSpec.from_value(metadata["network"])
+            if physical_network_settings(initial_spec.to_dict()) != physical_network_settings(stored_spec.to_dict()):
+                self.close()
+                raise ValueError("offline frame data does not match runtime network configuration")
+            self.spec = initial_spec
+            trace_manifest = json.loads(
+                (self.root / "orbit_trace/trace_manifest.json").read_text(encoding="utf-8")
+            )
+            if trace_manifest["trace_id"] != metadata["trace_id"]:
+                self.close()
+                raise ValueError("offline position and link-state traces differ")
+            self.trace = SimpleNamespace(time=trace_manifest["time"], trace_id=metadata["trace_id"])
+            timeline = {key: metadata[key] for key in ("frames", "events")}
+            timeline["observed_faults"] = {}
+            self.allocation_checks = metadata["allocation_checks"]
+        self.edge_by_id = {edge["link_id"]: edge for edge in self.edges}
+        self.candidate_edge_ids = set(self.edge_by_id)
+        self.geometry_sample_times = tuple(self.environment_times)
+        self.windows = {}
+        self.ground_positions = self.physical_attributes.metadata["ground_positions"]
+        self.sun_positions = self.physical_attributes.metadata["sun_positions"]
+        self.sun_times = tuple(row[0] for row in self.sun_positions)
+        self.calendars, self.shared_load, self.shared_pool_load = {}, {}, {}
+        self.active_faults, self.fault_boundaries, self.revision = {}, set(), 0
         for name, rows in timeline.items():
             setattr(self, name, rows)
-        self.link_times = {
-            key: [v["time_s"] for v in rows] for key, rows in self.link_frames.items()
-        }
+        if "link_frames" in timeline:
+            self.link_times = {
+                key: [v["time_s"] for v in rows] for key, rows in self.link_frames.items()
+            }
+        else:
+            store = self.physical_attributes.link_store
+            if store is None:
+                raise ValueError("snapshot store is missing the offline link-state index")
+            self.link_frames, self.link_times = store.frames, store.times
         self.frame_times = [v["time_s"] for v in self.frames]
 
     def __enter__(self):
@@ -102,10 +142,14 @@ class SnapshotSource(NetworkState):
         self.close()
 
     def close(self):
-        self.physical_attributes.close_read_session()
+        self.physical_attributes.close()
         self._positions.clear()
 
     def position(self, node_id, time_s):
+        with self._position_lock:
+            return self._position_at(node_id, time_s)
+
+    def _position_at(self, node_id, time_s):
         if not self.start_s <= time_s <= self.end_s:
             raise ValueError("position outside snapshot store")
         index = bisect.bisect_right(self.environment_times, time_s) - 1

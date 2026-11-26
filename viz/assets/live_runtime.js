@@ -248,14 +248,13 @@ if(identity){refresh();playbackTick()}else if(sourceRun){
  $('startScene').hidden=$('launchChoices').hidden=true;
  $('startFromRun').hidden=false;$('startFromRun').disabled=true;
  $('launchDescription').textContent='使用原配置重新运行。';
- get('/runs/'+encodeURIComponent(sourceRun)+'/input').then(value=>{const ready=[1,'orbitserve.native_cells.v1'].includes(value.schema_version)?value.physical_dataset&&value.physical&&value.cells?.length:value.physical_network;if(!ready)throw Error('原运行缺少完整实验配置');$('launchDescription').textContent='原配置已就绪';$('startFromRun').disabled=false;timeline()}).catch(error=>$('launchStatus').textContent=error.message);
+ get('/runs/'+encodeURIComponent(sourceRun)+'/input').then(value=>{const ready=[1,'orbitserve.native_cells.v1'].includes(value.schema_version)?(value.physical_dataset||value.physical_network)&&value.physical&&value.cells?.length:value.physical_network;if(!ready)throw Error('原运行缺少完整实验配置');$('launchDescription').textContent='原配置已就绪';$('startFromRun').disabled=false;timeline()}).catch(error=>$('launchStatus').textContent=error.message);
 }else get('/scene-catalog').then(rows=>{for(const row of rows)option($('sceneSelect'),row.id,row.name);if(!rows.length)$('launchStatus').textContent='暂无场景，先新建任务。';timeline()}).catch(error=>$('launchStatus').textContent=error.message);
 if(!identity&&!sourceRun){
  document.querySelector('main').classList.add('awaiting-live');
  $('launchDescription').textContent='启动后推进真实仿真，并可干预节点与链路。';
  $('launchStatus').textContent='历史回放和分析位于实验结果。';
  $('browseResults').hidden=false;
- get('/current-experiment').then(async current=>{if(!current.id)return;const job=await get('/runs/'+encodeURIComponent(current.id)+'/status');if(job.interactive&&job.state==='running'&&job.runtime_url)location.replace(job.runtime_url)}).catch(()=>{});
 }
 
 $('sceneSelect').onchange=async()=>{

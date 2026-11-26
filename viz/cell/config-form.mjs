@@ -153,10 +153,13 @@ export function renderConfigForm(container, root, keys, schema, onChange, choice
     const fixedBaudRate = full === 'fso.tx.baud_rate_ghz';
     if ((value === null || value === undefined) && !unsetCard) {
       const automatic = ['max_model_len','max_batched_tokens','num_kv_blocks','kv_block_size_tokens'].includes(key);
-      const note = fixedBaudRate ? "根据候选波特率自动选档" : automatic ? "自动 · 等待后端预检" : "未设置 / 未启用";
+      const fixedKvPool = key === "fast_kv_pool_blocks";
+      const note = fixedBaudRate ? "根据候选波特率自动选档"
+        : fixedKvPool ? "自动按可用显存分配"
+        : automatic ? "自动 · 等待后端预检" : "未设置 / 未启用";
       const status = el("small", note);
       if (automatic) status.dataset.schedulerValue = key;
-      wrap.append(el("span", title, "field-title"), status, button(fixedBaudRate ? "设为固定波特率" : "设置", () => {
+      wrap.append(el("span", title, "field-title"), status, button(fixedBaudRate ? "设为固定波特率" : fixedKvPool ? "指定块数" : "设置", () => {
         setAt(root, path, choices.seed?.(path, spec) ?? defaultValue(spec, defs)); rerender(path);
       })); return wrap;
     }
@@ -225,7 +228,10 @@ export function renderConfigForm(container, root, keys, schema, onChange, choice
       value.forEach((item, index) => {
         const row = el("details", undefined, "repeat-item"); row.open = true; row.dataset.detailPath = JSON.stringify([...path, index]);
         const desc = item?.name || item?.operation || (item?.worker_pool ? `${item.worker_pool} DP${item.parallel_coordinate.dp} / PP${item.parallel_coordinate.pp} / TP${item.parallel_coordinate.tp}` : item?.satellite_id ? `${item.satellite_id} / 卡 ${item.local_index}` : item?.source ? `${item.source} → ${item.target}` : `第 ${index + 1} 项`);
-        row.append(el("summary", desc));
+        const poolRole = full === 'deployment.worker_pools' && root.deployment.mode === 'pd_disagg'
+          ? {prefill:'Prefill', decode:'Decode'}[item.role] : null;
+        const heading = poolRole && item.name !== item.role ? `${poolRole} · ${desc}` : poolRole || desc;
+        row.append(el("summary", heading));
         const rendered = field(spec.prefixItems?.[index] || spec.items || {}, [...path, index], depth + 1); if (rendered) row.append(rendered);
         if (!spec.prefixItems && full !== "deployment.placements") {
           const remove = button("删除此项", () => {
@@ -336,7 +342,7 @@ export function renderConfigForm(container, root, keys, schema, onChange, choice
       if (["timestamp", "default_hardware_id", "resource_id", "source_id", "provenance", "max_total_num_tokens_source"].includes(key)) wrap.className += " field-wide";
     }
     if (nullable && !['detail_prediction_method','memory_policy_file'].includes(key)) {
-      const caption = fixedBaudRate ? "改为自动选档" : key === "max_batched_tokens" ? "改为自动" : "清空";
+      const caption = fixedBaudRate ? "改为自动选档" : ["max_batched_tokens","fast_kv_pool_blocks"].includes(key) ? "改为自动" : "清空";
       wrap.append(button(caption, () => { setAt(root, path, null); rerender(); }));
     }
     return wrap;

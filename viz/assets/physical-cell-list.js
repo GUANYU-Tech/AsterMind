@@ -11,7 +11,8 @@ function editCell(formation,key,capabilities,scene,render) {
   const layout=cellLayout(formation,key,memberIds(formation,key,geometry));
   const dialog=el('dialog');dialog.className='cell-workspace-dialog';
   dialog.setAttribute('aria-label','编辑算力编队 '+id);
-  const header=el('header');const title=el('strong',id);
+  const header=el('header');const title=el('strong',formation.compute_parameters?.cell_names?.[key] || id);
+  title.title=id;
   const cancel=button('取消',()=>dialog.close());header.append(title,cancel);
   const frame=el('iframe');frame.title='算力编队编辑器';
   const footer=el('footer');const status=el('span','正在打开编队编辑器…');status.setAttribute('role','status');
@@ -35,7 +36,7 @@ function editCell(formation,key,capabilities,scene,render) {
       }
       if (!dialog.open) return;
       applyCell(formation,key,geometry,layout,all);
-      scene.applyShared(layout.configuration);dialog.close();render();
+      dialog.close();render();
     },
   };
   frame.src='/cell/?context=physical';
@@ -56,13 +57,29 @@ export function showCellList(host,formation,capabilities,mode,render,focusId) {
     const layout=settings?.cells?.[key] || settings?.template;
     const count=formation.source.type==='tle'?formation.source.cell_members[key].length:geometry.satellites_per_cluster;
     const row=el('div');row.className='formation-cell-row';
-    const identity=el('div');identity.append(el('strong','Cell '+(page*size+i+1)),el('small',id));
+    const identity=el('div'), name=el('input');
+    name.type='text';name.placeholder='Cell '+(page*size+i+1);
+    name.value=settings?.cell_names?.[key] || '';
+    name.setAttribute('aria-label','编队名称');name.title=id;
+    const machineId=el('small',id);
+    machineId.hidden=Boolean(name.value);
+    name.onchange=()=>{
+      const params=formation.compute_parameters??={cells:{}};
+      const names=params.cell_names??={};
+      name.value=name.value.trim();
+      if(name.value)names[key]=name.value;else delete names[key];
+      machineId.hidden=Boolean(name.value);
+      document.dispatchEvent(new Event('modelchange'));
+    };
+    identity.append(name,machineId);
     const hardware=layout?.deployment.hardware_id || capabilities.default_configuration.hardware.default_hardware_id;
     const shape=formation.source.type==='tle'?'TLE':geometry.motion_model==='static_formation'
       ? formationNames[geometry.topology] : geometry.motion_model==='reference_fixed_lvlh'?'自定义相对位置':(geometry.grid_shape || count+'x1')+' 网格';
-    const summary=el('span',[count+' 颗卫星',capabilities.su_profiles[hardware]?.name || hardware,(layout?.deployment.gpus_per_satellite??1)+' 卡/星',
+    const summary=el('span');
+    const parts=[count+' 颗卫星',capabilities.su_profiles[hardware]?.name || hardware,(layout?.deployment.gpus_per_satellite??1)+' 卡/星',
       shape,layout?.deployment.model?.split('/').at(-1)?.replace(/\.json$/,''),
-      settings?.cells?.[key] || formation.cell_overrides?.[id]?'单独配置':settings?.template?'星座模板':'默认配置'].filter(Boolean).join(' · '));
+      settings?.cells?.[key] || formation.cell_overrides?.[id]?'单独配置':settings?.template?'星座模板':'默认配置'].filter(Boolean);
+    parts.forEach((part,index)=>summary.append(index ? ' · ' : '',el('span',part)));
     const edit=button('编辑编队',()=>{try{editCell(formation,key,capabilities,mode(),render)}catch(e){document.getElementById('status').textContent=e.message}});
     edit.setAttribute('aria-label','编辑编队 '+id);
     row.append(identity,summary,edit);list.append(row);

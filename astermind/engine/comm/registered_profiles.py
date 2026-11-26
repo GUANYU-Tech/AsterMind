@@ -1,4 +1,5 @@
 """Use Uni3Sim's pinned profile catalog with Comm's physical routes."""
+from dataclasses import replace
 from functools import lru_cache
 from itertools import permutations
 from math import ceil, isfinite
@@ -154,6 +155,69 @@ def _required_pairs(task):
     return tuple(permutations(ranks, 2))
 
 
+def _whole_parameters(task, profile, protocol, algorithm, capacity, latency, policy):
+    phase_policy = profile.protocol_policy
+    fixed = max(latency / 1000, phase_policy.phase_fixed_for_protocol(protocol))
+    rate = phase_policy.ring_bandwidth_for(protocol, task.operation, len(task.participants), capacity)
+    parameters = dict(profile.model_parameters, ring_bw_bytes_per_us=rate,
+                      packet_bw_bytes_per_us=rate)
+    if _whole_large_message(task, phase_policy):
+        parameters['wire_efficiency'] = phase_policy.large_message_wire_efficiency
+    overrides = policy.resolved_intra_profile.su.overrides.model_dump(exclude_none=True)
+    startup = overrides.pop('startup_us', phase_policy.startup_for_protocol(protocol))
+    fixed_override = overrides.pop('phase_fixed_us', None)
+    fixed = max(latency / 1000, fixed if fixed_override is None else fixed_override)
+    parameters.update(overrides, link_latency_us=fixed)
+    parameters['packet_bw_bytes_per_us'] = parameters['ring_bw_bytes_per_us']
+    if algorithm == 'tree':
+        parameters['t_min_switch_us'] = max(latency / 1000, parameters['t_min_switch_us']
+                                            if fixed_override is None else fixed_override)
+        fixed = parameters['t_min_switch_us']
+    for key in ('ring_bw_bytes_per_us', 'packet_bw_bytes_per_us', 'tree_bw_per_level_bytes_per_us',
+                'fullmesh_bw_bytes_per_us'):
+        parameters[key] = min(parameters[key], capacity)
+    return parameters, startup, fixed
+
+
+def _whole_large_message(task, phase_policy):
+    cutoff = phase_policy.large_message_min_bytes
+    return (cutoff is not None and task.operation == 'all_reduce'
+            and len(task.participants) == 2 and task.bytes >= cutoff)
+
+
+def bind_registered_ring(task, policy, card, bandwidth_gbps, latency_ns, port):
+    """Price the registered ring after Fast has certified its routes and policy."""
+    profile = registered(card, task.operation, 'ring', LINKS[card])
+    prototype = replace(task, algorithm='ring')
+    width = len(task.participants)
+    capacity = min(bandwidth_gbps * 125, port)
+    preset = profile.surrogate_topology
+    topology = None if preset is None else upstream_theory().Topology(preset.bisection_bw_bytes_per_us,
+                                                                     preset.hop_count)
+    entries = {}
+
+    def evaluate(size, _):
+        if task.operation == 'all_reduce' and size % width:
+            return None
+        actual = replace(prototype, bytes=size)
+        try:
+            protocol = _adapter()._selected_vendor_protocol(actual, profile)
+        except (ValueError, NotImplementedError):
+            return None
+        key = protocol, _whole_large_message(actual, profile.protocol_policy)
+        if key not in entries:
+            parameters, startup, _ = _whole_parameters(
+                actual, profile, protocol, 'ring', capacity, latency_ns, policy)
+            entries[key] = upstream_theory().TheoryDerivedSurrogate(**parameters), startup
+        model, startup = entries[key]
+        data_bytes = size * width if task.operation == 'all_gather' else size
+        value = model.predict(data_bytes, width, 'ring', profile.credits, startup_us=startup,
+                              topology=topology, collective=task.operation.replace('_', ''))
+        return elapsed_ns(value) * 10**9
+
+    return evaluate
+
+
 def whole_registered(task, routes, policy, selection):
     if task.operation not in ('all_reduce', 'all_gather'):
         raise ProfileMiss('no registered whole profile for this operation')
@@ -209,28 +273,7 @@ def whole_registered(task, routes, policy, selection):
     capacity = cap * 125
     ports = [gpu_port_bandwidth(gpu, hardware, policy) for gpu in task.participants]
     capacity = min(capacity, *(port or capacity for port in ports))
-    phase_policy = profile.protocol_policy
-    fixed = max(latency / 1000, phase_policy.phase_fixed_for_protocol(protocol))
-    rate = phase_policy.ring_bandwidth_for(protocol, task.operation, len(task.participants),
-                                          capacity)
-    parameters = dict(profile.model_parameters, ring_bw_bytes_per_us=rate,
-                      packet_bw_bytes_per_us=rate)
-    if (phase_policy.large_message_min_bytes is not None and task.operation == 'all_reduce'
-            and len(task.participants) == 2 and task.bytes >= phase_policy.large_message_min_bytes):
-        parameters['wire_efficiency'] = phase_policy.large_message_wire_efficiency
-    overrides = policy.resolved_intra_profile.su.overrides.model_dump(exclude_none=True)
-    startup = overrides.pop('startup_us', phase_policy.startup_for_protocol(protocol))
-    fixed_override = overrides.pop('phase_fixed_us', None)
-    fixed = max(latency / 1000, fixed if fixed_override is None else fixed_override)
-    parameters.update(overrides, link_latency_us=fixed)
-    parameters['packet_bw_bytes_per_us'] = parameters['ring_bw_bytes_per_us']
-    if algorithm == 'tree':
-        parameters['t_min_switch_us'] = max(latency / 1000, parameters['t_min_switch_us']
-                                            if fixed_override is None else fixed_override)
-        fixed = parameters['t_min_switch_us']
-    for key in ('ring_bw_bytes_per_us', 'packet_bw_bytes_per_us', 'tree_bw_per_level_bytes_per_us',
-                'fullmesh_bw_bytes_per_us'):
-        parameters[key] = min(parameters[key], capacity)
+    parameters, startup, fixed = _whole_parameters(task, profile, protocol, algorithm, capacity, latency, policy)
     if algorithm in ('fc2', 'mesh'):
         from collections import Counter
         peers = len(task.participants) - 1

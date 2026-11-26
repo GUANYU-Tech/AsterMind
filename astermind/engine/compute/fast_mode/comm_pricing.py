@@ -9,6 +9,7 @@ from random import Random
 from astermind.engine.clock import Time
 from astermind.engine.comm.native_intra import native_enabled
 from astermind.engine.comm.operator import CommunicationOperator
+from .frame_quote import FrameQuoteMemo
 
 
 def integer_dispatch_rows(rows, probability, destination_order):
@@ -39,6 +40,7 @@ class RankCommunicationPricing:
                 or native_enabled(runtime.policy, cell_id)):
             raise ValueError("this rank program requires Direct EP and COMM_Backend surrogate pricing")
         self.runtime, self.program, self.devices, self.cell_id = runtime, program, devices, cell_id
+        self.frame_quotes = FrameQuoteMemo()
         self.stages = tuple(tuple(Counter(stage).items()) for stage in program.stages)
         random = Random(42)
         self.destination_order = {
@@ -162,7 +164,9 @@ class RankCommunicationPricing:
         from .quote import BatchCommunication
 
         quote = BatchCommunication(self.runtime)
-        return self.quote_batch(batch, quote), quote.routes.frame.valid_until_s
+        deadline = quote.routes.frame.valid_until_s
+        key = batch.replica_tokens, batch.replica_logits
+        return self.frame_quotes.price(quote, key, lambda selected: self.quote_batch(batch, selected)), deadline
 
     def quote_batch(self, batch, quote):
         """Keep the task inventory while swapping a certified communication estimator for calibration."""

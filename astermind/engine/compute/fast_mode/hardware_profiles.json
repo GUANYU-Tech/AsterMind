@@ -1,0 +1,55 @@
+{
+  "nvidia_h200": {
+    "sku": "NVIDIA H200 SXM",
+    "bf16_flops": 989500000000000,
+    "fp16_flops": 989500000000000,
+    "fp8_flops": 1979000000000000,
+    "hbm_bytes_per_s": 4800000000000,
+    "hbm_capacity_gib": 141,
+    "sources": [
+      "https://www.nvidia.com/en-us/data-center/h200/"
+    ],
+    "notes": "SXM vendor sparse rates divided by two for dense arithmetic. Capacity uses the existing binary allocation convention."
+  },
+  "nvidia_a800": {
+    "sku": "NVIDIA A800 80 GB SXM4",
+    "bf16_flops": 312000000000000,
+    "fp16_flops": 312000000000000,
+    "fp8_flops": null,
+    "hbm_bytes_per_s": 2039000000000,
+    "hbm_capacity_gib": 80,
+    "sources": [
+      "https://lenovopress.lenovo.com/lp1813-thinksystem-nvidia-a800-pcie-gpu"
+    ],
+    "notes": "Table 2, 80 GB SXM column and dense Tensor Core rates."
+  },
+  "ascend_910b": {
+    "sku": "Huawei Ascend 910B2, 64 GiB",
+    "bf16_flops": 353894400000000,
+    "fp16_flops": 353894400000000,
+    "fp8_flops": null,
+    "hbm_bytes_per_s": 1600000000000,
+    "hbm_capacity_gib": 64,
+    "sources": [
+      "../upstream/microbench/ascend_910b/references/Ascend910B2.ini",
+      "https://e.huawei.com/cn/products/computing/ascend/atlas-800t-a2",
+      "https://serverflow.ru/upload/iblock/3bf/q2u89s80gevj3m17qvilz9qxunjf4x9e/%D0%A0%D1%83%D0%BA%D0%BE%D0%B2%D0%BE%D0%B4%D1%81%D1%82%D0%B2%D0%BE%20%D0%BF%D0%BE%D0%BB%D1%8C%D0%B7%D0%BE%D0%B2%D0%B0%D1%82%D0%B5%D0%BB%D1%8F%20Huawei%20Atlas%20800T%20A2.pdf"
+    ],
+    "notes": "Tensor envelope derived from Huawei CANN's pinned B2 platform declaration: 24 Cube cores x 1.8 GHz x 2 x 16 x 16 x 16 FLOP. Huawei Atlas 800T A2 User Guide v20 section 3.1 gives the 64 GB and 1600 GB/s HBM interface; its selectable 313/376 FP16 bins have no named B2 mapping."
+  },
+  "metax_c500": {
+    "sku": "MetaX C500 PCIe 350 W, 64 GiB",
+    "bf16_flops": 240000000000000,
+    "fp16_flops": 240000000000000,
+    "fp8_flops": null,
+    "hbm_bytes_per_s": 1800000000000,
+    "hbm_capacity_gib": 64,
+    "sources": [
+      "https://www.metax-tech.com/prod.html?cid=107&id=21",
+      "https://ici.oss-cn-hongkong.aliyuncs.com/ici/AI%20Cards%20Comparison%2024%20September.r400.pdf",
+      "https://github.com/MetaX-MACA/mcoplib/blob/main/Skills/optimized-cuda-kernels/references/c500-optimization-guide.md",
+      "../upstream/microbench/metax_c500/compute/matrix/mma_throughput.cpp"
+    ],
+    "notes": "Compute and bandwidth use the 350 W product card reproduced on page 1 of the distributor sheet. The retained architecture/matrix benchmark supports the rounded 240 TFLOP/s envelope. The MetaX optimization guide separately cites 1.55 TB/s; that figure is not used for this nameplate profile."
+  }
+}

@@ -7,6 +7,15 @@ import signal
 import time
 
 
+def write_status(job, state, **extra):
+    job.update(state=state, **extra)
+    if job.get('output'):
+        target = Path(job['output']) / 'status.json'
+        temporary = target.with_suffix('.json.tmp')
+        temporary.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding='utf-8')
+        temporary.replace(target)
+
+
 def processes(root, run_id):
     if not re.fullmatch(r'[a-zA-Z0-9_-]+', run_id):
         raise ValueError('invalid run ID')

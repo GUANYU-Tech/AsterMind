@@ -48,7 +48,7 @@ def generate(root, payload):
     upstream = enable_device_native()
     from astermind.builder.scene import build_scene
     from compute_options import prepare_deployment
-    from studio import physical_data
+    from studio import load, physical_data
     if set(payload) - {'physical_model_id', 'deployment', 'cell_deployments', 'requests', 'migrations',
                        'runtime_network', 'routing', 'cell_selection', 'refresh_workloads'}:
         raise ValueError('生成配置包含未知字段')
@@ -58,11 +58,18 @@ def generate(root, payload):
     arguments = dict(requests=payload.get('requests', ()), migrations=payload.get('migrations', ()),
                      runtime_network=payload.get('runtime_network'), routing=payload.get('routing'),
                      cell_selection=payload.get('cell_selection', 'least_loaded'))
-    if 'cell_deployments' in payload:
-        return build_cell_deployments(data['physical_dataset'], payload, upstream, arguments)
     options = deepcopy(payload.get('deployment', {}))
+    communication = options.setdefault('communication', {})
+    if options.get('compute_mode') in ('fast_mode', 'batch_roofline'):
+        if 'link_bandwidth_factors' not in communication:
+            document = load(root, 'physical', payload['physical_model_id'])
+            factors = (document.get('compute_configuration') or {}).get('link_bandwidth_factors')
+            if factors:
+                communication['link_bandwidth_factors'] = factors
+    if 'cell_deployments' in payload:
+        return build_cell_deployments(data['physical_dataset'], {**payload, 'deployment': options}, upstream, arguments)
     if options.get('compute_mode') not in ('fast_mode', 'batch_roofline'):
-        options.setdefault('communication', {}).setdefault('intra_mode', 'IntraSatelliteRoofline')
+        communication.setdefault('intra_mode', 'IntraSatelliteRoofline')
     deployment, hardware = prepare_deployment(options, upstream)
     defaults = {key: hardware[key] for key in ('gpu_link_bandwidth_gbps','gpu_link_latency_ns')
                 if key not in deployment.model_fields_set and hardware[key] is not None}
@@ -107,7 +114,7 @@ def build_cell_deployments(dataset, payload, upstream, arguments):
             profile = hardware.get(options.get('hardware_id'))
             if model is None or profile is None:
                 raise ValueError('请选择后端目录中的模型和 GPU 卡型')
-            options.update(hardware=profile['file'], compute_mode=base.compute_mode)
+            options.update(hardware=profile['file'], compute_mode=base.compute_mode, fast_link_contention=base.fast_link_contention)
             ep = options.get('expert_parallel', False)
             dp = options.get('dp', 1)
             if type(dp) is not int or dp < 1 or (dp > 1 and not ep) or (ep and not model['experts']):

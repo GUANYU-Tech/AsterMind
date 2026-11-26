@@ -46,7 +46,7 @@ HOMEPAGE_FILES = {
 }
 
 
-def prepare_physical(identity):
+def prepare_physical(identity, *, independent=False):
     from studio import key, physical_data, physical_input
     from astermind.builder.physical.network_inputs import snapshot_network_input
     from astermind.builder.physical.physical_dataset import input_fingerprint, validate_dataset_input
@@ -65,7 +65,7 @@ def prepare_physical(identity):
                 return {**run_status(data['run_id']), 'physical_model_id': identity}
         fingerprint = input_fingerprint(snapshot_network_input(physical, ROOT))
         reused = None
-        indexes = [*(ROOT / 'local/results/network').glob('*/physical_dataset.json'),
+        indexes = [] if independent else [*(ROOT / 'local/results/network').glob('*/physical_dataset.json'),
                    *(ROOT / 'local/results/network').glob('*/network/physical_dataset.json')]
         for index in indexes:
             try:
@@ -122,6 +122,11 @@ def result_index(output):
     current = folder / "network_result.json"
     return current if current.exists() else folder / "network_replay.json"
 
+def has_replay_frames(folder):
+    return ((folder / 'state/index.json').is_file()
+            or (folder / 'frames/frame-000000.json.gz').is_file())
+
+
 def saved_run_input(run_id):
     if not re.fullmatch(r"[a-zA-Z0-9_-]+", run_id):
         raise ValueError("invalid run ID")
@@ -169,13 +174,9 @@ def command_for(path, output):
 
 
 def status(job, state, **extra):
+    from tasks import write_status
     with LOCK:
-        job.update(state=state, **extra)
-        if job.get("output"):
-            target = Path(job["output"]) / "status.json"
-            temporary = target.with_suffix('.json.tmp')
-            temporary.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
-            temporary.replace(target)
+        write_status(job, state, **extra)
 
 
 def run_status(run_id):
@@ -194,7 +195,8 @@ def run_status(run_id):
                 raise ValueError('invalid task status')
         except ValueError:
             job = {'id':run_id,'state':'unknown','error':'状态记录损坏；可查看日志或删除此任务。'}
-        if job['state'] == 'running':
+        from live import SESSIONS
+        if job['state'] == 'running' and run_id not in SESSIONS:
             job.update(state='interrupted', error='控制台重启前的任务未记录完成，请检查日志；已落盘文件仍保留。')
     elif result_index(output).is_file():
         job = {'id': run_id, 'state': 'completed'}
@@ -214,8 +216,11 @@ def run_status(run_id):
     if job.get('interactive'):
         from live import SESSIONS
         session = SESSIONS.get(run_id)
-        active = session is not None and session.payload['state'] in {'preparing', 'paused', 'advancing', 'finalizing'}
-        job.update(can_stop=active and job['state']!='completed', can_rerun=not active, can_delete=not active,
+        state = session.payload['state'] if session else None
+        active = state in {'preparing', 'paused', 'advancing', 'finalizing', 'stopping'}
+        if state == 'stopping' and job['state'] == 'running':
+            job['state'] = 'stopping'
+        job.update(can_stop=active and job['state'] not in {'completed','stopping'}, can_rerun=not active, can_delete=not active,
                    can_stop_and_delete=False)
     if job.get('native_preset'):
         job['can_rerun'] = False  # The native preset is restarted from its dedicated entry.
@@ -294,11 +299,6 @@ def start_comparison(value):
 
 def _start(value):
     require_linux()
-    with LOCK:
-        if any(j["state"] == "running" for j in JOBS.values()):
-            raise ValueError("已有实验运行中，请等待完成；避免多个任务争用预留 CPU")
-    if any(row['state'] in {'running','stopping'} for row in task_catalog()):
-        raise ValueError('已有实验在运行，请先在任务管理中停止或等待完成')
     run_id, path = save_input(value)
     output = ROOT / "local/results/network" / run_id
     output.mkdir(parents=True, exist_ok=False)
@@ -490,9 +490,12 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError('TLE filename required')
                 _,_,file=sample_paths(ROOT,name[:-4])
                 return self.respond(file.read_bytes(),'text/plain')
-            if path in {'/physical-catalog', '/scene-catalog'}:
+            if path == '/physical-catalog':
+                from studio import physical_catalog
+                return self.respond(physical_catalog(ROOT))
+            if path == '/scene-catalog':
                 from studio import catalog
-                return self.respond(catalog(ROOT, 'physical' if path=='/physical-catalog' else 'scenes'))
+                return self.respond(catalog(ROOT, 'scenes'))
             if path == '/physical-datasets':
                 from studio import catalog, physical_data
                 rows = []
@@ -659,11 +662,11 @@ class Handler(BaseHTTPRequestHandler):
                 if parts[2]=="environment-index":
                     artifact=result_index(output)
                     if not artifact.is_file():return self.respond({"error":"environment index missing"},code=404)
-                    if artifact.stat().st_size>10_000_000 and not (replay_root(output)/'state/index.json').is_file():return self.respond({"error":"legacy environment must be regenerated"},code=400)
+                    if artifact.stat().st_size>10_000_000 and not has_replay_frames(replay_root(output)):return self.respond({"error":"legacy environment must be regenerated"},code=400)
                     from physical_frames import environment_index
                     return self.respond(environment_index(replay_root(output)))
                 if parts[2]=="viewer" and result_index(output).is_file():
-                    if result_index(output).stat().st_size > 10_000_000 and not (replay_root(output)/'state/index.json').is_file():
+                    if result_index(output).stat().st_size > 10_000_000 and not has_replay_frames(replay_root(output)):
                         raise ValueError("旧版结果为整小时大文件。请选择新版按帧实验，避免浏览器内存过高。")
                     from physical_frames import environment_index
                     replay=environment_index(replay_root(output))
@@ -717,7 +720,7 @@ class Handler(BaseHTTPRequestHandler):
                     value = interactive_run_input(payload['run_id']) if payload.get('run_id') else scene_input(ROOT, payload['scene_id'])
                 if value.get('schema_version') in (1, 'orbitserve.native_cells.v1'):
                     from native_scene_live import start as start_native_scene
-                    return self.respond(start_native_scene(ROOT, value), code=202)
+                    return self.respond(start_native_scene(ROOT, value, scene_id=payload.get('scene_id')), code=202)
                 from studio import validate_model
                 validate_model(value['physical_network'], ROOT)
                 job = start_live(ROOT, value)
@@ -768,8 +771,8 @@ class Handler(BaseHTTPRequestHandler):
                 saved=saved_run_input(run_id)
                 if saved.get('schema_version') in (1, 'orbitserve.native_cells.v1'):
                     from native_scene_live import start as start_native
-                    job=start_native(ROOT,saved,automatic=True)
-                    job=run_status(job['id'])
+                    job=start_native(ROOT,saved,automatic=True,scene_id=current.get('scene_id'))
+                    return self.respond(run_status(job['id']),code=202)
                 else:
                     job=start(saved)
                 if current.get('physical_model_id'):
@@ -822,14 +825,14 @@ class Handler(BaseHTTPRequestHandler):
                 value = scene_input(ROOT,payload['id'])
                 if value.get('schema_version') in (1, 'orbitserve.native_cells.v1'):
                     from native_scene_live import start as start_native_scene
-                    return self.respond(start_native_scene(ROOT, value, automatic=True), code=202)
+                    return self.respond(start_native_scene(ROOT, value, automatic=True, scene_id=payload['id']), code=202)
                 job=start(value)
                 status(job,job['state'],scene_id=payload['id'],runtime_url=f"/runs/{job['id']}/runtime")
                 from current_experiment import select
                 select(ROOT, job['id'])
                 return self.respond(job,code=202)
             if self.path in {'/launch-physical', '/prepare-physical'}:
-                return self.respond(prepare_physical(payload['id']), code=202)
+                return self.respond(prepare_physical(payload['id'], independent=payload.get('independent') is True), code=202)
             if self.path == '/physical-route':
                 from studio import key
                 from physical_preview import probe_routes

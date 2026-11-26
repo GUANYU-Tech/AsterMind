@@ -1,6 +1,5 @@
 import {normalizeComputeSettings} from '../cell/compute-config.mjs';
 import {mappingDraft} from '../cell/deployment-mapping.mjs';
-import {setAutomaticDeployment, automaticDeployment} from '../cell/resource-sync.mjs';
 import {editDependencies} from '../cell/config-edit.mjs';
 
 const gpuAddress = (satellite, slot) => `${satellite}/gpu${slot}`;
@@ -10,7 +9,9 @@ export function sceneCellDraft(capabilities, members, mode, layout) {
   const draft = normalizeComputeSettings(structuredClone(layout?.configuration ?? capabilities.default_configuration), capabilities);
   delete draft.requests;
   if (layout?.configuration) {
-    setAutomaticDeployment(draft,layout.automatic_deployment ?? false);
+    if (mode === 'fast_mode' && !Object.hasOwn(draft,'fast_kv_pool_blocks')) {
+      draft.fast_kv_pool_blocks=layout.deployment?.fast_kv_pool_blocks ?? null;
+    }
     if (draft.compute_mode !== mode) {
       draft.compute_mode = mode;
       editDependencies(draft,['compute_mode'],mode,capabilities);
@@ -22,9 +23,11 @@ export function sceneCellDraft(capabilities, members, mode, layout) {
   const scheduler = draft.scheduler[base.name];
   const fast = mode === 'fast_mode';
   Object.assign(draft, {
+    ...(options.fast_roofline?{fast_roofline:structuredClone(options.fast_roofline)}:{}),
     compute_mode: mode, model: options.model ? modelId(options.model) : draft.model,
     detail_prediction_method: fast ? null : options.detail_prediction_method || 'auto',
     memory_policy_file: fast ? options.memory_policy_file || '' : '',
+    fast_kv_pool_blocks: fast ? options.fast_kv_pool_blocks ?? null : null,
     fast_glm_dsa_score: fast ? options.fast_glm_dsa_score || '' : '',
     expert_routing_seed: options.expert_routing_seed ?? 0,
     collective_policies: structuredClone(layout?.collective_policies || []),
@@ -69,7 +72,6 @@ export function sceneCellDraft(capabilities, members, mode, layout) {
       }
     }
   }
-  setAutomaticDeployment(draft,false);
   return draft;
 }
 
@@ -92,10 +94,12 @@ export function sceneCellLayout(draft, capabilities, members, {remap=false}={}) 
   if (new Set(ranks).size!==ranks.length) throw Error('Rank 需要映射到不同的 GPU');
   return {
     deployment:{
+      ...(draft.compute_mode==='fast_mode' && draft.fast_roofline?{fast_roofline:structuredClone(draft.fast_roofline)}:{}),
       model:model.id,hardware_id:profile.id,gpus_per_satellite:cards,tp,pp,dp,expert_parallel:ep,
       expert_routing_seed:model.experts?draft.expert_routing_seed:null,
       detail_prediction_method:draft.detail_prediction_method,memory_policy_file:draft.memory_policy_file||null,
       fast_glm_dsa_score:draft.fast_glm_dsa_score||null,max_requests:settings.max_requests,
+      ...(draft.compute_mode==='fast_mode'?{fast_kv_pool_blocks:draft.fast_kv_pool_blocks ?? null}:{}),
       max_model_len:v.max_model_len,max_batched_tokens:settings.max_batched_tokens,
       kv_block_size_tokens:settings.kv_block_size_tokens,num_kv_blocks:settings.num_kv_blocks,
       prefix_caching:v.enable_prefix_caching,enable_chunked_prefill:v.enable_chunked_prefill,
@@ -106,7 +110,7 @@ export function sceneCellLayout(draft, capabilities, members, {remap=false}={}) 
     scale_out:domains>1?{bandwidth_gbps:hw.intra_satellite_bandwidth_gbps,latency_ns:hw.intra_satellite_latency_ns}:null,
     collective_policies:structuredClone(draft.collective_policies),
     ...(draft.topology.source === 'file' || draft.deployment.mode==='pd_disagg'
-      ? {configuration:structuredClone(draft),automatic_deployment:automaticDeployment(draft)} : {}),
+      ? {configuration:structuredClone(draft)} : {}),
   };
 }
 

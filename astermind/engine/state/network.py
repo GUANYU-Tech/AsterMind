@@ -38,7 +38,12 @@ class NetworkState:
             self.physical_attributes = PhysicalAttributes(physical_state)
             prepared = self.physical_attributes.metadata
             from astermind.engine.setup.faults import physical_network_settings
-            if prepared['trace_id'] != trace.trace_id or physical_network_settings(prepared['network']) != physical_spec(spec):
+            expected = physical_spec(spec)
+            saved = physical_network_settings(prepared['network'])
+            # Older datasets can omit optional settings that the current
+            # schema writes explicitly. Compare the same parsed contract.
+            if (prepared['trace_id'] != trace.trace_id
+                    or (saved != expected and physical_spec(NetworkSpec.from_value(prepared['network'])) != expected)):
                 raise ValueError('physical dataset does not match trace/network configuration')
             if (any(p.sun_exclusion_angle_deg is not None for p in spec.link_profiles.values())
                     and prepared.get('sun_geometry_version') != SUN_GEOMETRY_VERSION):
@@ -312,6 +317,13 @@ class NetworkState:
             result.observe_fault(index, fault, time_s, restored=restored)
         return result
 
+    def _terminal_pool(self, node_id, kind):
+        if kind == 'sgl':
+            return 'sgl'
+        if kind in ('cross_layer', 'inter_cell') and self.nodes[node_id].external_isl_terminals is not None:
+            return 'external_isl'
+        return 'isl'
+
     def _compile(self, from_s=None) -> None:
         """Store only per-link changes; never copy the whole graph per event."""
         compile_start = self.start_s if from_s is None else from_s
@@ -424,8 +436,8 @@ class NetworkState:
             used = {}
             for link_id in states:
                 edge = latest[link_id]
-                pool = "sgl" if edge["kind"] == "sgl" else "isl"
                 for node in (edge["endpoint_a"], edge["endpoint_b"]):
+                    pool = self._terminal_pool(node, edge["kind"])
                     used[node, pool] = used.get((node, pool), 0) + 1
 
             for edge in sorted(eligible.values(), key=lambda edge: connection_priority(self, edge, t)):
@@ -434,12 +446,11 @@ class NetworkState:
                     continue
                 if edge['kind'] == 'sgl' and link_id not in selected_sgl:
                     continue
-                pool = "sgl" if edge["kind"] == "sgl" else "isl"
-                endpoints = edge["endpoint_a"], edge["endpoint_b"]
+                endpoints = [(n, self._terminal_pool(n, edge["kind"])) for n in (edge["endpoint_a"], edge["endpoint_b"])]
                 if any(
                     used.get((n, pool), 0)
                     >= getattr(self.nodes[n], pool + "_terminals")
-                    for n in endpoints
+                    for n, pool in endpoints
                 ):
                     if (
                         not self.link_frames[link_id]
@@ -457,7 +468,7 @@ class NetworkState:
                     changed.add(link_id)
                     if t < states[link_id]["ready_s"] < self.end_s:
                         heapq.heappush(queue, (states[link_id]['ready_s'], 1, link_id, None))
-                for n in endpoints:
+                for n, pool in endpoints:
                     key = n, pool
                     used[key] = used.get(key, 0) + 1
                     if used[key] > getattr(self.nodes[n], pool + "_terminals"):
@@ -712,7 +723,14 @@ class NetworkState:
             self.calendars.setdefault(key, []).append((leg['start_s'], leg['finish_s']))
             self.calendars[key].sort()
 
+    def use_link_state_window(self, time_s):
+        attributes = self.physical_attributes
+        store = attributes.link_store if attributes is not None else None
+        if store is not None and self.link_frames is store.frames:
+            store.at_time(time_s)
+
     def link_at(self, link_id, time_s):
+        self.use_link_state_window(time_s)
         edge = self.edge_by_id[link_id]
         i = bisect.bisect_right(self.link_times[link_id], time_s) - 1
         if i < 0:
@@ -733,7 +751,10 @@ class NetworkState:
         time_s: float,
         payload_bytes: float,
         allow_wait: bool,
+        *,
+        bandwidth_fraction=1.0,
     ):
+        self.use_link_state_window(time_s)
         frames = self.link_frames[link_id]
         # Outages are learned online. Future fault schedules are not route oracles.
         if self.faulted(self.edge_by_id[link_id]):
@@ -781,6 +802,7 @@ class NetworkState:
                     bandwidth /= 1 + self.shared_load.get((link_id, source, target), 0)
                     bandwidth = min([bandwidth] + [self.pool_capacities[k] /
                                     (1 + self.shared_pool_load.get(k, 0)) for k in pools])
+                bandwidth *= bandwidth_fraction
                 duration = (remaining / bandwidth) if bandwidth > 0 else math.inf
                 finish = stop if not math.isfinite(duration) else min(cursor + duration, stop)
                 complete = bandwidth > 0 and duration <= stop - cursor
