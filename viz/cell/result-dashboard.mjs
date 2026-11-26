@@ -108,8 +108,17 @@ function addTabs(container) {
     panels.push({button,panel}); tabs.append(button); pages.append(panel); select(0); panel.open=()=>select(index); return panel;
   };
 }
-function overview(data,jumpRank,jumpOperators) {
-  const page=el('div',undefined,'report-overview'), grid=el('div',undefined,'report-overview-grid');
+function overview(data,rankTab,operatorTab) {
+  const page=el('div',undefined,'report-overview');
+  const completion=block('请求完成情况','按任务最终状态统计'), ring=el('div',undefined,'report-completion-ring');
+  const ratio=data.requests?data.completed/data.requests:0, image=svg('svg',{viewBox:'0 0 140 140',role:'img','aria-label':`完成 ${data.completed} / ${data.requests} 个请求`});
+  image.append(svg('circle',{cx:70,cy:70,r:53,fill:'none',stroke:'#2d3032','stroke-width':9}),svg('circle',{cx:70,cy:70,r:53,fill:'none',stroke:colors.compute,'stroke-width':9,'stroke-dasharray':`${ratio*333.01} 333.01`,transform:'rotate(-90 70 70)','stroke-linecap':'round'}));
+  image.append(svg('text',{x:70,y:72,'text-anchor':'middle',class:'report-ring-number'},pct(ratio)),svg('text',{x:70,y:94,'text-anchor':'middle',class:'report-axis-label'},'完成率'));
+  const counts=el('div'); counts.append(label(fmt(data.completed),'已完成'),label(fmt(data.failed),'失败'),label(fmt(Math.max(0,data.requests-data.completed-data.failed)),'其他状态')); ring.append(image,counts); completion.append(ring);
+  if(!rankTab) {
+    page.append(completion);
+    return page;
+  }
   const critical=data.ranks.find(row=>row.critical);
   const breakdown=block('关键 Rank 时间分解','计算、通信与间隔按真实执行区间重建',critical?el('span',`RANK ${critical.rank}`,'report-tag'):null);
   if(critical) {
@@ -121,15 +130,11 @@ function overview(data,jumpRank,jumpOperators) {
     segments.forEach(([name,value,color])=>{const row=el('div'),dot=el('i'); dot.style.background=color; row.append(dot,el('span',name),el('strong',time(value)),el('small',pct(value/total))); legend.append(row);});
     breakdown.append(legend,definition('查看统计口径','按原始 call 所属 Rank 取区间并集。计算包含 KV 访问；重叠区间只计一次。等待 / 空隙为首个至末个 call 之间未被记录区间覆盖的部分，不推断其具体原因。'));
   } else breakdown.append(empty('没有 Rank 执行记录','此任务未生成可绘制的算子区间。'));
-  const completion=block('请求完成情况','按任务最终状态统计'), ring=el('div',undefined,'report-completion-ring');
-  const ratio=data.requests?data.completed/data.requests:0, image=svg('svg',{viewBox:'0 0 140 140',role:'img','aria-label':`完成 ${data.completed} / ${data.requests} 个请求`});
-  image.append(svg('circle',{cx:70,cy:70,r:53,fill:'none',stroke:'#2d3032','stroke-width':9}),svg('circle',{cx:70,cy:70,r:53,fill:'none',stroke:colors.compute,'stroke-width':9,'stroke-dasharray':`${ratio*333.01} 333.01`,transform:'rotate(-90 70 70)','stroke-linecap':'round'}));
-  image.append(svg('text',{x:70,y:72,'text-anchor':'middle',class:'report-ring-number'},pct(ratio)),svg('text',{x:70,y:94,'text-anchor':'middle',class:'report-axis-label'},'完成率'));
-  const counts=el('div'); counts.append(label(fmt(data.completed),'已完成'),label(fmt(data.failed),'失败'),label(fmt(Math.max(0,data.requests-data.completed-data.failed)),'其他状态')); ring.append(image,counts); completion.append(ring);
   const satellites=new Map(); for(const row of data.ranks) satellites.set(row.satellite,Math.max(satellites.get(row.satellite)||0,row.end_ns));
-  const distribution=block('算力星完成分布','各卫星已记录算子的最晚结束时刻',action('查看明细 →',jumpRank,'report-block-link'));
+  const distribution=block('算力星完成分布','各卫星已记录算子的最晚结束时刻',action('查看明细 →',()=>rankTab.open(),'report-block-link'));
   distribution.append(barList([...satellites].map(([id,value])=>({label:id,value})),time));
-  const operators=block('算子构成','按调用数量统计',action('查看算子 →',jumpOperators,'report-block-link')); operators.append(barList([...data.operator_types].sort((a,b)=>b.count-a.count).map(row=>({label:kindNames[row.kind]||row.kind,value:row.count,color:row.kind==='COMMUNICATION'?colors.communication:row.kind==='KV_CACHE'?colors.memory:colors.compute})),fmt));
+  const operators=block('算子构成','按调用数量统计',action('查看算子 →',()=>operatorTab.open(),'report-block-link')); operators.append(barList([...data.operator_types].sort((a,b)=>b.count-a.count).map(row=>({label:kindNames[row.kind]||row.kind,value:row.count,color:row.kind==='COMMUNICATION'?colors.communication:row.kind==='KV_CACHE'?colors.memory:colors.compute})),fmt));
+  const grid=el('div',undefined,'report-overview-grid');
   grid.append(breakdown,completion,distribution,operators); page.append(grid); return page;
 }
 function requestPage(data) {
@@ -195,14 +200,19 @@ function networkPage(data) {
   if(network.paths.length) page.append(table(['传输端点','尝试次数','应用传输量','平均服务速率'],network.paths.map(row=>[label(row.source,`→ ${row.target}`),fmt(row.attempts),bytes(row.bytes),finite(row.service_gbps)?`${fmt(row.service_gbps)} Gbps`:'—'])));
   page.append(definition('通信统计口径','应用传输量累计实际 service 记录，包含集合通信及其重试，不等于用户业务净荷；不按多跳路径重复累计。平均服务速率按服务区间时长加权，不是包含传播和等待的端到端速率。星内 Roofline 估算不包含在路径传输量中。'));return page;
 }
-function memoryPage(data) {
-  const page=el('div'), memory=data.memory.filter(item=>item.available), rankMemory=data.ranks.filter(row=>finite(row.weight_bytes));
-  const box=block('KV 缓存占用曲线','按调度步骤结束时的 HBM 分配 / 释放事件重建');
-  box.append(memory.length?chart(memory.map((item,index)=>({label:item.cell,points:item.samples,color:index?colors.memory:colors.compute})),{label:'KV 缓存占用时间线',step:true,yFormat:bytes}):empty('没有 KV 事件记录','此任务没有可重建的 KV 缓存占用曲线。'));
-  page.append(stats([['KV 事件峰值',memory.length?bytes(Math.max(...memory.map(item=>item.peak_kv_bytes))):'—','按单 Cell HBM 事件累计','memory'],['分配事件',fmt(memory.reduce((sum,item)=>sum+item.allocation_events,0)),'HBM allocate','memory'],['释放事件',fmt(memory.reduce((sum,item)=>sum+item.release_events,0)),'HBM release','memory'],['已记录 Rank',fmt(rankMemory.length),'提供权重驻留数据的 Rank','chip']]),box);
-  const residency=block('Rank 内存配置','权重驻留与预留 KV 池 不是实测 HBM 峰值');
-  residency.append(rankMemory.length?table(['Rank / 算力星','权重驻留','预留 KV 池'],rankMemory.map(row=>[label(`RANK ${row.rank}`,row.satellite),bytes(row.weight_bytes),bytes(row.reserved_kv_bytes)])):empty('没有内存配置记录','当前报告未提供 Rank 级驻留信息。'));
-  page.append(residency,definition('与原版 Tensor 展示的差异','当前 V1 报告不包含完整临时 Tensor 生命周期和全量 HBM 峰值，不能恢复为实测 Tensor 热图。这里使用真实 KV 事件和权重驻留记录；KV 曲线只显示步骤末状态，事件峰值另行统计。显式配置的 KV 池容量不代表硬件自动探测容量。'));return page;
+function memoryPage(memory,rankMemory,fast) {
+  const page=el('div');
+  if(!fast||memory.length) {
+    const box=block('KV 缓存占用曲线','按调度步骤结束时的 HBM 分配 / 释放事件重建');
+    box.append(memory.length?chart(memory.map((item,index)=>({label:item.cell,points:item.samples,color:index?colors.memory:colors.compute})),{label:'KV 缓存占用时间线',step:true,yFormat:bytes}):empty('没有 KV 事件记录','此任务没有可重建的 KV 缓存占用曲线。'));
+    page.append(stats([['KV 事件峰值',memory.length?bytes(Math.max(...memory.map(item=>item.peak_kv_bytes))):'—','按单 Cell HBM 事件累计','memory'],['分配事件',fmt(memory.reduce((sum,item)=>sum+item.allocation_events,0)),'HBM allocate','memory'],['释放事件',fmt(memory.reduce((sum,item)=>sum+item.release_events,0)),'HBM release','memory'],['已记录 Rank',fmt(rankMemory.length),'提供权重驻留数据的 Rank','chip']]),box);
+  }
+  if(!fast||rankMemory.length) {
+    const residency=block('Rank 内存配置','权重驻留与预留 KV 池 不是实测 HBM 峰值');
+    residency.append(rankMemory.length?table(['Rank / 算力星','权重驻留','预留 KV 池'],rankMemory.map(row=>[label(`RANK ${row.rank}`,row.satellite),bytes(row.weight_bytes),bytes(row.reserved_kv_bytes)])):empty('没有内存配置记录','当前报告未提供 Rank 级驻留信息。'));
+    page.append(residency);
+  }
+  page.append(definition('与原版 Tensor 展示的差异','当前 V1 报告不包含完整临时 Tensor 生命周期和全量 HBM 峰值，不能恢复为实测 Tensor 热图。这里使用真实 KV 事件和权重驻留记录；KV 曲线只显示步骤末状态，事件峰值另行统计。显式配置的 KV 池容量不代表硬件自动探测容量。'));return page;
 }
 export async function renderDashboard(container,jobId,result,api,renderArtifacts) {
   const render=Symbol(); renders.set(container,render);
@@ -212,18 +222,27 @@ export async function renderDashboard(container,jobId,result,api,renderArtifacts
   try { data=await load('section=summary'); }
   catch(error) {if(renders.get(container)!==render||context.parentNode!==container)return;container.append(empty('图表数据暂未载入',error.message),action('重新载入图表',()=>renderDashboard(container,jobId,result,api,renderArtifacts))); await renderArtifacts(container,jobId,api);return;}
   if(renders.get(container)!==render||context.parentNode!==container)return;
+  const fast=['fast_mode','batch_roofline'].includes(data.compute_mode);
   const model=el('span',data.model||'模型未记录','report-model');context.insertBefore(model,context.lastChild);
   const parallel=data.parallelism[0], info=el('span',`${data.satellite_count??'—'} 颗卫星 ${data.ranks.length} 个 Rank${parallel?` TP ${parallel.tensor_parallel_size} / PP ${parallel.pipeline_parallel_size}`:''}`);context.insertBefore(info,context.lastChild);
   const hero=el('div',undefined,'report-hero'), lead=el('div',undefined,'report-lead');
   lead.append(el('span','任务完成用时'),el('strong',time(data.completion_ns)),el('small',`首次请求到达 → 最终完成 仿真时间窗 ${time(data.simulation_ns)}`));
-  hero.append(lead,stat('完成请求',`${data.completed} / ${data.requests}`,`${data.failed} 个请求失败`,'request'),stat('平均首 Token 延迟',time(average(data.request_rows,'ttft_ns')),'TTFT 有效请求均值','time'),stat('算子调用',fmt(data.kernel_calls),`${fmt(data.scheduler_steps)} 个调度步骤`,'chip'));container.append(hero);
+  const execution=fast
+    ? stat('调度步骤',fmt(data.scheduler_steps),null,'chart')
+    : stat('算子调用',fmt(data.kernel_calls),`${fmt(data.scheduler_steps)} 个调度步骤`,'chip');
+  hero.append(lead,stat('完成请求',`${data.completed} / ${data.requests}`,`${data.failed} 个请求失败`,'request'),stat('平均首 Token 延迟',time(average(data.request_rows,'ttft_ns')),'TTFT 有效请求均值','time'),execution);container.append(hero);
   const addTab=addTabs(container), system=addTab('System 总览','chart');
   const requests=addTab('请求性能','request');requests.append(requestPage(data));
-  const rank=addTab('Rank / 算力星','chip');rank.append(rankPage(data,load));
-  const operators=addTab('算子','chip');operators.append(operatorPage(data,load));
-  system.append(overview(data,()=>rank.open(),()=>operators.open()));
-  const network=addTab('通信','network');network.append(networkPage(data));
-  const memory=addTab('内存与 KV','memory');memory.append(memoryPage(data));
+  let rank, operators;
+  if(!fast) {
+    rank=addTab('Rank / 算力星','chip');rank.append(rankPage(data,load));
+    operators=addTab('算子','chip');operators.append(operatorPage(data,load));
+  }
+  system.append(overview(data,rank,operators));
+  if(!fast||data.network.attempts>0) addTab('通信','network').append(networkPage(data));
+  const memory=data.memory.filter(item=>item.available&&(!fast||item.allocation_events>0||item.release_events>0));
+  const rankMemory=data.ranks.filter(row=>finite(row.weight_bytes));
+  if(!fast||memory.length||rankMemory.length) addTab('内存与 KV','memory').append(memoryPage(memory,rankMemory,fast));
   const artifacts=addTab('产物与明细','request');
   const shortcut=document.querySelector('#artifact-shortcut');
   if(shortcut){

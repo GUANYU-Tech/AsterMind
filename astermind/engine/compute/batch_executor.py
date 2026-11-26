@@ -14,6 +14,12 @@ from src.serving.kernel_lowering.execution_timeline import (
 
 
 class RuntimeBatchExecutor(NetworkBatchExecutor):
+    def _publish_completed_batch(self, record, on_complete):
+        self.records.append(record)
+        on_complete(self.loop.now_s)
+        if self._on_batch_complete is not None:
+            self._on_batch_complete(record)
+
     def start_batch(self,cell_id,step_id,components,execution,on_complete,*,token_count,
                     pool_name="main",on_next_batch=None,replica_tokens=None,on_failure=None):
         if cell_id!=self.cell_id or pool_name in self._active:
@@ -187,8 +193,8 @@ class RuntimeBatchExecutor(NetworkBatchExecutor):
                     if not state['alive']:return
                     state['alive']=False
                     clear_native_contexts(getattr(self.comm,'network',None),self.cell_id,f'{self.cell_id}/{pool_name}/{step_id}/')
-                    self._active.remove(pool_name);self.records.append(batch)
-                    on_complete(self.loop.now_s)
+                    self._active.remove(pool_name)
+                    self._publish_completed_batch(batch, on_complete)
                     if self._on_batch_boundary:self._on_batch_boundary()
                     if on_next_batch:on_next_batch()
                 self.loop.schedule(self.loop.now_s,1,"batch:complete",publish,owner_id=self.cell_id)

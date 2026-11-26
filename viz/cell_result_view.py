@@ -31,7 +31,8 @@ def duration(items):
 
 def build_view(native, submitted):
     ranks, calls, kinds = {}, [], defaultdict(lambda: dict(count=0, duration_ns=0))
-    configs = {cell['id']: cell for cell in native.get('configuration', {}).get('cells', [])}
+    configuration = native.get('configuration', {})
+    configs = {cell['id']: cell for cell in configuration.get('cells', [])}
     memory = []
     for cell_id, cell_config in configs.items():
         for placement in cell_config.get('placements', []):
@@ -157,6 +158,7 @@ def build_view(native, submitted):
         concurrent_samples.append([time, active])
     native_stats = native.get('communication_runtime_stats', {})
     summary = dict(status=native.get('status'), model=submitted.get('model'),
+        compute_mode=configuration.get('compute_mode') or submitted.get('compute_mode'),
         satellite_count=submitted.get('hardware', {}).get('satellite_count'),
         hardware=submitted.get('hardware', {}).get('default_hardware_id'),
         parallelism=[pool.get('parallelism', {}) for pool in submitted.get('deployment', {}).get('worker_pools', [])],
@@ -174,7 +176,7 @@ def build_view(native, submitted):
             application_bytes=sum(row['bytes'] for row in services.values()),
             peak_active=native_stats.get('peak_active_flows'), retries=native_stats.get('retries'),
             paths=sorted(paths.values(), key=lambda row:-row['bytes']), concurrency=concurrent_samples,
-            intra_mode=native.get('configuration', {}).get('communication', {}).get('intra_mode')))
+            intra_mode=configuration.get('communication', {}).get('intra_mode')))
     return dict(summary=summary, calls=sorted(calls, key=lambda row:row['start_ns']), ranks=ranks)
 
 

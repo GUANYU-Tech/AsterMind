@@ -1,4 +1,4 @@
-import { renderDashboard } from "./result-dashboard.mjs?v=restore-1";
+import { renderDashboard } from "./result-dashboard.mjs?v=mode-results-1";
 import { appUrl } from "./app-path.mjs?v=compact-2";
 
 export function displayNumber(value, unit = "") {

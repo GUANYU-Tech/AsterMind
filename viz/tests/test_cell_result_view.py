@@ -21,6 +21,13 @@ def fixture():
 
 
 class CellResultViewTests(unittest.TestCase):
+    def test_result_mode_uses_saved_effective_configuration(self):
+        native, submitted = fixture()
+        submitted['compute_mode'] = 'batch_roofline'
+        self.assertEqual(build_view(native, submitted)['summary']['compute_mode'], 'batch_roofline')
+        native['configuration']['compute_mode'] = 'fast_mode'
+        self.assertEqual(build_view(native, submitted)['summary']['compute_mode'], 'fast_mode')
+
     def test_overlapping_intervals_do_not_inflate_rank_wall_time(self):
         view = build_view(*fixture())
         row = view['summary']['ranks'][0]

@@ -6,11 +6,13 @@ from astermind.engine.comm.native_intra import native_enabled, bind_native_conte
 class NetworkBatchExecutor:
     """Resolve rank placement and preserve the source communication contract."""
 
-    def __init__(self, cell_id, loop, comm, placements, *, on_batch_boundary=None):
+    def __init__(self, cell_id, loop, comm, placements, *, on_batch_boundary=None,
+                 on_batch_complete=None):
         self.cell_id = cell_id
         self.loop = loop
         self.comm = comm
         self._on_batch_boundary = on_batch_boundary
+        self._on_batch_complete = on_batch_complete
         self.placements = {}
         device_ids = set()
         for placement in placements:

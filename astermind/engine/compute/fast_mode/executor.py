@@ -186,8 +186,7 @@ class FastModeExecutor(RuntimeBatchExecutor):
             state["alive"] = False
             now = self.loop.now_s
             record.update(status="completed", end_time_ns=nanoseconds(now), end_time_ticks=str(now.ticks))
-            self.records.append(record)
-            on_complete(self.loop.now_s)
+            self._publish_completed_batch(record, on_complete)
             if self._on_batch_boundary:
                 self._on_batch_boundary()
             if on_next_batch:
