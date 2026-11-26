@@ -47,6 +47,12 @@ def export(output,result,config,physics,*,progress=None,on_ready=None):
     if fast:
         analysis["operator_replay"] = False
     (output/'analysis.json').write_text(json.dumps(analysis, ensure_ascii=False))
+    summary=dict(id=identity,communication_mode='runtime_comm',communication_label='V1.0 Runtime Comm',
+        timeline_mode='orbitserve',requests=result['requests'],audit=result.get('audit'),measurement=result['measurement'],
+        gpu_count=sum(d['kind']=='gpu' for d in config.physical['devices']),
+        flows=sum(e['kind']=='admit' for e in result.get('communication_events',[])),surrogate_operations=None)
+    (output/'native_summary.json').write_text(json.dumps(summary,ensure_ascii=False))
+    if on_ready:on_ready()
     if physics is not None:
         if progress:progress('整理场景几何快照')
         horizon = config.horizon_ns / 1e9
@@ -55,12 +61,6 @@ def export(output,result,config,physics,*,progress=None,on_ready=None):
                 trace=dict(trace_manifest=dict(time=physics.trace.time)),
                 sun_positions=[dict(time_s=t,position_itrs_km=p) for t,p in physics.sun_positions]),
                 horizon_s=horizon if fast else None)
-    summary=dict(id=identity,communication_mode='runtime_comm',communication_label='V1.0 Runtime Comm',
-        timeline_mode='orbitserve',requests=result['requests'],audit=result.get('audit'),measurement=result['measurement'],
-        gpu_count=sum(d['kind']=='gpu' for d in config.physical['devices']),
-        flows=sum(e['kind']=='admit' for e in result.get('communication_events',[])),surrogate_operations=None)
-    (output/'native_summary.json').write_text(json.dumps(summary,ensure_ascii=False))
-    if on_ready:on_ready()
     if not fast:
         if progress:progress('整理算子与通信回放')
         export_reports([output/'native_result.json'],output/'native-replay',loaded_results={str(output/'native_result.json'):result})
