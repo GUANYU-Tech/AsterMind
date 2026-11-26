@@ -67,7 +67,7 @@ async function seek(value){
  const u=right.time_s>left.time_s?(time-left.time_s)/(right.time_s-left.time_s):0,other=new Map(right.nodes.map(n=>[n.node_id,n]));
  const snapshot={...left,physical_time_s:left.time_s,time_s:time,nodes:left.nodes.map(n=>({...n,position_itrs_km:n.position_itrs_km.map((x,j)=>x+(other.get(n.node_id).position_itrs_km[j]-x)*u)}))};
  const r=record(),active=data.hops.filter(h=>h.start_s<=time&&time<h.arrival_s).map(pathLeg);
- presented={data:{network:source.network,time:source.time,sun_positions:source.sun_positions},snapshot,kind:'all',record:r,
+ presented={orbitSnapshot:left,loadOrbitSample:()=>right!==left ? right : i ? frames.get({artifact:'f'+(i-1),index:i-1}) : null,data:{network:source.network,time:source.time,sun_positions:source.sun_positions},snapshot,kind:'all',record:r,
   runtime:{time_s:time,event:{time_s:time,kind:'parallel_inference',event_order:time},globalMode:true,legs:active,activeTransfers:active,
    compute:'waiting',routePlans:[{reason:'initial',path:r.routing.selected_path.filter(h=>h.stage==='input')}],recoveryEvents:[],lossEvents:[]}};
  $('clock').textContent=format(time,6)+' s 快照 '+left.time_s+' s';$('time').value=time;

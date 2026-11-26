@@ -125,3 +125,4 @@ body:not([data-stage=home]) .cell-home { display: none; }
   .cell-studio #web-message { left: 20px; right: 20px; bottom: 20px; max-width: none; }
   .cell-studio #job-status { left: 20px; right: 20px; bottom: 20px; }
 }
+#cell-log-lines { max-height: 18rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }

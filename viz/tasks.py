@@ -5,11 +5,31 @@ from pathlib import Path
 import re
 import signal
 import time
+from datetime import datetime, timezone
+
+
+def record_progress(job):
+    """Keep recent status transitions in the same atomic snapshot as the job."""
+    entry = {'state': job.get('state') or job['status']}
+    for key in ('phase', 'progress'):
+        if job.get(key) is not None:
+            entry[key] = job[key]
+    stage = job.get('startup_stage') or {}
+    if stage.get('phase') == entry.get('phase') and entry.get('phase') in ('cell', 'cells'):
+        entry.update({k: stage[k] for k in ('index', 'completed', 'total') if k in stage})
+    history = job.setdefault('progress_history', [])
+    if history and history[-1]['event'] == entry:
+        return
+    history.append({'at': datetime.now(timezone.utc).isoformat(timespec='seconds'), 'event': entry})
+    if len(history) > 100:
+        del history[:-100]
+        job['progress_history_truncated'] = True
 
 
 def write_status(job, state, **extra):
     job.update(state=state, **extra)
     if job.get('output'):
+        record_progress(job)
         target = Path(job['output']) / 'status.json'
         temporary = target.with_suffix('.json.tmp')
         temporary.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding='utf-8')

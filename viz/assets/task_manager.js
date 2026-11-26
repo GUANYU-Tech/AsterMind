@@ -1,5 +1,5 @@
 import {get,post} from './studio_common.js';
-import {formatProgressLine,formatPhysicalSummary} from './progress_log.js';
+import {formatProgressLog,formatPhysicalSummary,taskFailure,taskPhase} from './progress_log.js';
 
 export const stateLabels={running:'正在运行',stopping:'正在停止',cancelled:'已手动停止',completed:'已完成',failed:'失败',interrupted:'已中断',paused:'已暂停',aborted:'已提前结束',terminated:'已终止',unknown:'状态暂不可用'};
 const validId=id=>typeof id==='string'&&/^[a-zA-Z0-9_-]+$/.test(id);
@@ -119,8 +119,10 @@ export function renderTask(container,task){
   if(task.can_rerun)action('重新运行','rerun','使用原始输入创建独立的新任务？原有文件将保留。');
   if(task.can_delete||task.can_stop_and_delete)action(task.can_stop_and_delete?'停止并删除':'删除记录与本地文件','delete',(task.can_stop_and_delete?'将先停止任务，等待计算进程退出，再永久删除任务输入、日志和结果。':'将永久删除此任务的输入、日志和结果。')+'删除后无法恢复。保存的场景配置会保留；仍被其他场景或任务引用的数据需先解除引用。');
   row.append(heading,id,actions);
-  const last=(task.log_tail||'').trim().split('\n').filter(Boolean).at(-1);
-  if(task.error||last){const detail=document.createElement('p');detail.textContent=(task.error||(task.preview_url&&task.checks?formatPhysicalSummary(task.checks):formatProgressLine(last))).slice(-400);if(task.error)detail.className='error';row.append(detail)}
+  const failure=taskFailure(task);
+  const latest=failure || (task.checks && formatPhysicalSummary(task.checks)) || taskPhase(task)
+    || formatProgressLog(task.log_tail,{knownOnly:true}).trim().split('\n').at(-1);
+  if(latest){const detail=document.createElement('p');detail.textContent=latest.slice(-400);if(failure)detail.className='error';row.append(detail)}
   container.append(row);
 }
 
