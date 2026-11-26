@@ -37,7 +37,7 @@ AsterMind 是一个可扩展的星座级太空智算系统仿真平台，为在�
 
 ### Windows（64位）
 
-[下载 AsterMind v1.0 Windows x64 安装包](https://github.com/GUANYU-Tech/AsterMind/releases/download/v1.0.0-preview.7/AsterMind-v1.0-Windows-x64-Setup.exe)。
+[下载 AsterMind v1.0 Windows x64 安装包](https://github.com/GUANYU-Tech/AsterMind/releases/download/v1.0.0-preview.9/AsterMind-v1.0-Windows-x64-Setup.exe)。
 
 ### macOS（Apple 芯片）
 

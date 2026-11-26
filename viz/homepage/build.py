@@ -8,7 +8,7 @@ from shutil import copyfile
 ROOT = Path(__file__).resolve().parent
 REPORT = ROOT.parents[1] / 'doc' / 'AsterMind-V1-Tech-Report.pdf'
 REPO = 'https://github.com/GUANYU-Tech/AsterMind'
-PREVIEW_TAG = 'v1.0.0-preview.7'
+PREVIEW_TAG = 'v1.0.0-preview.9'
 WINDOWS_INSTALLER = f'{REPO}/releases/download/{PREVIEW_TAG}/AsterMind-v1.0-Windows-x64-Setup.exe'
 COPY = {
 'en': {
@@ -56,7 +56,8 @@ COPY = {
 ['CASE STUDY III · MULTI-TURN INFERENCE SCHEDULING','How can users get a faster response to a follow-up?', 'Keeping follow-ups on the same cell lets it reuse cached context and return the first token sooner in long conversations.', ('Ground', '⇄', 'Cell')]],
 'start':['GET STARTED','Build on AsterMind.','Run the Windows prerelease installer or clone the source from GitHub and build it yourself.'],
 'windows':'Windows installer','windowsnote':'Windows 11 x64 · Prerelease',
-'guide':'Install from source','download':'Download the Windows x64 installer',
+'windows_preview_alt':'AsterMind for Windows showing the full-scenario and compute formation simulation workspaces in Chinese.',
+'guide':'Linux: Install from source','download':'Download the Windows x64 installer',
 'codehead':'Clone, build and run','copy':'Copy commands','copied':'Copied','copystatus':'Setup commands copied.','copyfail':'Select code to copy','copyfailstatus':'Clipboard unavailable. Select and copy the commands below.',
 'about':['ABOUT THE PROJECT','Exploring Space Computing','GUANYU and developers are building an open digital testbed for space computing.'],
 'org':'GUANYU / 观宇芯算','issue':'Issues & discussion','footer':'ORBITAL GEOMETRY · COMPUTE · COMMUNICATION · SYSTEMS',
@@ -106,7 +107,8 @@ COPY = {
 ['案例 III · 多轮推理调度','用户连续追问时，怎样缩短等待？','让同一编队接续对话，可复用上下文缓存，让长对话更早返回首个 Token。', ('地面站', '⇄', '编队')]],
 'start':['开始使用','基于 AsterMind，开展研究。','提供Windows 上运行预发布安装包，或从 GitHub 克隆源码并构建'],
 'windows':'Windows 安装包','windowsnote':'Windows 11 x64 · 预发布版',
-'guide':'从源码安装','download':'下载 Windows x64 安装包',
+'windows_preview_alt':'AsterMind Windows 桌面首页，展示「完整场景仿真」与「算力编队仿真」两个工作区。',
+'guide':'Linux：从源码安装','download':'下载 Windows x64 安装包',
 'codehead':'克隆、构建与启动','copy':'复制命令','copied':'已复制','copystatus':'安装命令已复制。','copyfail':'选中代码复制','copyfailstatus':'剪贴板不可用，请选中并复制下方命令。',
 'about':['关于项目','探索太空智算','观宇，与开发者共同构建太空智算的开放数字试验场'],
 'org':'观宇芯算 / GUANYU','issue':'问题与讨论','footer':'轨道几何 · 计算 · 通信 · 系统',
@@ -138,7 +140,7 @@ if args.pages_dir is not None:
         parser.error('Use a separate directory for the Pages export.')
     (output / 'assets').mkdir(parents=True, exist_ok=True)
     for name in ('style.css', 'app.js', 'language.js', 'assets/guanyu-logo.png',
-                 'assets/astermind-mark.png'):
+                 'assets/astermind-mark.png', 'assets/astermind-windows-home.jpg'):
         copyfile(ROOT / 'dist' / name, output / name)
     (output / '.nojekyll').touch()
 
@@ -203,7 +205,8 @@ for lang,d in COPY.items():
 <div class="getting-started">
 <article class="install-windows">
 <div><h3>{d['windows']}</h3><p><small>{d['windowsnote']}</small></p></div>
-{external(WINDOWS_INSTALLER,d['download'],'button primary')}</article>
+{external(WINDOWS_INSTALLER,d['download'],'button primary')}
+<img class="windows-preview" src="{prefix}assets/astermind-windows-home.jpg" alt="{d['windows_preview_alt']}" width="1326" height="853" loading="lazy" decoding="async"></article>
 <article class="install-source"><h3>{d['guide']}</h3>
 <div class="code-panel"><div class="code-top"><span>{d['codehead']}</span><button id="copy-code">{d['copy']}</button></div><pre><code id="setup-code">{escape(setup)}</code></pre><span class="sr-only" role="status" id="copy-status"></span></div></article>
 </div></div></section>

@@ -57,6 +57,7 @@ export const optionLabels = {
   midlayer:"Midlayer", roofline:"Roofline",
   nvidia_h200:"NVIDIA H200", nvidia_a800:"NVIDIA A800", metax_c500:"MetaX C500", ascend_910b:"Ascend 910B", formation:"静态编队", orbit:"TLE 轨道", file:"拓扑文件",
   synthetic:"合成请求", canonical:"标准请求文件", production:"生产 Trace", switch:"共享交换互联", fully_connected:"全连接", ring:"环形", chain:"链式",
+  simultaneous:"同时到达",
   device_only:"仅设备执行", device_plus_launch:"设备 + 主机启动", device_plus_launch_plus_scheduler:"设备 + 启动 + 调度",
   colocated:"同池部署", pd_disagg:"Prefill / Decode 分离", af_disagg:"Attention / FFN 分离", pd_af_disagg:"PD + AF 分离",
 };
