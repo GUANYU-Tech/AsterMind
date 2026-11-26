@@ -2594,6 +2594,8 @@ export const phrases = {
   "自动适配：16QAM → 8QAM → QPSK": "Auto-adaptation: 16QAM → 8QAM → QPSK",
   "自动选择": "Auto Select",
   "自定义优先顺序": "Custom Priority",
+  "最小负载": "Least Loaded",
+  "会话固定": "Session-Fixed",
   "自定义硬件": "Custom Hardware",
   "自定义策略": "Custom Policy",
   "自定义路由策略": "Custom Routing Policy",

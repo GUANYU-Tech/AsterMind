@@ -25,11 +25,7 @@ const topologyEditor=createCellTopology(topologyHost);
 const requestBatch=createRequestBatch({getExperiment:()=>experiment,apply:requests=>{experiment.requests=requests;requestPage=0;validatedSignature='';renderRequests();writeJson();state();$('status').textContent=`已应用 ${requests.length.toLocaleString()} 条业务请求`}});
 for(const [id,kind]of [['importRequests','import'],['generateRequests','generate']])$(id).onclick=()=>{try{requestBatch.open(kind)}catch(error){$('status').textContent=error.message}};
 function state(){
- const selection=$('cellSelection'), fast=$('computeMode').value==='fast_mode';
- for(const item of selection.querySelectorAll('[data-fast-policy]')){
-  item.hidden=!fast;item.disabled=!fast;
- }
- if(!fast&&selection.selectedOptions[0]?.dataset.fastPolicy!==undefined)selection.value='least_loaded';
+ if($('cellSelection').dataset.mode!==$('computeMode').value)setCellSelection(experiment?.cell_selection);
  $('runtimeConfig').disabled=!ready; $('sceneFields').disabled=busy;
  $('dataset').disabled=busy; $('name').disabled=busy;
  for(const id of ['save','run','liveRun'])$(id).disabled=busy||!experiment||needsBuild;
@@ -112,8 +108,29 @@ function updateSecondary(preferred){
  $('cellSecondary').value=choices.some(([id])=>id===preferred)?preferred:'';
 }
 updateSecondary('distance');
-for(const [id,label] of [['nearest_per_turn','Nearest（逐轮最近距离）'],['least_loaded_per_turn','Least-load（逐轮最小负载）'],['session_fixed','Session-fixed（首轮最近距离）']]){
- const item=option(id,label);item.dataset.fastPolicy='';$('cellSelection').append(item);
+const legacyPriorities={
+ least_loaded:{primary:'load',secondary:'distance'},
+ nearest:{primary:'distance',secondary:'load'},
+ estimated_arrival:{primary:'load',secondary:'arrival'},
+};
+const detailedCellChoices=[['least_loaded','负载优先'],['nearest','距离优先'],
+ ['estimated_arrival','负载相同时优先选传输更快的编队'],['custom','自定义优先顺序']];
+const fastCellChoices=[['custom','自定义优先顺序'],['nearest_per_turn','最近距离'],
+ ['least_loaded_per_turn','最小负载'],['session_fixed','会话固定']];
+function setCellSelection(policy){
+ const select=$('cellSelection'),mode=$('computeMode').value,fast=mode==='fast_mode';
+ const choices=fast?fastCellChoices:detailedCellChoices;
+ if(select.dataset.mode!==mode){
+  select.replaceChildren(...choices.map(([value,label])=>option(value,label)));
+  select.dataset.mode=mode;
+ }
+ const preserved=fast&&typeof policy==='string'&&Object.hasOwn(legacyPriorities,policy)?legacyPriorities[policy]:policy;
+ if(preserved&&typeof preserved==='object'){
+  select.value='custom';$('cellPrimary').value=preserved.primary;updateSecondary(preserved.secondary);
+ }else{
+  select.value=choices.some(([value])=>value===preserved)?preserved:fast?'nearest_per_turn':'least_loaded';
+ }
+ showPriority();
 }
 function selectionPolicy(){
  return $('cellSelection').value==='custom'
@@ -128,7 +145,7 @@ $('cellSecondary').onchange=changePriority;
 function syncRuntime(){delete runtime.failure_policy;delete runtime.max_transfer_retries;if(experiment){experiment.communication??={};experiment.communication.retry_limit=number('retryCount');}runtime.fault_timing='continuous';runtime.faults??=[];if(experiment){experiment.runtime_network=runtime;experiment.routing=routingConfig();experiment.cell_selection=selectionPolicy()}}
 function routingConfig(){const selected=$('routingPolicy').value;const policy=selected==='custom'?$('customRoutingPolicy').value.trim():selected;if(!/^[a-z][a-z0-9_-]{0,127}$/.test(policy))throw Error('请填写有效的已注册策略名称');return {policy}}
 $('cellSelection').onchange=changePriority;
-function reflectRouting(){const selection=experiment?.cell_selection||'least_loaded';$('cellSelection').value=typeof selection==='object'?'custom':selection;if(typeof selection==='object'){$('cellPrimary').value=selection.primary;updateSecondary(selection.secondary)}showPriority();const policy=experiment?.routing?.policy||'min_hops';const custom=!['min_hops','min_propagation'].includes(policy);$('routingPolicy').value=custom?'custom':policy;$('customRoutingField').hidden=!custom;$('customRoutingPolicy').required=custom;$('customRoutingPolicy').value=custom?policy:''}
+function reflectRouting(){setCellSelection(experiment?.cell_selection);const policy=experiment?.routing?.policy||'min_hops';const custom=!['min_hops','min_propagation'].includes(policy);$('routingPolicy').value=custom?'custom':policy;$('customRoutingField').hidden=!custom;$('customRoutingPolicy').required=custom;$('customRoutingPolicy').value=custom?policy:''}
 $('routingPolicy').onchange=$('customRoutingPolicy').oninput=()=>{const custom=$('routingPolicy').value==='custom';$('customRoutingField').hidden=!custom;$('customRoutingPolicy').required=custom;try{if(experiment){experiment.routing=routingConfig();writeJson()}else routingConfig();$('status').textContent=''}catch(error){$('status').textContent=error.message}};
 function renderRuntime(){runtime.faults??=[];runtime.random_faults=normalizeRandomFaults(runtime.random_faults,physicalTime);$('retryCount').value=experiment?.communication?.retry_limit??8;renderRandomFaults($('runtimeFaults'),runtime.random_faults,physicalTime)}
 function option(value,text){const o=document.createElement('option');o.value=value;o.textContent=text;return o}
