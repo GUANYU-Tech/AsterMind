@@ -30,6 +30,10 @@ __pycache__/
 # Local documents and temporary workspaces (case variants included).
 # Root anchors preserve the immutable engine snapshot's source inventory.
 /[Dd][Oo][Cc]/
+!/doc/
+/doc/*
+!/doc/AsterMind-V1-Tech-Report.pdf
+/viz/homepage/dist/assets/AsterMind-V1-Tech-Report.pdf
 /[Dd][Oo][Cc][Ss]/
 /[Tt][Ee][Mm][Pp]/
 /[Tt][Mm][Pp]/

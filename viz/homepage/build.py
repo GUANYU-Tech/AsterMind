@@ -5,7 +5,8 @@ import argparse
 import json
 from shutil import copyfile
 
-ROOT = Path(__file__).parent
+ROOT = Path(__file__).resolve().parent
+REPORT = ROOT.parents[1] / 'doc' / 'AsterMind-V1-Tech-Report.pdf'
 REPO = 'https://github.com/GUANYU-Tech/AsterMind'
 RELEASE = REPO + '/releases/tag/v1.0.0-preview.7'
 COPY = {
@@ -138,9 +139,11 @@ if args.pages_dir is not None:
         parser.error('Use a separate directory for the Pages export.')
     (output / 'assets').mkdir(parents=True, exist_ok=True)
     for name in ('style.css', 'app.js', 'language.js', 'assets/guanyu-logo.png',
-                 'assets/astermind-mark.png', 'assets/AsterMind-V1-Tech-Report.pdf'):
+                 'assets/astermind-mark.png'):
         copyfile(ROOT / 'dist' / name, output / name)
     (output / '.nojekyll').touch()
+
+copyfile(REPORT, output / 'assets' / REPORT.name)
 
 for lang,d in COPY.items():
     prefix='../' if lang=='en' else './'

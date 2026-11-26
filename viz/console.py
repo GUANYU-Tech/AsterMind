@@ -8,6 +8,7 @@ import platform
 import re
 import subprocess
 import sys
+import sysconfig
 import threading
 import time
 from datetime import datetime
@@ -24,7 +25,7 @@ if __name__ == '__main__':
 from viewer import write_network_viewer
 from playback import export_runtime_views
 
-from paths import WORKSPACE as ROOT
+from paths import REPOSITORY, WORKSPACE as ROOT
 from native_environment import enable_local_flowsim
 enable_local_flowsim()
 JOBS = {}
@@ -44,7 +45,6 @@ HOMEPAGE_FILES = {
     '/app.js': ('app.js', 'text/javascript'),
     '/assets/astermind-mark.png': ('assets/astermind-mark.png', 'image/png'),
     '/assets/guanyu-logo.png': ('assets/guanyu-logo.png', 'image/png'),
-    '/assets/AsterMind-V1-Tech-Report.pdf': ('assets/AsterMind-V1-Tech-Report.pdf', 'application/pdf'),
 }
 
 
@@ -399,6 +399,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond({"error": "Host not allowed"}, code=403)
         path = urlparse(self.path).path
         try:
+            if path == '/assets/AsterMind-V1-Tech-Report.pdf':
+                name = 'AsterMind-V1-Tech-Report.pdf'
+                report = REPOSITORY / 'doc' / name
+                if not report.is_file():
+                    report = Path(sysconfig.get_path('data')) / 'share' / 'astermind' / 'doc' / name
+                return self.respond_file(report, 'application/pdf')
             if path in HOMEPAGE_FILES:
                 name, kind = HOMEPAGE_FILES[path]
                 return self.respond_file(HOMEPAGE / name, kind)

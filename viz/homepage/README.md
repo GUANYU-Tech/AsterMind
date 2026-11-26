@@ -34,8 +34,9 @@ From the repository root, build into a fresh directory outside the checkout.
 python3 viz/homepage/build.py --pages-dir ../astermind-website
 ```
 
-The export contains both languages, the brand images and the original
-technical report. “Enter simulation platform” leads to the on-page setup guide.
+The export contains both languages, the brand images and a copy of the
+[technical report](../../doc/AsterMind-V1-Tech-Report.pdf). Update the PDF in
+`doc/` when a new report is available. “Enter simulation platform” leads to the on-page setup guide.
 The integrated homepage continues to open the simulator at `/platform`.
 The report opens inline at `#pdf` and loads on first use.
 

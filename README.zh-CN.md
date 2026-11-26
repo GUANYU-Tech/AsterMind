@@ -1,6 +1,6 @@
 # <img src="assets/astermind-logo.png" alt="" width="36" align="absmiddle"> AsterMind
 
-[English](README.md) · 简体中文
+[English](README.md) · 简体中文 · [项目官网](https://guanyu-tech.github.io/AsterMind/)
 
 **面向低轨卫星星座的大语言模型端到端推理服务仿真器**
 
@@ -10,7 +10,7 @@ AsterMind 模拟低轨卫星如何为地面用户提供大语言模型推理服�
 
 ## 技术报告
 
-**AsterMind 技术报告**（公开版 PDF 链接待补充）
+[阅读 AsterMind 技术报告（PDF）](doc/AsterMind-V1-Tech-Report.pdf)
 
 ## 主要特点
 
@@ -24,6 +24,12 @@ AsterMind 模拟低轨卫星如何为地面用户提供大语言模型推理服�
 ![AsterMind 系统架构，展示工作负载回放、离线网络快照、调度、Cell 执行和通信](assets/astermind-architecture-zh.png)
 
 ## 构建与安装
+
+### Windows x64
+
+[下载 AsterMind v1.0 Windows x64 安装包](https://github.com/GUANYU-Tech/AsterMind/releases/download/v1.0.0-preview.7/AsterMind-v1.0-Windows-x64-Setup.exe)（预发布版 `1.0.0-preview.7`）。
+
+### Linux 源码安装
 
 **运行前提。** x86-64 Linux，glibc 版本至少为 2.39，并提供 Git、C/C++ 工具链和 `libnuma.so.1`。需要 Python 3.12。样例在 CPU 上运行，无需模型权重或 GPU。
 
@@ -62,7 +68,7 @@ viz/                             L2 和 L3 仿真的本地前端
 bash scripts/run.sh
 ```
 
-打开[首页](http://localhost:8766/)。
+打开[本地仿真首页](http://localhost:8766/)。
 
 | 仿真范围 | 前端入口 | 样例 |
 | --- | --- | --- |

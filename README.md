@@ -1,6 +1,6 @@
 # <img src="assets/astermind-logo.png" alt="" width="36" align="absmiddle"> AsterMind
 
-English · [简体中文](README.zh-CN.md)
+English · [简体中文](README.zh-CN.md) · [Project website](https://guanyu-tech.github.io/AsterMind/en/)
 
 **End-to-end simulation of LLM serving on low Earth orbit constellations**
 
@@ -10,7 +10,7 @@ AsterMind simulates how satellites serve inference requests from users on Earth.
 
 ## Technical Report
 
-**AsterMind Technical Report** — Public PDF link pending.
+[Read the AsterMind technical report (PDF)](doc/AsterMind-V1-Tech-Report.pdf)
 
 ## Features
 
@@ -24,6 +24,12 @@ AsterMind simulates how satellites serve inference requests from users on Earth.
 ![AsterMind architecture showing workload replay, offline network snapshots, scheduling, Cell execution, and communication](assets/astermind-architecture-en.png)
 
 ## Build and Install
+
+### Windows x64
+
+[Download the AsterMind v1.0 Windows x64 installer](https://github.com/GUANYU-Tech/AsterMind/releases/download/v1.0.0-preview.7/AsterMind-v1.0-Windows-x64-Setup.exe) (prerelease `1.0.0-preview.7`).
+
+### Linux source installation
 
 **Prerequisites.** x86-64 Linux with glibc 2.39 or newer, Git, a C/C++ toolchain, and `libnuma.so.1`. Python 3.12 is required. The examples run on the CPU without model weights or a GPU.
 
@@ -62,7 +68,7 @@ Start the local service. The 3D previews require a browser with WebGL 2.
 bash scripts/run.sh
 ```
 
-Open the [homepage](http://localhost:8766/en/).
+Open the [local simulation homepage](http://localhost:8766/en/).
 
 | Simulation scope | Frontend | Example |
 | --- | --- | --- |
