@@ -1,5 +1,13 @@
 # Changelog
 
+## AsterMind v1.0 · Windows preview 7
+
+- Windows 11 x64 desktop installer for the AsterMind simulation platform. The simulation engine uses WSL 2.
+- Package version `1.0.0-preview.7`, built from `8f5d366f4cc4820f28e535225f27fbe81d523cb1`. This package predates subsequent changes on `main`.
+- Release asset: `AsterMind-v1.0-Windows-x64-Setup.exe` (1,906,600,651 bytes).
+- SHA-256: `4271241e89dc3c6734ab9e45531cf97abbb9db26b535d5b3efb936173eca072a`.
+- [Release and download](https://github.com/GUANYU-Tech/AsterMind/releases/tag/v1.0.0-preview.7)
+
 - Prefilled versioned Starlink single-carrier RF and optical budgets with separate
   user/feeder uplink/downlink profiles, clearly labelled inference and assumptions,
   and separate V3 160-Gbps specification / >200-Gbps report editions. Added tests
