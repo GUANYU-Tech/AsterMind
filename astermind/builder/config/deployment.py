@@ -5,6 +5,11 @@ from astermind.common.contracts import Contract, ComputeModeConfig, Identifier, 
 
 Positive = Annotated[int, Field(strict=True, gt=0)]
 
+class FastRoofline(Contract):
+    tensor_percent: Annotated[float, Field(gt=0, le=100, allow_inf_nan=False)] = 70
+    hbm_percent: Annotated[float, Field(gt=0, le=100, allow_inf_nan=False)] = 96
+
+
 class Parallelism(Contract):
     # Native physical worker count is TP * PP * DP. EP reuses stage-local ranks.
     dp: Positive = 1
@@ -65,6 +70,9 @@ class ServingCell(Contract):
     execution_mode: Literal["accelerated", "fast", "reference"] = "accelerated"
     graph_backend: Literal["midlayer"] = "midlayer"
     fast_glm_dsa_score: Literal["bf16_timing_proxy"] | None = None
+    fast_roofline: FastRoofline | None = None
+    fast_kv_pool_blocks: Positive | None = None
+    fast_link_contention: StrictBool = False
     detail_prediction_method: Literal["midlayer", "roofline"] | None = None
 
     @model_validator(mode="before")
@@ -108,6 +116,9 @@ class ServingCell(Contract):
 
 
 class SceneDeployment(ComputeModeConfig):
+    fast_roofline: FastRoofline | None = None
+    fast_kv_pool_blocks: Positive | None = None
+    fast_link_contention: StrictBool = False
     model: str = "configs/model/qwen3-8b.json"
     hardware: str = "configs/hardware/nvidia_a800.yaml"
     hardware_id: str = "nvidia_a800"

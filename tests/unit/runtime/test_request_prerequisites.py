@@ -9,11 +9,23 @@ from astermind.engine.simulation import Simulation
 from astermind.engine.timeline import GlobalTimeline
 from astermind.engine.cell_migration import NetworkKVMigration
 from astermind.engine.cell_events import CellCompletion
+from astermind.engine.policies.admission import legacy_cell_history
 from tests.unit.runtime.test_cell_migration import Cell
 
 from astermind.builder.config import SimulationConfig
 
 ROOT = Path(__file__).resolve().parents[3]
+
+
+class LegacyCellHistoryTests(unittest.TestCase):
+    def test_return_to_an_earlier_cell_does_not_reuse_an_older_prefix(self):
+        request = SimpleNamespace(id="turn3", session_id="session", parent_context_id="turn2")
+        previous_cell = SimpleNamespace(tips={"session": "turn1"}, pending={})
+        parent_cell = SimpleNamespace(tips={"session": "turn2"}, pending={})
+        new_cell = SimpleNamespace(tips={}, pending={})
+        self.assertEqual(legacy_cell_history(previous_cell, request), ("session|cold:turn3", None))
+        self.assertEqual(legacy_cell_history(parent_cell, request), ("session", "turn2"))
+        self.assertEqual(legacy_cell_history(new_cell, request), ("session", None))
 
 
 class PrerequisiteConfigTests(unittest.TestCase):

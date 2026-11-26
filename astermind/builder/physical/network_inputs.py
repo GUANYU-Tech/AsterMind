@@ -293,6 +293,18 @@ def materialize_network_input(manifest, base_dir="."):
             raise ValueError('ingress_members must identify unique physical cell members; single requires one')
         if egress == 'free':
             ingress_members = list(range(count))
+        limits = formation.get('ingress_isl_terminals')
+        external = {}
+        if limits is not None:
+            indices = ingress_members
+            if egress == 'free':
+                largest = max([count] + [v.get('satellites_per_cluster', count)
+                                         for v in formation.get('cell_overrides', {}).values()])
+                indices = range(largest)
+            if (not isinstance(limits, list) or len(limits) != len(indices)
+                    or any(type(n) is not int or n < 0 for n in limits)):
+                raise ValueError('接入成员对外 ISL 终端数须与接入成员一一对应，且均为非负整数')
+            external = dict(zip(indices, limits))
         if formation['source']['type'] == 'tle':
             physical, _ = source_rows(formation['source'], name, topology='explicit')
             by_catalog = {str(row['satnum']): row for row in physical}
@@ -314,6 +326,7 @@ def materialize_network_input(manifest, base_dir="."):
                     elements.append(row)
                     nodes.append(dict(node_id=row['satellite_id'], role='compute', shell_id=name,
                         cell_id=cell, cell_ingress=member in ingress_members, compute_target=member == 0,
+                        **({'external_isl_terminals':external[member]} if member in external else {}),
                         isl_terminals=formation.get('isl_terminals', 4),
                         sgl_terminals=formation.get('sgl_terminals', 1 if actual_scenario == 'compute_only' else 0),
                         **{k:formation[k] for k in ('max_user_links','max_gateway_links') if k in formation}))
@@ -421,6 +434,7 @@ def materialize_network_input(manifest, base_dir="."):
                         cell_id=cell,
                         cell_ingress=member in cell_ingresses,
                         compute_target=member == 0,
+                        **({"external_isl_terminals":external[member]} if member in external else {}),
                         isl_terminals=formation.get("isl_terminals", 4),
                         sgl_terminals=formation.get("sgl_terminals", 1 if actual_scenario == 'compute_only' else 0),
                         **{k: formation[k] for k in ('max_user_links', 'max_gateway_links') if k in formation},

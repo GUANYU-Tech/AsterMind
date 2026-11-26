@@ -66,14 +66,14 @@ bash scripts/run.sh
 
 | 仿真范围 | 前端入口 | 样例 |
 | --- | --- | --- |
-| **L2 · 单编队** | [计算 Cell 仿真](http://localhost:8766/cell/) | [DeepSeek-V4-Pro 网页样例](#l2--deepseek-v4-pro-仿真样例)。 |
+| **L2 · 单编队** | [算力编队仿真](http://localhost:8766/cell/) | [DeepSeek-V4-Pro 网页样例](#l2--deepseek-v4-pro-仿真样例)。 |
 | **L3 · 星座级** | [完整场景仿真](http://localhost:8766/workspace) | 样例待补充。 |
 
 ### L2 · DeepSeek-V4-Pro 仿真样例
 
 本例在 **Detail Mode** 下用 **TP8 × PP4** 模拟 **DeepSeek-V4-Pro**，四颗卫星各配八张模拟 H200 GPU。
 
-1. 打开[计算 Cell 仿真](http://localhost:8766/cell/)，点击「新建任务」。
+1. 打开[算力编队仿真](http://localhost:8766/cell/)，点击「新建任务」。
 2. 在「星座资源」选择 **NVIDIA H200**，设置 **4 颗卫星、每星 8 张 GPU**。静态编队选环形，间距设为 **1 km**。
 3. 在「通信网络」中，每星使用 **一组 8 卡 SU**，星间链路选「默认模式」，带宽设为 **400 Gbps**。
 4. 在「模型负载」选择 **deepseek-v4-pro** 和 **Detail Mode**。设置两条合成请求，到达率为 **16 请求/秒**，每条 **16 个输入 Token、2 个输出 Token**。

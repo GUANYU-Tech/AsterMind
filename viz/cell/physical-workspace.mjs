@@ -5,10 +5,10 @@ import {linkMode,rememberEmptyLinkMode} from './link-mode.mjs';
 import {renderParameterGroup,renderSchedulingReadout} from './parameter-panel.mjs';
 import {editorChoices,editDependencies,formationPairs} from './config-edit.mjs';
 import {configurationErrors} from './config-validation.mjs';
-import {renderConfigProfile} from '../assets/config-profile.js';
-import {mappingDraft,matchParallelismToResources} from './deployment-mapping.mjs';
-import {detailChoices,modelOptions} from './compute-config.mjs';
-import {setAutomaticDeployment,synchronizeResources,clearDependentDrafts} from './resource-sync.mjs';
+import {renderCellConfigProfile} from '../assets/config-profile.js';
+import {mappingDraft} from './deployment-mapping.mjs';
+import {modelOptions} from './compute-config.mjs';
+import {synchronizeResources,clearDependentDrafts} from './resource-sync.mjs';
 import {AsterMindScene,sceneState,syncSceneConfiguration} from './scene.js?v=profile-1';
 import {sceneCellDraft,sceneCellLayout} from '../assets/scene-cell-parameters.js';
 import {memberIds} from '../assets/physical-cells.js';
@@ -25,6 +25,7 @@ let draft=sceneCellDraft(capabilities,members(),mode,session.layout);
 // The full scene supplies the physical topology and accepts single-member Cells.
 draft.topology.source='file';
 draft.ep_strategy=session.epStrategy;
+delete draft.fast_link_contention;
 const profile=session.linkProfile || {};
 function geometryLinks(mode=profile.capacity_model==='fixed'?'fixed':'islsim') {
   rememberEmptyLinkMode(draft,mode);
@@ -51,7 +52,7 @@ document.querySelector('.studio-topbar').remove();
 const section=(stage,index)=>$('form-'+stage+'-'+index);
 const fields=[['formation',0,['hardware.default_hardware_id','hardware.accelerators_per_satellite']],
   ...Object.entries(groups).filter(([stage])=>stage!=='formation').flatMap(([stage,sections])=>
-    sections.map(([,paths],index)=>[stage,index,paths]).filter(([,index])=>section(stage,index)))];
+    sections.map(([,paths],index)=>[stage,index,paths.filter(path=>path!=='compute_mode')]).filter(([,index])=>section(stage,index)))];
 function scopeChoice(host, caption, options, value) {
   const label=document.createElement('label');label.className='config-field';
   label.append(document.createTextNode(caption));
@@ -91,6 +92,9 @@ $('discard-json').onclick=()=>jsonLock(false);
 $('apply-json').onclick=()=>{try{
   const next=parseConfiguration($('advanced-config').value);
   if(Object.hasOwn(next,'requests'))throw Error('请在实验场景的「业务请求」中配置请求。');
+  if(Object.hasOwn(next,'compute_mode') && next.compute_mode!==mode)throw Error('请在物理场景中统一设置计算模式。');
+  next.compute_mode=mode;
+  if(mode==='fast_mode' && capabilities.fast_roofline_defaults)next.fast_roofline??=structuredClone(capabilities.fast_roofline_defaults);
   if(JSON.stringify(next.hardware.satellite_ids)!==JSON.stringify(members()) || next.topology.source!=='file' ||
      JSON.stringify(next.constellation)!==JSON.stringify(draft.constellation))
     throw Error('请在星座几何中设置全场景的编队成员');
@@ -161,12 +165,11 @@ function renderGeometry(){
 }
 function renderParameters(){
   const choices=editorChoices(draft,capabilities);
-  const visible=choices.visible;
   let refresh=false;
-  Object.assign(choices,{drafts,onDraftChange:schedulePreflight,labels:{compute_mode:'全场景计算模式',ep_strategy:'全场景专家并行通信'},visible,onEdit:(path,value,previous)=>{
-    if(['hardware','model','compute_mode'].includes(path[0]) || path[0]==='deployment' && ['worker_pools','mode'].includes(path[1])) clearDependentDrafts(drafts);
+  Object.assign(choices,{drafts,onDraftChange:schedulePreflight,onEdit:(path,value,previous)=>{
+    if(['hardware','model'].includes(path[0]) || path[0]==='deployment' && ['worker_pools','mode'].includes(path[1])) clearDependentDrafts(drafts);
     refresh=editDependencies(draft,path,value,capabilities,previous);
-    if(path[0]==='deployment' && path[1]==='placements'){setAutomaticDeployment(draft,false);refresh=true}
+    if(path[0]==='deployment' && path[1]==='placements')refresh=true;
     if(path[0]==='topology')updatePreview();
   }});
   for(const [stage,index,paths] of fields) renderParameterGroup(section(stage,index),draft,paths,capabilities,path=>{
@@ -177,19 +180,21 @@ function renderParameters(){
   section('network',1).disabled=section('network',2).disabled=linkScope.value==='scene';
   section('network',2).closest('details').hidden=linkMode(draft)==='fixed';
   renderJson();
-  renderComputeSummary(draft,capabilities);
+  renderComputeSummary(draft,capabilities,()=>{renderJson();schedulePreflight()},choices);
   schedulePreflight();
 }
 function renderJson(){
-  $('advanced-config').value=JSON.stringify(draft,null,2);
-  renderConfigProfile($('config-profile'),draft,labels);
+  const {compute_mode,fast_link_contention,...editable}=draft;
+  $('advanced-config').value=JSON.stringify(editable,null,2);
+  renderCellConfigProfile($('config-profile'),draft,labels);
 }
-for(const [id,action] of [
-  ['generate-mapping',()=>{draft.deployment.placements=mappingDraft(draft,{reset:true})}],
-  ['match-parallelism',()=>matchParallelismToResources(draft,{modelShape:capabilities.model_shapes?.[draft.model],supportedChoices:detailChoices(draft,capabilities)})],
-  ['automatic-deployment',()=>{setAutomaticDeployment(draft,true);synchronizeResources(draft,capabilities)}],
-  ['manual-deployment',()=>setAutomaticDeployment(draft,false)],
-])$(id).onclick=()=>{try{action();renderParameters();report('')}catch(e){report(e.message)}};
+$('generate-mapping').onclick=()=>{
+  try {
+    draft.deployment.placements=mappingDraft(draft,{reset:true});
+    renderParameters();
+    report('');
+  } catch(e){report(e.message)}
+};
 function stage(name){
   document.body.dataset.stage=name;
   document.querySelectorAll('.config-panel').forEach(panel=>{panel.hidden=panel.dataset.panel!==name;panel.classList.toggle('is-active',!panel.hidden)});
@@ -233,7 +238,7 @@ function currentLayout(){
 }
 async function validateLayout(layout) {
   const response=await fetch('/cell/api/scene/validate',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({id:session.id,layout})});
+    body:JSON.stringify({id:session.id,compute_mode:mode,layout})});
   const result=await response.json();if(!response.ok)throw Error(result.detail||'编队配置校验失败');
   return result;
 }

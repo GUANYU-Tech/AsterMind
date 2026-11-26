@@ -1,4 +1,5 @@
 """Run the existing Qwen TP/PP preset through the shared live controller."""
+from bisect import bisect_left
 from datetime import datetime
 from dataclasses import replace
 import gzip
@@ -25,13 +26,18 @@ class NativeSession(LiveSession):
         self.payload.update(native_preset=PRESET, deployment=DEPLOYMENT)
 
 
-def physical_export(output, engine, source):
+def physical_export(output, engine, source, *, horizon_s=None):
     """Export actual network snapshots in the existing viewer's frame contract."""
     from astermind.engine.setup.sun_geometry import SUN_GEOMETRY_VERSION
     frames = output/'frames'
     frames.mkdir(exist_ok=True)
     descriptors = []
-    for i, time in enumerate(engine.net.environment_times):
+    times = engine.net.environment_times
+    if horizon_s is not None:
+        # Keep the first sample at or after the end for the viewer's last
+        # interval. A longer offline topology may serve several shorter runs.
+        times = times[:bisect_left(times, horizon_s) + 1]
+    for i, time in enumerate(times):
         snapshot = engine.net.snapshot(time)
         name = f'frames/frame-{i:06d}.json.gz'
         with gzip.open(output/name, 'wt', encoding='utf-8') as stream:
@@ -42,7 +48,7 @@ def physical_export(output, engine, source):
         schema_version='orbitserve.network_result.v1', trace_id=engine.net.trace.trace_id,
         time=source['trace']['trace_manifest']['time'], network=network,
         sun_positions=source['sun_positions'], artifacts=dict(frames=descriptors),
-        boundary_sample_times_s=list(engine.net.environment_times),
+        boundary_sample_times_s=list(times),
         candidate_links=list(engine.net.edges), routes=[], events=[], snapshots=[],
         warnings=source['trace'].get('warnings', []),
         provenance=dict(between_samples='sample_hold', sun_geometry_version=SUN_GEOMETRY_VERSION,

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import test from 'node:test';
-import {mappingDraft, matchParallelismToResources, deploymentCapacity} from '../cell/deployment-mapping.mjs';
+import {mappingDraft, deploymentCapacity} from '../cell/deployment-mapping.mjs';
 
 const defaults = JSON.parse(readFileSync(new URL('../cell/presentation.json', import.meta.url))).default_configuration;
 function fixture(satellites = 2, cards = 1, tp = 1, pp = 2) {
@@ -53,23 +53,11 @@ test('insufficient physical cards remain unassigned instead of reusing a card', 
   assert.ok(rows.slice(2).every(row => row.satellite_id === '' && row.local_index === null));
 });
 
-test('explicit resource matching preserves divisible TP and generates complete mappings', () => {
-  const config = fixture(3,4,2,1);
-  assert.deepEqual(matchParallelismToResources(config), {tp:2,pp:6});
-  assertCoverage(config);
-});
-
-test('nondivisible TP falls back to a per-satellite divisor', () => {
-  const config = fixture(3,2,4,1);
-  assert.deepEqual(matchParallelismToResources(config), {tp:2,pp:3});
-  assertCoverage(config);
-});
-
-test('PD pools receive the same parallel shape and disjoint physical cards', () => {
-  const config = fixture(2,2,1,1);
+test('manual PD pools map to disjoint physical cards', () => {
+  const config = fixture(2,2,1,2);
   const second = structuredClone(config.deployment.worker_pools[0]); second.name = 'decode';
   config.deployment.worker_pools.push(second);
-  assert.deepEqual(matchParallelismToResources(config), {tp:1,pp:2});
+  config.deployment.placements = mappingDraft(config);
   assertCoverage(config);
 });
 
@@ -95,11 +83,10 @@ test('odd inventory leaves spare cards idle; unsupported parallelism still fails
   const config = fixture(3,1,1,1);
   const second = structuredClone(config.deployment.worker_pools[0]); second.name = 'decode';
   config.deployment.worker_pools.push(second);
-  assert.deepEqual(matchParallelismToResources(config),{tp:1,pp:1});
+  config.deployment.placements = mappingDraft(config);
   assert.equal(config.deployment.placements.length,2);
   assert.equal(new Set(locations(config.deployment.placements)).size,2);
   config.deployment.worker_pools.pop();
   config.deployment.worker_pools[0].parallelism.data_parallel_size = 2;
-  assert.throws(() => matchParallelismToResources(config), /DP/);
   assert.equal(mappingDraft(config),config.deployment.placements);
 });

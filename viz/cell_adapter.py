@@ -30,8 +30,15 @@ def capabilities():
     value['model_details'] = {Path(m['id']).stem: m for m in catalog['models']}
     for key in ('compute_modes', 'detail_prediction_methods', 'memory_policies', 'collective_algorithms'):
         value[key] = catalog[key]
+    value['fast_roofline_defaults'] = {'tensor_percent':70, 'hbm_percent':96}
     value['fast_gpu_limits'] = {h['id']: h['fast_gpu_limit_per_satellite'] for h in catalog['hardware']}
     value['su_profiles'] = {h['id']: h for h in catalog['hardware']}
+    from astermind.engine.compute.fast_mode.hardware import Hardware
+    from src.kernel.hardware_spec import HWSpec
+    for row in catalog['hardware']:
+        profile = Hardware.from_hardware_spec(HWSpec(upstream / row['file']))
+        row['roofline_peaks'] = dict(bf16_tflops=profile.bf16_flops/1e12,
+                                    hbm_tb_s=profile.nominal_hbm_bytes(row['id'])/1e12)
     value['hardware_details']={h['id']:yaml.safe_load((upstream/h['file']).read_text()) for h in catalog['hardware']}
     config = value['default_configuration']
     config.update(compute_mode='detail_mode', detail_prediction_method='auto',
@@ -55,6 +62,10 @@ def capabilities():
             collective['backend'] = 'runtime_comm'
     definitions = value['schema']['$defs']
     value['schema']['properties'].update(
+        fast_roofline={'type':'object','additionalProperties':False,'required':['tensor_percent','hbm_percent'],
+                       'properties':{key:{'type':'number','exclusiveMinimum':0,'maximum':100}
+                                     for key in ('tensor_percent','hbm_percent')}},
+        fast_link_contention={'type':'boolean'},
         compute_mode={'enum': [mode['id'] for mode in value['compute_modes']]},
         detail_prediction_method={'anyOf': [
             {'type': 'string', 'enum': ['auto', *value['detail_prediction_methods']]}, {'type': 'null'},
@@ -325,9 +336,9 @@ def compile_serving_cell(value, physical, longest_request, *, cell_id='cell', sc
     chunked = v.get('enable_chunked_prefill', True)
     long_prefill = v.get('long_prefill_token_threshold', 0)
     if long_prefill and not chunked:
-        raise ValueError('长 Prefill 阈值需要开启分块 Prefill')
+        raise ValueError('Prefill 分块上限需要开启分块 Prefill')
     if deployment['mode'] == 'pd_disagg' and (not chunked or long_prefill):
-        raise ValueError('PD 使用 vLLM 0.11，需要开启分块 Prefill 并将长 Prefill 阈值设为 0')
+        raise ValueError('PD 使用 vLLM 0.11，需要开启分块 Prefill 并将Prefill 分块上限设为 0')
     if value['launch_policy'] != 'analytical_launch':
         raise ValueError('V1 当前适配器只接受 analytical_launch')
     workers = tp * pp * dp
@@ -386,10 +397,12 @@ def compile_serving_cell(value, physical, longest_request, *, cell_id='cell', sc
                    kv_block_size_tokens=s.get('kv_block_size_tokens'), prefix_caching=v['enable_prefix_caching'],
                    enable_chunked_prefill=chunked, long_prefill_token_threshold=long_prefill,
                    memory_policy_file=value.get('memory_policy_file') or None,
-                   fast_glm_dsa_score=value.get('fast_glm_dsa_score') or None)
+                   fast_glm_dsa_score=value.get('fast_glm_dsa_score') or None,
+                   fast_roofline=value.get('fast_roofline') if fast else None,
+                   fast_link_contention=fast and value.get('fast_link_contention',False))
     options.update(resolve_scheduling(options, model, longest_request, upstream))
     if adapter == 'vllm_0_11' and (not chunked or long_prefill):
-        raise ValueError('vLLM 0.11 需要开启分块 Prefill 并将长 Prefill 阈值设为 0')
+        raise ValueError('vLLM 0.11 需要开启分块 Prefill 并将Prefill 分块上限设为 0')
     hierarchy = physical.get('intra_hierarchies', {})
     largest_su = max((len(group) for row in hierarchy.values() for group in row['su_groups']), default=hw['accelerators_per_satellite'])
     if deployment['mode'] == 'colocated':
@@ -419,6 +432,7 @@ def compile_serving_cell(value, physical, longest_request, *, cell_id='cell', sc
                     'max_model_len', 'max_batched_tokens', 'max_requests', 'num_kv_blocks', 'kv_block_size_tokens',
                     'prefix_caching', 'enable_chunked_prefill', 'long_prefill_token_threshold', 'scheduler_adapter',
                     'expert_routing_seed', 'wide_ep_enabled', 'memory_policy_file', 'fast_glm_dsa_score',
+                    'fast_roofline', 'fast_link_contention',
                 )})
     return cell, communication, None if fast else method
 

@@ -14,14 +14,6 @@ export function modelOptions(config, capabilities) {
     : Object.keys(capabilities.models_by_hardware?.[hardware] || {});
 }
 
-export function detailChoices(config, capabilities) {
-  if (config.deployment.mode === 'pd_disagg') {
-    return config.hardware.default_hardware_id === 'nvidia_h200' && config.model === 'kimi-k2.6'
-      ? [{tp:8, pp:1, expert_parallel:true}] : [];
-  }
-  return capabilities.models_by_hardware?.[config.hardware.default_hardware_id]?.[config.model];
-}
-
 export function normalizeComputeSettings(config, capabilities) {
   if (config.runtime) delete config.runtime.timeout_seconds;
   if (['midlayer', 'roofline'].includes(config.compute_mode)) {
@@ -30,6 +22,7 @@ export function normalizeComputeSettings(config, capabilities) {
   }
   if (config.compute_mode === 'batch_roofline') config.compute_mode = 'fast_mode';
   config.compute_mode ??= 'detail_mode';
+  if (capabilities.fast_roofline_defaults) config.fast_roofline ??= structuredClone(capabilities.fast_roofline_defaults);
   if (config.compute_mode === 'detail_mode') config.detail_prediction_method ??= 'auto';
   const policy = capabilities.memory_policies?.find(row => row.file === config.memory_policy_file);
   config.memory_policy_file = policy?.id ?? config.memory_policy_file ?? '';

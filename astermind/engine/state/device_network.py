@@ -7,11 +7,32 @@ no physical capacity or acquisition clock is duplicated by this projection.
 
 from __future__ import annotations
 
+from bisect import bisect_left
+from collections import Counter
+from collections.abc import Sequence
 from types import SimpleNamespace
 from astermind.engine.clock import Time
 
 from astermind.engine.setup.network_spec import LinkProfile, NetworkNodeSpec
 from astermind.engine.state.network import C_KM_PER_S, NetworkState
+
+
+class ProjectedLinkHistory(Sequence):
+    def __init__(self, history, edge, end_s, count):
+        self.history, self.edge, self.end_s, self.count = history, edge, end_s, count
+
+    def __len__(self):
+        return self.count
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return [self[i] for i in range(*index.indices(self.count))]
+        if index < 0:
+            index += self.count
+        if not 0 <= index < self.count:
+            raise IndexError(index)
+        row = self.history[index]
+        return {**row, **self.edge, "end_s": min(row["end_s"], self.end_s)}
 
 
 class DeviceNetworkState(NetworkState):
@@ -24,8 +45,11 @@ class DeviceNetworkState(NetworkState):
         physical=None,
         bindings=None,
         ground_owners=(),
+        prune_terminal_checks=False,
+        indexed_fast_routes=False,
     ):
         self.topology, self.physical = topology, physical
+        self.indexed_fast_routes = indexed_fast_routes
         self.disabled_device_links = set()
         self.failed_device_links = set()
         self.start_s = physical.start_s if physical is not None else 0.0
@@ -87,7 +111,7 @@ class DeviceNetworkState(NetworkState):
                 )
 
         for identifier, device in topology.devices.items():
-            if device.capacity_gbps is not None:
+            if device.capacity_gbps is not None and (not indexed_fast_routes or device.kind == "switch"):
                 add(
                     topology.ingress[identifier],
                     topology.egress[identifier],
@@ -173,11 +197,24 @@ class DeviceNetworkState(NetworkState):
         )
         self.calendars, self.shared_load, self.shared_pool_load = {}, {}, {}
         self._project()
-        self._validate_terminal_allocation()
+        self._validate_terminal_allocation(prune=prune_terminal_checks)
 
-    def _validate_terminal_allocation(self):
+    def _validate_terminal_allocation(self, *, prune=False):
         if self.physical is None:
             return
+        links = self.topology.links
+        candidates = None
+        if prune:
+            # A terminal with no more possible incident links than slots
+            # cannot overflow in any frame, even if every link is active.
+            bound = tuple(link for link in links if link.id in self._bindings)
+            counts = Counter(terminal for link in bound for terminal in (link.source, link.target))
+            candidates = {terminal for terminal, count in counts.items()
+                          if count > self.topology.devices[terminal].max_external_links}
+            if not candidates:
+                return
+            links = tuple(link for link in bound
+                          if link.source in candidates or link.target in candidates)
         checks = sorted(
             {
                 self.start_s,
@@ -191,7 +228,7 @@ class DeviceNetworkState(NetworkState):
         )
         for time_s in checks:
             used = {}
-            for link in self.topology.links:
+            for link in links:
                 physical_id = self._bindings.get(link.id)
                 if (
                     physical_id is None
@@ -199,6 +236,8 @@ class DeviceNetworkState(NetworkState):
                 ):
                     continue
                 for terminal in (link.source, link.target):
+                    if candidates is not None and terminal not in candidates:
+                        continue
                     used[terminal] = used.get(terminal, 0) + 1
                     if (
                         used[terminal]
@@ -224,14 +263,13 @@ class DeviceNetworkState(NetworkState):
                 else:
                     self.active_faults[index] = fault
         boundaries = {self.start_s, self.end_s}
+        indexed = (self.indexed_fast_routes and physical is not None
+                   and physical.physical_attributes.link_store)
         if physical is not None:
             boundaries.update(t for t in physical.environment_times if t < self.end_s)
-            boundaries.update(
-                t
-                for rows in physical.link_times.values()
-                for t in rows
-                if t < self.end_s
-            )
+            changes = (indexed.boundaries if indexed and indexed.boundaries is not None
+                       else (t for rows in physical.link_times.values() for t in rows))
+            boundaries.update(t for t in changes if t < self.end_s)
             boundaries.update(
                 t
                 for times in physical.attribute_boundaries.values()
@@ -252,6 +290,12 @@ class DeviceNetworkState(NetworkState):
         for edge in self.edges:
             metadata = self._meta[edge["link_id"]]
             physical_id = metadata.get("physical_link_id")
+            if physical_id and indexed:
+                times = physical.link_times[physical_id]
+                self.link_frames[edge["link_id"]] = ProjectedLinkHistory(
+                    physical.link_frames[physical_id], edge, self.end_s, bisect_left(times, self.end_s))
+                self.link_times[edge["link_id"]] = times
+                continue
             if physical_id:
                 rows = [
                     {**row, **edge, "end_s": min(row["end_s"], self.end_s)}
@@ -284,6 +328,10 @@ class DeviceNetworkState(NetworkState):
         if source is not None:
             return self._directions.get((edge["link_id"], source, target))
         return self._meta[edge["link_id"]]
+
+    def use_link_state_window(self, time_s):
+        if self.indexed_fast_routes:
+            self.physical.use_link_state_window(time_s)
 
     def pools_for_hop(self, source, target):
         edge = self._pairs.get(tuple(sorted((source, target))))

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import test from 'node:test';
-import {synchronizeResources,setAutomaticDeployment,clearDependentDrafts} from '../cell/resource-sync.mjs';
+import {synchronizeResources,clearDependentDrafts} from '../cell/resource-sync.mjs';
 import {editDependencies} from '../cell/config-edit.mjs';
 import {configurationErrors} from '../cell/config-validation.mjs';
 const capabilities=JSON.parse(readFileSync(new URL('../cell/presentation.json',import.meta.url)));
@@ -31,16 +31,15 @@ test('resource renaming repairs stale placement IDs and gateway card references'
   editDependencies(config,['hardware','satellite_ids'],config.hardware.satellite_ids,capabilities);
   assert.equal(config.topology.intra_satellite.gateway_local_index,0); validMapping(config);
 });
-test('extra cards may stay idle when using every card violates model geometry',()=>{
+test('extra cards stay idle without changing TP or PP',()=>{
   const config=fixture(); config.hardware.accelerators_per_satellite=30;
+  const parallel=structuredClone(config.deployment.worker_pools[0].parallelism);
   const result=synchronizeResources(config,capabilities);
-  assert.equal(result.error,''); assert.ok(result.idle>0); validMapping(config);
-  const parallel=config.deployment.worker_pools[0].parallelism, shape=capabilities.model_shapes[config.model];
-  assert.equal(shape.num_attention_heads%parallel.tensor_parallel_size,0);
-  assert.equal(shape.num_hidden_layers%parallel.pipeline_parallel_size,0);
+  assert.equal(result.error,''); assert.equal(result.idle,58); validMapping(config);
+  assert.deepEqual(config.deployment.worker_pools[0].parallelism,parallel);
 });
 test('manual mode retains TP/PP while still repairing invalid card mappings',()=>{
-  const config=fixture(); setAutomaticDeployment(config,false); config.hardware.accelerators_per_satellite=2;
+  const config=fixture(); config.hardware.accelerators_per_satellite=2;
   synchronizeResources(config,capabilities);
   assert.equal(config.deployment.worker_pools[0].parallelism.tensor_parallel_size,2);
   assert.equal(config.deployment.worker_pools[0].parallelism.pipeline_parallel_size,1); validMapping(config);
@@ -61,7 +60,7 @@ test('tied Qwen weights avoid every cross-pipeline plan, leaving surplus cards i
 });
 
 test('manual tied-weight PP incompatibility is reported before publishing',()=>{
-  const config=fixture(); setAutomaticDeployment(config,false);
+  const config=fixture();
   config.hardware.accelerators_per_satellite=2;
   config.deployment.worker_pools[0].parallelism.pipeline_parallel_size=2;
   assert.match(synchronizeResources(config,capabilities).error,/PP/);

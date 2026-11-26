@@ -533,7 +533,7 @@ class VLLM030SchedulerProcess(VLLMSchedulerProcess):
                  max_requests: int, kv_block_size_tokens: int,
                  available_memory_by_rank: tuple[int, ...],
                  supported_layouts_by_rank: tuple[tuple[str, ...], ...], role: str = "colocated",
-                 session_storage: bool = False) -> None:
+                 session_storage: bool = False, export_k3_session_state: bool = False) -> None:
         from src.serving.backend.vllm import VLLMSchedulerConfig
         if (not isinstance(scheduler_config, VLLMSchedulerConfig)
                 or scheduler_config.scheduler_version != "0.30.0"):
@@ -541,6 +541,8 @@ class VLLM030SchedulerProcess(VLLMSchedulerProcess):
         if scheduler_config.context_parallel_size != 1 or scheduler_config.data_parallel_size != 1:
             raise NotImplementedError("native CPU0.30 process requires CP1; use VLLMBackend's explicit PCP cache projection")
         self._session_storage = session_storage
+        if export_k3_session_state and not session_storage:
+            raise ValueError("K3 session state export requires the Fast storage adapter")
         if (scheduler_config.max_model_len is None
                 or (scheduler_config.pipeline_parallel_size != 1 and role != "colocated")
                 or (scheduler_config.async_scheduling and (role != "colocated"
@@ -631,11 +633,15 @@ class VLLM030SchedulerProcess(VLLMSchedulerProcess):
             import astermind
 
             python_paths.append(str(Path(astermind.__file__).resolve().parents[1]))
+            # This Fast worker owns its Python environment. The frontend may
+            # export its own site-packages in PYTHONPATH, ahead of this venv.
+        else:
+            python_paths.append(environment.get("PYTHONPATH", ""))
         environment.update(
             CUDA_VISIBLE_DEVICES="", VLLM_TARGET_DEVICE="cpu", VLLM_PLUGINS="",
             HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", PYTHONDONTWRITEBYTECODE="1",
             VLLM_NO_USAGE_STATS="1", VLLM_CACHE_ROOT=str(model_root / "cache"),
-            PYTHONPATH=os.pathsep.join((*python_paths, os.environ.get("PYTHONPATH", ""))),
+            PYTHONPATH=os.pathsep.join(python_paths),
         )
         if scheduler_config.dspark_draft_model is not None:
             environment["VLLM_USE_V2_MODEL_RUNNER"]="1"
@@ -666,7 +672,11 @@ class VLLM030SchedulerProcess(VLLMSchedulerProcess):
             startup = (scheduler_config, source_root, pool_name, max_batched_tokens,
                          max_requests, kv_block_size_tokens, available_memory_by_rank,
                          supported_layouts_by_rank, role)
-            parent.send((*startup, True) if session_storage else startup)
+            if export_k3_session_state:
+                startup = (*startup, True, True)
+            elif session_storage:
+                startup = (*startup, True)
+            parent.send(startup)
             self.runtime_info = self._parse_ready(self._receive(_STARTUP_TIMEOUT_S))
             self._startup_request = startup_request
             self._startup_model_sha256 = startup_model
@@ -1446,11 +1456,13 @@ def _vllm030_pipe_worker(fd: int) -> None:
     connection = Connection(fd)
     try:
         startup = connection.recv()
-        if not isinstance(startup, tuple) or len(startup) not in (9, 10):
+        if (not isinstance(startup, tuple) or len(startup) not in (9, 10, 11)
+                or any(flag is not True for flag in startup[9:])):
             raise ValueError("invalid isolated 0.30 startup packet")
         (requested, source_root, pool_name, max_batch, max_requests, block_size,
          budgets, layouts, role) = startup[:9]
-        session_storage = len(startup) == 10 and startup[-1] is True
+        session_storage = len(startup) >= 10
+        export_k3_session_state = len(startup) == 11
         if role not in ("colocated", "prefill", "decode") and worker_role_operator_group(role) != "attention":
             raise ValueError("invalid isolated 0.30 Scheduler role")
         identity = vllm030_source_identity(source_root)
@@ -1467,12 +1479,19 @@ def _vllm030_pipe_worker(fd: int) -> None:
         from vllm.v1.core.sched.scheduler import Scheduler
         from vllm.v1.structured_output import StructuredOutputManager
         model = load_model_config(requested.model)
-        if session_storage and (model.model_id != "zai-org/GLM-5.2"
-                or model.weight_dtype != "bf16" or role != "colocated"
-                or (requested.tensor_parallel_size, requested.pipeline_parallel_size) != (8, 4)
-                or requested.enable_expert_parallel or requested.async_scheduling
-                or requested.mtp_num_speculative_tokens or requested.simple_cpu_offload_bytes_per_rank):
-            raise ValueError("0.30 session storage is limited to synchronous GLM-5.2 TP8×PP4 DP1")
+        hybrid_session = session_storage and model.model_id == "moonshotai/Kimi-K3"
+        if export_k3_session_state and not hybrid_session:
+            raise ValueError("K3 session state export requires the pinned Kimi-K3 cache source")
+        if hybrid_session and (role != "colocated" or requested.async_scheduling
+                or requested.data_parallel_size != 1 or requested.mtp_num_speculative_tokens
+                or requested.simple_cpu_offload_bytes_per_rank is not None or not requested.enable_chunked_prefill):
+            raise ValueError("K3 native session storage requires synchronous colocated DP1 and chunked prefill")
+        if session_storage and not hybrid_session and (
+                role != "colocated" or requested.async_scheduling or requested.data_parallel_size != 1
+                or requested.mtp_num_speculative_tokens or requested.simple_cpu_offload_bytes_per_rank is not None):
+            raise NotImplementedError(
+                "Fast Mode vLLM 0.30 session storage requires synchronous colocated DP1 "
+                "without speculative decoding or host KV offload")
         target_model = ModelConfig(
                 model=requested.model, skip_tokenizer_init=True, enforce_eager=True,
                 dtype=requested.dtype, max_model_len=requested.max_model_len,
@@ -1533,14 +1552,31 @@ def _vllm030_pipe_worker(fd: int) -> None:
             # only schedules the simulated GPU model, so retain the Cell policy.
             native.scheduler_config.enable_chunked_prefill = requested.chunked_prefill_override
             native.scheduler_config.max_num_batched_tokens = max_batch
+        if hybrid_session:
+            from astermind.engine.compute.hybrid_session import start_hybrid_k3_session
+
+            effective, control = start_hybrid_k3_session(
+                native, model, requested, pool_name, role, budgets, layouts, source_root, identity,
+                export_step_state=export_k3_session_state,
+            )
+            _verify_no_accelerator_access(baseline)
+            connection.send(("ready", effective, control.runtime_info))
+            _serve_scheduler_commands(connection, control, baseline)
+            return
         workers, scheduler_cache = allocate_vllm030_model_cache(
             native, model, MidlayerParallel(tensor_parallel_size=requested.tensor_parallel_size,
                 pipeline_parallel_size=requested.pipeline_parallel_size,
                 enable_expert_parallel=requested.enable_expert_parallel),
-            budgets, source_root=source_root, supported_layouts_by_rank=layouts)
+            budgets, source_root=source_root, supported_layouts_by_rank=layouts,
+            pool_blocks=requested.kv_pool_blocks)
         native.cache_config.num_gpu_blocks = scheduler_cache.num_blocks
         scheduler_block_size = (requested.max_model_len if model.model_id == "moonshotai/Kimi-K3"
                                 else native.cache_config.block_size)
+        grouped_v4_session = session_storage and model.model_type == "deepseek_v4"
+        if session_storage and not grouped_v4_session:
+            from astermind.engine.compute.native_cell_storage import StorageControlPlane
+
+            session_layout = StorageControlPlane.native_030_layout(scheduler_cache, workers, scheduler_block_size)
         from vllm.v1.core.sched.async_scheduler import AsyncScheduler
         scheduler_class = AsyncScheduler if requested.async_scheduling else Scheduler
         scheduler = scheduler_class(native, scheduler_cache, StructuredOutputManager(native),
@@ -1579,6 +1615,7 @@ def _vllm030_pipe_worker(fd: int) -> None:
             bootstrap="explicit SDK Python subprocess; guarded CpuPlatform",
             device_guard="CpuPlatform forced; CUDA availability hidden; CUDA/NVML APIs blocked",
             requested_max_num_batched_tokens=max_batch, requested_cache_block_size=block_size,
+            requested_kv_pool_blocks=requested.kv_pool_blocks,
             available_memory_by_rank=budgets, supported_layouts_by_rank=layouts,
             capacity_input_source="caller-declared byte budgets, not measured/normal available KV",
             layout_capabilities_source="caller declaration, not worker report",
@@ -1591,17 +1628,29 @@ def _vllm030_pipe_worker(fd: int) -> None:
             simple_cpu_offload_mode=(None if simple_cpu_bytes is None else "eager_cpu"),
         )
         if session_storage:
-            from astermind.engine.compute.native_cell_storage import StorageControlPlane
-
             # CpuPlatform disables prefix caching for MLA model execution.
             # This worker executes only Scheduler and already verified the
             # real allocator output before enabling its block hash cache.
             info = control.runtime_info
             control.close()
             native.cache_config.enable_prefix_caching = True
-            scheduler = Scheduler(native, scheduler_cache, StructuredOutputManager(native),
-                                  block_size=scheduler_block_size)
-            control = StorageControlPlane.from_native_030(scheduler, effective, requested, info)
+            if grouped_v4_session:
+                from astermind.engine.compute.hybrid_session import NativeGroupedSessionControl
+                from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+
+                step_size, hash_size = resolve_kv_cache_block_sizes(scheduler_cache, native)
+                scheduler = Scheduler(native, scheduler_cache, StructuredOutputManager(native),
+                                      block_size=step_size, hash_block_size=hash_size)
+                info.update(session_storage=True, effective_prefix_caching=True, requested_prefix_caching=True,
+                            session_cache_layout="v4_grouped", scheduler_block_size=step_size,
+                            prefix_hash_block_size=hash_size)
+                control = NativeGroupedSessionControl.create(
+                    scheduler, effective, replace(requested, enable_prefix_caching=True), info)
+            else:
+                scheduler = Scheduler(native, scheduler_cache, StructuredOutputManager(native),
+                                      block_size=scheduler_block_size)
+                control = StorageControlPlane.from_native_030(
+                    scheduler, effective, requested, info, attention_layout=session_layout)
         _verify_no_accelerator_access(baseline)
         connection.send(("ready", effective, control.runtime_info))
         _serve_scheduler_commands(connection, control, baseline)

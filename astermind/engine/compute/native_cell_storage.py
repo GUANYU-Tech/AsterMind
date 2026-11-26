@@ -16,23 +16,58 @@ class StorageControlPlane(LatestControlPlane):
     def __init__(self, config, requested, options):
         self._bind(construct_scheduler(config, requested, options), config, requested)
 
+    @staticmethod
+    def native_030_layout(scheduler_cache, worker_caches, block_size):
+        """Inspect the allocator result, including leaves hidden by the Scheduler's representative."""
+        from vllm.v1.kv_cache_interface import FullAttentionSpec, MLAAttentionSpec, UniformTypeKVCacheSpecs
+
+        kinds = set()
+        for cache in (scheduler_cache, *worker_caches):
+            groups = cache.kv_cache_groups
+            if len(groups) != 1:
+                raise NotImplementedError(
+                    f"Fast Mode session storage requires one full-prefix native KV group; found {len(groups)} groups")
+            spec = groups[0].kv_cache_spec
+            members = tuple(spec.kv_cache_specs.values()) if isinstance(spec, UniformTypeKVCacheSpecs) else (spec,)
+            if not members:
+                raise NotImplementedError("Fast Mode session storage requires native KV group members")
+            for member in members:
+                kind = type(member)
+                if (kind not in (FullAttentionSpec, MLAAttentionSpec)
+                        or not member.prefix_cacheable or member.non_causal
+                        or member.sliding_window is not None or member.attention_chunk_size is not None
+                        or member.tokens_per_state != 1):
+                    raise NotImplementedError(
+                        f"Fast Mode session storage requires full-prefix attention; unsupported {kind.__name__} layout")
+                if member.block_size != block_size:
+                    raise NotImplementedError(
+                        f"Native KV page width {member.block_size} differs from the session block width {block_size}")
+                kinds.add(kind)
+        if len(kinds) != 1:
+            raise NotImplementedError("Fast Mode session storage requires one native attention cache layout across workers")
+        return "mla" if kinds == {MLAAttentionSpec} else "paged_varlen"
+
     @classmethod
-    def from_native_030(cls, scheduler, config, requested, runtime_info):
-        if (len(scheduler.kv_cache_config.kv_cache_groups) != 1
-                or not scheduler.cache_config.enable_prefix_caching):
-            raise ValueError("Fast Mode session storage requires one native KV cache group and real prefix caching")
+    def from_native_030(cls, scheduler, config, requested, runtime_info, *, attention_layout):
+        if not scheduler.cache_config.enable_prefix_caching:
+            raise ValueError("Fast Mode session storage requires native prefix caching")
+        if scheduler.hash_block_size != config.kv_block_size_tokens:
+            raise ValueError("Native prefix hash width disagrees with the session block width")
         plane = cls.__new__(cls)
         plane.scheduler_config = requested
         plane.runtime_info = {**runtime_info, "requested_prefix_caching": True, "effective_prefix_caching": True,
-                              "session_storage": True, "prefix_oracle_mode": "symbolic_session_hashes"}
+                              "session_storage": True, "prefix_oracle_mode": "symbolic_session_hashes",
+                              "session_cache_layout": attention_layout}
         scheduler.orbitserve_capacity = dict(runtime_info["native_allocation"])
         plane._bind(scheduler, config, replace(requested, enable_prefix_caching=True))
+        plane.attention_layout = attention_layout
         return plane
 
     def _bind(self, scheduler, config, requested):
         self.scheduler = scheduler
         self.config = replace(config, num_kv_blocks=self.scheduler.orbitserve_capacity["num_kv_blocks"])
         self.requested = requested
+        self.attention_layout = "paged_varlen"
         self.specs, self.highwater, self.histories = {}, {}, {}
         self.pending, self.index = None, 0
         self.ready_hashes = {}
@@ -52,6 +87,9 @@ class StorageControlPlane(LatestControlPlane):
             raise ValueError("duplicate request history")
         self.histories[request_id] = history
 
+    def _prefix_hash_block_size(self):
+        return self.config.kv_block_size_tokens
+
     def add_request(self, spec):
         from vllm import SamplingParams
         from vllm.v1.request import Request
@@ -62,13 +100,14 @@ class StorageControlPlane(LatestControlPlane):
             raise ValueError("a claimed hit without a session identity is unsupported")
         if history is not None and not self.requested.enable_prefix_caching:
             raise ValueError("session reuse requires enable_prefix_caching")
+        hash_block_size = self._prefix_hash_block_size()
         def hasher(request):
             identity = history or {"session_id": f"request:{spec.request_id}",
                                    "context_id": spec.request_id,
                                    "token_keys": tuple(f"input:{i}" for i in range(spec.input_tokens))}
             keys = identity["token_keys"] + tuple(
                 f"{identity['context_id']}:output:{i}" for i in range(len(request.output_token_ids)))
-            full = history_block_hashes({**identity, "token_keys": keys}, self.config.kv_block_size_tokens)
+            full = history_block_hashes({**identity, "token_keys": keys}, hash_block_size)
             return full[len(request.block_hashes):]
         request = Request(spec.request_id, [0] * spec.input_tokens,
                           SamplingParams(max_tokens=spec.output_tokens, ignore_eos=True), None,
@@ -156,7 +195,7 @@ class StorageControlPlane(LatestControlPlane):
             state = "waiting" if request.status.name != "RUNNING" else "running_not_scheduled"
             self._record(rid, state, time_s=now)
         step = BackendStep(ScheduleStep(f"{self.config.pool_name}:{self.index}", self.config.pool_name,
-                           tuple(scheduled), tuple(finished), tuple(preempted), "paged_varlen"), tuple(events), generated,
+                            tuple(scheduled), tuple(finished), tuple(preempted), self.attention_layout), tuple(events), generated,
                            embedding_token_ids=tuple(token_ids), embedding_token_source="vllm_length_only_simulation")
         self.pending = (step, native)
         self.index += 1

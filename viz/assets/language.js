@@ -1,7 +1,7 @@
 /* Localize presentation without reloading forms, tasks or the WebGL scene. */
 (() => {
   const STORAGE_KEY = 'astermind.language';
-  const attrs = ['aria-label', 'aria-description', 'title', 'placeholder', 'alt'];
+  const attrs = ['aria-label', 'aria-description', 'title', 'placeholder', 'alt', 'label'];
   const excluded = 'script,style,template,[translate="no"],[data-raw]';
   const skip = excluded + ',textarea,code';
   const hasChinese = /\p{Script=Han}/u;
@@ -59,6 +59,8 @@
     if (node.nodeType === Node.TEXT_NODE) { updateText(node); return; }
     if (node.nodeType !== Node.ELEMENT_NODE || node.closest(excluded)) return;
     for (const name of attrs) updateAttribute(node,name);
+    // Updating the default attribute leaves a user-edited or loaded value alone.
+    if (node.matches('input[data-localize-default]')) updateAttribute(node,'value');
     if (node.matches('textarea,code')) return;
     for (const child of node.childNodes) scan(child);
   }

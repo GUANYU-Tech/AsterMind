@@ -3,24 +3,38 @@
 from astermind.common.hardware_capabilities import PORTABLE_BATCH_HARDWARE
 
 
-def supports_fast_session_storage(config, model):
-    """The GLM-5.2 configuration verified with real 0.30 session storage."""
-    from src.serving.workload.model_config import GLM_MOE_DSA_CONFIG_SHA256
+def validate_fast_session_storage(config, model):
+    """Check Cell constraints before the native worker validates the cache layout."""
+    if config.deployment != "colocated" or config.sequence_parallel_size != 1:
+        raise NotImplementedError("Fast Mode vLLM 0.30 session storage requires a colocated Cell with SP1")
+    if config.watermark:
+        raise NotImplementedError("Fast Mode vLLM 0.30 session storage does not support a custom KV watermark")
 
-    return (
-        config.compute_mode == "fast_mode" and config.scheduler_adapter == "vllm_0_30"
-        and config.hardware_id == "nvidia_h200" and config.deployment == "colocated"
-        and model.config_sha256 == GLM_MOE_DSA_CONFIG_SHA256
-        and model.model_type == "glm_moe_dsa" and model.weight_dtype == model.compute_dtype == "bf16"
-        and (config.tensor_parallel_size, config.pipeline_parallel_size, config.data_parallel_size,
-             config.sequence_parallel_size) == (8, 4, 1, 1)
-        and not config.enable_expert_parallel and not config.watermark
-    )
+    if model.attention_layout == "hybrid_kda_mla":
+        from src.serving.parallelism.parallel_config import ParallelConfig
+        from src.serving.workload.model_config import (
+            KIMI_K3_CONFIG_SHA256, is_kimi_k3_data_parallel_model_scope, is_kimi_k3_parallel_model_scope,
+        )
+
+        tp, pp, dp = config.tensor_parallel_size, config.pipeline_parallel_size, config.data_parallel_size
+        ep = config.enable_expert_parallel
+        parallel = ParallelConfig(tensor_parallel_size=tp, pipeline_parallel_size=pp,
+                                  data_parallel_size=dp, enable_expert_parallel=ep)
+        if config.hardware_id == "nvidia_h200":
+            supported = (is_kimi_k3_parallel_model_scope(model, tp, pp, expert_parallel=ep) if dp == 1
+                         else ep and is_kimi_k3_data_parallel_model_scope(model, parallel))
+        else:
+            supported = supports_portable_batch_k3(config, model, parallel)
+        if (model.config_sha256 != KIMI_K3_CONFIG_SHA256
+                or config.enable_chunked_prefill is not True or not supported):
+            raise NotImplementedError(
+                "Hybrid KDA/MLA session storage requires a supported Kimi-K3 hardware and layout, "
+                "and chunked prefill")
 
 
 def _portable_scope(config, parallel):
     return (config.compute_mode == "fast_mode" and config.hardware_id in PORTABLE_BATCH_HARDWARE
-            and config.scheduler_adapter == "vllm_0_30" and config.deployment == "colocated"
+            and config.scheduler_adapter in ("auto", "vllm_0_30") and config.deployment == "colocated"
             and parallel.context_parallel_size == parallel.sequence_parallel_size == 1)
 
 
@@ -28,8 +42,8 @@ KIMI_VENDOR_PROJECTION_HARDWARE = frozenset(("ascend_910b", "metax_c500"))
 
 
 def supports_portable_fp8_reference(config, model, parallel):
-    """Allow only the explicit software-widened reference for the pinned sources."""
-    if (not _portable_scope(config, parallel) or not config.memory_policy_file):
+    """Allow the software-widened reference for the pinned sources."""
+    if not _portable_scope(config, parallel):
         return False
     from src.serving.workload.model_config import (
         DEEPSEEK_V3_CONFIG_SHA256, DEEPSEEK_V3_L32_CONFIG_SHA256,

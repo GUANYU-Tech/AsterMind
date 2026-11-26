@@ -138,7 +138,7 @@ class VLLMKVAllocation:
                 raise ValueError(
                     f"native vLLM KV allocation {name} disagrees with the "
                     "pinned allocator")
-        supported_specs = (("UniformTypeKVCacheSpecs", "FullAttentionSpec", "MLAAttentionSpec") if self.version == "0.30.0" else
+        supported_specs = (("UniformTypeKVCacheSpecs", "FullAttentionSpec", "MLAAttentionSpec", "MambaSpec") if self.version == "0.30.0" else
                            ("FullAttentionSpec", "MLAAttentionSpec", "HeterogeneousMLAAttentionSpec"))
         if self.kv_spec_type not in supported_specs:
             raise ValueError(
@@ -371,6 +371,7 @@ def allocate_vllm030_model_cache(
     *,
     source_root: Path,
     supported_layouts_by_rank: tuple[tuple[str, ...], ...],
+    pool_blocks: int | None = None,
 ):
     """Project target-off cache specs and call the actual 0.30 allocator.
 
@@ -472,6 +473,20 @@ def allocate_vllm030_model_cache(
         list(available_memory_by_rank))
     if len(native_configs) != parallelism.worker_count:
         raise RuntimeError("0.30 allocator returned an inconsistent worker count")
+    if pool_blocks is not None:
+        if pool_blocks < 2 or any(config.num_blocks < pool_blocks for config in native_configs):
+            raise ValueError("Requested Fast KV pool does not fit the per-rank HBM budgets")
+        from vllm.v1.core.kv_cache_utils import _pool_bytes_per_block
+
+        # Re-plan with capped byte budgets so the native planner derives
+        # offsets, layer strides and the reserved block for the smaller pool.
+        capped_budgets = [pool_blocks * _pool_bytes_per_block(config.kv_cache_groups)
+                          for config in native_configs]
+        if any(capped > budget for capped, budget in zip(capped_budgets, available_memory_by_rank, strict=True)):
+            raise RuntimeError("Capped Fast KV allocation exceeds the original byte budget")
+        native_configs = get_kv_cache_configs(vllm_config, list(worker_specs), capped_budgets)
+        if any(config.num_blocks != pool_blocks for config in native_configs):
+            raise RuntimeError("Native allocator did not produce the requested Fast KV pool")
     for config, budget, expected in zip(native_configs, available_memory_by_rank, worker_specs, strict=True):
         owners = [name for group in config.kv_cache_groups for name in group.layer_names]
         if len(owners) != len(expected) or set(owners) != set(expected):
@@ -644,7 +659,7 @@ def normalize_vllm030_model_allocation(vllm_config, model: ModelConfig, workers:
     return VLLMKVAllocation(
         **identity, allocator_symbol=_ALLOCATOR_SYMBOL, scheduler_config_symbol=_SCHEDULER_CONFIG_SYMBOL,
         kv_spec_type=spec_type,
-        kv_block_size_tokens=(vllm_config.model_config.max_model_len if model.model_id == "moonshotai/Kimi-K3"
+        kv_block_size_tokens=(vllm_config.model_config.max_model_len if model.model_id == "moonshotai/Kimi-K3" and not vllm_config.cache_config.enable_prefix_caching
                               else vllm_config.cache_config.block_size),
         max_model_len=vllm_config.model_config.max_model_len,
         kv_page_size_bytes_per_layer=first_spec.page_size_bytes,
@@ -997,8 +1012,11 @@ def vllm030_kimi_k3_cache_specs(vllm_config, model: ModelConfig):
         raise NotImplementedError("K3 cache projection requires whole TP/stage-local EP, nonempty PP, CP/DP/SP1 and MTP-off")
     if cache.cache_dtype not in ("auto", "bfloat16"):
         raise NotImplementedError("K3 source MLA cache projection requires BF16")
-    if cache.enable_prefix_caching or cache.mamba_cache_mode != "none":
-        raise NotImplementedError("K3 source state placement currently requires prefix caching off and mamba mode none")
+    if (cache.enable_prefix_caching, cache.mamba_cache_mode) not in ((False, "none"), (True, "align")):
+        raise NotImplementedError("K3 state placement requires none without prefixes or align with prefixes")
+    if cache.enable_prefix_caching and (cache.block_size != cache.mamba_block_size
+            or not vllm_config.scheduler_config.enable_chunked_prefill):
+        raise ValueError("K3 prefix checkpoints require equal aligned cache pages and chunked prefill")
     for name in ("block_size", "mamba_block_size"):
         if type(getattr(cache, name)) is not int or getattr(cache, name) <= 0:
             raise ValueError("K3 source cache requires explicit positive attention and mamba block sizes")

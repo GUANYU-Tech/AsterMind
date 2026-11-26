@@ -1,5 +1,6 @@
 import {renderConfigForm} from './config-form.mjs';
 import {optionLabels} from './config-labels.mjs';
+import {enhanceSelects} from '../assets/design-controls.js';
 
 function element(tag, text) {
   const node = document.createElement(tag);
@@ -8,13 +9,53 @@ function element(tag, text) {
 }
 
 export function renderParameterGroup(container, config, paths, capabilities, changed, choices) {
-  if (paths.includes('hardware.su_group_sizes')) {
+  if (paths.includes('deployment.routes')) {
+    renderPdEndpoints(container, config, changed, choices);
+  } else if (paths.includes('hardware.su_group_sizes')) {
     renderIntraSatelliteNetwork(container, config, paths, capabilities, changed, choices);
   } else if (paths.length === 1 && paths[0] === 'deployment.placements') {
     renderRankMapping(container, config, changed, choices);
   } else {
     renderConfigForm(container, config, paths, capabilities.schema, changed, choices);
   }
+}
+
+function renderPdEndpoints(container, config, changed, choices) {
+  const section = container.closest('details');
+  const pd = config.compute_mode === 'detail_mode' && config.deployment.mode === 'pd_disagg';
+  if (section.hidden && pd) section.open = true;
+  section.hidden = !pd;
+  container.replaceChildren();
+  if (!pd) return;
+
+  const pools = config.deployment.worker_pools;
+  const roles = ['prefill', 'decode'];
+  const selected = roles.map(role => pools.find(pool => pool.role === role));
+  const validPair = pools.length === 2 && selected.every(Boolean) && pools[0].name !== pools[1].name;
+  for (const [index, caption] of ['源 pool（Prefill）', '目标 pool（Decode）'].entries()) {
+    const field = element('div'), label = element('label', caption), select = element('select');
+    field.className = 'config-field';
+    select.id = 'pd-' + roles[index] + '-pool';
+    label.htmlFor = select.id;
+    select.append(...pools.map(pool => new Option(pool.name, pool.name)));
+    select.value = selected[index]?.name ?? '';
+    select.disabled = !validPair;
+    select.onchange = () => {
+      if (select.value === selected[index].name) return;
+      // The native KV route is always Prefill → Decode. Bind the chosen physical
+      // pool to that role; placements and scheduler settings stay keyed by pool name.
+      const [source, target] = [selected[1], selected[0]];
+      source.role = 'prefill';
+      target.role = 'decode';
+      config.deployment.worker_pools = [source, target];
+      const path = ['deployment', 'worker_pools'];
+      choices.onEdit?.(path, config.deployment.worker_pools);
+      changed(path);
+    };
+    field.append(label, select);
+    container.append(field);
+  }
+  enhanceSelects(container);
 }
 
 function renderIntraSatelliteNetwork(container, config, paths, capabilities, changed, choices) {

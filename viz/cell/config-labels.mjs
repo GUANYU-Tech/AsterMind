@@ -2,8 +2,9 @@ export const formationNames = {ring:"环形编队", chain:"链式编队", fully_
 
 export const labels = {
   su_group_sizes:"每星 SU 分组", ep_strategy:"专家并行通信", collective_policies:"集合通信规则", scope:"通信范围",
-  compute_mode:"计算模式", detail_prediction_method:"详细预测方法", memory_policy_file:"显存策略",
-  fast_glm_dsa_score:"GLM DSA 计时", expert_routing_seed:"专家路由种子", long_prefill_token_threshold:"长 Prefill 阈值 / token",
+  fast_link_contention:"链路带宽资源竞争", tensor_percent:"算力效率 / %", hbm_percent:"HBM 带宽效率 / %",
+  compute_mode:"计算模式", detail_prediction_method:"详细预测方法", memory_policy_file:"显存策略（可选，留空自动）",
+  fast_glm_dsa_score:"GLM DSA 计时", expert_routing_seed:"专家路由种子", long_prefill_token_threshold:"Prefill 分块上限 / token",
   model:"模型", source:"输入来源", synthetic:"合成请求", production:"生产 Trace", requests:"请求流",
   num_requests:"请求数量", request_rate:"每秒到达请求数", input_lengths:"输入 Token 长度", output_lengths:"输出 Token 长度",
   arrival_distribution:"到达分布", seed:"随机种子", arrival_rate_scale:"到达率缩放", closed_loop_client_count:"闭环客户端数",
@@ -24,7 +25,7 @@ export const labels = {
   link_margin_db:"链路余量 / dB", optical_efficiency:"光学效率", wdm_loss_db:"WDM 损耗 / dB", pointing_error_rad:"指向误差 / rad",
   routing_seed:"ECMP 固定种子", acknowledgement:"ACK 设置", enabled:"启用", packet_payload_bytes:"报文净荷 / B",
   ack_interval_packets:"ACK 间隔 / 包", ack_size_bytes:"ACK 大小 / B",
-  mode:"模式", worker_pools:"Worker pools", name:"名称", role:"角色", parallelism:"并行策略",
+  mode:"模式", worker_pools:"计算池", name:"名称", role:"角色", parallelism:"并行策略",
   tensor_parallel_size:"TP", pipeline_parallel_size:"PP", data_parallel_size:"DP", sequence_parallel_size:"SP", context_parallel_size:"CP",
   enable_expert_parallel:"启用 EP", expert_communication_backend:"EP 通信语义", enable_eplb:"EPLB",
   collectives:"Collective", operation:"通信操作", algorithm:"执行算法", link:"通信类型标记", topology:"逻辑通信拓扑",

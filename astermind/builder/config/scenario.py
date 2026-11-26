@@ -20,6 +20,7 @@ class RoutingConfig(Contract):
 
 
 CellMetric = Literal["load", "distance", "arrival"]
+FastCellSelection = Literal["nearest_per_turn", "least_loaded_per_turn", "session_fixed"]
 
 
 class CellPriority(Contract):
@@ -48,7 +49,10 @@ class SimulationConfig(ComputeModeConfig):
     migrations: tuple[Migration, ...] = ()
     communication: CommPolicy = Field(default_factory=CommPolicy)
     routing: RoutingConfig = Field(default_factory=RoutingConfig)
-    cell_selection: Literal['least_loaded', 'nearest', 'estimated_arrival'] | CellPriority = 'least_loaded'
+    cell_selection: Literal['least_loaded', 'nearest', 'estimated_arrival'] | FastCellSelection | CellPriority = 'least_loaded'
+    output_delivery: Literal["by_batch", "first_then_rest"] = "by_batch"
+    fast_orbital_route_frames: str | None = None
+    fast_device_route_frames: str | None = None
     horizon_ns: Positive = 1_000_000_000
     physical_dataset: str | None = None
     physical_network: dict | str | None = None
@@ -105,6 +109,21 @@ class SimulationConfig(ComputeModeConfig):
 
     @model_validator(mode="after")
     def validate_ids(self):
+        if self.fast_device_route_frames is not None and self.fast_orbital_route_frames is None:
+            raise ValueError("Fast device route frames require Fast orbital routing")
+        if self.fast_orbital_route_frames is not None and (
+                self.compute_mode != "fast_mode" or not self.physical_dataset or self.migrations):
+            raise ValueError("Fast orbital frames require an offline Fast scenario without KV migration")
+        if self.communication.link_bandwidth_factors and (
+                self.compute_mode != "fast_mode" or not (self.physical_dataset or self.physical_network)):
+            raise ValueError("Static link bandwidth factors require a Fast Mode physical topology")
+        if self.fast_orbital_route_frames is not None and any(cell.fast_link_contention for cell in self.cells):
+            raise ValueError("Fast orbital routing uses static bandwidth factors")
+        if self.output_delivery == "first_then_rest" and self.compute_mode != "fast_mode":
+            raise ValueError("First-token delivery with a combined decode response requires Fast Mode")
+        if self.cell_selection in ("nearest_per_turn", "least_loaded_per_turn", "session_fixed"):
+            if self.compute_mode != "fast_mode" or self.migrations:
+                raise ValueError("Case Study Cell policies require Fast Mode without KV migration")
         from astermind.engine import RUNTIME_NETWORK_FIELDS
 
         if set(self.runtime_network) - (set(RUNTIME_NETWORK_FIELDS) - {'transport_model','failure_policy','max_transfer_retries'}):
@@ -140,9 +159,8 @@ class SimulationConfig(ComputeModeConfig):
                     raise ValueError(f"fast_mode requires surrogate intra communication in Cell {cell.id}")
                 if cell.parallel.dp > 1 and self.communication.ep_strategy != "direct":
                     raise ValueError(f"fast_mode requires direct EP in Cell {cell.id}")
-                if (cell.hardware_id in PORTABLE_BATCH_HARDWARE
-                        and cell.scheduler_adapter != "vllm_0_30"):
-                    raise ValueError(f"{cell.hardware_id} fast_mode requires vllm_0_30 in Cell {cell.id}")
+                if cell.scheduler_adapter not in ("auto", "vllm_0_30"):
+                    raise ValueError(f"Fast Mode requires scheduler_adapter vllm_0_30 or auto in Cell {cell.id}")
                 if portable_scene:
                     comm_hardware = (override and override.hardware_id) or self.communication.default_hardware_id
                     for placement in cell.placements:

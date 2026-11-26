@@ -63,6 +63,14 @@ class PathRouteCache:
         period = bisect.bisect_right(self.geometry_times, time_s) - 1
         index = bisect.bisect_right(self.boundaries, time_s)
         deadline = self.boundaries[index] if index < len(self.boundaries) else net.end_s
+        provider = getattr(net, "prepared_route_frames", None)
+        prepared = provider.at(net, time_s) if provider is not None else None
+        if prepared is not None:
+            offline_deadline, (adjacency, edges, states, directions) = prepared
+            if offline_deadline != deadline:
+                raise ValueError("Prepared route frame misses a live topology boundary")
+            self._install(marker, time_s, deadline, period, adjacency, edges, states, directions, started)
+            return
         adjacency, edges, states, directions = {}, {}, {}, {}
         allows = getattr(net, 'allows_hop', lambda a, b: True)
         for edge in net.edges:
@@ -85,6 +93,11 @@ class PathRouteCache:
                 item = RoutingEdge(edge['link_id'], source, target, distance)
                 edges[item.key] = item
                 adjacency.setdefault(source, []).append(item)
+        adjacency = MappingProxyType({node: tuple(sorted(rows, key=lambda e: (e.target, e.link_id)))
+                                           for node, rows in adjacency.items()})
+        self._install(marker, time_s, deadline, period, adjacency, edges, states, directions, started)
+
+    def _install(self, marker, time_s, deadline, period, adjacency, edges, states, directions, started):
         rewind = self.start is not None and time_s < self.start
         periodic = self.period is not None and period != self.period
         changed = edges != self.edges
@@ -99,8 +112,7 @@ class PathRouteCache:
             if invalid:
                 del self.entries[key]
                 self.invalidations += 1
-        self.adjacency = MappingProxyType({node: tuple(sorted(rows, key=lambda e: (e.target, e.link_id)))
-                                           for node, rows in adjacency.items()})
+        self.adjacency = adjacency
         self.edges = edges
         # Communication and routing read one physical snapshot. Records are
         # replaced at boundaries; readers never mutate a retained snapshot.

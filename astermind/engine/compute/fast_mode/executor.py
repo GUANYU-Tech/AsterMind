@@ -3,6 +3,7 @@
 import json
 from pathlib import Path
 from itertools import count
+from time import perf_counter
 
 from astermind.engine.clock import Time
 from astermind.engine.comm.frame_surrogate import NoRouteError
@@ -11,6 +12,7 @@ from astermind.engine.compute.batch_executor import RuntimeBatchExecutor
 from astermind.common.hardware_capabilities import FAST_MODE_HARDWARE, PORTABLE_BATCH_HARDWARE
 from astermind.engine.timeline import nanoseconds
 from src.serving.parallelism.pp import pipeline_layer_ranges_for_model
+from src.serving.workload.model_config import GLM_MOE_DSA_CONFIG_SHA256
 
 from .admission import supports_portable_fp8_reference
 from .communication import RankProgram
@@ -21,6 +23,7 @@ from .frame_forecast import forecast_routes
 from .hardware import Hardware
 from .predictor import Predictor, Row
 from .quote import BatchCommunication, mixed_runtime_waves
+from .v4_small_gemm import SmallFp8Gemm
 
 
 class FastModeExecutor(RuntimeBatchExecutor):
@@ -29,6 +32,7 @@ class FastModeExecutor(RuntimeBatchExecutor):
     compute_mode = "fast_mode"
     compute_timing_reference = None
     portable_hardware = False
+    link_contention = False
 
     def configure(self, execution, config):
 
@@ -44,14 +48,37 @@ class FastModeExecutor(RuntimeBatchExecutor):
         model = json.loads(model_path.read_text(encoding="utf-8-sig"))
         ranges = pipeline_layer_ranges_for_model(execution.model, parallel.pipeline_parallel_size)
         widened_fp8 = supports_portable_fp8_reference(config, execution.model, parallel)
+        hardware_spec = execution.hardware_by_id[pool.hardware_id]
         hardware = Hardware.from_hardware_spec(
-            execution.hardware_by_id[pool.hardware_id], compute_dtype=execution.model.compute_dtype,
+            hardware_spec, compute_dtype=execution.model.compute_dtype,
             widen_fp8_to_bf16=widened_fp8,
-        )
+        ).with_roofline(pool.hardware_id, config.fast_roofline)
+        self.link_contention = config.fast_link_contention
         self.compute_timing_reference = "fp8_widened_bf16_reference_roofline" if widened_fp8 else None
+        v4_small_gemm = (
+            model_name in ("deepseek-v4-pro", "deepseek-v4-flash") and pool.hardware_id == "nvidia_h200"
+            and parallel.data_parallel_size == parallel.expert_parallel_size == 1
+            and execution.runtime_inputs.symbolic_forward_source == "vllm_0_30_v4_sync_fp8_ds_mla"
+            and hardware_spec.block_fp8_gemm_tma_ring_service is not None
+            and not execution.runtime_inputs.graph_execution.enabled
+        )
+        if v4_small_gemm:
+            self.compute_timing_reference = "h200_v4_fp8_single_wave"
+        grouped_glm_ffn = (
+            model_name == "glm-5.2"
+            and execution.model.config_sha256 == GLM_MOE_DSA_CONFIG_SHA256
+            and pool.hardware_id == "nvidia_h200"
+            and parallel.tensor_parallel_size > 1 and parallel.pipeline_parallel_size > 1
+            and parallel.data_parallel_size == parallel.expert_parallel_size == 1
+            and not parallel.enable_expert_parallel
+        )
+        if grouped_glm_ffn:
+            self.compute_timing_reference = "glm52_grouped_shared_routed_ffn"
         predictor = Predictor(model_name, model, parallel.tensor_parallel_size, parallel.data_parallel_size,
                               parallel.expert_parallel_size, ranges, hardware=hardware,
-                              glm_dsa_bf16_timing=config.fast_glm_dsa_score == "bf16_timing_proxy")
+                              small_fp8_gemm=SmallFp8Gemm(hardware_spec, hardware) if v4_small_gemm else None,
+                              glm_dsa_bf16_timing=config.fast_glm_dsa_score == "bf16_timing_proxy",
+                              grouped_glm_ffn=grouped_glm_ffn)
         devices = tuple(self._device("main", rank) for rank in range(len(pool.ranks)))
         program = RankProgram(predictor, ranges, len(devices))
         if pool.hardware_id in PORTABLE_BATCH_HARDWARE:
@@ -59,7 +86,9 @@ class FastModeExecutor(RuntimeBatchExecutor):
         self.predictor = predictor
         self.pricing = RankCommunicationPricing(self.comm, program, devices, self.cell_id)
         self.portable_hardware = pool.hardware_id in PORTABLE_BATCH_HARDWARE
-        self.fixed = BoundCommunicationPlan(self.pricing, direct_factory=DirectGroups) if pool.hardware_id == "nvidia_h200" else None
+        self.fixed = BoundCommunicationPlan(
+            self.pricing, direct_factory=DirectGroups if pool.hardware_id == "nvidia_h200" else None,
+        )
         self.prepared_frame = None
         self.bound_available = False
 
@@ -84,7 +113,7 @@ class FastModeExecutor(RuntimeBatchExecutor):
 
     def _price(self, components):
         routes = self.comm._refresh()
-        if self.fixed is not None and routes is not self.prepared_frame and not (self.comm.active or self.comm.tasks):
+        if routes is not self.prepared_frame and not (self.comm.active or self.comm.tasks):
             self.prepared_frame = routes
             try:
                 self.fixed.prepare()
@@ -100,10 +129,11 @@ class FastModeExecutor(RuntimeBatchExecutor):
                 pass
             else:
                 used_original = (before != self.fixed.stats["ordinary_fallback"]
-                                 or self.fixed.stats["direct_fallback"] != 0)
+                                 or self.fixed.direct is None and any(self.pricing.program.experts))
                 return seconds, deadline, "partial_reuse" if used_original else "reused"
+        before = self.pricing.frame_quotes.hits
         seconds, deadline = self.pricing.price(components)
-        return seconds, deadline, "isolated"
+        return seconds, deadline, "reused" if self.pricing.frame_quotes.hits != before else "isolated"
 
     def _start_batch(self, cell_id, step_id, components, execution, on_complete, *,
                      token_count, pool_name, on_next_batch, replica_tokens, state):
@@ -114,28 +144,36 @@ class FastModeExecutor(RuntimeBatchExecutor):
         start = self.loop.now_s
         crossing = None
         fallback = None
-        try:
-            communication_s, frame_end, pricing = self._price(components)
-        except NoRouteError:
-            communication_s, end = 0., None
-            fallback = "initial_route_unavailable"
+        quote_started = perf_counter()
+        if self.link_contention:
+            communication_s, end, pricing = 0., None, "runtime"
         else:
-            end = start + Time(compute_s + communication_s)
-            if frame_end is not None and end >= frame_end:
-                fallback = self._crossing_reason(components, frame_end, end)
-                if fallback is None:
-                    crossing = "certified"
+            try:
+                communication_s, frame_end, pricing = self._price(components)
+            except NoRouteError:
+                communication_s, end, pricing = 0., None, "runtime"
+                fallback = "initial_route_unavailable"
+            else:
+                end = start + Time(compute_s + communication_s)
+                if frame_end is not None and end >= frame_end:
+                    fallback = self._crossing_reason(components, frame_end, end)
+                    if fallback is None:
+                        crossing = "certified"
         if fallback is not None:
             pricing, crossing = "runtime", "runtime"
+        quote_wall_s = perf_counter() - quote_started
         self._active.add(pool_name)
         record = dict(cell_id=cell_id, pool_name=pool_name, step_id=step_id,
                       mode="fast_mode", communication_pricing=pricing,
                       compute_s=compute_s, communication_s=communication_s,
+                      communication_quote_wall_s=quote_wall_s,
                       start_time_ns=nanoseconds(start), start_time_ticks=str(start.ticks),
                       native_communication_duration_charged_s=0., calls=[])
         if self.compute_timing_reference is not None:
             record["compute_timing_reference"] = self.compute_timing_reference
         state["record"] = record
+        if self.link_contention:
+            record["runtime_reason"] = "link_bandwidth_contention"
         if crossing is not None:
             record["cross_frame"] = crossing
         if fallback is not None:
@@ -155,7 +193,7 @@ class FastModeExecutor(RuntimeBatchExecutor):
             if on_next_batch:
                 on_next_batch()
 
-        if fallback is None:
+        if pricing != "runtime":
             self.loop.schedule(end, 1, "cell:fast-mode-complete", complete, owner_id=cell_id)
         else:
             self._run_runtime_phases(components, state, complete)

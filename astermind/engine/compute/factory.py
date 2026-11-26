@@ -12,17 +12,21 @@ from src.serving.backend.vllm import VLLMBackend, VLLMSchedulerConfig
 from .fast_mode.admission import (
     supports_portable_batch_k3, supports_portable_batch_kimi, supports_portable_fp8_reference,
 )
+from .fast_mode.hardware import KV_HBM_UTILIZATION_PERCENT, KV_RUNTIME_RESERVE_BYTES, fast_hbm_capacity_bytes
 
 
 def standard_vllm030_budgets(model, hardware, parallel, layers, *, percentage=90,
-                              extra_reserve=2 * 1024**3, v4_weight_storage_profile=None):
+                              extra_reserve=2 * 1024**3, v4_weight_storage_profile=None,
+                              physical_hbm_bytes=None):
     from src.serving.kv_cache.model_residency import model_rank_residencies
 
     residencies = model_rank_residencies(
         model, parallel, worker_role="colocated", model_execution_version="vllm_0_30_0",
         pipeline_layer_partition=layers, v4_weight_storage_profile=v4_weight_storage_profile,
     )
-    hbm_budget = hardware.resource_by_role("dram").size_bytes * percentage // 100 - extra_reserve
+    physical = (hardware.resource_by_role("dram").size_bytes
+                if physical_hbm_bytes is None else physical_hbm_bytes)
+    hbm_budget = physical * percentage // 100 - extra_reserve
     return tuple(hbm_budget - rank.weight_resident_bytes for rank in residencies)
 
 
@@ -374,10 +378,8 @@ def vllm030_byte_budget(config, model, hardware):
         raise ValueError("K3 hybrid Scheduler block size must equal the configured model context")
     ranges = pipeline_layer_ranges_for_model(model, parallelism.pipeline_parallel_size)
     layers = tuple(end - start for start, end in ranges)
-    # Established profiles retain their original policy. V4 requires an
-    # explicitly supplied experimental memory projection.
-    percentage, extra_reserve = 90, 2 * 1024**3
-    if v4 and not portable_fp8:
+    percentage, extra_reserve = KV_HBM_UTILIZATION_PERCENT, KV_RUNTIME_RESERVE_BYTES
+    if v4 and not portable_fp8 and (not fast_mode or config.memory_policy_file):
         policy_file = (config.root / config.memory_policy_file
                        if fast_mode and config.memory_policy_file else
                        os.environ.get("ORBITServe_V4_EXPERIMENTAL_MEMORY_PROJECTION"))
@@ -389,11 +391,13 @@ def vllm030_byte_budget(config, model, hardware):
                 or policy.get("model_file") != str(config.model_file)
                 or policy.get("weight_storage_profile") != "sm90_deepgemm_marlin"):
             raise ValueError("H200 V4 experimental memory projection identity mismatch")
-        percentage = policy.get("hbm_utilization_percent")
-        extra_reserve = policy.get("additional_non_kv_reserve_bytes_per_rank")
-        if (type(percentage) is not int or not 0 < percentage <= 100
-                or type(extra_reserve) is not int or extra_reserve < 0):
+        projection_percentage = policy.get("hbm_utilization_percent")
+        projection_reserve = policy.get("additional_non_kv_reserve_bytes_per_rank")
+        if (type(projection_percentage) is not int or not 0 < projection_percentage <= 100
+                or type(projection_reserve) is not int or projection_reserve < 0):
             raise ValueError("invalid experimental memory projection parameters")
+        if not fast_mode:
+            percentage, extra_reserve = projection_percentage, projection_reserve
     if portable_fp8:
         from .fast_mode.source_memory import FP8_REFERENCE_MEMORY_PROFILE, projected_budgets
         budgets, percentage = projected_budgets(
@@ -408,6 +412,7 @@ def vllm030_byte_budget(config, model, hardware):
         budgets = standard_vllm030_budgets(
             model, hardware, parallelism, layers, percentage=percentage, extra_reserve=extra_reserve,
             v4_weight_storage_profile="sm90_deepgemm_marlin" if v4 else None,
+            physical_hbm_bytes=fast_hbm_capacity_bytes(config.hardware_id) if fast_mode else None,
         )
     if v4 and not portable_fp8:
         budgets = tuple(budget - sum(dsv4_parallel_model_buffer_bytes(
@@ -422,6 +427,9 @@ def vllm030_byte_budget(config, model, hardware):
 def _fast_vllm030_with_byte_budget(config, pool_name, model, hardware, requested=None):
     config = resolve_batch_token_budget(config)
     budgets, percentage, layers, layout, k3 = vllm030_byte_budget(config, model, hardware)
+    if config.fast_kv_pool_blocks is not None and (model.model_type != "glm_moe_dsa"
+            or config.data_parallel_size != 1 or config.enable_expert_parallel):
+        raise ValueError("explicit Fast KV capacity requires a colocated GLM TP/PP pool")
     if requested is None:
         if not k3:
             raise ValueError("hybrid native budget requires the supported K3 source")
@@ -443,6 +451,7 @@ def _fast_vllm030_with_byte_budget(config, pool_name, model, hardware, requested
         requested, scheduler_version="0.30.0", data_parallel_size=config.data_parallel_size,
         pipeline_layer_partition=layers, enable_chunked_prefill=config.enable_chunked_prefill is True,
         gpu_memory_utilization=percentage / 100,
+        kv_pool_blocks=config.fast_kv_pool_blocks,
     )
     options = {
         "python_executable": Path(python), "source_root": Path(source), "pool_name": pool_name,
@@ -450,6 +459,10 @@ def _fast_vllm030_with_byte_budget(config, pool_name, model, hardware, requested
         "kv_block_size_tokens": config.kv_block_size_tokens, "available_memory_by_rank": budgets,
         "supported_layouts_by_rank": (layout,) * len(budgets),
     }
+    if config.enable_prefix_caching and config.data_parallel_size > 1:
+        return VLLMBackend.from_vllm030_byte_budget(
+            replace(settings, enable_prefix_caching=False), session_storage=True, **options,
+        )
     if config.enable_prefix_caching:
         from src.serving.backend.vllm_scheduler_process import VLLM030SchedulerProcess
 

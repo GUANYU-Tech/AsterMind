@@ -1,7 +1,7 @@
 import { defaultValue, resolveSchema } from "./config-form.mjs?v=validation-1";
 import { mappingDraft } from "./config-layout.mjs?v=compact-2";
 import {newInterSatelliteLink} from './link-mode.mjs';
-import {synchronizeResources,setAutomaticDeployment} from './resource-sync.mjs';
+import {synchronizeResources} from './resource-sync.mjs';
 import {fastMode, modelOptions, normalizeComputeSettings} from './compute-config.mjs';
 
 export const networkInputs = config => Object.fromEntries(["hardware", "topology", "constellation", "fso"].map(key => [key, config[key]]));
@@ -205,7 +205,6 @@ export function editDependencies(config, path, value, capabilities, previous) {
   if (full === 'hardware.accelerators_per_satellite' && config.hardware.su_group_sizes?.length &&
       config.hardware.su_group_sizes.reduce((sum,n) => sum+n,0) !== value) config.hardware.su_group_sizes=[];
   if (path[0] === "deployment" && path[1] === "worker_pools" && (path.length === 2 || (path.length === 4 && ["name", "role"].includes(key)) || path[3] === "parallelism")) {
-    if (path[3] === 'parallelism') setAutomaticDeployment(config, false);
     syncDeployment(config, capabilities, path, previous);
     synchronizeResources(config, capabilities);
     return true;

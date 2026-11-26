@@ -18,3 +18,24 @@ test('every locale pattern keeps its value placeholders', () => {
   const slots = text => [...new Set(text.match(/\{\d+\}/g))].sort();
   for (const [source, english] of patterns) assert.deepEqual(slots(source), slots(english), source);
 });
+
+test('translates the shared L2/L3 configuration labels and dynamic summaries', () => {
+  const expected = {
+    'Prefill 分块上限': 'Prefill Chunk Limit',
+    'KV 缓存（高级）': 'KV Cache Config',
+    '4 颗卫星': '4 satellites',
+    '8 卡/星': '8 GPUs/satellite',
+    '自定义相对位置': 'Custom Relative Positions',
+    '星座模板': 'Constellation Template',
+    '计算池 1': 'Worker Pool 1',
+    '候选模型 15 个': '15 candidate models',
+    '编辑算力编队 dawn_dusk-p000-s0000': 'Edit Compute Cell dawn_dusk-p000-s0000',
+    '计算星—通信星 有效可用带宽比例': 'Compute–Communication Satellite Effective Bandwidth Ratio',
+    '上行 0.4 → 0.36 Gbps': 'Uplink 0.4 → 0.36 Gbps',
+    'Nearest（逐轮最近距离）': 'Nearest (Per Turn)',
+    'V1 路径 / #16/p2p/16': 'V1 Path / #16/p2p/16',
+    '传输 #16/p2p/16 / V1 整条路径共享资源 / 路径传输中': 'Transfer #16/p2p/16 / V1 Whole-Path Resources / In Transit',
+    '18 条活跃路径段': '18 active path segments',
+  };
+  for (const [source, english] of Object.entries(expected)) assert.equal(translate(source), english, source);
+});

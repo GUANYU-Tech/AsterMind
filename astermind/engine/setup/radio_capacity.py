@@ -76,6 +76,8 @@ def radio_parameters(node):
     result['assumptions'] = list(node.capacity_assumptions)
     result['allocated_terminal_limits'] = {'isl': node.isl_terminals, 'sgl': node.sgl_terminals,
         'optical_bandwidth_bps_per_direction': node.optical_terminal_bandwidth_bps}
+    if node.external_isl_terminals is not None:
+        result['allocated_terminal_limits']['external_isl'] = node.external_isl_terminals
     result['terminal_assumptions'] = list(node.terminal_assumptions)
     result['terminal_reference_checked'] = '2026-10-21' if node.radio_profile else None
     return result

@@ -58,6 +58,20 @@ class NetworkInputTests(unittest.TestCase):
             {degrees[n.node_id] for n in comm if n.shell_id == "comm-high"}, {3}
         )
 
+    def test_egress_terminal_limits_follow_ordered_member_ids(self):
+        scenario = json.loads((ROOT / 'tests/fixtures/network/multi_shell.json').read_text())
+        formation = scenario['constellations']['compute_formations'][0]
+        formation.update(egress_policy='multi', ingress_members=[2, 0], ingress_isl_terminals=[0, 3])
+        spec = NetworkSpec.from_value(materialize_network_input(scenario)['network'])
+        for node in spec.nodes:
+            if node.role == 'compute':
+                index = int(node.node_id.rsplit('-m', 1)[1])
+                self.assertEqual(node.external_isl_terminals, {2: 0, 0: 3}.get(index))
+        for invalid in ([1], [1, -1], [1, True]):
+            with self.subTest(limits=invalid), self.assertRaisesRegex(ValueError, 'ISL'):
+                formation['ingress_isl_terminals'] = invalid
+                materialize_network_input(scenario)
+
     def test_cross_shell_configuration_and_explicit_bypass_are_rejected(self):
         value = json.loads(
             (ROOT / "tests/fixtures/network/multi_shell.json").read_text()

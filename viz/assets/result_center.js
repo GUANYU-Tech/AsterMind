@@ -3,12 +3,13 @@ import {setupResultSelection} from '/assets/result_selection.js';
 const $=id=>document.getElementById(id),q=new URLSearchParams(location.search),pathId=location.pathname.match(/^\/runs\/([^/]+)\/result$/)?.[1];
 let identity=q.get('run')||pathId,data=null,view=q.get('view')||'requests',offset=0,filtered=[],frames=new Map(),replayState=null,replayError='';
 const views=['requests','charts','scene','operators','kv'],size=25;
+const detailedViews=['operators','kv'];
 const fmt=n=>Number.isFinite(n)?n.toLocaleString('zh-CN',{maximumFractionDigits:6}):'—';
 const communicationLabel=value=>value?.backend==='runtime_comm'?'V1 Runtime Comm':value?.timeline_mode==='simgrid'||value?.backend==='simgrid'?'SimGrid':'FlowSim';
 function el(tag,text,cls){const e=document.createElement(tag);if(text!=null)e.textContent=text;if(cls)e.className=cls;return e}
 function table(headers,rows){const t=el('table'),head=el('thead'),tr=el('tr'),body=el('tbody');for(const h of headers)tr.append(el('th',h));head.append(tr);t.append(head,body);for(const values of rows){const row=el('tr');for(const value of values)row.append(el('td',value??'—'));body.append(row)}if(!rows.length){const td=el('td','没有符合条件的数据');td.colSpan=headers.length;const row=el('tr');row.append(td);body.append(row)}return t}
 function metric(label,value,detail){const card=el('div');card.append(el('small',label),el('strong',value),el('span',detail));$('performanceMetrics').append(card)}
-function selectView(name,write=true){view=views.includes(name)?name:'requests';for(const panel of document.querySelectorAll('[data-panel]'))panel.hidden=panel.dataset.panel!==view;for(const link of document.querySelectorAll('[data-view]')){if(link.dataset.view===view)link.setAttribute('aria-current','page');else link.removeAttribute('aria-current')}
+function selectView(name,write=true){view=views.includes(name)&&!(data?.operator_replay===false&&detailedViews.includes(name))?name:'requests';for(const panel of document.querySelectorAll('[data-panel]'))panel.hidden=panel.dataset.panel!==view;for(const link of document.querySelectorAll('[data-view]')){link.hidden=data?.operator_replay===false&&detailedViews.includes(link.dataset.view);if(link.dataset.view===view)link.setAttribute('aria-current','page');else link.removeAttribute('aria-current')}
  if(write){const url=new URL(location.href);url.searchParams.set('view',view);history.pushState(null,'',url)}
  if(view==='charts'&&data)charts();if(data&&['scene','operators','kv'].includes(view))tool(view);
  for(const [name,frame]of frames){frame.contentWindow?.postMessage({type:'analysis-visibility',visible:name===view},location.origin);if(name==='scene')frame.dispatchEvent(new CustomEvent('analysis-visibility',{detail:{visible:name===view}}))}
@@ -56,7 +57,7 @@ async function load(){try{if(!identity){$('resultState').textContent='未选择�
  data=await get(base+'analysis');$('resultState').textContent='已完成';$('pendingActions').replaceChildren();if(data.kind==='physical'){$('resultNotice').textContent='本记录只生成物理数据，没有用户业务响应指标。';const a=el('a','查看物理场景','button');a.href=base+'viewer';$('pendingActions').append(a);return}
  $('resultNotice').textContent='';$('resultBody').hidden=false;const s=data.summary;metric('完成请求',`${s.completed} / ${s.total}`,`${s.total-s.completed} 个未完成`);metric('平均响应时间',fmt(s.latency.average)+' s','P95 '+fmt(s.latency.p95)+' s');metric('平均 TTFT',fmt(s.ttft.average)+' s','首 Token 到达客户端');metric('平均 TPOT',fmt(s.tpot.average)+' s','后续 Token 平均间隔');
  const cells=[...new Set(data.requests.map(r=>r.cell).filter(Boolean))];for(const cell of cells){const option=el('option',cell);option.value=cell;$('requestCell').append(option)}$('resultMethod').textContent=({protobridge_cell:'Cell 内通信使用 ProtoBridge',protobridge_satellite:'卫星内通信使用 ProtoBridge',flowsim:'全部通信使用 FlowSim',legacy:'历史服务模型'}[data.communication_mode]||data.communication_mode||'已保存的运行记录').replaceAll('FlowSim',communicationLabel(data))+' / '+fmt(s.requests_per_s)+' 请求/s';$('rawResult').href=data.raw_url;$('rawResult').textContent=data.kind==='legacy'?'下载结果索引':'下载完整结果';
- requests();toolsSummary();selectView(view,false);if(replayState==='preparing')watchReplay();
+ requests();if(data.operator_replay!==false)toolsSummary();selectView(view,false);if(replayState==='preparing')watchReplay();
  }catch(e){$('resultNotice').textContent='结果读取失败：'+e.message;$('resultState').textContent='读取失败'}}
 async function watchReplay(){
  $('resultNotice').textContent='计算结果已就绪，正在整理回放。请求表格和统计图已可查看。';

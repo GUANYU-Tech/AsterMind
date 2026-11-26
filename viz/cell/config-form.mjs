@@ -225,7 +225,10 @@ export function renderConfigForm(container, root, keys, schema, onChange, choice
       value.forEach((item, index) => {
         const row = el("details", undefined, "repeat-item"); row.open = true; row.dataset.detailPath = JSON.stringify([...path, index]);
         const desc = item?.name || item?.operation || (item?.worker_pool ? `${item.worker_pool} DP${item.parallel_coordinate.dp} / PP${item.parallel_coordinate.pp} / TP${item.parallel_coordinate.tp}` : item?.satellite_id ? `${item.satellite_id} / 卡 ${item.local_index}` : item?.source ? `${item.source} → ${item.target}` : `第 ${index + 1} 项`);
-        row.append(el("summary", desc));
+        const poolRole = full === 'deployment.worker_pools' && root.deployment.mode === 'pd_disagg'
+          ? {prefill:'Prefill', decode:'Decode'}[item.role] : null;
+        const heading = poolRole && item.name !== item.role ? `${poolRole} · ${desc}` : poolRole || desc;
+        row.append(el("summary", heading));
         const rendered = field(spec.prefixItems?.[index] || spec.items || {}, [...path, index], depth + 1); if (rendered) row.append(rendered);
         if (!spec.prefixItems && full !== "deployment.placements") {
           const remove = button("删除此项", () => {

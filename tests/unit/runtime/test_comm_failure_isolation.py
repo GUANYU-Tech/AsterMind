@@ -45,6 +45,29 @@ def executor_fixture(loop, comm, cell='A'):
 
 
 class FailureIsolationTests(unittest.TestCase):
+    def test_fast_independent_rates_keep_paths_and_ignore_overlapping_transfers(self):
+        def replay(sizes, shared):
+            loop = GlobalTimeline()
+            comm = RuntimeCommunication(Frames(), loop, CommPolicy(execution='runtime'),
+                                        shared_bandwidth=shared)
+            completed = {}
+            for index, size in enumerate(sizes):
+                identity = str(index)
+                comm.submit_transfer(identity, 'g0', 'g1', size,
+                                     lambda key=identity: completed.update({key: loop.now_s.ticks}))
+            loop.run()
+            return completed, comm
+
+        alone, _ = replay((1_000_000,), False)
+        overlap, fast = replay((1_000_000, 2_000_000), False)
+        shared, detailed = replay((1_000_000, 2_000_000), True)
+        self.assertEqual(alone['0'], overlap['0'])
+        self.assertGreater(shared['0'], overlap['0'])
+        self.assertEqual(fast.delivery_paths, detailed.delivery_paths)
+        self.assertEqual(fast.stats['rate_allocations'], 0)
+        self.assertGreater(detailed.stats['rate_allocations'], 0)
+        self.assertTrue(any(row['kind'] == 'admit' for row in fast.trace))
+
     def test_failed_batch_cancels_siblings_and_never_releases_successor(self):
         loop = GlobalTimeline()
         comm = RuntimeCommunication(Frames(), loop, CommPolicy(execution='runtime',
