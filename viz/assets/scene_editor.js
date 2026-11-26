@@ -5,7 +5,7 @@ import {createCellTopology} from '/assets/cell_topology.js';
 import {createRequestBatch} from '/assets/request_batch.js';
 import {startBatchExperiment} from '/assets/experiment_flow.js';
 import {deploymentFromPhysical,removeLegacyCellWorkload} from './physical-cells.js';
-import {layoutFromExperiment, preserveFixedKvPools, preserveOtherCellTopologies, sceneCellDraft, sceneCellLayout} from './scene-cell-parameters.js';
+import {layoutFromExperiment, preserveOtherCellTopologies, sceneCellDraft, sceneCellLayout} from './scene-cell-parameters.js';
 const $=id=>document.getElementById(id);
 let experiment=null,modelId=null,physicalTime={},runtime={},busy=false,needsBuild=true,ready=false;
 let validatedSignature='';
@@ -224,7 +224,6 @@ async function build(updated=cellParameters, changed=new Set(Object.keys(members
  const value=await post('/native-scene-config',{physical_model_id:modelId,deployment:{compute_mode:mode,communication},
   cell_deployments:submitted,requests:experiment?.requests||[],migrations:experiment?.migrations||[],
   runtime_network:runtime,routing:routingConfig(),cell_selection:selectionPolicy()});
- if(experiment)preserveFixedKvPools(experiment,value);
  experiment=experiment?preserveOtherCellTopologies(experiment,value,changed):value;
  cellParameters=submitted;needsBuild=false;effectiveRequestKey=requestSchedulingKey();validatedSignature='';
  reflectConfig();$('legacyNotice').hidden=true;$('build').textContent='重新生成 GPU 部署';$('status').textContent='GPU 部署已生成，可添加业务请求。';
@@ -293,8 +292,15 @@ $('dataset').onchange=()=>perform(async()=>{experiment=null;needsBuild=true;runt
  $('epStrategy').value=((revised||!doc)?physicalOptions?.ep_strategy:doc?.ep_strategy||experiment?.communication?.ep_strategy)||'auto';
  if(experiment){
   const sameTopology=!restored||doc.physical_model_id===modelId;
-  if(sameTopology&&!Object.keys(cellParameters).length)for(const cell of experiment.cells){
-   if(membersByCell[cell.id])cellParameters[cell.id]=layoutFromExperiment(experiment,cell,membersByCell[cell.id]);
+  if(sameTopology)for(const cell of experiment.cells){
+   if(!membersByCell[cell.id])continue;
+   const saved=cellParameters[cell.id];
+   if(!saved){
+    cellParameters[cell.id]=layoutFromExperiment(experiment,cell,membersByCell[cell.id]);
+   }else if(cell.fast_kv_pool_blocks!=null){
+    const settings=saved.configuration??saved.deployment;
+    if(!Object.hasOwn(settings,'fast_kv_pool_blocks'))settings.fast_kv_pool_blocks=cell.fast_kv_pool_blocks;
+   }
   }
   // Previously saved scenes carry effective fields. Only form-owned fields are posted on future builds.
   if(!revised && !doc?.cell_parameters)for(const [id,layout] of Object.entries(cellParameters)){

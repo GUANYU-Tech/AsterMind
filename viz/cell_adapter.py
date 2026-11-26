@@ -42,7 +42,7 @@ def capabilities():
     value['hardware_details']={h['id']:yaml.safe_load((upstream/h['file']).read_text()) for h in catalog['hardware']}
     config = value['default_configuration']
     config.update(compute_mode='detail_mode', detail_prediction_method='auto',
-                  memory_policy_file=None, fast_glm_dsa_score=None, expert_routing_seed=0,
+                  memory_policy_file=None, fast_kv_pool_blocks=None, fast_glm_dsa_score=None, expert_routing_seed=0,
                   ep_strategy='auto', collective_policies=[])
     config['hardware']['su_group_sizes'] = []
     config['topology']['intra_satellite']['type'] = 'profile_su'
@@ -71,6 +71,7 @@ def capabilities():
             {'type': 'string', 'enum': ['auto', *value['detail_prediction_methods']]}, {'type': 'null'},
         ]},
         memory_policy_file={'anyOf': [{'type': 'string'}, {'type': 'null'}]},
+        fast_kv_pool_blocks={'anyOf': [{'type': 'integer', 'minimum': 2}, {'type': 'null'}]},
         fast_glm_dsa_score={'enum': ['', 'bf16_timing_proxy', None]},
         expert_routing_seed={'type': 'integer', 'minimum': 0},
     )
@@ -397,6 +398,7 @@ def compile_serving_cell(value, physical, longest_request, *, cell_id='cell', sc
                    kv_block_size_tokens=s.get('kv_block_size_tokens'), prefix_caching=v['enable_prefix_caching'],
                    enable_chunked_prefill=chunked, long_prefill_token_threshold=long_prefill,
                    memory_policy_file=value.get('memory_policy_file') or None,
+                   fast_kv_pool_blocks=value.get('fast_kv_pool_blocks') if fast else None,
                    fast_glm_dsa_score=value.get('fast_glm_dsa_score') or None,
                    fast_roofline=value.get('fast_roofline') if fast else None,
                    fast_link_contention=fast and value.get('fast_link_contention',False))
@@ -432,7 +434,7 @@ def compile_serving_cell(value, physical, longest_request, *, cell_id='cell', sc
                     'max_model_len', 'max_batched_tokens', 'max_requests', 'num_kv_blocks', 'kv_block_size_tokens',
                     'prefix_caching', 'enable_chunked_prefill', 'long_prefill_token_threshold', 'scheduler_adapter',
                     'expert_routing_seed', 'wide_ep_enabled', 'memory_policy_file', 'fast_glm_dsa_score',
-                    'fast_roofline', 'fast_link_contention',
+                    'fast_roofline', 'fast_kv_pool_blocks', 'fast_link_contention',
                 )})
     return cell, communication, None if fast else method
 

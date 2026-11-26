@@ -49,9 +49,10 @@ experiment under `viz/.runtime/`. To register just the inputs, run
    eight H200 GPUs per satellite, TP8 within a satellite, and PP4 across
    four satellites per Cell. Its compute and HBM efficiency settings are
    70% and 96.25%, the batch token budget is 16,384, and each Cell has
-   193,904 KV blocks of 16 tokens. Editing the workload or rebuilding the
-   same deployment keeps this capacity. New Fast deployments derive capacity
-   from the GPU memory budget.
+   193,904 KV blocks of 16 tokens. **Fixed KV Pool Size** is an optional
+   Fast setting, measured in native blocks per scheduler replica. The vLLM
+   allocator checks the size against rank-local memory and the model's KV
+   layout. Leave it blank to derive capacity from available GPU memory.
 3. Keep the supplied **Nearest** setting for the initial run. Default
    route selection uses the physical data and deployed ranks.
 4. Click **Start experiment and view results** (「开始实验并查看结果」).

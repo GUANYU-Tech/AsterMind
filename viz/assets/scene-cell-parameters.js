@@ -9,6 +9,9 @@ export function sceneCellDraft(capabilities, members, mode, layout) {
   const draft = normalizeComputeSettings(structuredClone(layout?.configuration ?? capabilities.default_configuration), capabilities);
   delete draft.requests;
   if (layout?.configuration) {
+    if (mode === 'fast_mode' && !Object.hasOwn(draft,'fast_kv_pool_blocks')) {
+      draft.fast_kv_pool_blocks=layout.deployment?.fast_kv_pool_blocks ?? null;
+    }
     if (draft.compute_mode !== mode) {
       draft.compute_mode = mode;
       editDependencies(draft,['compute_mode'],mode,capabilities);
@@ -24,6 +27,7 @@ export function sceneCellDraft(capabilities, members, mode, layout) {
     compute_mode: mode, model: options.model ? modelId(options.model) : draft.model,
     detail_prediction_method: fast ? null : options.detail_prediction_method || 'auto',
     memory_policy_file: fast ? options.memory_policy_file || '' : '',
+    fast_kv_pool_blocks: fast ? options.fast_kv_pool_blocks ?? null : null,
     fast_glm_dsa_score: fast ? options.fast_glm_dsa_score || '' : '',
     expert_routing_seed: options.expert_routing_seed ?? 0,
     collective_policies: structuredClone(layout?.collective_policies || []),
@@ -95,6 +99,7 @@ export function sceneCellLayout(draft, capabilities, members, {remap=false}={}) 
       expert_routing_seed:model.experts?draft.expert_routing_seed:null,
       detail_prediction_method:draft.detail_prediction_method,memory_policy_file:draft.memory_policy_file||null,
       fast_glm_dsa_score:draft.fast_glm_dsa_score||null,max_requests:settings.max_requests,
+      ...(draft.compute_mode==='fast_mode'?{fast_kv_pool_blocks:draft.fast_kv_pool_blocks ?? null}:{}),
       max_model_len:v.max_model_len,max_batched_tokens:settings.max_batched_tokens,
       kv_block_size_tokens:settings.kv_block_size_tokens,num_kv_blocks:settings.num_kv_blocks,
       prefix_caching:v.enable_prefix_caching,enable_chunked_prefill:v.enable_chunked_prefill,
@@ -129,27 +134,6 @@ export function layoutFromExperiment(experiment, cell, members) {
     collective_policies:Object.entries(algorithms).flatMap(([scope,operations])=>
       Object.entries(operations).map(([operation,algorithm])=>({scope,operation,algorithm}))),
   };
-}
-
-function kvPoolInputs(cell) {
-  const {tp,pp,dp,ep}=cell.parallel;
-  return [cell.model,cell.hardware_id,tp,pp,dp,ep,cell.native_expert_parallel,
-    cell.max_model_len,cell.max_batched_tokens,cell.max_requests,cell.kv_block_size_tokens,
-    cell.enable_chunked_prefill];
-}
-
-export function preserveFixedKvPools(previous, rebuilt) {
-  if(previous.compute_mode!=='fast_mode'||rebuilt.compute_mode!=='fast_mode'||
-     previous.physical_dataset!==rebuilt.physical_dataset)return;
-  const byId=new Map(previous.cells.filter(cell=>cell.fast_kv_pool_blocks!=null).map(cell=>[cell.id,cell]));
-  for(const cell of rebuilt.cells){
-    const old=byId.get(cell.id);
-    if(!old)continue;
-    const inputs=kvPoolInputs(old);
-    if(kvPoolInputs(cell).every((value,index)=>value===inputs[index])){
-      cell.fast_kv_pool_blocks=old.fast_kv_pool_blocks;
-    }
-  }
 }
 
 export function preserveOtherCellTopologies(previous, rebuilt, changedCells) {

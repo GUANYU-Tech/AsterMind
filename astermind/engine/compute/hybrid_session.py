@@ -36,7 +36,7 @@ def start_hybrid_k3_session(native, model, requested, pool, role, budgets, layou
                               pipeline_parallel_size=requested.pipeline_parallel_size,
                               enable_expert_parallel=requested.enable_expert_parallel)
     workers, shared = allocate_vllm030_kimi_k3_cache(native, model, parallel, budgets,
-        source_root=source, supported_layouts_by_rank=layouts)
+        source_root=source, supported_layouts_by_rank=layouts, pool_blocks=requested.kv_pool_blocks)
     cache.num_gpu_blocks = shared.num_blocks
     scheduler = Scheduler(native, shared, StructuredOutputManager(native), block_size=span)
     specs = vllm030_kimi_k3_cache_specs(native, model)
@@ -85,7 +85,8 @@ def start_hybrid_k3_session(native, model, requested, pool, role, budgets, layou
                 native_allocation=asdict(allocation), k3_source_capacities=(span * shared.num_blocks, shared.num_blocks),
                 kv_group_geometry=tuple(geometry), kda_groups=kda, mla_groups=mla,
                 shared_cache_arena_bytes_by_rank=tuple(max(t.size for t in w.kv_cache_tensors) for w in workers),
-                available_memory_by_rank=budgets, source_identity=identity,
+                available_memory_by_rank=budgets, requested_kv_pool_blocks=requested.kv_pool_blocks,
+                source_identity=identity,
                 session_storage=True, effective_prefix_caching=True, mamba_cache_mode="align",
                 model_config_sha256=model.config_sha256, source_model_type=model.model_type,
                 effective_tensor_parallel_size=native.parallel_config.tensor_parallel_size,

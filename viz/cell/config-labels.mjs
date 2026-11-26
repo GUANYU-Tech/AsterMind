@@ -33,6 +33,7 @@ export const labels = {
   source_pool:"源 pool", destination_pool:"目标 pool", payload:"传输内容", placements:"显式部署映射", worker_pool:"Worker pool",
   parallel_coordinate:"并行坐标", dp:"DP 坐标", pp:"PP 坐标", cp:"CP 坐标", tp:"TP 坐标",
   framework:"调度框架", max_batched_tokens:"每批 Token 上限", max_requests:"每批请求上限", num_kv_blocks:"KV block 数",
+  fast_kv_pool_blocks:"固定 KV 池大小 / 块",
   kv_block_size_tokens:"每 block Token 数", scheduler_pipeline_depth:"调度流水深度", vllm:"vLLM 选项", sglang:"SGLang 选项",
   dtype:"数据精度", max_model_len:"模型长度上限", gpu_memory_utilization:"显存利用比例", trust_remote_code:"远程模型代码",
   enable_chunked_prefill:"分块 Prefill", enable_prefix_caching:"前缀缓存", async_scheduling:"异步调度", dummy_token_id:"模拟 Token ID",

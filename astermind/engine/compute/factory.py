@@ -427,9 +427,6 @@ def vllm030_byte_budget(config, model, hardware):
 def _fast_vllm030_with_byte_budget(config, pool_name, model, hardware, requested=None):
     config = resolve_batch_token_budget(config)
     budgets, percentage, layers, layout, k3 = vllm030_byte_budget(config, model, hardware)
-    if config.fast_kv_pool_blocks is not None and (model.model_type != "glm_moe_dsa"
-            or config.data_parallel_size != 1 or config.enable_expert_parallel):
-        raise ValueError("explicit Fast KV capacity requires a colocated GLM TP/PP pool")
     if requested is None:
         if not k3:
             raise ValueError("hybrid native budget requires the supported K3 source")

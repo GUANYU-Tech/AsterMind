@@ -71,7 +71,7 @@ class ServingCell(Contract):
     graph_backend: Literal["midlayer"] = "midlayer"
     fast_glm_dsa_score: Literal["bf16_timing_proxy"] | None = None
     fast_roofline: FastRoofline | None = None
-    fast_kv_pool_blocks: Positive | None = None
+    fast_kv_pool_blocks: Annotated[int, Field(strict=True, ge=2)] | None = None
     fast_link_contention: StrictBool = False
     detail_prediction_method: Literal["midlayer", "roofline"] | None = None
 
@@ -117,7 +117,7 @@ class ServingCell(Contract):
 
 class SceneDeployment(ComputeModeConfig):
     fast_roofline: FastRoofline | None = None
-    fast_kv_pool_blocks: Positive | None = None
+    fast_kv_pool_blocks: Annotated[int, Field(strict=True, ge=2)] | None = None
     fast_link_contention: StrictBool = False
     model: str = "configs/model/qwen3-8b.json"
     hardware: str = "configs/hardware/nvidia_a800.yaml"

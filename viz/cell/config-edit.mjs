@@ -169,6 +169,7 @@ export function editDependencies(config, path, value, capabilities, previous) {
     if (!fast) {
       config.memory_policy_file = '';
       config.fast_glm_dsa_score = '';
+      config.fast_kv_pool_blocks = null;
     }
     ensureSupportedModel();
     synchronizeResources(config, capabilities);
