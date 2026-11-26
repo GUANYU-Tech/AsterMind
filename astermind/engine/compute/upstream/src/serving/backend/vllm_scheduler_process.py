@@ -43,11 +43,13 @@ VLLM030_SOURCE_COMMIT = "ced6857afa0ea7b2e3f0846a62e1394e90f15607"
 _VLLM030_ALLOCATOR_PACKAGE_MANIFEST_SHA256 = (
     "c0955783f251f7419d61aa5ae8fbc8b78babc586deab407c322c439c6733ad6f"
 )
-_STARTUP_TIMEOUT_S = 60.0
+# Concurrent Cells can take minutes to import vLLM. The startup pipe closes
+# if its worker exits, so wait for readiness or EOF without a wall-clock limit.
+_STARTUP_TIMEOUT_S: float | None = None
 # A CPU production-trace point can spend several minutes in one scheduler
 # command while draining a long-output request.  The previous 60-second RPC
 # deadline terminated otherwise healthy runs before their aggregate result was
-# persisted.  Keep startup/shutdown deadlines tight, but allow the control
+# persisted.  Keep routine command deadlines short, but allow the control
 # command to complete within a bounded ten-minute window.
 _COMMAND_TIMEOUT_S = 60.0
 _PRODUCTION_TRACE_COMMAND_TIMEOUT_S = 600.0
@@ -444,8 +446,8 @@ class VLLMSchedulerProcess:
             self._force_close()
             raise
 
-    def _receive(self, timeout_s: float) -> tuple[Any, ...]:
-        if not self._connection.poll(timeout_s):
+    def _receive(self, timeout_s: float | None) -> tuple[Any, ...]:
+        if timeout_s is not None and not self._connection.poll(timeout_s):
             raise TimeoutError(
                 f"vLLM scheduler process did not respond within {timeout_s}s")
         response = self._connection.recv()
