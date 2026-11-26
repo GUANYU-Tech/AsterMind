@@ -14,11 +14,11 @@ import { sceneData } from "./scene-data.mjs?v=compact-2";
 import { configurationErrors, validationError } from "./config-validation.mjs?v=validation-1";
 
 import {renderCellConfigProfile} from "../assets/config-profile.js";
+import {formatTaskLog,taskPhase,taskFailure} from "../assets/progress_log.js";
 import {labels,formationNames} from "./config-labels.mjs?v=compact-2";
 const $ = selector => document.querySelector(selector);
 buildWorkspace();
 const statuses = { queued: "排队", running: "运行中", success: "成功", failed: "失败", interrupted: "已中断", cancelled: "已取消", rejected: "校验失败" };
-const phases = { queued: "等待执行", preparing_environment:"准备运行环境", configuration: "解析配置", topology: "构建网络", serving: "请求调度与计算 / 通信仿真", completed: "完成" };
 let config, capabilities, scene, dirty = false, busy = false, jobId = null, pollVersion = 0, previewVersion = 0, refreshForms = false;
 let previewTimer, previewAbort, previewKey = "", networkPreview = null;
 let preflightTimer, preflightVersion = 0, preflightKey = '', preflightStatus = 'pending', effectiveCell;
@@ -294,6 +294,7 @@ function historyReplace(id) { window.history.replaceState(null, "", `#job=${enco
 
 async function watch(id, open = false) {
   $('#artifact-shortcut').hidden=true;
+  $('#cell-task-log').hidden=true;
   const version = ++pollVersion; jobId = id; remember(id);
   if (open) stage("analysis");
   $("#job-status").hidden = false;
@@ -303,8 +304,11 @@ async function watch(id, open = false) {
       const status = await api(`/api/simulations/${id}`);
       if (version !== pollVersion) return;
       const hasBatchProgress = Number.isInteger(status.batches_completed);
-      const stageProgress = status.phase === "serving" && hasBatchProgress ? "" : ` ${status.progress ?? 0}%`;
-      $("#job-progress").textContent = `${statuses[status.status] || status.status} ${phases[status.phase] || status.phase || ""}${stageProgress}`;
+      const showPercent = Number.isFinite(status.progress) && !(status.phase === "serving" && hasBatchProgress);
+      $("#job-progress").textContent = [statuses[status.status] || status.status, taskPhase(status),
+        showPercent ? `${status.progress}%` : ""].filter(Boolean).join(" · ");
+      $("#cell-log-lines").textContent = formatTaskLog(status);
+      $("#cell-task-log").hidden = false;
       const batches = $("#job-batches");
       batches.hidden = !hasBatchProgress;
       if (hasBatchProgress) {
@@ -323,7 +327,7 @@ async function watch(id, open = false) {
         await renderResults($("#simulation-results"), id, result, api); message(""); return;
       }
       if (!["queued", "running", "received"].includes(status.status)) {
-        $("#simulation-results").replaceChildren(element("h2", statuses[status.status] || status.status), element("pre", status.error || "任务未完成，请检查配置后重新提交。"));
+        $("#simulation-results").replaceChildren(element("h2", statuses[status.status] || status.status), element("pre", taskFailure(status) || "任务未完成，请检查配置后重新提交。"));
         await renderArtifacts($("#simulation-results"), id, api); return;
       }
       $("#simulation-results").replaceChildren(element("h2", "仿真进行中"), element("p", "可以关闭网页；后台任务继续执行。通过历史记录或当前页面链接恢复查看。"));

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {formatProgressLine,formatProgressLog,formatPhysicalSummary} from '../assets/progress_log.js';
+import {formatProgressLine,formatProgressLog,formatPhysicalSummary,formatTaskLog,taskFailure} from '../assets/progress_log.js';
+import {translate} from '../assets/language-en.js';
 
 test('legacy JSON strings display readable stages and simulation time ranges',()=>{
  const log=String.raw`"Materializing physical nodes"
@@ -41,4 +42,34 @@ test('legacy byte tails discard an incomplete first line without corrupting late
  assert.equal(formatProgressLog('429 links; 1 workers"\n"Physical attributes: 4408/4429 links; 1 workers"',
   {discardPartialFirstLine:true}),'物理属性计算：已完成 4408/4429 条链路｜并行进程：1');
  assert.equal(formatProgressLine('"Physical core dataset ready"'),'核心物理数据已生成');
+});
+
+test('historical tasks show only recorded facts, regardless of host diagnostics',()=>{
+ const log_tail="Using 'pin_memory=False' as WSL is detected. This may slow down performance.\nmacOS host diagnostic";
+ assert.equal(formatTaskLog({state:'completed',phase:'结果与回放已就绪',log_tail}),'运行完成 · 结果与回放已就绪');
+ assert.equal(formatTaskLog({status:'success',phase:'completed',progress:100,log_tail}),'运行完成 · 100%');
+ assert.equal(formatTaskLog({state:'cancelled',log_tail}),'已手动停止');
+});
+
+test('recorded stages keep their UTC time, actual cell counts and reported percentages',()=>{
+ const event={state:'running',phase:'cells',completed:2,total:4,progress:20};
+ const job={status:'running',phase:'cells',startup_stage:{phase:'cells',completed:2,total:4},progress:20,
+   progress_history:[{at:'2026-11-26T05:02:07+00:00',event}]};
+ const text=formatTaskLog(job);
+ assert.equal(text,'[05:02:07 UTC] 正在运行 · 初始化计算编队（2/4） · 20%');
+ assert.doesNotMatch(translate(text,true),/\p{Script=Han}/u);
+});
+
+test('physical stages are ordered relative to the job state and diagnostics are omitted',()=>{
+ const log_tail='Materializing physical nodes\nGPU driver initialization diagnostic';
+ assert.equal(formatTaskLog({state:'running',log_tail}),'正在运行\n正在生成物理节点');
+ assert.equal(formatTaskLog({state:'completed',log_tail}),'正在生成物理节点\n运行完成');
+});
+
+test('preserve structured failures and extract only the exception from a legacy diagnostic tail',()=>{
+ const log_tail='Host performance warning\nTraceback (most recent call last):\n  File "worker.py"\nValueError: invalid orbit';
+ assert.equal(formatTaskLog({state:'failed',error:log_tail,log_tail}),'运行失败\nValueError: invalid orbit');
+ assert.equal(taskFailure({status:'rejected',phase:'validation',error:'invalid configuration'}),'invalid configuration');
+ assert.equal(taskFailure({state:'completed',replay_state:'failed',replay_error:'invalid replay index'}),'invalid replay index');
+ assert.equal(taskFailure({state:'failed',log_tail:'host diagnostic only'}),'任务失败，详见原始诊断日志。');
 });

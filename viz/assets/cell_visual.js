@@ -36,5 +36,5 @@ export function attachComputeCells({THREE,scene,container,vector,catalog}){
  window.inspectNetworkCell=show;
  window.computeCellCenter=nodeId=>window.collectivePhysicalMembers?undefined:centers.get(nodeId);
  function update(state){current=state;for(const sprite of sprites){const data=CellModel.describe(catalog,state.snapshot,sprite.userData.cellId),v=vector(data.center);sprite.position.copy(v);sprite.visible=!window.collectivePhysicalMembers;for(const member of data.members)centers.set(member.node_id,v)}if(dialog.open&&selected)show(selected)}
- return {update,pick(raycaster,earthDistance=Infinity){const hit=raycaster.intersectObjects(sprites).find(h=>h.distance<earthDistance+.03);if(hit){const id=hit.object.userData.cellId;if(window.runtimeLiveMode){const members=catalog.filter(n=>n.cell_id===id),member=members.find(n=>n.cell_ingress)||members[0];if(member)window.inspectNetworkNode?.(member.node_id)}else show(id);return true}return false}};
+ return {update,pick(raycaster,earthDistance=Infinity){const hit=raycaster.intersectObjects(sprites).find(h=>h.distance<earthDistance+.03);if(hit){const id=hit.object.userData.cellId;if(window.runtimeLiveMode){const members=catalog.filter(n=>n.cell_id===id),member=members.find(n=>n.cell_ingress)||members[0];if(member)window.inspectNetworkNode?.(member.node_id)}else show(id);return id}return false}};
 }

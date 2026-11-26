@@ -26,7 +26,7 @@ test('handoff continuous playback stays live across buffers; only explicit histo
   modules.set(name,module);
   await module.link(spec=>{
    const dependency=spec.split('/').at(-1);
-   return ['live_watch.js','communication_clock.js','live_event_cursor.js','live_traffic_model.js','replay_page_loader.js'].includes(dependency)?load(dependency):empty;
+   return ['live_watch.js','communication_clock.js','live_event_cursor.js','live_traffic_model.js','replay_page_loader.js','orbit_planes.js','runtime_frames.js'].includes(dependency)?load(dependency):empty;
   });
   return module;
  }

@@ -1,4 +1,5 @@
 import * as THREE from '/assets/three.module.js';
+import {attachOrbitPlanes} from './globe_orbits.js';
 import {OrbitControls} from '/assets/OrbitControls.js';
 import {pickGlobeNode} from '/assets/globe_picking.js';
 import {createTopologyLinkLayers,updateTopologyLinkLayers,setTopologyLinksVisible} from '/assets/globe_links.js';
@@ -34,22 +35,45 @@ const panelCanvas=document.createElement('canvas');panelCanvas.width=256;panelCa
 const wings=new THREE.InstancedMesh(new THREE.BoxGeometry(.12,.003,.034),new THREE.MeshStandardMaterial({color:0xffffff,map:panelTexture,metalness:.48,roughness:.35,emissive:0x082247,emissiveIntensity:.25}),space.length);
 scene.add(body,wings);
 const groundMesh=new THREE.InstancedMesh(new THREE.ConeGeometry(.035,.09,5),new THREE.MeshStandardMaterial({color:0xffb95a,emissive:0xb36518,emissiveIntensity:.4}),grounds.length);scene.add(groundMesh);
-const orbitGeometry=new THREE.BufferGeometry(),orbitMaterial=new THREE.LineBasicMaterial({color:0x64b1e9,transparent:true,opacity:.07,depthWrite:false}),orbitLines=new THREE.LineSegments(orbitGeometry,orbitMaterial);scene.add(orbitLines);
+const orbitToggle=document.getElementById('showOrbits');
+const geometryPreview = initial.data.provenance?.scope === 'orbital_geometry_preview';
+if (geometryPreview) {
+  orbitToggle.checked = true;
+  document.getElementById('showLinks').checked = false;
+}
+orbitToggle.parentElement.title='按当前高度显示瞬时轨道面，地球会遮挡背面的轨道线。';
+const orbitLegend=document.createElement('span'), orbitStatus=document.createElement('span');
+orbitLegend.hidden=true;
+for (const [text,color] of [['通信轨道面','#4ed8ff'],['计算轨道面','#ffb745']]) {
+  const swatch=document.createElement('span');swatch.textContent='━ ';swatch.style.color=color;
+  const label=document.createElement('span');label.textContent=text;
+  orbitLegend.append(swatch,label,document.createTextNode('　'));
+}
+orbitStatus.setAttribute('role','status');orbitLegend.append(orbitStatus);toolbar.append(orbitLegend);
+const updateOrbitPlanes=attachOrbitPlanes(THREE,scene,container,orbitStatus,initial);
 const linkColors={communication_isl:0x45cfff,sgl:0xffa42f,cross_layer:0xf1a1ff,cell_isl:0xbb8aff,inter_cell:0xf47fbd};
 const linkLayers=createTopologyLinkLayers({THREE,scene,colors:linkColors,live:window.runtimeLiveMode});
-const sglDisplay=new THREE.InstancedMesh(new THREE.CylinderGeometry(.022,.022,1,8),new THREE.MeshBasicMaterial({color:0xffaa22,transparent:true,opacity:.95}),Math.max(1,grounds.reduce((s,n)=>s+n.sgl_terminals,0)));sglDisplay.count=0;scene.add(sglDisplay);
 const markerGroups=[];
 for(const[role,color,size]of [['communication',0x54d8ff,6],['compute',0xd99cff,10],['ground',0xffbe47,19]]){const nodes=catalog.filter(n=>n.role===role&&(!n.cell_id||window.collectivePhysicalMembers)),geometry=new THREE.BufferGeometry(),canvas=document.createElement('canvas');canvas.width=canvas.height=64;const c=canvas.getContext('2d');c.fillStyle='#fff';c.beginPath();if(role==='ground'){c.moveTo(32,3);c.lineTo(61,58);c.lineTo(3,58);c.closePath()}else if(role==='compute'){c.rect(8,8,48,48)}else c.arc(32,32,24,0,Math.PI*2);c.fill();const map=new THREE.CanvasTexture(canvas),mesh=new THREE.Points(geometry,new THREE.PointsMaterial({color,size,sizeAttenuation:false,map,transparent:true,alphaTest:.2,depthWrite:false}));mesh.userData.nodes=nodes;scene.add(mesh);markerGroups.push({nodes,geometry,mesh,role})}
 const linkLegend=document.createElement('div');linkLegend.style.cssText='font-size:12px;line-height:1.8;color:#acc5df';linkLegend.innerHTML='<span style="color:#45cfff">━ 通信 ISL</span>　<span style="color:#ffa42f">━ 星地链路</span>　<span style="color:#f1a1ff">━ 通信—计算</span>　<span style="color:#bb8aff">━ cell 内部</span><br>● 通信卫星　▤ 计算 cell（点击展开）　▲ 地面站 标记按屏幕大小显示，虚线为建链中';note.after(linkLegend);
 const pathGeometry=new THREE.BufferGeometry(),pathLines=new THREE.LineSegments(pathGeometry,new THREE.LineBasicMaterial({color:0xffd66f,transparent:true,opacity:.95}));scene.add(pathLines);
 const vector=v=>new THREE.Vector3(v[0]/1000,v[2]/1000,-v[1]/1000),dummy=new THREE.Object3D(),up=new THREE.Vector3(0,1,0);
+const overviewPosition=camera.position.clone();
+if (geometryPreview && initial.data.sun_positions?.length) {
+  const sun=vector(initial.data.sun_positions[0].position_itrs_km).normalize();
+  const north=up.clone().addScaledVector(sun,-up.dot(sun)).normalize();
+  overviewPosition.crossVectors(up,sun).normalize().addScaledVector(north,.23)
+    .addScaledVector(sun,.10).normalize().multiplyScalar(22);
+  camera.position.copy(overviewPosition);
+  controls.update();
+}
 function segments(target,pairs,positions){const points=[];for(const[a,b]of pairs){if(positions.has(a)&&positions.has(b)){points.push(...positions.get(a).toArray(),...positions.get(b).toArray())}}target.setAttribute('position',new THREE.Float32BufferAttribute(points,3));target.computeBoundingSphere()}
-let signature='',orbitStep=-1,focusId=null,latestPositions=new Map();
+let signature='',focusId=null,latestPositions=new Map();
 const focusButton=document.createElement('button');focusButton.textContent='卫星特写';toolbar.append(focusButton);
 const overviewButton=document.createElement('button');overviewButton.textContent='整体星座';toolbar.append(overviewButton);
 if(runtimeMode){focusButton.hidden=true;overviewButton.hidden=true}
-focusButton.onclick=()=>{const state=window.networkReplayState(),sun=state.data.sun_positions?.find(s=>s.time_s===Math.floor(state.snapshot.time_s/60)*60)?.position_itrs_km||[1e8,0,0],direction=vector(sun).normalize();const chosen=space.filter(n=>latestPositions.has(n.node_id)).sort((a,b)=>latestPositions.get(b.node_id).clone().normalize().dot(direction)-latestPositions.get(a.node_id).clone().normalize().dot(direction))[0];if(!chosen)return;focusId=chosen.node_id;const position=latestPositions.get(focusId);controls.target.copy(position);camera.position.copy(position).add(position.clone().normalize().multiplyScalar(.45)).add(new THREE.Vector3(.1,.08,.1));controls.minDistance=.12;orbitLines.visible=false;document.getElementById('showOrbits').checked=false;window.inspectNetworkNode?.(focusId)};
-overviewButton.onclick=()=>{focusId=null;controls.target.set(0,0,0);camera.position.set(13,8,15);controls.minDistance=6.6;document.getElementById('showOrbits').checked=false};
+focusButton.onclick=()=>{const state=window.networkReplayState(),sun=state.data.sun_positions?.find(s=>s.time_s===Math.floor(state.snapshot.time_s/60)*60)?.position_itrs_km||[1e8,0,0],direction=vector(sun).normalize();const chosen=space.filter(n=>latestPositions.has(n.node_id)).sort((a,b)=>latestPositions.get(b.node_id).clone().normalize().dot(direction)-latestPositions.get(a.node_id).clone().normalize().dot(direction))[0];if(!chosen)return;focusId=chosen.node_id;const position=latestPositions.get(focusId);controls.target.copy(position);camera.position.copy(position).add(position.clone().normalize().multiplyScalar(.45)).add(new THREE.Vector3(.1,.08,.1));controls.minDistance=.12;window.inspectNetworkNode?.(focusId)};
+overviewButton.onclick=()=>{focusId=null;controls.target.set(0,0,0);camera.position.copy(overviewPosition);controls.minDistance=6.6};
 if(!runtimeMode){const routeFocus=document.createElement('button');routeFocus.textContent='聚焦所选路径';routeFocus.onclick=()=>{const state=window.networkReplayState(),ids=new Set((state.route?.path||[]).flatMap(e=>[e.source_node_id,e.target_node_id])),positions=[...ids].map(id=>latestPositions.get(id)).filter(Boolean);if(!positions.length){note.textContent='请先查询并选择一条可达路径';return}const direction=positions.reduce((sum,p)=>sum.add(p.clone().normalize()),new THREE.Vector3());if(direction.length()<.01)direction.copy(positions[0]);focusId=null;controls.target.set(0,0,0);camera.position.copy(direction.normalize().multiplyScalar(18));controls.minDistance=6.6;controls.update()};toolbar.append(routeFocus)}
 
 function update(state){const snapshot=state.snapshot,positions=new Map(snapshot.nodes.map(n=>[n.node_id,vector(n.position_itrs_km)]));
@@ -57,23 +81,25 @@ cellVisual.update(state);latestPositions=positions;if(focusId&&positions.has(foc
 
 space.forEach((n,i)=>{dummy.position.copy(positions.get(n.node_id));dummy.quaternion.setFromUnitVectors(up,dummy.position.clone().normalize());const scale=(n.role==='compute'?2.1:1)*(window.collectiveModelScale||1);dummy.scale.setScalar(scale);dummy.updateMatrix();body.setMatrixAt(i,dummy.matrix);wings.setMatrixAt(i,dummy.matrix)});body.instanceMatrix.needsUpdate=true;wings.instanceMatrix.needsUpdate=true;
 grounds.forEach((n,i)=>{dummy.position.copy(positions.get(n.node_id));dummy.quaternion.setFromUnitVectors(up,dummy.position.clone().normalize());dummy.scale.setScalar(1);dummy.updateMatrix();groundMesh.setMatrixAt(i,dummy.matrix)});groundMesh.instanceMatrix.needsUpdate=true;
-const step=Math.floor(snapshot.time_s/(state.data.time.step_s||60));if(step!==orbitStep){orbitStep=step;
-const orbitGroups=window.ConstellationLayout.orbitGroups(snapshot.nodes);
-const orbitPoints=[];for(const nodes of orbitGroups){const curve=new THREE.CatmullRomCurve3(nodes.map(n=>positions.get(n.node_id)),true,'centripetal'),points=curve.getPoints(128);for(let i=0;i<points.length-1;i++)orbitPoints.push(...points[i].toArray(),...points[i+1].toArray())}orbitGeometry.setAttribute('position',new THREE.Float32BufferAttribute(orbitPoints,3));orbitGeometry.computeBoundingSphere();}
 updateTopologyLinkLayers(THREE,linkLayers,snapshot,positions,state.kind);
-const activeSgl=snapshot.links.filter(e=>e.kind==='sgl'&&e.state==='UP'&&(state.kind==='all'||state.kind==='sgl'));sglDisplay.count=Math.min(activeSgl.length,sglDisplay.instanceMatrix.count);for(let i=0;i<sglDisplay.count;i++){const e=activeSgl[i],a=positions.get(e.endpoint_a),b=positions.get(e.endpoint_b),delta=b.clone().sub(a);dummy.position.copy(a).add(b).multiplyScalar(.5);dummy.quaternion.setFromUnitVectors(up,delta.clone().normalize());dummy.scale.set(window.collectiveVisualScale||1,delta.length(),window.collectiveVisualScale||1);dummy.updateMatrix();sglDisplay.setMatrixAt(i,dummy.matrix)}sglDisplay.instanceMatrix.needsUpdate=true;sglDisplay.computeBoundingSphere();
 for(const group of markerGroups){const points=[];for(const n of group.nodes){const p=positions.get(n.node_id).clone();if(group.role==='ground')p.add(p.clone().normalize().multiplyScalar(.008));points.push(...p.toArray())}group.geometry.setAttribute('position',new THREE.Float32BufferAttribute(points,3));group.geometry.computeBoundingSphere()}
 const paths=window.runtimeLiveMode?[]:state.route?.path||[];
 segments(pathGeometry,paths.map(e=>[e.source_node_id,e.target_node_id]),positions);
 pathLines.userData.links=paths;
 }
-function resize(){const r=container.getBoundingClientRect();if(!r.width||!r.height)return;renderer.setSize(r.width,r.height);camera.aspect=r.width/r.height;camera.updateProjectionMatrix()}new ResizeObserver(resize).observe(container);resize();
+function resize(){
+ const width=container.clientWidth,height=container.clientHeight;
+ if(!width||!height)return;
+ renderer.setSize(width,height);
+ camera.aspect=width/height;camera.updateProjectionMatrix();
+}
+new ResizeObserver(resize).observe(container);resize();
 const raycaster=new THREE.Raycaster(),mouse=new THREE.Vector2();let pointer;
-let selectedObject={},selectionSignature='',overlay=null;
+let selectedObject={},selectionSignature='',overlay=null,pickedOrbitNode;
 const selectionMarker=new THREE.Mesh(new THREE.RingGeometry(.78,1,48),new THREE.MeshBasicMaterial({color:0xc5e78b,side:THREE.DoubleSide,depthWrite:false}));selectionMarker.visible=false;scene.add(selectionMarker);
 const connectedSelection=new THREE.LineBasicMaterial({color:0xc5e78b,depthWrite:false}),disconnectedSelection=new THREE.LineDashedMaterial({color:0xe9ba70,depthWrite:false,dashSize:.06,gapSize:.04});
 const selectionLink=new THREE.Line(new THREE.BufferGeometry(),connectedSelection);selectionLink.visible=false;scene.add(selectionLink);
-window.selectGlobeObject=value=>{selectedObject=value||{};overlay?.select?.(selectedObject)};
+window.selectGlobeObject=value=>{selectedObject=value||{};pickedOrbitNode=selectedObject.nodeId;overlay?.select?.(selectedObject)};
 function updateSelection(){
  const point=selectedObject.nodeId&&(window.computeCellCenter?.(selectedObject.nodeId)||latestPositions.get(selectedObject.nodeId));
  selectionMarker.visible=!!point;if(point){selectionMarker.position.copy(point);selectionMarker.quaternion.copy(camera.quaternion);selectionMarker.scale.setScalar(camera.position.distanceTo(point)*Math.tan(camera.fov*Math.PI/360)*28/container.clientHeight)}
@@ -90,12 +116,13 @@ renderer.domElement.addEventListener('click',e=>{
  raycaster.params.Points.threshold=camera.position.distanceTo(controls.target)*.006;
  raycaster.params.Line.threshold=8*camera.position.distanceTo(controls.target)*Math.tan(camera.fov*Math.PI/360)/r.height;
  const earthDistance=raycaster.intersectObject(earth)[0]?.distance??Infinity;
- if(cellVisual.pick(raycaster,earthDistance))return;
+ const cell=cellVisual.pick(raycaster,earthDistance);
+ if(cell){pickedOrbitNode=catalog.find(n=>n.cell_id===cell && n.compute_target)?.node_id || catalog.find(n=>n.cell_id===cell)?.node_id;return}
  const node=pickGlobeNode({THREE,camera,positions:latestPositions,nodes:catalog.filter(n=>!n.cell_id||window.collectivePhysicalMembers),pointer:screen,width:r.width,height:r.height,radius:7});
- if(node){window.inspectNetworkNode?.(node);return}
+ if(node){pickedOrbitNode=node;window.inspectNetworkNode?.(node);return}
  if(faults?.pick(raycaster,earthDistance))return;
  const link=raycaster.intersectObjects([pathLines,...linkLayers.filter(l=>l.mesh.visible).map(l=>l.mesh)]).find(h=>h.distance<earthDistance);
- if(link){const edge=link.object.userData.links[Math.floor(link.index/2)];if(edge)window.inspectNetworkLink?.(edge.link_id)}
+ if(link){const edge=link.object.userData.links[Math.floor(link.index/2)];if(edge){pickedOrbitNode=null;window.inspectNetworkLink?.(edge.link_id)}}
 });
 overlay=runtimeMode?(await import(window.runtimeLiveMode?'/assets/live_traffic.js':'/assets/runtime_overlay.js')).attachOverlay({THREE,scene,camera,controls,container,toolbar,vector}):null;
 const faults=runtimeMode?(await import('/assets/runtime_faults.js')).attachFaults({THREE,scene,vector,camera,controls,toolbar,container,onFocus:()=>overlay?.stopFocus()}):null;
@@ -103,4 +130,4 @@ const solar=(await import('/assets/sun_visual.js')).attachSun({THREE,scene,sunli
 if(!runtimeMode)await import('/assets/physical_motion.js');
 window.orbitGlobe={THREE,scene,camera,controls,container,vector,overlay};
 renderer.domElement.setAttribute('role','img');renderer.domElement.setAttribute('aria-label',runtimeMode?'真实 Runtime 三维地球、故障与传输路径':'三维地球与物理拓扑');
-function animate(){requestAnimationFrame(animate);if(!container.clientWidth||!container.clientHeight)return;const state=window.networkReplayState(),key=state.snapshot.time_s+'|'+(state.runtime?.event?.event_order??'')+'|'+state.kind+'|'+(state.revision??'')+'|'+(document.getElementById('probe')?.value||'')+'|'+(state.route?.probe_revision??'');if(key!==signature){signature=key;update(state);if(faults)faults.update(state);solar.update(state)}orbitLines.visible=document.getElementById('showOrbits').checked;controls.autoRotate=document.getElementById('autoRotate').checked;controls.update();if(overlay)overlay.update(state);updateSelection();const linksVisible=document.getElementById('showLinks').checked;setTopologyLinksVisible(linkLayers,linksVisible,sglDisplay,pathLines);selectionLink.visible=linksVisible&&!!selectedObject.linkId&&!!selectionLink.geometry.getAttribute('position')?.count;overlay?.setLinksVisible?.(linksVisible);const visibleCount=String(linksVisible?linkLayers.reduce((n,l)=>n+l.mesh.userData.links.length,0):0);if(toolbar.dataset.visibleLinks!==visibleCount)toolbar.dataset.visibleLinks=visibleCount;solar.animate?.(performance.now()/1000);renderer.render(scene,camera)}animate();
+function animate(){requestAnimationFrame(animate);if(!container.clientWidth||!container.clientHeight)return;const state=window.networkReplayState(),key=state.snapshot.time_s+'|'+(state.runtime?.event?.event_order??'')+'|'+state.kind+'|'+(state.revision??'')+'|'+(document.getElementById('probe')?.value||'')+'|'+(state.route?.probe_revision??'');if(key!==signature){signature=key;update(state);if(faults)faults.update(state);solar.update(state)}orbitLegend.hidden=!orbitToggle.checked;updateOrbitPlanes(state,orbitToggle.checked,pickedOrbitNode);controls.autoRotate=document.getElementById('autoRotate').checked;controls.update();if(overlay)overlay.update(state);updateSelection();const linksVisible=document.getElementById('showLinks').checked;setTopologyLinksVisible(linkLayers,linksVisible,pathLines);selectionLink.visible=linksVisible&&!!selectedObject.linkId&&!!selectionLink.geometry.getAttribute('position')?.count;overlay?.setLinksVisible?.(linksVisible);const visibleCount=String(linksVisible?linkLayers.reduce((n,l)=>n+l.mesh.userData.links.length,0):0);if(toolbar.dataset.visibleLinks!==visibleCount)toolbar.dataset.visibleLinks=visibleCount;solar.animate?.(performance.now()/1000);renderer.render(scene,camera)}animate();

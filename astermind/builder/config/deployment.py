@@ -131,7 +131,7 @@ class SceneDeployment(ComputeModeConfig):
     fast_glm_dsa_score: Literal["bf16_timing_proxy"] | None = None
     expert_routing_seed: Annotated[int, Field(strict=True, ge=0)] | None = None
     max_requests: Annotated[int, Field(strict=True, ge=1, le=1024)] = 4
-    max_model_len: Annotated[int, Field(strict=True, ge=2, le=131072)] = 128
+    max_model_len: Annotated[int, Field(strict=True, ge=2)] = 128
     max_batched_tokens: Positive | None = None
     num_kv_blocks: Positive = 64
     kv_block_size_tokens: Positive = 16

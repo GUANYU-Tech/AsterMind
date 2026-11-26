@@ -10,6 +10,7 @@ import uuid
 
 from paths import VIZ, RUNTIME, owned
 from runtime_environment import identity
+from tasks import record_progress
 
 ROOT = RUNTIME / 'cell-jobs'
 LOCK = threading.Lock()
@@ -17,6 +18,8 @@ LOCK = threading.Lock()
 
 def write(path, value):
     path = owned(path)
+    if path.name == 'status.json':
+        record_progress(value)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix+'.tmp')
     temporary.write_text(json.dumps(value,ensure_ascii=False,allow_nan=False,indent=2))
@@ -62,7 +65,7 @@ def start(config, client):
                     cwd=VIZ,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
                 process.wait()
             if process.returncode and status(job)['status'] not in ('failed','cancelled'):
-                raise RuntimeError(f'V1 worker 退出码 {process.returncode}；详见执行日志')
+                raise RuntimeError(f'仿真进程退出码 {process.returncode}')
         except Exception as error:
             write(destination/'status.json',{**status(job),'status':'failed','error':str(error)})
     threading.Thread(target=run,name=job,daemon=True).start()

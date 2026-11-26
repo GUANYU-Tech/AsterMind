@@ -178,12 +178,24 @@ def normalize_request(row, devices):
     return Request.model_validate(fields)
 
 
-def validate_requests(config, requests):
+def validate_requests(config, requests, auto_context_cells=()):
     if len(requests) > MAX_REQUESTS:
         raise ValueError(f"业务请求最多 {MAX_REQUESTS} 条")
     devices = ground_devices(config)
     seen, histories = set(), {}
     by_cell = {cell.id: cell for cell in config.cells}
+    if any(cell_id not in by_cell for cell_id in auto_context_cells):
+        raise ValueError("自动上下文配置引用了未知 Cell")
+    limits = {cell.id: cell.max_model_len for cell in config.cells}
+    if auto_context_cells:
+        from astermind.builder.catalog import scene_catalog
+
+        model_limits = {row["id"]: row["max_context"] for row in scene_catalog()["models"]}
+        for cell_id in auto_context_cells:
+            model = by_cell[cell_id].model
+            if model not in model_limits:
+                raise ValueError(f"Cell {cell_id} 的模型上下文上限未知")
+            limits[cell_id] = model_limits[model]
     for request in requests:
         if request.id in seen:
             raise ValueError(f"请求 ID 重复：{request.id}")
@@ -195,13 +207,12 @@ def validate_requests(config, requests):
         if request.cell is not None and request.cell not in by_cell:
             raise ValueError(f"请求 {request.id} 的目标 Cell 不存在")
         targets = [by_cell[request.cell]] if request.cell else config.cells
-        if any(
-            request.input_tokens + request.output_tokens > cell.max_model_len
-            for cell in targets
-        ):
-            raise ValueError(
-                f"请求 {request.id} 的输入与输出 token 总数超过目标 Cell 上下文上限"
-            )
+        for cell in targets:
+            if request.input_tokens + request.output_tokens > limits[cell.id]:
+                raise ValueError(
+                    f"请求 {request.id} 的输入与输出 token 总数超过目标 Cell 上下文上限"
+                    f"（{cell.id}，{limits[cell.id]:,} token）"
+                )
         if request.prefix_hit_tokens and not request.session_id:
             raise ValueError(f"请求 {request.id} 的前缀复用需要 session_id")
     for request in sorted(requests, key=lambda row: row.arrival_ns):
@@ -284,11 +295,17 @@ def prepare_batch(value):
         "content",
         "options",
         "mode",
+        "auto_context_cells",
     }:
         raise ValueError("批量请求参数包含未知字段")
     mode = value.get("mode", "append")
     if mode not in {"append", "replace"}:
         raise ValueError("导入方式须为追加或替换")
+    auto_context_cells = value.get("auto_context_cells", [])
+    if not isinstance(auto_context_cells, list) or any(
+        not isinstance(cell_id, str) for cell_id in auto_context_cells
+    ):
+        raise ValueError("自动上下文配置必须是 Cell ID 列表")
     original = value["experiment"]
     config = SimulationConfig.model_validate(
         {**original, "requests": [], "migrations": []}
@@ -324,7 +341,7 @@ def prepare_batch(value):
             raise ValueError("\n".join(errors))
     else:
         raise ValueError("未知批量请求操作")
-    requests = validate_requests(config, retained + incoming)
+    requests = validate_requests(config, retained + incoming, auto_context_cells)
     serialized = [row.model_dump(mode="json") for row in requests]
     scene = {**original, "requests": serialized}
     resources = {

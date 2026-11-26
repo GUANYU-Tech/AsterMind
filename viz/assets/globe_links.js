@@ -7,7 +7,8 @@ export function createTopologyLinkLayers({THREE,scene,colors,live=false}){
   const material=state==='UP'
    ?new THREE.LineBasicMaterial({color,transparent:true,opacity:live ? .55 : .48,depthWrite:false})
    :new THREE.LineDashedMaterial({color,transparent:true,opacity:.4,depthWrite:false,dashSize:.03,gapSize:.02});
-  const mesh=new THREE.LineSegments(geometry,material);scene.add(mesh);layers.push({kind,state,geometry,mesh});
+  const mesh=new THREE.LineSegments(geometry,material);
+  scene.add(mesh);layers.push({kind,state,geometry,mesh});
  }
  return layers;
 }

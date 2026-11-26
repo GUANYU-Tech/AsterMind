@@ -1,4 +1,5 @@
 import { appUrl } from "./app-path.mjs?v=compact-2";
+import {formatTaskLog} from "../assets/progress_log.js";
 
 const $ = (selector) => document.querySelector(selector);
 const statuses = {
@@ -149,7 +150,7 @@ async function showDetail(id) {
     }
     const content = $("#detail-content");
     content.replaceChildren(node("p", record.id, "detail-id"), grid);
-    if (record.error) content.append(node("p", record.error, "run-error"));
+    content.append(node("h3", "执行日志"), node("pre", formatTaskLog(record)));
     if (!record.effective_configuration) content.append(node("p", "此提交未生成有效仿真配置，下方保留了原始提交及错误信息。", "muted"));
     content.append(
       section("提交硬件配置 物理清单 / 星内互联", config.hardware, true),
