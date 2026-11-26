@@ -2,7 +2,7 @@
 import json
 from pathlib import Path
 from typing import Annotated, Literal
-from pydantic import Field, model_validator
+from pydantic import Field, PrivateAttr, model_validator
 from astermind.common.contracts import Contract, ComputeModeConfig, Identifier, Nanoseconds
 from .deployment import Positive, ServingCell
 from .requests import Request, Migration
@@ -60,6 +60,9 @@ class SimulationConfig(ComputeModeConfig):
     additional_cell_links: tuple[CellLinkAddition, ...] = ()
     disabled_physical_links: tuple[Identifier, ...] = ()
     runtime_network: dict = Field(default_factory=dict)
+    _context_index: tuple[tuple[Request, ...], dict[tuple[str | None, str], str]] | None = (
+        PrivateAttr(default=None)
+    )
 
     @property
     def backend(self):
@@ -95,17 +98,20 @@ class SimulationConfig(ComputeModeConfig):
         return compile_topology(self)
 
     def predecessor(self, request):
-        # Ported from Communication 9c08c9c ConfiguredScheduler.predecessor;
-        # Cell selection remains owned by the existing Engine policy.
         if request.parent_context_id is None:
             return None
-        for parent in self.requests:
-            # Retain the current native history key when context_id is omitted.
-            if (parent.session_id, parent.context_id or parent.id) == (
-                request.session_id, request.parent_context_id
-            ):
-                return parent.id
-        raise ValueError("prerequisite requires an explicit parent request in the workload")
+        snapshot = self._context_index
+        # A model copy can replace the immutable request tuple.
+        if snapshot is None or snapshot[0] is not self.requests:
+            by_context = {}
+            for parent in self.requests:
+                by_context.setdefault((parent.session_id, parent.context_id or parent.id), parent.id)
+            snapshot = (self.requests, by_context)
+            self._context_index = snapshot
+        parent_id = snapshot[1].get((request.session_id, request.parent_context_id))
+        if parent_id is None:
+            raise ValueError("prerequisite requires an explicit parent request in the workload")
+        return parent_id
 
     @model_validator(mode="after")
     def validate_ids(self):
