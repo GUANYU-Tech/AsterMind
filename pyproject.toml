@@ -24,6 +24,9 @@ where = ["."]
 include = ["astermind*", "viz", "workloads*", "examples", "examples.native"]
 namespaces = false
 
+[tool.setuptools.data-files]
+"share/astermind/doc" = ["doc/AsterMind-V1-Tech-Report.pdf"]
+
 [tool.setuptools.package-data]
 "viz" = ["*.html", "*.css", "*.js", "homepage/dist/*.html", "homepage/dist/*.css",
          "homepage/dist/*.js", "homepage/dist/en/*.html", "homepage/dist/assets/*.png"]

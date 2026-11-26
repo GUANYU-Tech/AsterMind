@@ -34,16 +34,18 @@ From the repository root, build into a fresh directory outside the checkout.
 python3 viz/homepage/build.py --pages-dir ../astermind-website
 ```
 
-The export contains both languages, the brand images and the original
-technical report. “Enter simulation platform” leads to the on-page setup guide.
+The export contains both languages, the brand images and a copy of the
+[technical report](../../doc/AsterMind-V1-Tech-Report.pdf). Update the PDF in
+`doc/` when a new report is available. “Enter simulation platform” leads to the on-page setup guide.
 The integrated homepage continues to open the simulator at `/platform`.
 The report opens inline at `#pdf` and loads on first use.
 
-For a dedicated GitHub Pages repository, put the **contents** of the export
-at the root of its publishing branch, including `.nojekyll`. Select the
-approved branch and `/(root)` under **Settings → Pages → Deploy from a branch**.
-The published project URL supports both `/<repository>/` and
-`/<repository>/en/#pdf`. See the [GitHub Pages setup guide](https://docs.github.com/en/pages/getting-started-with-github-pages/creating-a-github-pages-site).
+The [Pages workflow](../../.github/workflows/pages.yml) builds both languages
+on pull requests and deploys the static export when homepage or report changes
+reach `main`. A maintainer selects **Settings → Pages → Build and deployment →
+Source → GitHub Actions** once. After a successful deployment, the
+[project homepage](https://guanyu-tech.github.io/AsterMind/) is available in
+Chinese and [English](https://guanyu-tech.github.io/AsterMind/en/).
 
 ## Brand assets and typography
 
