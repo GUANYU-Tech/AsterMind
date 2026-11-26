@@ -36,7 +36,9 @@ def result_events(result):
     rows.sort(key=lambda e:int(e.get('time_ticks') or round(e['time_s']*1e18)))
     from event_catalog import annotate
     rows=[annotate(dict(e,event_order=i)) for i,e in enumerate(rows)]
-    return dict(events=rows,end_s=result['configuration']['horizon_ns']/1e9,
+    horizon = result['configuration']['horizon_ns']
+    end_ns = result['measurement']['simulated_time_ns'] if horizon is None else horizon
+    return dict(events=rows,end_s=end_ns/1e9,
         disabled_links=result['configuration']['disabled_physical_links'],
         category_counts=dict(Counter(e['category'] for e in rows)),
         event_counts=dict(Counter(e['kind'] for e in rows)),initial_events=sum(e['time_s']==0 for e in rows))

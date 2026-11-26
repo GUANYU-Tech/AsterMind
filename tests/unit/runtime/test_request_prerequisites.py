@@ -89,6 +89,7 @@ class PrerequisiteLifecycleTests(unittest.TestCase):
         runtime = Simulation.__new__(Simulation)
         runtime.config, runtime.loop = config, loop
         runtime.requests = {r.id: r for r in config.requests}
+        runtime._remaining_requests = len(runtime.requests)
         runtime.state = {r.id: dict(status="pending", arrival_ns=0, received_tokens=0,
                                    first_token_received_ns=None,last_token_received_ns=None)
                          for r in config.requests}

@@ -151,7 +151,8 @@ def _scene_events(path, stamp):
     from astermind.builder.config import SimulationConfig
     from astermind.engine.state.device_network import DeviceNetworkState
     result=read(path);config=SimulationConfig.model_validate(result['configuration'])
-    net=DeviceNetworkState(config.topology(),config.horizon_ns/1e9,config.backend)
+    end_ns = result['measurement']['simulated_time_ns'] if config.horizon_ns is None else config.horizon_ns
+    net=DeviceNetworkState(config.topology(),end_ns/1e9,config.backend)
     bindings=config.physical_link_bindings
     links={k:bindings.get(meta.get('device_link_id')) for k,meta in net._meta.items()}
     transfers={r['id']:r.get('correlation_id') for r in result['network'].get('flows',[])}
@@ -177,7 +178,7 @@ def _scene_events(path, stamp):
     rows.extend(row for row in request_milestones(result) if (row['kind'], row['request_id']) not in present)
     rows.sort(key=lambda row: row['time_s'])
     rows = [annotate(dict(row, event_order=i)) for i, row in enumerate(rows)]
-    return dict(events=rows,end_s=config.horizon_ns/1e9,disabled_links=list(config.disabled_physical_links),
+    return dict(events=rows,end_s=end_ns/1e9,disabled_links=list(config.disabled_physical_links),
         category_counts=dict(Counter(e['category'] for e in rows)),
         event_counts=dict(Counter(e['kind'] for e in rows)),initial_events=sum(e['time_s']==0 for e in rows))
 

@@ -17,9 +17,10 @@ class DeviceRuntimeHost(_EventEngine):
         routing_policy = getattr(getattr(config, 'routing', None), 'policy', 'min_hops')
         get_routing_policy(routing_policy)
         timeline_mode="orbitserve"
+        horizon = Time.from_ns(config.horizon_ns) if config.horizon_ns is not None else None
         network = DeviceNetworkState(
             topology,
-            Time.from_ns(config.horizon_ns),
+            horizon,
             "runtime_comm",
             physical=physical,
             bindings=config.physical_link_bindings,
@@ -37,15 +38,15 @@ class DeviceRuntimeHost(_EventEngine):
         spec = SimpleNamespace(
             network=network.spec,
             routing_policy=routing_policy,
-            time_horizon_s=Time.from_ns(config.horizon_ns),
+            time_horizon_s=horizon,
         )
         environment = SimpleNamespace(
-            network=network, time={"start_s": 0.0, "end_s": network.end_s}
+            network=network, time={"start_s": 0.0, "end_s": horizon}
         )
         super().__init__(spec, environment)
         for time_s in network.environment_times:
             self.push(time_s, 0, "topology_sample")
-            if self.controller is not None and time_s < self.end:
+            if self.controller is not None and (self.end is None or time_s < self.end):
                 self.push(time_s, 5, "control_boundary")
         for event in network.events:
             self.push(event["time_s"], 0, "link_state", payload=event)

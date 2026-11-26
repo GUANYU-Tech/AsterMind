@@ -121,6 +121,7 @@ class Simulation:
         self.host.log = CompressedRecords()
         self.loop.events = CompressedRecords()
         self.cells, self.requests = {}, {r.id: r for r in config.requests}
+        self._remaining_requests = len(self.requests)
         self.state = {
             r.id: {
                 "status": "pending",
@@ -290,6 +291,8 @@ class Simulation:
                 and "compute_complete_ns" not in state):
             loads[previous_cell] -= 1
         state.update(changes)
+        if changes.get("status") in ("completed", "failed") and previous not in ("completed", "failed"):
+            self._remaining_requests -= 1
         if (loads is not None and state.get("cell") and state["status"] in ("input", "computing")
                 and "compute_complete_ns" not in state):
             loads[state["cell"]] += 1
@@ -450,17 +453,23 @@ class Simulation:
                 lambda request=request: self._arrive(request),
             )
         self.positions = {}
+        horizon_ns = self.config.horizon_ns
         for at, positions in self.topology.orbit_grid or ():
-            if at <= self.config.horizon_ns:
+            if horizon_ns is None or at <= horizon_ns:
                 self.loop.schedule(
                     self.host.now.from_ns(at),
                     ARRIVAL,
                     f"orbit:{at}",
                     lambda positions=positions: self.positions.update(positions),
                 )
-        self.host.run()
+        if horizon_ns is None and not self.config.migrations:
+            self.host.run(stop_when=lambda: self._remaining_requests == 0)
+        else:
+            self.host.run()
         self.migrations.close()
         if any(s["status"] not in {"completed", "failed"} for s in self.state.values()):
+            if horizon_ns is None:
+                raise RuntimeError("Simulation ran out of events before all native requests completed")
             raise RuntimeError(
                 "Simulation horizon exceeded before all native requests completed"
             )

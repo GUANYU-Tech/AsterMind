@@ -98,7 +98,7 @@ def capabilities():
     definitions['CollectiveConfig']['properties']['backend']['enum'] = ['runtime_comm']
     value['compatibility'] = {'unsupported': ['sglang', 'af_disagg', 'pd_af_disagg',
         'FlowSim ACK', 'SimGrid', 'MTP', 'KV offload replay', 'closed-loop admission'],
-        'simulation_horizon_s': 60, 'client_boundary': 'explicit zero-payload ground endpoint; no access time model'}
+        'simulation_horizon_s': None, 'client_boundary': 'explicit zero-payload ground endpoint; no access time model'}
     return value
 
 
@@ -473,7 +473,7 @@ def convert(value):
         input_bytes=0,output_bytes_per_token=0) for r in stream]
     from astermind.builder.config import SimulationConfig
     config=SimulationConfig.model_validate(dict(physical=physical,ground_owners=['client'],cells=[cell],requests=requests,
-        horizon_ns=max(60_000_000_000,max(r['arrival_ns'] for r in requests)+60_000_000_000),
+        horizon_ns=None,
         compute_mode=value.get('compute_mode', 'detail_mode'), detail_prediction_method=method,
         communication=communication))
     config.topology()

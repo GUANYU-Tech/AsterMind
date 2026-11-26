@@ -3,7 +3,7 @@
 
 def apply_device_command(engine, command):
     net, identity, action = engine.net, command.get("target_id"), command.get("action")
-    if not net.start_s <= engine.now < engine.end:
+    if engine.now < net.start_s or (engine.end is not None and engine.now >= engine.end):
         raise ValueError("只能在运行时域内修改 GPU 链路")
     link = next((link for link in net.topology.links if link.id == identity), None)
     if (

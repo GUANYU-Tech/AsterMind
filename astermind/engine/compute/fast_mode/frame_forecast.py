@@ -15,7 +15,7 @@ def forecast_routes(frames, at):
     host = frames.host
     state = host.net
     physical = state.physical
-    if (not host.now < at < frames.horizon
+    if (at <= host.now or (frames.horizon is not None and at >= frames.horizon)
             or host.controller is not None and not getattr(host.controller, 'read_only_topology', False)
             or state.active_faults or physical is not None and physical.spec.faults
             or host.spec.routing_policy not in ("min_hops", "min_propagation")):

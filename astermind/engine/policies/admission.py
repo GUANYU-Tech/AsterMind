@@ -34,7 +34,7 @@ def admit_request(self, request):
         if case_study and isinstance(error, NoReachableCell):
             times = self.host.net.environment_times
             index = bisect_right(times, self.loop.now_s)
-            if index < len(times) and times[index] < self.host.end:
+            if index < len(times) and (self.host.end is None or times[index] < self.host.end):
                 self.loop.schedule(Time(times[index]), 1, "request:retry-cell-selection",
                                    lambda: admit_request(self, request))
                 return
