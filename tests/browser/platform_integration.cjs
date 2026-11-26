@@ -125,7 +125,14 @@ async function main() {
       await page.waitForURL(baseURL + destination);
     };
     await page.goto('/en/');
-    assert.ok(await page.locator('.brand-mark svg').isVisible());
+    assert.ok(await page.locator('img.brand-mark').evaluate(img => img.complete && img.naturalWidth > 0));
+    assert.equal(await page.locator('#pdf').isVisible(), false);
+    const reportResponse = page.waitForResponse(response => response.url().endsWith('/AsterMind-V1-Tech-Report.pdf'));
+    await page.locator('#report-link').click();
+    assert.equal((await reportResponse).headers()['content-type'], 'application/pdf');
+    assert.ok(await page.locator('#pdf iframe').isVisible());
+    await page.locator('#pdf a[href="#report-link"]').click();
+    assert.equal(await page.locator('#pdf').isVisible(), false);
     await page.locator('.hero a[href="/platform"]').click();
     await language('en');
     await page.locator('.portal-card[href="/cell/"]').click();
