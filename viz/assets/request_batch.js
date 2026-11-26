@@ -20,7 +20,7 @@ function inlinePicker(select) {
  return ()=>{disclosure.open=false;refresh()};
 }
 
-export function createRequestBatch({getExperiment,apply}){
+export function createRequestBatch({getExperiment,autoContextCells,apply}){
  const $=id=>document.getElementById(id),dialog=$('requestBatchDialog');
  const pickers=[...dialog.querySelectorAll('#requestGenerateFields select, #requestBatchMode')].map(inlinePicker);
  let kind='import' ,preview=null,configuration='',pending=false;
@@ -53,7 +53,7 @@ export function createRequestBatch({getExperiment,apply}){
   try{
    if(kind==='generate')for(const input of $('requestGenerateFields').querySelectorAll('input,select'))if(!input.checkValidity()){input.reportValidity();throw Error(input.validationMessage)}
    const experiment=getExperiment();configuration=JSON.stringify(experiment);controls(true);$('requestBatchStatus').textContent='正在检查请求…';
-   const value={experiment,kind,mode:$('requestBatchMode').value};
+   const value={experiment,kind,mode:$('requestBatchMode').value,auto_context_cells:autoContextCells()};
    if(kind==='import')Object.assign(value,{format:$('requestFormat').value,content:$('requestImportContent').value});
    else value.options={count:Number($('requestBatchCount').value),window_s:Number($('requestBatchWindow').value),distribution:$('requestBatchDistribution').value,seed:Number($('requestBatchSeed').value),input_tokens:Number($('requestBatchInput').value),output_tokens:Number($('requestBatchOutput').value),user_device:target('requestBatchGround'),cell:target('requestBatchCell')};
    const result=await post('/native-scene-requests',value);

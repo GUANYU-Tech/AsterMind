@@ -125,7 +125,7 @@ def resolve_scheduling(options, model, longest, upstream):
     """Resolve an editor's automatic fields while retaining explicit values."""
     context = options.get('max_model_len')
     if context is None:
-        context = min(model['max_context'], 131072, max(128, longest))
+        context = min(model['max_context'], max(128, longest))
     if context > model['max_context'] or longest > context:
         raise ValueError(f'最长请求需要 {longest} Token，调度上限 {context} Token，模型上限 {model["max_context"]} Token')
     batch_tokens = options.get('max_batched_tokens')
