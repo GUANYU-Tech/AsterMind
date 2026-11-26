@@ -43,12 +43,12 @@ VLLM030_SOURCE_COMMIT = "ced6857afa0ea7b2e3f0846a62e1394e90f15607"
 _VLLM030_ALLOCATOR_PACKAGE_MANIFEST_SHA256 = (
     "c0955783f251f7419d61aa5ae8fbc8b78babc586deab407c322c439c6733ad6f"
 )
-_STARTUP_TIMEOUT_S = 60.0
+_STARTUP_TIMEOUT_S = 800.0
 # A CPU production-trace point can spend several minutes in one scheduler
 # command while draining a long-output request.  The previous 60-second RPC
 # deadline terminated otherwise healthy runs before their aggregate result was
-# persisted.  Keep startup/shutdown deadlines tight, but allow the control
-# command to complete within a bounded ten-minute window.
+# persisted.  Allow the control command to complete within a bounded ten-minute
+# window, independently of startup and shutdown deadlines.
 _COMMAND_TIMEOUT_S = 60.0
 _PRODUCTION_TRACE_COMMAND_TIMEOUT_S = 600.0
 _SHUTDOWN_TIMEOUT_S = 5.0

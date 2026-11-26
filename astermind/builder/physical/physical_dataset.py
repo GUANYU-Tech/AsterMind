@@ -12,6 +12,50 @@ from astermind.builder.physical.network_inputs import snapshot_network_input
 SCHEMA = "orbitserve.physical_dataset.v2"
 LEGACY_SCHEMA = "orbitserve.physical_dataset.v1"
 PHYSICS_VERSION = "sample_hold_directional_solar_visibility_islsim_v4"
+FAST_ORBITAL_ROUTE_DIRECTORY = Path("state/orbital-routes")
+
+
+def generated_fast_routes(dataset):
+    """A Builder-generated route directory published with its physical dataset."""
+    root = Path(dataset)
+    if root.is_file():
+        root = root.parent
+    manifest = root / "physical_dataset.json"
+    if not manifest.is_file():
+        return None
+    from astermind.engine.state.link_state_store import INDEX_DIRECTORY
+    names = (INDEX_DIRECTORY / "index.json", FAST_ORBITAL_ROUTE_DIRECTORY / "index-24h.json")
+    files = json.loads(manifest.read_bytes()).get("files", {})
+    if all(name.as_posix() in files and (root / name).is_file() for name in names):
+        return str(root / FAST_ORBITAL_ROUTE_DIRECTORY)
+    return None
+
+
+def configure_generated_fast_routes(experiment):
+    """Bind routes published with the selected dataset for a compatible Fast run."""
+    dataset = experiment.get("physical_dataset")
+    if not dataset:
+        return experiment
+    from astermind.engine.setup.faults import random_faults_enabled
+
+    frames = generated_fast_routes(dataset)
+    explicit = experiment.get("fast_orbital_route_frames")
+    if frames is None or explicit not in (None, frames):
+        return experiment
+    runtime = experiment.get("runtime_network", {})
+    if (
+        experiment.get("compute_mode") == "fast_mode"
+        and experiment.get("routing", {}).get("policy", "min_hops") in ("min_hops", "min_propagation")
+        and not any(experiment.get(key) for key in ("migrations", "additional_cell_links", "disabled_physical_links"))
+        and not any(cell.get("fast_link_contention") for cell in experiment.get("cells", ()))
+        and not runtime.get("faults")
+        and not random_faults_enabled(runtime.get("random_faults", {}))
+    ):
+        experiment["fast_orbital_route_frames"] = frames
+    elif explicit == frames:
+        experiment["fast_orbital_route_frames"] = None
+        experiment["fast_device_route_frames"] = None
+    return experiment
 
 
 def input_fingerprint(concrete, *, legacy=False):

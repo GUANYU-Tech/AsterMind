@@ -26,6 +26,7 @@ def run_network_experiment(
     export_workers: int | None = None,
     compression_level: int = 1,
     chunk_samples: int = 32,
+    prepare_fast_frames: bool = False,
 ) -> dict:
     if export_mode not in {'core', 'full'}:
         raise ValueError('export_mode must be core or full')
@@ -128,7 +129,12 @@ def run_network_experiment(
     timings['network_setup_s'] = perf_counter() - start
     report("Persisting complete backend-independent physical attributes")
     report(f"Visibility screening: {len(edges)} structural pairs -> {len(network.edges)} horizon candidates")
-    network.save_physical_state(output_root / 'physical_state.sqlite', workers=workers, progress=report)
+    if prepare_fast_frames:
+        from astermind.engine.setup.faults import random_faults_enabled
+        if spec.faults or random_faults_enabled(spec.random_faults):
+            raise ValueError("Fast offline routes require fault-free prepared physics")
+    network.save_physical_state(output_root / 'physical_state.sqlite', workers=workers, progress=report,
+                                indexed_timeline=prepare_fast_frames)
     timings.update(network.precompute_timings)
     online_origin = network
     network = network.audit_timeline()
@@ -225,12 +231,16 @@ def run_network_experiment(
     }
     from astermind.common import write_json
 
-    from astermind.builder.physical.physical_dataset import publish_dataset
+    from astermind.builder.physical.physical_dataset import FAST_ORBITAL_ROUTE_DIRECTORY, publish_dataset
     started = perf_counter()
     persisted = {**result, 'events': [], 'candidate_links': []}
     index = output_root / 'core_result.json'
     file_hashes[str(index.resolve())] = write_json(index, persisted)
     write_json(output_root / 'network_result.json', persisted)
+    if prepare_fast_frames:
+        from astermind.engine.comm.legacy_orbital_routes import export_orbital_frames
+        report('Preparing Fast orbital routes')
+        export_orbital_frames(online_origin, output_root / FAST_ORBITAL_ROUTE_DIRECTORY, duration)
     publish_dataset(output_root, manifest, source_input=source_input, file_hashes=file_hashes)
     timings['core_publish_s'] = perf_counter() - started
     report('Physical core dataset ready')

@@ -173,12 +173,13 @@ class NetworkState:
                 boundaries.update(float(w[k]) for w in self.windows.get((edge['endpoint_a'],edge['endpoint_b']),())
                                   for k in ('start_s','end_s'))
                 self.attribute_boundaries[edge['link_id']] = tuple(sorted(boundaries))
-    def save_physical_state(self, path, *, workers=1, progress=None):
+    def save_physical_state(self, path, *, workers=1, progress=None, indexed_timeline=False):
         """Persist initial acquisition state and backend-independent budgets."""
         from astermind.engine.state.physical_dataset import write_physical_state
         if self.observed_faults or self.calendars or self.shared_load or self.shared_pool_load:
             raise ValueError('physical preparation requires a fresh network without runtime observations/traffic')
-        write_physical_state(self, path, workers=workers, progress=progress)
+        write_physical_state(self, path, workers=workers, progress=progress,
+                             indexed_timeline=indexed_timeline)
 
     @staticmethod
     def open_physical_attributes(path, *, lazy_blocks=False):

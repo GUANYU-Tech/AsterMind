@@ -49,11 +49,12 @@ HOMEPAGE_FILES = {
 
 
 def prepare_physical(identity, *, independent=False):
-    from studio import key, physical_data, physical_input
+    from studio import key, load, physical_data, physical_input
     from astermind.builder.physical.network_inputs import snapshot_network_input
-    from astermind.builder.physical.physical_dataset import input_fingerprint, validate_dataset_input
+    from astermind.builder.physical.physical_dataset import generated_fast_routes, input_fingerprint, validate_dataset_input
 
     with PHYSICAL_LOCK:
+        prepare_fast_frames = load(ROOT, 'physical', identity).get('compute_configuration', {}).get('mode') == 'fast_mode'
         data = physical_data(ROOT, identity)
         if data['state'] == 'running':
             return {**run_status(data['run_id']), 'physical_model_id': identity}
@@ -64,7 +65,8 @@ def prepare_physical(identity, *, independent=False):
             except (ValueError, OSError):
                 pass  # Explicit step-one generation repairs stale or damaged data.
             else:
-                return {**run_status(data['run_id']), 'physical_model_id': identity}
+                if not prepare_fast_frames or generated_fast_routes(data['physical_dataset']):
+                    return {**run_status(data['run_id']), 'physical_model_id': identity}
         fingerprint = input_fingerprint(snapshot_network_input(physical, ROOT))
         reused = None
         indexes = [] if independent else [*(ROOT / 'local/results/network').glob('*/physical_dataset.json'),
@@ -79,12 +81,14 @@ def prepare_physical(identity, *, independent=False):
                 if previous['state'] != 'completed':
                     continue
                 validate_dataset_input(str(index.parent), physical, ROOT)
+                if prepare_fast_frames and not generated_fast_routes(index.parent):
+                    continue
             except (ValueError, OSError):
                 continue
             reused = {**previous, 'physical_model_id': identity,
                       'preview_url': f'/runs/{source_run}/viewer'}
             break
-        job = reused or start(physical)
+        job = reused or start(physical, prepare_fast_frames=prepare_fast_frames)
         if reused is None:
             status(job, job['state'], physical_model_id=identity, preview_url=f"/runs/{job['id']}/viewer")
         target = ROOT / 'local/inputs/physical-data' / (key(identity) + '.json')
@@ -171,8 +175,11 @@ def save_input(value):
     return identity, path
 
 
-def command_for(path, output):
-    return [sys.executable, '-B', str(Path(__file__).with_name('worker.py')), str(path), '--out', str(output)]
+def command_for(path, output, *, prepare_fast_frames=False):
+    command = [sys.executable, '-B', str(Path(__file__).with_name('worker.py')), str(path), '--out', str(output)]
+    if prepare_fast_frames:
+        command.append('--prepare-fast-frames')
+    return command
 
 
 def status(job, state, **extra):
@@ -261,11 +268,11 @@ def comparison_status(item, **changes):
     (folder / 'status.json').write_text(json.dumps(item, ensure_ascii=False), encoding='utf-8')
 
 
-def start(value, comparison=False):
+def start(value, comparison=False, *, prepare_fast_frames=False):
     with LAUNCH_LOCK:
         if not comparison and any(c['state']=='running' for c in COMPARISONS.values()):
             raise ValueError('两模式对照运行中，请等待完成')
-        return _start(value)
+        return _start(value, prepare_fast_frames=prepare_fast_frames)
 
 
 def start_comparison(value):
@@ -299,13 +306,13 @@ def start_comparison(value):
     return item
 
 
-def _start(value):
+def _start(value, *, prepare_fast_frames=False):
     require_linux()
     run_id, path = save_input(value)
     output = ROOT / "local/results/network" / run_id
     output.mkdir(parents=True, exist_ok=False)
     job = dict(id=run_id, state="running", input=str(path.relative_to(ROOT)), output=str(output),
-               command=command_for(path, output))
+               command=command_for(path, output, prepare_fast_frames=prepare_fast_frames))
     if Path('/proc/self/stat').is_file():
         job.update(owner_pid=os.getpid(), owner_stamp=Path('/proc/self/stat').read_text().rsplit(')',1)[1].split()[19])
     JOBS[run_id] = job

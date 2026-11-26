@@ -17,6 +17,8 @@ def main(argv=None):
     compute.add_argument("manifest", type=Path)
     compute.add_argument("--out", type=Path, required=True)
     compute.add_argument("--exports", choices=("core", "full"), default="core")
+    compute.add_argument("--prepare-fast-frames", action="store_true",
+                         help="Include the indexed link states and orbital route frames for Fast Mode.")
     export = commands.add_parser("export", help="Export views from a completed core.")
     export.add_argument("dataset", type=Path)
     for command in (compute, export):
@@ -46,6 +48,7 @@ def main(argv=None):
             _workers=args.workers,
             compression_level=args.compression_level,
             chunk_samples=args.chunk_samples,
+            prepare_fast_frames=args.prepare_fast_frames,
         )
         summary = {
             k: result[k]

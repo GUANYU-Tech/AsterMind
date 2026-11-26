@@ -79,18 +79,19 @@ class SimulationConfig(ComputeModeConfig):
         path = Path(path)
         data = json.loads(path.read_text(encoding="utf-8"))
         from .scenario_input import SCHEMA, lower_scenario
+        from astermind.builder.physical.physical_dataset import configure_generated_fast_routes
 
         if data.get("schema_version") == SCHEMA:
             from astermind.engine.policies.routing import get_routing_policy
 
-            config = cls.model_validate(lower_scenario(data, path.parent))
+            config = cls.model_validate(configure_generated_fast_routes(lower_scenario(data, path.parent)))
             get_routing_policy(config.routing.policy)
             return config
         for key in ("physical_dataset", "physical_network"):
             value = data.get(key)
             if isinstance(value, str) and not Path(value).is_absolute():
                 data[key] = str((path.parent / value).resolve())
-        return cls.model_validate(data)
+        return cls.model_validate(configure_generated_fast_routes(data))
 
     def topology(self):
         from astermind.builder.resources import compile_topology

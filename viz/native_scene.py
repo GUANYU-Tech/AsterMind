@@ -7,6 +7,7 @@ def validate_document(root, document):
     from runtime_environment import activate
     activate()
     from astermind.builder.config import SimulationConfig
+    from astermind.builder.physical.physical_dataset import configure_generated_fast_routes
     from studio import physical_data
     value = deepcopy(document)
     experiment = value.get('experiment')
@@ -26,7 +27,7 @@ def validate_document(root, document):
         problem = dataset_islsim_problem(experiment['physical_dataset'])
         if problem:
             raise ValueError(problem)
-    config = SimulationConfig.model_validate(experiment)
+    config = SimulationConfig.model_validate(configure_generated_fast_routes(experiment))
     if config.compute_mode == 'fast_mode':
         from compute_options import resolve_memory_policy, validate_fast_su_placement
         cells = tuple(cell.model_copy(update={
@@ -47,6 +48,7 @@ def generate(root, payload):
     from runtime_environment import enable_device_native
     upstream = enable_device_native()
     from astermind.builder.scene import build_scene
+    from astermind.builder.physical.physical_dataset import configure_generated_fast_routes
     from compute_options import prepare_deployment
     from studio import load, physical_data
     if set(payload) - {'physical_model_id', 'deployment', 'cell_deployments', 'requests', 'migrations',
@@ -67,14 +69,16 @@ def generate(root, payload):
             if factors:
                 communication['link_bandwidth_factors'] = factors
     if 'cell_deployments' in payload:
-        return build_cell_deployments(data['physical_dataset'], {**payload, 'deployment': options}, upstream, arguments)
+        experiment = build_cell_deployments(data['physical_dataset'], {**payload, 'deployment': options}, upstream, arguments)
+        return configure_generated_fast_routes(experiment)
     if options.get('compute_mode') not in ('fast_mode', 'batch_roofline'):
         communication.setdefault('intra_mode', 'IntraSatelliteRoofline')
     deployment, hardware = prepare_deployment(options, upstream)
     defaults = {key: hardware[key] for key in ('gpu_link_bandwidth_gbps','gpu_link_latency_ns')
                 if key not in deployment.model_fields_set and hardware[key] is not None}
     deployment = deployment.model_copy(update=defaults)
-    return build_scene(data['physical_dataset'], deployment, **arguments).model_dump(mode='json')
+    experiment = build_scene(data['physical_dataset'], deployment, **arguments).model_dump(mode='json')
+    return configure_generated_fast_routes(experiment)
 
 
 def build_cell_deployments(dataset, payload, upstream, arguments):

@@ -147,7 +147,7 @@ def _encode_prepared(rows):
     return [(link, time, _encode_block(block)) for link, time, block, _ in rows]
 
 
-def write_physical_state(network, path, *, workers=1, progress=None):
+def write_physical_state(network, path, *, workers=1, progress=None, indexed_timeline=False):
     """Calculate bounded batches once; serialize separately, then allocate."""
     if type(workers) is not int or workers < 1:
         raise ValueError('physical attribute worker count must be a positive integer')
@@ -239,9 +239,16 @@ def write_physical_state(network, path, *, workers=1, progress=None):
                 network._set_attribute_boundaries()
             metadata.update(frames=network.frames, events=network.events,
                             link_frames=network.link_frames, allocation_checks=network.allocation_checks)
+            persisted = metadata
+            if indexed_timeline:
+                persisted = {key: value for key, value in metadata.items() if key != "link_frames"}
+                persisted["indexed_timeline"] = True
             with closing(sqlite3.connect(temporary)) as db, db:
-                db.execute('INSERT INTO metadata VALUES (?)', (json.dumps(metadata, allow_nan=False),))
+                db.execute('INSERT INTO metadata VALUES (?)', (json.dumps(persisted, allow_nan=False),))
             temporary.replace(path)
+            if indexed_timeline:
+                from .link_state_store import INDEX_DIRECTORY, write_index
+                write_index(path, path.parent / INDEX_DIRECTORY, network.trace.trace_id, network.link_frames)
         except BaseException:
             network.physical_attributes = previous
             raise
