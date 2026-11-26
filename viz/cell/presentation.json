@@ -2189,7 +2189,8 @@
           "arrival_distribution": {
             "default": "poisson",
             "title": "Arrival Distribution",
-            "type": "string"
+            "type": "string",
+            "enum": ["poisson", "constant", "simultaneous"]
           },
           "seed": {
             "default": 0,
@@ -2199,10 +2200,14 @@
         },
         "required": [
           "num_requests",
-          "request_rate",
           "input_lengths",
           "output_lengths"
         ],
+        "if": {
+          "properties": {"arrival_distribution": {"const": "simultaneous"}},
+          "required": ["arrival_distribution"]
+        },
+        "else": {"required": ["request_rate"]},
         "title": "SyntheticRequestConfig",
         "type": "object"
       },

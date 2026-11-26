@@ -104,7 +104,6 @@ export function editorChoices(config, capabilities) {
           if(path[2]==='algorithm') return scopes[row.scope]?.[row.operation]?.choices;
         }
         if(full==='requests.source') return ['synthetic','canonical'];
-        if(full==='requests.synthetic.arrival_distribution') return ['poisson','constant'];
         if(full==='deployment.mode') return fastMode(config)?['colocated']:['colocated','pd_disagg'];
         if(path[0]==='scheduler' && path.at(-1)==='framework') return ['vllm'];
         if(full==='runtime_inputs.graph_execution.configured_mode') return ['NONE'];
@@ -269,6 +268,13 @@ export function editDependencies(config, path, value, capabilities, previous) {
       prefix_hit_tokens_field:"prefix_hit_tokens", request_id_field:"request_id", input_time_unit:"s",
       successful_request_filter:{mode:"upstream_attested", field_name:null, accepted_value:null, provenance:"请填写数据来源及成功请求筛选依据"},
     } : null;
+  }
+  if (full === 'requests.synthetic.arrival_distribution') {
+    const synthetic = config.requests.synthetic;
+    if (value !== 'simultaneous' && !(synthetic.request_rate > 0)) {
+      synthetic.request_rate = capabilities.default_configuration.requests.synthetic.request_rate;
+    }
+    return true;
   }
   if (key === "framework") {
     const settings = config.scheduler[path[1]];
