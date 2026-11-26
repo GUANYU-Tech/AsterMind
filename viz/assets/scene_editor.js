@@ -22,7 +22,16 @@ const number=id=>Number($(id).value);
 const topologySection=document.createElement('section');topologySection.className='card topology-panel';topologySection.hidden=true;
 const topologyHeading=document.createElement('h2');topologyHeading.textContent='计算节点拓扑';const topologyHost=document.createElement('div');topologySection.append(topologyHeading,topologyHost);$('requests').closest('section').before(topologySection);
 const topologyEditor=createCellTopology(topologyHost);
-const requestBatch=createRequestBatch({getExperiment:()=>experiment,apply:requests=>{experiment.requests=requests;requestPage=0;validatedSignature='';renderRequests();writeJson();state();$('status').textContent=`已应用 ${requests.length.toLocaleString()} 条业务请求`}});
+function autoContextCells(){
+ return Object.entries(cellParameters).filter(([,layout])=>{
+  const draft=layout.configuration;
+  const limit=draft
+   ? draft.scheduler[draft.deployment.worker_pools[0].name].vllm.max_model_len
+   : layout.deployment.max_model_len;
+  return limit==null;
+ }).map(([id])=>id);
+}
+const requestBatch=createRequestBatch({getExperiment:()=>experiment,autoContextCells,apply:requests=>{experiment.requests=requests;requestPage=0;validatedSignature='';renderRequests();writeJson();state();$('status').textContent=`已应用 ${requests.length.toLocaleString()} 条业务请求`}});
 for(const [id,kind]of [['importRequests','import'],['generateRequests','generate']])$(id).onclick=()=>{try{requestBatch.open(kind)}catch(error){$('status').textContent=error.message}};
 function state(){
  if($('cellSelection').dataset.mode!==$('computeMode').value)setCellSelection(experiment?.cell_selection);
