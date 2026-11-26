@@ -1,27 +1,37 @@
-# <img src="assets/astermind-logo.png" alt="" width="36" align="absmiddle"> AsterMind
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/astermind-readme-lockup-dark.png">
+    <img src="assets/astermind-readme-lockup.png" alt="AsterMind" width="380">
+  </picture>
+</p>
 
-[English](README.md) · 简体中文 · [项目官网](https://guanyu-tech.github.io/AsterMind/)
+<p align="center">
+  <a href="doc/AsterMind-V1-Tech-Report.pdf"><strong>Technical Report</strong></a> · <a href="https://guanyu-tech.github.io/AsterMind/"><strong>Project Homepage</strong></a>
+</p>
 
-**面向低轨卫星星座的大语言模型端到端推理服务仿真器**
+<p align="center">
+  <a href="README.md" lang="en">English</a> · 简体中文
+</p>
 
-AsterMind 模拟低轨卫星如何为地面用户提供大语言模型推理服务。它在同一条时间线上推进网关接入、模型推理和 Token 回传，并计入卫星运动、链路可用性变化和带宽竞争。
+<h1 align="center">AsterMind V1: Exploring Space Intelligence</h1>
 
-[技术报告](#技术报告) · [主要特点](#主要特点) · [系统架构](#系统架构) · [构建与安装](#构建与安装) · [快速上手](#快速上手) · [参与贡献](#参与贡献) · [联系方式](#联系方式)
+AsterMind 是一个可扩展的星座级太空智算系统仿真平台，为在轨大语言模型服务提供从单星、算力编队到完整星座的系统级评估工具。平台联合建模轨道运动、通信和计算，模拟地面请求接入、卫星转发、排队执行和结果回传的全过程。
 
-## 技术报告
+开发者可以配置业务负载和星座场景，在星载环境约束下比较不同的建链、路由、任务调度和模型部署策略，评估端到端性能并定位影响服务表现的关键因素。
 
-[阅读 AsterMind 技术报告（PDF）](doc/AsterMind-V1-Tech-Report.pdf)
+## 核心特性
 
-## 主要特点
-
-- **仿真范围。** L2 模拟单个多星 Cell 内的 LLM 推理。L3 模拟星座级端到端 LLM 服务，涵盖网关接入、模型推理和响应回传。
-- **仿真模式。** Detail Mode 按算子做精细化仿真，Fast Mode 按批次对算子组估时。L2 支持两种模式，L3 仅支持 Fast Mode。
-- **模型部署。** 配置张量、流水线和专家并行，并将 Rank 映射到 GPU 和卫星。
-- **网络与指标。** 模拟链路变化、路由和带宽共享，查看 TTFT、TPOT 和端到端时延。
+- **覆盖不同尺度的全链路仿真。** 支持单星、算力编队和完整星座场景，评估各尺度下的设计与优化方案。
+- **轨道、通信与计算联合仿真。** 在同一仿真过程中跟踪卫星位置、可见窗口、建链和路由，并模拟传输时延、带宽竞争、计算排队和模型执行。
+- **可配置、可扩展的开放验证。** 支持配置星座构型、硬件资源、链路参数、模型部署和业务负载，并在建链、路由、请求调度和状态迁移等环节扩展自定义策略。
 
 ## 系统架构
 
 ![AsterMind 系统架构，展示工作负载回放、离线网络快照、调度、Cell 执行和通信](assets/astermind-architecture-zh.png)
+
+**离线星座构建器**按时间间隔计算卫星位置和星地、星间链路条件，生成包含链路容量与传播时延的拓扑快照，供运行时查询可接入卫星和转发路径。
+
+**状态耦合运行时引擎**按到达时间和接入网关回放请求，选择目标计算单元与转发路径，按需模拟 KV 缓存迁移。数据到齐后，请求排队组批。每批完成后，引擎更新请求进度和 KV 缓存状态，并模拟结果回传至地面网关。
 
 ## 构建与安装
 
@@ -50,15 +60,6 @@ bash scripts/build.sh
 ```
 
 ## 快速上手
-
-### 目录结构
-
-```text
-astermind/builder/                场景配置、轨道与物理网络数据
-astermind/engine/compute/         模型执行与推理服务
-astermind/engine/comm/            集合通信与数据传输仿真
-viz/                             L2 和 L3 仿真的本地前端
-```
 
 ### 启动前端
 
@@ -96,5 +97,5 @@ bash scripts/run.sh
 
 ## 联系方式
 
-- 维护者 1（姓名待补充，邮箱待补充）
-- 维护者 2（姓名待补充，邮箱待补充）
+- **郭立栋** · [guolidong@guanyu.cn](mailto:guolidong@guanyu.cn)
+- **朱振华** · [zhuzhenhua@mail.tsinghua.edu.cn](mailto:zhuzhenhua@mail.tsinghua.edu.cn)
