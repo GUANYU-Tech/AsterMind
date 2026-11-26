@@ -2478,6 +2478,7 @@ export const phrases = {
   "算力资源": "Compute Resources",
   "算子": "Operators",
   "算子 / 调度步骤": "Count / Schedule Step",
+  "调度步骤": "Scheduling Steps",
   "算子 Rank": "Count, Rank.",
   "算子 occurrence 必须唯一": "Count it.",
   "算子不能早于批次或主机就绪时间执行": "Counts can't be performed before batch or host is ready.",
