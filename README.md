@@ -90,6 +90,9 @@ In **Detail Mode**, this example simulates distributed inference for **DeepSeek-
 
 Sample dataset and run instructions pending.
 
+## Contribution Guidelines
+We welcome contributions to AsterMind. Before opening a pull request, read the [contribution guide](CONTRIBUTING.md). Thank you to everyone who contributes to the project.
+
 ## Acknowledgements
 
 We thank the teams at Tsinghua University and Infinigence AI for open-sourcing [Uni3Sim](https://github.com/thu-nics/uni3sim). AsterMind V1.0 draws on Uni3Sim’s simulation methods in its compute and inter-accelerator communication modules.
