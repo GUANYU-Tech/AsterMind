@@ -44,6 +44,7 @@ HOMEPAGE_FILES = {
     '/language.js': ('language.js', 'text/javascript'),
     '/app.js': ('app.js', 'text/javascript'),
     '/assets/astermind-mark.png': ('assets/astermind-mark.png', 'image/png'),
+    '/assets/astermind-windows-home.jpg': ('assets/astermind-windows-home.jpg', 'image/jpeg'),
     '/assets/guanyu-logo.png': ('assets/guanyu-logo.png', 'image/png'),
 }
 

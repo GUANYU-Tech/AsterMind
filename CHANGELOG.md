@@ -1,5 +1,13 @@
 # Changelog
 
+## AsterMind v1.0 · Windows preview 9
+
+- Simultaneous arrivals in Compute Formation simulation submit every synthetic request at simulation time zero.
+- The Windows app can launch a Compute Formation task from the workspace selector.
+- Full Scenario simulation waits for vLLM schedulers to finish starting, including when multiple Cells take longer than 60 seconds to initialize.
+- [Download the Windows 11 x64 installer](https://github.com/GUANYU-Tech/AsterMind/releases/download/v1.0.0-preview.9/AsterMind-v1.0-Windows-x64-Setup.exe). The installer includes the WSL 2 simulation engine.
+- SHA-256: `fd5754123bfbd480c185b2cb307b8280621ecd01e71ec39d7ce6416a6c66921d`.
+
 ## AsterMind v1.0 · Windows preview 7
 
 - Windows 11 x64 desktop installer for the AsterMind simulation platform. The simulation engine uses WSL 2.

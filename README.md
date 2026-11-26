@@ -37,7 +37,7 @@ The **state-coupled runtime engine** replays requests at their recorded arrival 
 
 ### Windows (64-bit)
 
-[Download the AsterMind v1.0 Windows x64 installer](https://github.com/GUANYU-Tech/AsterMind/releases/download/v1.0.0-preview.7/AsterMind-v1.0-Windows-x64-Setup.exe).
+[Download the AsterMind v1.0 Windows x64 installer](https://github.com/GUANYU-Tech/AsterMind/releases/download/v1.0.0-preview.9/AsterMind-v1.0-Windows-x64-Setup.exe).
 
 ### macOS (Apple Silicon)
 
