@@ -1,7 +1,9 @@
 """Run editable GPU-level scenes through the existing live controller."""
 from datetime import datetime
 import json
+import logging
 from pathlib import Path
+from sqlite3 import Error as SQLiteError
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -36,6 +38,7 @@ class DeviceLiveSession(LiveSession):
         self.read_only_topology = automatic and config.fast_orbital_route_frames is not None
         from live_paths import FlowPathWindow
         self.flow_paths=FlowPathWindow(archive=output)
+        self.capture_paths=not automatic
         from live_record_store import LiveRecords
         self.projected_events=LiveRecords(output=output,name='projected-events')
         self.event_cursors={}
@@ -86,10 +89,16 @@ class DeviceLiveSession(LiveSession):
                                env=SimpleNamespace(time=physical.trace.time))
 
     def persist_paths(self, view, *, force=False):
-        for order in range(self.flow_paths.cursor,len(view.log)):
-            self.flow_paths.observe(view.log[order],order)
-        if self.output is not None:
-            self.flow_paths.save(self.output,force=force)
+        if not self.capture_paths:
+            return
+        try:
+            for order in range(self.flow_paths.cursor,len(view.log)):
+                self.flow_paths.observe(view.log[order],order)
+            if self.output is not None:
+                self.flow_paths.save(self.output,force=force)
+        except (OSError, SQLiteError):
+            self.capture_paths=False
+            logging.getLogger(__name__).warning('Live path index unavailable; final replay will rebuild it',exc_info=True)
 
     def _capture(self, engine, state='paused'):
         view = self.record_view(engine)
@@ -124,6 +133,13 @@ class DeviceLiveSession(LiveSession):
             # at every physical sample would erase part of the solver speedup.
             return
         return super().checkpoint(engine, force)
+
+    def finished(self, engine):
+        if not self.automatic:
+            self.finish_recording(engine)
+
+    def finish_recording(self, engine):
+        super().finished(engine)
 
     def _event_ready(self, engine):
         view=self.record_view(engine)
@@ -208,6 +224,8 @@ def run_session(session, job):
             results_ready = True
             write_status(job,'completed',phase='计算结果已就绪，正在整理回放',
                            replay_state='preparing',result_url=f'/runs/{identity}/result')
+            if session.automatic:
+                session.finish_recording(session.simulation.host)
         def progress(stage):
             label={'bootstrap':'加载执行环境','physics':'读取已生成的物理拓扑','network':'建立通信资源与全局时间轴','ready':'初始化完成，准备推进仿真'}.get(stage['phase'])
             if stage['phase']=='cell':

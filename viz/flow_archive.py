@@ -1,6 +1,8 @@
 """Indexed completed paths; bounded memory and no full event-log reads in HTTP."""
 import json
+import os
 from pathlib import Path
+from shutil import copyfile, copyfileobj
 import sqlite3
 import sys
 import tempfile
@@ -22,18 +24,26 @@ class FlowArchive:
         self.dirty=False
         self.published_at=0
         self.temporary=None
-        # Avoid random SQLite commits over WSL's Windows filesystem bridge.
-        # The temporary index is local; public snapshots remain in the workspace.
-        if sys.platform=='linux' and str(self.path.resolve()).startswith('/mnt/'):
-            self.temporary=tempfile.TemporaryDirectory(prefix='orbitserve-path-index-',dir='/tmp')
-            self.working_path=Path(self.temporary.name)/'paths.sqlite3'
-            if self.path.is_file():
-                import shutil
-                shutil.copyfile(self.path,self.working_path)
-        else:
-            self.working_path=self.path
+        self.working_path=self.path
+        if sys.platform=='linux':
+            self._select_workspace()
         with ACTIVE_LOCK:
             ACTIVE[str(self.path.resolve())]=self
+
+    def _select_workspace(self):
+        temporary=None
+        try:
+            temporary=tempfile.TemporaryDirectory(prefix='orbitserve-path-index-',
+                                                  dir=os.environ.get('TMPDIR'), ignore_cleanup_errors=True)
+            working_path=Path(temporary.name)/'paths.sqlite3'
+            if self.path.is_file():
+                copyfile(self.path,working_path)
+        except OSError:
+            if temporary is not None:
+                temporary.cleanup()
+            return
+        self.temporary=temporary
+        self.working_path=working_path
 
     def __del__(self):
         if self.database is not None:
@@ -87,9 +97,8 @@ class FlowArchive:
             # above. Under the writer lock its main file is a complete SQLite
             # snapshot. Copy sequentially; SQLite.backup writes small random
             # pages to the Windows target and recreates the original bottleneck.
-            import shutil
             with self.working_path.open('rb') as source, temporary.open('wb') as destination:
-                shutil.copyfileobj(source,destination,length=1024*1024)
+                copyfileobj(source,destination,length=1024*1024)
             temporary.replace(self.path)
             self.dirty=False
             self.published_at=time.monotonic()
