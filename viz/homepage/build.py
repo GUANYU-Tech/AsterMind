@@ -8,7 +8,9 @@ from shutil import copyfile
 ROOT = Path(__file__).resolve().parent
 REPORT = ROOT.parents[1] / 'doc' / 'AsterMind-V1-Tech-Report.pdf'
 REPO = 'https://github.com/GUANYU-Tech/AsterMind'
-RELEASE = REPO + '/releases/tag/v1.0.0-preview.7'
+PREVIEW_TAG = 'v1.0.0-preview.7'
+RELEASE = f'{REPO}/releases/tag/{PREVIEW_TAG}'
+WINDOWS_INSTALLER = f'{REPO}/releases/download/{PREVIEW_TAG}/AsterMind-v1.0-Windows-x64-Setup.exe'
 COPY = {
 'en': {
 'lang':'en','skip':'Skip to content','menu':'Menu','nav':['Background','Framework','Interactive diagrams','Examples','About'],
@@ -27,10 +29,9 @@ COPY = {
 ['A distributed model','Model ranks span accelerators and satellites. Kernel dependencies, parallel deployment, and collective communication shape progress.'],
 ['A shared system','Input delivery, KV readiness, batch scheduling, and network contention all contribute to the time a request takes to complete.']],
 'statement':'Evaluate a specified system design—from physical configuration to end-to-end serving behavior.',
-'framework':['THE ASTERMIND FRAMEWORK','Configure the scenario.<br>Execute the system.','Builder prepares configuration and physical inputs. Engine advances runtime state through a shared event timeline.'],
+'framework':['THE ASTERMIND FRAMEWORK','Configure the scenario.<br>Run the simulation.','Builder prepares configuration and physical inputs. Engine advances runtime state through a shared event timeline.'],
 'builder':'Configuration & preparation','engine':'Runtime simulation',
 'brows':[['Constellation & geometry','Formation · TLE / SGP4 · visibility'],['Resources & deployment','Accelerators · model ranks · Compute Cells'],['Workload & network','Requests · topology · link parameters']],
-'contract':'Physical inputs + execution settings',
 'compute':'Compute','comm':'Communication','commshort':'Protocol models + shared flows',
 'runtime':['Request admission','Batch scheduling','KV readiness','Dynamic network state'],
 'clock':['One global event timeline','Integer ticks · causal dependencies · completion feedback'],
@@ -49,15 +50,17 @@ COPY = {
 ['COMPUTE','From a batch to kernel time.','Midlayer or Roofline is selected as the global compute mode. Model configuration, hardware profiles, and supported parallel deployments determine the execution path.'],
 ['COMMUNICATION','Protocol-aware latency.<br>Resource-aware progress.','Communication combines protocol-aware estimates with flow-level resource sharing where applicable. Cross-satellite transfers consume the capacity of their paths and shared resources.']],
 'outputcards':[['TTFT','Time to first token','Trace the path from request arrival to the first returned output token.'],['TOKEN TIMING','Decode progress','Inspect output-token timing alongside scheduling, computation, and communication events.'],['THROUGHPUT','System-level output','Interpret serving throughput together with request completion and execution traces.']],
-'examples':['REPRODUCIBLE SCENARIOS','Three scenarios for<br>inference in orbit.','Use repository scenarios to inspect execution and dependencies. These examples are experiment starting points, not claimed performance results.'],
+'examples':['REPRODUCIBLE SCENARIOS','Three scenarios for<br>inference in orbit.','Follow a request across two satellites, a session between compute formations, and ground traffic through a constellation.'],
 'cases':[
-['CROSS-SATELLITE INFERENCE','One Cell, two satellites.','Inspect how distributed compute and communication contribute to an inference request.'],
-['PARALLEL EXECUTION','Place the model in orbit.','Trace execution across tensor and pipeline stages under a configured physical network.'],
-['STATEFUL SERVING','Follow the KV state.','Explore session migration, transfer readiness, and dependencies before compute resumes.']],
-'start':['GET STARTED','Build on AsterMind.','AsterMind includes scenario examples, modeling code, tests, and a visualization workbench.'],
-'guide':'Install from source','download':'Download for Windows x64',
+['COMPUTE FORMATION','One request, two satellites','Split a model across two GPUs using tensor parallelism. Follow the computation on each satellite and the data they exchange.'],
+['SESSION MIGRATION','Continue a conversation on another Cell','Move a session from Cell A to Cell B. Trace the transfer of its KV cache and see when the next turn can start.'],
+['FULL SCENARIO · CASE STUDY III','From ground request to first token','Load the built-in Case Study III to replay 1,096 requests in 600 seconds. Follow the uplink and return paths and inspect the time to first token at the gateway.']],
+'ground':'Ground','formation':'Cell',
+'start':['GET STARTED','Build on AsterMind.','Choose the Windows installer or build from the GitHub source on Linux.'],
+'windows':'Windows installer','windowsnote':'For Windows 11 x64. Download and run the installer. The simulation engine uses WSL 2.',
+'guide':'Build from source on Linux','download':'Download the Windows installer (.exe)','release_notes':'Release notes',
 'setupnote':'Use x86-64 Linux with glibc 2.39 or later, Python 3.12, a C/C++ toolchain and libnuma.so.1. Building the frontend also requires Node.js and npm.',
-'codehead':'INSTALL AND RUN','copy':'Copy commands','copied':'Copied','copystatus':'Setup commands copied.','copyfail':'Select code to copy','copyfailstatus':'Clipboard unavailable. Select and copy the commands below.','codefoot':'After startup, open the local homepage on port 8766.',
+'codehead':'Clone, build and run','copy':'Copy commands','copied':'Copied','copystatus':'Setup commands copied.','copyfail':'Select code to copy','copyfailstatus':'Clipboard unavailable. Select and copy the commands below.','codefoot':'After startup, open the local homepage on port 8766.',
 'about':['ABOUT THE PROJECT','Exploring Space Computing','GUANYU and developers are building an open digital testbed for space computing.'],
 'org':'GUANYU / 观宇芯算','issue':'Issues & discussion','footer':'ORBITAL GEOMETRY · COMPUTE · COMMUNICATION · SYSTEMS',
 },
@@ -78,10 +81,9 @@ COPY = {
 ['分布式部署的模型','模型各个 rank 分布在加速器和卫星上，算子依赖、并行部署与集合通信共同影响执行进度。'],
 ['共享资源的系统','输入送达、KV 就绪、批次调度与网络竞争，共同决定请求从到达到完成所需的时间。']],
 'statement':'评估一套确定的系统设计：从物理配置，一直到端到端推理服务行为。',
-'framework':['ASTERMIND 整体框架','配置场景，<br>执行系统。','Builder 准备配置与物理输入，Engine 通过统一的事件时间线推进运行时状态。'],
+'framework':['ASTERMIND 整体框架','配置场景，<br>执行仿真。','Builder 准备配置与物理输入，Engine 通过统一的事件时间线推进运行时状态。'],
 'builder':'配置与准备','engine':'运行时仿真',
 'brows':[['星座与几何','编队 · TLE / SGP4 · 可见性'],['资源与部署','加速器 · 模型 rank · 计算 Cell'],['负载与网络','请求流 · 拓扑 · 链路参数']],
-'contract':'物理输入与执行配置',
 'compute':'计算','comm':'通信','commshort':'协议模型与流级资源共享',
 'runtime':['请求准入','批次调度','KV 就绪','动态网络状态'],
 'clock':['统一全局事件时间线','整数 tick · 因果依赖 · 完成事件反馈'],
@@ -100,15 +102,17 @@ COPY = {
 ['计算建模','从调度批次，到算子耗时。','全局选择 Midlayer 或 Roofline 计算模式，由模型配置、硬件档案与受支持的并行部署共同决定执行路径。'],
 ['通信建模','协议感知的时延，<br>资源约束下的进度。','通信在适用路径上结合协议感知时延估计与流级资源共享。跨星传输消耗所经路径和共享资源的容量。']],
 'outputcards':[['TTFT','首 Token 时延','跟踪从请求到达，到首个输出 Token 返回的完整路径。'],['TOKEN 时间','Decode 执行进度','结合调度、计算与通信事件，观察输出 Token 的时间信息。'],['吞吐量','系统级输出','将服务吞吐与请求完成状态、执行轨迹结合起来分析。']],
-'examples':['可复现的场景','用三个场景，<br>研究在轨推理。','使用仓库中的场景检查执行与依赖关系。这些示例是实验起点，不代表已宣称的性能结果。'],
+'examples':['可复现的场景','用三个场景，<br>研究在轨推理。','观察两颗卫星如何协同推理、会话如何在编队间迁移，以及地面用户多久能收到首个 Token。'],
 'cases':[
-['跨星推理','一个 Cell，两颗卫星。','检查分布式计算与通信分别如何影响一次推理请求。'],
-['并行执行','将模型部署到轨道上。','在配置好的物理网络中，跟踪张量并行与流水线阶段之间的执行。'],
-['有状态服务','跟随 KV 的流动。','观察会话迁移、传输就绪，以及计算恢复前需要满足的依赖。']],
-'start':['开始使用','基于 AsterMind，开展研究。','AsterMind 提供场景示例、建模代码、测试与可视化工作台。'],
-'guide':'从源码安装','download':'下载 Windows x64 安装包',
+['算力编队','两颗卫星共同处理一次推理','通过张量并行把模型分到两颗卫星的 GPU 上，跟踪各自的计算以及星间交换的数据。'],
+['会话迁移','换一个编队，继续同一段对话','把会话从编队 A 迁移到编队 B，观察 KV 缓存何时传完、下一轮请求何时可以开始计算。'],
+['全场景仿真 · 案例 III','从地面请求到首个 Token','加载内置案例 III，回放 600 秒内的 1,096 条请求，查看请求上行和结果回传经过的链路，以及地面网关收到首个 Token 的时延。']],
+'ground':'地面站','formation':'编队',
+'start':['开始使用','基于 AsterMind，开展研究。','在 Windows 上运行预发布安装包，或在 Linux 上从 GitHub 克隆源码并构建。'],
+'windows':'Windows 安装包','windowsnote':'适用于 Windows 11 x64。下载并运行安装程序，仿真引擎使用 WSL 2。',
+'guide':'Linux 源码安装','download':'下载 Windows 安装包（.exe）','release_notes':'版本说明',
 'setupnote':'源码安装需要 x86-64 Linux、glibc 2.39 或更高版本、Python 3.12、C/C++ 工具链及 libnuma.so.1。构建前端还需要 Node.js 和 npm。',
-'codehead':'安装与启动','copy':'复制命令','copied':'已复制','copystatus':'安装命令已复制。','copyfail':'选中代码复制','copyfailstatus':'剪贴板不可用，请选中并复制下方命令。','codefoot':'启动后，在浏览器中打开本机 8766 端口的首页。',
+'codehead':'克隆、构建与启动','copy':'复制命令','copied':'已复制','copystatus':'安装命令已复制。','copyfail':'选中代码复制','copyfailstatus':'剪贴板不可用，请选中并复制下方命令。','codefoot':'启动后，在浏览器中打开本机 8766 端口的首页。',
 'about':['关于项目','探索太空智算','观宇，与开发者共同构建太空智算的开放数字试验场'],
 'org':'观宇芯算 / GUANYU','issue':'问题与讨论','footer':'轨道几何 · 计算 · 通信 · 系统',
 }}
@@ -157,10 +161,19 @@ for lang,d in COPY.items():
     challenges=''.join(f'<article>{icon(i)}<h3>{v[0]}</h3><p>{v[1]}</p></article>' for i,v in enumerate(d['challenges']))
     brows=''.join(f'<div class="config-row"><h4>{v[0]}</h4><p>{v[1]}</p></div>' for v in d['brows'])
     tabs=''.join(f'<button id="step-{i}" role="tab" aria-selected="{str(i==0).lower()}" aria-controls="journey-panel" tabindex="{0 if i==0 else -1}" data-step="{i}"><span class="stage-track" aria-hidden="true"><i></i></span><span class="step-number">{i+1:02}</span>{v}</button>' for i,v in enumerate(d['steps']))
-    nodes=''.join(f'<div class="flow-node {"active" if i==0 else ""}" data-node="{i}">{icon(i)}<h3>{v[0]}</h3><p>{v[1]}</p></div>'+('<span class="flow-wire" aria-hidden="true">→</span>' if i<3 else '') for i,v in enumerate(d['nodes']))
+    nodes = '<span class="flow-wire" aria-hidden="true">→</span>'.join(
+        f'<button type="button" class="flow-node{" active" if i == 0 else ""}" data-node="{i}" '
+        f'aria-pressed="{str(i == 0).lower()}" aria-controls="journey-panel">'
+        f'{icon(i)}<span class="node-name">{name}</span><span class="node-detail">{detail}</span></button>'
+        for i, (name, detail) in enumerate(d['nodes'])
+    )
     models=''.join(f'<article class="model-card"><p class="eyebrow">{v[0]}</p><h3>{v[1]}</h3><p>{v[2]}</p></article>' for v in d['modelcards'])
     outputs=''.join(f'<article><span class="eyebrow">{v[0]}</span><h3>{v[1]}</h3><p>{v[2]}</p></article>' for v in d['outputcards'])
-    arts=['<span>GPU</span><i></i><span>GPU</span>','<span>TP</span><i>PP</i><span>TP</span>','<span>Cell A</span><i>KV</i><span>Cell B</span>']
+    arts = [
+        '<span>GPU</span><i>TP</i><span>GPU</span>',
+        f'<span>{d["formation"]} A</span><i>KV</i><span>{d["formation"]} B</span>',
+        f'<span>{d["ground"]}</span><i>⇄</i><span>{d["formation"]}</span>',
+    ]
     cases=''.join(f'<article class="example"><div class="mini-art" aria-hidden="true">{arts[i]}</div><p class="eyebrow">{v[0]}</p><h3>{v[1]}</h3><p>{v[2]}</p></article>' for i,v in enumerate(d['cases']))
     data={k:d[k] for k in ['stages','play','pause','copy','copied','copystatus','copyfail','copyfailstatus']}
     page=f'''<!doctype html>
@@ -179,7 +192,7 @@ for lang,d in COPY.items():
 <noscript><a class="text-link" href="{report_url}">{d['report']}</a></noscript>
 </section>
 <section class="section container" id="background">{heading(d['background'])}<div class="challenges">{challenges}</div><div class="statement">{d['statement']}</div></section>
-<section class="section muted" id="framework"><div class="container">{heading(d['framework'])}<div class="architecture"><article class="builder"><header><h3>Builder</h3><span>{d['builder']}</span></header>{brows}<div class="contract"><code>SimulationConfig</code><span>{d['contract']}</span></div></article><div class="arch-bridge" aria-hidden="true">→</div><article class="engine"><header><h3>Engine</h3><span>{d['engine']}</span></header><div class="engine-models"><div><h4>{d['compute']}</h4><p>Midlayer / Roofline</p></div><div><h4>{d['comm']}</h4><p>{d['commshort']}</p></div></div><div class="runtime">{''.join(f'<span>{v}</span>' for v in d['runtime'])}</div><div class="timeline"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 6v6l4 2"/></svg><div><h4>{d['clock'][0]}</h4><p>{d['clock'][1]}</p></div></div></article></div><div class="arch-output"><span class="eyebrow">{d['observe']}</span><p>{' <span aria-hidden="true">/</span> '.join(d['metrics'])}</p></div></div></section>
+<section class="section muted" id="framework"><div class="container">{heading(d['framework'])}<div class="architecture"><article class="builder"><header><h3>Builder</h3><span>{d['builder']}</span></header>{brows}</article><div class="arch-bridge" aria-hidden="true">→</div><article class="engine"><header><h3>Engine</h3><span>{d['engine']}</span></header><div class="engine-models"><div><h4>{d['compute']}</h4><p>Midlayer / Roofline</p></div><div><h4>{d['comm']}</h4><p>{d['commshort']}</p></div></div><div class="runtime">{''.join(f'<span>{v}</span>' for v in d['runtime'])}</div><div class="timeline"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 6v6l4 2"/></svg><div><h4>{d['clock'][0]}</h4><p>{d['clock'][1]}</p></div></div></article></div><div class="arch-output"><span class="eyebrow">{d['observe']}</span><p>{' <span aria-hidden="true">/</span> '.join(d['metrics'])}</p></div></div></section>
 <section class="section container" id="modeling">{heading(d['journey'])}
 <div class="journey"><div class="flow-visual">{nodes}</div>
 <div class="tabs" role="tablist" aria-label="{d['journey'][0]}">{tabs}</div>
@@ -191,7 +204,13 @@ for lang,d in COPY.items():
 </div></div></div></section>
 <section class="section muted" id="performance"><div class="container">{heading(d['models'])}<div class="model-grid">{models}</div><div class="metrics">{outputs}</div></div></section>
 <section class="section container" id="examples">{heading(d['examples'])}<div class="example-grid">{cases}</div></section>
-<section class="section muted" id="start"><div class="container">{heading(d['start'])}<div class="getting-started"><div><h3>{d['guide']}</h3><p>{d['setupnote']}</p><div class="start-links">{external(RELEASE,d['download'],'text-link')}</div></div><div class="code-panel"><div class="code-top"><span>{d['codehead']}</span><button id="copy-code">{d['copy']}</button></div><pre><code id="setup-code">{escape(setup)}</code></pre><p class="code-bottom">{d['codefoot']}</p><span class="sr-only" role="status" id="copy-status"></span></div></div></div></section>
+<section class="section muted" id="start"><div class="container">{heading(d['start'])}
+<div class="getting-started">
+<article class="install-windows"><h3>{d['windows']}</h3><p>{d['windowsnote']}</p>
+<div class="start-links">{external(WINDOWS_INSTALLER,d['download'],'button primary')}{external(RELEASE,d['release_notes']+' · '+PREVIEW_TAG,'text-link')}</div></article>
+<article class="install-source"><h3>{d['guide']}</h3><p>{d['setupnote']}</p>
+<div class="code-panel"><div class="code-top"><span>{d['codehead']}</span><button id="copy-code">{d['copy']}</button></div><pre><code id="setup-code">{escape(setup)}</code></pre><p class="code-bottom">{d['codefoot']}</p><span class="sr-only" role="status" id="copy-status"></span></div></article>
+</div></div></section>
 <section class="section container about" id="about">{heading(d['about'])}<p class="organization">{d['org']}</p><div class="actions">{external(REPO,'GitHub','button primary')}{external(REPO+'/issues',d['issue'],'button secondary')}</div></section></main>
 <footer class="container"><span>AsterMind V1.0</span><span>{d['footer']}</span><span>GUANYU</span></footer>
 <script type="application/json" id="page-copy">{json.dumps(data,ensure_ascii=False)}</script>
