@@ -8,8 +8,7 @@ from shutil import copyfile
 ROOT = Path(__file__).resolve().parent
 REPORT = ROOT.parents[1] / 'doc' / 'AsterMind-V1-Tech-Report.pdf'
 REPO = 'https://github.com/GUANYU-Tech/AsterMind'
-PREVIEW_TAG = 'v1.0.0-preview.9'
-WINDOWS_INSTALLER = f'{REPO}/releases/download/{PREVIEW_TAG}/AsterMind-v1.0-Windows-x64-Setup.exe'
+WINDOWS_INSTALLER = f'{REPO}/releases/latest/download/AsterMind-Windows-x64-Setup.exe'
 LANDSCAPE_POSTER = 'assets/astermind-landscape-poster-zh.png'
 VERTICAL_POSTER = 'assets/astermind-vertical-poster-zh.png'
 COPY = {
@@ -55,8 +54,8 @@ COPY = {
 ['CASE STUDY I · COMPUTE FORMATION','How should satellites in a formation connect?', 'With the same total bandwidth, direct links between satellites that often exchange data can shorten inference latency.', ('Ring', '→', 'Full mesh')],
 ['CASE STUDY II · CONSTELLATION ACCESS AND LOAD DISTRIBUTION','When ground sites send requests at once, how can the constellation serve more of them?', 'Relays can ease local congestion by sending tasks to cells with spare capacity.', ('Relay', '→', 'Cell')],
 ['CASE STUDY III · MULTI-TURN INFERENCE SCHEDULING','How can users get a faster response to a follow-up?', 'Keeping follow-ups on the same cell lets it reuse cached context and return the first token sooner in long conversations.', ('Ground', '⇄', 'Cell')]],
-'start':['Download & Install','Build on AsterMind.','Run the Windows prerelease installer or clone the source from GitHub and build it yourself.'],
-'windows':'Windows installer','windowsnote':'Windows 11 x64 · Prerelease',
+'start':['Download & Install','Build on AsterMind.','Run the Windows installer or clone the source from GitHub and build it yourself.'],
+'windows':'Windows installer','windowsnote':'Windows 11 x64',
 'poster_alt':'AsterMind project poster in Chinese.',
 'guide':'Linux: Install from source','download':'Download the Windows x64 installer',
 'codehead':'Clone, build and run','copy':'Copy commands','copied':'Copied','copystatus':'Setup commands copied.','copyfail':'Select code to copy','copyfailstatus':'Clipboard unavailable. Select and copy the commands below.',
@@ -105,8 +104,8 @@ COPY = {
 ['案例 I · 算力编队','编队内的卫星如何互联？','总带宽相同时，让频繁通信的卫星直连可缩短推理时延。', ('环形', '→', '全连接')],
 ['案例 II · 星座接入与分流','多地任务同时到达，星座怎样承接更多请求？','中继星把任务分给仍有余量的编队，可缓解局部拥塞。', ('中继星', '→', '服务单元')],
 ['案例 III · 多轮推理调度','用户连续追问时，怎样缩短等待？','让同一编队接续对话，可复用上下文缓存，让长对话更早返回首个 Token。', ('地面站', '⇄', '编队')]],
-'start':['下载与安装','基于 AsterMind，开展研究。','在 Windows 上运行预发布安装包，或从 GitHub 克隆源码并构建。'],
-'windows':'Windows 安装包','windowsnote':'Windows 11 x64 · 预发布版',
+'start':['下载与安装','基于 AsterMind，开展研究。','在 Windows 上运行安装包，或从 GitHub 克隆源码并构建。'],
+'windows':'Windows 安装包','windowsnote':'Windows 11 x64',
 'poster_alt':'AsterMind 中文项目海报。',
 'guide':'Linux：从源码安装','download':'下载 Windows x64 安装包',
 'codehead':'克隆、构建与启动','copy':'复制命令','copied':'已复制','copystatus':'安装命令已复制。','copyfail':'选中代码复制','copyfailstatus':'剪贴板不可用，请选中并复制下方命令。',
