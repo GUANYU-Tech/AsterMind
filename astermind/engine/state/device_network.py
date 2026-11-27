@@ -10,6 +10,7 @@ from __future__ import annotations
 from bisect import bisect_left
 from collections import Counter
 from collections.abc import Sequence
+from math import inf, isfinite
 from types import SimpleNamespace
 from astermind.engine.clock import Time
 
@@ -53,8 +54,9 @@ class DeviceNetworkState(NetworkState):
         self.disabled_device_links = set()
         self.failed_device_links = set()
         self.start_s = physical.start_s if physical is not None else 0.0
-        self.end_s = Time(horizon_s)
-        if self.start_s != 0 or (physical is not None and horizon_s > physical.end_s):
+        # Static links can have an open interval. The end is not an event time.
+        self.end_s = inf if horizon_s is None else Time(horizon_s)
+        if self.start_s != 0 or (physical is not None and self.end_s > physical.end_s):
             raise ValueError(
                 "device serving horizon must lie inside physical data starting at zero"
             )
@@ -280,10 +282,11 @@ class DeviceNetworkState(NetworkState):
             boundaries.update(
                 Time.from_ns(at) for at, _ in data.get("schedule", ()) if Time.from_ns(at) < self.end_s
             )
-        self.environment_times = tuple(sorted(boundaries))
+        ordered = tuple(sorted(boundaries))
+        self.environment_times = ordered if isfinite(self.end_s) else ordered[:-1]
         self.frames = [
             {"time_s": a, "end_s": b, "revision": self.revision}
-            for a, b in zip(self.environment_times, self.environment_times[1:])
+            for a, b in zip(ordered, ordered[1:])
         ]
         self.frame_times = [f["time_s"] for f in self.frames]
         self.link_frames, self.link_times, self.events = {}, {}, []

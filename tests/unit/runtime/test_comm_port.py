@@ -39,6 +39,38 @@ class CommPortTests(unittest.TestCase):
         self.assertEqual(done,[Time.from_ns(1010)])
         self.assertAlmostEqual(sum(r['application_bytes'] for r in comm.trace if r['kind']=='service'),1000)
 
+    def test_open_horizon_completes_transfer_past_sixty_seconds(self):
+        host, network, comm = self.runtime(horizon_ns=None)
+        done = []
+        size = 75_000_000_000  # 75 seconds of data at 8 Gbps.
+        comm.submit_transfer('long', 'ag', 'bg', size, lambda: done.append(host.now), self.fail)
+        host.timeline.schedule(90, 0, 'test:future_callback', lambda: self.fail('past last completion'))
+        host.run(stop_when=lambda: bool(done))
+        self.assertEqual(done, [Time.from_ns(75_000_000_010)])
+        self.assertEqual(host.now, done[0])
+        self.assertIsNone(comm.routes.frame.valid_until_s)
+        self.assertFalse(comm.tasks)
+
+    def test_open_horizon_honors_explicit_communication_deadline(self):
+        raw = scenario(horizon_ns=None)
+        raw['communication']['task_timeout_s'] = 60
+        host, network, comm = self.runtime(raw)
+        failed = []
+        comm.submit_transfer('long', 'ag', 'bg', 75_000_000_000, self.fail, failed.append)
+        host.run(stop_when=lambda: bool(failed))
+        self.assertEqual([e.reason for e in failed], ['communication deadline exceeded'])
+        self.assertEqual(host.now, Time(60))
+
+    def test_open_horizon_fails_when_route_cannot_recover(self):
+        host, network, comm = self.runtime(horizon_ns=None)
+        host.net.failed_device_links.add('isl')
+        failed = []
+        comm.submit_transfer('unreachable', 'ag', 'bg', 1, self.fail, failed.append)
+        host.run()
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(host.now, Time(0))
+        self.assertFalse(comm.tasks)
+
     def test_two_flows_share_the_same_resource_once(self):
         host,network,comm=self.runtime();done=[]
         for i in range(2):

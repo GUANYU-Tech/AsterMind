@@ -3,6 +3,7 @@
 Path selection never forecasts traffic. Comm owns capacity competition,
 protocol budgets, progress, retries and completion events.
 """
+from math import isfinite
 from types import SimpleNamespace
 
 from astermind.engine.clock import Time
@@ -77,8 +78,12 @@ class TargetNetworkFrames:
                         'target_native_direction': (source, target)}))
         # The shared snapshot already indexed real sample/contact/capacity
         # boundaries. Do not scan every link's future history a second time.
+        deadline = (Time(snapshot.deadline)
+                    if isfinite(snapshot.deadline) and snapshot.deadline > host.now else None)
         return SimpleNamespace(start_time_s=host.now,
-            valid_until_s=Time(snapshot.deadline) if snapshot.deadline > host.now else None,
+            valid_until_s=deadline,
+            can_wait_for_route=deadline is not None or self.horizon is not None
+                               or getattr(host, 'controller', None) is not None,
             revision=net.revision,
             node_states=nodes, established_topology_graph=tuple(established),
             shared_capacity_pools_bps=pools)

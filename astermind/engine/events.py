@@ -11,9 +11,11 @@ class _EventEngine:
         from astermind.engine.control import current_controller
         self.controller = current_controller()
         self.spec, self.env, self.net = spec, environment, environment.network
-        self.end = Time(environment.time['end_s'])
+        end = environment.time['end_s']
+        self.end = Time(end) if end is not None else None
         if spec.time_horizon_s is not None:
-            self.end = min(self.end, Time(spec.time_horizon_s))
+            limit = Time(spec.time_horizon_s)
+            self.end = limit if self.end is None else min(self.end, limit)
         self.heap, self.log = [], ClockLog()
         self.sequence, self.now = 0, Time()
 
@@ -24,12 +26,15 @@ class _EventEngine:
         self.sequence += 1
         heapq.heappush(self.heap, (time, priority, self.sequence, kind, request_id, payload))
 
-    def run(self):
+    def run(self, *, stop_when=None):
         while self.heap:
+            # Drain callbacks at the last request's tick before ending the run.
+            if stop_when is not None and self.heap[0][0] > self.now and stop_when():
+                break
             if self.controller and hasattr(self.controller, 'poll'):
                 self.controller.poll(self)
             time, priority, sequence, kind, request_id, payload = heapq.heappop(self.heap)
-            if time > self.end:
+            if self.end is not None and time > self.end:
                 break
             self.now = time
             if kind in {'link_state', 'network_update'} and (payload or {}).get('revision', 0) != self.net.revision:
@@ -41,7 +46,8 @@ class _EventEngine:
                     policy.network_changed()
                 continue
             getattr(self, 'on_' + kind)(None, payload)
-        self.now = self.end
+        if self.end is not None:
+            self.now = self.end
         if self.controller:
             self.controller.finished(self)
 

@@ -53,7 +53,7 @@ class SimulationConfig(ComputeModeConfig):
     output_delivery: Literal["by_batch", "first_then_rest"] = "by_batch"
     fast_orbital_route_frames: str | None = None
     fast_device_route_frames: str | None = None
-    horizon_ns: Positive = 1_000_000_000
+    horizon_ns: Positive | None = 1_000_000_000
     physical_dataset: str | None = None
     physical_network: dict | str | None = None
     physical_link_bindings: dict[str, str] = Field(default_factory=dict)
@@ -142,6 +142,8 @@ class SimulationConfig(ComputeModeConfig):
             )
         if self.physical_dataset is not None and self.physical_network is not None:
             raise ValueError("supply physical_dataset or physical_network, not both")
+        if self.horizon_ns is None and (self.physical_dataset is not None or self.physical_network is not None):
+            raise ValueError("physical scenarios require a finite simulation horizon")
         for entries in (self.cells, self.requests):
             ids = [entry.id for entry in entries]
             if len(ids) != len(set(ids)):
@@ -216,7 +218,7 @@ class SimulationConfig(ComputeModeConfig):
                     raise ValueError("KV history must match receiving request parent context")
         if any(r.cell is not None and r.cell not in known for r in self.requests):
             raise ValueError("request selects an unknown Cell")
-        if any(r.arrival_ns > self.horizon_ns for r in self.requests):
+        if self.horizon_ns is not None and any(r.arrival_ns > self.horizon_ns for r in self.requests):
             raise ValueError("request arrival exceeds simulation horizon")
         if len({m.id for m in self.migrations}) != len(self.migrations):
             raise ValueError("duplicate migration ID")

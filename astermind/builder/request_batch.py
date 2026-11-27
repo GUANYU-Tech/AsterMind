@@ -202,7 +202,7 @@ def validate_requests(config, requests, auto_context_cells=()):
         seen.add(request.id)
         if request.user_device not in devices:
             raise ValueError(f"请求 {request.id} 的地面接入节点不在当前物理场景中")
-        if request.arrival_ns >= config.horizon_ns:
+        if config.horizon_ns is not None and request.arrival_ns >= config.horizon_ns:
             raise ValueError(f"请求 {request.id} 的到达时间必须在仿真时域内")
         if request.cell is not None and request.cell not in by_cell:
             raise ValueError(f"请求 {request.id} 的目标 Cell 不存在")
@@ -247,8 +247,9 @@ def generate_requests(config, options, existing_ids=()):
     options = Generation.model_validate(options)
     start = seconds_ns(options.start_s)
     window = seconds_ns(options.window_s)
-    if start >= config.horizon_ns or (
-        options.distribution != "simultaneous" and start + window > config.horizon_ns
+    if config.horizon_ns is not None and (
+        start >= config.horizon_ns
+        or (options.distribution != "simultaneous" and start + window > config.horizon_ns)
     ):
         raise ValueError("生成请求的时间窗口超出仿真时域")
     devices = ground_devices(config)

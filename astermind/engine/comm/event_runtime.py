@@ -179,7 +179,11 @@ class RuntimeCommunication(CommunicationRouting):
         try:
             route = initial_route if initial_route is not None else routes.route(
                 f['source'], f['target'], f['size'], first_hop=first_hop)
-        except NoRouteError:
+        except NoRouteError as error:
+            if not getattr(routes.frame, 'can_wait_for_route', True):
+                self._later(0, lambda reason=str(error): self._fail(f['task'], reason),
+                            'comm:route_unavailable')
+                return
             f['state']='waiting'
             self.trace.append(dict(kind='route_wait',id=f['id'],task=f['task'],time_ns=self.now_ns));return
         finally:self.stats['route_wall_s']+=perf_counter()-started

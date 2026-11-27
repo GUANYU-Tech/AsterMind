@@ -786,12 +786,9 @@ class NetworkState:
                     "setup_start_s"
                 ) != edge.get("setup_start_s"):
                     break
-                next_sample = self.environment_times[
-                    min(
-                        bisect.bisect_right(self.environment_times, cursor),
-                        len(self.environment_times) - 1,
-                    )
-                ]
+                sample_index = bisect.bisect_right(self.environment_times, cursor)
+                next_sample = (self.environment_times[sample_index]
+                               if sample_index < len(self.environment_times) else self.end_s)
                 stop = min(
                     current["end_s"], next_sample, busy[0] if busy else self.end_s
                 )
@@ -804,8 +801,10 @@ class NetworkState:
                                     (1 + self.shared_pool_load.get(k, 0)) for k in pools])
                 bandwidth *= bandwidth_fraction
                 duration = (remaining / bandwidth) if bandwidth > 0 else math.inf
+                if not math.isfinite(duration) and not math.isfinite(stop):
+                    return None
                 finish = stop if not math.isfinite(duration) else min(cursor + duration, stop)
-                complete = bandwidth > 0 and duration <= stop - cursor
+                complete = bandwidth > 0 and (not math.isfinite(stop) or duration <= stop - cursor)
                 sent = (
                     remaining
                     if complete
