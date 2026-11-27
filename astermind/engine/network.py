@@ -101,7 +101,6 @@ class LinkProfile:
         if self.capacity_model not in {
             "fixed",
             "free_space_shannon",
-            "optical_photon_budget",
             "islsim",
         }:
             raise ValueError(f"unsupported Link Profile model: {self.capacity_model}")

@@ -1,7 +1,7 @@
 import {buildWorkspace,renderComputeSummary} from './workspace-ui.mjs?v=profile-1';
 import {groups} from './config-layout.mjs';
 import {renderConfigForm,parseConfiguration} from './config-form.mjs';
-import {linkMode,rememberEmptyLinkMode} from './link-mode.mjs';
+import {rememberEmptyLinkMode} from './link-mode.mjs';
 import {renderParameterGroup,renderSchedulingReadout} from './parameter-panel.mjs';
 import {editorChoices,editDependencies,formationPairs} from './config-edit.mjs';
 import {configurationErrors} from './config-validation.mjs';
@@ -11,7 +11,7 @@ import {modelOptions} from './compute-config.mjs';
 import {synchronizeManualResources as synchronizeResources,clearDependentDrafts} from './resource-sync.mjs';
 import {AsterMindScene,sceneState,syncSceneConfiguration} from './scene.js?v=profile-1';
 import {sceneCellDraft,sceneCellLayout} from '../assets/scene-cell-parameters.js';
-import {memberIds} from '../assets/physical-cells.js';
+import {memberIds,inheritCellBudget} from '../assets/physical-cells.js';
 import {formationNames,labels} from './config-labels.mjs';
 
 const $=id=>document.getElementById(id);
@@ -27,11 +27,13 @@ draft.topology.source='file';
 draft.ep_strategy=session.epStrategy;
 delete draft.fast_link_contention;
 const profile=session.linkProfile || {};
-function geometryLinks(mode=profile.capacity_model==='fixed'?'fixed':'islsim') {
-  rememberEmptyLinkMode(draft,mode);
-  return formationPairs(members(),geo.layout??geo.topology).map(([source,target])=>({
-    source,target,mode,bandwidth_gbps:mode==='fixed'?(profile.capacity_model==='fixed'?profile.bandwidth_bps/1e9:400):null,
-  }));
+const opticalMode=profile.capacity_model==='fixed'?'fixed':'islsim';
+let explicitPairs=session.explicitPairs ?? (session.layout?.custom_links
+  ? draft.topology.inter_satellite.links.map(({source,target})=>[source,target]) : null);
+function inheritLinks() {
+  rememberEmptyLinkMode(draft,opticalMode);
+  const pairs=explicitPairs ?? formationPairs(members(),geo.layout??geo.topology);
+  inheritCellBudget(draft,profile,pairs.map(([source,target])=>({source,target})));
 }
 const drafts=new Map();
 const synthetic=!observed && !fixed;
@@ -53,24 +55,13 @@ const section=(stage,index)=>$('form-'+stage+'-'+index);
 const fields=[['formation',0,['hardware.default_hardware_id','hardware.accelerators_per_satellite']],
   ...Object.entries(groups).filter(([stage])=>stage!=='formation').flatMap(([stage,sections])=>
     sections.map(([,paths],index)=>[stage,index,paths.filter(path=>path!=='compute_mode')]).filter(([,index])=>section(stage,index)))];
-function scopeChoice(host, caption, options, value) {
-  const label=document.createElement('label');label.className='config-field';
-  label.append(document.createTextNode(caption));
-  const select=document.createElement('select');
-  select.setAttribute('aria-label',caption);
-  select.append(...options.map(([key,text])=>new Option(text,key)));
-  select.value=value;label.append(select);host.before(label);
-  return select;
-}
-const linkScope=scopeChoice(section('network',1),'编队链路参数',[
-  ['scene','继承场景链路预算'],['cell','单独配置此编队']],session.layout?.custom_links?'cell':'scene');
-function inheritLinks() {
-  draft.topology.inter_satellite.links=geometryLinks();
-  if(profile.islsim_config) draft.fso=structuredClone(profile.islsim_config);
-}
-if(linkScope.value==='scene') inheritLinks();
-else rememberEmptyLinkMode(draft,session.layout?.link_mode);
-linkScope.onchange=()=>{if(linkScope.value==='scene')inheritLinks();renderParameters();updatePreview()};
+// The physical scene owns all inter-satellite rates. Keep the intra-satellite fabric editable.
+inheritLinks();
+section('network',1).closest('details').remove();
+section('network',2).closest('details').remove();
+const budgetNote=document.createElement('p');
+budgetNote.textContent='编队内星间链路使用「连接与链路预算」中的设置。';
+section('network',0).closest('details').after(budgetNote);
 $('run-simulation').remove();
 const geometryHost=section('formation',1);
 if(synthetic && geometry.motion_model!=='static_formation'){
@@ -83,7 +74,6 @@ let jsonDirty=false;
 function jsonLock(value){
   jsonDirty=value;
   for(const panel of document.querySelectorAll('.basic-fields'))panel.disabled=value;
-  linkScope.disabled=value;
   if(!value)renderParameters();
   else schedulePreflight();
 }
@@ -101,7 +91,8 @@ $('apply-json').onclick=()=>{try{
   const problem=configurationErrors(next,cellSchema)[0];
   if(problem)throw Error(problem.msg);
   if(JSON.stringify(next.fso)!==JSON.stringify(draft.fso) ||
-     JSON.stringify(next.topology.inter_satellite)!==JSON.stringify(draft.topology.inter_satellite))linkScope.value='cell';
+     JSON.stringify(next.topology.inter_satellite)!==JSON.stringify(draft.topology.inter_satellite))
+    throw Error('请在连接与链路预算中修改星间链路');
   draft=next;drafts.clear();jsonLock(false);updatePreview();report('');
 }catch(e){report(e.message)}};
 $('export-config').onclick=()=>{
@@ -153,9 +144,8 @@ function renderGeometry(){
         synchronizeResources(draft,capabilities);renderGeometry();renderParameters();
       }
       if (path[0]==='satellite_count' || path[0]==='layout' || path[0]==='topology') {
-        const previous=draft.topology.inter_satellite.links;
-        draft.topology.inter_satellite.links=geometryLinks(linkScope.value==='cell'?linkMode(draft)??undefined:undefined).map(edge=>
-          linkScope.value==='cell' && previous.find(p=>(p.source===edge.source&&p.target===edge.target)||(p.target===edge.source&&p.source===edge.target)) || edge);
+        explicitPairs=null;
+        inheritLinks();
         renderParameters();
       }
       updatePreview();
@@ -172,13 +162,11 @@ function renderParameters(){
     if(path[0]==='deployment' && path[1]==='placements')refresh=true;
     if(path[0]==='topology')updatePreview();
   }});
-  for(const [stage,index,paths] of fields) renderParameterGroup(section(stage,index),draft,paths,capabilities,path=>{
+  for(const [stage,index,paths] of fields) if(section(stage,index)) renderParameterGroup(section(stage,index),draft,paths,capabilities,path=>{
     if(refresh || path?.[0]==='deployment')renderParameters();
     else renderJson();
     schedulePreflight();
   },{...choices,stage});
-  section('network',1).disabled=section('network',2).disabled=linkScope.value==='scene';
-  section('network',2).closest('details').hidden=linkMode(draft)==='fixed';
   renderJson();
   renderComputeSummary(draft,capabilities,()=>{renderJson();schedulePreflight()},choices);
   schedulePreflight();
@@ -221,19 +209,10 @@ function currentLayout(){
   }
   geometry.topology=geo.layout??geo.topology;
   if(!modelOptions(draft,capabilities).includes(draft.model))throw Error('请选择当前计算模式与卡型支持的模型');
-  if(linkScope.value==='cell'){
-    const pairs=new Set();
-    for(const {source,target} of draft.topology.inter_satellite.links){
-      const pair=JSON.stringify([source,target].sort());
-      if(source===target||!members().includes(source)||!members().includes(target)||pairs.has(pair))
-        throw Error('星间连接必须使用编队内两个不同的成员，且每对成员只能连接一次');
-      pairs.add(pair);
-    }
-  }
   const problem=configurationErrors(draft,cellSchema)[0];
   if(problem)throw Error(problem.msg);
   const layout=sceneCellLayout(draft,capabilities,members());
-  Object.assign(layout,{custom_links:linkScope.value==='cell',link_mode:linkMode(draft)});
+  layout.custom_links=explicitPairs!==null;
   return layout;
 }
 async function validateLayout(layout) {

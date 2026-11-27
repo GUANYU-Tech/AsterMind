@@ -14,9 +14,12 @@ export function completedDestination(job, search) {
     const draft = query.get('scene_draft');
     return '/scene?model=' + model + (draft ? '&scene_draft=' + encodeURIComponent(draft) : '');
   }
-  if (query.get('next') === 'replay' || job.automatic) {
+  if (query.get('next') === 'replay' || (job.automatic && !query.has('stay'))) {
     return '/results?run=' + encodeURIComponent(job.id) + '&view=scene';
   }
-  return (job.native_preset || job.native_scene) ? job.result_url :
-    job.preview_url || job.runtime_url || job.result_url;
+  const fallback = '/runs/' + encodeURIComponent(job.id) + '/result';
+  if (job.native_preset || job.native_scene) return job.result_url || fallback;
+  if (job.preview_url) return job.preview_url;
+  if (query.has('stay') && job.result_url) return job.result_url;
+  return job.runtime_url || job.result_url || fallback;
 }

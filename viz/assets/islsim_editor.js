@@ -1,4 +1,4 @@
-import {field,get} from '/assets/studio_common.js';
+import {get} from '/assets/studio_common.js';
 
 let defaults;
 export async function initISLSim(){
@@ -78,13 +78,7 @@ function renderModulation(fields,profile){
   wrap.append(select);fields.append(wrap);
   const note=document.createElement('p');note.textContent='OrbitServe 提供允许的调制集合；ISLSim 按候选顺序选择首个满足 BER 门限的方式。固定模式也必须满足 BER，否则链路不可用。';fields.append(note);
 }
-export function renderISLSim(fields,profile,changed){
-  profile.capacity_model??='islsim';
-  const select=field(fields,profile,'capacity_model','星间链路计算模型','text',[
-    ['islsim','ISLSim 激光链路模型（默认）'],
-    ['optical_photon_budget','光子预算'],['fixed','固定带宽']]);
-  select.addEventListener('change',changed);
-  if(profile.capacity_model!=='islsim')return false;
+export function renderISLSim(fields,profile){
   if(!bindISLSim(profile)){
     const note=document.createElement('p');
     note.textContent='ISLSim 参数未加载，请检查服务后重试。';

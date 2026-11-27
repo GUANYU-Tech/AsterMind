@@ -81,7 +81,7 @@ export async function loadTasks(){
   return {tasks:tasks.filter(task=>!deletedTaskIds.has(task.id)),partial};
 }
 
-export function renderTask(container,task){
+export function renderTask(container,task,{onProgressPage=false}={}){
   const row=document.createElement('article');row.className='row task-row';
   const heading=document.createElement('h3'),badge=document.createElement('span');
   badge.className='task-badge task-'+task.state;badge.textContent=stateLabels[task.state]||task.state;
@@ -90,8 +90,8 @@ export function renderTask(container,task){
   id.textContent=created.key?'创建时间 '+created.text:created.text;
   id.title='记录编号：'+task.id;
   const actions=document.createElement('div');actions.className='actions';
-  const link=(label,suffix)=>{const a=document.createElement('a');a.className='button';a.href='/runs/'+encodeURIComponent(task.id)+'/'+suffix;a.textContent=label;actions.append(a)};
-  link(task.state==='running'?'查看进度与日志':'查看状态与日志','progress?stay=1');
+  const link=(label,suffix)=>{const a=document.createElement('a');a.className='button';a.href=suffix.startsWith('#')?suffix:'/runs/'+encodeURIComponent(task.id)+'/'+suffix;a.textContent=label;actions.append(a)};
+  link(task.state==='running'?'查看进度与日志':'查看状态与日志',onProgressPage?'#execution-log':'progress?stay=1#execution-log');
   if(task.state==='running'&&task.interactive&&!task.automatic&&task.runtime_url){
     const a=document.createElement('a');a.className='button';a.href='/live/'+encodeURIComponent(task.id);a.textContent='在线仿真';actions.append(a);
   }

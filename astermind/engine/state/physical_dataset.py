@@ -55,6 +55,9 @@ def physical_spec(spec):
 
 
 def validate_stored_link_budgets(network, edges=()):
+    if network.get('optical_link_model') in ('fixed', 'islsim'):
+        # This format explicitly distinguishes endpoint hardware limits from scene budgets.
+        return
     profiles = network.get("link_profiles", {})
     if any(profile.get("capacity_model") == "islsim"
            and "terminal_cap_gbps" in profile.get("islsim_config", {}).get("rx", {})

@@ -136,6 +136,15 @@ export function cellLayout(formation,key,members) {
   return bindLayout(settings?.cells?.[key] || settings?.template,members);
 }
 
+// The standalone editor needs a complete configuration, including derived link fields.
+export function inheritCellBudget(config,profile,links=config.topology.inter_satellite.links) {
+  const mode=profile.capacity_model==='fixed'?'fixed':'islsim';
+  config.topology.inter_satellite.links=links.map(link=>({
+    ...link,mode,bandwidth_gbps:mode==='fixed'?profile.bandwidth_bps/1e9:null,
+  }));
+  if(mode==='islsim' && profile.islsim_config)config.fso=structuredClone(profile.islsim_config);
+}
+
 export function physicalPayload(network, mode, epStrategy, capabilities, linkBandwidthFactors={}) {
   const physical_network=structuredClone(network);
   const formations={};
@@ -150,6 +159,7 @@ export function physicalPayload(network, mode, epStrategy, capabilities, linkBan
       for (const layout of [settings.template,...Object.values(settings.cells)]) {
         if (!layout?.configuration) continue;
         delete layout.configuration.fast_link_contention;
+        if(spec?.optical_link_model)inheritCellBudget(layout.configuration,spec.link_profiles.cell_isl);
         if (!capabilities||layout.configuration.compute_mode===mode) continue;
         const members=layout.configuration.hardware.satellite_ids;
         const draft=sceneCellDraft(capabilities,members,mode,layout);
@@ -163,6 +173,7 @@ export function physicalPayload(network, mode, epStrategy, capabilities, linkBan
         const ids = memberIds(formation,key,cellGeometry(formation,key));
         const config = bindLayout(saved,ids).configuration;
         const links = config.topology.inter_satellite.links.map(link => {
+          if(spec.optical_link_model)return {source:link.source,target:link.target,profile_id:'cell_isl'};
           const profile = {...spec.link_profiles.cell_isl, capacity_model:link.mode || 'islsim'};
           if (profile.capacity_model === 'fixed') {
             profile.bandwidth_bps = link.bandwidth_gbps * 1e9;
@@ -183,6 +194,18 @@ export function physicalPayload(network, mode, epStrategy, capabilities, linkBan
       }
       delete formation.compute_parameters;
     }
+  }
+  if (spec?.optical_link_model) {
+    const profiles=spec.link_profiles;
+    for (const kind of ['communication_isl','cross_layer','cell_isl','inter_cell']) {
+      if (spec.optical_link_model==='fixed') {
+        delete profiles[kind].islsim_config;
+        delete profiles[kind].islsim_source_sha256;
+      }
+    }
+    const directions=['user_uplink','user_downlink','feeder_uplink','feeder_downlink'];
+    profiles.sgl.bandwidth_bps=Math.max(...directions.map(key=>profiles[key].bandwidth_bps));
+    for (const k of directions) profiles[k].setup_time_s=profiles.sgl.setup_time_s;
   }
   const compute_configuration={mode,ep_strategy:epStrategy,formations};
   if (mode==='fast_mode') compute_configuration.link_bandwidth_factors=linkBandwidthFactors;

@@ -71,7 +71,7 @@ class SnapshotSource(NetworkState):
         )
         if value["trace_id"] != self.physical_attributes.metadata["trace_id"]:
             raise ValueError("snapshot store trace mismatch")
-        self.spec = NetworkSpec.from_value(value["network"])
+        self.spec = NetworkSpec.from_recording(value["network"])
         self.nodes = {n.node_id: n for n in self.spec.nodes}
         self._snapshot_catalog = value["nodes"]
         self.node_indices = {

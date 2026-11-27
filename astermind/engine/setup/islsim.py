@@ -184,11 +184,47 @@ def calculate(profile, distance_km):
                 receiver_model='external_islsim_unmodified')
 
 
+OPTICAL_LINKS = ('communication_isl', 'cross_layer', 'cell_isl', 'inter_cell')
+RF_DIRECTIONS = ('user_uplink', 'user_downlink', 'feeder_uplink', 'feeder_downlink')
+
+
 def freeze_profiles(network, *, bind_islsim=False):
     """Default user-facing ISLs to ISLSim; preserve explicitly selected models."""
     value = deepcopy(network)
     profiles = value.get('link_profiles', {})
+    mode = value.get('optical_link_model')
     gsl = {'sgl'}
+    if mode is not None:
+        if mode not in ('fixed', 'islsim'):
+            raise ValueError('optical_link_model must be fixed or islsim')
+        if not set((*OPTICAL_LINKS, *RF_DIRECTIONS, 'sgl')) <= profiles.keys():
+            raise ValueError('Unified link budgets require four optical and four directional RF profiles')
+        gsl.update(RF_DIRECTIONS)
+        for kind in OPTICAL_LINKS:
+            profile = profiles[kind]
+            if not isinstance(profile, dict):
+                if profile.capacity_model != mode:
+                    raise ValueError('Optical link profile conflicts with the scene model')
+                continue
+            profile['capacity_model'] = mode
+            if mode == 'islsim':
+                # Apply the scene ceiling once, after the native optical calculation.
+                profile.setdefault('islsim_config', {}).setdefault('rx', {})['terminal_cap_gbps'] = None
+            else:
+                profile.pop('islsim_config', None)
+                profile.pop('islsim_source_sha256', None)
+        ground = profiles['sgl']
+        if isinstance(ground, dict) and all(isinstance(profiles[k], dict) for k in RF_DIRECTIONS):
+            ground['bandwidth_bps'] = max(profiles[k]['bandwidth_bps'] for k in RF_DIRECTIONS)
+            ground['capacity_model'] = 'fixed'
+            for kind in RF_DIRECTIONS:
+                profiles[kind]['setup_time_s'] = ground['setup_time_s']
+        for kind in RF_DIRECTIONS:
+            profile = profiles[kind]
+            model = profile.get('capacity_model', 'fixed') if isinstance(profile, dict) else profile.capacity_model
+            if model not in ('fixed', 'free_space_shannon'):
+                raise ValueError(f'{kind} requires a directional RF budget')
+
     for profile in profiles.values():
         if isinstance(profile, dict):
             gsl.update(p for p in (profile.get('uplink_profile'), profile.get('downlink_profile')) if p)

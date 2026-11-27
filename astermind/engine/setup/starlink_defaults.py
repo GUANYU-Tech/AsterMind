@@ -63,8 +63,7 @@ def simulation_defaults(generation, *, report_2025=False):
             assumptions=[
                 '公开光口标称 200 / 400 Gbps 的单双向口径未明确，默认按双向合计保守解释，每方向 100 / 200 Gbps；可在场景中修改。',
                 '每方向光口工程上限同时传入 ISLSim terminal_cap_gbps；功率、口径、波特率、调制池等未公开项继承选定的 ISLSim 配置，可在本场景覆盖，不代表 Starlink 实测参数。',
-                '默认使用外部 ISLSim 的 tx/rx/channel 配置计算速率；3 s 建链与 6000 km 限距为 OrbitServe 场景假设。',
-                '光子预算参数仅供显式选择 optical_photon_budget 时使用；ISLSim 使用 islsim_config。'])
+                '默认使用外部 ISLSim 的 tx/rx/channel 配置计算速率；3 s 建链与 6000 km 限距为 OrbitServe 场景假设。'])
     }
     for kind in ('feeder_uplink', 'feeder_downlink'):
         profiles[kind]['parameter_sources'].append(FCC_E)

@@ -55,7 +55,12 @@
   </details>
   <div id="grounds"></div><div id="access" class="fields"></div>
 </section>
-<section data-panel="links" hidden><h2>计算卫星—通信卫星建链规则</h2><p>设置跨层接入；切换策略在“地面站”中配置。</p><div id="connections" class="fields"></div><h2>按每个方向计算的物理链路预算</h2><p>通用链路预算。壳层专属预算可在“通信星座”中修改。</p><div id="budgets"></div><section id="fastLinkBudget" hidden></section></section>
+<section data-panel="links" hidden>
+  <h2>连接与链路预算</h2>
+  <div id="connections" class="fields"></div>
+  <p id="budgetMigration" hidden>旧版配置已载入。请核对统一预算后另存，原实验保留原始数据。</p>
+  <div id="budgets"></div><section id="fastLinkBudget" hidden></section>
+</section>
 <details><summary>完整物理模型 JSON</summary><div id="json"></div></details><p id="status" role="status"></p><p id="scenarioNote" role="status" hidden></p><div class="actions sticky"><button id="save">保存配置草稿</button><button id="preview">生成并预览</button><button id="next" class="primary">生成数据并继续 →</button></div><dialog id="addFormation" class="formation-dialog" aria-labelledby="addFormationTitle"><form><h2 id="addFormationTitle">添加计算星座</h2>
 <label>星座 ID<input name="formationName" required></label><label>Cell 数量<input name="cellCount" type="number" min="1" step="1" required value="2"></label>
 <p>新星座从一个轨道面开始，可在星座参数中调整轨道面和每面 Cell 数。</p><div class="actions"><button type="button" id="cancelFormation">取消</button><button type="submit" class="primary">添加星座</button></div></form></dialog></main><script type="module" src="/assets/physical_editor.js"></script></html>
