@@ -57,8 +57,8 @@ def decorate_document(content: bytes, path: str) -> bytes:
         current = ' aria-current="page"' if current_path == href.split('?')[0] else ''
         rows.append(f'<a href="{escape(href, quote=True)}"{current}><b aria-hidden="true">{number}</b>{label}</a>')
     caption = '太空智算系统仿真平台' if path == '/platform' else '仿真任务工作台'
-    parent = {'/platform': '/', '/workspace': '/platform'}.get(path, '/workspace')
-    home = ' data-project-home' if path == '/platform' else ''
+    parent = {'/platform': 'https://guanyu-tech.github.io/AsterMind/', '/workspace': '/platform'}.get(path, '/workspace')
+    home = ' data-project-home target="_blank" rel="noopener noreferrer"' if path == '/platform' else ''
     shell = (f'<header class="studio-topbar"><a class="studio-logo" href="{parent}"{home}>'
              '<span class="studio-mark" aria-hidden="true">✧</span>AsterMind <em>星鉴</em></a>'
              f'<span>{caption}</span><a class="studio-local" href="/platform">'

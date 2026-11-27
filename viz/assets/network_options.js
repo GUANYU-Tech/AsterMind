@@ -17,6 +17,7 @@ export function sourceFields(parent,card,obj,compute,render,sync,parametersOnly=
   const options=[['walker_delta','Walker 参数'],['dawn_dusk','晨昏太阳同步轨道']];
   if(!parametersOnly)options.push(['tle','TLE 实测轨道']);
   const source=field(parent,obj,'source.type',parametersOnly?'轨道模型':'轨道来源','text',options);
+  source.dataset.orbitSource='';
   source.addEventListener('change',()=>{
     const s=obj.source;
     if(!compute && s.type==='tle'){s.satellites_per_plane??=1;s.planes??=1}

@@ -2,13 +2,9 @@
 
 ## OrbitServe integration
 
-Start the platform from the repository root with `python -B -m viz` using
-the environment described in [the frontend guide](../README.md). The project
-homepage is served at `/` (Chinese) and `/en/` (English). Previous `/zh/`
-links explicitly select Chinese. The homepage and simulation views share the selected
-language across navigation, reloads and open tabs on the same origin. The homepage's
-primary button jumps to Download & Install. The workspace selector is available at
-`/platform`. The standalone static preview below serves only the homepage files.
+The project website is built independently for GitHub Pages. To run the simulator,
+follow the [frontend guide](../README.md) and open [the local workspace selector](http://localhost:8766/).
+Both simulation workspaces are available directly when the service starts.
 
 Static bilingual research homepage inspired by the layout of
 https://thu-nics.github.io/uni3sim-website/ and using GUANYU brand guidance.

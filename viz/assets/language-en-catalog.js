@@ -97,6 +97,7 @@ export const phrases = {
   "SU 间单跳时延": "Inter-SU single-hop latency",
   "每个 SU 通过一条上联接入同一个卫星出口。跨域通信经过源 SU 和目的 SU 的两条上联。下方可设置每条上联的单向带宽和单跳时延。": "Each SU has one uplink to the same satellite egress. Traffic between two SUs traverses both their uplinks. Set the one-way bandwidth and single-hop latency per uplink below.",
   "当前每星只有一个 SU 域，无需跨域上联。": "Each satellite has one SU domain. No inter-SU uplink is needed.",
+  "项目官网": "Project website",
   "返回项目首页": "Back to project home",
   "← 返回仿真平台": "← Back to simulation platform",
   "配置计算星座与算力编队 →": "Configure Compute Constellations and Cells →",

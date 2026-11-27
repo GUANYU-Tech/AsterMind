@@ -17,14 +17,13 @@ function upload(title, id, accept) {
 }
 export function buildWorkspace({sceneCell=false}={}) {
   const rail = document.querySelector("#chapter-rail"), shell = document.querySelector("#config-shell");
-  const titles=stageNames.map((title,i)=>sceneCell && stages[i]==='workload'?'模型':title);
   stages.forEach((name, i) => {
     const button = action(""); button.className = ""; button.dataset.stageTarget = name;
-    button.append(element("b", String(i + 1).padStart(2, "0")), element("span", titles[i])); rail.append(button);
+    button.append(element("b", String(i + 1).padStart(2, "0")), element("span", stageNames[i])); rail.append(button);
     if (name === "analysis") return;
     const panel = element("section", undefined, "config-panel"); panel.dataset.panel = name; panel.hidden = true;
     const header = element("header", undefined, "panel-header"), heading = element("div");
-    heading.append(element("span", `${["RESOURCES","NETWORK",sceneCell?"MODEL":"WORKLOAD","DEPLOYMENT","RUNTIME"][i]} / 0${i + 1}`, "eyebrow"), element("h1", titles[i]));
+    heading.append(element("span", `${["RESOURCES","NETWORK","WORKLOAD","DEPLOYMENT","RUNTIME"][i]} / 0${i + 1}`, "eyebrow"), element("h1", stageNames[i]));
     const close = action("×", null, "panel-close icon-button"); close.dataset.action = "home"; close.setAttribute("aria-label", "关闭配置"); header.append(heading, close);
     const scroll = element("div", undefined, "panel-scroll");
     if (name === 'deployment') {
@@ -78,7 +77,7 @@ export function buildWorkspace({sceneCell=false}={}) {
     }
     const footer = element("div", undefined, `panel-actions${i === 0 ? " panel-actions-single" : ""}`);
     if (i) { const back = action("← 上一步", null, "back-action"); back.dataset.stageTarget = stages[i - 1]; footer.append(back); }
-    const next = action("", i === 4 ? "run-simulation" : null, "primary-action"); next.append(element("span", i === 4 ? "发布任务" : `进入${titles[i + 1]}`)); if (i !== 4) next.dataset.stageTarget = stages[i + 1]; footer.append(next);
+    const next = action("", i === 4 ? "run-simulation" : null, "primary-action"); next.append(element("span", i === 4 ? "发布任务" : `进入${stageNames[i + 1]}`)); if (i !== 4) next.dataset.stageTarget = stages[i + 1]; footer.append(next);
     panel.append(header, scroll, footer); shell.append(panel);
   });
 }

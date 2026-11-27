@@ -19,6 +19,7 @@ let capabilities, epStrategy='auto';
 const linkBudget=createFastLinkBudget($('fastLinkBudget'));
 $('computeMode').addEventListener('change',()=>sync());
 const selectedCell=sceneQuery.get('cell');
+const orbitPanels=new WeakMap();
 const selectedFormation=()=>[...config.constellations.compute_formations].sort((a,b)=>b.name.length-a.name.length)
  .find(formation=>selectedCell?.startsWith(formation.name+'-'));
 for (const [containerId, buttonId] of [['shells','addShell'],['cells','addCell']]) {
@@ -101,14 +102,23 @@ config.constellations.compute_formations.forEach((cell,i)=>{
 const {card,fields}=group($('cells'),'计算星座 '+(i+1)+' · '+cell.name);
 card.dataset.formationName=cell.name;
 const list=document.createElement('div');list.className='formation-cell-list';card.insertBefore(list,fields);
-const advanced=document.createElement('details');const caption=document.createElement('summary');caption.textContent='星座轨道与接入参数';advanced.append(caption,fields);card.append(advanced);
+let advanced=orbitPanels.get(cell);
+if(!advanced){
+  advanced=document.createElement('details');
+  orbitPanels.set(cell,advanced);
+}
+const caption=document.createElement('summary');caption.textContent='星座轨道与接入参数';advanced.replaceChildren(caption,fields);card.append(advanced);
 const identity=field(fields,cell,'name','星座 ID','text');identity.required=true;
 identity.addEventListener('change',()=>{
  const old=card.dataset.formationName;
  if(cell.cell_overrides)cell.cell_overrides=Object.fromEntries(Object.entries(cell.cell_overrides).map(([id,v])=>[cell.name+id.slice(old.length),v]));
  render();
 });
-sourceFields(fields,advanced,cell,true,render,()=>{render()});
+sourceFields(fields,advanced,cell,true,()=>{
+  const restoreFocus=document.activeElement===advanced.querySelector('[data-orbit-source]');
+  render();
+  if(restoreFocus)advanced.querySelector('[data-orbit-source]').focus({preventScroll:true});
+},render);
 const refreshList=()=>showCellList(list,cell,capabilities,()=>({
  mode:$('computeMode').value, epStrategy, linkProfile:config.network.link_profiles.cell_isl,
   cellLinkOverrides:config.network.cell_link_overrides,

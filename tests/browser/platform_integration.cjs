@@ -1,4 +1,4 @@
-// Verify the homepage against the running worktree, including its compute backend.
+// Verify the local simulator entry and both workspaces against the running backend.
 const assert = require('node:assert/strict');
 const { execFileSync } = require('node:child_process');
 const path = require('node:path');
@@ -124,16 +124,10 @@ async function main() {
       await page.locator('.studio-logo').click();
       await page.waitForURL(baseURL + destination);
     };
+    await page.goto('/');
+    await page.waitForURL(baseURL + '/platform');
+    assert.equal(await page.locator('a.portal-card').count(), 2);
     await page.goto('/en/');
-    assert.ok(await page.locator('img.brand-mark').evaluate(img => img.complete && img.naturalWidth > 0));
-    assert.equal(await page.locator('#pdf').isVisible(), false);
-    const reportResponse = page.waitForResponse(response => response.url().endsWith('/AsterMind-V1-Tech-Report.pdf'));
-    await page.locator('#report-link').click();
-    assert.equal((await reportResponse).headers()['content-type'], 'application/pdf');
-    assert.ok(await page.locator('#pdf iframe').isVisible());
-    await page.locator('#pdf a[href="#report-link"]').click();
-    assert.equal(await page.locator('#pdf').isVisible(), false);
-    await page.locator('.hero a[href="/platform"]').click();
     await language('en');
     await page.locator('.portal-card[href="/cell/"]').click();
     await language('en');
@@ -182,7 +176,7 @@ async function main() {
     assert.ok(rows.length > 0 && rows.every(row => row.includes('星座模板')));
     await back('/workspace');
     await back('/platform');
-    await back('/');
+    assert.equal(await page.locator('.studio-logo').getAttribute('href'), 'https://guanyu-tech.github.io/AsterMind/');
     await language('zh-CN');
     await checkSavedInterconnects(page, caps.default_configuration);
     assert.deepEqual(errors, []);

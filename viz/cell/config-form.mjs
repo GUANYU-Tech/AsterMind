@@ -1,5 +1,5 @@
 import { fieldStage, hardwareForPool, visibleField } from "./config-layout.mjs?v=compact-2";
-import { labels, optionLabels } from "./config-labels.mjs?v=compact-2";
+import { labels, modelDisplayName, optionLabels } from "./config-labels.mjs?v=compact-2";
 import { fieldError } from "./config-validation.mjs?v=validation-1";
 import { enhanceSelects } from "../assets/design-controls.js";
 import {linkMode, setLinkMode} from './link-mode.mjs';
@@ -267,12 +267,15 @@ export function renderConfigForm(container, root, keys, schema, onChange, choice
       const strict = ["topology.source", "model", "requests.source", "requests.synthetic.arrival_distribution"].includes(full);
       const values = strict ? options : [...new Set([...options, value])];
       if (strict && !values.includes(value)) {
-        const label = full === "model" ? `${choices.optionLabels?.[value] || value}（当前模式或卡型不支持）` : "已载入的外部配置";
+        const label = full === "model" ? `${modelDisplayName(choices.optionLabels?.[value] || value)}（当前模式或卡型不支持）` : "已载入的外部配置";
         const old = el("option", label); old.value = value; old.disabled = true; input.append(old);
       }
       for (const option of values) {
         if (option === null) continue;
-        const n = el("option", choices.optionLabels?.[option] || optionLabels[option] || (option === "" ? "默认" : String(option))); n.value = option; input.append(n);
+        const label = choices.optionLabels?.[option] || optionLabels[option] || (option === "" ? "默认" : String(option));
+        const n = el("option", key === "model" ? modelDisplayName(label) : label);
+        n.value = option;
+        input.append(n);
       }
       input.value = value;
     } else if (typeof value === "boolean") { input.type = "checkbox"; input.checked = value; }
