@@ -94,7 +94,11 @@ html[lang=zh-CN] .hero h1{font-size:clamp(38px,4.4vw,58px);line-height:1.22;lett
   gap: 16px 24px;
 }
 .install-windows p { margin-top: 4px; }
-.windows-preview {
+.windows-poster {
+  display: block;
+  width: 100%;
+}
+.windows-poster img {
   display: block;
   width: 100%;
   height: auto;

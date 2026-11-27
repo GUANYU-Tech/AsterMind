@@ -6,9 +6,9 @@ Start the platform from the repository root with `python -B -m viz` using
 the environment described in [the frontend guide](../README.md). The project
 homepage is served at `/` (Chinese) and `/en/` (English). Previous `/zh/`
 links explicitly select Chinese. The homepage and simulation views share the selected
-language across navigation, reloads and open tabs on the same origin. Both primary
-buttons open the workspace selector at `/platform`. The standalone static
-preview below serves only the homepage files.
+language across navigation, reloads and open tabs on the same origin. The homepage's
+primary button jumps to Download & Install. The workspace selector is available at
+`/platform`. The standalone static preview below serves only the homepage files.
 
 Static bilingual research homepage inspired by the layout of
 https://thu-nics.github.io/uni3sim-website/ and using GUANYU brand guidance.
@@ -34,11 +34,10 @@ From the repository root, build into a fresh directory outside the checkout.
 python3 viz/homepage/build.py --pages-dir ../astermind-website
 ```
 
-The export contains both languages, the brand images and a copy of the
-[technical report](../../doc/AsterMind-V1-Tech-Report.pdf). Update the PDF in
-`doc/` when a new report is available. “Enter simulation platform” leads to the on-page setup guide.
-The integrated homepage continues to open the simulator at `/platform`.
-The report opens inline at `#pdf` and loads on first use.
+The export contains both languages, the brand images, the desktop and mobile
+Chinese posters, and a copy of the [technical report](../../doc/AsterMind-V1-Tech-Report.pdf).
+Update the PDF in `doc/` when a new report is available. The report opens inline
+at `#pdf` and loads on first use.
 
 The [Pages workflow](../../.github/workflows/pages.yml) builds both languages
 on pull requests and deploys the static export when homepage or report changes
@@ -68,8 +67,8 @@ Chinese and [English](https://guanyu-tech.github.io/AsterMind/en/).
 
 ## Scope and content
 
-The homepage introduces the project. The platform button opens the existing
-workspace selector. The diagrams illustrate request stages. Repository examples are starting points, not performance claims.
+The homepage introduces the project and provides download and installation
+instructions. The diagrams illustrate request stages. Repository examples are starting points, not performance claims.
 Content is grounded in the version/AsterMind-V1.0 source inspected for the
 initial homepage (a1baab7). No authors, paper URL, benchmark data, or partnership
 claims have been invented.

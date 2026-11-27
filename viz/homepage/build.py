@@ -10,19 +10,20 @@ REPORT = ROOT.parents[1] / 'doc' / 'AsterMind-V1-Tech-Report.pdf'
 REPO = 'https://github.com/GUANYU-Tech/AsterMind'
 PREVIEW_TAG = 'v1.0.0-preview.9'
 WINDOWS_INSTALLER = f'{REPO}/releases/download/{PREVIEW_TAG}/AsterMind-v1.0-Windows-x64-Setup.exe'
+LANDSCAPE_POSTER = 'assets/astermind-landscape-poster-zh.png'
+VERTICAL_POSTER = 'assets/astermind-vertical-poster-zh.png'
 COPY = {
 'en': {
 'lang':'en','skip':'Skip to content','menu':'Menu','nav':['Background','Framework','Interactive diagrams','Examples','About'],
-'eyebrow':'GUANYU · SPACE COMPUTING RESEARCH',
+'eyebrow':'GUANYU and developers are building an open digital testbed for space computing',
 'title':['Open-source simulation','for space computing systems'],
-'desc':'Connect <strong>orbital dynamics, distributed compute, and communication</strong> to understand end-to-end LLM serving across satellite Compute Cells.',
-'platform':'Enter simulation platform',
-'actions':['Start with the background','Explore the framework','GitHub'],
+'desc':'Connect <strong>orbital dynamics, distributed compute, and communication</strong> to <strong>evaluate on-orbit LLM serving at the system level, from single satellites to formations and constellations</strong>.',
+'actions':['Background','Framework','GitHub'],
 'report':'Technical Report','collapse':'Collapse','close_report':'Collapse report',
 'dimensions':['Orbital geometry','Distributed compute','Communication','System evaluation'],
 'dimsub':['Positions & connectivity','Model, hardware & parallelism','Protocols & shared resources','Latency, throughput & traces'],
 'promise':'Physical configuration · Event-driven execution · Interpretable serving behavior',
-'background':['FROM CONSTELLATIONS TO COMPUTE CELLS','Space computing is<br>a system-level question.','Faster accelerators are only part of the answer. Satellites move, models span devices, and requests share network resources.'],
+'background':['FROM COMPUTE FORMATIONS TO CONSTELLATIONS','Space computing is<br>a system-level question.','Faster accelerators are only part of the answer. Satellites move, models span devices, and requests share network resources.'],
 'challenges':[
 ['A moving network','Distance, visibility, and link availability evolve with orbital geometry. The physical scene defines the resources that execution can use.'],
 ['A distributed model','Model ranks span accelerators and satellites. Kernel dependencies, parallel deployment, and collective communication shape progress.'],
@@ -46,7 +47,7 @@ COPY = {
 'play':'Play','pause':'Pause','restart':'Restart from the beginning',
 'models':['INTERPRETABLE PERFORMANCE MODELING','Compute and communication.<br>Connected by dependencies.','Model execution time and data movement together to explain where the system spends time.'],
 'modelcards':[
-['COMPUTE','From a batch to kernel time.','Midlayer or Roofline is selected as the global compute mode. Model configuration, hardware profiles, and supported parallel deployments determine the execution path.'],
+['COMPUTE','From a batch to kernel time.','Choose Fast Mode or Detail Mode. Model configuration, hardware profiles, and supported parallel deployments determine the execution path.'],
 ['COMMUNICATION','Protocol-aware latency.<br>Resource-aware progress.','Communication combines protocol-aware estimates with flow-level resource sharing where applicable. Cross-satellite transfers consume the capacity of their paths and shared resources.']],
 'outputcards':[['TTFT','Time to first token','Trace the path from request arrival to the first returned output token.'],['TOKEN TIMING','Decode progress','Inspect output-token timing alongside scheduling, computation, and communication events.'],['THROUGHPUT','System-level output','Interpret serving throughput together with request completion and execution traces.']],
 'examples':['CASE STUDIES','Three scenarios for<br>inference in orbit.','Compare satellite links, task assignment and request scheduling.'],
@@ -54,9 +55,9 @@ COPY = {
 ['CASE STUDY I · COMPUTE FORMATION','How should satellites in a formation connect?', 'With the same total bandwidth, direct links between satellites that often exchange data can shorten inference latency.', ('Ring', '→', 'Full mesh')],
 ['CASE STUDY II · CONSTELLATION ACCESS AND LOAD DISTRIBUTION','When ground sites send requests at once, how can the constellation serve more of them?', 'Relays can ease local congestion by sending tasks to cells with spare capacity.', ('Relay', '→', 'Cell')],
 ['CASE STUDY III · MULTI-TURN INFERENCE SCHEDULING','How can users get a faster response to a follow-up?', 'Keeping follow-ups on the same cell lets it reuse cached context and return the first token sooner in long conversations.', ('Ground', '⇄', 'Cell')]],
-'start':['GET STARTED','Build on AsterMind.','Run the Windows prerelease installer or clone the source from GitHub and build it yourself.'],
+'start':['Download & Install','Build on AsterMind.','Run the Windows prerelease installer or clone the source from GitHub and build it yourself.'],
 'windows':'Windows installer','windowsnote':'Windows 11 x64 · Prerelease',
-'windows_preview_alt':'AsterMind for Windows showing the full-scenario and compute formation simulation workspaces in Chinese.',
+'poster_alt':'AsterMind project poster in Chinese.',
 'guide':'Linux: Install from source','download':'Download the Windows x64 installer',
 'codehead':'Clone, build and run','copy':'Copy commands','copied':'Copied','copystatus':'Setup commands copied.','copyfail':'Select code to copy','copyfailstatus':'Clipboard unavailable. Select and copy the commands below.',
 'about':['ABOUT THE PROJECT','Exploring Space Computing','GUANYU and developers are building an open digital testbed for space computing.'],
@@ -64,16 +65,15 @@ COPY = {
 },
 'zh': {
 'lang':'zh-CN','skip':'跳转到正文','menu':'菜单','nav':['研究背景','整体框架','交互图解','场景示例','关于项目'],
-'eyebrow':'观宇芯算 · 太空计算研究',
+'eyebrow':'观宇，与开发者共同构建太空智算的开放数字试验场',
 'title':['面向太空智算系统的','开源仿真平台'],
-'desc':'连接<strong>轨道动态、分布式计算与通信</strong>，<br class="desktop-break">理解卫星计算编队中大模型推理的端到端服务性能。',
-'platform':'进入仿真平台',
-'actions':['了解研究背景','探索整体框架','GitHub'],
+'desc':'连接<strong>轨道动态、分布式计算与通信</strong>，<br class="desktop-break"><strong>为在轨大模型服务提供从单星、编队到星座的系统级评估工具</strong>。',
+'actions':['研究背景','整体框架','GitHub'],
 'report':'技术报告','collapse':'收起','close_report':'收起报告',
 'dimensions':['轨道几何','分布式计算','通信建模','系统评估'],
 'dimsub':['位置与连接关系','模型、硬件与并行部署','协议与共享资源','时延、吞吐与执行轨迹'],
 'promise':'物理场景配置 · 事件驱动执行 · 可解释的推理服务行为',
-'background':['从星座到计算编队','太空智算，<br>是一个系统级问题。','更快的加速器只是其中一环。卫星持续运动，模型跨设备部署，请求共同使用有限的网络资源。'],
+'background':['从计算编队到星座','太空智算，<br>是一个系统级问题。','更快的加速器只是其中一环。卫星持续运动，模型跨设备部署，请求共同使用有限的网络资源。'],
 'challenges':[
 ['持续变化的网络','轨道几何影响距离、可见性与链路可用性。物理场景决定仿真执行时能够使用哪些资源。'],
 ['分布式部署的模型','模型各个 rank 分布在加速器和卫星上，算子依赖、并行部署与集合通信共同影响执行进度。'],
@@ -97,7 +97,7 @@ COPY = {
 'play':'播放','pause':'暂停','restart':'从头播放',
 'models':['可解释的性能建模','计算与通信，<br>通过依赖关系连接。','联合建模执行时间与数据传输，理解时间消耗在系统的哪些环节。'],
 'modelcards':[
-['计算建模','从调度批次，到算子耗时。','全局选择 Midlayer 或 Roofline 计算模式，由模型配置、硬件档案与受支持的并行部署共同决定执行路径。'],
+['计算建模','从调度批次，到算子耗时。','选择 Fast Mode 或 Detail Mode，由模型配置、硬件档案与受支持的并行部署共同决定执行路径。'],
 ['通信建模','协议感知的时延，<br>资源约束下的进度。','通信在适用路径上结合协议感知时延估计与流级资源共享。跨星传输消耗所经路径和共享资源的容量。']],
 'outputcards':[['TTFT','首 Token 时延','跟踪从请求到达，到首个输出 Token 返回的完整路径。'],['TOKEN 时间','Decode 执行进度','结合调度、计算与通信事件，观察输出 Token 的时间信息。'],['吞吐量','系统级输出','将服务吞吐与请求完成状态、执行轨迹结合起来分析。']],
 'examples':['研究案例','用三个场景，<br>研究在轨推理。','比较星间互联、任务分配与请求调度。'],
@@ -105,9 +105,9 @@ COPY = {
 ['案例 I · 算力编队','编队内的卫星如何互联？','总带宽相同时，让频繁通信的卫星直连可缩短推理时延。', ('环形', '→', '全连接')],
 ['案例 II · 星座接入与分流','多地任务同时到达，星座怎样承接更多请求？','中继星把任务分给仍有余量的编队，可缓解局部拥塞。', ('中继星', '→', '服务单元')],
 ['案例 III · 多轮推理调度','用户连续追问时，怎样缩短等待？','让同一编队接续对话，可复用上下文缓存，让长对话更早返回首个 Token。', ('地面站', '⇄', '编队')]],
-'start':['开始使用','基于 AsterMind，开展研究。','提供Windows 上运行预发布安装包，或从 GitHub 克隆源码并构建'],
+'start':['下载与安装','基于 AsterMind，开展研究。','在 Windows 上运行预发布安装包，或从 GitHub 克隆源码并构建。'],
 'windows':'Windows 安装包','windowsnote':'Windows 11 x64 · 预发布版',
-'windows_preview_alt':'AsterMind Windows 桌面首页，展示「完整场景仿真」与「算力编队仿真」两个工作区。',
+'poster_alt':'AsterMind 中文项目海报。',
 'guide':'Linux：从源码安装','download':'下载 Windows x64 安装包',
 'codehead':'克隆、构建与启动','copy':'复制命令','copied':'已复制','copystatus':'安装命令已复制。','copyfail':'选中代码复制','copyfailstatus':'剪贴板不可用，请选中并复制下方命令。',
 'about':['关于项目','探索太空智算','观宇，与开发者共同构建太空智算的开放数字试验场'],
@@ -140,7 +140,7 @@ if args.pages_dir is not None:
         parser.error('Use a separate directory for the Pages export.')
     (output / 'assets').mkdir(parents=True, exist_ok=True)
     for name in ('style.css', 'app.js', 'language.js', 'assets/guanyu-logo.png',
-                 'assets/astermind-mark.png', 'assets/astermind-windows-home.jpg'):
+                 'assets/astermind-mark.png', LANDSCAPE_POSTER, VERTICAL_POSTER):
         copyfile(ROOT / 'dist' / name, output / name)
     (output / '.nojekyll').touch()
 
@@ -150,7 +150,6 @@ for lang,d in COPY.items():
     prefix='../' if lang=='en' else './'
     alternate='../' if lang=='en' else './en/'
     report_url = prefix + 'assets/AsterMind-V1-Tech-Report.pdf'
-    start_href = '/platform' if args.pages_dir is None else '#start'
     company = ('<span class="company-name" lang="en">GUANYU</span>' if lang == 'en' else
                f'<img src="{prefix}assets/guanyu-logo.png" width="1903" height="784" alt="观宇芯算 GUANYU">')
     nav=''.join(f'<a href="#{anchor}">{name}</a>' for anchor,name in zip(['background','framework','modeling','examples','about'],d['nav']))
@@ -182,12 +181,24 @@ for lang,d in COPY.items():
 <link rel="icon" type="image/png" href="{prefix}assets/guanyu-logo.png"><link rel="stylesheet" href="{prefix}style.css"><script defer src="{prefix}language.js"></script><script defer src="{prefix}app.js"></script>
 </head><body><a class="skip" href="#main">{d['skip']}</a>
 <header class="header"><div class="nav-wrap"><a class="brand" href="#top" aria-label="{'GUANYU' if lang=='en' else '观宇芯算'} · AsterMind V1.0">{company}<span class="brand-divider"></span><span class="brand-product"><img class="brand-mark" src="{prefix}assets/astermind-mark.png" width="876" height="728" alt="">AsterMind</span></a><div class="nav-right"><nav id="nav" aria-label="{d['menu']}">{nav}</nav><a id="language" class="language" href="{alternate}" lang="{'en' if lang=='zh' else 'zh-CN'}" aria-label="{'Switch to English' if lang=='zh' else '切换到中文版'}"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><ellipse cx="12" cy="12" rx="4" ry="9"/><path d="M3 12h18"/></svg>{'EN' if lang=='zh' else '中文'}</a><button id="menu" class="menu" aria-expanded="false" aria-controls="nav">{d['menu']}</button></div></div></header>
-<main id="main"><section class="hero" id="top"><div class="orbital-lines" aria-hidden="true"></div><div class="container hero-content"><p class="eyebrow">{d['eyebrow']}</p><h1><span class="project-title">AsterMind <span class="version">V1.0</span></span><span>{d['title'][0]}</span><span class="silver-title">{d['title'][1]}</span></h1><p class="hero-description">{d['desc']}</p><div class="actions"><a class="button primary" href="{start_href}">{d['platform']}</a><a class="button secondary" href="#background">{d['actions'][0]}</a><a class="button secondary" href="#framework">{d['actions'][1]}</a>{external(REPO,d['actions'][2],'button secondary github')}<a class="button secondary" id="report-link" href="#pdf" aria-controls="pdf">{d['report']}</a></div><div class="dimensions">{hero}</div><p class="hero-note">{d['promise']}</p></div></section>
+<main id="main"><section class="hero" id="top"><div class="orbital-lines" aria-hidden="true"></div><div class="container hero-content"><p class="eyebrow">{d['eyebrow']}</p><h1><span class="project-title">AsterMind <span class="version">V1.0</span></span><span>{d['title'][0]}</span><span class="silver-title">{d['title'][1]}</span></h1><p class="hero-description">{d['desc']}</p><div class="actions"><a class="button primary" href="#start">{d['start'][0]}</a><a class="button secondary" href="#background">{d['actions'][0]}</a><a class="button secondary" href="#framework">{d['actions'][1]}</a>{external(REPO,d['actions'][2],'button secondary github')}<a class="button secondary" id="report-link" href="#pdf" aria-controls="pdf">{d['report']}</a></div><div class="dimensions">{hero}</div><p class="hero-note">{d['promise']}</p></div></section>
 <section id="pdf" class="container report" aria-labelledby="report-link" tabindex="-1">
 <a class="report-close" href="#report-link" aria-label="{d['close_report']}"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="m3 10 5-5 5 5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>{d['collapse']}</a>
 <template id="report-viewer"><iframe src="{report_url}" title="AsterMind V1.0 · {d['report']}"></iframe></template>
 <noscript><a class="text-link" href="{report_url}">{d['report']}</a></noscript>
 </section>
+<section class="section muted" id="start"><div class="container">{heading(d['start'])}
+<div class="getting-started">
+<article class="install-windows">
+<div><h3>{d['windows']}</h3><p><small>{d['windowsnote']}</small></p></div>
+{external(WINDOWS_INSTALLER,d['download'],'button primary')}
+<picture class="windows-poster">
+<source media="(max-width: 560px)" srcset="{prefix}{VERTICAL_POSTER}" width="1280" height="1706">
+<img src="{prefix}{LANDSCAPE_POSTER}" alt="{d['poster_alt']}" width="1440" height="810" loading="lazy" decoding="async">
+</picture></article>
+<article class="install-source"><h3>{d['guide']}</h3>
+<div class="code-panel"><div class="code-top"><span>{d['codehead']}</span><button id="copy-code">{d['copy']}</button></div><pre><code id="setup-code">{escape(setup)}</code></pre><span class="sr-only" role="status" id="copy-status"></span></div></article>
+</div></div></section>
 <section class="section container" id="background">{heading(d['background'])}<div class="challenges">{challenges}</div><div class="statement">{d['statement']}</div></section>
 <section class="section muted" id="framework"><div class="container">{heading(d['framework'])}<div class="architecture"><article class="builder"><header><h3>Builder</h3><span>{d['builder']}</span></header>{brows}</article><div class="arch-bridge" aria-hidden="true">→</div><article class="engine"><header><h3>Engine</h3><span>{d['engine']}</span></header><div class="engine-models"><div><h4>{d['compute']}</h4><p>Midlayer / Roofline</p></div><div><h4>{d['comm']}</h4><p>{d['commshort']}</p></div></div><div class="runtime">{''.join(f'<span>{v}</span>' for v in d['runtime'])}</div><div class="timeline"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 6v6l4 2"/></svg><div><h4>{d['clock'][0]}</h4><p>{d['clock'][1]}</p></div></div></article></div><div class="arch-output"><span class="eyebrow">{d['observe']}</span><p>{' <span aria-hidden="true">/</span> '.join(d['metrics'])}</p></div></div></section>
 <section class="section container" id="modeling">{heading(d['journey'])}
@@ -201,15 +212,6 @@ for lang,d in COPY.items():
 </div></div></div></section>
 <section class="section muted" id="performance"><div class="container">{heading(d['models'])}<div class="model-grid">{models}</div><div class="metrics">{outputs}</div></div></section>
 <section class="section container" id="examples">{heading(d['examples'])}<div class="example-grid">{cases}</div></section>
-<section class="section muted" id="start"><div class="container">{heading(d['start'])}
-<div class="getting-started">
-<article class="install-windows">
-<div><h3>{d['windows']}</h3><p><small>{d['windowsnote']}</small></p></div>
-{external(WINDOWS_INSTALLER,d['download'],'button primary')}
-<img class="windows-preview" src="{prefix}assets/astermind-windows-home.jpg" alt="{d['windows_preview_alt']}" width="1326" height="853" loading="lazy" decoding="async"></article>
-<article class="install-source"><h3>{d['guide']}</h3>
-<div class="code-panel"><div class="code-top"><span>{d['codehead']}</span><button id="copy-code">{d['copy']}</button></div><pre><code id="setup-code">{escape(setup)}</code></pre><span class="sr-only" role="status" id="copy-status"></span></div></article>
-</div></div></section>
 <section class="section container about" id="about">{heading(d['about'])}<p class="organization">{d['org']}</p><div class="actions">{external(REPO,'GitHub','button primary')}{external(REPO+'/issues',d['issue'],'button secondary')}</div></section></main>
 <footer class="container"><span>AsterMind V1.0</span><span>{d['footer']}</span><span>GUANYU</span></footer>
 <script type="application/json" id="page-copy">{json.dumps(data,ensure_ascii=False)}</script>
