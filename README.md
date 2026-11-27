@@ -103,54 +103,40 @@ In **Detail Mode**, this example simulates distributed inference for **DeepSeek-
 
 ### Constellation simulation
 
-This example uses **Fast Mode** to simulate a **global inference service** at constellation scale. It replays **300 seconds of global request traffic**, with **168 requests** arriving through **five ground gateways** in Asia, Africa, Europe, and North America. The physical scenario includes **6,000 communications satellites** and **10 compute formations** with **40 compute satellites** in total. Each formation runs **GLM-5.2** with **TP8 × PP4** parallelism. The simulation runs for **360 seconds** and updates the topology every **60 seconds**. Requests that have already arrived can continue processing during the final 60 seconds.
+**Fast Mode · 6,000 communications satellites · 10 compute formations · 5 gateways · 168 requests**
 
-#### Physical Scenario
+Simulate global inference serving with GLM-5.2 at TP8 × PP4 per formation. A 360 s simulation replays 300 s of arrivals and gives in-flight requests 60 s to continue. The topology updates every 60 s.
 
-1. Open 「End-to-End Simulation」 and select 「New Task」. In 「Setup」, select 「New Physical Model」.
-2. In 「Physical Scenario」, enter a model name. Set the experiment start time (UTC) to `2026-11-20T00:00:00Z`, the simulation duration to **360 s**, and the geometry time step to **60 s**. 「Physical model source」 loads a previously configured scenario. Leave it blank when setting up a new one.
-3. In 「Communications Constellation」, use the 「−」 button in the upper-right corner of each card to remove unused default constellations. Select 「Add communications constellation → Generate from parameters」, then choose 「Walker Parameters」.
-   - Set the altitude to **550 km**. Use **60 orbital planes with 100 satellites per plane**. Then set the inclination to **53°**, the Walker phase to **1**, and both the initial RAAN and the initial argument of latitude to **0**.
-   - After adding the constellation, set 「Inter-Satellite Topology」 to **Grid / 4 Neighbors**.
-   - Set 「Communications Satellite Hardware Preset」 to 「Custom Hardware」. In 「Advanced Hardware Settings (Manual)」, set **6 ISL terminals** and set Max Ground Links per Satellite to **1**.
-   - Scroll back to the top and select 「Compute Constellations and Cells」 next to the highlighted 「Communications Constellation」 tab.
-4. In 「Compute Constellations and Cells」, select **Fast Mode**. Use the 「−」 button in the upper-right corner of each 「Compute Constellation」 card to remove unused default constellations. Select 「Add Compute Constellation」, enter a constellation ID, set the number of Cells to **10**, and select Add Constellation.
-5. In the constellation's 「Compute Cells」 card, select 「Edit Cell」 on any Cell.
-   - In 「Constellation Resources」, set the physical resources to **8 H200 GPUs per satellite**. For constellation geometry, set **4 satellites in a Ring with 1 km spacing at an altitude of 800 km**. Open 「Communication Network」.
-   - In 「Communication Network」, keep the defaults, including 8 GPUs per scale-up (SU) group. Open 「Model and Workload」.
-   - In 「Model and Workload」, select **GLM-5.2**. Under 「Roofline parameters」, set compute efficiency to **70%** and HBM bandwidth efficiency to **96%**.
-   - In 「Parallel Deployment」, select 「Colocated」. Set **TP8 × PP4**, turn off EP, and set DP to 1. Open 「Scheduling and Execution」.
-   - In 「Scheduling and Execution」, set a limit of **32 requests per batch** and enable 「Chunked Prefill」. Keep 「Prefill Chunk Limit」 at its default of **0** so the scheduler can size each chunk using the remaining batch token budget.
-   - Under 「KV Cache Config」, **enable Prefix Caching**.
-   - After configuring one Cell, select 「Use as Template for All 10 Cells」 to return to the physical scenario.
-6. Scroll to the bottom and expand 「Constellation Orbit and Access Settings」.
-   - Set 「Orbit Source」 to **Dawn–Dusk Sun-Synchronous Orbit** and 「Cell Egress Mode」 to **Single-Satellite Egress**. Set 「Access member indices」 to **0** and 「External ISL terminals per access member」 to **2**.
-   - Keep the remaining settings at their defaults.
-   - Scroll back to the top and select 「Ground Stations」 next to the highlighted 「Compute Constellations and Cells」 tab.
+1. **Build the topology.** Open **End-to-End Simulation → New Task** and select **New Physical Model** in **Setup**. Apply the topology settings below, with **Append to this scenario**. Confirm **5 gateways**, then select **Generate Data and Continue**.
+2. **Run the workload.** In **Configure Scenario**, select the generated **Physical Topology Dataset**, confirm **10 Cells**, and apply the routing settings below. In **Service Requests → Batch Import**, load workload files as JSONL with **Replace Current Requests**. Select **Validate and Preview**, confirm **168 requests**, then select **Apply Requests** and **Run Experiment and View Results**.
+3. **Inspect the results.** In **Request Performance**, check the target Cell, completion status, and gateway-side TTFT, TPOT, and end-to-end latency. In **Scene Replay → Play Replay**, follow a request from uplink to response delivery in 3D.
 
-7. In 「Ground Stations and Access」, use the 「−」 button in the upper-right corner of each card to remove the default ground stations. Expand 「Import ground stations from CSV」.
-   - Upload the [sample gateway CSV](examples/L3_Quick_Start/gateways-quick-start.csv) and click 「Append to this scenario」. Confirm that the list contains **five gateways** (Guangzhou, New Delhi, Johannesburg, Frankfurt, and Los Angeles). The CSV supplies the coordinates, a minimum elevation of **25°**, and **16 terminals per station**. Set Ground Node Role to **RF Gateway Backhaul**.
-   - Keep the remaining settings at their defaults.
-   - Scroll back to the top and select 「Connectivity and Link Budgets」 next to the highlighted 「Ground Stations」 tab.
-8. In 「Connectivity and Link Budgets」, disable direct links between Cells, set 「Inter-Satellite Link Calculation Model」 to **Fixed bandwidth**, and enter the values below. Under 「Link Bandwidth Contention (Fast Mode)」, you can adjust the effective bandwidth ratio for each link type. The default is 100%. Click 「Generate Data and Continue」. When the physical model is ready, the application opens 「Configure Scenario」.
+<details>
+<summary>Exact scenario settings</summary>
 
-   | Link type | Per-direction limit (bps) | Maximum distance (km) | Link setup time (s) |
-   | --- | ---: | ---: | ---: |
-   | Communications satellite to communications satellite | `400000000000` | 4000 | 2 |
-   | Compute satellite to communications satellite | `400000000000` | 4000 | 2 |
-   | Within a Cell | `1000000000000` | 10 | 2 |
-   | Ground-to-satellite link budget | `1000000000` | 2500 | 2 |
+Leave **Physical model source** blank. Remove unused default constellations and keep unlisted settings at their defaults.
 
-#### Workload and Execution
+| Panel | Settings |
+| --- | --- |
+| Physical Scenario | Start `2026-11-20T00:00:00Z`, duration 360 s, geometry time step 60 s |
+| Communications Constellation | **Generate from parameters → Walker Parameters**. Altitude 550 km, 60 planes × 100 satellites, inclination 53°, phase 1, initial RAAN 0°, initial argument of latitude 0°. Use **Grid / 4 Neighbors** and **Custom Hardware** with 6 ISL terminals and at most 1 ground link per satellite. |
+| Compute Constellations and Cells | Create a **Fast Mode** constellation with 10 Cells. Edit one Cell using the next three rows, then select **Use as Template for All 10 Cells**. |
+| Cell resources and network | 4 satellites in a ring, 1 km spacing, 800 km altitude, 8 H200 GPUs per satellite and 8 GPUs per SU group |
+| Cell model and deployment | GLM-5.2, 70% compute efficiency, 96% HBM bandwidth efficiency, **Colocated**, TP8 × PP4, DP1, EP off |
+| Cell scheduling and cache | 32 requests per batch, **Chunked Prefill** on, **Prefill Chunk Limit** `0` (use the remaining batch token budget), **Prefix Caching** on |
+| Constellation Orbit and Access Settings | **Dawn–Dusk Sun-Synchronous Orbit**, **Single-Satellite Egress**, access member index `0`, 2 external ISL terminals per access member |
+| Ground Stations and Access | Remove the default ground stations, then use **Import ground stations from CSV** to add Guangzhou, New Delhi, Johannesburg, Frankfurt, and Los Angeles. It sets the coordinates, 25° minimum elevation, and 16 terminals per station. Set **Ground Node Role** to **RF Gateway Backhaul**. |
+| Connectivity and Link Budgets | Disable direct links between Cells, select **Fixed bandwidth**, use the values below, and leave effective bandwidth at 100%. |
+| Routing and Scheduling | **Shortest Total Path** for routing and **Shortest Distance** for Cell selection |
 
-1. In 「Configure Scenario」, enter a scenario name and select the physical scenario you just generated from 「Physical Topology Dataset」. Under 「Routing and Scheduling」, set 「Routing Policy」 to **Shortest Total Path** and 「Cell Selection Policy」 to **Shortest Distance**. Confirm that 「Compute Cells in the Physical Scenario」 lists **10 Cells**.
-2. Scroll to the bottom. In 「Service Requests」, select 「Batch Import」 and upload the [300-second sample request trace](examples/L3_Quick_Start/wildchat-1x-quick-start-300s.jsonl). Select **JSONL** as the format and 「Replace Current Requests」 under 「Apply Mode」. Click 「Validate and Preview」, confirm there are **168 requests**, and click 「Apply Requests」. Keep the remaining settings at their defaults.
-3. Click 「Run Experiment and View Results」.
+| Link | Limit per direction (bps) | Max distance (km) | Setup (s) |
+| --- | ---: | ---: | ---: |
+| Communications satellite ↔ communications satellite | `400000000000` | 4000 | 2 |
+| Compute satellite ↔ communications satellite | `400000000000` | 4000 | 2 |
+| Within a Cell | `1000000000000` | 10 | 2 |
+| Ground ↔ satellite | `1000000000` | 2500 | 2 |
 
-#### Run and Replay
-
-1. When the run finishes, open 「Request Performance」 to view each request's target Cell, completion status, and gateway-side TTFT, TPOT, and end-to-end latency. In 「Scene Replay」, click 「Play Replay」 or step through the recorded events to inspect request upload paths and response return paths in 3D.
-2. Select 「Run History」 in the left sidebar to view past experiments.
+</details>
 
 ## Contribution Guidelines
 We welcome contributions to AsterMind. Before opening a pull request, read the [contribution guide](CONTRIBUTING.md). Thank you to everyone who contributes to the project.
