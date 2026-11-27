@@ -51,6 +51,12 @@ export const labels = {
   timing_mode:"耗时建模范围", output_directory:"结果目录（服务端管理）",
   host_evidence_directory:"Host 证据目录（服务端管理）", dispatch_service_time_s:"Router 派发耗时 / s",
 };
+const modelFamilyNames = { glm: 'GLM', kimi: 'Kimi', deepseek: 'Deepseek' };
+
+export function modelDisplayName(name) {
+  return name?.replace(/^(glm|kimi|deepseek)(?=$|[-_\s])/i, family => modelFamilyNames[family.toLowerCase()]);
+}
+
 export const optionLabels = {
   auto:"自动", profile_su:"SU 分域互联（按卡型）", single_su:"同一 SU 域", intra_cross_su:"同星跨 SU 域", inter_satellite:"跨卫星",
   allgather:"AllGather / ReduceScatter", direct:"Direct",

@@ -1,3 +1,4 @@
+import {modelDisplayName} from '../cell/config-labels.mjs';
 import {renderConfigProfile} from './config-profile.js';
 import {get,post} from '/assets/studio_common.js';
 import {normalizeRandomFaults,renderRandomFaults} from '/assets/random_faults.js';
@@ -82,7 +83,7 @@ function renderCellList(){
   const hardware=options?.hardware_id||cell?.hardware_id;
   const deployment=row.insertCell();
   const parts=model?[
-   capabilities.su_profiles[hardware]?.name||hardware, (options?.gpus_per_satellite??1)+' 卡/星',model.split('/').at(-1).replace(/\.json$/,''),
+   capabilities.su_profiles[hardware]?.name||hardware, (options?.gpus_per_satellite??1)+' 卡/星',modelDisplayName(model.split('/').at(-1).replace(/\.json$/,'')),
    cell?'TP '+cell.parallel.tp+' / PP '+cell.parallel.pp+' / DP '+cell.parallel.dp:'',
   ].filter(Boolean):['待生成默认部署'];
   parts.forEach((part,index)=>{

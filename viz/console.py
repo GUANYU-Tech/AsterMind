@@ -14,7 +14,7 @@ import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, parse_qsl, urlencode
 from zoneinfo import ZoneInfo
 
 # Workers import console to register jobs. Running this file as a script must
@@ -33,21 +33,6 @@ LOCK = threading.Lock()
 LAUNCH_LOCK = threading.Lock()
 COMPARISONS = {}
 PHYSICAL_LOCK = threading.Lock()
-
-HOMEPAGE = Path(__file__).parent / 'homepage' / 'dist'
-HOMEPAGE_FILES = {
-    '/': ('index.html', 'text/html'),
-    '/index.html': ('index.html', 'text/html'),
-    '/en/': ('en/index.html', 'text/html'),
-    '/en/index.html': ('en/index.html', 'text/html'),
-    '/style.css': ('style.css', 'text/css'),
-    '/language.js': ('language.js', 'text/javascript'),
-    '/app.js': ('app.js', 'text/javascript'),
-    '/assets/astermind-mark.png': ('assets/astermind-mark.png', 'image/png'),
-    '/assets/astermind-windows-home.jpg': ('assets/astermind-windows-home.jpg', 'image/jpeg'),
-    '/assets/guanyu-logo.png': ('assets/guanyu-logo.png', 'image/png'),
-}
-
 
 def prepare_physical(identity, *, independent=False):
     from studio import key, physical_data, physical_input
@@ -406,16 +391,15 @@ class Handler(BaseHTTPRequestHandler):
                 if not report.is_file():
                     report = Path(sysconfig.get_path('data')) / 'share' / 'astermind' / 'doc' / name
                 return self.respond_file(report, 'application/pdf')
-            if path in HOMEPAGE_FILES:
-                name, kind = HOMEPAGE_FILES[path]
-                return self.respond_file(HOMEPAGE / name, kind)
-            if path in {'/zh', '/zh/', '/zh/index.html', '/en', '/platform/'}:
-                canonical = {'/en': '/en/', '/platform/': '/platform'}.get(path, '/')
-                query = urlparse(self.path).query
-                if path.startswith('/zh'):
-                    query = (query + '&' if query else '') + 'lang=zh-CN'
+            if path in {'/', '/index.html', '/platform/', '/zh', '/zh/', '/zh/index.html',
+                        '/en', '/en/', '/en/index.html'}:
+                query = parse_qsl(urlparse(self.path).query, keep_blank_values=True)
+                prefix = path.split('/')[1]
+                if prefix in {'en', 'zh'} and not any(key == 'lang' for key, _ in query):
+                    query.append(('lang', 'en' if prefix == 'en' else 'zh-CN'))
+                location = '/platform' + ('?' + urlencode(query) if query else '')
                 self.send_response(302)
-                self.send_header('Location', canonical + ('?' + query if query else ''))
+                self.send_header('Location', location)
                 self.send_header('Content-Length', '0')
                 self.end_headers()
                 return

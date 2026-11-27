@@ -129,7 +129,7 @@
     language = locale;
     document.documentElement.lang = locale;
     for (const link of document.querySelectorAll('[data-project-home]')) {
-      link.href = locale === 'en' ? '/en/' : '/';
+      link.href = 'https://guanyu-tech.github.io/AsterMind/' + (locale === 'en' ? 'en/' : '');
     }
     switcher.setAttribute('aria-label',locale === 'en' ? 'Interface language' : '界面语言');
     for (const [id,button] of buttons) button.setAttribute('aria-pressed',String(locale === id));
@@ -158,10 +158,18 @@
   window.addEventListener('storage', event => {
     if (event.key === STORAGE_KEY || event.key === null) choose(savedLanguage(),false);
   });
-  window.addEventListener('pageshow', () => {
-    if (savedLanguage() !== language) choose(savedLanguage(),false);
+  window.addEventListener('pageshow', event => {
+    if (event.persisted && savedLanguage() !== language) choose(savedLanguage(),false);
   });
   fileInputs(document.body);
-  choose('zh-CN',false);
-  if (savedLanguage() === 'en') choose('en',false);
+  const url = new URL(location.href);
+  const requested = url.searchParams.get('lang');
+  if (requested === 'en' || requested === 'zh-CN') {
+    try { localStorage.setItem(STORAGE_KEY,requested); } catch { /* private storage */ }
+    url.searchParams.delete('lang');
+    history.replaceState(history.state,'',url);
+    choose(requested,false);
+  } else {
+    choose(savedLanguage(),false);
+  }
 })();

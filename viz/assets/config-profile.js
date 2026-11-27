@@ -1,3 +1,5 @@
+import {modelDisplayName} from '../cell/config-labels.mjs';
+
 const commonLabels = {
   hardware:'算力资源', constellation:'星座', topology:'拓扑', deployment:'模型部署', scheduler:'调度器',
   kv_offload:'KV 缓存', runtime_inputs:'运行参数', compute_mode:'计算模式', horizon_ns:'仿真时长',
@@ -55,6 +57,7 @@ export function renderConfigProfile(container, config, labels={}, metrics=[], om
       else if(typeof item==='object') shown='无';
       else if(typeof item==='boolean')shown=item?'开启':'关闭';
       else if(typeof item==='number' && key.endsWith('_ns'))shown=(item/1e9).toLocaleString('zh-CN',{maximumFractionDigits:9})+' 秒';
+      else if(typeof item==='string' && key==='model')shown=modelDisplayName(item);
       else if(typeof item==='string' && ['cell_selection','compute_mode','primary','secondary'].includes(key))shown=displayValues[item]||item;
       yield [name.join(' / '),shown];
     }

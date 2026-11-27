@@ -1,6 +1,6 @@
 import {cellCount,cellIndex,cellGeometry,cellKeys,cellLayout,memberIds,applyCell,bindLayout} from './physical-cells.js';
 
-import {formationNames} from '../cell/config-labels.mjs';
+import {formationNames,modelDisplayName} from '../cell/config-labels.mjs';
 
 const pages=new WeakMap();
 const el=(tag,text)=>{const node=document.createElement(tag);if(text!==undefined)node.textContent=text;return node};
@@ -82,7 +82,7 @@ export function showCellList(host,formation,capabilities,mode,render,focusId) {
       ? formationNames[geometry.topology] : geometry.motion_model==='reference_fixed_lvlh'?'自定义相对位置':(geometry.grid_shape || count+'x1')+' 网格';
     const summary=el('span');
     const parts=[count+' 颗卫星',capabilities.su_profiles[hardware]?.name || hardware,(layout?.deployment.gpus_per_satellite??1)+' 卡/星',
-      shape,layout?.deployment.model?.split('/').at(-1)?.replace(/\.json$/,''),
+      shape,modelDisplayName(layout?.deployment.model?.split('/').at(-1)?.replace(/\.json$/,'')),
       settings?.cells?.[key] || formation.cell_overrides?.[id]?'单独配置':settings?.template?'星座模板':'默认配置'].filter(Boolean);
     parts.forEach((part,index)=>summary.append(index ? ' · ' : '',el('span',part)));
     const edit=button('编辑编队',()=>{try{editCell(formation,key,capabilities,mode(),render)}catch(e){document.getElementById('status').textContent=e.message}});

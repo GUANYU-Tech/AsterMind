@@ -13,9 +13,9 @@ if (!document.querySelector('[data-studio-theme]')) {
   theme.rel='stylesheet';theme.href='/assets/workspace.css';theme.dataset.studioTheme='';document.head.append(theme);
   document.body.classList.add('studio-shell');
   const links=[['01','场景概览','/workspace'],['02','实验配置','/configuration'],['03','在线仿真','/live'],['04','实验结果','/results'],['05','运行记录','/experiments']];
-  const parent = ({'/platform':'/', '/workspace':'/platform'})[location.pathname] || '/workspace';
+  const parent = ({'/platform':'https://guanyu-tech.github.io/AsterMind/', '/workspace':'/platform'})[location.pathname] || '/workspace';
   const shell=document.createElement('div');
-  shell.innerHTML=`<header class="studio-topbar"><a class="studio-logo" href="${parent}"${parent === '/' ? ' data-project-home' : ''}><span class="studio-mark" aria-hidden="true">✧</span>AsterMind <em>星鉴</em></a><span>仿真任务工作台</span><a class="studio-local" href="/platform">切换仿真工作区 ↗</a></header><aside class="studio-sidebar" aria-label="工作台导航"><div class="studio-nav-label">完整场景仿真</div>${links.map(([n,label,href])=>`<a href="${href}"${location.pathname===href.split('?')[0]?' aria-current="page"':''}><b aria-hidden="true">${n}</b>${label}</a>`).join('')}<div class="studio-sidefoot"><a href="https://qcnaaemidt0k.feishu.cn/wiki/CwKmwM1VhiOD19kbv8UcNM5RnTq" target="_blank" rel="noopener noreferrer">技术文档 ↗</a></div></aside>`;
+  shell.innerHTML=`<header class="studio-topbar"><a class="studio-logo" href="${parent}"${location.pathname === '/platform' ? ' data-project-home target="_blank" rel="noopener noreferrer"' : ''}><span class="studio-mark" aria-hidden="true">✧</span>AsterMind <em>星鉴</em></a><span>仿真任务工作台</span><a class="studio-local" href="/platform">切换仿真工作区 ↗</a></header><aside class="studio-sidebar" aria-label="工作台导航"><div class="studio-nav-label">完整场景仿真</div>${links.map(([n,label,href])=>`<a href="${href}"${location.pathname===href.split('?')[0]?' aria-current="page"':''}><b aria-hidden="true">${n}</b>${label}</a>`).join('')}<div class="studio-sidefoot"><a href="https://qcnaaemidt0k.feishu.cn/wiki/CwKmwM1VhiOD19kbv8UcNM5RnTq" target="_blank" rel="noopener noreferrer">技术文档 ↗</a></div></aside>`;
   document.body.prepend(...shell.childNodes);
 }
 

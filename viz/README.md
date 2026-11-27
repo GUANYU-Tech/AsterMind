@@ -65,7 +65,7 @@ export ORBITSERVE_ISLSIM_ROOT="$PWD/astermind/builder/islsim"
 python -B -m viz
 ```
 
-在浏览器打开[项目首页](http://localhost:8766/)或[英文首页](http://localhost:8766/en/)，点击「进入仿真平台」选择工作区。首页与平台共用语言设置。也可以访问[健康检查](http://localhost:8766/health)，确认返回的 `status` 为 `ok`。[Windows 浏览器访问 WSL 服务](https://learn.microsoft.com/zh-cn/windows/wsl/networking)
+在浏览器打开[本地仿真平台](http://localhost:8766/)，直接选择「完整场景仿真」或「算力编队仿真」。也可以访问[健康检查](http://localhost:8766/health)，确认返回的 `status` 为 `ok`。[Windows 浏览器访问 WSL 服务](https://learn.microsoft.com/zh-cn/windows/wsl/networking)
 
 - **计算 Cell**。打开[计算 Cell](http://localhost:8766/cell/)，沿用默认 Qwen3-4B 配置，预览拓扑后进入任务配置并运行仿真。完成后在仿真结果页查看报告。
 - **完整场景**。从首页进入工作区，在物理场景的「计算星座与编队」中设置 Cell 数量，逐个编辑编队或将一个 Cell 的配置作为整座模板，生成拓扑数据后在场景编辑页面配置业务请求。保存场景并启动仿真，完成后在实验结果页查看报告。
