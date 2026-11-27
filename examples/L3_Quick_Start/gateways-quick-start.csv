@@ -1,0 +1,6 @@
+ingress_id,lat_deg,lon_deg,altitude_km,min_elevation_deg,terminal_count,ground_kind
+gw_los_angeles,34.0522,-118.2437,0,25,16,gateway
+gw_frankfurt,50.1109,8.6821,0,25,16,gateway
+gw_johannesburg,-26.2041,28.0473,0,25,16,gateway
+gw_delhi,28.6139,77.209,0,25,16,gateway
+gw_guangzhou,23.1291,113.2644,0,25,16,gateway
