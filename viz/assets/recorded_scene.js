@@ -126,10 +126,13 @@ $('recordMode').onchange=()=>{pause();$('recordClock').textContent=($('recordMod
 window.addEventListener('message',event=>{if(event.origin===location.origin&&event.data?.type==='analysis-visibility'&&!event.data.visible)pause()});
 main.addEventListener('analysis-visibility',event=>{if(!event.detail.visible)pause()});
 try{
- model=await get(base+'environment-index');
+ const [geometry,response]=await Promise.all([
+  get(base+'environment-index'),
+  fetch(base+'native-replay/transmission-recording.json')
+ ]);
+ model=geometry;
  physical=createRecordedFrameLoader(base,model,loadReplayJson);
  loadOrbitSample=createOrbitSampleLoader(base,model);
- const response=await fetch(base+'native-replay/transmission-recording.json');
  if(response.ok)catalog=await response.json();
  else{
   const log=await get(base+'scene-events'),visible=log.events.flatMap((e,i)=>isTransmissionEvent(e)?[i]:[]);

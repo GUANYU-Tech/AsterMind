@@ -33,6 +33,16 @@ test('physical generation still opens step two, and historical result links rema
   assert.equal(completedDestination({preview_url: '/runs/physical/viewer'}, ''), '/runs/physical/viewer');
 });
 
+test('the manual results button opens the request report even for automatic or older runs', () => {
+  const job = {id:'batch-42', native_scene:true, automatic:true, result_url:'/runs/batch-42/result'};
+  assert.equal(completedDestination(job, '?stay=1'), '/runs/batch-42/result');
+  assert.equal(completedDestination({id:'old', native_scene:true}, '?stay=1'), '/runs/old/result');
+  const historical = {id:'old', runtime_url:'/runs/old/runtime', result_url:'/runs/old/result'};
+  assert.equal(completedDestination(historical, ''), historical.runtime_url);
+  assert.equal(completedDestination(historical, '?stay=1'), historical.result_url);
+  assert.equal(completedDestination(job, '?next=replay'), '/results?run=batch-42&view=scene');
+});
+
 test('configuration launches the selected scene once and recovers its button after an error', async () => {
   const ids = ['models', 'scenes', 'editModel', 'editScene', 'createScene', 'configurePhysical', 'runExperiment', 'status'];
   const elements = Object.fromEntries(ids.map(id => [id, {value: '', addEventListener() {}}]));

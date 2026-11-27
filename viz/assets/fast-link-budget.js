@@ -10,6 +10,11 @@ const format = new Intl.NumberFormat(undefined, {maximumFractionDigits: 5});
 const ratioLabel = '有效可用带宽比例';
 
 function groundBudgets(config, profile) {
+  if(config.network.optical_link_model){
+    const profiles=config.network.link_profiles;
+    return [['上行',[profiles.user_uplink.bandwidth_bps,profiles.feeder_uplink.bandwidth_bps]],
+            ['下行',[profiles.user_downlink.bandwidth_bps,profiles.feeder_downlink.bandwidth_bps]]];
+  }
   const shells = config.constellations.communication_shells;
   const kinds = new Set(config.ground_ingresses.map(ground => ground.ground_kind === 'user' ? 'user' : 'feeder'));
   const roles = config.network.ground_roles ?? [];
@@ -76,7 +81,7 @@ export function createFastLinkBudget(host) {
     const profile = profiles[kind];
     let budgets = [['', [profile?.bandwidth_bps]]];
     if (kind === 'sgl') budgets = groundBudgets(config, profile);
-    if (kind === 'communication_isl' && config.constellations.communication_shells.length) {
+    if (kind === 'communication_isl' && !config.network.optical_link_model && config.constellations.communication_shells.length) {
       budgets = [['', config.constellations.communication_shells.map(shell =>
         shell.hardware_link_profiles?.communication_isl?.bandwidth_bps
         ?? profiles[shell.isl_profile]?.bandwidth_bps ?? profile?.bandwidth_bps)]];

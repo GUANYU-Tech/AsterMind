@@ -28,6 +28,7 @@ function editCell(formation,key,capabilities,scene,render) {
   const template=button('设为模板并应用到全部 '+count+' 个 Cell',()=>commit(true));
   apply.disabled=template.disabled=true;footer.append(status,template,apply);
   frame.formationSession={formation:structuredClone(formation),key,id,geometry,layout,capabilities,...scene,
+    explicitPairs:scene.cellLinkOverrides?.[id]?.map(edge=>[edge.source,edge.target]),
     status:message=>status.textContent=message,
     ready:callback=>{submit=callback;apply.disabled=template.disabled=false;status.textContent=''},
     apply:(geometry,layout,all)=>{
@@ -35,6 +36,10 @@ function editCell(formation,key,capabilities,scene,render) {
         for (const other of cellKeys(formation)) bindLayout(layout,memberIds(formation,other,cellGeometry(formation,other)));
       }
       if (!dialog.open) return;
+      if(scene.cellLinkOverrides){
+        const keys=all?cellKeys(formation):[key];
+        for(const memberKey of keys)delete scene.cellLinkOverrides[formation.name+'-'+memberKey];
+      }
       applyCell(formation,key,geometry,layout,all);
       dialog.close();render();
     },

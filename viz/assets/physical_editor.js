@@ -4,14 +4,14 @@ import {renderIngressFields} from './ingress-fields.js';
 import {showCellList} from './physical-cell-list.js';
 import {renderConfigProfile} from './config-profile.js';
 import {renderRadio} from '/assets/radio_editor.js';
-import {initISLSim,renderISLSim,bindISLSim} from '/assets/islsim_editor.js';
+import {initISLSim,bindISLSim} from '/assets/islsim_editor.js';
 import {createFastLinkBudget} from './fast-link-budget.js';
 import {initCommunicationDialog} from './communication-dialog.js';
 import {groundDefaults,initGroundImport,parseGroundCsv} from './ground-import.js';
 import {sourceFields,quotaFields,preferenceOptions,inferredScenario} from '/assets/network_options.js';
 import {get,post,field,group,tabs} from '/assets/studio_common.js';
 import {enhancePhysicalFields} from '/assets/design-controls.js';
-import {ensureInterCellProfile,interCellProfileNote,missingInterCellProfile} from '/assets/link_profiles.js';
+import {initializeLinkBudgets,renderLinkBudgets,opticalKinds} from './scene-link-budgets.js';
 const $=id=>document.getElementById(id);let config,defaultShell,defaultCell,radioProfiles;tabs('data-tab');
 const sceneQuery=new URLSearchParams(location.search);
 const sceneDraft=sceneQuery.get('scene_draft');
@@ -70,7 +70,7 @@ function render(){
   if(previousType==='compute_only'&&type==='mixed'){
     config.network.ground_roles=['communication','compute'];
   }
-  stripRuntime();ensureInterCellProfile(config.network);for(const g of config.ground_ingresses){g.terminal_count??=1;g.altitude_km??=0}for(const id of ['time','shells','cells','grounds','access','connections','budgets'])$(id).replaceChildren();
+  stripRuntime();for(const g of config.ground_ingresses){g.terminal_count??=1;g.altitude_km??=0}for(const id of ['time','shells','cells','grounds','access','connections','budgets'])$(id).replaceChildren();
 for(const[path,label,type]of [['epoch_utc','实验开始时间（UTC）','text'],['duration_s','实验时长 s','number'],['step_s','几何时间片间隔 s','number']]){
  const input=field($('time'),config,'time.'+path,label,type);
  if(path==='duration_s'&&preparedExample)input.setAttribute('aria-describedby','caseStudyDurationNote');
@@ -111,6 +111,7 @@ identity.addEventListener('change',()=>{
 sourceFields(fields,advanced,cell,true,render,()=>{render()});
 const refreshList=()=>showCellList(list,cell,capabilities,()=>({
  mode:$('computeMode').value, epStrategy, linkProfile:config.network.link_profiles.cell_isl,
+  cellLinkOverrides:config.network.cell_link_overrides,
 }),render,selectedCell);
 refreshList();
 for(const label of ['轨道面数','每面 cell 数']){
@@ -130,8 +131,7 @@ const handoverNote=document.createElement('p');handoverNote.textContent='适用�
 field($('access'),config,'network.ground_access_policy','地面侧候选偏好','text',preferenceOptions);config.network.ground_matching??='greedy';config.network.satellite_access_policy??='nearest_distance';field($('access'),config,'network.ground_matching','双端关联算法','text',[['greedy','全局偏好排序 双端配额约束'],['deferred_acceptance','双向偏好 地面提议 / 卫星择优']]);field($('access'),config,'network.satellite_access_policy','卫星侧候选偏好（双向匹配生效）','text',preferenceOptions);const role=document.createElement('label');role.textContent='允许计算 cell 直接接地面';const check=document.createElement('input');check.type='checkbox';check.checked=config.network.ground_roles?.includes('compute');check.disabled=type!=='mixed';check.onchange=()=>{config.network.ground_roles=check.checked?['communication','compute']:['communication'];sync()};role.append(check);$('access').append(role);
 const interCell=field($('connections'),config,'network.inter_cell_links','允许 cell 间直接连接','checkbox');
 interCell.addEventListener('change',render);
-const interCellNote=document.createElement('p');interCellNote.textContent=config.network.inter_cell_links&&!config.network.link_profiles?.inter_cell?missingInterCellProfile:interCellProfileNote;$('connections').append(interCellNote);
-for(const[k,label]of [['communication_isl','通信星间'],['cross_layer','计算—通信'],['cell_isl','cell 内部'],['inter_cell','cell 间直连'],['sgl','星地']]){const p=config.network.link_profiles[k];if(!p)continue;const{card,fields}=group($('budgets'),label);card.dataset.linkProfile=k;for(const[key,text]of [['setup_time_s','建链时间 s'],['bandwidth_bps','每方向终端速率上限 bps'],['max_distance_km','最大距离 km']])field(fields,p,key,text);if(k!=='sgl')renderISLSim(fields,p,render);if(p.capacity_model==='optical_photon_budget'){for(const[key,text]of [['transmit_power_w','发射功率 W'],['transmit_aperture_m','发射孔径 m'],['receive_aperture_m','接收孔径 m'],['wavelength_m','波长 m'],['required_photons_per_bit','接收光子/bit'],['pointing_loss_db','指向损耗 dB']])field(fields,p,key,text)}else if(p.capacity_model==='free_space_shannon'){for(const[key,text]of [['frequency_hz','频率 Hz'],['channel_bandwidth_hz','信道带宽 Hz'],['transmit_power_w','发射功率 W'],['transmit_gain_db','发射增益 dB'],['receive_gain_db','接收增益 dB'],['noise_temperature_k','噪声温度 K'],['system_loss_db','系统损耗 dB']])field(fields,p,key,text)}field(fields,p,'sun_exclusion_angle_deg','太阳避让角 °')}
+renderLinkBudgets($('budgets'),config,radioProfiles,render);
 enhancePhysicalFields(document.querySelector('.physical-page'));sync()}
 const physicalLabels={schema_version:'配置版本',time:'时间',constellations:'星座资源',ground_ingresses:'地面站',network:'通信网络',route_probes:'路由探测',scenario_type:'场景类型',compute_formations:'算力星座',communication_shells:'通信星座'};
 let saving=false;
@@ -191,19 +191,17 @@ function physicalFormState(){
 }
 async function save(next){
   try{
-    if(config.network.inter_cell_links&&!config.network.link_profiles?.inter_cell)throw Error(missingInterCellProfile);
     const invalid=document.querySelector('main input:invalid:not(dialog input),main select:invalid:not(dialog select),main textarea:invalid');
     if(invalid){invalid.reportValidity();throw Error('请先修正无效输入')}
     if(!inferredScenario(config))throw Error('请先添加通信壳层或计算编队。');
     if(next===true&&!config.constellations.compute_formations.length)throw Error('可以保存和预览通信拓扑。要运行推理，请添加计算编队。');
-    if(next===true&&preparedExample?.formState===physicalFormState()){
+    if(next===true&&preparedExample?.canReuse&&preparedExample.formState===physicalFormState()){
       location.assign('/scene?model='+encodeURIComponent(preparedExample.modelId));
       return;
     }
-    const profiles=[config.network.link_profiles,...config.constellations.communication_shells.map(shell=>shell.hardware_link_profiles)];
-    for(const group of profiles){
-      for(const profile of Object.values(group??{})){
-        if(profile.capacity_model==='islsim'||(!profile.capacity_model&&profile.islsim_source_sha256))bindISLSim(profile);
+    if(config.network.optical_link_model==='islsim'){
+      for(const kind of opticalKinds){
+        if(!bindISLSim(config.network.link_profiles[kind]))throw Error('ISLSim 参数未加载，请检查服务后重试。');
       }
     }
     saving=true;updateActions();
@@ -261,7 +259,12 @@ $('save').onclick=()=>save(false);$('next').onclick=()=>save(true);$('preview').
    config=example==='starlink_550'?initial:newPhysicalPreset(await get('/templates/'+example));
    selectLoadedSource(option.value);$('name').value=option.textContent;
  }
- if(preset?.id===id&&!sceneDraft&&!selectedCell)preparedExample={modelId:id};
+ const migrated=initializeLinkBudgets(config,radioProfiles,{newModel:!id});
+ if(id && migrated)$('budgetMigration').hidden=false;
+ if(preset?.id===id&&!sceneDraft&&!selectedCell)preparedExample={modelId:id,canReuse:!migrated};
+ // New shells use the scene budgets, including shells added after the initial render.
+ delete defaultShell.hardware_link_profiles;
+ delete defaultShell.isl_profile;
  render();modelSource.disabled=$('addCell').disabled=false;
  if(preparedExample){
    preparedExample.formState=physicalFormState();
@@ -277,6 +280,7 @@ $('save').onclick=()=>save(false);$('next').onclick=()=>save(true);$('preview').
  });
  $('groundFile').disabled=$('addGround').disabled=false;
  for(const tab of document.querySelectorAll('[data-tab]'))tab.disabled=false;
+ if(location.hash==='#links')document.querySelector('[data-tab="links"]').click();
  if(location.hash==='#cells'||sceneDraft||selectedCell)showComputeTab();
  if(sceneDraft||selectedCell){
   const match=selectedFormation();

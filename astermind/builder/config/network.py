@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from copy import deepcopy
-from dataclasses import dataclass, field, replace
+from dataclasses import InitVar, dataclass, field, replace
 from typing import Any
 
 from astermind.common import to_jsonable
@@ -125,8 +125,9 @@ class LinkProfile:
     # Portable TX/RX/channel input; local physical preparation binds source hashes.
     islsim_config: dict[str, Any] = field(default_factory=dict)
     islsim_source_sha256: dict[str, str] = field(default_factory=dict)
+    _from_recording: InitVar[bool] = False
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, _from_recording=False) -> None:
         for key in ("bandwidth_bps", "setup_time_s"):
             value = getattr(self, key)
             if not math.isfinite(value) or value < 0:
@@ -151,7 +152,8 @@ class LinkProfile:
         if any(a[0] >= b[0] for a, b in zip(schedule, schedule[1:])):
             raise ValueError("capacity_schedule must have strictly increasing times")
         object.__setattr__(self, "capacity_schedule", schedule)
-        if self.capacity_model not in {"fixed", "free_space_shannon", "optical_photon_budget", "islsim"}:
+        legacy_record = _from_recording and self.capacity_model == "optical_photon_budget"
+        if not legacy_record and self.capacity_model not in {"fixed", "free_space_shannon", "islsim"}:
             raise ValueError("unsupported capacity_model")
         for key in ("transmit_gain_db", "receive_gain_db", "system_loss_db"):
             if not math.isfinite(getattr(self, key)):
@@ -186,11 +188,6 @@ class LinkProfile:
         for key in ("pointing_loss_db", "atmospheric_loss_db"):
             if not math.isfinite(getattr(self, key)) or getattr(self, key) < 0:
                 raise ValueError(f"{key} must be finite and nonnegative")
-        if self.capacity_model == "optical_photon_budget":
-            for key in ("wavelength_m", "transmit_aperture_m", "receive_aperture_m", "transmit_power_w", "required_photons_per_bit"):
-                value = getattr(self, key)
-                if value is None or not math.isfinite(value) or value <= 0:
-                    raise ValueError(f"optical_photon_budget requires positive {key}")
         for key in ("parameter_sources", "assumptions"):
             values = getattr(self, key)
             if isinstance(values, str) or any(not isinstance(v, str) for v in values):
@@ -250,6 +247,8 @@ class NetworkSpec:
     fault_timing: str = 'continuous'
     random_faults: dict[str, Any] = field(default_factory=dict)
 
+    optical_link_model: str | None = None
+
     def __post_init__(self) -> None:
         from astermind.engine.setup.faults import validate_random_faults
         if self.fault_timing not in {'boundary', 'continuous'}:
@@ -288,8 +287,12 @@ class NetworkSpec:
         nodes = tuple(replace(n, cell_ingress=True)
                       if n.cell_id and self.cell_egress_policies.get(n.cell_id) == 'free' else n
                       for n in nodes)
-        from astermind.engine.setup.islsim import freeze_profiles
-        profile_values = freeze_profiles({'nodes': self.nodes, 'link_profiles': self.link_profiles})['link_profiles']
+        from astermind.engine.setup.islsim import RF_DIRECTIONS, freeze_profiles
+        if self.optical_link_model is not None:
+            directions = {kind: kind for kind in RF_DIRECTIONS}
+            nodes = tuple(replace(n, sgl_profiles=directions) if n.role != 'ground' else n for n in nodes)
+        profile_values = freeze_profiles({'nodes': nodes, 'link_profiles': self.link_profiles,
+                                          'optical_link_model': self.optical_link_model})['link_profiles']
         profiles = {
             k: v if isinstance(v, LinkProfile) else LinkProfile(**v)
             for k, v in profile_values.items()
@@ -405,8 +408,19 @@ class NetworkSpec:
             raise TypeError("network must be a mapping")
         return cls(**value)
 
+    @classmethod
+    def from_recording(cls, value):
+        # Replay reads the recorded directional attributes without re-running retired models.
+        profiles = {name: LinkProfile(**p, _from_recording=True)
+                    if p.get('capacity_model') == 'optical_photon_budget' else p
+                    for name, p in value['link_profiles'].items()}
+        return cls.from_value({**value, 'link_profiles': profiles})
+
     def to_dict(self) -> dict[str, Any]:
-        return to_jsonable(self)
+        result = to_jsonable(self)
+        if self.optical_link_model is None:
+            result.pop('optical_link_model', None)
+        return result
 
 # Preserve public serialization identities across the file-only move.
 NetworkNodeSpec.__module__ = 'astermind.engine.setup.network_spec'

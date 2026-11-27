@@ -166,6 +166,8 @@ def candidate_links(spec: NetworkSpec) -> tuple[dict, ...]:
     shell_configs = {row["shell_id"]: row for row in spec.communication_shells}
 
     def profile_id(a, b, kind):
+        if spec.optical_link_model is not None:
+            return kind
         if kind == 'cell_isl' and (a, b) in cell_profiles:
             return cell_profiles[a, b]
         shell = nodes[a].shell_id

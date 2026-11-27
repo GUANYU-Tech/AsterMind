@@ -43,6 +43,14 @@ def snapshot_network_input(manifest, base_dir=".", *, bind_islsim=False):
     from astermind.engine import freeze_network_profiles
     if 'network' in result:
         result['network'] = freeze_network_profiles(result['network'], bind_islsim=bind_islsim)
+    if result.get('network', {}).get('optical_link_model') is not None:
+        for shell in result.get('constellations', {}).get('communication_shells', ()):
+            shell.pop('hardware_link_profiles', None)
+            shell.pop('isl_profile', None)
+        for links in result['network'].get('cell_link_overrides', {}).values():
+            for edge in links:
+                edge['profile_id'] = 'cell_isl'
+        return result
     # Include generated hardware parameters in the input identity. Only local
     # physical preparation requests bind_islsim and attaches implementation hashes.
     from astermind.engine import STARLINK_RADIO_PROFILES
@@ -217,7 +225,8 @@ def materialize_network_input(manifest, base_dir="."):
             shell['capacity_assumptions'] = [*defaults['capacity_assumptions'], *shell.get('capacity_assumptions', ())]
             for key in ('optical_terminal_bandwidth_bps', 'terminal_assumptions'):
                 shell.setdefault(key, deepcopy(defaults[key]))
-        physical_profiles = _hardware_profiles(defaults.get('hardware_link_profiles', {}), shell.get('hardware_link_profiles', {}))
+        physical_profiles = {} if network.get('optical_link_model') else _hardware_profiles(
+            defaults.get('hardware_link_profiles', {}), shell.get('hardware_link_profiles', {}))
         directional_ids = {}
         for kind, profile in physical_profiles.items():
             if kind not in {'communication_isl', 'user_uplink', 'user_downlink', 'feeder_uplink', 'feeder_downlink'}:
