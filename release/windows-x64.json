@@ -1,0 +1,11 @@
+{
+  "version": "1.0.0",
+  "platform": "Windows 11 x64",
+  "source_commit": "27126b1b9e1956dbf647abd78d07d122d03e602d",
+  "desktop_build": "81755749d70b7a7d8ac24d05366d1facc143c6bcf918d50b463774670b28002c",
+  "installer": {
+    "filename": "AsterMind-v1.0.0-Windows-x64-Setup.exe",
+    "bytes": 1925716479,
+    "sha256": "4f6947cee2ca07ce7b411c256cb146f625a0d4a2a48b5dc31a2c63500ea56197"
+  }
+}

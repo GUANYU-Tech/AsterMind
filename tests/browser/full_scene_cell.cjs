@@ -24,6 +24,11 @@ async function main() {
     const response=await context.request.post('/save-physical',{data:{name:'编队配置联调验证',physical_network:physical}});
     assert.ok(response.ok(),await response.text());
     await page.goto('/physical?id='+(await response.json()).id+'#cells');
+    await page.getByRole('tab',{name:'连接与链路预算'}).click();
+    await page.getByLabel('星间链路计算模型',{exact:true}).selectOption('fixed');
+    const budget=page.locator('[data-link-profile="cell_isl"]');
+    await budget.getByLabel('固定单向带宽（Gbps）',{exact:true}).fill('123');
+    await page.getByRole('tab',{name:'计算星座与编队'}).click();
     await page.locator('.formation-cell-row button').first().click();
     const dialog=page.locator('dialog.cell-workspace-dialog');
     const editor=page.frameLocator('dialog.cell-workspace-dialog iframe');
@@ -36,11 +41,7 @@ async function main() {
       await editor.locator('#field-hardware-accelerators_per_satellite').press('Tab');
     }
     await stage('network');
-    await editor.getByLabel('编队链路参数',{exact:true}).selectOption('cell');
-    await editor.getByRole('button',{name:'默认模式',exact:true}).click();
-    const link=editor.locator('#form-network-1 details').first();
-    if(!(await link.evaluate(el=>el.open)))await link.locator('summary').first().click();
-    await editor.locator('#field-topology-inter_satellite-links-0-bandwidth_gbps').fill('123');
+    await editor.getByText('编队内星间链路使用「连接与链路预算」中的设置。',{exact:true}).waitFor();
     await stage('workload');
     assert.equal(await editor.locator('#field-model').isVisible(),true);
     assert.equal(await editor.locator('[data-group="workload-1"],#request-upload').count(),0);
@@ -69,8 +70,7 @@ async function main() {
     const savedLayout=Object.values(Object.values(revision.compute_configuration.formations)[0].cells)[0];
     assert.equal(Object.hasOwn(savedLayout,'workload_ground'),false);
     assert.equal(Object.hasOwn(savedLayout.configuration,'requests'),false);
-    const links=Object.values(revision.physical_network.network.cell_link_overrides)[0];
-    const profile=revision.physical_network.network.link_profiles[links[0].profile_id];
+    const profile=revision.physical_network.network.link_profiles.cell_isl;
     assert.equal(profile.bandwidth_bps,123e9);assert.equal(profile.setup_time_s,2);
     await page.waitForURL('**/scene?**',{timeout:180000});
     await page.locator('#run:enabled').waitFor({timeout:120000});
