@@ -19,6 +19,13 @@ AsterMind 是一个可扩展的星座级太空智算系统仿真平台，为在�
 
 开发者可以配置业务负载和星座场景，在星载环境约束下比较不同的建链、路由、任务调度和模型部署策略，评估端到端性能并定位影响服务表现的关键因素。
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/astermind-overview-zh.png">
+    <img src="assets/astermind-overview-zh.png" alt="AsterMind">
+  </picture>
+</p>
+
 ## 核心特性
 
 - **覆盖不同尺度的全链路仿真。** 支持单星、算力编队和完整星座场景，评估各尺度下的设计与优化方案。

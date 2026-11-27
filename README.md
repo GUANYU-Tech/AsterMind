@@ -19,6 +19,13 @@ AsterMind is an extensible system-level simulator for space computing. It evalua
 
 Developers can configure workloads and constellation scenarios to compare link establishment, routing, scheduling, and model deployment strategies under orbital operating constraints. This supports end-to-end performance evaluation and helps identify what limits serving performance.
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/astermind-overview-en.png">
+    <img src="assets/astermind-overview-en.png" alt="AsterMind">
+  </picture>
+</p>
+
 ## Key Features
 
 - **End-to-end simulation across deployment scales.** AsterMind supports single-satellite, satellite formation, and constellation-scale scenarios within a common simulation framework. It supports the simulation of end-to-end request execution on a shared event timeline.
