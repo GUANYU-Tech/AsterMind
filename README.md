@@ -107,8 +107,8 @@ In **Detail Mode**, this example simulates distributed inference for **DeepSeek-
 
 Simulate global inference serving with GLM-5.2 at TP8 × PP4 per formation. A 360 s simulation replays 300 s of arrivals and gives in-flight requests 60 s to continue. The topology updates every 60 s.
 
-1. **Build the topology.** Open **End-to-End Simulation → New Task** and select **New Physical Model** in **Setup**. Apply the topology settings below, with **Append to this scenario**. Confirm **5 gateways**, then select **Generate Data and Continue**.
-2. **Run the workload.** In **Configure Scenario**, select the generated **Physical Topology Dataset**, confirm **10 Cells**, and apply the routing settings below. In **Service Requests → Batch Import**, load workload files as JSONL with **Replace Current Requests**. Select **Validate and Preview**, confirm **168 requests**, then select **Apply Requests** and **Run Experiment and View Results**.
+1. **Build the topology.** Open **End-to-End Simulation → New Task** and select **New Physical Model** in **Setup**. Apply the topology settings below. Remove the default ground stations, then import the [gateway CSV](examples/L3_Quick_Start/gateways-quick-start.csv) and select **Append to this scenario**. Confirm **5 gateways**, then select **Generate Data and Continue**.
+2. **Run the workload.** In **Configure Scenario**, select the generated **Physical Topology Dataset**, confirm **10 Cells**, and apply the routing settings below. In **Service Requests → Batch Import**, import the [300-second request trace](examples/L3_Quick_Start/wildchat-1x-quick-start-300s.jsonl) as JSONL with **Replace Current Requests**. Select **Validate and Preview**, confirm **168 requests**, then select **Apply Requests** and **Run Experiment and View Results**.
 3. **Inspect the results.** In **Request Performance**, check the target Cell, completion status, and gateway-side TTFT, TPOT, and end-to-end latency. In **Scene Replay → Play Replay**, follow a request from uplink to response delivery in 3D.
 
 <details>
@@ -122,7 +122,7 @@ Leave **Physical model source** blank. Remove unused default constellations and 
 | Communications Constellation | **Generate from parameters → Walker Parameters**. Altitude 550 km, 60 planes × 100 satellites, inclination 53°, phase 1, initial RAAN 0°, initial argument of latitude 0°. Use **Grid / 4 Neighbors** and **Custom Hardware** with 6 ISL terminals and at most 1 ground link per satellite. |
 | Compute Constellations and Cells | Create a **Fast Mode** constellation with 10 Cells. Edit one Cell using the next three rows, then select **Use as Template for All 10 Cells**. |
 | Cell resources and network | 4 satellites in a ring, 1 km spacing, 800 km altitude, 8 H200 GPUs per satellite and 8 GPUs per SU group |
-| Cell model and deployment | GLM-5.2, 70% compute efficiency, 96% HBM bandwidth efficiency, **Colocated**, TP8 × PP4, DP1, EP off |
+| Cell model and deployment | GLM-5.2, 70% compute efficiency, 96% HBM bandwidth efficiency, **Colocated**, TP8 × PP4, EP off, DP1 |
 | Cell scheduling and cache | 32 requests per batch, **Chunked Prefill** on, **Prefill Chunk Limit** `0` (use the remaining batch token budget), **Prefix Caching** on |
 | Constellation Orbit and Access Settings | **Dawn–Dusk Sun-Synchronous Orbit**, **Single-Satellite Egress**, access member index `0`, 2 external ISL terminals per access member |
 | Ground Stations and Access | Remove the default ground stations, then use **Import ground stations from CSV** to add Guangzhou, New Delhi, Johannesburg, Frankfurt, and Los Angeles. It sets the coordinates, 25° minimum elevation, and 16 terminals per station. Set **Ground Node Role** to **RF Gateway Backhaul**. |
